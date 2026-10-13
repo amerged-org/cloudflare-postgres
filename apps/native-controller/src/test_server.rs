@@ -2,7 +2,11 @@
 //! In-process HTTPS Kubernetes API double for controller tests. It serves stored objects, lists
 //! and text bodies, creates by POST, applies merge patches and deletes only under the request's
 //! UID and resourceVersion preconditions, and can drop the reply of one committed write.
-use crate::kubernetes::{Kubernetes, named};
+//! A plain-HTTP Cloudflare API double answers the controller's agent requests.
+use crate::{
+    api::ControlApi,
+    kubernetes::{Kubernetes, named},
+};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
 use std::{
@@ -338,4 +342,69 @@ impl Server {
                 .unwrap(),
         );
     }
+}
+/// Every request the Cloudflare API double received, as (path, JSON body).
+pub type Requests = Arc<Mutex<Vec<(String, Value)>>>;
+/// A plain-HTTP Cloudflare API double that records each request and answers with `respond`;
+/// status 0 holds the request open without a reply.
+pub async fn api_double(
+    respond: impl Fn(&str, &Value) -> (u16, Value) + Send + Sync + 'static,
+) -> (ControlApi, Requests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests: Requests = Arc::default();
+    let (recorded, respond) = (requests.clone(), Arc::new(respond));
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (recorded, respond) = (recorded.clone(), respond.clone());
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let (path, body) = loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                    let length: usize = head
+                        .to_ascii_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:").map(str::to_string))
+                        .map_or(0, |n| n.trim().parse().unwrap());
+                    if bytes.len() >= end + 4 + length {
+                        let path = head.split_whitespace().nth(1).unwrap().to_string();
+                        let body =
+                            serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                                .unwrap_or(Value::Null);
+                        break (path, body);
+                    }
+                };
+                recorded.lock().unwrap().push((path.clone(), body.clone()));
+                let (code, reply) = respond(&path, &body);
+                if code == 0 {
+                    return std::future::pending().await;
+                }
+                let reply = reply.to_string();
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                    .await;
+            });
+        }
+    });
+    let api = ControlApi::double(reqwest::Url::parse(&format!("http://{address}/")).unwrap());
+    (api, requests)
+}
+/// An `sa1` token of node `node_uid` with schema-valid claims; its signature is never read here.
+pub fn token(database: &str, generation: u64, node_uid: &str, revision: u64, exp: u64) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let claims = json!({"v":1,"kid":"cf","database_id":database,"generation":generation,"authority_revision":revision,"storage_uid":uid(31),"node_uid":node_uid,"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","profile_sha256":"f".repeat(64),"volume_handle":format!("pvc-{}",uid(32)),"lv_uuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","pvc_uid":uid(33),"pv_uid":uid(34),"pod_uid":uid(35),"observed_at":exp.saturating_sub(10_000),"iat":exp.saturating_sub(10_000),"exp":exp,"guard_seconds":10,"drain_seconds":10,"write_allowed":true});
+    format!(
+        "sa1.{}.c2lnbmF0dXJl",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    )
 }

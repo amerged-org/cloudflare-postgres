@@ -172,6 +172,14 @@ pub fn database_valid(db: &Value) -> bool {
 pub fn desired_valid(value: &Value, region: &str) -> bool {
     schema_valid("DesiredResponse", value)
         && text(&value["region"], "id") == region
+        // Each node is sampled once.
+        && value["region"]["storage_samples"].as_array().is_none_or(|rows| {
+            rows.iter()
+                .map(|row| text(row, "node_id"))
+                .collect::<HashSet<_>>()
+                .len()
+                == rows.len()
+        })
         && value["databases"].as_array().is_some_and(|rows| {
             rows.iter().all(|db| {
                 if !database_valid(db) {
@@ -292,6 +300,29 @@ mod tests {
             configuration_fingerprint(&changed, text(&vectors[0]["ctx"], "postgresImage")).unwrap(),
             text(&vectors[0], "configuration_fingerprint")
         );
+    }
+    #[test]
+    fn a_region_with_thin_samples_and_composed_authorities_is_valid_desired_state() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/power-vectors.generated.json"
+        ))
+        .unwrap();
+        let composed = vectors["reclamation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "renewed_after_identity_read_before_deletion")
+            .unwrap()["nodes"][0]
+            .clone();
+        assert!(!composed["inventory_revision"].is_null());
+        let sampled = |node: &str, run: Value| serde_json::json!({"node_id":node,"name":composed["name"],"node_uid":composed["node_uid"],"period_milliseconds":2000,"qualification_run":run});
+        let mut desired = serde_json::json!({"region":{"id":"eu-test","backup":{"bucket":"native-controller-test","endpoint_url":"https://backup.example.invalid","region":"auto"},"storage_nodes":[composed],"storage_samples":[sampled(text(&composed,"node_id"),Value::Null),sampled("nod_qualified00000000000",format!("op_{}","q".repeat(20)).into())]},"databases":[],"next":null});
+        assert!(desired_valid(&desired, "eu-test"));
+        desired["region"]["storage_samples"][1]["node_id"] = composed["node_id"].clone();
+        assert!(!desired_valid(&desired, "eu-test"));
+        desired["region"]["storage_samples"][1]["node_id"] = "nod_qualified00000000000".into();
+        desired["region"]["storage_samples"][1]["period_milliseconds"] = 100.into();
+        assert!(!desired_valid(&desired, "eu-test"));
     }
     #[test]
     fn authority_numbers_preserve_integral_json_float_counts() {

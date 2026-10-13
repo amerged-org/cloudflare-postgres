@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use pgcf_native_controller::{
     Error,
     api::{ControlApi, DesiredSnapshot},
-    contracts::{constant, number, schema_valid, text},
+    contracts::{constant, integer, number, schema_valid, text},
     kubernetes::Kubernetes,
     measurements::Measurements,
-    reconcile::Reconciler,
+    node_storage::{Renewal, Sampler, driver_image, sample_node},
+    reconcile::{Reconciler, newer_token, storage_claims},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -79,6 +79,7 @@ fn fingerprint(db: &Value, snapshot: &DesiredSnapshot) -> Result<Vec<u8>, Error>
 fn apply_snapshot(
     cells: &mut HashMap<String, Cell>,
     active: &HashMap<String, Active>,
+    renewals: &Renewals,
     snapshot: DesiredSnapshot,
     requested: Option<&[String]>,
     pulled_at: Instant,
@@ -116,8 +117,8 @@ fn apply_snapshot(
             }
             cell.authority_at = pulled_at;
             let changed = cell.fingerprint != hash;
-            let host_changed =
-                host_write_state(&cell.db, &cell.snapshot) != host_write_state(db, &snapshot);
+            let host_changed = host_write_state(&cell.db, &cell.snapshot, renewals)
+                != host_write_state(db, &snapshot, renewals);
             if changed || host_changed {
                 if let Some(job) = active.get(&id) {
                     job.abort.abort();
@@ -158,19 +159,96 @@ fn apply_snapshot(
     }
     Ok(())
 }
-fn host_write_state(db: &Value, snapshot: &DesiredSnapshot) -> Value {
+/// The newest accepted fast renewal per node UID. Wherever its revision is higher it replaces the
+/// snapshot's node authority, and its tokens the snapshot's (thin-authority-renewal.md, 4.5).
+#[derive(Default)]
+struct Renewals(HashMap<String, Renewal>);
+impl Renewals {
+    /// Keeps a renewal only over an older one of its node.
+    fn accept(&mut self, renewal: Renewal) -> bool {
+        if self
+            .0
+            .get(&renewal.node_uid)
+            .is_some_and(|held| held.revision >= renewal.revision)
+        {
+            return false;
+        }
+        self.0.insert(renewal.node_uid.clone(), renewal);
+        true
+    }
+    fn listed<'a>(db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
+        snapshot.region["storage_nodes"]
+            .as_array()?
+            .iter()
+            .find(|row| row["node_uid"] == db["storage"]["node_uid"])
+    }
+    /// The renewal of the database's thin node when it is newer than the snapshot's entry.
+    fn renewed(&self, db: &Value, snapshot: &DesiredSnapshot) -> Option<&Renewal> {
+        let renewal = self.0.get(db["storage"]["node_uid"].as_str()?)?;
+        let listed = Self::listed(db, snapshot)
+            .and_then(|listed| integer(listed, "revision").ok())
+            .is_some_and(|revision| revision >= renewal.revision);
+        (!listed).then_some(renewal)
+    }
+    /// The authority the database's thin node currently holds.
+    fn authority<'a>(&'a self, db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
+        self.renewed(db, snapshot)
+            .map(|renewal| &renewal.authority)
+            .or_else(|| Self::listed(db, snapshot))
+    }
+    /// The newest write token of the database's current generation.
+    fn token<'a>(&'a self, db: &'a Value) -> Option<&'a str> {
+        let renewed = db["storage"]["node_uid"]
+            .as_str()
+            .and_then(|node| self.0.get(node))
+            .and_then(|renewal| renewal.tokens.get(text(db, "id")))
+            .map(String::as_str)
+            .filter(|token| {
+                storage_claims(token).is_some_and(|claims| claims["generation"] == db["generation"])
+            });
+        newer_token(db["storage_authority"].as_str(), renewed)
+    }
+    /// The database and snapshot a job runs on: the newest token and node authority.
+    fn effective(
+        &self,
+        db: &Value,
+        snapshot: &Arc<DesiredSnapshot>,
+    ) -> (Value, Arc<DesiredSnapshot>) {
+        let mut view = db.clone();
+        if let Some(token) = self.token(db) {
+            view["storage_authority"] = token.into();
+        }
+        let Some(renewal) = self.renewed(db, snapshot) else {
+            return (view, snapshot.clone());
+        };
+        let mut region = snapshot.region.clone();
+        let mut nodes = region["storage_nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        nodes.retain(|row| row["node_uid"] != renewal.authority["node_uid"]);
+        nodes.push(renewal.authority.clone());
+        region["storage_nodes"] = nodes.into();
+        let snapshot = DesiredSnapshot {
+            region,
+            fleet_release: snapshot.fleet_release.clone(),
+            databases: snapshot.databases.clone(),
+        };
+        (view, Arc::new(snapshot))
+    }
+}
+fn host_write_state(db: &Value, snapshot: &DesiredSnapshot, renewals: &Renewals) -> Value {
     if db["storage"].is_null() {
         return Value::Null;
     }
-    let authority = snapshot.region["storage_nodes"]
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|row| row["node_uid"] == db["storage"]["node_uid"])
-        });
-    authority.map_or(Value::Null,|a|json!({"node_uid":a["node_uid"],"profile_sha256":a["profile_sha256"],"volume_group_uuid":a["volume_group_uuid"],"pool_uuid":a["pool_uuid"],"write_allowed":a["write_allowed"]}))
+    renewals.authority(db, snapshot).map_or(Value::Null,|a|json!({"node_uid":a["node_uid"],"profile_sha256":a["profile_sha256"],"volume_group_uuid":a["volume_group_uuid"],"pool_uuid":a["pool_uuid"],"write_allowed":a["write_allowed"]}))
 }
-fn storage_protection_due(db: &Value, snapshot: &DesiredSnapshot, clock: i128) -> bool {
+fn storage_protection_due(
+    db: &Value,
+    snapshot: &DesiredSnapshot,
+    renewals: &Renewals,
+    clock: i128,
+) -> bool {
     if db["storage"].is_null() || text(db, "desired_state") != "running" {
         return false;
     }
@@ -181,13 +259,7 @@ fn storage_protection_due(db: &Value, snapshot: &DesiredSnapshot, clock: i128) -
             })
             .map(|t| t.unix_timestamp_nanos() / 1_000_000)
     };
-    let authority = snapshot.region["storage_nodes"]
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|row| row["node_uid"] == db["storage"]["node_uid"])
-        });
-    let Some(authority) = authority else {
+    let Some(authority) = renewals.authority(db, snapshot) else {
         return true;
     };
     if authority["write_allowed"] != true
@@ -195,30 +267,19 @@ fn storage_protection_due(db: &Value, snapshot: &DesiredSnapshot, clock: i128) -
     {
         return true;
     }
-    let token = db["storage_authority"].as_str();
-    if token.is_none() {
+    let Some(token) = renewals.token(db) else {
         return db["storage_startup"]["generation"] != db["generation"]
             || db["storage_startup"]["node_uid"] != db["storage"]["node_uid"]
             || parse(&db["storage_startup"]["expires_at"]).is_none_or(|expiry| expiry <= clock);
-    }
+    };
     // This only chooses an earlier protective stop. It never authorizes a write:
     // the gateway independently verifies the deployment-pinned CF signature.
-    let parts: Vec<_> = token.unwrap_or("").split('.').collect();
-    if parts.len() != 3 || parts[0] != "sa1" {
-        return true;
-    }
-    let claims = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-    claims.is_none_or(|claims| {
-        !pgcf_native_protocol::valid_schema("storageWriteClaims", &claims)
-            || claims["database_id"] != db["id"]
+    storage_claims(token).is_none_or(|claims| {
+        claims["database_id"] != db["id"]
             || claims["generation"] != db["generation"]
             || claims["node_uid"] != db["storage"]["node_uid"]
             || claims["write_allowed"] != true
-            || pgcf_native_controller::contracts::integer(&claims, "exp")
-                .map_or(true, |expiry| i128::from(expiry) <= clock)
+            || integer(&claims, "exp").map_or(true, |expiry| i128::from(expiry) <= clock)
     })
 }
 /// Bounded reconciliation slots shared by every database.
@@ -241,8 +302,10 @@ fn waking(cell: &Cell) -> bool {
             && cell.db["power"]["mode"] == "running"
             && cell.db["power"]["operation"].as_str() != cell.woke.as_deref())
 }
-fn class(cell: &Cell, clock: i128) -> Class {
-    if storage_protection_due(&cell.db, &cell.snapshot, clock) || (cell.renew && cell.ready) {
+fn class(cell: &Cell, renewals: &Renewals, clock: i128) -> Class {
+    if storage_protection_due(&cell.db, &cell.snapshot, renewals, clock)
+        || (cell.renew && cell.ready)
+    {
         Class::Storage
     } else if waking(cell) {
         Class::Wake
@@ -324,6 +387,7 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u
 /// leave one slot to due routine work while none runs, so stuck wakes cannot starve it.
 fn schedule(
     cells: &HashMap<String, Cell>,
+    renewals: &Renewals,
     busy: &HashMap<String, Class>,
     now: Instant,
     clock: i128,
@@ -337,14 +401,14 @@ fn schedule(
     let mut candidates: Vec<_> = cells
         .iter()
         .filter(|(id, cell)| {
-            let protect = storage_protection_due(&cell.db, &cell.snapshot, clock);
+            let protect = storage_protection_due(&cell.db, &cell.snapshot, renewals, clock);
             (cell.due <= now || (cell.ready && protect))
                 && (protect
                     || (control_healthy
                         && now.duration_since(cell.authority_at) <= Duration::from_secs(90)))
                 && !busy.contains_key(*id)
         })
-        .map(|(id, cell)| (class(cell, clock), cell.due, id.clone()))
+        .map(|(id, cell)| (class(cell, renewals, clock), cell.due, id.clone()))
         .collect();
     // Within each class, pending databases rotate by oldest due time; a slow first cohort
     // cannot monopolize the bounded reconciliation slots.
@@ -374,6 +438,67 @@ fn schedule(
 }
 fn clock_ms() -> i128 {
     time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000
+}
+/// One running node sampler and what it was started for.
+struct Sampling {
+    started_for: Value,
+    task: tokio::task::Id,
+    abort: AbortHandle,
+}
+/// What each sampled node's sampler is started for: its `storage_samples` target and the
+/// release's driver. Any change starts a new sampler, which asks Cloudflare for a fresh nonce.
+fn sampler_targets(snapshot: &DesiredSnapshot) -> HashMap<String, Value> {
+    let driver = driver_image(&snapshot.fleet_release);
+    snapshot.region["storage_samples"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|target| {
+            (
+                text(target, "node_id").to_string(),
+                json!({"target":target,"driver":driver}),
+            )
+        })
+        .collect()
+}
+/// Runs exactly one sampler per sampled node of the newest snapshot, each as its own task.
+fn sync_samplers(
+    samplers: &mut HashMap<String, Sampling>,
+    tasks: &mut JoinSet<()>,
+    snapshot: &DesiredSnapshot,
+    (kube, api, renewals): (&Kubernetes, &ControlApi, &mpsc::Sender<Renewal>),
+) {
+    let wanted = sampler_targets(snapshot);
+    samplers.retain(|node, running| {
+        let keep = wanted.get(node) == Some(&running.started_for);
+        if !keep {
+            running.abort.abort();
+        }
+        keep
+    });
+    for (node, started_for) in wanted {
+        if samplers.contains_key(&node) {
+            continue;
+        }
+        let Some(sampler) = Sampler::new(&started_for["target"], text(&started_for, "driver"))
+        else {
+            continue;
+        };
+        let abort = tasks.spawn_local(sample_node(
+            kube.clone(),
+            api.clone(),
+            sampler,
+            renewals.clone(),
+        ));
+        samplers.insert(
+            node,
+            Sampling {
+                started_for,
+                task: abort.id(),
+                abort,
+            },
+        );
+    }
 }
 fn manifest() -> Result<Value, Error> {
     let source = option_env!("PGCF_SOURCE_REVISION").ok_or("unqualified controller build")?;
@@ -518,6 +643,10 @@ async fn run() -> Result<(), Error> {
     let mut metering: JoinSet<Result<(), Error>> = JoinSet::new();
     let mut storage: HashMap<String, Value> = HashMap::new();
     let mut storage_sampling: JoinSet<Result<HashMap<String, Value>, Error>> = JoinSet::new();
+    let mut renewals = Renewals::default();
+    let (renewal_sender, mut renewal_receiver) = mpsc::channel::<Renewal>(64);
+    let mut samplers: HashMap<String, Sampling> = HashMap::new();
+    let mut sampling: JoinSet<()> = JoinSet::new();
     let mut meter_interval = tokio::time::interval(Duration::from_millis(250));
     let mut node_interval = tokio::time::interval(Duration::from_secs(60));
     let mut storage_interval = tokio::time::interval(Duration::from_secs(60));
@@ -584,6 +713,23 @@ async fn run() -> Result<(), Error> {
                     _ => eprintln!("{{\"event\":\"node_storage_sample_failed\"}}"),
                 }
             },
+            renewal = renewal_receiver.recv() => {
+                if let Some(renewal) = renewal {
+                    renewals.accept(renewal);
+                }
+            },
+            result = sampling.join_next_with_id(), if !sampling.is_empty() => {
+                // A sampler ends only when replaced or by failing; a failed one starts again.
+                let ended = match result {
+                    Some(Ok((task, ()))) => Some(task),
+                    Some(Err(error)) => Some(error.id()),
+                    None => None,
+                };
+                samplers.retain(|_, running| Some(running.task) != ended);
+                if let Some((_, snapshot)) = &latest_snapshot {
+                    sync_samplers(&mut samplers, &mut sampling, snapshot, (&kube, &api, &renewal_sender));
+                }
+            },
             _ = full.tick() => {
                 if !pull_full {
                     pull_full = true;
@@ -616,8 +762,12 @@ async fn run() -> Result<(), Error> {
                     match result {
                         Ok(snapshot) => {
                             if is_full { control_healthy = true; have_full_snapshot = true; }
-                            if latest_snapshot.as_ref().is_none_or(|(at,_)|pulled_at>=*at) {latest_snapshot=Some((pulled_at,Arc::new(snapshot.clone())));}
-                            apply_snapshot(&mut cells, &active, snapshot, requested.as_deref(), pulled_at)?;
+                            if latest_snapshot.as_ref().is_none_or(|(at,_)|pulled_at>=*at) {
+                                let latest = Arc::new(snapshot.clone());
+                                sync_samplers(&mut samplers, &mut sampling, &latest, (&kube, &api, &renewal_sender));
+                                latest_snapshot=Some((pulled_at,latest));
+                            }
+                            apply_snapshot(&mut cells, &active, &renewals, snapshot, requested.as_deref(), pulled_at)?;
                         },
                         Err(_) => {
                             control_healthy = false;
@@ -681,7 +831,7 @@ async fn run() -> Result<(), Error> {
         for (id, job) in &active {
             if job.kind != JobKind::Protect
                 && cells.get(id).is_some_and(|cell| {
-                    storage_protection_due(&cell.db, &cell.snapshot, clock_ms())
+                    storage_protection_due(&cell.db, &cell.snapshot, &renewals, clock_ms())
                 })
             {
                 job.abort.abort();
@@ -692,22 +842,32 @@ async fn run() -> Result<(), Error> {
                 .iter()
                 .map(|(id, job)| (id.clone(), job.class))
                 .collect();
-            for (id, class) in schedule(&cells, &busy, Instant::now(), clock_ms(), control_healthy)
-            {
+            for (id, class) in schedule(
+                &cells,
+                &renewals,
+                &busy,
+                Instant::now(),
+                clock_ms(),
+                control_healthy,
+            ) {
                 let cell = &cells[&id];
-                let db = cell.db.clone();
-                let snapshot = cell.snapshot.clone();
+                // Jobs see the newest token and node authority, from a renewal or the snapshot.
+                let (db, snapshot) = renewals.effective(&cell.db, &cell.snapshot);
+                let decided = renewals
+                    .authority(&cell.db, &cell.snapshot)
+                    .and_then(|authority| integer(authority, "revision").ok());
                 let generation = number(&db, "generation");
                 let marker = cell.hints;
                 let controller = controller.clone();
                 let api = api.clone();
-                let kind = if storage_protection_due(&db, &snapshot, clock_ms()) {
-                    JobKind::Protect
-                } else if cell.renew && cell.ready {
-                    JobKind::Renew
-                } else {
-                    JobKind::Reconcile
-                };
+                let kind =
+                    if storage_protection_due(&cell.db, &cell.snapshot, &renewals, clock_ms()) {
+                        JobKind::Protect
+                    } else if cell.renew && cell.ready {
+                        JobKind::Renew
+                    } else {
+                        JobKind::Reconcile
+                    };
                 let job_id = id.clone();
                 let started = Instant::now();
                 let abort = jobs.spawn_local(async move {
@@ -718,7 +878,7 @@ async fn run() -> Result<(), Error> {
                         if kind == JobKind::Renew {
                             tokio::time::timeout(
                                 Duration::from_secs(30),
-                                controller.renew_storage_authority(&db),
+                                controller.renew_storage_authority(&db, decided),
                             )
                             .await
                             .map_err(|_| "storage authority renewal deadline exceeded")??;
@@ -759,6 +919,7 @@ async fn run() -> Result<(), Error> {
     }
     inventories.abort_all();
     storage_sampling.abort_all();
+    sampling.abort_all();
     metering.abort_all();
     pulls.abort_all();
     jobs.abort_all();
@@ -815,10 +976,12 @@ mod tests {
     fn delayed_target_pulls_never_downgrade_or_remove_newer_rows() {
         let mut cells = HashMap::new();
         let active = HashMap::new();
+        let none = Renewals::default();
         let started = Instant::now();
         apply_snapshot(
             &mut cells,
             &active,
+            &none,
             snapshot(vec![
                 json!({"id":"a","generation":2}),
                 json!({"id":"b","generation":1}),
@@ -830,17 +993,19 @@ mod tests {
         apply_snapshot(
             &mut cells,
             &active,
+            &none,
             snapshot(vec![json!({"id":"a","generation":1})]),
             Some(&["a".into()]),
             started,
         )
         .unwrap();
         assert_eq!(cells["a"].db["generation"], 2);
-        apply_snapshot(&mut cells, &active, snapshot(vec![]), None, started).unwrap();
+        apply_snapshot(&mut cells, &active, &none, snapshot(vec![]), None, started).unwrap();
         assert_eq!(cells.len(), 2);
         apply_snapshot(
             &mut cells,
             &active,
+            &none,
             snapshot(vec![]),
             Some(&["a".into()]),
             started + Duration::from_secs(2),
@@ -854,11 +1019,31 @@ mod tests {
         let db = json!({"id":"a","generation":1,"desired_state":"running","storage":{"node_uid":"same"},"storage_startup":{"generation":1,"node_uid":"same","expires_at":"1970-01-01T00:00:02.000Z"}});
         let mut state = snapshot(vec![]);
         state.region = json!({"storage_nodes":[{"node_uid":"same","write_allowed":true,"expires_at":"1970-01-01T00:00:03.000Z"}]});
-        assert!(!storage_protection_due(&db, &state, 1000));
-        assert!(storage_protection_due(&db, &state, 2000));
-        assert!(storage_protection_due(&db, &state, 3000));
+        assert!(!storage_protection_due(
+            &db,
+            &state,
+            &Renewals::default(),
+            1000
+        ));
+        assert!(storage_protection_due(
+            &db,
+            &state,
+            &Renewals::default(),
+            2000
+        ));
+        assert!(storage_protection_due(
+            &db,
+            &state,
+            &Renewals::default(),
+            3000
+        ));
         state.region["storage_nodes"][0]["write_allowed"] = false.into();
-        assert!(storage_protection_due(&db, &state, 1000));
+        assert!(storage_protection_due(
+            &db,
+            &state,
+            &Renewals::default(),
+            1000
+        ));
     }
     #[test]
     fn a_pending_wake_never_waits_behind_unrelated_reconciliation() {
@@ -884,18 +1069,21 @@ mod tests {
             .map(|index| (format!("busy{index}"), Class::Routine))
             .collect();
         assert_eq!(
-            schedule(&cells, &routine, now, 0, true),
+            schedule(&cells, &Renewals::default(), &routine, now, 0, true),
             vec![("wake".to_string(), Class::Wake)]
         );
         cells.remove("wake");
-        assert!(schedule(&cells, &routine, now, 0, true).is_empty());
-        assert_eq!(schedule(&cells, &HashMap::new(), now, 0, true).len(), 3);
+        assert!(schedule(&cells, &Renewals::default(), &routine, now, 0, true).is_empty());
+        assert_eq!(
+            schedule(&cells, &Renewals::default(), &HashMap::new(), now, 0, true).len(),
+            3
+        );
         for index in 0..SLOTS {
             let id = format!("wake{index}");
             cells.insert(id.clone(), cell(wake(&id, &operation(index)), now, false));
         }
         cells.retain(|id, _| id.starts_with("wake"));
-        let selected = schedule(&cells, &HashMap::new(), now, 0, true);
+        let selected = schedule(&cells, &Renewals::default(), &HashMap::new(), now, 0, true);
         assert_eq!(selected.len(), SLOTS);
         assert!(
             selected
@@ -924,7 +1112,7 @@ mod tests {
         let now = started + Duration::from_millis(10);
         // The renewal goes first like a protective stop; one slot stays with routine work.
         assert_eq!(
-            schedule(&cells, &HashMap::new(), now, 0, true),
+            schedule(&cells, &Renewals::default(), &HashMap::new(), now, 0, true),
             vec![
                 ("renew".to_string(), Class::Storage),
                 ("wake0".to_string(), Class::Wake),
@@ -938,7 +1126,7 @@ mod tests {
             .map(|index| (format!("wake{index}"), Class::Wake))
             .collect();
         assert_eq!(
-            schedule(&cells, &wakes, now, 0, true),
+            schedule(&cells, &Renewals::default(), &wakes, now, 0, true),
             vec![("routine".to_string(), Class::Routine)]
         );
         // Each stuck wake backs off after its first not-ready results.
@@ -950,13 +1138,13 @@ mod tests {
             })
             .collect();
         assert_eq!(delays, [1, 1, 1, 1, 1, 2, 4, 8, 16, 30, 30]);
-        assert_eq!(class(stuck, 0), Class::Wake);
+        assert_eq!(class(stuck, &Renewals::default(), 0), Class::Wake);
     }
     #[test]
     fn only_a_power_operation_not_yet_observed_ready_is_a_wake() {
         let now = Instant::now();
         let mut database = cell(wake("db", &operation(1)), now, false);
-        assert_eq!(class(&database, 0), Class::Wake);
+        assert_eq!(class(&database, &Renewals::default(), 0), Class::Wake);
         finish(&mut database, now, Some(&json!({"state":"provisioning"})));
         assert_eq!(database.stalled, 1);
         finish(&mut database, now, Some(&json!({"state":"ready"})));
@@ -965,13 +1153,13 @@ mod tests {
         assert_eq!(database.due, now + Duration::from_secs(60));
         // A later configuration change or failed check of the woken database is routine work.
         database.ready = false;
-        assert_eq!(class(&database, 0), Class::Routine);
+        assert_eq!(class(&database, &Renewals::default(), 0), Class::Routine);
         finish(&mut database, now, None);
         assert_eq!(database.stalled, 0);
         assert_eq!(database.due, now + Duration::from_secs(1));
         // The next wake of the same database is a new power operation.
         database.db = wake("db", &operation(2));
-        assert_eq!(class(&database, 0), Class::Wake);
+        assert_eq!(class(&database, &Renewals::default(), 0), Class::Wake);
     }
     #[test]
     fn a_pod_change_of_a_ready_database_is_urgent_re_attestation() {
@@ -985,28 +1173,31 @@ mod tests {
             .collect();
         // A Cluster or volume change of a ready database stays routine work.
         hinted(cells.get_mut("db").unwrap(), "Cluster", now);
-        assert_eq!(class(&cells["db"], 0), Class::Routine);
-        assert!(schedule(&cells, &routine, now, 0, true).is_empty());
+        assert_eq!(class(&cells["db"], &Renewals::default(), 0), Class::Routine);
+        assert!(schedule(&cells, &Renewals::default(), &routine, now, 0, true).is_empty());
         // A Pod change may have replaced the attested primary within the same revision: v3
         // routes to it are refused until re-attestation, which takes the last slot at once.
         hinted(cells.get_mut("db").unwrap(), "Pod", now);
-        assert_eq!(class(&cells["db"], 0), Class::Wake);
+        assert_eq!(class(&cells["db"], &Renewals::default(), 0), Class::Wake);
         assert_eq!(
-            schedule(&cells, &routine, now, 0, true),
+            schedule(&cells, &Renewals::default(), &routine, now, 0, true),
             vec![("db".to_string(), Class::Wake)]
         );
         // It stays urgent, backing off like a wake, until a ready result re-attests it.
         let db = cells.get_mut("db").unwrap();
         finish(db, now, None);
-        assert_eq!(class(db, 0), Class::Wake);
+        assert_eq!(class(db, &Renewals::default(), 0), Class::Wake);
         finish(db, now, Some(&json!({"state":"provisioning"})));
-        assert_eq!((class(db, 0), db.stalled), (Class::Wake, 2));
+        assert_eq!(
+            (class(db, &Renewals::default(), 0), db.stalled),
+            (Class::Wake, 2)
+        );
         finish(db, now, Some(&json!({"state":"ready"})));
-        assert_eq!(class(db, 0), Class::Routine);
+        assert_eq!(class(db, &Renewals::default(), 0), Class::Routine);
         // A Pod change of a database that is not ready is already reconciled as due work.
         db.ready = false;
         hinted(db, "Pod", now);
-        assert_eq!(class(db, 0), Class::Routine);
+        assert_eq!(class(db, &Renewals::default(), 0), Class::Routine);
     }
     #[test]
     fn a_pod_change_during_an_in_flight_check_keeps_re_attestation_urgent() {
@@ -1017,9 +1208,9 @@ mod tests {
         // name the replaced Pod, so it cannot complete the re-attestation.
         hinted(&mut db, "Pod", now);
         settle(&mut db, now, Some(&json!({"state":"ready"})), started);
-        assert_eq!(class(&db, 0), Class::Wake);
+        assert_eq!(class(&db, &Renewals::default(), 0), Class::Wake);
         finish(&mut db, now, Some(&json!({"state":"ready"})));
-        assert_eq!(class(&db, 0), Class::Routine);
+        assert_eq!(class(&db, &Renewals::default(), 0), Class::Routine);
     }
     #[test]
     fn failing_renewals_back_off_instead_of_holding_every_slot() {
@@ -1038,6 +1229,7 @@ mod tests {
         assert_eq!(
             schedule(
                 &cells,
+                &Renewals::default(),
                 &HashMap::new(),
                 now + Duration::from_millis(1500),
                 0,
@@ -1059,6 +1251,83 @@ mod tests {
         renewed(renewal, now, true, marker, now);
         assert!(!renewal.renew);
         assert_eq!(renewal.attempt, 0);
+    }
+    const NODE: &str = "01234567-89ab-4def-8123-000000000001";
+    /// An `sa1` token of NODE with schema-valid claims; the controller never reads its signature.
+    fn token(generation: u64, revision: u64, exp: u64) -> String {
+        let claims = json!({"v":1,"kid":"cf","database_id":"db000000000000000001","generation":generation,"authority_revision":revision,"storage_uid":NODE,"node_uid":NODE,"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","profile_sha256":"f".repeat(64),"volume_handle":format!("pvc-{NODE}"),"lv_uuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","pvc_uid":NODE,"pv_uid":NODE,"pod_uid":NODE,"observed_at":0,"iat":0,"exp":exp,"guard_seconds":10,"drain_seconds":10,"write_allowed":true});
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!(
+            "sa1.{}.c2ln",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+    fn renewal(revision: u64, write_allowed: bool, expires: &str, tokens: &[String]) -> Renewal {
+        Renewal {
+            node_uid: NODE.into(),
+            revision,
+            authority: json!({"node_uid":NODE,"revision":revision,"write_allowed":write_allowed,"expires_at":expires}),
+            tokens: tokens
+                .iter()
+                .map(|token| ("db000000000000000001".to_string(), token.clone()))
+                .collect(),
+        }
+    }
+    #[test]
+    fn a_fast_renewal_keeps_writes_between_pulls_and_an_older_one_never_wins() {
+        let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_authority":token(3,2,2000)});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":NODE,"revision":2,"write_allowed":true,"expires_at":"1970-01-01T00:00:02.000Z"}]});
+        let mut renewals = Renewals::default();
+        // The 60 s snapshot's authority and token lapse long before the next pull.
+        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(renewals.accept(renewal(
+            4,
+            true,
+            "1970-01-01T00:00:10.000Z",
+            &[token(3, 4, 10_000)]
+        )));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(storage_protection_due(&db, &state, &renewals, 10_000));
+        // An older renewal never replaces a newer one.
+        assert!(!renewals.accept(renewal(3, false, "1970-01-01T00:00:20.000Z", &[])));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        // A renewal's token of another generation never stands in for this one's.
+        let mut woken = db.clone();
+        woken["generation"] = 4.into();
+        woken["storage_authority"] = Value::Null;
+        assert!(storage_protection_due(&woken, &state, &renewals, 5000));
+        // A newer snapshot entry wins again: here Cloudflare stopped allowing writes.
+        state.region["storage_nodes"][0] = json!({"node_uid":NODE,"revision":5,"write_allowed":false,"expires_at":"1970-01-01T00:00:20.000Z"});
+        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+    }
+    #[test]
+    fn jobs_run_on_the_newest_token_and_node_authority() {
+        let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_authority":token(3,2,2000)});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"backup":{},"storage_nodes":[{"node_uid":NODE,"revision":2,"write_allowed":true}]});
+        let state = Arc::new(state);
+        let mut renewals = Renewals::default();
+        let (view, effective) = renewals.effective(&db, &state);
+        assert_eq!((&view, Arc::ptr_eq(&effective, &state)), (&db, true));
+        renewals.accept(renewal(
+            4,
+            false,
+            "1970-01-01T00:00:10.000Z",
+            &[token(3, 4, 10_000)],
+        ));
+        let (view, effective) = renewals.effective(&db, &state);
+        assert_eq!(view["storage_authority"], token(3, 4, 10_000));
+        assert_eq!(
+            effective.region["storage_nodes"],
+            json!([renewal(4, false, "1970-01-01T00:00:10.000Z", &[]).authority])
+        );
+        assert_eq!(effective.region["backup"], json!({}));
+        // The renewed write state is the host state a snapshot is compared under.
+        assert_eq!(
+            host_write_state(&db, &state, &renewals)["write_allowed"],
+            false
+        );
     }
     #[test]
     fn runtime_lease_rotation_is_not_a_configuration_change() {

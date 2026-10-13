@@ -127,6 +127,35 @@ impl ControlApi {
         }
         Ok(reply)
     }
+    /// Posts one headroom sample of a node. Every reply carries the next nonce; only an accepted
+    /// product sample also carries the composed node authority and the node's write tokens.
+    pub async fn storage_headroom(&self, node_id: &str, sample: &Value) -> Result<Value, Error> {
+        if !node_id.strip_prefix("nod_").is_some_and(|id| {
+            id.len() == 20
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        }) || !crate::node_storage::sample_valid(sample)
+        {
+            return Err("native headroom sample invalid".into());
+        }
+        let reply = self
+            .request(
+                &format!("/agent/v1/nodes/{node_id}/storage-headroom"),
+                Some(sample),
+            )
+            .await?;
+        let accepted = reply["accepted"] == true;
+        let renewal = !reply["authority"].is_null();
+        if !schema_valid("NodeStorageHeadroomResponse", &reply)
+            || accepted != reply["reason"].is_null()
+            || (!accepted && renewal)
+            || (!renewal && reply["tokens"].as_array().is_none_or(|t| !t.is_empty()))
+        {
+            return Err("headroom acknowledgement invalid".into());
+        }
+        Ok(reply)
+    }
     pub async fn from_env() -> Result<Self, Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let region = std::env::var("PGCF_REGION_ID")?;
@@ -349,6 +378,18 @@ impl ControlApi {
         }
     }
 }
+#[cfg(test)]
+impl ControlApi {
+    /// A client of a plain-HTTP Cloudflare API double.
+    pub(crate) fn double(origin: Url) -> Self {
+        Self {
+            client: crate::cluster_http(Duration::from_secs(5)).unwrap(),
+            origin,
+            region: "eu-test".into(),
+            key: AgentKey::Environment(format!("pgcf_ak_eu-test_{}", "a".repeat(43))),
+        }
+    }
+}
 /// A Cloudflare API refusal with its HTTP status and error code.
 #[derive(Debug)]
 pub struct Refusal {
@@ -383,6 +424,7 @@ fn legacy_report(envelope: &Value) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_server::{Requests, api_double};
     #[test]
     fn exact_target_lookup_never_broadens_a_wake_into_a_fleet_scan() {
         assert_eq!(predecessor("a0000000000000000000").unwrap(), None);
@@ -423,61 +465,9 @@ mod tests {
         assert_eq!(timestamp.len(), 24);
         assert!(timestamp.ends_with('Z'));
     }
-    /// A plain-HTTP Cloudflare API double that records every request body and answers with `respond`.
-    async fn api_double(
-        respond: impl Fn(&Value) -> (u16, Value) + Send + 'static,
-    ) -> (ControlApi, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = bodies.clone();
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let mut chunk = [0; 4096];
-                let body = loop {
-                    let read = socket.read(&mut chunk).await.unwrap();
-                    bytes.extend_from_slice(&chunk[..read]);
-                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
-                    let length: usize = head
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .unwrap()
-                        .trim()
-                        .parse()
-                        .unwrap();
-                    if bytes.len() >= end + 4 + length {
-                        break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
-                            .unwrap();
-                    }
-                };
-                recorded.lock().unwrap().push(body.clone());
-                let (code, reply) = respond(&body);
-                let reply = reply.to_string();
-                let _ = socket
-                    .write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
-                    .await;
-            }
-        });
-        let api = ControlApi {
-            client: crate::cluster_http(Duration::from_secs(5)).unwrap(),
-            origin: Url::parse(&format!("http://{address}/")).unwrap(),
-            region: "eu-test".into(),
-            key: AgentKey::Environment(format!("pgcf_ak_eu-test_{}", "a".repeat(43))),
-        };
-        (api, bodies)
-    }
     /// With `coverage_known` false the double refuses labelled reports like an API released before coverage.
-    async fn observation_api(
-        coverage_known: bool,
-        status: u16,
-    ) -> (ControlApi, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
-        api_double(move |body| {
+    async fn observation_api(coverage_known: bool, status: u16) -> (ControlApi, Requests) {
+        api_double(move |_, body| {
             if status != 200 {
                 (
                     status,
@@ -502,13 +492,13 @@ mod tests {
         let sample = |sequence: u64| json!({"database_id":"a0000000000000000001","source":"agent","producer_id":"fixture","sequence":sequence,"observed_at":timestamp().unwrap(),"storage_used_bytes":null,"storage_allocated_bytes":1});
         let envelope = json!({"samples":[sample(1),sample(2)]});
         let (refusing, _) =
-            api_double(|_| (200, json!({"recorded":1,"duplicates":0,"refused":1}))).await;
+            api_double(|_, _| (200, json!({"recorded":1,"duplicates":0,"refused":1}))).await;
         refusing.usage(&envelope).await.unwrap();
         // An API released before refusals omits the count; its acknowledgement still covers every sample.
-        let (legacy, _) = api_double(|_| (200, json!({"recorded":1,"duplicates":1}))).await;
+        let (legacy, _) = api_double(|_, _| (200, json!({"recorded":1,"duplicates":1}))).await;
         legacy.usage(&envelope).await.unwrap();
         let (short, _) =
-            api_double(|_| (200, json!({"recorded":1,"duplicates":0,"refused":0}))).await;
+            api_double(|_, _| (200, json!({"recorded":1,"duplicates":0,"refused":0}))).await;
         assert!(short.usage(&envelope).await.is_err());
     }
     #[tokio::test]
@@ -516,7 +506,12 @@ mod tests {
         let db = json!({"id":"a0000000000000000001","generation":3,"state":"ready","archive":{"continuous":false,"ready_wal_files":null,"health":"unknown"}});
         let (api, bodies) = observation_api(false, 200).await;
         api.observation(db.clone()).await.unwrap();
-        let sent = bodies.lock().unwrap().clone();
+        let sent: Vec<_> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| body.clone())
+            .collect();
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0]["coverage"], "databases");
         assert_eq!(
@@ -525,7 +520,12 @@ mod tests {
         );
         let scan = json!({"coverage":"inventory","observed_at":timestamp().unwrap(),"nodes":[],"orphans":[],"node_memory_samples":[]});
         api.inventory(&scan).await.unwrap();
-        let sent = bodies.lock().unwrap().clone();
+        let sent: Vec<_> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| body.clone())
+            .collect();
         assert_eq!(sent.len(), 4);
         assert_eq!(
             sent[3],

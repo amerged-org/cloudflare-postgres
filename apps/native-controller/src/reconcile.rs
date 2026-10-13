@@ -293,6 +293,90 @@ fn pending_creation(db: &Value) -> bool {
         && matches!(text(origin, "status"), "pending" | "running")
         && text(&db["archive"], "destination_path").ends_with(&expected)
 }
+/// The schema-valid claims of an `sa1` token, read without its signature. They only order ledger
+/// writes and choose earlier protective stops; the gateway verifies the signature itself.
+pub fn storage_claims(token: &str) -> Option<Value> {
+    let parts: Vec<_> = token.split('.').collect();
+    if parts.len() != 3 || parts[0] != "sa1" {
+        return None;
+    }
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).ok()?).ok()?;
+    pgcf_native_protocol::valid_schema("storageWriteClaims", &claims).then_some(claims)
+}
+/// A token's place in the ledger: its node authority revision, then its database generation.
+fn ledger_order(claims: &Value) -> Option<(u64, u64)> {
+    Some((
+        integer(claims, "authority_revision").ok()?,
+        integer(claims, "generation").ok()?,
+    ))
+}
+/// The newer of two tokens by ledger order; `held` wins a tie, and an unreadable token loses.
+pub fn newer_token<'a>(held: Option<&'a str>, candidate: Option<&'a str>) -> Option<&'a str> {
+    let order = |token: Option<&str>| {
+        token
+            .and_then(storage_claims)
+            .and_then(|c| ledger_order(&c))
+    };
+    if order(candidate) > order(held) {
+        candidate
+    } else {
+        held.or(candidate)
+    }
+}
+/// Whether `candidate` may replace the ledger's `current` token at wall clock `now` (ms). A token
+/// never replaces one of a higher authority revision, or within one revision of a higher
+/// generation: the gateway disconnects on a regression, and a 60 s snapshot can still carry an
+/// older token than a fast renewal wrote. A removal decided at node authority revision `decided`
+/// never withdraws an unexpired token signed for a newer authority.
+pub fn ledger_replaces(
+    current: Option<&str>,
+    candidate: Option<&str>,
+    decided: Option<u64>,
+    now: u64,
+) -> bool {
+    if current == candidate {
+        return false;
+    }
+    let Some(held) = current.and_then(storage_claims) else {
+        return true;
+    };
+    let order = ledger_order(&held);
+    match candidate {
+        Some(token) => storage_claims(token)
+            .and_then(|claims| ledger_order(&claims))
+            .is_some_and(|candidate| Some(candidate) >= order),
+        None => {
+            integer(&held, "exp").is_ok_and(|expiry| expiry <= now)
+                || decided
+                    .zip(order)
+                    .is_some_and(|(decided, (revision, _))| decided >= revision)
+        }
+    }
+}
+/// Writes `candidate` into database `db`'s gateway write-authority ledger when it replaces the
+/// current token. The patch is bound to the resourceVersion that was compared, so a concurrent
+/// writer makes it fail instead of being overwritten. Returns whether it wrote.
+pub async fn write_ledger(
+    k8s: &Kubernetes,
+    db: &Value,
+    candidate: Option<&str>,
+    decided: Option<u64>,
+) -> Result<bool, Error> {
+    let name = format!("storage-{}", text(db, "id"));
+    let Some(map) = k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+        return Ok(false);
+    };
+    owned(&map, db, &name, Some(SYSTEM))?;
+    let key = constant("STORAGE_AUTHORITY_LEDGER_KEY")
+        .as_str()
+        .ok_or("storage gate key not generated")?;
+    let clock = u64::try_from(now()).map_err(|_| "ledger clock invalid")?;
+    if !ledger_replaces(map["data"][key].as_str(), candidate, decided, clock) {
+        return Ok(false);
+    }
+    k8s.patch(&map, &json!({"data":{key:candidate}})).await?;
+    Ok(true)
+}
 fn startup_valid(db: &Value) -> bool {
     let hold = &db["storage_startup"];
     !hold.is_null()
@@ -540,22 +624,17 @@ impl Reconciler {
         }
         health::archive_health(&self.k8s, db, &fresh_cluster, sample).await
     }
-    pub async fn renew_storage_authority(&self, db: &Value) -> Result<(), Error> {
+    /// Writes the database's token into its ledger, never over a newer one; `decided` is the
+    /// revision of the node authority under which the token (or its absence) was decided.
+    pub async fn renew_storage_authority(
+        &self,
+        db: &Value,
+        decided: Option<u64>,
+    ) -> Result<(), Error> {
         if db["storage"].is_null() {
             return Ok(());
         }
-        let name = format!("storage-{}", text(db, "id"));
-        let Some(map) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
-            return Ok(());
-        };
-        owned(&map, db, &name, Some(SYSTEM))?;
-        let key = constant("STORAGE_AUTHORITY_LEDGER_KEY")
-            .as_str()
-            .ok_or("storage gate key not generated")?;
-        let token = db["storage_authority"].as_str();
-        if map["data"][key].as_str() != token {
-            self.k8s.patch(&map, &json!({"data":{key:token}})).await?;
-        }
+        write_ledger(&self.k8s, db, db["storage_authority"].as_str(), decided).await?;
         Ok(())
     }
     /// A runtime switch at the same generation relabels the namespace that runtime admission
@@ -918,7 +997,8 @@ impl Reconciler {
             applied.push(actual);
         }
         fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
-        self.renew_storage_authority(db).await?;
+        self.renew_storage_authority(db, integer(&authority, "revision").ok())
+            .await?;
         let Some(cluster) = self.k8s.read("Cluster", Some(&ns), "database").await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
@@ -1503,6 +1583,84 @@ fn pinned_to_node(pv: &Value, node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_server::{Server, token, uid};
+    #[test]
+    fn a_ledger_token_never_yields_to_an_older_one() {
+        let (id, node) = ("db000000000000000001", uid(1));
+        let current = token(id, 2, &node, 5, 10_000);
+        let older = token(id, 2, &node, 4, 10_000);
+        let newer = token(id, 2, &node, 6, 10_000);
+        let woken = token(id, 3, &node, 5, 10_000);
+        // A snapshot pulled before a fast renewal carries an older token: it never replaces it.
+        assert!(!ledger_replaces(Some(&current), Some(&older), Some(9), 0));
+        assert!(ledger_replaces(Some(&current), Some(&newer), None, 0));
+        // Within one authority revision a newer generation replaces, never the reverse.
+        assert!(ledger_replaces(Some(&current), Some(&woken), None, 0));
+        assert!(!ledger_replaces(Some(&woken), Some(&current), None, 0));
+        assert!(!ledger_replaces(Some(&current), Some(&current), None, 0));
+        // An empty or unreadable ledger takes a token; an unreadable token replaces nothing.
+        assert!(ledger_replaces(None, Some(&older), None, 0));
+        assert!(ledger_replaces(Some("garbage"), Some(&older), None, 0));
+        assert!(!ledger_replaces(
+            Some(&current),
+            Some("sa1.e30.c2ln"),
+            None,
+            0
+        ));
+        // A removal withdraws a live token only when decided at its authority or a newer one.
+        assert!(!ledger_replaces(Some(&current), None, Some(4), 0));
+        assert!(ledger_replaces(Some(&current), None, Some(5), 0));
+        assert!(!ledger_replaces(Some(&current), None, None, 9_999));
+        assert!(ledger_replaces(Some(&current), None, None, 10_000));
+        assert_eq!(
+            newer_token(Some(&current), Some(&older)),
+            Some(current.as_str())
+        );
+        assert_eq!(
+            newer_token(Some(&older), Some(&current)),
+            Some(current.as_str())
+        );
+        assert_eq!(
+            newer_token(Some(&current), Some(&woken)),
+            Some(woken.as_str())
+        );
+        assert_eq!(newer_token(None, Some(&older)), Some(older.as_str()));
+    }
+    #[tokio::test]
+    async fn the_ledger_write_is_bound_to_the_token_it_compared() {
+        let server = Server::start().await;
+        let (id, node) = ("db000000000000000001", uid(1));
+        let soon = u64::try_from(now()).unwrap() + 60_000;
+        let (current, older, newer) = (
+            token(id, 2, &node, 5, soon),
+            token(id, 2, &node, 4, soon),
+            token(id, 2, &node, 6, soon),
+        );
+        server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{id}"),"namespace":SYSTEM,"uid":uid(7),"labels":{LABEL:id}},"data":{"state":"{}","write-authority":current}}));
+        let db = json!({ "id": id });
+        assert!(
+            !write_ledger(&server.k8s, &db, Some(&older), Some(4))
+                .await
+                .unwrap()
+        );
+        assert!(
+            write_ledger(&server.k8s, &db, Some(&newer), Some(6))
+                .await
+                .unwrap()
+        );
+        let ledger = server
+            .get("ConfigMap", Some(SYSTEM), &format!("storage-{id}"))
+            .unwrap();
+        assert_eq!(ledger["data"]["write-authority"], newer);
+        assert_eq!(ledger["data"]["state"], "{}");
+        // The one patch named the uid and resourceVersion of the ledger it compared.
+        let writes = server.state.lock().unwrap().writes.clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].2["metadata"],
+            json!({"uid":uid(7),"resourceVersion":"1"})
+        );
+    }
     #[test]
     fn a_retained_volume_pinned_by_the_openebs_node_label_belongs_to_its_node() {
         // OpenEBS LVM LocalPV 1.x provisioned R1 volumes with only `openebs.io/nodename`.

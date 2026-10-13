@@ -2,17 +2,22 @@
 //! Physical LVM capacity from the existing OpenEBS LocalPV exporter, read through the
 //! authenticated API-server Pod proxy: no exec, host writer or new daemon. A sample is a
 //! measurement, never thin write authority, and anything unproven is unknown, never zero use.
+//! A sampled thin node's readings go to Cloudflare against its nonce; only Cloudflare renews
+//! write authority from them, and the controller delivers what Cloudflare signed.
 use crate::{
     Error,
-    api::timestamp,
-    contracts::{constant, schema_valid, text},
+    api::{ControlApi, timestamp},
+    contracts::{constant, integer, schema_valid, text},
     kubernetes::Kubernetes,
+    reconcile::{storage_claims, write_ledger},
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 
 const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
 struct Metric {
@@ -125,9 +130,18 @@ fn volume_group_uuid(value: &str) -> bool {
                 && part.bytes().all(|b| b.is_ascii_alphanumeric())
         })
 }
+/// One complete exporter scrape of VG `pgcf`: its physical facts and every LV series it listed,
+/// which number exactly the exporter's own LV count.
+struct Scrape {
+    physical: Value,
+    lvs: Vec<Value>,
+}
 /// OpenEBS LocalPV LVM 1.10.1 runs vgs/lvs on each scrape, so its text is the measurement.
 /// Thin percentages become conservative upper-bound bytes; every gauge must be unambiguous.
 pub fn physical(source: &str, group_uuid: &str) -> Option<Value> {
+    scrape(source, group_uuid).map(|scrape| scrape.physical)
+}
+fn scrape(source: &str, group_uuid: &str) -> Option<Scrape> {
     if source.len() > 2 * 1024 * 1024 {
         return None;
     }
@@ -168,6 +182,7 @@ pub fn physical(source: &str, group_uuid: &str) -> Option<Value> {
     let mut names = HashSet::new();
     let mut thick = 0.0;
     let mut pool = None;
+    let mut lvs = Vec::with_capacity(volumes.len());
     for volume in &volumes {
         let labels = &volume.labels;
         let name = label(labels, "name").unwrap_or_default();
@@ -183,6 +198,9 @@ pub fn physical(source: &str, group_uuid: &str) -> Option<Value> {
         {
             return None;
         }
+        lvs.push(
+            json!({"name":name,"segtype":label(labels,"segtype"),"size_bytes":volume.value as u64}),
+        );
         match (
             label(labels, "segtype").as_deref(),
             label(labels, "pool").as_deref(),
@@ -243,9 +261,10 @@ pub fn physical(source: &str, group_uuid: &str) -> Option<Value> {
             json!({"name":"pgcf_thinpool","data_total_bytes":data,"data_used_bytes_upper_bound":data_used,"metadata_total_bytes":metadata,"metadata_used_bytes_upper_bound":metadata_used})
         }
     };
-    Some(
-        json!({"volume_group_uuid":group_uuid,"total_bytes":total,"free_bytes":free,"thick_allocated_bytes":thick,"thin_pool":thin_pool}),
-    )
+    Some(Scrape {
+        physical: json!({"volume_group_uuid":group_uuid,"total_bytes":total,"free_bytes":free,"thick_allocated_bytes":thick,"thin_pool":thin_pool}),
+        lvs,
+    })
 }
 fn condition<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
     value["status"]["conditions"]
@@ -340,13 +359,19 @@ fn present(value: &Option<Value>) -> bool {
             && value["metadata"]["deletionTimestamp"].is_null()
     })
 }
+/// One complete scrape between two identical identity reads of its node, cluster, VG and driver;
+/// the witnesses bind it to Cloudflare's identity proof of the node.
+struct Observed {
+    scrape: Scrape,
+    witnesses: Value,
+}
 async fn observe(
     kube: &Kubernetes,
     node: &Value,
     uid: &str,
     driver: &str,
     started: Instant,
-) -> Result<Option<Value>, Error> {
+) -> Result<Option<Observed>, Error> {
     if !stable(node, uid) {
         return Ok(None);
     }
@@ -393,7 +418,7 @@ async fn observe(
         return Ok(None);
     };
     let pod_name = text(&pod["metadata"], "name");
-    let measured = physical(&kube.openebs_metrics(pod_name).await?, &group);
+    let measured = scrape(&kube.openebs_metrics(pod_name).await?, &group);
     let (fresh_node, fresh_pod, fresh_owner, fresh_lvm, fresh_namespace, fresh_cluster) = tokio::try_join!(
         kube.read("Node", None, name),
         kube.read("Pod", Some("openebs"), pod_name),
@@ -407,8 +432,10 @@ async fn observe(
             && fresh.as_ref().map(|v| &v["metadata"]["uid"])
                 == original.as_ref().map(|v| &v["metadata"]["uid"])
     };
+    let boot = &node["status"]["nodeInfo"]["bootID"];
     let unchanged = fresh_node.as_ref().is_some_and(|fresh| {
         stable(fresh, uid)
+            && fresh["status"]["nodeInfo"]["bootID"] == *boot
             && fresh_pod
                 .as_ref()
                 .and_then(|pod| identity(pod, fresh, driver))
@@ -430,7 +457,14 @@ async fn observe(
     }) && same(&fresh_namespace, &namespace)
         && same(&fresh_cluster, &cluster)
         && started.elapsed() <= Duration::from_secs(20);
-    Ok(if unchanged { measured } else { None })
+    if !unchanged {
+        return Ok(None);
+    }
+    let cluster = cluster.as_ref().map(|value| &value["metadata"]["uid"]);
+    Ok(measured.map(|scrape| Observed {
+        scrape,
+        witnesses: json!({"cluster_uid":cluster,"boot_id":boot,"volume_group_uuid":group,"driver_pod_uid":pod["metadata"]["uid"],"driver_image":bound["image"]}),
+    }))
 }
 /// The driver a fleet patch installs: the release's `openebs-lvm` pin, else the locked chart's.
 pub fn driver_image(fleet: &Value) -> &str {
@@ -452,7 +486,8 @@ pub async fn sample(kube: &Kubernetes, node: &Value, driver: &str) -> Option<Val
     let physical = observe(kube, node, uid, driver, Instant::now())
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .map(|observed| observed.scrape.physical);
     let observed_at = timestamp().ok()?;
     let sample = json!({"node_uid":uid,"observed_at":observed_at,"physical":physical});
     Some(if schema_valid("NodeStorageSample", &sample) {
@@ -460,6 +495,200 @@ pub async fn sample(kube: &Kubernetes, node: &Value, driver: &str) -> Option<Val
     } else {
         json!({"node_uid":uid,"observed_at":observed_at,"physical":null})
     })
+}
+/// A headroom sample of one sampled node, without its nonce: one complete scrape and its
+/// witnesses (thin-authority-renewal.md, 4.1). None is an unknown reading; it is never posted.
+pub async fn headroom(kube: &Kubernetes, target: &Value, driver: &str) -> Option<Value> {
+    let started = Instant::now();
+    let captured_at = timestamp().ok()?;
+    let node = kube.read("Node", None, text(target, "name")).await.ok()??;
+    let observed = observe(kube, &node, text(target, "node_uid"), driver, started)
+        .await
+        .ok()??;
+    // A complete scrape lists exactly as many LV series as the exporter counts.
+    let count = observed.scrape.lvs.len();
+    let sample = json!({"nonce":null,"node_uid":target["node_uid"],"captured_at":captured_at,"physical":observed.scrape.physical,"lvs":observed.scrape.lvs,"lv_count":count,"witnesses":observed.witnesses,"scrape_milliseconds":started.elapsed().as_millis() as u64});
+    sample_valid(&sample).then_some(sample)
+}
+/// The headroom sample contract with the refinement JSON Schema cannot state: one complete
+/// scrape of the witnessed volume group.
+pub fn sample_valid(sample: &Value) -> bool {
+    schema_valid("NodeStorageHeadroomSample", sample)
+        && sample["lvs"].as_array().is_some_and(|lvs| {
+            Some(lvs.len() as u64) == sample["lv_count"].as_u64()
+                && lvs
+                    .iter()
+                    .map(|lv| text(lv, "name"))
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == lvs.len()
+        })
+        && sample["physical"]["volume_group_uuid"] == sample["witnesses"]["volume_group_uuid"]
+}
+/// What an accepted product sample renewed: the node's composed authority and the current write
+/// token of each of its thin databases (database ID to token) at that authority.
+#[derive(Debug)]
+pub struct Renewal {
+    pub node_uid: String,
+    pub revision: u64,
+    pub authority: Value,
+    pub tokens: HashMap<String, String>,
+}
+/// How one sample ended.
+#[derive(Debug)]
+pub enum Sampled {
+    /// The scrape was incomplete or an identity changed around it: nothing was posted.
+    Unknown,
+    /// Cloudflare refused the reading with this reason; only the next nonce changed.
+    Refused(String),
+    /// Cloudflare accepted the reading; a product sample also renewed its node.
+    Accepted(Option<Renewal>),
+}
+/// The fast loop's state for one `storage_samples` target: the nonce the next sample answers
+/// (none before Cloudflare's first answer) and the period Cloudflare asks for.
+pub struct Sampler {
+    target: Value,
+    driver: String,
+    nonce: Option<String>,
+    period: Duration,
+    /// How long the last complete scrape took.
+    scraped: Option<Duration>,
+}
+impl Sampler {
+    pub fn new(target: &Value, driver: &str) -> Option<Self> {
+        schema_valid("ThinStorageSampleTarget", target).then(|| Self {
+            target: target.clone(),
+            driver: driver.to_string(),
+            nonce: None,
+            period: Duration::from_millis(target["period_milliseconds"].as_u64().unwrap_or(0)),
+            scraped: None,
+        })
+    }
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+    /// Scrapes once and posts the reading with the last nonce. The scrape is bounded by two
+    /// periods, the post by the nonce's validity (guard / 2, 2.5 periods); a failed post keeps
+    /// the nonce. An accepted reply also sets the next period, a refused one only the nonce.
+    pub async fn sample(&mut self, kube: &Kubernetes, api: &ControlApi) -> Result<Sampled, Error> {
+        let started = Instant::now();
+        let scrape =
+            tokio::time::timeout(self.period * 2, headroom(kube, &self.target, &self.driver));
+        let Ok(Some(mut body)) = scrape.await else {
+            return Ok(Sampled::Unknown);
+        };
+        self.scraped = Some(started.elapsed());
+        body["nonce"] = self.nonce.clone().into();
+        let reply = tokio::time::timeout(
+            self.period * 5 / 2,
+            api.storage_headroom(text(&self.target, "node_id"), &body),
+        )
+        .await
+        .map_err(|_| "headroom sample deadline exceeded")??;
+        self.nonce = Some(text(&reply, "nonce").to_string());
+        if reply["accepted"] != true {
+            return Ok(Sampled::Refused(text(&reply, "reason").to_string()));
+        }
+        self.period = Duration::from_millis(reply["period_milliseconds"].as_u64().unwrap_or(0));
+        Ok(Sampled::Accepted(self.renewal(&reply)))
+    }
+    /// The renewal of an accepted product reply: this node's authority and the tokens that name a
+    /// database on this node. A qualification run's samples renew nothing.
+    fn renewal(&self, reply: &Value) -> Option<Renewal> {
+        let authority = &reply["authority"];
+        if !self.target["qualification_run"].is_null()
+            || authority.is_null()
+            || ["node_id", "name", "node_uid"]
+                .iter()
+                .any(|key| authority[*key] != self.target[*key])
+        {
+            return None;
+        }
+        let tokens = reply["tokens"]
+            .as_array()?
+            .iter()
+            .filter(|entry| {
+                storage_claims(text(entry, "token")).is_some_and(|claims| {
+                    claims["database_id"] == entry["database_id"]
+                        && claims["node_uid"] == self.target["node_uid"]
+                })
+            })
+            .map(|entry| {
+                (
+                    text(entry, "database_id").to_string(),
+                    text(entry, "token").to_string(),
+                )
+            })
+            .collect();
+        Some(Renewal {
+            node_uid: text(&self.target, "node_uid").to_string(),
+            revision: integer(authority, "revision").ok()?,
+            authority: authority.clone(),
+            tokens,
+        })
+    }
+}
+/// Samples one node until the controller stops it: one sample in flight, each scrape once the
+/// period has passed since the previous one started. A renewal reaches the controller first and
+/// then the gateway ledgers, never over a newer token. Reconcile and wake never wait for it.
+pub async fn sample_node(
+    kube: Kubernetes,
+    api: ControlApi,
+    mut sampler: Sampler,
+    renewals: mpsc::Sender<Renewal>,
+) {
+    let mut next = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep_until(next).await;
+        let started = tokio::time::Instant::now();
+        sampler.scraped = None;
+        let outcome = sampler.sample(&kube, &api).await;
+        let mut event = json!({"event":"thin_storage_sample","node_id":sampler.target["node_id"],"outcome":"failed","milliseconds":started.elapsed().as_millis() as u64,"scrape_milliseconds":sampler.scraped.map(|scraped| scraped.as_millis() as u64)});
+        match outcome {
+            Ok(Sampled::Unknown) => event["outcome"] = "unknown".into(),
+            Ok(Sampled::Refused(reason)) => {
+                event["outcome"] = "refused".into();
+                event["reason"] = reason.into();
+            }
+            Ok(Sampled::Accepted(renewal)) => {
+                event["outcome"] = "accepted".into();
+                if let Some(renewal) = renewal {
+                    let (revision, tokens) = (renewal.revision, renewal.tokens.clone());
+                    event["revision"] = revision.into();
+                    if renewals.send(renewal).await.is_err() {
+                        return;
+                    }
+                    event["ledgers"] = deliver(&kube, &tokens, revision, sampler.period * 2)
+                        .await
+                        .into();
+                }
+            }
+            Err(_) => {}
+        }
+        eprintln!("{event}");
+        next = started + sampler.period;
+    }
+}
+/// Writes each renewed token into its database's ledger, a few at a time and bounded as a whole;
+/// returns how many ledgers changed. A write cut off is superseded by the next renewal.
+async fn deliver(
+    kube: &Kubernetes,
+    tokens: &HashMap<String, String>,
+    revision: u64,
+    bound: Duration,
+) -> u64 {
+    let mut writes = futures_util::stream::iter(tokens.iter().map(|(id, token)| async move {
+        write_ledger(kube, &json!({ "id": id }), Some(token), Some(revision)).await
+    }))
+    .buffer_unordered(4);
+    let mut written = 0;
+    let _ = tokio::time::timeout(bound, async {
+        while let Some(result) = writes.next().await {
+            written += u64::from(matches!(result, Ok(true)));
+        }
+    })
+    .await;
+    written
 }
 /// Samples every Node once; the controller starts these slow scrapes at most every 60 seconds.
 pub async fn samples(kube: &Kubernetes, fleet: &Value) -> Result<HashMap<String, Value>, Error> {
@@ -476,7 +705,11 @@ pub async fn samples(kube: &Kubernetes, fleet: &Value) -> Result<HashMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_server::{Server, uid};
+    use crate::test_server::{Server, api_double, token, uid};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     #[test]
     fn typescript_exporter_conformance() {
         let vectors: Value = serde_json::from_str(include_str!(
@@ -535,7 +768,7 @@ mod tests {
     const WRAPPER: &str = "ghcr.io/example/pgcf-regional:lvm-thin-sha-0123456789ab@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     /// One customer Node whose OpenEBS driver runs the release-pinned wrapper image.
     fn cluster(server: &Server) -> Value {
-        let node = json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"customer","uid":uid(1)},"status":{"conditions":[{"type":"Ready","status":"True"}]}});
+        let node = json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"customer","uid":uid(1)},"status":{"conditions":[{"type":"Ready","status":"True"}],"nodeInfo":{"bootID":uid(8)}}});
         let owner = json!([{"apiVersion":"apps/v1","kind":"DaemonSet","name":"openebs-lvm-localpv-node","uid":uid(5),"controller":true}]);
         for object in [
             node.clone(),
@@ -587,5 +820,260 @@ mod tests {
         let sample = sample(&server.k8s, &node, WRAPPER).await.unwrap();
         assert_eq!(sample["node_uid"], uid(1));
         assert!(sample["physical"].is_null());
+    }
+    const NODE: &str = "nod_customer000000000000";
+    fn target(qualification: Value) -> Value {
+        // Periods of a second keep the scrape and post bounds above an emulated test build's latency.
+        json!({"node_id":NODE,"name":"customer","node_uid":uid(1),"period_milliseconds":1000,"qualification_run":qualification})
+    }
+    /// The node's composed authority as Cloudflare returns it with an accepted sample.
+    fn authority(revision: u64) -> Value {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/power-vectors.generated.json"
+        ))
+        .unwrap();
+        let mut authority = vectors["reclamation"][0]["nodes"][0].clone();
+        authority["node_id"] = NODE.into();
+        authority["name"] = "customer".into();
+        authority["node_uid"] = uid(1).into();
+        authority["revision"] = revision.into();
+        authority
+    }
+    fn reply(
+        accepted: bool,
+        nonce: char,
+        period: u64,
+        renewal: Option<(u64, Vec<Value>)>,
+    ) -> Value {
+        let (authority, tokens) = match renewal {
+            Some((revision, tokens)) => (authority(revision), tokens),
+            None => (Value::Null, vec![]),
+        };
+        json!({"accepted":accepted,"reason":if accepted {Value::Null} else {"thin_storage_sample_nonce_invalid".into()},"nonce":nonce.to_string().repeat(32),"period_milliseconds":period,"authority":authority,"tokens":tokens})
+    }
+    fn nonces(requests: &crate::test_server::Requests) -> Vec<Value> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, body)| {
+                assert_eq!(path, &format!("/agent/v1/nodes/{NODE}/storage-headroom"));
+                body["nonce"].clone()
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn a_headroom_sample_binds_one_complete_scrape_to_its_witnesses() {
+        let server = Server::start().await;
+        cluster(&server);
+        let sample = headroom(&server.k8s, &target(Value::Null), WRAPPER)
+            .await
+            .unwrap();
+        assert_eq!(
+            sample["witnesses"],
+            json!({"cluster_uid":uid(2),"boot_id":uid(8),"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","driver_pod_uid":uid(6),"driver_image":WRAPPER})
+        );
+        assert_eq!(
+            (&sample["lvs"], &sample["lv_count"], &sample["nonce"]),
+            (
+                &json!([{"name":"pvc-a","segtype":"linear","size_bytes":3000}]),
+                &json!(1),
+                &Value::Null
+            )
+        );
+        // A reboot between the two identity reads leaves no reading.
+        server.state.lock().unwrap().during_text = Some(Box::new(|objects| {
+            objects.get_mut("/api/v1/nodes/customer").unwrap()["status"]["nodeInfo"]["bootID"] =
+                uid(9).into();
+        }));
+        assert!(
+            headroom(&server.k8s, &target(Value::Null), WRAPPER)
+                .await
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn each_sample_answers_the_last_nonce_and_a_refusal_changes_only_the_nonce() {
+        let server = Server::start().await;
+        cluster(&server);
+        let database = "db000000000000000001";
+        let renewed = token(database, 3, &uid(1), 7, 10_000);
+        let foreign = token("db000000000000000002", 3, &uid(99), 7, 10_000);
+        let tokens = vec![
+            json!({"database_id":database,"token":renewed}),
+            json!({"database_id":"db000000000000000002","token":foreign}),
+        ];
+        let (api, requests) = api_double(move |_, body| match body["nonce"].as_str() {
+            None => (200, reply(false, 'a', 400, None)),
+            Some(nonce) if nonce.starts_with('a') => {
+                (200, reply(true, 'b', 1500, Some((7, tokens.clone()))))
+            }
+            Some(_) => (200, reply(false, 'c', 900, None)),
+        })
+        .await;
+        let mut sampler = Sampler::new(&target(Value::Null), WRAPPER).unwrap();
+        assert!(matches!(
+            sampler.sample(&server.k8s, &api).await.unwrap(),
+            Sampled::Refused(reason) if reason == "thin_storage_sample_nonce_invalid"
+        ));
+        assert_eq!(sampler.period(), Duration::from_millis(1000));
+        let Sampled::Accepted(Some(renewal)) = sampler.sample(&server.k8s, &api).await.unwrap()
+        else {
+            panic!("an accepted product sample renews its node");
+        };
+        assert_eq!(
+            (renewal.node_uid.as_str(), renewal.revision),
+            (uid(1).as_str(), 7)
+        );
+        assert_eq!(renewal.authority, authority(7));
+        // Only tokens of this node's databases are delivered.
+        assert_eq!(
+            renewal.tokens,
+            HashMap::from([(database.to_string(), renewed)])
+        );
+        assert_eq!(sampler.period(), Duration::from_millis(1500));
+        assert!(matches!(
+            sampler.sample(&server.k8s, &api).await.unwrap(),
+            Sampled::Refused(_)
+        ));
+        assert_eq!(sampler.period(), Duration::from_millis(1500));
+        assert_eq!(
+            nonces(&requests),
+            [Value::Null, "a".repeat(32).into(), "b".repeat(32).into()]
+        );
+    }
+    #[tokio::test]
+    async fn a_qualification_run_samples_the_same_way_and_renews_nothing() {
+        let server = Server::start().await;
+        cluster(&server);
+        let (api, requests) = api_double(|_, body| {
+            if body["nonce"].is_null() {
+                (200, reply(true, 'a', 1000, None))
+            } else {
+                (200, reply(true, 'b', 1000, Some((7, vec![]))))
+            }
+        })
+        .await;
+        let mut sampler =
+            Sampler::new(&target(format!("op_{}", "q".repeat(20)).into()), WRAPPER).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                sampler.sample(&server.k8s, &api).await.unwrap(),
+                Sampled::Accepted(None)
+            ));
+        }
+        assert_eq!(nonces(&requests), [Value::Null, "a".repeat(32).into()]);
+    }
+    #[tokio::test]
+    async fn an_unknown_scrape_posts_nothing_and_a_stalled_post_keeps_the_nonce() {
+        let server = Server::start().await;
+        cluster(&server);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let (api, requests) = api_double(move |_, _| {
+            match counted.fetch_add(1, Ordering::SeqCst) {
+                0 => (200, reply(false, 'a', 1000, None)),
+                // The second post never gets an answer.
+                1 => (0, Value::Null),
+                _ => (200, reply(false, 'b', 1000, None)),
+            }
+        })
+        .await;
+        let mut sampler = Sampler::new(&target(Value::Null), WRAPPER).unwrap();
+        sampler.sample(&server.k8s, &api).await.unwrap();
+        let stalled = Instant::now();
+        assert!(sampler.sample(&server.k8s, &api).await.is_err());
+        // Bounded by the nonce's validity, 2.5 periods.
+        assert!(stalled.elapsed() < Duration::from_secs(4));
+        sampler.sample(&server.k8s, &api).await.unwrap();
+        // The exporter lost its LV series: nothing is posted.
+        let metrics =
+            "/api/v1/namespaces/openebs/pods/openebs-lvm-localpv-node-x:9500/proxy/metrics";
+        let lost = server.state.lock().unwrap().texts[metrics]
+            .lines()
+            .filter(|line| !line.starts_with("lvm_lv_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        server
+            .state
+            .lock()
+            .unwrap()
+            .texts
+            .insert(metrics.into(), lost);
+        assert!(matches!(
+            sampler.sample(&server.k8s, &api).await.unwrap(),
+            Sampled::Unknown
+        ));
+        let a = Value::from("a".repeat(32));
+        assert_eq!(nonces(&requests), [Value::Null, a.clone(), a]);
+    }
+    #[tokio::test]
+    async fn the_loop_hands_each_renewal_to_the_controller_and_then_the_ledger() {
+        let server = Server::start().await;
+        cluster(&server);
+        let database = "db000000000000000001";
+        let soon =
+            (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as u64 + 60_000;
+        let (older, renewed) = (
+            token(database, 3, &uid(1), 3, soon),
+            token(database, 3, &uid(1), 7, soon),
+        );
+        server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{database}"),"namespace":"pgcf-system","uid":uid(40),"labels":{"pgcf.io/database-id":database}},"data":{"state":"{}","write-authority":older}}));
+        let token = renewed.clone();
+        let (api, requests) = api_double(move |_, body| match body["nonce"].as_str() {
+            None => (200, reply(false, 'a', 1000, None)),
+            Some(_) => (
+                200,
+                reply(
+                    true,
+                    'b',
+                    1000,
+                    Some((7, vec![json!({"database_id":database,"token":token})])),
+                ),
+            ),
+        })
+        .await;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let sampler = Sampler::new(&target(Value::Null), WRAPPER).unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let task =
+                    tokio::task::spawn_local(sample_node(server.k8s.clone(), api, sampler, sender));
+                let renewal = receiver.recv().await.unwrap();
+                assert_eq!(renewal.revision, 7);
+                let ledger = || {
+                    server
+                        .get(
+                            "ConfigMap",
+                            Some("pgcf-system"),
+                            &format!("storage-{database}"),
+                        )
+                        .unwrap()["data"]["write-authority"]
+                        .clone()
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ledger() != renewed && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(ledger(), renewed);
+                // A later renewal of the same revision rewrites nothing.
+                receiver.recv().await.unwrap();
+                task.abort();
+            })
+            .await;
+        let sent = nonces(&requests);
+        assert_eq!(sent[..2], [Value::Null, "a".repeat(32).into()]);
+        assert_eq!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .filter(|(method, _, _)| method == "PATCH")
+                .count(),
+            1
+        );
     }
 }
