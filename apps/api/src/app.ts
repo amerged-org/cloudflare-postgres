@@ -3,7 +3,7 @@ import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { ERROR_HTTP_STATUS, errorBody, type ErrorCode } from "@pgcf/contracts";
 import { HTTPException } from "hono/http-exception";
 import { routePath } from "hono/route";
-import { version } from "../package.json";
+import { registerApiDocuments } from "./openapi.ts";
 import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
 import { registerPlatform } from "./routes/platform.ts";
@@ -455,27 +455,7 @@ export function createApp(): ApiApp {
   registerFleetUpdates(app);
   registerResourceProfiles(app);
   registerRegionArchiveSources(app);
-  app.doc31("/v1/openapi.json", {
-    openapi: "3.1.0",
-    info: { title: "PGCF API", version },
-    tags: [
-      {
-        name: "Nodes",
-        description:
-          "Node additions and per-region capacity policies. Infrastructure alert thresholds are part of GET/PUT /v1/regions/{id}/capacity-policy.",
-      },
-      {
-        name: "Infrastructure",
-        description:
-          "Daily infrastructure backups and infrastructure alert delivery by email through Resend or by an authenticated webhook (see PUT /v1/infrastructure-backups/config).",
-      },
-      {
-        name: "Health",
-        description:
-          "Measured health with explicit unknown states and the status of infrastructure alert episodes (GET /v1/operational-health?scope=regions).",
-      },
-    ],
-  });
+  registerApiDocuments(app);
   app.notFound((c) => apiError(c, "not_found", "Route not found"));
   return app;
 }

@@ -4,6 +4,7 @@ flowchart LR
     n_aa93ed8be291["Workflow<br/>THIN_QUALIFICATION<br/>name: pgcf-thin-qualification<br/>class_name: ThinQualification"]
     n_049ba2d64372["Workflow<br/>PATCH_NODE<br/>name: pgcf-patch-node<br/>class_name: PatchNode"]
     n_36ffcdc5f79f["Workflow<br/>INFRASTRUCTURE_BACKUP<br/>name: pgcf-infrastructure-backup<br/>class_name: InfrastructureBackup"]
+    n_85c654928d8c["version_metadata<br/>CF_VERSION_METADATA"]
     n_0775d02dbb64["Workflow<br/>ADD_NODE<br/>name: pgcf-add-node<br/>class_name: AddNode"]
     n_71083a5197e9["R2 bucket<br/>ARCHIVE<br/>bucket_name:<br/>replace-r2-backup-bucket"]
     n_12eaf448c6b2["R2 bucket<br/>ARCHIVE_US<br/>bucket_name:<br/>replace-r2-us-backup-bucket"]
@@ -22,6 +23,7 @@ flowchart LR
     n_7a30182df25a --> n_049ba2d64372
     n_7a30182df25a --> n_d0efe52f1f47
     n_7a30182df25a --> n_71083a5197e9
+    n_7a30182df25a --> n_85c654928d8c
     n_7a30182df25a --> n_926733166afd
     n_7a30182df25a --> n_056b63fe76be
     n_7a30182df25a --> n_12eaf448c6b2

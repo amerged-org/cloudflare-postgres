@@ -241,13 +241,12 @@ describe("API harness in the Workers runtime", () => {
     expect(ErrorBody.parse(await invalid.json()).error.code).toBe(
       "invalid_request",
     );
-    const documentResponse = await app.fetch(request("/v1/openapi.json"), env);
-    const document = await documentResponse.json<{
-      components: { schemas: Record<string, unknown> };
-      paths: Record<string, unknown>;
-    }>();
-    expect(document.components.schemas.ProjectCreate).toBeDefined();
-    expect(JSON.stringify(document.paths["/test/projects"])).toContain(
+    const document = app.getOpenAPI31Document({
+      openapi: "3.1.0",
+      info: { title: "Test registration", version: env.CF_VERSION_METADATA.id },
+    });
+    expect(document.components?.schemas?.ProjectCreate).toBeDefined();
+    expect(JSON.stringify(document.paths?.["/test/projects"])).toContain(
       "#/components/schemas/ProjectCreate",
     );
   });

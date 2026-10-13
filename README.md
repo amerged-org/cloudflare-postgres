@@ -254,7 +254,14 @@ customer EU1. Each further region adds one control server and customer workers f
 [delivery architecture](docs/architecture/cloudflare-convergence-and-serverless-plan.md#delivery-architecture).
 Public-release installation polish follows separately; see [ULTRA execution plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#open).
 
-The API reference is generated at `/v1/openapi.json` from the shared contracts. Operator runbooks
+The management API reference is generated at `/v1/openapi.json` from the shared contracts,
+including the public raw fleet-image GET/HEAD service. Regional agent operations are published
+at `/agent/v1/openapi.json`; operation callbacks and relays are published at
+`/internal/v1/openapi.json`. Each document contains only its interface and referenced schemas.
+Their `info.version` is the request-serving Worker's version ID; `info.x-worker-version` also
+includes its tag and timestamp. Configure the `CF_VERSION_METADATA` version metadata binding
+shown in the example Worker configuration. If it is missing, reference requests return an
+explicit internal error rather than a made-up version. Operator runbooks
 cover [installation](docs/operations/operator-installation.md), [recovery](docs/operations/recovery.md)
 and [credential changes](docs/operations/credentials.md).
 

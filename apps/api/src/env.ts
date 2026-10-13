@@ -3,6 +3,7 @@ import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
 
 export type Env = Cloudflare.Env & {
+  CF_VERSION_METADATA: WorkerVersionMetadata;
   PATCH_NODE: Workflow<{ operation_id: string }>;
   THIN_QUALIFICATION: Workflow<{ run_id: string }>;
   INFRASTRUCTURE_BACKUP?: Workflow<{ run_id: string }>;
