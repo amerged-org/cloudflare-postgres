@@ -7,7 +7,11 @@ use crate::{
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, Method, Url};
 use serde_json::{Value, json};
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 #[derive(Clone)]
 enum AgentKey {
     File(PathBuf),
@@ -25,6 +29,69 @@ pub struct DesiredSnapshot {
     pub region: Value,
     pub fleet_release: Value,
     pub databases: Vec<Value>,
+}
+/// Region configuration and fleet identity stay fixed throughout a pull. Node readings may
+/// advance between pages: keep the greatest revision of each same node, never merge away an
+/// omitted authority (which can revoke writing) or hide a changed configuration.
+fn merge_page_authority(snapshot: &mut DesiredSnapshot, page: &Value) -> Result<(), Error> {
+    let mut held = snapshot.region.clone();
+    let mut candidate = page["region"].clone();
+    held.as_object_mut()
+        .ok_or("desired region invalid")?
+        .remove("storage_nodes");
+    candidate
+        .as_object_mut()
+        .ok_or("desired region invalid")?
+        .remove("storage_nodes");
+    if held != candidate || snapshot.fleet_release != page["fleet_release"] {
+        return Err("desired configuration changed across reads".into());
+    }
+    let nodes = |region: &Value| -> Result<BTreeMap<String, Value>, Error> {
+        let mut nodes = BTreeMap::new();
+        if let Some(rows) = region["storage_nodes"].as_array() {
+            for row in rows {
+                if nodes
+                    .insert(text(row, "node_uid").to_string(), row.clone())
+                    .is_some()
+                {
+                    return Err("duplicate desired node authority".into());
+                }
+            }
+        }
+        Ok(nodes)
+    };
+    let mut held = nodes(&snapshot.region)?;
+    let candidate = nodes(&page["region"])?;
+    if held.keys().ne(candidate.keys()) {
+        return Err("desired node authority membership changed across reads".into());
+    }
+    for (uid, row) in candidate {
+        let current = held
+            .get_mut(&uid)
+            .ok_or("desired node authority disappeared")?;
+        if ["node_id", "name"]
+            .iter()
+            .any(|key| current[*key] != row[*key])
+        {
+            return Err("desired node authority identity changed across reads".into());
+        }
+        let (old, new) = (
+            crate::contracts::integer(current, "revision")?,
+            crate::contracts::integer(&row, "revision")?,
+        );
+        if old == new && *current != row {
+            return Err("desired node authority revision changed across reads".into());
+        }
+        if new > old {
+            *current = row;
+        }
+    }
+    if snapshot.region.get("storage_nodes").is_some()
+        || page["region"].get("storage_nodes").is_some()
+    {
+        snapshot.region["storage_nodes"] = held.into_values().collect::<Vec<_>>().into();
+    }
+    Ok(())
 }
 pub fn timestamp() -> Result<String, Error> {
     let now = time::OffsetDateTime::now_utc();
@@ -298,11 +365,7 @@ impl ControlApi {
                         fleet_release: page["fleet_release"].clone(),
                         databases: vec![],
                     });
-                    if state.region != page["region"]
-                        || state.fleet_release != page["fleet_release"]
-                    {
-                        return Err("desired authority changed across hint reads".into());
-                    }
+                    merge_page_authority(state, &page)?;
                     if let Some(db) = page["databases"]
                         .as_array()
                         .and_then(|rows| rows.first())
@@ -323,9 +386,7 @@ impl ControlApi {
                     fleet_release: page["fleet_release"].clone(),
                     databases: vec![],
                 });
-                if state.region != page["region"] || state.fleet_release != page["fleet_release"] {
-                    return Err("desired authority changed across pages".into());
-                }
+                merge_page_authority(state, &page)?;
                 for db in page["databases"].as_array().ok_or("desired rows invalid")? {
                     if !seen.insert(text(db, "id").to_string()) {
                         return Err("duplicate desired database".into());
@@ -425,6 +486,77 @@ fn legacy_report(envelope: &Value) -> Result<Value, Error> {
 mod tests {
     use super::*;
     use crate::test_server::{Requests, api_double};
+    /// Authority readings are mutable while one desired pull pages through a stable region.
+    fn desired_page(revision: u64, next: Value) -> Value {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/power-vectors.generated.json"
+        ))
+        .unwrap();
+        let mut authority = vectors["reclamation"][0]["nodes"][0].clone();
+        authority["revision"] = revision.into();
+        json!({"region":{"id":"eu-test","backup":{"bucket":"pgcf-backups","endpoint_url":"https://r2.example.test","region":"auto"},"storage_nodes":[authority]},"databases":[],"next":next})
+    }
+    #[tokio::test]
+    async fn a_renewal_between_desired_pages_keeps_the_newest_node_authority() {
+        let (api, requests) = api_double(|path, _| {
+            if path.contains("after=") {
+                (200, desired_page(8, Value::Null))
+            } else {
+                (200, desired_page(7, "a0000000000000000001".into()))
+            }
+        })
+        .await;
+        let snapshot = api.desired(None).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(snapshot.region["storage_nodes"][0]["revision"], 8);
+    }
+    #[tokio::test]
+    async fn a_renewal_between_hinted_reads_never_regresses_the_node_authority() {
+        let (api, requests) = api_double(|path, _| {
+            let revision = if path.contains("after=a0000000000000000001") {
+                8
+            } else {
+                7
+            };
+            (200, desired_page(revision, Value::Null))
+        })
+        .await;
+        let snapshot = api
+            .desired(Some(&[
+                "a0000000000000000001".into(),
+                "a0000000000000000002".into(),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(snapshot.region["storage_nodes"][0]["revision"], 8);
+    }
+    #[tokio::test]
+    async fn mutable_authority_never_hides_a_region_configuration_or_membership_change() {
+        for membership in [false, true] {
+            let (api, _) = api_double(move |path, _| {
+                let mut page = desired_page(
+                    7,
+                    if path.contains("after=") {
+                        Value::Null
+                    } else {
+                        "a0000000000000000001".into()
+                    },
+                );
+                if path.contains("after=") {
+                    if membership {
+                        page["region"]["storage_nodes"] = json!([]);
+                    } else {
+                        page["region"]["backup"]["endpoint_url"] =
+                            "https://changed.example.test".into();
+                    }
+                }
+                (200, page)
+            })
+            .await;
+            assert!(api.desired(None).await.is_err());
+        }
+    }
     #[test]
     fn exact_target_lookup_never_broadens_a_wake_into_a_fleet_scan() {
         assert_eq!(predecessor("a0000000000000000000").unwrap(), None);

@@ -166,11 +166,56 @@ fn apply_snapshot(
 struct Renewals {
     nodes: HashMap<String, (u64, Value)>,
     tokens: HashMap<String, String>,
+    /// The newest regional snapshot fences even cells retained from an earlier hinted pull.
+    targets: Option<HashMap<String, Value>>,
+    listed: HashMap<String, Value>,
 }
 impl Renewals {
+    fn sync_targets(&mut self, snapshot: &DesiredSnapshot, wanted: &HashMap<String, Value>) {
+        let targets: HashMap<_, _> = wanted
+            .values()
+            .filter(|source| source["target"]["qualification_run"].is_null())
+            .map(|source| {
+                (
+                    text(&source["target"], "node_uid").to_string(),
+                    source.clone(),
+                )
+            })
+            .collect();
+        let unchanged = |uid: &str| {
+            targets.get(uid).is_some_and(|source| {
+                self.targets
+                    .as_ref()
+                    .is_none_or(|held| held.get(uid) == Some(source))
+            })
+        };
+        self.nodes.retain(|uid, _| unchanged(uid));
+        self.tokens.retain(|_, token| {
+            storage_claims(token).is_some_and(|claims| unchanged(text(&claims, "node_uid")))
+        });
+        self.targets = Some(targets);
+        self.listed = snapshot.region["storage_nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| (text(row, "node_uid").to_string(), row.clone()))
+            .collect();
+    }
+    fn sampled(&self, db: &Value) -> bool {
+        self.targets
+            .as_ref()
+            .is_none_or(|targets| targets.contains_key(text(&db["storage"], "node_uid")))
+    }
     /// Keeps a renewal only over an older one of its node and each of its tokens only over an
     /// older one of its database; tokens that expired by `clock` (ms) are dropped.
     fn accept(&mut self, renewal: Renewal, clock: i128) -> bool {
+        if self
+            .targets
+            .as_ref()
+            .is_some_and(|targets| !targets.contains_key(&renewal.node_uid))
+        {
+            return false;
+        }
         if self
             .nodes
             .get(&renewal.node_uid)
@@ -193,24 +238,38 @@ impl Renewals {
         });
         true
     }
-    fn listed<'a>(db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
+    fn snapshot_listed<'a>(db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
         snapshot.region["storage_nodes"]
             .as_array()?
             .iter()
             .find(|row| row["node_uid"] == db["storage"]["node_uid"])
     }
+    fn listed<'a>(&'a self, db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
+        if self.targets.is_some() {
+            self.listed.get(text(&db["storage"], "node_uid"))
+        } else {
+            Self::snapshot_listed(db, snapshot)
+        }
+    }
     /// The renewed authority of the database's thin node when it is newer than the snapshot's.
     fn renewed(&self, db: &Value, snapshot: &DesiredSnapshot) -> Option<&Value> {
+        if !self.sampled(db) {
+            return None;
+        }
         let (revision, authority) = self.nodes.get(db["storage"]["node_uid"].as_str()?)?;
-        let listed = Self::listed(db, snapshot)
+        let listed = self
+            .listed(db, snapshot)
             .and_then(|listed| integer(listed, "revision").ok())
             .is_some_and(|listed| listed >= *revision);
         (!listed).then_some(authority)
     }
     /// The authority the database's thin node currently holds.
     fn authority<'a>(&'a self, db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
+        if !self.sampled(db) {
+            return None;
+        }
         self.renewed(db, snapshot)
-            .or_else(|| Self::listed(db, snapshot))
+            .or_else(|| self.listed(db, snapshot))
     }
     /// The newest write token of the database's current generation on its node.
     fn token<'a>(&'a self, db: &'a Value) -> Option<&'a str> {
@@ -236,16 +295,19 @@ impl Renewals {
         if let Some(token) = self.token(db) {
             view["storage_authority"] = token.into();
         }
-        let Some(authority) = self.renewed(db, snapshot) else {
+        let authority = self.authority(db, snapshot);
+        if authority == Self::snapshot_listed(db, snapshot) {
             return (view, snapshot.clone());
-        };
+        }
         let mut region = snapshot.region.clone();
         let mut nodes = region["storage_nodes"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        nodes.retain(|row| row["node_uid"] != authority["node_uid"]);
-        nodes.push(authority.clone());
+        nodes.retain(|row| row["node_uid"] != db["storage"]["node_uid"]);
+        if let Some(authority) = authority {
+            nodes.push(authority.clone());
+        }
         region["storage_nodes"] = nodes.into();
         let snapshot = DesiredSnapshot {
             region,
@@ -462,6 +524,8 @@ struct Sampling {
     started_for: Value,
     task: tokio::task::Id,
     abort: AbortHandle,
+    /// Dropping a removed or replaced sampler also drops every reply it already queued.
+    replies: mpsc::Receiver<Renewal>,
 }
 /// What each sampled node's sampler is started for: its `storage_samples` target and the
 /// release's driver. Any change starts a new sampler, which asks Cloudflare for a fresh nonce.
@@ -484,16 +548,11 @@ fn sync_samplers(
     samplers: &mut HashMap<String, Sampling>,
     tasks: &mut JoinSet<()>,
     snapshot: &DesiredSnapshot,
-    (kube, api, renewals): (&Kubernetes, &ControlApi, &mpsc::Sender<Renewal>),
+    (kube, api, renewals): (&Kubernetes, &ControlApi, &mut Renewals),
 ) {
     let wanted = sampler_targets(snapshot);
-    samplers.retain(|node, running| {
-        let keep = wanted.get(node) == Some(&running.started_for);
-        if !keep {
-            running.abort.abort();
-        }
-        keep
-    });
+    renewals.sync_targets(snapshot, &wanted);
+    retain_samplers(samplers, &wanted);
     for (node, started_for) in wanted {
         if samplers.contains_key(&node) {
             continue;
@@ -502,20 +561,35 @@ fn sync_samplers(
         else {
             continue;
         };
-        let abort = tasks.spawn_local(sample_node(
-            kube.clone(),
-            api.clone(),
-            sampler,
-            renewals.clone(),
-        ));
+        let (sender, replies) = mpsc::channel(1);
+        let abort = tasks.spawn_local(sample_node(kube.clone(), api.clone(), sampler, sender));
         samplers.insert(
             node,
             Sampling {
                 started_for,
                 task: abort.id(),
                 abort,
+                replies,
             },
         );
+    }
+}
+fn retain_samplers(samplers: &mut HashMap<String, Sampling>, wanted: &HashMap<String, Value>) {
+    samplers.retain(|node, running| {
+        let keep = wanted.get(node) == Some(&running.started_for);
+        if !keep {
+            running.abort.abort();
+        }
+        keep
+    });
+}
+fn poll_renewals(samplers: &mut HashMap<String, Sampling>, renewals: &mut Renewals, clock: i128) {
+    for sampling in samplers.values_mut() {
+        while let Ok(renewal) = sampling.replies.try_recv() {
+            if renewal.node_uid == text(&sampling.started_for["target"], "node_uid") {
+                renewals.accept(renewal, clock);
+            }
+        }
     }
 }
 fn manifest() -> Result<Value, Error> {
@@ -662,7 +736,6 @@ async fn run() -> Result<(), Error> {
     let mut storage: HashMap<String, Value> = HashMap::new();
     let mut storage_sampling: JoinSet<Result<HashMap<String, Value>, Error>> = JoinSet::new();
     let mut renewals = Renewals::default();
-    let (renewal_sender, mut renewal_receiver) = mpsc::channel::<Renewal>(64);
     let mut samplers: HashMap<String, Sampling> = HashMap::new();
     let mut sampling: JoinSet<()> = JoinSet::new();
     let mut meter_interval = tokio::time::interval(Duration::from_millis(250));
@@ -731,11 +804,6 @@ async fn run() -> Result<(), Error> {
                     _ => eprintln!("{{\"event\":\"node_storage_sample_failed\"}}"),
                 }
             },
-            renewal = renewal_receiver.recv() => {
-                if let Some(renewal) = renewal {
-                    renewals.accept(renewal, clock_ms());
-                }
-            },
             result = sampling.join_next_with_id(), if !sampling.is_empty() => {
                 // A sampler ends only when replaced or by failing; a failed one starts again.
                 let ended = match result {
@@ -745,7 +813,7 @@ async fn run() -> Result<(), Error> {
                 };
                 samplers.retain(|_, running| Some(running.task) != ended);
                 if let Some((_, snapshot)) = &latest_snapshot {
-                    sync_samplers(&mut samplers, &mut sampling, snapshot, (&kube, &api, &renewal_sender));
+                    sync_samplers(&mut samplers, &mut sampling, snapshot, (&kube, &api, &mut renewals));
                 }
             },
             _ = full.tick() => {
@@ -782,7 +850,7 @@ async fn run() -> Result<(), Error> {
                             if is_full { control_healthy = true; have_full_snapshot = true; }
                             if latest_snapshot.as_ref().is_none_or(|(at,_)|pulled_at>=*at) {
                                 let latest = Arc::new(snapshot.clone());
-                                sync_samplers(&mut samplers, &mut sampling, &latest, (&kube, &api, &renewal_sender));
+                                sync_samplers(&mut samplers, &mut sampling, &latest, (&kube, &api, &mut renewals));
                                 latest_snapshot=Some((pulled_at,latest));
                             }
                             apply_snapshot(&mut cells, &active, &renewals, snapshot, requested.as_deref(), pulled_at)?;
@@ -833,6 +901,7 @@ async fn run() -> Result<(), Error> {
             },
             _ = cadence.tick() => {}
         }
+        poll_renewals(&mut samplers, &mut renewals, clock_ms());
 
         if !pull_ids.is_empty() && pulls.len() < 4 {
             let ids: Vec<_> = pull_ids.iter().take(200).cloned().collect();
@@ -1337,6 +1406,100 @@ mod tests {
         // Expired tokens leave the cache with the next renewal.
         renewals.accept(renewal(6, true, "1970-01-01T00:00:20.000Z", &[]), 10_000);
         assert!(renewals.tokens.is_empty());
+    }
+    #[test]
+    fn an_omitted_sampling_target_revokes_cached_authority_and_tokens() {
+        let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_authority":token(3,2,2000)});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":NODE,"revision":2,"write_allowed":true,"expires_at":"1970-01-01T00:00:02.000Z"}]});
+        state.region["storage_samples"] = json!([sampling_target()]);
+        let older = state.clone();
+        let mut renewals = Renewals::default();
+        renewals.sync_targets(&state, &sampler_targets(&state));
+        renewals.accept(
+            renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
+            0,
+        );
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        state.region["storage_nodes"] = json!([]);
+        state.region["storage_samples"] = json!([]);
+        renewals.sync_targets(&state, &sampler_targets(&state));
+        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(storage_protection_due(&db, &older, &renewals, 1000));
+        assert!(renewals.nodes.is_empty());
+        assert!(renewals.tokens.is_empty());
+        let (_, effective) = renewals.effective(&db, &Arc::new(state));
+        assert_eq!(effective.region["storage_nodes"], json!([]));
+    }
+    fn sampling_target() -> Value {
+        json!({"node_id":format!("nod_{}", "x".repeat(20)),"node_uid":NODE,"name":"customer-node","period_milliseconds":2000,"qualification_run":null})
+    }
+    #[test]
+    fn a_current_sampler_recovers_when_expired_authority_is_absent_from_desired() {
+        let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_authority":null});
+        let mut state = snapshot(vec![]);
+        state.region["storage_samples"] = json!([sampling_target()]);
+        let mut renewals = Renewals::default();
+        renewals.sync_targets(&state, &sampler_targets(&state));
+        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(renewals.accept(
+            renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
+            5000,
+        ));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        let (_, effective) = renewals.effective(&db, &Arc::new(state));
+        assert_eq!(effective.region["storage_nodes"][0]["revision"], 4);
+    }
+    #[tokio::test]
+    async fn replacing_a_sampler_drops_its_queued_reply_before_it_can_restore_authority() {
+        let mut state = snapshot(vec![]);
+        state.region["storage_samples"] = json!([sampling_target()]);
+        let wanted = sampler_targets(&state);
+        let (node, source) = wanted.iter().next().unwrap();
+        let (sender, replies) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut samplers = HashMap::from([(
+            node.clone(),
+            Sampling {
+                started_for: source.clone(),
+                task: task.id(),
+                abort: task.abort_handle(),
+                replies,
+            },
+        )]);
+        let mut renewals = Renewals::default();
+        renewals.sync_targets(&state, &wanted);
+        sender
+            .send(renewal(
+                4,
+                true,
+                "1970-01-01T00:00:10.000Z",
+                &[token(3, 4, 10_000)],
+            ))
+            .await
+            .unwrap();
+        poll_renewals(&mut samplers, &mut renewals, 0);
+        assert!(!renewals.nodes.is_empty());
+        sender
+            .send(renewal(
+                5,
+                true,
+                "1970-01-01T00:00:12.000Z",
+                &[token(3, 5, 12_000)],
+            ))
+            .await
+            .unwrap();
+        // A changed period represents a new sampling target, even with the same Node UID.
+        state.region["storage_samples"][0]["period_milliseconds"] = 4000.into();
+        let replacement = sampler_targets(&state);
+        renewals.sync_targets(&state, &replacement);
+        retain_samplers(&mut samplers, &replacement);
+        poll_renewals(&mut samplers, &mut renewals, 0);
+        assert!(sender.is_closed());
+        assert!(samplers.is_empty());
+        assert!(renewals.nodes.is_empty());
+        assert!(renewals.tokens.is_empty());
+        assert!(task.await.unwrap_err().is_cancelled());
     }
     #[test]
     fn jobs_run_on_the_newest_token_and_node_authority() {
