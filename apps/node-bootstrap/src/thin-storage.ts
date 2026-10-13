@@ -869,8 +869,21 @@ export async function verifyThinNode(
         c.name === "openebs-lvm-plugin" &&
         (scope.driver_image === null || c.image === scope.driver_image),
     );
+  const driverOwner = (p: ObjectValue) => {
+    const owners = items(metadata(p).ownerReferences).filter(
+      (owner) => owner.controller === true,
+    );
+    return owners.length === 1 && owners[0]!.kind === "DaemonSet"
+      ? owners[0]
+      : undefined;
+  };
   const driverPods = items(pods.items).filter(
-    (p) => object(p.spec).nodeName === scope.name && plugin(p) && ready(p),
+    (p) =>
+      object(p.spec).nodeName === scope.name &&
+      plugin(p) &&
+      ready(p) &&
+      !metadata(p).deletionTimestamp &&
+      driverOwner(p),
   );
   if (driverPods.length !== 1)
     throw new BootstrapError("thin_storage_driver_ambiguous");
@@ -878,12 +891,7 @@ export async function verifyThinNode(
     driverImage = text(plugin(driver)!.image),
     podName = text(metadata(driver).name),
     driverUid = uid(metadata(driver).uid);
-  const owners = items(metadata(driver).ownerReferences).filter(
-    (v) => v.kind === "DaemonSet" && v.controller === true,
-  );
-  if (owners.length !== 1)
-    throw new BootstrapError("thin_storage_driver_owner_changed");
-  const owner = owners[0]!,
+  const owner = driverOwner(driver)!,
     ds = await get(["daemonset", text(owner.name), "--namespace", "openebs"]);
   if (
     uid(owner.uid) !== uid(metadata(ds).uid) ||

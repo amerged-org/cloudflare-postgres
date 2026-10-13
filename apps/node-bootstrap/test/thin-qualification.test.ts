@@ -36,6 +36,76 @@ const vg = "Rq3Vb8-xYzA-1bCd-2eFg-3hIj-4kLm-5nOpQr",
   pool = "Tp7Kq2-AbCd-EfGh-IjKl-MnOp-QrSt-UvWxYz",
   volume = "Lv9Zx1-QwEr-TyUi-OpAs-DfGh-JkLz-XcVbNm";
 
+test("a colocated Ready ReplicaSet with the same OpenEBS plugin image is not a node driver", async () => {
+  const run = thinQualificationRun("cleanup");
+  run.world.driverPods = (driver) => {
+    const controller = structuredClone(driver);
+    controller.metadata.name = "openebs-lvm-controller-colocated";
+    controller.metadata.uid = randomUUID();
+    controller.metadata.ownerReferences[0] = {
+      kind: "ReplicaSet",
+      controller: true,
+      name: "openebs-lvm-controller",
+      uid: randomUUID(),
+    };
+    return [controller, driver];
+  };
+  assert.deepEqual(await run.turn(), { kind: "report" });
+  assert.ok(
+    thinQualificationCleanupVerified(
+      (run.calls[0]!.report as { cleanup: ThinQualificationCleanup }).cleanup,
+    ),
+  );
+});
+
+test("two genuine Ready DaemonSet driver Pods remain ambiguous before physical commands", async () => {
+  const run = thinQualificationRun("cleanup");
+  run.world.driverPods = (driver) => {
+    const second = structuredClone(driver);
+    second.metadata.name = "openebs-lvm-localpv-node-second";
+    second.metadata.uid = randomUUID();
+    return [driver, second];
+  };
+  await assert.rejects(run.turn(), /thin_storage_driver_ambiguous/);
+  assert.deepEqual(run.world.log, []);
+});
+
+test("a sole driver with two controlling owners cannot authorize physical commands", async () => {
+  const run = thinQualificationRun("cleanup");
+  run.world.driverPods = (driver) => {
+    driver.metadata.ownerReferences.push({
+      kind: "ReplicaSet",
+      controller: true,
+      name: "foreign-owner",
+      uid: randomUUID(),
+    });
+    return [driver];
+  };
+  await assert.rejects(
+    run.turn(),
+    /thin_storage_driver_(?:ambiguous|owner_changed)/,
+  );
+  assert.deepEqual(run.world.log, []);
+});
+
+test("a deleting Ready node driver cannot authorize physical commands", async () => {
+  const run = thinQualificationRun("cleanup");
+  run.world.driverPods = (driver) => [
+    {
+      ...driver,
+      metadata: {
+        ...driver.metadata,
+        deletionTimestamp: new Date().toISOString(),
+      },
+    },
+  ];
+  await assert.rejects(
+    run.turn(),
+    /thin_storage_driver_(?:ambiguous|identity_changed)/,
+  );
+  assert.deepEqual(run.world.log, []);
+});
+
 test("dm-thin pool status keeps full, read-only and failed modes distinct and never guesses", () => {
   assert.deepEqual(
     parseThinPoolStatus(

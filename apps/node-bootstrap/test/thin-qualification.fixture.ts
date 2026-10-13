@@ -104,6 +104,10 @@ export class ThinWorld {
   readonly total: number;
   readonly driverUid = randomUUID();
   readonly daemonSetUid = randomUUID();
+  /** A namespace inventory around the actual node DaemonSet Pod, including colocated workloads. */
+  driverPods: (
+    driver: ReturnType<ThinWorld["driver"]>,
+  ) => ReturnType<ThinWorld["driver"]>[] = (driver) => [driver];
   lvs: Lv[] = [];
   pods = new Map<string, Pod>();
   claims = new Map<string, Claim>();
@@ -425,13 +429,18 @@ export class ThinWorld {
         return one({
           items:
             namespace === "openebs"
-              ? [this.driver()]
+              ? this.driverPods(this.driver())
               : [...this.pods.values()].map((pod) => this.podObject(pod)),
         });
       case "daemonset":
         return one(this.daemonSet());
       case "pod": {
-        if (namespace === "openebs") return one(this.driver());
+        if (namespace === "openebs")
+          return one(
+            this.driverPods(this.driver()).find(
+              (pod) => pod.metadata.name === name,
+            ),
+          );
         const pod = this.pods.get(name!);
         if (pod?.phase === "Pending") {
           this.elapse(SCHEDULER_RETRY_MS);
