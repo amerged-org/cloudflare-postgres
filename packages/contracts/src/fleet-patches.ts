@@ -53,6 +53,25 @@ export const FleetPatchFacts = z.strictObject({
     .optional(),
   release_facts: FleetReleaseFacts.optional(),
   host_configuration_sha256: Hash.optional(),
+  /** Full active document hash; unproved STATE snapshots never attest persistence. */
+  talos_configuration: z
+    .strictObject({
+      sha256: Hash,
+      persistence: z.enum([
+        "unproved",
+        "persistent_readback",
+        "hash_bound_state_boot",
+      ]),
+    })
+    .optional(),
+  /** One host_config write intent. It binds the current boot, not a historical receipt. */
+  talos_configuration_reapply: z
+    .strictObject({
+      boot_id: z.uuid(),
+      before_sha256: Hash,
+      target_sha256: Hash,
+    })
+    .optional(),
   sandbox_service_running: z.boolean().optional(),
   kubernetes_control_plane: z.boolean().optional(),
   kubernetes_image_configuration: z
@@ -525,7 +544,23 @@ export function fleetPatchCheckpointAllowed(
     current.state === "pending"
   ) {
     if (!healthy) return false;
-    if (current.stage === "host_config") return !!input.host_configuration;
+    if (current.stage === "host_config") {
+      const configuration = facts.talos_configuration,
+        intent = facts.talos_configuration_reapply,
+        baseline = current.baseline?.talos_configuration;
+      return (
+        !!input.host_configuration &&
+        ((baseline?.persistence !== "unproved" &&
+          configuration?.persistence !== "unproved" &&
+          !current.observed?.talos_configuration_reapply) ||
+          (configuration?.persistence === "unproved" &&
+            !!intent &&
+            intent.boot_id === facts.boot_id &&
+            intent.before_sha256 === configuration.sha256 &&
+            baseline?.sha256 === intent.before_sha256 &&
+            current.baseline?.boot_id === facts.boot_id))
+      );
+    }
     if (current.stage === "host_service")
       return (
         input.host_configuration_only &&
@@ -597,6 +632,16 @@ export function fleetPatchCheckpointAllowed(
       return (
         !input.spec.roles[input.role].host_configuration_required ||
         (!!input.host_configuration &&
+          facts.talos_configuration?.persistence !== "unproved" &&
+          ((current.baseline?.talos_configuration?.persistence !== "unproved" &&
+            !current.observed?.talos_configuration_reapply) ||
+            (!!current.observed?.talos_configuration_reapply &&
+              current.observed.talos_configuration_reapply.boot_id ===
+                facts.boot_id &&
+              facts.talos_configuration?.persistence ===
+                "persistent_readback" &&
+              facts.talos_configuration.sha256 ===
+                current.observed.talos_configuration_reapply.target_sha256)) &&
           facts.host_configuration_sha256 ===
             current.host_configuration_sha256 &&
           facts.host_configuration_sha256 ===
@@ -714,6 +759,20 @@ export function fleetPatchWritePreflightAllowed(
   latest: FleetPatchFacts,
 ): boolean {
   const current = input.status;
+  const reapply = current.observed?.talos_configuration_reapply;
+  if (
+    reapply &&
+    current.stage === "host_config" &&
+    (reapply.boot_id !== before.boot_id ||
+      latest.boot_id !== reapply.boot_id ||
+      before.talos_configuration?.sha256 !== reapply.before_sha256 ||
+      latest.talos_configuration?.sha256 !== reapply.before_sha256 ||
+      JSON.stringify(before.talos_configuration_reapply) !==
+        JSON.stringify(reapply) ||
+      JSON.stringify(latest.talos_configuration_reapply) !==
+        JSON.stringify(reapply))
+  )
+    return false;
   if (
     current.state !== "dispatched" ||
     !(

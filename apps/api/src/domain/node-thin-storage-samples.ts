@@ -44,6 +44,36 @@ import {
 } from "./fleet-releases.ts";
 
 const iso = (ms: number) => new Date(ms).toISOString();
+/** Genuine D1 SQL execution metadata, excluding network time; timings concern only the last
+ * backend attempt. Missing or invalid metrics remain unknown, never a fabricated zero. */
+export function thinStorageSampleSqlTiming(meta: Record<string, unknown>) {
+  const finite = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? value
+      : null;
+  const timings = meta.timings,
+    sql = finite(
+      timings !== null && typeof timings === "object"
+        ? (timings as Record<string, unknown>).sql_duration_ms
+        : null,
+    ),
+    duration = finite(meta.duration);
+  return {
+    milliseconds: sql ?? duration,
+    source:
+      sql !== null
+        ? "meta.timings.sql_duration_ms"
+        : duration !== null
+          ? "meta.duration"
+          : null,
+    attempts:
+      typeof meta.total_attempts === "number" &&
+      Number.isSafeInteger(meta.total_attempts) &&
+      meta.total_attempts > 0
+        ? meta.total_attempts
+        : null,
+  };
+}
 /** 128 random bits; Cloudflare's issue time is the earliest start of the scrape that answers it. */
 function sampleNonce() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
@@ -407,6 +437,28 @@ async function productSample(
     )
     .run();
   if (result.meta.changes !== 1) return "conflict";
+  const timing = thinStorageSampleSqlTiming(result.meta);
+  // This proves the authority CAS, even if a later token/read await or HTTP response fails.
+  // It does not prove token delivery or write permission; qualification never reaches this log.
+  console.log(
+    JSON.stringify({
+      event: "thin_storage_sample_accepted",
+      node_id: nodeId,
+      node_uid: row.node_uid,
+      authority_revision: authority.revision,
+      sample_observed_at: iso(issued),
+      authority_received_at: iso(now),
+      authority_expires_at: authority.expires_at,
+      write_allowed: authority.write_allowed,
+      period_milliseconds: period,
+      scrape_milliseconds: body.scrape_milliseconds,
+      d1_update_sql_milliseconds: timing.milliseconds,
+      d1_update_sql_timing_source: timing.source,
+      d1_update_sql_timing_scope:
+        timing.source === null ? null : "last_attempt",
+      d1_update_total_attempts: timing.attempts,
+    }),
+  );
   const databases = await env.DB.prepare(
     "SELECT * FROM databases WHERE node_id=? AND region_id=? AND storage_profile_json IS NOT NULL AND storage_volume_json IS NOT NULL AND desired_state='running' AND deleted_at IS NULL ORDER BY id",
   )

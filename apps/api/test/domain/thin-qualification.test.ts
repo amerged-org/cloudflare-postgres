@@ -54,6 +54,7 @@ import {
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   await cleanupFixtures();
   for (const id of releases.splice(0).reverse())
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
@@ -1202,6 +1203,7 @@ it("ends the measurements when database placement reopens during a run and still
 });
 
 it("records a running qualification's samples against its setup identity and renews nothing", async () => {
+  const observation = vi.spyOn(console, "log").mockImplementation(() => {});
   const f = await qualificationSetup(),
     setup = thinQualificationFixture(profile, {
       node_uid: f.uid,
@@ -1311,6 +1313,16 @@ it("records a running qualification's samples against its setup identity and ren
       .bind(id, "f".repeat(32), issued, issued)
       .run(),
   ).rejects.toThrow("thin_storage_qualification_terminal");
+  expect(
+    observation.mock.calls.some(([value]) => {
+      if (typeof value !== "string") return false;
+      const event = JSON.parse(value) as Record<string, unknown>;
+      return (
+        event.event === "thin_storage_sample_accepted" &&
+        event.node_id === f.node
+      );
+    }),
+  ).toBe(false);
 });
 
 it("records qualification samples only inside a journaled window with an active turn lease", async () => {

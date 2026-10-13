@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
@@ -10,6 +10,7 @@ import {
   thinStorageClass,
 } from "@pgcf/contracts";
 import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
+import * as samplesDomain from "../../src/domain/node-thin-storage-samples.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
@@ -27,11 +28,200 @@ import {
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   await cleanupFixtures();
   for (const id of releases.splice(0))
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
       .bind(id)
       .run();
+});
+function sampleLogger() {
+  return vi.spyOn(console, "log").mockImplementation(() => {});
+}
+async function authorityReceipt(nodeId: string) {
+  return env.DB.prepare(
+    "SELECT authority_received_at FROM node_thin_storage WHERE node_id=?",
+  )
+    .bind(nodeId)
+    .first<string>("authority_received_at");
+}
+function acceptedObservations(
+  log: ReturnType<typeof sampleLogger>,
+  nodeId: string,
+) {
+  return log.mock.calls.flatMap(([value]) => {
+    if (typeof value !== "string") return [];
+    const event = JSON.parse(value) as Record<string, unknown>;
+    return event.event === "thin_storage_sample_accepted" &&
+      event.node_id === nodeId
+      ? [event]
+      : [];
+  });
+}
+it("observes only a confirmed product CAS with CF clocks and selected SQL metadata", async () => {
+  const f = await thinExecutionFixture(releases),
+    proof = await identityProof(f),
+    log = sampleLogger();
+  const first = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, null))).body,
+  );
+  expect(acceptedObservations(log, f.node)).toHaveLength(0);
+  const issued = await row(f),
+    supplied = sample(f, first.nonce),
+    accepted = NodeStorageHeadroomResponse.parse(
+      (await post(f, supplied)).body,
+    ),
+    receipt = await authorityReceipt(f.node),
+    events = acceptedObservations(log, f.node);
+  expect(accepted.accepted).toBe(true);
+  expect(events).toHaveLength(1);
+  const event = events[0]!;
+  expect(Object.keys(event).sort()).toEqual([
+    "authority_expires_at",
+    "authority_received_at",
+    "authority_revision",
+    "d1_update_sql_milliseconds",
+    "d1_update_sql_timing_scope",
+    "d1_update_sql_timing_source",
+    "d1_update_total_attempts",
+    "event",
+    "node_id",
+    "node_uid",
+    "period_milliseconds",
+    "sample_observed_at",
+    "scrape_milliseconds",
+    "write_allowed",
+  ]);
+  const serialized = JSON.stringify(event);
+  for (const secret of [
+    f.agent,
+    first.nonce,
+    accepted.nonce,
+    ...accepted.tokens.map((entry) => entry.token),
+  ])
+    expect(serialized.includes(secret)).toBe(false);
+  expect(event).toMatchObject({
+    event: "thin_storage_sample_accepted",
+    node_id: f.node,
+    node_uid: f.uid,
+    authority_revision: proof.revision + 1,
+    sample_observed_at: issued.sample_nonce_issued_at,
+    authority_received_at: receipt,
+    authority_expires_at: accepted.authority!.expires_at,
+    period_milliseconds: f.profile.guard_seconds * 200,
+    scrape_milliseconds: supplied.scrape_milliseconds,
+    write_allowed: true,
+    d1_update_sql_timing_scope: "last_attempt",
+  });
+  expect(["meta.duration", "meta.timings.sql_duration_ms"]).toContain(
+    event.d1_update_sql_timing_source,
+  );
+  expect(typeof event.d1_update_sql_milliseconds).toBe("number");
+  expect(Number.isFinite(event.d1_update_sql_milliseconds)).toBe(true);
+  expect(Number(event.d1_update_sql_milliseconds)).toBeGreaterThanOrEqual(0);
+  expect(
+    event.d1_update_total_attempts === null ||
+      (Number.isSafeInteger(event.d1_update_total_attempts) &&
+        Number(event.d1_update_total_attempts) > 0),
+  ).toBe(true);
+  expect(
+    NodeStorageHeadroomResponse.parse((await post(f, supplied)).body).accepted,
+  ).toBe(false);
+  expect(acceptedObservations(log, f.node)).toHaveLength(1);
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET sample_nonce_issued_at=? WHERE node_id=?",
+  )
+    .bind(iso(Date.now() - f.profile.guard_seconds * 500 - 1000), f.node)
+    .run();
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, accepted.nonce))).body,
+    ).accepted,
+  ).toBe(false);
+  expect(acceptedObservations(log, f.node)).toHaveLength(1);
+});
+
+it("emits no accepted product observation for a real zero-change SQLite CAS", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f);
+  const current = await nonce(f),
+    before = await row(f),
+    receipt = await authorityReceipt(f.node),
+    log = sampleLogger(),
+    trigger = `ignore_thin_sample_${crypto.randomUUID().replaceAll("-", "")}`;
+  await env.DB.exec(
+    `CREATE TRIGGER ${trigger} BEFORE UPDATE OF authority_json ON node_thin_storage WHEN NEW.node_id='${f.node}' BEGIN SELECT RAISE(IGNORE); END`,
+  );
+  try {
+    const result = await post(f, sample(f, current));
+    expect(result.status).toBe(200);
+    expect(NodeStorageHeadroomResponse.parse(result.body)).toMatchObject({
+      accepted: false,
+      reason: "thin_storage_sample_conflict",
+    });
+    const stored = await row(f);
+    expect(stored.authority_revision).toBe(before.authority_revision);
+    expect(stored.authority_json).toBe(before.authority_json);
+    expect(await authorityReceipt(f.node)).toBe(receipt);
+    expect(acceptedObservations(log, f.node)).toHaveLength(0);
+  } finally {
+    await env.DB.exec(`DROP TRIGGER ${trigger}`);
+  }
+});
+
+it("emits no accepted product observation for a real failed SQLite write", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f);
+  const current = await nonce(f),
+    before = await row(f),
+    log = sampleLogger(),
+    trigger = `abort_thin_sample_${crypto.randomUUID().replaceAll("-", "")}`;
+  await env.DB.exec(
+    `CREATE TRIGGER ${trigger} BEFORE UPDATE OF authority_json ON node_thin_storage WHEN NEW.node_id='${f.node}' BEGIN SELECT RAISE(ABORT,'fixture_thin_sample_write_failed'); END`,
+  );
+  try {
+    expect((await post(f, sample(f, current))).status).toBe(500);
+    expect(await row(f)).toEqual(before);
+    expect(acceptedObservations(log, f.node)).toHaveLength(0);
+  } finally {
+    await env.DB.exec(`DROP TRIGGER ${trigger}`);
+  }
+});
+
+it("projects actual D1 SQL timing and keeps missing or invalid metrics null", async () => {
+  const result = await env.DB.prepare("SELECT 1").run();
+  const projected = samplesDomain.thinStorageSampleSqlTiming(result.meta);
+  const expected = result.meta.timings?.sql_duration_ms ?? result.meta.duration;
+  expect(projected.milliseconds).toBe(expected);
+  expect(projected.source).toBe(
+    result.meta.timings ? "meta.timings.sql_duration_ms" : "meta.duration",
+  );
+  expect(projected.milliseconds).toBeGreaterThanOrEqual(0);
+  expect(samplesDomain.thinStorageSampleSqlTiming({})).toEqual({
+    milliseconds: null,
+    source: null,
+    attempts: null,
+  });
+  expect(
+    samplesDomain.thinStorageSampleSqlTiming({
+      duration: Number.NaN,
+      timings: { sql_duration_ms: -1 },
+      total_attempts: Infinity,
+    }),
+  ).toEqual({ milliseconds: null, source: null, attempts: null });
+  expect(
+    samplesDomain.thinStorageSampleSqlTiming({
+      duration: "private_sql_duration",
+      timings: { sql_duration_ms: true },
+      total_attempts: 0,
+    }),
+  ).toEqual({ milliseconds: null, source: null, attempts: null });
+  expect(
+    samplesDomain.thinStorageSampleSqlTiming({
+      duration: 0,
+      total_attempts: 2,
+    }),
+  ).toEqual({ milliseconds: 0, source: "meta.duration", attempts: 2 });
 });
 it("rejects a stale qualification context before issuing a product nonce or renewing authority", async () => {
   const f = await thinExecutionFixture(releases);
@@ -254,7 +444,8 @@ it("refuses a sample its witnesses, pool or volumes do not bind to the identity 
 
 it("decides write_allowed on the fresh reading with today's headroom rule and asks for growth", async () => {
   const f = await thinExecutionFixture(releases),
-    proof = await identityProof(f);
+    proof = await identityProof(f),
+    log = sampleLogger();
   const pool = sample(f, null).physical;
   // 64 MiB free is below the 256 MiB data reserve; the 2 GiB pool can still grow to 32 GiB.
   const full = NodeStorageHeadroomResponse.parse(
@@ -280,6 +471,9 @@ it("decides write_allowed on the fresh reading with today's headroom rule and as
   });
   expect(full.tokens).toEqual([]);
   expect((await row(f)).status).toBe("blocked");
+  expect(
+    acceptedObservations(log, f.node).map((event) => event.write_allowed),
+  ).toEqual([false]);
   expect(await turnRequested(f)).toBe(true);
   // The larger pool after growth renews with writes allowed again.
   const grown = NodeStorageHeadroomResponse.parse(
@@ -312,10 +506,14 @@ it("decides write_allowed on the fresh reading with today's headroom rule and as
     write_allowed: true,
   });
   expect((await row(f)).status).toBe("ready");
+  expect(
+    acceptedObservations(log, f.node).map((event) => event.write_allowed),
+  ).toEqual([false, true]);
 });
 
 it("returns the renewed token of every thin database on the node", async () => {
-  const f = await thinExecutionFixture(releases);
+  const f = await thinExecutionFixture(releases),
+    log = sampleLogger();
   // A 16 GiB pool admits the 5 GiB startup hold of one new database.
   const physical = {
     ...f.authority.physical,
@@ -423,6 +621,12 @@ it("returns the renewed token of every thin database on the node", async () => {
   expect(renewed.accepted).toBe(true);
   expect(renewed.tokens).toHaveLength(1);
   expect(renewed.tokens[0]!.database_id).toBe(created.id);
+  const observations = acceptedObservations(log, f.node);
+  expect(observations).toHaveLength(1);
+  const serialized = JSON.stringify(observations[0]);
+  expect(serialized.includes(renewed.tokens[0]!.token)).toBe(false);
+  expect(serialized.includes(renewed.nonce)).toBe(false);
+  expect(serialized.includes(f.agent)).toBe(false);
   const claims = StorageWriteClaims.parse(
     JSON.parse(
       new TextDecoder().decode(

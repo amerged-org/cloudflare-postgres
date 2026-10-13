@@ -125,17 +125,9 @@ export function mergeHostConfiguration(
   }
   return parsed.values.map((value) => stringify(value)).join("---\n");
 }
-export async function readMachineConfiguration(
-  commands: HostConfigurationCommands,
-  boot?: {
-    boot_id: string;
-    configuration_boot_id: string;
-    configuration_sha256?: string;
-  },
-) {
-  const resources = jsonRecords(
-    await commands.talos(["get", "machineconfig", "--output=json"]),
-  );
+/** Private full snapshot only. Active-only STATE is deliberately not a persistence proof. */
+export function machineConfigurationSnapshot(raw: string) {
+  const resources = jsonRecords(raw);
   const selected = (id: string) =>
     resources.filter((value) => object(value.metadata).id === id);
   const activeRows = selected("v1alpha1"),
@@ -156,6 +148,17 @@ export async function readMachineConfiguration(
     throw new BootstrapError(
       "patch_host_configuration_active_persistent_diverged",
     );
+  return { active, persistent, sha256 };
+}
+export function proveMachineConfiguration(
+  value: ReturnType<typeof machineConfigurationSnapshot>,
+  boot?: {
+    boot_id: string;
+    configuration_boot_id: string;
+    configuration_sha256?: string;
+  },
+) {
+  const { active, persistent, sha256 } = value;
   // Talos omits PersistentID when a boot loads its already persisted STATE configuration.
   // The caller must bind that absence to the previous proved configuration and changed boot.
   if (
@@ -184,6 +187,75 @@ export async function readMachineConfiguration(
         }
       : {}),
   };
+}
+export async function readMachineConfiguration(
+  commands: HostConfigurationCommands,
+  boot?: Parameters<typeof proveMachineConfiguration>[1],
+) {
+  return proveMachineConfiguration(
+    machineConfigurationSnapshot(
+      await commands.talos(["get", "machineconfig", "--output=json"]),
+    ),
+    boot,
+  );
+}
+export function planHostConfigurationReapply(
+  snapshot: ReturnType<typeof machineConfigurationSnapshot>,
+  input: NodeHostConfigurationPrivate,
+  boot_id: string,
+  requireThinPool = false,
+  admitted = false,
+) {
+  if (snapshot.persistent)
+    throw new BootstrapError("patch_configuration_reapply_not_required");
+  const body = mergeHostConfiguration(
+      snapshot.active,
+      input,
+      requireThinPool,
+      admitted,
+    ),
+    values = parseAllDocuments(body).map((document) => document.toJSON());
+  return {
+    body,
+    intent: {
+      boot_id,
+      before_sha256: snapshot.sha256,
+      target_sha256: digest(canonical(values)),
+    },
+  };
+}
+export function hostConfigurationReapplyReadback(
+  raw: string,
+  intent: { boot_id: string; before_sha256: string; target_sha256: string },
+  input: NodeHostConfigurationPrivate,
+  requireThinPool = false,
+  admitted = false,
+) {
+  const snapshot = machineConfigurationSnapshot(raw);
+  if (!snapshot.persistent || snapshot.sha256 !== intent.target_sha256)
+    return undefined;
+  if (
+    !hostConfigurationMatches(snapshot.active, "v1alpha1", input, admitted) ||
+    !hostConfigurationMatches(
+      snapshot.persistent,
+      "persistent",
+      input,
+      admitted,
+    )
+  )
+    return undefined;
+  if (requireThinPool) {
+    const modules = machineConfigurationDocuments(
+      snapshot.active,
+      "v1alpha1",
+    ).values.filter(
+      (value) =>
+        value.kind === "KernelModuleConfig" && value.name === "dm_thin_pool",
+    );
+    if (modules.length !== 1 || modules[0]!.apiVersion !== "v1alpha1")
+      return undefined;
+  }
+  return proveMachineConfiguration(snapshot);
 }
 export async function readHostConfiguration(
   commands: HostConfigurationCommands,

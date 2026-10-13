@@ -70,7 +70,15 @@ import {
   readHostConfiguration,
   readMachineConfiguration,
   applyHostConfiguration,
+  machineConfigurationSnapshot,
+  proveMachineConfiguration,
+  planHostConfigurationReapply,
+  hostConfigurationReapplyReadback,
 } from "./fleet-host-configuration.ts";
+import {
+  fleetStateReapplyEligible,
+  fleetStateReapplyDisposition,
+} from "./fleet-state-reapply.ts";
 
 import {
   observeKubernetesImages,
@@ -392,7 +400,9 @@ export async function runFleetPatch(
       platformState: FleetPlatformState | undefined,
       platformReadback: ReturnType<typeof fleetPlatformReadback> | undefined,
       machineConfiguration:
-        Awaited<ReturnType<typeof readMachineConfiguration>> | undefined;
+        Awaited<ReturnType<typeof readMachineConfiguration>> | undefined,
+      unprovedConfiguration:
+        ReturnType<typeof machineConfigurationSnapshot> | undefined;
     let observedBootId: string | undefined,
       quarantineRemoved = true;
     const authorize = async (refreshHostPool = false) => {
@@ -572,10 +582,60 @@ export async function runFleetPatch(
                 ),
               )
             : priorConfiguration?.kubernetes_image_configuration;
-      machineConfiguration =
-        input.host_configuration || observeImages
-          ? await readMachineConfiguration(hostCommands, stateBoot)
-          : undefined;
+      machineConfiguration = undefined;
+      unprovedConfiguration = undefined;
+      if (current.observed?.talos_configuration_reapply)
+        facts.talos_configuration_reapply =
+          current.observed.talos_configuration_reapply;
+      if (input.host_configuration || observeImages) {
+        const snapshot = machineConfigurationSnapshot(
+            await hostCommands.talos(["get", "machineconfig", "--output=json"]),
+          ),
+          knownFullHash =
+            priorConfiguration?.talos_configuration &&
+            priorConfiguration.talos_configuration.persistence !== "unproved"
+              ? priorConfiguration.talos_configuration.sha256
+              : undefined,
+          fullBoot =
+            stateBoot && knownFullHash
+              ? { ...stateBoot, configuration_sha256: knownFullHash }
+              : stateBoot;
+        try {
+          machineConfiguration = proveMachineConfiguration(snapshot, fullBoot);
+          if (snapshot.persistent || knownFullHash)
+            facts.talos_configuration = {
+              sha256: snapshot.sha256,
+              persistence: snapshot.persistent
+                ? "persistent_readback"
+                : "hash_bound_state_boot",
+            };
+        } catch (error) {
+          if (
+            snapshot.persistent ||
+            !fleetStateReapplyEligible(
+              { ...input, status: current },
+              facts,
+              snapshot.active,
+              admitted,
+            )
+          )
+            throw error;
+          if (
+            current.state !== "dispatched" &&
+            current.baseline?.talos_configuration &&
+            (current.baseline.boot_id !== facts.boot_id ||
+              current.baseline.talos_configuration.sha256 !== snapshot.sha256)
+          )
+            throw new BootstrapError(
+              "patch_host_configuration_changed_before_write",
+            );
+          unprovedConfiguration = snapshot;
+          facts.talos_configuration = {
+            sha256: snapshot.sha256,
+            persistence: "unproved",
+          };
+        }
+      }
       if (
         machineConfiguration?.state_loaded &&
         canonical(
@@ -671,6 +731,10 @@ export async function runFleetPatch(
       if (
         input.retained_thick_storage !== undefined &&
         ((current.stage === "preflight" && !current.baseline) ||
+          (!!facts.talos_configuration_reapply &&
+            ["host_config", "host_service", "talos", "talos_reboot"].includes(
+              current.stage,
+            )) ||
           ["regional", "release_verify"].includes(current.stage))
       ) {
         const bindings = await readFleetLegacyStorage(input, kube),
@@ -694,6 +758,7 @@ export async function runFleetPatch(
 
       if (
         input.host_configuration &&
+        !unprovedConfiguration &&
         (current.stage !== "preflight" || current.baseline)
       ) {
         const host = await readHostConfiguration(
@@ -702,7 +767,8 @@ export async function runFleetPatch(
           machineConfiguration,
           thinPool,
           undefined,
-          !["preflight", "host_config"].includes(current.stage),
+          !!facts.talos_configuration_reapply ||
+            !["preflight", "host_config"].includes(current.stage),
           admitted,
         );
         if (host.matches)
@@ -984,6 +1050,78 @@ export async function runFleetPatch(
         throw new BootstrapError("patch_preflight_unhealthy");
       await checkpoint("preflight", "confirmed", facts);
     } else if (current.stage === "host_config") {
+      if (fleetStateReapplyDisposition(current) === "readback") {
+        const intent = current.observed!.talos_configuration_reapply!;
+        // An uncertain single attempt has only a readback path. Never regenerate/replay its body.
+        if (
+          facts.boot_id === intent.boot_id &&
+          machineConfiguration?.persistent &&
+          machineConfiguration.sha256 === intent.target_sha256 &&
+          facts.host_configuration_sha256 ===
+            input.host_configuration?.status.sha256
+        )
+          await checkpoint("host_config", "confirmed", facts);
+        return current;
+      }
+      if (unprovedConfiguration && current.state === "pending") {
+        const host = input.host_configuration!,
+          plan = planHostConfigurationReapply(
+            unprovedConfiguration,
+            host,
+            facts.boot_id,
+            thinPool,
+            admitted,
+          );
+        facts.talos_configuration_reapply = plan.intent;
+        await checkpoint("host_config", "dispatched", facts);
+        const latest = await latePreflight(facts);
+        if (!latest) return current;
+        await authorize();
+        const immediatelyBefore = machineConfigurationSnapshot(
+          await hostCommands.talos(["get", "machineconfig", "--output=json"]),
+        );
+        if (
+          immediatelyBefore.sha256 !== plan.intent.before_sha256 ||
+          latest.boot_id !== plan.intent.boot_id ||
+          latest.node_uid !== facts.node_uid ||
+          latest.cluster_uid !== facts.cluster_uid ||
+          latest.system_uuid !== facts.system_uuid
+        ) {
+          // The command has not been attempted. The existing explicit pre-write refusal is safe.
+          await checkpoint(
+            "host_config",
+            "pending",
+            latest,
+            "patch_write_not_attempted",
+          );
+          return current;
+        }
+        await hostCommands
+          .talos(["apply-config", "--mode=no-reboot", "--file=-"], plan.body)
+          .catch(() => undefined);
+        const raw = await hostCommands.talos([
+            "get",
+            "machineconfig",
+            "--output=json",
+          ]),
+          readback = hostConfigurationReapplyReadback(
+            raw,
+            plan.intent,
+            host,
+            thinPool,
+            admitted,
+          );
+        if (!readback) return current;
+        const after = await fresh();
+        if (
+          after.boot_id === plan.intent.boot_id &&
+          after.talos_configuration?.persistence === "persistent_readback" &&
+          after.talos_configuration.sha256 === plan.intent.target_sha256 &&
+          after.host_configuration_sha256 === host.status.sha256
+        )
+          await checkpoint("host_config", "confirmed", after);
+        return current;
+      }
       if (
         !target.host_configuration_required ||
         facts.host_configuration_sha256 ===
