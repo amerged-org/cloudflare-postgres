@@ -108,6 +108,13 @@ function rustInputs(path: string, directory: string): boolean {
     (path.startsWith(`${directory}/proto/`) && !path.endsWith(".md"))
   );
 }
+/** Every native image ships cargo metadata for this workspace member. Path-only change
+ * detection conservatively includes edits to files that can create/remove automatic targets. */
+function poolWorkspaceMetadataInput(path: string): boolean {
+  return /^apps\/pool-supervisor\/(?:Cargo\.toml|build\.rs|src\/(?:main|lib)\.rs|(?:src\/bin|examples|tests|benches)\/.*\.rs)$/.test(
+    path,
+  );
+}
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object")
@@ -273,6 +280,7 @@ export function selectImageInputs(
         "infra/platform/versions.lock.json",
       ].includes(path) ||
       rustInputs(path, "packages/native-protocol") ||
+      poolWorkspaceMetadataInput(path) ||
       (nativeSchemaInputs.has(path) &&
         path !== "packages/contracts/native/controller.generated.json")
     ) {

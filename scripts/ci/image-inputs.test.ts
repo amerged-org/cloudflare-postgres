@@ -39,6 +39,22 @@ test("pool supervisor source selects its own immutable native image", () => {
   );
 });
 
+test("supervisor manifest and auto-discovered targets invalidate every shipped workspace metadata file", () => {
+  const manifest = selectImageInputs(
+    ["apps/pool-supervisor/Cargo.toml"],
+    "push",
+  );
+  assert.equal(manifest.native_controller, true);
+  assert.equal(manifest.rust_gateway, true);
+  assert.equal(manifest.sandbox_controller, true);
+  const addedTarget = selectImageInputs(
+    ["apps/pool-supervisor/tests/kernel.rs"],
+    "push",
+  );
+  assert.equal(addedTarget.native_reclaimer, true);
+  assert.equal(addedTarget.pool_supervisor, true);
+});
+
 test("workflow retention, test globs, installer delivery and documentation do not rebuild unchanged native artifacts", async () => {
   const before = await readFile(
     new URL("../../.github/workflows/ci.yml", import.meta.url),
