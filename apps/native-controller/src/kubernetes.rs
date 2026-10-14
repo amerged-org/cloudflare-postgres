@@ -236,6 +236,7 @@ fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
         "Backup" => ("/apis/postgresql.cnpg.io/v1", "backups", false),
         "ObjectStore" => ("/apis/barmancloud.cnpg.io/v1", "objectstores", false),
         "LVMVolume" => ("/apis/local.openebs.io/v1alpha1", "lvmvolumes", false),
+        "LVMSnapshot" => ("/apis/local.openebs.io/v1alpha1", "lvmsnapshots", false),
         "LVMNode" => ("/apis/local.openebs.io/v1alpha1", "lvmnodes", false),
         "NetworkPolicy" => ("/apis/networking.k8s.io/v1", "networkpolicies", false),
         "CiliumNetworkPolicy" => ("/apis/cilium.io/v2", "ciliumnetworkpolicies", false),
@@ -898,6 +899,108 @@ impl Kubernetes {
         .await?;
         Ok(())
     }
+    /// Bounded logs from the exact current OpenEBS driver container, with identity brackets.
+    pub async fn openebs_driver_logs(
+        &self,
+        pod: &Value,
+        container: &str,
+        image: &str,
+        since: u64,
+    ) -> Result<String, Error> {
+        fn identity(pod: &Value, container: &str, image: &str) -> Result<Value, Error> {
+            let digest = image
+                .split_once("@sha256:")
+                .map(|(_, d)| d)
+                .filter(|d| {
+                    d.len() == 64
+                        && d.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+                .ok_or("qualification driver digest unavailable")?;
+            let specs = pod["spec"]["containers"]
+                .as_array()
+                .ok_or("qualification driver container missing")?
+                .iter()
+                .filter(|c| c["name"] == container && c["image"] == image)
+                .collect::<Vec<_>>();
+            let statuses = pod["status"]["containerStatuses"]
+                .as_array()
+                .ok_or("qualification driver status missing")?
+                .iter()
+                .filter(|c| c["name"] == container)
+                .collect::<Vec<_>>();
+            if pod["kind"] != "Pod"
+                || pod["metadata"]["namespace"] != "openebs"
+                || !pod["metadata"]["deletionTimestamp"].is_null()
+                || pod["status"]["phase"] != "Running"
+                || specs.len() != 1
+                || statuses.len() != 1
+                || statuses[0]["ready"] != true
+                || !statuses[0]["state"]["running"].is_object()
+                || !statuses[0]["imageID"].as_str().is_some_and(|id| {
+                    id == format!("sha256:{digest}")
+                        || id == format!("containerd://sha256:{digest}")
+                        || id.ends_with(&format!("@sha256:{digest}"))
+                })
+                || !pgcf_native_protocol::valid_pattern("uuid", text(&pod["metadata"], "uid"))
+                || statuses[0]["containerID"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+            {
+                return Err("qualification driver log identity changed".into());
+            }
+            Ok(
+                serde_json::json!({"uid":pod["metadata"]["uid"],"container":statuses[0]["containerID"],"restarts":statuses[0]["restartCount"],"image":statuses[0]["imageID"]}),
+            )
+        }
+        let name = text(&pod["metadata"], "name");
+        if !identifier(name) || !identifier(container) || container.len() > 63 {
+            return Err("qualification driver log selector invalid".into());
+        }
+        let expected = identity(pod, container, image)?;
+        let before = self
+            .read("Pod", Some("openebs"), name)
+            .await?
+            .ok_or("qualification driver absent")?;
+        if identity(&before, container, image)? != expected {
+            return Err("qualification driver changed before logs".into());
+        }
+        let stamp = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(since) * 1_000_000)?
+            .format(&time::format_description::well_known::Rfc3339)?;
+        let token = tokio::fs::read_to_string(&self.token).await?;
+        if token.trim().is_empty() {
+            return Err("Kubernetes bearer missing".into());
+        }
+        let mut url = self
+            .origin
+            .join(&format!("/api/v1/namespaces/openebs/pods/{name}/log"))?;
+        url.query_pairs_mut().extend_pairs([
+            ("container", container),
+            ("sinceTime", stamp.as_str()),
+            ("timestamps", "true"),
+            ("follow", "false"),
+            ("limitBytes", "262144"),
+        ]);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token.trim())
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err("qualification driver logs unavailable".into());
+        }
+        let raw = String::from_utf8(bounded(response, 262144).await?)?;
+        let after = self
+            .read("Pod", Some("openebs"), name)
+            .await?
+            .ok_or("qualification driver absent")?;
+        if identity(&after, container, image)? != expected {
+            return Err("qualification driver changed during logs".into());
+        }
+        Ok(raw)
+    }
     /// Authenticated API-server proxy to the read-only OpenEBS LVM exporter of one driver Pod.
     pub async fn openebs_metrics(&self, pod: &str) -> Result<String, Error> {
         if pod.len() > 63 || pod.contains('.') || !identifier(pod) {
@@ -935,6 +1038,13 @@ impl Kubernetes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_snapshot_uses_the_pinned_namespaced_resource() {
+        assert_eq!(
+            named("LVMSnapshot", Some("openebs"), "pgcf-q-owned").unwrap(),
+            "/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmsnapshots/pgcf-q-owned"
+        );
+    }
     #[test]
     fn pool_namespace_watch_loss_invalidates_only_its_actual_runtime_proof() {
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

@@ -1518,6 +1518,10 @@ impl Runtime {
                 let Some(q) = self.qualification(text(target, "node_id")?).await? else {
                     continue;
                 };
+                if q["status"] == "cleanup" {
+                    crate::pool_qualification::observe_cleanup(self, k8s, &q).await?;
+                    continue;
+                }
                 if q["status"] != "running" || q["policy"].is_null() {
                     continue;
                 }
@@ -1601,6 +1605,7 @@ impl Runtime {
             self.prepare(k8s, &state, node, &image, q.as_ref()).await?;
             if let Some(q) = q.as_ref() {
                 self.join_sleep(k8s, q).await?;
+                crate::pool_qualification::advance(self, k8s, q).await?;
             }
         }
         Ok(())

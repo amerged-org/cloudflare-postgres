@@ -28,7 +28,7 @@ metadata:
 automountServiceAccountToken: false
 ---
 # The agent owns every per-database namespace and its resources. Namespace names are dynamic, so
-# these rules are cluster-wide. There is no pods/exec, pods/log, list or watch on Secrets, and no
+# these rules are cluster-wide. There is no pods/exec or cluster-wide pods/log access, and no
 # RBAC or workload-controller access.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -161,6 +161,14 @@ rules:
   - apiGroups: [apps]
     resources: [daemonsets]
     verbs: [get]
+  # Qualification reads only the signed current driver Pod's bounded workqueue errors.
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  # One run-owned Pending probe: unexpected finalizers or Ready state are retained.
+  - apiGroups: [local.openebs.io]
+    resources: [lvmsnapshots]
+    verbs: [get, create, delete]
   - apiGroups: [local.openebs.io]
     resources: [lvmnodes]
     verbs: [get]

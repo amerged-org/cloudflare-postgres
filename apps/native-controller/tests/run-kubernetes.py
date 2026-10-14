@@ -146,13 +146,15 @@ def start():
         shutil.rmtree(root)
         raise
 
-def run(path, worktree, target, target_dir):
+def run(path, worktree, target, target_dir, example="pool-kubernetes"):
+    if example not in ("pool-kubernetes", "pool-qualification-kubernetes"):
+        raise RuntimeError("Fixture example invalid")
     if not target_dir or len(target_dir)>96 or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-/" for c in target_dir) or ".." in target_dir:
         raise RuntimeError("Fixture target directory invalid")
     metadata=load_metadata(path)
     owned(metadata)
     root=path.parent
-    args=["docker","run","--rm","--platform","linux/amd64","--network",metadata["network"],"-e","CARGO_HOME=/cargo","-e","CARGO_TARGET_DIR=/target/"+target_dir,"-e","CARGO_PROFILE_DEV_DEBUG=0","-e","CARGO_PROFILE_TEST_DEBUG=0","-e","CARGO_INCREMENTAL=0","-e","PGCF_POOL_TEST_ORIGIN="+metadata["origin"],"-e","PGCF_POOL_TEST_CA=/fixture/ca.crt","-e","PGCF_POOL_TEST_TOKEN=/fixture/token","-e","PGCF_POOL_TEST_ATTEMPT="+uuid.uuid4().hex,"-v",str(worktree)+":/repo","-v",str(root)+":/fixture:ro","-v","pgcf-diag-cargo-amd64:/cargo","-v",target+":/target","-w","/repo",RUST_IMAGE,"sh","-c","apk add --no-cache musl-dev >/dev/null && cargo run --locked -p pgcf-native-controller --example pool-kubernetes"]
+    args=["docker","run","--rm","--platform","linux/amd64","--network",metadata["network"],"-e","CARGO_HOME=/cargo","-e","CARGO_TARGET_DIR=/target/"+target_dir,"-e","CARGO_PROFILE_DEV_DEBUG=0","-e","CARGO_PROFILE_TEST_DEBUG=0","-e","CARGO_INCREMENTAL=0","-e","PGCF_POOL_TEST_ORIGIN="+metadata["origin"],"-e","PGCF_POOL_TEST_CA=/fixture/ca.crt","-e","PGCF_POOL_TEST_TOKEN=/fixture/token","-e","PGCF_POOL_TEST_ATTEMPT="+uuid.uuid4().hex,"-v",str(worktree)+":/repo","-v",str(root)+":/fixture:ro","-v","pgcf-diag-cargo-amd64:/cargo","-v",target+":/target","-w","/repo",RUST_IMAGE,"sh","-c","apk add --no-cache musl-dev >/dev/null && cargo run --locked -p pgcf-native-controller --example "+example]
     # The executable reports only fixed public check names; a failed command is not printed raw.
     result=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     if result.returncode:
@@ -169,12 +171,13 @@ if __name__ == "__main__":
     parser.add_argument("--worktree",type=Path,default=Path(__file__).resolve().parents[3])
     parser.add_argument("--target-volume",default="pgcf-diag-target-amd64")
     parser.add_argument("--target-dir",default="warm-pool-routing-kubernetes")
+    parser.add_argument("--example", choices=["pool-kubernetes", "pool-qualification-kubernetes"], default="pool-kubernetes")
     args=parser.parse_args()
     try:
         if args.mode=="start":start()
         elif args.metadata is None:parser.error("--metadata is required")
         elif args.mode=="stop":stop(args.metadata.resolve())
-        else:run(args.metadata.resolve(),args.worktree.resolve(),args.target_volume,args.target_dir)
+        else:run(args.metadata.resolve(),args.worktree.resolve(),args.target_volume,args.target_dir,args.example)
     except Exception as error:
         # No subprocess body, credentials, addresses or API payload are emitted.
         print(json.dumps({"fixture":"failed","reason":type(error).__name__,"stage":str(error) if isinstance(error,RuntimeError) else "fixture_error"}))
