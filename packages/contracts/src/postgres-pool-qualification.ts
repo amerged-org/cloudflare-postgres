@@ -540,6 +540,133 @@ export const PostgresPoolQualificationExecution = z.strictObject({
 export type PostgresPoolQualificationExecution = z.infer<
   typeof PostgresPoolQualificationExecution
 >;
+/** Pending measured pieces and effect intents never advance a qualification gate. */
+const ResourceVersion = z.string().regex(/^[0-9]{1,128}$/);
+const Namespace = z
+  .string()
+  .max(63)
+  .regex(/^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/);
+const ResourceName = z
+  .string()
+  .max(253)
+  .regex(/^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/);
+export const PostgresPoolQualificationProgress = z.discriminatedUnion("phase", [
+  z.strictObject({
+    gate: z.literal("finite_creator_fence"),
+    phase: z.literal("node_fence_ready"),
+    source_generation: Positive,
+    volume_handle: z.string().regex(/^pvc-[a-f0-9-]{36}$/),
+    driver_sha256: Hash,
+    deny_record_inode: Positive,
+    deny_record_sha256: Hash,
+    deny_record_scope_sha256: Hash,
+    deny_record_fsync_errno: Counter.max(4095),
+    agent_owner_deaths: Positive,
+    before_claim_requests_completed: Positive,
+    surviving_creation_descriptors: Counter,
+    dm_open_count: Counter,
+    foreign_mounts: Counter,
+    named_namespace_scan_errno: Counter.max(4095),
+  }),
+  z.strictObject({
+    gate: z.literal("finite_creator_fence"),
+    phase: z.literal("driver_delete_intent"),
+    driver_pod_uid: z.uuid(),
+    driver_pod_name: ResourceName,
+    driver_pod_resource_version: ResourceVersion,
+    driver_namespace: Namespace,
+    driver_daemonset_uid: z.uuid(),
+    driver_image: Image,
+  }),
+  z.strictObject({
+    gate: z.literal("finite_creator_fence"),
+    phase: z.literal("driver_restarted"),
+    driver_pod_uid_before_restart: z.uuid(),
+    driver_pod_uid_after_restart: z.uuid(),
+    driver_daemonset_uid: z.uuid(),
+    driver_image: Image,
+    driver_deleted_at: Counter,
+    driver_replacement_ready_at: Counter,
+    volume_reconcile_error: z.literal("pool_creator_fence_denied"),
+    volume_reconcile_observed_at: Counter,
+  }),
+  z.strictObject({
+    gate: z.literal("finite_creator_fence"),
+    phase: z.literal("snapshot_create_intent"),
+    snapshot_name: ResourceName,
+    snapshot_namespace: Namespace,
+    source_volume_handle: z.string().regex(/^pvc-[a-f0-9-]{36}$/),
+  }),
+  z.strictObject({
+    gate: z.literal("finite_creator_fence"),
+    phase: z.literal("snapshot_created"),
+    snapshot_uid: z.uuid(),
+    snapshot_resource_version: ResourceVersion,
+    snapshot_name: ResourceName,
+    snapshot_namespace: Namespace,
+    source_volume_handle: z.string().regex(/^pvc-[a-f0-9-]{36}$/),
+  }),
+  z.strictObject({
+    gate: z.literal("finite_creator_fence"),
+    phase: z.literal("snapshot_removed"),
+    snapshot_uid: z.uuid(),
+    source_volume_handle: z.string().regex(/^pvc-[a-f0-9-]{36}$/),
+    state_at_denial: z.literal("Pending"),
+    error: z.literal("pool_creator_fence_denied"),
+    requested_at: Counter,
+    deleted_at: Counter,
+    absent_at: Counter,
+    physical_snapshot_count: Counter,
+  }),
+  z.strictObject({
+    gate: z.literal("cleanup"),
+    phase: z.literal("controller_cleanup_observed"),
+    namespace_uid: z.uuid(),
+    cnpg_cluster_uid: z.uuid(),
+    hibernation: z.enum(["on", "off", "unknown"]),
+    remaining_instance_pods: Counter,
+    remaining_pool_pods: Counter,
+    primary_lease: z
+      .strictObject({
+        uid: z.uuid(),
+        resource_version: ResourceVersion,
+        holder_identity: z.string().max(253).nullable(),
+      })
+      .nullable(),
+  }),
+]);
+export type PostgresPoolQualificationProgress = z.infer<
+  typeof PostgresPoolQualificationProgress
+>;
+const { measurement: ignoredProgressMeasurement, ...progressReportFields } =
+  PostgresPoolQualificationReport.shape;
+void ignoredProgressMeasurement;
+export const PostgresPoolQualificationProgressReport = z
+  .strictObject({
+    ...progressReportFields,
+    progress: PostgresPoolQualificationProgress,
+  })
+  .refine((r) => r.observed_at >= r.started_at, {
+    message: "Progress cannot precede its read start",
+  });
+export type PostgresPoolQualificationProgressReport = z.infer<
+  typeof PostgresPoolQualificationProgressReport
+>;
+export const PostgresPoolQualificationProgressEvidence = z.strictObject({
+  sequence: Positive,
+  producer: PostgresPoolQualificationProducer,
+  issued_at: Counter,
+  started_at: Counter,
+  observed_at: Counter,
+  received_at: Counter,
+  nonce_sha256: Hash,
+  execution: PostgresPoolQualificationExecution,
+  progress: PostgresPoolQualificationProgress,
+});
+export type PostgresPoolQualificationProgressEvidence = z.infer<
+  typeof PostgresPoolQualificationProgressEvidence
+>;
+
 export const PostgresPoolQualificationEvidence = z.strictObject({
   sequence: Positive,
   producer: PostgresPoolQualificationProducer,
@@ -584,6 +711,7 @@ export const PostgresPoolQualificationInput = z.strictObject({
   policy: PostgresPoolPolicyState.nullable(),
   accepted_evidence: z.array(PostgresPoolQualificationEvidence).max(10),
   accepted_sleep: PoolSleepRecord.nullable(),
+  pending_progress: z.array(PostgresPoolQualificationProgressEvidence).max(7),
 });
 export type PostgresPoolQualificationInput = z.infer<
   typeof PostgresPoolQualificationInput
@@ -605,6 +733,7 @@ export const PoolQualificationClaims = z.strictObject({
   execution: PostgresPoolQualificationExecution,
   /** Null until Cloudflare has persisted and revalidated the actual candidate Pod context. */
   preparation_sha256: Hash.nullable(),
+  progress_sha256: Hash,
   iat: Counter,
   exp: Positive,
 });
@@ -641,6 +770,20 @@ export async function postgresPoolQualificationNonceHash(nonce: string) {
   return bytesToHex(
     new Uint8Array(
       await crypto.subtle.digest("SHA-256", new TextEncoder().encode(nonce)),
+    ),
+  );
+}
+export async function postgresPoolQualificationProgressHash(raw: unknown) {
+  const progress = z
+    .array(PostgresPoolQualificationProgressEvidence)
+    .max(7)
+    .parse(raw);
+  return bytesToHex(
+    new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(canonical(progress)),
+      ),
     ),
   );
 }

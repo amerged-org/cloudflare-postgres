@@ -33,6 +33,9 @@ import {
   type PostgresPoolQualificationRequest,
   type PostgresPoolQualificationExecution,
   postgresPoolQualificationNonceHash,
+  PostgresPoolQualificationProgressReport,
+  PostgresPoolQualificationProgressEvidence,
+  postgresPoolQualificationProgressHash,
 } from "@pgcf/contracts/postgres-pool-qualification";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
@@ -66,6 +69,10 @@ const Journal = z.strictObject({
   version: z.literal(1),
   pending: PostgresPoolQualificationChallenge.nullable(),
   entries: z.array(PostgresPoolQualificationEvidence).max(10),
+  progress: z
+    .array(PostgresPoolQualificationProgressEvidence)
+    .max(7)
+    .default([]),
 });
 interface Row {
   id: string;
@@ -847,6 +854,15 @@ export async function getPostgresPoolQualificationInput(
         ? "cleanup"
         : POSTGRES_POOL_QUALIFICATION_GATES[j.entries.length];
   if (!gate) conflict("Qualification is waiting for cleanup");
+  if (
+    row.status === "running" &&
+    j.pending &&
+    j.pending.expires_at <= now &&
+    j.progress.length
+  ) {
+    await cleanupState(c.env, row, "pool_qualification_challenge_expired");
+    return getPostgresPoolQualificationInput(c, nodeId);
+  }
   let challenge = j.pending;
   if (!challenge || challenge.expires_at <= now) {
     challenge = PostgresPoolQualificationChallenge.parse({
@@ -878,6 +894,7 @@ export async function getPostgresPoolQualificationInput(
         .run();
     if (result.meta.changes !== 1)
       conflict("Qualification challenge changed concurrently");
+    row = { ...row, evidence_json: next };
   }
   const preparation =
       row.status === "running"
@@ -900,6 +917,9 @@ export async function getPostgresPoolQualificationInput(
         challenge,
         execution,
         preparation_sha256: preparation?.preparation_sha256 ?? null,
+        progress_sha256: await postgresPoolQualificationProgressHash(
+          j.progress,
+        ),
         iat,
         exp: Math.min(
           iat + 30_000,
@@ -922,6 +942,7 @@ export async function getPostgresPoolQualificationInput(
   const still = await c.env.DB.prepare(
     `SELECT 1 FROM postgres_pool_qualification_runs WHERE id=? AND status=?
     AND json_extract(evidence_json,'$.pending.nonce')=? AND ${fence.sql}
+    AND evidence_json=?
     AND ${sleep.sql}
     ${preparation ? `AND (${preparation.fence.sql})` : ""}`,
   )
@@ -930,6 +951,7 @@ export async function getPostgresPoolQualificationInput(
       row.status,
       challenge.nonce,
       ...fence.bindings,
+      row.evidence_json,
       ...sleep.bindings,
       ...(preparation?.fence.bindings ?? []),
     )
@@ -947,6 +969,7 @@ export async function getPostgresPoolQualificationInput(
         permission,
         accepted_evidence: j.entries,
         accepted_sleep: sleep.value,
+        pending_progress: j.progress,
         policy: setup
           ? {
               node_id: row.node_id,
@@ -961,6 +984,228 @@ export async function getPostgresPoolQualificationInput(
     },
     200,
   );
+}
+
+export async function recordPostgresPoolQualificationProgress(
+  c: ApiContext,
+  nodeId: string,
+  raw: PostgresPoolQualificationProgressReport,
+) {
+  const auth = await agent(c, nodeId),
+    report = PostgresPoolQualificationProgressReport.parse(raw);
+  let row = await read(c.env.DB, report.run_id);
+  if (row.node_id !== nodeId || row.region_id !== auth.id)
+    throw new ApiError("not_found", "Qualification not found");
+  if (row.status === "running" && row.expires_at <= Date.now())
+    row = await cleanupState(c.env, row, "pool_qualification_expired");
+  if (!["running", "cleanup"].includes(row.status))
+    conflict("Qualification already ended");
+  const j = journal(row),
+    p = j.pending,
+    s = scope(row),
+    now = Date.now(),
+    m = report.progress;
+  if (
+    !p ||
+    p.nonce !== report.nonce ||
+    p.sequence !== report.sequence ||
+    p.expires_at <= now ||
+    p.gate !== m.gate ||
+    report.scope_sha256 !== row.scope_sha256 ||
+    report.node_uid !== s.node_uid ||
+    report.started_at < p.issued_at - SKEW_MS ||
+    !fresh(report.observed_at, now) ||
+    (m.phase === "node_fence_ready"
+      ? report.producer !== "node_agent"
+      : report.producer !== "controller")
+  )
+    conflict("Qualification progress scope or producer changed");
+  let fence;
+  try {
+    fence = await currentFence(c.env, row, auth.keyHash);
+  } catch (error) {
+    if (
+      row.status === "running" &&
+      error instanceof ApiError &&
+      error.name === "PostgresPoolQualificationScopeChanged"
+    )
+      await cleanupState(c.env, row, "pool_qualification_scope_changed");
+    throw error;
+  }
+  if (
+    report.boot_id !== fence.current.boot_id ||
+    report.candidate_spec_sha256 !== fence.current.spec_sha256
+  )
+    conflict();
+  const nonceHash = await postgresPoolQualificationNonceHash(report.nonce),
+    execution = await executionIdentity(c.env, fence.current, fence.authority),
+    existing = j.progress.find((e) => e.progress.phase === m.phase);
+  if (existing && existing.nonce_sha256 === nonceHash) {
+    if (
+      !equal(existing.progress, m) ||
+      existing.producer !== report.producer ||
+      existing.started_at !== report.started_at ||
+      existing.observed_at !== report.observed_at
+    )
+      conflict("Recorded effect intent cannot change");
+    const still = await c.env.DB.prepare(
+      `SELECT 1 FROM postgres_pool_qualification_runs WHERE id=? AND evidence_json=? AND status=? AND ${fence.sql}`,
+    )
+      .bind(row.id, row.evidence_json, row.status, ...fence.bindings)
+      .first();
+    if (!still) conflict();
+    return c.json({ recorded: true }, 200);
+  }
+  const phases = [
+      "node_fence_ready",
+      "driver_delete_intent",
+      "driver_restarted",
+      "snapshot_create_intent",
+      "snapshot_created",
+      "snapshot_removed",
+    ] as const,
+    current = j.progress.filter((e) => e.nonce_sha256 === nonceHash),
+    get = (phase: string) =>
+      current.find((e) => e.progress.phase === phase)?.progress;
+  if (
+    m.gate === "finite_creator_fence" &&
+    (row.status !== "running" || phases[current.length] !== m.phase)
+  )
+    conflict("Current measured predecessor is missing");
+  const nodeReady = get("node_fence_ready"),
+    intent = get("driver_delete_intent"),
+    intentRecorded = current.find(
+      (e) => e.progress.phase === "driver_delete_intent",
+    ),
+    restart = get("driver_restarted"),
+    snapshotIntent = get("snapshot_create_intent"),
+    snapshotIntentRecorded = current.find(
+      (e) => e.progress.phase === "snapshot_create_intent",
+    ),
+    created = get("snapshot_created");
+  switch (m.phase) {
+    case "node_fence_ready":
+      if (
+        m.source_generation !== s.database_generation - 1 ||
+        m.volume_handle !== s.volume.volume_handle ||
+        m.driver_sha256 !== s.software.driver_sha256 ||
+        m.deny_record_scope_sha256 !== row.scope_sha256 ||
+        m.deny_record_fsync_errno !== 0 ||
+        m.surviving_creation_descriptors !== 0 ||
+        m.dm_open_count !== 0 ||
+        m.foreign_mounts !== 0 ||
+        m.named_namespace_scan_errno !== 0
+      )
+        conflict();
+      break;
+    case "driver_delete_intent": {
+      const original = journal(row).entries.find(
+        (e) => e.measurement.gate === "host_mount_context",
+      )?.execution.driver_pod_uid;
+      if (
+        !nodeReady ||
+        m.driver_pod_uid !== original ||
+        m.driver_pod_uid !== execution.driver_pod_uid ||
+        m.driver_image !== s.software.driver_image
+      )
+        conflict();
+      break;
+    }
+    case "driver_restarted":
+      if (
+        !intent ||
+        !intentRecorded ||
+        intent.phase !== "driver_delete_intent" ||
+        m.driver_pod_uid_before_restart !== intent.driver_pod_uid ||
+        m.driver_pod_uid_after_restart === intent.driver_pod_uid ||
+        m.driver_pod_uid_after_restart !== execution.driver_pod_uid ||
+        m.driver_daemonset_uid !== intent.driver_daemonset_uid ||
+        m.driver_image !== intent.driver_image ||
+        m.driver_deleted_at < intentRecorded.received_at - SKEW_MS ||
+        m.driver_replacement_ready_at < m.driver_deleted_at ||
+        m.volume_reconcile_observed_at < m.driver_deleted_at ||
+        m.volume_reconcile_observed_at > report.observed_at + SKEW_MS ||
+        m.driver_replacement_ready_at > report.observed_at + SKEW_MS
+      )
+        conflict();
+      break;
+    case "snapshot_create_intent":
+      if (
+        !restart ||
+        m.source_volume_handle !== s.volume.volume_handle ||
+        m.snapshot_name !== `pgcf-q-${row.scope_sha256.slice(0, 24)}`
+      )
+        conflict();
+      break;
+    case "snapshot_created":
+      if (
+        !snapshotIntent ||
+        snapshotIntent.phase !== "snapshot_create_intent" ||
+        m.source_volume_handle !== snapshotIntent.source_volume_handle ||
+        m.snapshot_name !== snapshotIntent.snapshot_name ||
+        m.snapshot_namespace !== snapshotIntent.snapshot_namespace
+      )
+        conflict();
+      break;
+    case "snapshot_removed":
+      if (
+        !created ||
+        !snapshotIntentRecorded ||
+        created.phase !== "snapshot_created" ||
+        m.snapshot_uid !== created.snapshot_uid ||
+        m.source_volume_handle !== created.source_volume_handle ||
+        m.requested_at < snapshotIntentRecorded.received_at - SKEW_MS ||
+        m.deleted_at < m.requested_at ||
+        m.absent_at < m.deleted_at ||
+        m.absent_at > report.observed_at + SKEW_MS ||
+        m.physical_snapshot_count !== 0
+      )
+        conflict();
+      break;
+    case "controller_cleanup_observed":
+      if (
+        row.status !== "cleanup" ||
+        m.namespace_uid !== s.volume.namespace_uid ||
+        m.cnpg_cluster_uid !== s.volume.cluster_uid ||
+        m.hibernation !== "on" ||
+        m.remaining_instance_pods !== 0 ||
+        m.remaining_pool_pods !== 0 ||
+        m.primary_lease?.holder_identity != null
+      )
+        conflict();
+      break;
+  }
+  const progress = PostgresPoolQualificationProgressEvidence.parse({
+      sequence: report.sequence,
+      producer: report.producer,
+      issued_at: p.issued_at,
+      started_at: report.started_at,
+      observed_at: report.observed_at,
+      received_at: now,
+      nonce_sha256: nonceHash,
+      execution,
+      progress: m,
+    }),
+    entries = existing
+      ? j.progress.map((e) => (e === existing ? progress : e))
+      : [...j.progress, progress];
+  if (entries.length > 7) conflict();
+  const result = await c.env.DB.prepare(
+    `UPDATE postgres_pool_qualification_runs SET evidence_json=?,updated_at=? WHERE id=? AND status=?
+   AND evidence_json=? AND ${fence.sql}`,
+  )
+    .bind(
+      canonicalInstallation({ ...j, progress: entries }),
+      now,
+      row.id,
+      row.status,
+      row.evidence_json,
+      ...fence.bindings,
+    )
+    .run();
+  if (result.meta.changes !== 1) conflict();
+  hint(c, row.region_id, [row.database_id]);
+  return c.json({ recorded: true }, 200);
 }
 
 async function measuredHolder(
@@ -1021,6 +1266,53 @@ async function measuredHolder(
     return preparation.fence;
   }
   if (m.gate === "finite_creator_fence") {
+    const nonceHash = await postgresPoolQualificationNonceHash(report.nonce),
+      parts = journal(row).progress.filter((e) => e.nonce_sha256 === nonceHash),
+      nodePart = parts.find(
+        (e) => e.progress.phase === "node_fence_ready",
+      )?.progress,
+      driverPart = parts.find(
+        (e) => e.progress.phase === "driver_restarted",
+      )?.progress,
+      snapshotPart = parts.find(
+        (e) => e.progress.phase === "snapshot_removed",
+      )?.progress,
+      snapshot = m.denied_operations.find(
+        (o) => o.operation === "snapshot_create",
+      );
+    if (
+      parts.length !== 6 ||
+      !nodePart ||
+      nodePart.phase !== "node_fence_ready" ||
+      !driverPart ||
+      driverPart.phase !== "driver_restarted" ||
+      !snapshotPart ||
+      snapshotPart.phase !== "snapshot_removed" ||
+      !snapshot ||
+      snapshot.operation !== "snapshot_create" ||
+      m.deny_record_inode_before_restart !== nodePart.deny_record_inode ||
+      m.deny_record_sha256_before_restart !== nodePart.deny_record_sha256 ||
+      m.agent_owner_deaths !== nodePart.agent_owner_deaths ||
+      m.before_claim_requests_completed !==
+        nodePart.before_claim_requests_completed ||
+      m.driver_pod_uid_before_restart !==
+        driverPart.driver_pod_uid_before_restart ||
+      m.driver_pod_uid_after_restart !==
+        driverPart.driver_pod_uid_after_restart ||
+      m.driver_daemonset_uid !== driverPart.driver_daemonset_uid ||
+      m.driver_image !== driverPart.driver_image ||
+      m.driver_deleted_at !== driverPart.driver_deleted_at ||
+      m.driver_replacement_ready_at !==
+        driverPart.driver_replacement_ready_at ||
+      snapshot.snapshot_uid !== snapshotPart.snapshot_uid ||
+      snapshot.source_volume_handle !== snapshotPart.source_volume_handle ||
+      snapshot.requested_at !== snapshotPart.requested_at ||
+      snapshot.deleted_at !== snapshotPart.deleted_at ||
+      snapshot.absent_at !== snapshotPart.absent_at
+    )
+      conflict(
+        "Final creator evidence requires the exact independently journaled producer pieces",
+      );
     const priorDriver = journal(row).entries.find(
         (e) => e.measurement.gate === "host_mount_context",
       )?.execution.driver_pod_uid,
@@ -1072,6 +1364,26 @@ async function measuredHolder(
     return;
   }
   if (m.gate === "cleanup") {
+    const nonceHash = await postgresPoolQualificationNonceHash(report.nonce),
+      controller = journal(row).progress.find(
+        (e) =>
+          e.nonce_sha256 === nonceHash &&
+          e.progress.phase === "controller_cleanup_observed",
+      )?.progress;
+    if (
+      !controller ||
+      controller.phase !== "controller_cleanup_observed" ||
+      controller.namespace_uid !== s.volume.namespace_uid ||
+      controller.cnpg_cluster_uid !== s.volume.cluster_uid ||
+      controller.hibernation !== m.cnpg_hibernation ||
+      controller.remaining_instance_pods !== m.remaining_instance_pods ||
+      controller.remaining_pool_pods !== m.remaining_pool_pods ||
+      (controller.primary_lease?.holder_identity != null ? 1 : 0) !==
+        m.remaining_primary_lease_holders
+    )
+      conflict(
+        "Cleanup requires the independently journaled Kubernetes observation",
+      );
     const state = await readPostgresPoolDatabaseContext(env, s.database_id);
     if (
       state.row.desired_state !== "suspended" ||
@@ -1422,7 +1734,12 @@ export async function reportPostgresPoolQualification(
         WHERE id=? AND status='running' AND expires_at>? AND evidence_json=? AND ${sql}`,
       )
         .bind(
-          canonicalInstallation({ version: 1, pending: null, entries }),
+          canonicalInstallation({
+            version: 1,
+            pending: null,
+            entries,
+            progress: passed ? [] : j.progress,
+          }),
           ended ? "cleanup" : "running",
           passed ? null : "pool_qualification_gate_failed",
           now,
@@ -1491,7 +1808,12 @@ async function complete(
     )
   )
     conflict("Qualification gates are incomplete");
-  const material = { scope: s, evidence: j.entries, cleanup },
+  const material = {
+      scope: s,
+      evidence: j.entries,
+      cleanup,
+      cleanup_progress: j.progress,
+    },
     evidenceJson = canonicalInstallation(material),
     evidenceHash = await installationHash(material),
     qualifiedAt = new Date(now).toISOString(),

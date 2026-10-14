@@ -39,7 +39,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /agent/v1/nodes/{id}/postgres-pool/qualification": route(
     "reportPostgresPoolQualification",
-    "Consume a scoped challenge with actual measured gate evidence",
+    "Record scoped progress or consume measured qualification evidence",
     "agent",
   ),
   "POST /agent/v1/nodes/{id}/postgres-pool/preparations": route(

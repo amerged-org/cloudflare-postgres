@@ -6,6 +6,7 @@ import {
   PostgresPoolQualificationRun,
   PostgresPoolQualificationInput,
   PostgresPoolQualificationReport,
+  PostgresPoolQualificationProgressReport,
 } from "@pgcf/contracts/postgres-pool-qualification";
 import type { ApiApp } from "../app.ts";
 import {
@@ -14,6 +15,7 @@ import {
   cancelPostgresPoolQualification,
   getPostgresPoolQualificationInput,
   reportPostgresPoolQualification,
+  recordPostgresPoolQualificationProgress,
 } from "../domain/postgres-pool-qualification.ts";
 const content = (schema: z.ZodType) => ({ "application/json": { schema } });
 const errors = (statuses: readonly number[]) =>
@@ -131,33 +133,48 @@ export function registerPostgresPoolQualification(app: ApiApp) {
       tags: ["PostgreSQL pool"],
       security: [{ AgentBearer: [] }],
       operationId: "reportPostgresPoolQualification",
-      summary: "Consume a scoped challenge with actual measured gate evidence",
+      summary:
+        "Record scoped progress or consume measured qualification evidence",
       request: {
         params: z.object({ id: NodeId }),
         body: {
           required: true,
-          content: content(PostgresPoolQualificationReport),
+          content: content(
+            z.union([
+              PostgresPoolQualificationReport,
+              PostgresPoolQualificationProgressReport,
+            ]),
+          ),
         },
       },
       responses: {
         200: {
           description:
-            "Challenge accepted; gate decisions and cleanup follow measured values",
+            "Pending progress recorded without consuming the challenge, or measured gate evidence accepted",
           content: content(
-            z.strictObject({
-              accepted: z.literal(true),
-              run: PostgresPoolQualificationRun,
-            }),
+            z.union([
+              z.strictObject({ recorded: z.literal(true) }),
+              z.strictObject({
+                accepted: z.literal(true),
+                run: PostgresPoolQualificationRun,
+              }),
+            ]),
           ),
         },
         ...errors([400, 401, 404, 409, 500]),
       },
     }),
-    async (c) =>
-      reportPostgresPoolQualification(
-        c,
-        NodeId.parse(c.req.param("id")),
-        PostgresPoolQualificationReport.parse(await c.req.json()),
-      ),
+    async (c) => {
+      const body = z
+          .union([
+            PostgresPoolQualificationReport,
+            PostgresPoolQualificationProgressReport,
+          ])
+          .parse(await c.req.json()),
+        node = NodeId.parse(c.req.param("id"));
+      return "progress" in body
+        ? recordPostgresPoolQualificationProgress(c, node, body)
+        : reportPostgresPoolQualification(c, node, body);
+    },
   );
 }

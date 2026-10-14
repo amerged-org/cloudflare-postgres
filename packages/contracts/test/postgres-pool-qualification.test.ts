@@ -4,8 +4,10 @@ import {
   PostgresPoolQualificationScope,
   PostgresPoolQualificationReport,
   PostgresPoolQualificationMeasurement,
+  PostgresPoolQualificationProgressReport,
   postgresPoolQualificationGatePassed,
   postgresPoolQualificationScopeHash,
+  postgresPoolQualificationProgressHash,
   signPoolQualificationPermission,
   verifyPoolQualificationPermission,
 } from "../src/postgres-pool-qualification.ts";
@@ -206,6 +208,7 @@ it("signs only a bounded current qualification challenge and detects tampering a
         kernel_version: scope.software.kernel_version,
       },
       preparation_sha256: null,
+      progress_sha256: await postgresPoolQualificationProgressHash([]),
       iat: now,
       exp: now + 30_000,
     },
@@ -331,5 +334,41 @@ it("allows the finite creator experiment before any tenant binding exists", asyn
         final_dm_open_count: 1,
       }),
     ),
+  ).toBe(false);
+});
+
+it("records bounded controller action intent without claiming a measured gate passed", () => {
+  const s = qualificationScopeFixture(),
+    report = {
+      run_id: s.run_id,
+      scope_sha256: "a".repeat(64),
+      sequence: 2,
+      nonce: "b".repeat(32),
+      producer: "controller",
+      node_uid: s.node_uid,
+      boot_id: s.boot_id,
+      candidate_spec_sha256: s.candidate_spec_sha256,
+      started_at: 1,
+      observed_at: 2,
+      progress: {
+        gate: "finite_creator_fence",
+        phase: "driver_delete_intent",
+        driver_pod_uid: s.volume.pv_uid,
+        driver_pod_name: "driver-known",
+        driver_pod_resource_version: "2",
+        driver_namespace: "openebs",
+        driver_daemonset_uid: s.volume.pvc_uid,
+        driver_image: s.software.driver_image,
+      },
+    };
+  expect(
+    PostgresPoolQualificationProgressReport.safeParse(report).success,
+  ).toBe(true);
+  expect(PostgresPoolQualificationReport.safeParse(report).success).toBe(false);
+  expect(
+    PostgresPoolQualificationProgressReport.safeParse({
+      ...report,
+      passed: true,
+    }).success,
   ).toBe(false);
 });

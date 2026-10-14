@@ -432,6 +432,7 @@
             { "type": "null" }
           ]
         },
+        "progress_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "exp": {
           "type": "integer",
@@ -447,6 +448,7 @@
         "challenge",
         "execution",
         "preparation_sha256",
+        "progress_sha256",
         "iat",
         "exp"
       ],
@@ -8417,6 +8419,560 @@
             },
             { "type": "null" }
           ]
+        },
+        "pending_progress": {
+          "maxItems": 7,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "sequence": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "producer": {
+                "type": "string",
+                "enum": ["node_agent", "controller"]
+              },
+              "issued_at": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "started_at": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "observed_at": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "received_at": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "nonce_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "execution": {
+                "type": "object",
+                "properties": {
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "boot_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "candidate_release_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+                  },
+                  "candidate_spec_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "verifier_keys_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "driver_pod_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "driver_image": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                  },
+                  "driver_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "host_extension_image": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                  },
+                  "host_controller_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "kernel_version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "node_uid",
+                  "boot_id",
+                  "candidate_release_id",
+                  "candidate_spec_sha256",
+                  "verifier_keys_sha256",
+                  "driver_pod_uid",
+                  "driver_image",
+                  "driver_sha256",
+                  "host_extension_image",
+                  "host_controller_sha256",
+                  "kernel_version"
+                ],
+                "additionalProperties": false
+              },
+              "progress": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": {
+                        "type": "string",
+                        "const": "finite_creator_fence"
+                      },
+                      "phase": {
+                        "type": "string",
+                        "const": "node_fence_ready"
+                      },
+                      "source_generation": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "volume_handle": {
+                        "type": "string",
+                        "pattern": "^pvc-[a-f0-9-]{36}$"
+                      },
+                      "driver_sha256": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      },
+                      "deny_record_inode": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "deny_record_sha256": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      },
+                      "deny_record_scope_sha256": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      },
+                      "deny_record_fsync_errno": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4095
+                      },
+                      "agent_owner_deaths": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "before_claim_requests_completed": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "surviving_creation_descriptors": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "dm_open_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "foreign_mounts": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "named_namespace_scan_errno": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4095
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "source_generation",
+                      "volume_handle",
+                      "driver_sha256",
+                      "deny_record_inode",
+                      "deny_record_sha256",
+                      "deny_record_scope_sha256",
+                      "deny_record_fsync_errno",
+                      "agent_owner_deaths",
+                      "before_claim_requests_completed",
+                      "surviving_creation_descriptors",
+                      "dm_open_count",
+                      "foreign_mounts",
+                      "named_namespace_scan_errno"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": {
+                        "type": "string",
+                        "const": "finite_creator_fence"
+                      },
+                      "phase": {
+                        "type": "string",
+                        "const": "driver_delete_intent"
+                      },
+                      "driver_pod_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "driver_pod_name": {
+                        "type": "string",
+                        "maxLength": 253,
+                        "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                      },
+                      "driver_pod_resource_version": {
+                        "type": "string",
+                        "pattern": "^[0-9]{1,128}$"
+                      },
+                      "driver_namespace": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "driver_daemonset_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "driver_image": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "driver_pod_uid",
+                      "driver_pod_name",
+                      "driver_pod_resource_version",
+                      "driver_namespace",
+                      "driver_daemonset_uid",
+                      "driver_image"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": {
+                        "type": "string",
+                        "const": "finite_creator_fence"
+                      },
+                      "phase": {
+                        "type": "string",
+                        "const": "driver_restarted"
+                      },
+                      "driver_pod_uid_before_restart": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "driver_pod_uid_after_restart": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "driver_daemonset_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "driver_image": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                      },
+                      "driver_deleted_at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "driver_replacement_ready_at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "volume_reconcile_error": {
+                        "type": "string",
+                        "const": "pool_creator_fence_denied"
+                      },
+                      "volume_reconcile_observed_at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "driver_pod_uid_before_restart",
+                      "driver_pod_uid_after_restart",
+                      "driver_daemonset_uid",
+                      "driver_image",
+                      "driver_deleted_at",
+                      "driver_replacement_ready_at",
+                      "volume_reconcile_error",
+                      "volume_reconcile_observed_at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": {
+                        "type": "string",
+                        "const": "finite_creator_fence"
+                      },
+                      "phase": {
+                        "type": "string",
+                        "const": "snapshot_create_intent"
+                      },
+                      "snapshot_name": {
+                        "type": "string",
+                        "maxLength": 253,
+                        "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                      },
+                      "snapshot_namespace": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "source_volume_handle": {
+                        "type": "string",
+                        "pattern": "^pvc-[a-f0-9-]{36}$"
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "snapshot_name",
+                      "snapshot_namespace",
+                      "source_volume_handle"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": {
+                        "type": "string",
+                        "const": "finite_creator_fence"
+                      },
+                      "phase": {
+                        "type": "string",
+                        "const": "snapshot_created"
+                      },
+                      "snapshot_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "snapshot_resource_version": {
+                        "type": "string",
+                        "pattern": "^[0-9]{1,128}$"
+                      },
+                      "snapshot_name": {
+                        "type": "string",
+                        "maxLength": 253,
+                        "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                      },
+                      "snapshot_namespace": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "source_volume_handle": {
+                        "type": "string",
+                        "pattern": "^pvc-[a-f0-9-]{36}$"
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "snapshot_uid",
+                      "snapshot_resource_version",
+                      "snapshot_name",
+                      "snapshot_namespace",
+                      "source_volume_handle"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": {
+                        "type": "string",
+                        "const": "finite_creator_fence"
+                      },
+                      "phase": {
+                        "type": "string",
+                        "const": "snapshot_removed"
+                      },
+                      "snapshot_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "source_volume_handle": {
+                        "type": "string",
+                        "pattern": "^pvc-[a-f0-9-]{36}$"
+                      },
+                      "state_at_denial": {
+                        "type": "string",
+                        "const": "Pending"
+                      },
+                      "error": {
+                        "type": "string",
+                        "const": "pool_creator_fence_denied"
+                      },
+                      "requested_at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "deleted_at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "absent_at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "physical_snapshot_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "snapshot_uid",
+                      "source_volume_handle",
+                      "state_at_denial",
+                      "error",
+                      "requested_at",
+                      "deleted_at",
+                      "absent_at",
+                      "physical_snapshot_count"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "gate": { "type": "string", "const": "cleanup" },
+                      "phase": {
+                        "type": "string",
+                        "const": "controller_cleanup_observed"
+                      },
+                      "namespace_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "cnpg_cluster_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "hibernation": {
+                        "type": "string",
+                        "enum": ["on", "off", "unknown"]
+                      },
+                      "remaining_instance_pods": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "remaining_pool_pods": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "primary_lease": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "uid": {
+                                "type": "string",
+                                "format": "uuid",
+                                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                              },
+                              "resource_version": {
+                                "type": "string",
+                                "pattern": "^[0-9]{1,128}$"
+                              },
+                              "holder_identity": {
+                                "anyOf": [
+                                  { "type": "string", "maxLength": 253 },
+                                  { "type": "null" }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "uid",
+                              "resource_version",
+                              "holder_identity"
+                            ],
+                            "additionalProperties": false
+                          },
+                          { "type": "null" }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "gate",
+                      "phase",
+                      "namespace_uid",
+                      "cnpg_cluster_uid",
+                      "hibernation",
+                      "remaining_instance_pods",
+                      "remaining_pool_pods",
+                      "primary_lease"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "required": [
+              "sequence",
+              "producer",
+              "issued_at",
+              "started_at",
+              "observed_at",
+              "received_at",
+              "nonce_sha256",
+              "execution",
+              "progress"
+            ],
+            "additionalProperties": false
+          }
         }
       },
       "required": [
@@ -8428,7 +8984,8 @@
         "permission",
         "policy",
         "accepted_evidence",
-        "accepted_sleep"
+        "accepted_sleep",
+        "pending_progress"
       ],
       "additionalProperties": false,
       "$defs": {
@@ -12434,6 +12991,1356 @@
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
       }
+    },
+    "PostgresPoolQualificationProgress": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "finite_creator_fence" },
+            "phase": { "type": "string", "const": "node_fence_ready" },
+            "source_generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "volume_handle": {
+              "type": "string",
+              "pattern": "^pvc-[a-f0-9-]{36}$"
+            },
+            "driver_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "deny_record_inode": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "deny_record_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "deny_record_scope_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "deny_record_fsync_errno": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4095
+            },
+            "agent_owner_deaths": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "before_claim_requests_completed": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "surviving_creation_descriptors": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "dm_open_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "foreign_mounts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "named_namespace_scan_errno": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4095
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "source_generation",
+            "volume_handle",
+            "driver_sha256",
+            "deny_record_inode",
+            "deny_record_sha256",
+            "deny_record_scope_sha256",
+            "deny_record_fsync_errno",
+            "agent_owner_deaths",
+            "before_claim_requests_completed",
+            "surviving_creation_descriptors",
+            "dm_open_count",
+            "foreign_mounts",
+            "named_namespace_scan_errno"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "finite_creator_fence" },
+            "phase": { "type": "string", "const": "driver_delete_intent" },
+            "driver_pod_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "driver_pod_name": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+            },
+            "driver_pod_resource_version": {
+              "type": "string",
+              "pattern": "^[0-9]{1,128}$"
+            },
+            "driver_namespace": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+            },
+            "driver_daemonset_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "driver_image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "driver_pod_uid",
+            "driver_pod_name",
+            "driver_pod_resource_version",
+            "driver_namespace",
+            "driver_daemonset_uid",
+            "driver_image"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "finite_creator_fence" },
+            "phase": { "type": "string", "const": "driver_restarted" },
+            "driver_pod_uid_before_restart": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "driver_pod_uid_after_restart": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "driver_daemonset_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "driver_image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+            },
+            "driver_deleted_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "driver_replacement_ready_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "volume_reconcile_error": {
+              "type": "string",
+              "const": "pool_creator_fence_denied"
+            },
+            "volume_reconcile_observed_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "driver_pod_uid_before_restart",
+            "driver_pod_uid_after_restart",
+            "driver_daemonset_uid",
+            "driver_image",
+            "driver_deleted_at",
+            "driver_replacement_ready_at",
+            "volume_reconcile_error",
+            "volume_reconcile_observed_at"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "finite_creator_fence" },
+            "phase": { "type": "string", "const": "snapshot_create_intent" },
+            "snapshot_name": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+            },
+            "snapshot_namespace": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+            },
+            "source_volume_handle": {
+              "type": "string",
+              "pattern": "^pvc-[a-f0-9-]{36}$"
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "snapshot_name",
+            "snapshot_namespace",
+            "source_volume_handle"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "finite_creator_fence" },
+            "phase": { "type": "string", "const": "snapshot_created" },
+            "snapshot_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "snapshot_resource_version": {
+              "type": "string",
+              "pattern": "^[0-9]{1,128}$"
+            },
+            "snapshot_name": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+            },
+            "snapshot_namespace": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+            },
+            "source_volume_handle": {
+              "type": "string",
+              "pattern": "^pvc-[a-f0-9-]{36}$"
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "snapshot_uid",
+            "snapshot_resource_version",
+            "snapshot_name",
+            "snapshot_namespace",
+            "source_volume_handle"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "finite_creator_fence" },
+            "phase": { "type": "string", "const": "snapshot_removed" },
+            "snapshot_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "source_volume_handle": {
+              "type": "string",
+              "pattern": "^pvc-[a-f0-9-]{36}$"
+            },
+            "state_at_denial": { "type": "string", "const": "Pending" },
+            "error": { "type": "string", "const": "pool_creator_fence_denied" },
+            "requested_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "deleted_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "absent_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "physical_snapshot_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "snapshot_uid",
+            "source_volume_handle",
+            "state_at_denial",
+            "error",
+            "requested_at",
+            "deleted_at",
+            "absent_at",
+            "physical_snapshot_count"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gate": { "type": "string", "const": "cleanup" },
+            "phase": {
+              "type": "string",
+              "const": "controller_cleanup_observed"
+            },
+            "namespace_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "cnpg_cluster_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "hibernation": {
+              "type": "string",
+              "enum": ["on", "off", "unknown"]
+            },
+            "remaining_instance_pods": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "remaining_pool_pods": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "primary_lease": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "resource_version": {
+                      "type": "string",
+                      "pattern": "^[0-9]{1,128}$"
+                    },
+                    "holder_identity": {
+                      "anyOf": [
+                        { "type": "string", "maxLength": 253 },
+                        { "type": "null" }
+                      ]
+                    }
+                  },
+                  "required": ["uid", "resource_version", "holder_identity"],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "gate",
+            "phase",
+            "namespace_uid",
+            "cnpg_cluster_uid",
+            "hibernation",
+            "remaining_instance_pods",
+            "remaining_pool_pods",
+            "primary_lease"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PostgresPoolQualificationProgressReport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "scope_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "sequence": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "nonce": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+        "producer": { "type": "string", "enum": ["node_agent", "controller"] },
+        "node_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "boot_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "candidate_spec_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "started_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "observed_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "progress": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "node_fence_ready" },
+                "source_generation": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                },
+                "driver_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "deny_record_inode": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "deny_record_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "deny_record_scope_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "deny_record_fsync_errno": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4095
+                },
+                "agent_owner_deaths": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "before_claim_requests_completed": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "surviving_creation_descriptors": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "dm_open_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "foreign_mounts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "named_namespace_scan_errno": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4095
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "source_generation",
+                "volume_handle",
+                "driver_sha256",
+                "deny_record_inode",
+                "deny_record_sha256",
+                "deny_record_scope_sha256",
+                "deny_record_fsync_errno",
+                "agent_owner_deaths",
+                "before_claim_requests_completed",
+                "surviving_creation_descriptors",
+                "dm_open_count",
+                "foreign_mounts",
+                "named_namespace_scan_errno"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "driver_delete_intent" },
+                "driver_pod_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_pod_name": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                },
+                "driver_pod_resource_version": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,128}$"
+                },
+                "driver_namespace": {
+                  "type": "string",
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                },
+                "driver_daemonset_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_image": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "driver_pod_uid",
+                "driver_pod_name",
+                "driver_pod_resource_version",
+                "driver_namespace",
+                "driver_daemonset_uid",
+                "driver_image"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "driver_restarted" },
+                "driver_pod_uid_before_restart": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_pod_uid_after_restart": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_daemonset_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_image": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                },
+                "driver_deleted_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "driver_replacement_ready_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "volume_reconcile_error": {
+                  "type": "string",
+                  "const": "pool_creator_fence_denied"
+                },
+                "volume_reconcile_observed_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "driver_pod_uid_before_restart",
+                "driver_pod_uid_after_restart",
+                "driver_daemonset_uid",
+                "driver_image",
+                "driver_deleted_at",
+                "driver_replacement_ready_at",
+                "volume_reconcile_error",
+                "volume_reconcile_observed_at"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": {
+                  "type": "string",
+                  "const": "snapshot_create_intent"
+                },
+                "snapshot_name": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                },
+                "snapshot_namespace": {
+                  "type": "string",
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                },
+                "source_volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "snapshot_name",
+                "snapshot_namespace",
+                "source_volume_handle"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "snapshot_created" },
+                "snapshot_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "snapshot_resource_version": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,128}$"
+                },
+                "snapshot_name": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                },
+                "snapshot_namespace": {
+                  "type": "string",
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                },
+                "source_volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "snapshot_uid",
+                "snapshot_resource_version",
+                "snapshot_name",
+                "snapshot_namespace",
+                "source_volume_handle"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "snapshot_removed" },
+                "snapshot_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "source_volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                },
+                "state_at_denial": { "type": "string", "const": "Pending" },
+                "error": {
+                  "type": "string",
+                  "const": "pool_creator_fence_denied"
+                },
+                "requested_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "deleted_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "absent_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "physical_snapshot_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "snapshot_uid",
+                "source_volume_handle",
+                "state_at_denial",
+                "error",
+                "requested_at",
+                "deleted_at",
+                "absent_at",
+                "physical_snapshot_count"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "cleanup" },
+                "phase": {
+                  "type": "string",
+                  "const": "controller_cleanup_observed"
+                },
+                "namespace_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "cnpg_cluster_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "hibernation": {
+                  "type": "string",
+                  "enum": ["on", "off", "unknown"]
+                },
+                "remaining_instance_pods": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "remaining_pool_pods": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "primary_lease": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "resource_version": {
+                          "type": "string",
+                          "pattern": "^[0-9]{1,128}$"
+                        },
+                        "holder_identity": {
+                          "anyOf": [
+                            { "type": "string", "maxLength": 253 },
+                            { "type": "null" }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "uid",
+                        "resource_version",
+                        "holder_identity"
+                      ],
+                      "additionalProperties": false
+                    },
+                    { "type": "null" }
+                  ]
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "namespace_uid",
+                "cnpg_cluster_uid",
+                "hibernation",
+                "remaining_instance_pods",
+                "remaining_pool_pods",
+                "primary_lease"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "scope_sha256",
+        "sequence",
+        "nonce",
+        "producer",
+        "node_uid",
+        "boot_id",
+        "candidate_spec_sha256",
+        "started_at",
+        "observed_at",
+        "progress"
+      ],
+      "additionalProperties": false
+    },
+    "PostgresPoolQualificationProgressEvidence": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "producer": { "type": "string", "enum": ["node_agent", "controller"] },
+        "issued_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "started_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "observed_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "received_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "nonce_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "execution": {
+          "type": "object",
+          "properties": {
+            "node_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "boot_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "candidate_release_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+            },
+            "candidate_spec_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "verifier_keys_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "driver_pod_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "driver_image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+            },
+            "driver_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "host_extension_image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+            },
+            "host_controller_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "kernel_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "node_uid",
+            "boot_id",
+            "candidate_release_id",
+            "candidate_spec_sha256",
+            "verifier_keys_sha256",
+            "driver_pod_uid",
+            "driver_image",
+            "driver_sha256",
+            "host_extension_image",
+            "host_controller_sha256",
+            "kernel_version"
+          ],
+          "additionalProperties": false
+        },
+        "progress": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "node_fence_ready" },
+                "source_generation": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                },
+                "driver_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "deny_record_inode": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "deny_record_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "deny_record_scope_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "deny_record_fsync_errno": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4095
+                },
+                "agent_owner_deaths": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "before_claim_requests_completed": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "surviving_creation_descriptors": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "dm_open_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "foreign_mounts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "named_namespace_scan_errno": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4095
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "source_generation",
+                "volume_handle",
+                "driver_sha256",
+                "deny_record_inode",
+                "deny_record_sha256",
+                "deny_record_scope_sha256",
+                "deny_record_fsync_errno",
+                "agent_owner_deaths",
+                "before_claim_requests_completed",
+                "surviving_creation_descriptors",
+                "dm_open_count",
+                "foreign_mounts",
+                "named_namespace_scan_errno"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "driver_delete_intent" },
+                "driver_pod_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_pod_name": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                },
+                "driver_pod_resource_version": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,128}$"
+                },
+                "driver_namespace": {
+                  "type": "string",
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                },
+                "driver_daemonset_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_image": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "driver_pod_uid",
+                "driver_pod_name",
+                "driver_pod_resource_version",
+                "driver_namespace",
+                "driver_daemonset_uid",
+                "driver_image"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "driver_restarted" },
+                "driver_pod_uid_before_restart": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_pod_uid_after_restart": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_daemonset_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "driver_image": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                },
+                "driver_deleted_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "driver_replacement_ready_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "volume_reconcile_error": {
+                  "type": "string",
+                  "const": "pool_creator_fence_denied"
+                },
+                "volume_reconcile_observed_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "driver_pod_uid_before_restart",
+                "driver_pod_uid_after_restart",
+                "driver_daemonset_uid",
+                "driver_image",
+                "driver_deleted_at",
+                "driver_replacement_ready_at",
+                "volume_reconcile_error",
+                "volume_reconcile_observed_at"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": {
+                  "type": "string",
+                  "const": "snapshot_create_intent"
+                },
+                "snapshot_name": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                },
+                "snapshot_namespace": {
+                  "type": "string",
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                },
+                "source_volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "snapshot_name",
+                "snapshot_namespace",
+                "source_volume_handle"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "snapshot_created" },
+                "snapshot_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "snapshot_resource_version": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,128}$"
+                },
+                "snapshot_name": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                },
+                "snapshot_namespace": {
+                  "type": "string",
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+                },
+                "source_volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "snapshot_uid",
+                "snapshot_resource_version",
+                "snapshot_name",
+                "snapshot_namespace",
+                "source_volume_handle"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "finite_creator_fence" },
+                "phase": { "type": "string", "const": "snapshot_removed" },
+                "snapshot_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "source_volume_handle": {
+                  "type": "string",
+                  "pattern": "^pvc-[a-f0-9-]{36}$"
+                },
+                "state_at_denial": { "type": "string", "const": "Pending" },
+                "error": {
+                  "type": "string",
+                  "const": "pool_creator_fence_denied"
+                },
+                "requested_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "deleted_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "absent_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "physical_snapshot_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "snapshot_uid",
+                "source_volume_handle",
+                "state_at_denial",
+                "error",
+                "requested_at",
+                "deleted_at",
+                "absent_at",
+                "physical_snapshot_count"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "gate": { "type": "string", "const": "cleanup" },
+                "phase": {
+                  "type": "string",
+                  "const": "controller_cleanup_observed"
+                },
+                "namespace_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "cnpg_cluster_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "hibernation": {
+                  "type": "string",
+                  "enum": ["on", "off", "unknown"]
+                },
+                "remaining_instance_pods": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "remaining_pool_pods": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "primary_lease": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "resource_version": {
+                          "type": "string",
+                          "pattern": "^[0-9]{1,128}$"
+                        },
+                        "holder_identity": {
+                          "anyOf": [
+                            { "type": "string", "maxLength": 253 },
+                            { "type": "null" }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "uid",
+                        "resource_version",
+                        "holder_identity"
+                      ],
+                      "additionalProperties": false
+                    },
+                    { "type": "null" }
+                  ]
+                }
+              },
+              "required": [
+                "gate",
+                "phase",
+                "namespace_uid",
+                "cnpg_cluster_uid",
+                "hibernation",
+                "remaining_instance_pods",
+                "remaining_pool_pods",
+                "primary_lease"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": [
+        "sequence",
+        "producer",
+        "issued_at",
+        "started_at",
+        "observed_at",
+        "received_at",
+        "nonce_sha256",
+        "execution",
+        "progress"
+      ],
+      "additionalProperties": false
     }
   },
   "fixture": {
@@ -12519,8 +14426,83 @@
         "kernel_version": "6.18.54-talos"
       },
       "preparation_sha256": null,
+      "progress_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
       "iat": 1000,
       "exp": 31000
-    }
+    },
+    "progress": [
+      {
+        "sequence": 2,
+        "producer": "node_agent",
+        "issued_at": 1000,
+        "started_at": 1001,
+        "observed_at": 1002,
+        "received_at": 1003,
+        "nonce_sha256": "3ba3f5f43b92602683c19aee62a20342b084dd5971ddd33808d81a328879a547",
+        "execution": {
+          "node_uid": "00000000-0000-4000-8000-000000000002",
+          "boot_id": "00000000-0000-4000-8000-000000000003",
+          "candidate_release_id": "pool-candidate",
+          "candidate_spec_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "verifier_keys_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+          "driver_pod_uid": "00000000-0000-4000-8000-000000000099",
+          "driver_image": "ghcr.io/amerged-org/pgcf-regional:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "driver_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "host_extension_image": "ghcr.io/amerged-org/pgcf-regional:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_controller_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "kernel_version": "6.18.54-talos"
+        },
+        "progress": {
+          "gate": "finite_creator_fence",
+          "phase": "node_fence_ready",
+          "source_generation": 1,
+          "volume_handle": "pvc-00000000-0000-4000-8000-000000000008",
+          "driver_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "deny_record_inode": 9007199254740991,
+          "deny_record_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "deny_record_scope_sha256": "0e7962f97ba2fa90c31f291ed30afb034e9bb5ea44dc65dfde866ba32297458e",
+          "deny_record_fsync_errno": 0,
+          "agent_owner_deaths": 1,
+          "before_claim_requests_completed": 1,
+          "surviving_creation_descriptors": 0,
+          "dm_open_count": 0,
+          "foreign_mounts": 0,
+          "named_namespace_scan_errno": 0
+        }
+      },
+      {
+        "sequence": 2,
+        "producer": "controller",
+        "issued_at": 1000,
+        "started_at": 1004,
+        "observed_at": 1005,
+        "received_at": 1006,
+        "nonce_sha256": "3ba3f5f43b92602683c19aee62a20342b084dd5971ddd33808d81a328879a547",
+        "execution": {
+          "node_uid": "00000000-0000-4000-8000-000000000002",
+          "boot_id": "00000000-0000-4000-8000-000000000003",
+          "candidate_release_id": "pool-candidate",
+          "candidate_spec_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "verifier_keys_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+          "driver_pod_uid": "00000000-0000-4000-8000-000000000099",
+          "driver_image": "ghcr.io/amerged-org/pgcf-regional:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "driver_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "host_extension_image": "ghcr.io/amerged-org/pgcf-regional:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "host_controller_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "kernel_version": "6.18.54-talos"
+        },
+        "progress": {
+          "gate": "finite_creator_fence",
+          "phase": "driver_delete_intent",
+          "driver_pod_uid": "00000000-0000-4000-8000-000000000099",
+          "driver_pod_name": "driver-known",
+          "driver_pod_resource_version": "0012",
+          "driver_namespace": "openebs",
+          "driver_daemonset_uid": "00000000-0000-4000-8000-000000000098",
+          "driver_image": "ghcr.io/amerged-org/pgcf-regional:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ],
+    "progress_sha256": "3c0ea0a385a3db344957b5679533c936f97f830ff1d4cd09ce27ab4e468da73c"
   }
 }

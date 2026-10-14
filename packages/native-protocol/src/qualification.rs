@@ -20,12 +20,31 @@ pub fn validate(name: &str, value: &Value) -> bool {
     match name {
         "PostgresPoolQualificationScope" => scope_valid(value),
         "PoolQualificationClaims" => scope_valid(&value["scope"]),
-        "PostgresPoolQualificationReport" => value["observed_at"]
-            .as_u64()
-            .zip(value["started_at"].as_u64())
-            .is_some_and(|(observed, started)| observed >= started),
+        "PostgresPoolQualificationReport" | "PostgresPoolQualificationProgressReport" => {
+            value["observed_at"]
+                .as_u64()
+                .zip(value["started_at"].as_u64())
+                .is_some_and(|(observed, started)| observed >= started)
+        }
         _ => true,
     }
+}
+/// Link the authenticated CF pending pieces to the digest in its pq1 permission.
+pub fn progress_hash(progress: &Value) -> Option<String> {
+    let entries = progress.as_array()?;
+    if entries.len() > 7
+        || entries
+            .iter()
+            .any(|entry| !validate("PostgresPoolQualificationProgressEvidence", entry))
+    {
+        return None;
+    }
+    Some(
+        Sha256::digest(serde_json::to_vec(progress).ok()?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 fn scope_valid(value: &Value) -> bool {
     let storage = &value["storage"];
@@ -163,6 +182,10 @@ mod tests {
     #[test]
     fn actual_signature_and_finite_preparation_boundaries() {
         let mut c = claims();
+        assert_eq!(
+            progress_hash(&serde_json::json!([])).as_deref(),
+            c["progress_sha256"].as_str()
+        );
         let (token, keys) = signed(&c);
         assert_eq!(
             verify_qualification_permission(&token, &keys, 1000),
@@ -181,6 +204,25 @@ mod tests {
         c["preparation_sha256"] = Value::from("b".repeat(64));
         parts[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&c).unwrap());
         assert!(verify_qualification_permission(&parts.join("."), &keys, 1000).is_none());
+    }
+    #[test]
+    fn nonempty_typescript_progress_hash_binds_every_recorded_field() {
+        let progress = &CONTRACT["fixture"]["progress"];
+        assert!(
+            !progress
+                .as_array()
+                .expect("nonempty TS progress vector")
+                .is_empty()
+        );
+        assert_eq!(
+            progress_hash(progress).as_deref(),
+            CONTRACT["fixture"]["progress_sha256"].as_str()
+        );
+        let mut changed = progress.clone();
+        changed[0]["received_at"] = Value::from(1005);
+        assert_ne!(progress_hash(&changed), progress_hash(progress));
+        changed[0]["progress"]["passed"] = Value::from(true);
+        assert!(progress_hash(&changed).is_none());
     }
     #[test]
     fn re_signed_scope_drift_and_overlong_expiry_are_refused() {

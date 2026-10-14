@@ -14,6 +14,7 @@ import type {
 } from "@pgcf/contracts/postgres-pool-qualification";
 import { verifyPoolQualificationPermission } from "@pgcf/contracts/postgres-pool-qualification";
 import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
+import { installationHash } from "../../src/domain/node-installation.ts";
 import { readCurrentNodeThinStorage } from "../../src/domain/node-thin-storage.ts";
 import {
   thinStorageAuthorityMatches,
@@ -32,6 +33,80 @@ import { readPostgresPoolQualificationSetup } from "../../src/domain/postgres-po
 
 const runs: string[] = [];
 const releases: string[] = [];
+it("publishes pending progress separately from challenge consumption", async () => {
+  const response = await request("/agent/v1/openapi.json");
+  expect(response.status).toBe(200);
+  const doc = (await response.json()) as {
+    paths: Record<
+      string,
+      {
+        post: {
+          summary: string;
+          requestBody: {
+            content: Record<
+              string,
+              { schema: { anyOf: { required: string[] }[] } }
+            >;
+          };
+          responses: Record<
+            string,
+            {
+              content: Record<
+                string,
+                { schema: { anyOf: { required: string[] }[] } }
+              >;
+            }
+          >;
+        };
+      }
+    >;
+  };
+  const post =
+    doc.paths["/agent/v1/nodes/{id}/postgres-pool/qualification"]!.post;
+  expect(
+    post.requestBody.content["application/json"]!.schema.anyOf.map((s) =>
+      s.required.includes("progress"),
+    ),
+  ).toEqual([false, true]);
+  expect(
+    post.responses["200"]!.content["application/json"]!.schema.anyOf.map(
+      (s) => s.required,
+    ),
+  ).toEqual([["recorded"], ["accepted", "run"]]);
+  expect(post.summary).toMatch(/progress/);
+});
+async function recordCleanupController(
+  f: Awaited<ReturnType<typeof poolQualificationSource>>,
+  run: PostgresPoolQualificationRun,
+  report: Record<string, unknown>,
+) {
+  const { measurement: ignored, ...base } = report;
+  void ignored;
+  expect(
+    (
+      await request(
+        `/agent/v1/nodes/${f.node}/postgres-pool/qualification`,
+        f.agent,
+        "POST",
+        {
+          ...base,
+          producer: "controller",
+          progress: {
+            gate: "cleanup",
+            phase: "controller_cleanup_observed",
+            namespace_uid: run.scope.volume.namespace_uid,
+            cnpg_cluster_uid: run.scope.volume.cluster_uid,
+            hibernation: "on",
+            remaining_instance_pods: 0,
+            remaining_pool_pods: 0,
+            primary_lease: null,
+          },
+        },
+      )
+    ).status,
+  ).toBe(200);
+}
+
 it("does not accept a namespace-only probe as the host inspection gate", async () => {
   const f = await poolQualificationSource(releases),
     started = await request(
@@ -643,6 +718,45 @@ it("waits for authenticated driver replacement before consuming finite creator e
       measurement,
     };
   expect((await request(url, f.agent, "POST", report)).status).toBe(409);
+  const { measurement: ignoredPart, ...partBase } = report;
+  void ignoredPart;
+  const piece = (producer: string, progress: unknown) =>
+    request(url, f.agent, "POST", { ...partBase, producer, progress });
+  expect(
+    (
+      await piece("node_agent", {
+        gate: "finite_creator_fence",
+        phase: "node_fence_ready",
+        source_generation: measurement.source_generation,
+        volume_handle: measurement.volume_handle,
+        driver_sha256: measurement.driver_sha256,
+        deny_record_inode: measurement.deny_record_inode_before_restart,
+        deny_record_sha256: measurement.deny_record_sha256_before_restart,
+        deny_record_scope_sha256: run.scope_sha256,
+        deny_record_fsync_errno: 0,
+        agent_owner_deaths: 1,
+        before_claim_requests_completed: 1,
+        surviving_creation_descriptors: 0,
+        dm_open_count: 0,
+        foreign_mounts: 0,
+        named_namespace_scan_errno: 0,
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "driver_delete_intent",
+        driver_pod_uid: f.authority.driver_pod_uid,
+        driver_pod_name: "driver-known",
+        driver_pod_resource_version: "2",
+        driver_namespace: "openebs",
+        driver_daemonset_uid: measurement.driver_daemonset_uid,
+        driver_image: measurement.driver_image,
+      })
+    ).status,
+  ).toBe(200);
   await env.DB.batch([
     env.DB.prepare(
       "UPDATE node_thin_storage SET authority_json=json_set(authority_json,'$.driver_pod_uid',?) WHERE node_id=?",
@@ -664,6 +778,122 @@ it("waits for authenticated driver replacement before consuming finite creator e
     );
   expect(refreshed.challenge.nonce).toBe(second.challenge.nonce);
   expect(claims?.execution.driver_pod_uid).toBe(replacement);
+  expect((await request(url, f.agent, "POST", report)).status).toBe(409);
+  const progressJournal = async () =>
+    JSON.parse(
+      (await env.DB.prepare(
+        "SELECT evidence_json FROM postgres_pool_qualification_runs WHERE id=?",
+      )
+        .bind(run.id)
+        .first<string>("evidence_json"))!,
+    ) as {
+      progress: { received_at: number; progress: { phase: string } }[];
+    };
+  const deleteIntentReceived = (await progressJournal()).progress.find(
+    (e) => e.progress.phase === "driver_delete_intent",
+  )!.received_at;
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "driver_restarted",
+        driver_pod_uid_before_restart:
+          measurement.driver_pod_uid_before_restart,
+        driver_pod_uid_after_restart: measurement.driver_pod_uid_after_restart,
+        driver_daemonset_uid: measurement.driver_daemonset_uid,
+        driver_image: measurement.driver_image,
+        driver_deleted_at: deleteIntentReceived - 5_001,
+        driver_replacement_ready_at: measuredAt,
+        volume_reconcile_error: "pool_creator_fence_denied",
+        volume_reconcile_observed_at: measuredAt,
+      })
+    ).status,
+  ).toBe(409);
+  expect((await progressJournal()).progress).toHaveLength(2);
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "driver_restarted",
+        driver_pod_uid_before_restart:
+          measurement.driver_pod_uid_before_restart,
+        driver_pod_uid_after_restart: measurement.driver_pod_uid_after_restart,
+        driver_daemonset_uid: measurement.driver_daemonset_uid,
+        driver_image: measurement.driver_image,
+        driver_deleted_at: measuredAt,
+        driver_replacement_ready_at: measuredAt,
+        volume_reconcile_error: "pool_creator_fence_denied",
+        volume_reconcile_observed_at: measuredAt,
+      })
+    ).status,
+  ).toBe(200);
+  const snapshot = measurement.denied_operations.find(
+    (o) => o.operation === "snapshot_create",
+  );
+  if (!snapshot || snapshot.operation !== "snapshot_create")
+    throw Error("Expected owned snapshot structural evidence");
+  const name = `pgcf-q-${run.scope_sha256.slice(0, 24)}`;
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "snapshot_create_intent",
+        snapshot_name: name,
+        snapshot_namespace: "openebs",
+        source_volume_handle: measurement.volume_handle,
+      })
+    ).status,
+  ).toBe(200);
+  const snapshotIntentReceived = (await progressJournal()).progress.find(
+    (e) => e.progress.phase === "snapshot_create_intent",
+  )!.received_at;
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "snapshot_created",
+        snapshot_name: name,
+        snapshot_namespace: "openebs",
+        source_volume_handle: measurement.volume_handle,
+        snapshot_uid: snapshot.snapshot_uid,
+        snapshot_resource_version: "3",
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "snapshot_removed",
+        snapshot_uid: snapshot.snapshot_uid,
+        source_volume_handle: measurement.volume_handle,
+        state_at_denial: "Pending",
+        error: "pool_creator_fence_denied",
+        requested_at: snapshotIntentReceived - 5_001,
+        deleted_at: measuredAt,
+        absent_at: measuredAt,
+        physical_snapshot_count: 0,
+      })
+    ).status,
+  ).toBe(409);
+  expect((await progressJournal()).progress).toHaveLength(5);
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "snapshot_removed",
+        snapshot_uid: snapshot.snapshot_uid,
+        source_volume_handle: measurement.volume_handle,
+        state_at_denial: "Pending",
+        error: "pool_creator_fence_denied",
+        requested_at: measuredAt,
+        deleted_at: measuredAt,
+        absent_at: measuredAt,
+        physical_snapshot_count: 0,
+      })
+    ).status,
+  ).toBe(200);
+  // Final gate evidence must match the independently recorded producer pieces.
   expect((await request(url, f.agent, "POST", report)).status).toBe(200);
   expect((await request(url, f.agent, "POST", report)).status).toBe(409);
   const recorded = (await (
@@ -716,6 +946,152 @@ it("refuses expired slow driver identity without cancelling an unchanged run", a
   expect(fresh.qualification.challenge.nonce).toBe(
     before.qualification.challenge.nonce,
   );
+});
+
+it("journals one controller delete intent only after measured node fence readiness", async () => {
+  const f = await poolQualificationSource(releases),
+    url = `/agent/v1/nodes/${f.node}/postgres-pool/qualification`,
+    started = await request(
+      `/v1/nodes/${f.node}/postgres-pool/qualifications`,
+      f.admin,
+      "POST",
+      f.request,
+    );
+  expect(started.status).toBe(202);
+  const run = (await started.json()) as PostgresPoolQualificationRun;
+  runs.push(run.id);
+  const first = (
+      (await (await request(url, f.agent)).json()) as {
+        qualification: PostgresPoolQualificationInput;
+      }
+    ).qualification,
+    host = await qualificationHostMeasurement(f, run, first.challenge.nonce),
+    at = Date.now();
+  expect(
+    (
+      await request(url, f.agent, "POST", {
+        run_id: run.id,
+        scope_sha256: run.scope_sha256,
+        sequence: 1,
+        nonce: first.challenge.nonce,
+        producer: "node_agent",
+        node_uid: f.uid,
+        boot_id: run.scope.boot_id,
+        candidate_spec_sha256: f.specHash,
+        started_at: at,
+        observed_at: at,
+        measurement: host,
+      })
+    ).status,
+  ).toBe(200);
+  const second = (
+      (await (await request(url, f.agent)).json()) as {
+        qualification: PostgresPoolQualificationInput;
+      }
+    ).qualification,
+    now = Date.now(),
+    base = {
+      run_id: run.id,
+      scope_sha256: run.scope_sha256,
+      sequence: 2,
+      nonce: second.challenge.nonce,
+      node_uid: f.uid,
+      boot_id: run.scope.boot_id,
+      candidate_spec_sha256: f.specHash,
+      started_at: now,
+      observed_at: now,
+    },
+    intent = {
+      ...base,
+      producer: "controller",
+      progress: {
+        gate: "finite_creator_fence",
+        phase: "driver_delete_intent",
+        driver_pod_uid: f.authority.driver_pod_uid,
+        driver_pod_name: "driver-known",
+        driver_pod_resource_version: "2",
+        driver_namespace: "openebs",
+        driver_daemonset_uid: crypto.randomUUID(),
+        driver_image: run.scope.software.driver_image,
+      },
+    };
+  expect((await request(url, f.agent, "POST", intent)).status).toBe(409);
+  const ready = {
+    ...base,
+    producer: "node_agent",
+    progress: {
+      gate: "finite_creator_fence",
+      phase: "node_fence_ready",
+      source_generation: run.scope.database_generation - 1,
+      volume_handle: run.scope.volume.volume_handle,
+      driver_sha256: run.scope.software.driver_sha256,
+      deny_record_inode: 42,
+      deny_record_sha256: "a".repeat(64),
+      deny_record_scope_sha256: run.scope_sha256,
+      deny_record_fsync_errno: 0,
+      agent_owner_deaths: 1,
+      before_claim_requests_completed: 1,
+      surviving_creation_descriptors: 0,
+      dm_open_count: 0,
+      foreign_mounts: 0,
+      named_namespace_scan_errno: 0,
+    },
+  };
+  expect((await request(url, f.agent, "POST", ready)).status).toBe(200);
+  const saved = await request(url, f.agent, "POST", intent);
+  expect(saved.status).toBe(200);
+  expect(await saved.json()).toEqual({ recorded: true });
+  expect((await request(url, f.agent, "POST", intent)).status).toBe(200);
+  expect(
+    (
+      await request(url, f.agent, "POST", {
+        ...intent,
+        progress: { ...intent.progress, driver_pod_uid: crypto.randomUUID() },
+      })
+    ).status,
+  ).toBe(409);
+  const input = (
+    (await (await request(url, f.agent)).json()) as {
+      qualification: PostgresPoolQualificationInput;
+    }
+  ).qualification;
+  expect(input.challenge.nonce).toBe(second.challenge.nonce);
+  expect(input.accepted_evidence).toHaveLength(1);
+  expect(input.pending_progress).toHaveLength(2);
+  const claims = await verifyPoolQualificationPermission(
+    input.permission,
+    await importBootstrapVerificationKeys(
+      JSON.parse(env.BOOTSTRAP_VERIFIER_KEYS),
+    ),
+  );
+  expect(claims?.progress_sha256).toBe(
+    await installationHash(input.pending_progress),
+  );
+  const persisted = JSON.parse(
+    (await env.DB.prepare(
+      "SELECT evidence_json FROM postgres_pool_qualification_runs WHERE id=?",
+    )
+      .bind(run.id)
+      .first<string>("evidence_json"))!,
+  );
+  persisted.pending.expires_at = Date.now() - 1;
+  await env.DB.prepare(
+    "UPDATE postgres_pool_qualification_runs SET evidence_json=? WHERE id=?",
+  )
+    .bind(JSON.stringify(persisted), run.id)
+    .run();
+  const expired = (
+    (await (await request(url, f.agent)).json()) as {
+      qualification: PostgresPoolQualificationInput;
+    }
+  ).qualification;
+  expect(expired.status).toBe("cleanup");
+  expect(expired.challenge.gate).toBe("cleanup");
+  expect(expired.pending_progress.map((e) => e.progress.phase)).toEqual([
+    "node_fence_ready",
+    "driver_delete_intent",
+  ]);
+  expect((await request(url, f.agent, "POST", intent)).status).toBe(409);
 });
 
 it("refuses a previously issued challenge after the actual controller artifact rolls back", async () => {
@@ -812,6 +1188,63 @@ it("replays a lost start by idempotency key and refuses another active run", asy
   ).toBe(409);
 });
 
+it("requires independently recorded Kubernetes absence before node cleanup can release a run", async () => {
+  const f = await poolQualificationSource(releases),
+    started = await request(
+      `/v1/nodes/${f.node}/postgres-pool/qualifications`,
+      f.admin,
+      "POST",
+      f.request,
+    );
+  expect(started.status).toBe(202);
+  const run = (await started.json()) as PostgresPoolQualificationRun;
+  runs.push(run.id);
+  await request(
+    `/v1/postgres-pool/qualifications/${run.id}/cancel`,
+    f.admin,
+    "POST",
+    {},
+  );
+  const url = `/agent/v1/nodes/${f.node}/postgres-pool/qualification`,
+    input = (
+      (await (await request(url, f.agent)).json()) as {
+        qualification: PostgresPoolQualificationInput;
+      }
+    ).qualification,
+    p = input.challenge,
+    at = Date.now(),
+    report = {
+      run_id: run.id,
+      scope_sha256: run.scope_sha256,
+      sequence: p.sequence,
+      nonce: p.nonce,
+      producer: "node_agent",
+      node_uid: f.uid,
+      boot_id: run.scope.boot_id,
+      candidate_spec_sha256: f.specHash,
+      started_at: at,
+      observed_at: at,
+      measurement: {
+        gate: "cleanup",
+        binding_id: null,
+        storage: f.volume,
+        remaining_pool_pods: 0,
+        remaining_instance_pods: 0,
+        remaining_primary_lease_holders: 0,
+        cnpg_hibernation: "on",
+        remaining_creation_descriptors: 0,
+        dm_open_count: 0,
+        foreign_mounts: 0,
+        named_namespace_scan_errno: 0,
+        deny_record: "absent",
+        unmount_errno: null,
+      },
+    };
+  expect((await request(url, f.agent, "POST", report)).status).toBe(409);
+  await recordCleanupController(f, run, report);
+  expect((await request(url, f.agent, "POST", report)).status).toBe(200);
+});
+
 it("cleans a cancelled pre-wake run without inventing a binding or a receipt", async () => {
   const f = await poolQualificationSource(releases),
     started = await request(
@@ -847,6 +1280,18 @@ it("cleans a cancelled pre-wake run without inventing a binding or a receipt", a
     ).json()) as { qualification: PostgresPoolQualificationInput },
     p = input.qualification.challenge,
     now = Date.now();
+  await recordCleanupController(f, run, {
+    run_id: run.id,
+    scope_sha256: run.scope_sha256,
+    sequence: p.sequence,
+    nonce: p.nonce,
+    producer: p.producer,
+    node_uid: f.uid,
+    boot_id: f.qualified.bootId,
+    candidate_spec_sha256: f.specHash,
+    started_at: now,
+    observed_at: now,
+  });
   const response = await request(
     `/agent/v1/nodes/${f.node}/postgres-pool/qualification`,
     f.agent,
@@ -977,6 +1422,7 @@ it("retains lost inventory across boots until explicit retirement before start a
       unmount_errno: null,
     },
   };
+  await recordCleanupController(f, run, report);
   expect((await request(agentUrl, f.agent, "POST", report)).status).toBe(409);
   expect((await request(startUrl, f.admin, "POST", f.request)).status).toBe(
     409,
@@ -1034,34 +1480,46 @@ it("fails boot drift permanently but permits current-attested cleanup of the ori
   expect(permission?.scope.boot_id).toBe(f.qualified.bootId);
   expect(permission?.execution.boot_id).toBe(boot);
   expect(p.gate).toBe("cleanup");
-  const now = Date.now(),
-    response = await request(url, f.agent, "POST", {
-      run_id: run.id,
-      scope_sha256: run.scope_sha256,
-      sequence: p.sequence,
-      nonce: p.nonce,
-      producer: p.producer,
-      node_uid: f.uid,
-      boot_id: boot,
-      candidate_spec_sha256: f.specHash,
-      started_at: now,
-      observed_at: now,
-      measurement: {
-        gate: "cleanup",
-        binding_id: null,
-        storage: f.volume,
-        remaining_pool_pods: 0,
-        remaining_instance_pods: 0,
-        remaining_primary_lease_holders: 0,
-        cnpg_hibernation: "on",
-        remaining_creation_descriptors: 0,
-        dm_open_count: 0,
-        foreign_mounts: 0,
-        named_namespace_scan_errno: 0,
-        deny_record: "absent",
-        unmount_errno: null,
-      },
-    });
+  const now = Date.now();
+  await recordCleanupController(f, run, {
+    run_id: run.id,
+    scope_sha256: run.scope_sha256,
+    sequence: p.sequence,
+    nonce: p.nonce,
+    producer: p.producer,
+    node_uid: f.uid,
+    boot_id: boot,
+    candidate_spec_sha256: f.specHash,
+    started_at: now,
+    observed_at: now,
+  });
+  const response = await request(url, f.agent, "POST", {
+    run_id: run.id,
+    scope_sha256: run.scope_sha256,
+    sequence: p.sequence,
+    nonce: p.nonce,
+    producer: p.producer,
+    node_uid: f.uid,
+    boot_id: boot,
+    candidate_spec_sha256: f.specHash,
+    started_at: now,
+    observed_at: now,
+    measurement: {
+      gate: "cleanup",
+      binding_id: null,
+      storage: f.volume,
+      remaining_pool_pods: 0,
+      remaining_instance_pods: 0,
+      remaining_primary_lease_holders: 0,
+      cnpg_hibernation: "on",
+      remaining_creation_descriptors: 0,
+      dm_open_count: 0,
+      foreign_mounts: 0,
+      named_namespace_scan_errno: 0,
+      deny_record: "absent",
+      unmount_errno: null,
+    },
+  });
   expect(response.status).toBe(200);
   const ended = (
     (await response.json()) as { run: PostgresPoolQualificationRun }
@@ -1144,6 +1602,7 @@ it("atomically stores the completed receipt with actual cleanup and rolls both b
       observed_at: Date.now(),
       measurement: prepared.measurement,
     };
+  await recordCleanupController(f, run, body);
   await env.DB.exec(
     "CREATE TRIGGER qualification_completion_abort BEFORE UPDATE OF status ON postgres_pool_qualification_runs WHEN NEW.status='completed' BEGIN SELECT RAISE(ABORT,'qualification_completion_abort'); END;",
   );
@@ -1220,20 +1679,32 @@ it("cannot complete a receipt when boot drift first appears during final cleanup
     input = (await (await request(url, f.agent)).json()) as {
       qualification: PostgresPoolQualificationInput;
     },
-    p = input.qualification.challenge,
-    response = await request(url, f.agent, "POST", {
-      run_id: run.id,
-      scope_sha256: run.scope_sha256,
-      sequence: p.sequence,
-      nonce: p.nonce,
-      producer: p.producer,
-      node_uid: f.uid,
-      boot_id: boot,
-      candidate_spec_sha256: f.specHash,
-      started_at: now,
-      observed_at: Date.now(),
-      measurement: prepared.measurement,
-    });
+    p = input.qualification.challenge;
+  await recordCleanupController(f, run, {
+    run_id: run.id,
+    scope_sha256: run.scope_sha256,
+    sequence: p.sequence,
+    nonce: p.nonce,
+    producer: p.producer,
+    node_uid: f.uid,
+    boot_id: boot,
+    candidate_spec_sha256: f.specHash,
+    started_at: now,
+    observed_at: now,
+  });
+  const response = await request(url, f.agent, "POST", {
+    run_id: run.id,
+    scope_sha256: run.scope_sha256,
+    sequence: p.sequence,
+    nonce: p.nonce,
+    producer: p.producer,
+    node_uid: f.uid,
+    boot_id: boot,
+    candidate_spec_sha256: f.specHash,
+    started_at: now,
+    observed_at: Date.now(),
+    measurement: prepared.measurement,
+  });
   expect(response.status).toBe(200);
   const ended = (
     (await response.json()) as { run: PostgresPoolQualificationRun }
