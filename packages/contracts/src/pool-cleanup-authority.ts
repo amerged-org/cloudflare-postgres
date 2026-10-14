@@ -14,7 +14,9 @@ export const POOL_CLEANUP_MAX_MS = 120000;
 const Safe = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   Positive = Safe.positive(),
   Hash = z.string().regex(/^[a-f0-9]{64}$/);
-/** A bounded cleanup worker grant; it never grants tenant, postmaster or bundle startup. */
+/** A finite drain/unmount grant backed by the LV's full allocation reserve.
+ * The reserve is not a total BIO write-byte cap; metadata/swap bypass io.max.
+ * It never grants tenant, postmaster or bundle startup. */
 export const PoolCleanupClaims = z.strictObject({
   v: z.literal(1),
   kid: z.string().regex(STORAGE_AUTHORITY_KEY_ID_PATTERN),
@@ -33,7 +35,8 @@ export const PoolCleanupClaims = z.strictObject({
   storage: PoolThinPhysicalStorage,
   device_major: Safe.max(4294967295),
   device_minor: Safe.max(4294967295),
-  maximum_write_bytes: Positive,
+  allocation_reserve_bytes: Positive,
+  cleanup_mode: z.literal("drain_unmount"),
   write_bytes_per_second: Positive,
   write_iops_per_second: Positive,
   iat: Safe,

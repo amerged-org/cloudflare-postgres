@@ -23,6 +23,177 @@ import {
 } from "../src/postgres-pool.ts";
 import { POOL_WORKLOAD_PROBE_RESULTS } from "../src/pool-workload-probe.ts";
 
+it("keeps distinct server and client CA provenance and exact PEM bytes in a tenant bundle", async () => {
+  const { PoolTenantBundle } = await import("../src/postgres-pool.ts"),
+    scope = generatedPool.thin_scope,
+    server = "\nserver-ca-public-fixture\n",
+    client = "client-ca-public-fixture\n";
+  const value = {
+    v: 1,
+    scope,
+    scope_sha256: "a".repeat(64),
+    holder_revision: 1,
+    permission: null,
+    storage_authority: null,
+    server_certificate_pem: "leaf-public-fixture\n",
+    server_private_key_pem: "fixture\n",
+    server_ca_pem: server,
+    client_ca_pem: client,
+    ca_secret_uid: crypto.randomUUID(),
+    ca_secret_resource_version: "server-31",
+    ca_sha256: "b".repeat(64),
+    client_ca_secret_uid: crypto.randomUUID(),
+    client_ca_secret_resource_version: "client-47",
+    tls_server_name: "database-rw.pgcf-db-" + scope.database_id + ".svc",
+    archive: {
+      destination_path: "s3://fixture/archive",
+      server_name: "database",
+      endpoint_url: "https://archive.invalid",
+      retention_days: 7,
+    },
+  };
+  const parsed = PoolTenantBundle.parse(value);
+  expect(parsed.server_ca_pem).toBe(server);
+  expect(parsed.client_ca_pem).toBe(client);
+  const { server_ca_pem: _server, ...missing } = value;
+  expect(_server).toBe(server);
+  expect(PoolTenantBundle.safeParse(missing).success).toBe(false);
+});
+
+it("retains a bound Pod beside the ready refill target in one bounded preparation context", async () => {
+  const { PoolPodPreparationContext, POSTGRES_POOL } =
+    await import("../src/postgres-pool.ts");
+  const value = {
+    ...generatedPool.preparation,
+    pods: [
+      generatedPool.preparation.pods[0]!,
+      {
+        ...generatedPool.preparation.pods[0]!,
+        pod_uid: crypto.randomUUID(),
+        pod_name: "ready-refill",
+      },
+    ],
+  };
+  expect(value.policy.target_slots).toBe(1);
+  expect(PoolPodPreparationContext.safeParse(value).success).toBe(true);
+  expect(
+    PoolPodPreparationContext.safeParse({
+      ...value,
+      pods: Array.from({ length: POSTGRES_POOL.max_inventory + 1 }, (_, i) => ({
+        ...value.pods[0]!,
+        pod_uid: crypto.randomUUID(),
+        pod_name: "inventory-" + i,
+      })),
+    }).success,
+  ).toBe(false);
+});
+
+it("signs a fixed full allocation reserve for drain/unmount without asserting a total BIO byte cap", async () => {
+  const base = { ...generatedPool.cleanup.claims } as Record<string, unknown>;
+  delete base.maximum_write_bytes;
+  delete base.allocation_reserve_bytes;
+  delete base.cleanup_mode;
+  const value = {
+    ...base,
+    allocation_reserve_bytes: 1024 ** 3,
+    cleanup_mode: "drain_unmount",
+  };
+  expect(PoolCleanupClaims.safeParse(value).success).toBe(true);
+  expect(
+    PoolCleanupClaims.safeParse({ ...value, cleanup_mode: "tenant_start" })
+      .success,
+  ).toBe(false);
+  expect(
+    PoolCleanupClaims.safeParse({ ...value, maximum_write_bytes: 1 }).success,
+  ).toBe(false);
+  const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ])) as unknown as {
+    privateKey: StorageAuthorityCryptoKey;
+    publicKey: StorageAuthorityCryptoKey;
+  };
+  const parsed = PoolCleanupClaims.parse(value);
+  const token = await signPoolCleanupAuthority(parsed, pair.privateKey, 1000);
+  expect(
+    (
+      await verifyPoolCleanupAuthority(
+        token,
+        new Map([[parsed.kid, pair.publicKey]]),
+        1000,
+      )
+    )?.allocation_reserve_bytes,
+  ).toBe(1024 ** 3);
+});
+
+it("permits only exact same-boot unclean reference destruction with reaped cleanup custody and global absence", () => {
+  const scope = generatedPool.thin_scope,
+    mounted = generatedPool.vectors.find(
+      (v) => v.name === "finite-creator-fence",
+    )!.value as unknown as PoolNodeReport;
+  const io = PoolIoAttestation.parse(
+    generatedPool.vectors.find((v) => v.name === "measured-thin-device")!.value,
+  );
+  const worker = {
+    ...io.cgroups[0]!,
+    pool_pod_uid: scope.pool_pod_uid,
+    executable_sha256: scope.host_controller_sha256,
+  };
+  const value = {
+    ...mounted,
+    state: "released",
+    storage_backend: "lvm-thin-v1",
+    thin_guard: null,
+    clean_stop: false,
+    kernel_proof: {
+      ...mounted.kernel_proof,
+      mount_id: null,
+      dm_open_count: 0,
+      device_major: worker.device_major,
+      device_minor: worker.device_minor,
+      nonlazy_unmount_verified: false,
+    },
+    reference_destruction: {
+      v: 1,
+      operation_id: "op_" + "a".repeat(20),
+      authority_revision: 9,
+      cleanup_io_sha256: "b".repeat(64),
+      cleanup_mode: "drain_unmount",
+      dispatch_persisted: true,
+      worker,
+      worker_reaped: true,
+      stopped_writers: scope.container_ids.map((container_id) => ({
+        container_id,
+        cgroup_inode:
+          container_id === worker.container_id ? worker.cgroup_inode : 31,
+        tenant_tasks_remaining: 0,
+      })),
+    },
+  };
+  expect(PoolNodeReport.safeParse(value).success).toBe(true);
+  expect(PoolNodeReport.safeParse({ ...value, clean_stop: true }).success).toBe(
+    false,
+  );
+  expect(
+    PoolNodeReport.safeParse({
+      ...value,
+      boot_loss: {
+        holder_boot_id: crypto.randomUUID(),
+        storage: scope.storage,
+      },
+    }).success,
+  ).toBe(false);
+  expect(
+    PoolNodeReport.safeParse({
+      ...value,
+      reference_destruction: {
+        ...value.reference_destruction,
+        worker_reaped: false,
+      },
+    }).success,
+  ).toBe(false);
+});
+
 it("bounds the fixed readonly inspector to one prepared Pod and refuses an invented clean result", async () => {
   const pool = await import("../src/postgres-pool.ts"),
     scope = generatedPool.thin_scope;

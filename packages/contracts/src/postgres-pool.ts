@@ -409,10 +409,14 @@ export const PoolTenantBundle = z.strictObject({
   permission: z.string().max(POSTGRES_POOL.bind_max_length).nullable(),
   server_certificate_pem: z.string().min(1).max(32768),
   server_private_key_pem: z.string().min(1).max(32768),
+  server_ca_pem: z.string().min(1).max(32768),
   client_ca_pem: z.string().min(1).max(32768),
+  /** These three existing fields identify the SERVER CA, independently of client authentication. */
   ca_secret_uid: z.uuid(),
   ca_secret_resource_version: z.string().min(1).max(128),
   ca_sha256: Hash,
+  client_ca_secret_uid: z.uuid(),
+  client_ca_secret_resource_version: z.string().min(1).max(128),
   tls_server_name: z
     .string()
     .min(1)
@@ -644,7 +648,7 @@ export const PoolPodPreparationContext = z
           container_ids: z.array(Hash).min(1).max(8),
         }),
       )
-      .max(POSTGRES_POOL.max_slots),
+      .max(POSTGRES_POOL.max_inventory),
   })
   .superRefine((value, ctx) => {
     if (
@@ -655,14 +659,13 @@ export const PoolPodPreparationContext = z
       value.pods.some(
         (p) => new Set(p.container_ids).size !== p.container_ids.length,
       ) ||
-      value.pods.length > value.policy.target_slots ||
       (value.qualification_run_id === undefined) !==
         (value.qualification_scope_sha256 === undefined)
     )
       ctx.addIssue({
         code: "custom",
         message:
-          "Preparation must be finite unique tenant-free inventory under one authoritative policy",
+          "Preparation must retain finite unique ready and bound inventory under one authoritative policy",
       });
   });
 export type PoolPodPreparationContext = z.infer<
@@ -790,6 +793,20 @@ export const PoolThinGuardProof = z.strictObject({
   shared_pod_io: PoolSharedPodIo,
   cgroups: z.array(PoolIoCgroup).min(1).max(8),
 });
+/** Historical pregrant custody, independently joined to the exact retained CF grant.
+ * Reaped references and global absence prove release, never a clean PostgreSQL shutdown. */
+export const PoolReferenceDestruction = z.strictObject({
+  v: z.literal(1),
+  operation_id: OperationId,
+  authority_revision: Revision,
+  cleanup_io_sha256: Hash,
+  cleanup_mode: z.literal("drain_unmount"),
+  dispatch_persisted: z.literal(true),
+  worker: PoolCleanupIoAttestation.shape.worker,
+  worker_reaped: z.literal(true),
+  stopped_writers: PoolCleanupIoAttestation.shape.stopped_writers,
+});
+export type PoolReferenceDestruction = z.infer<typeof PoolReferenceDestruction>;
 export const PoolNodeReport = z
   .strictObject({
     v: z.literal(1),
@@ -812,11 +829,45 @@ export const PoolNodeReport = z
     boot_loss: z
       .strictObject({ holder_boot_id: z.uuid(), storage: PoolPhysicalStorage })
       .optional(),
+    reference_destruction: PoolReferenceDestruction.optional(),
     kernel_proof: PoolKernelProof,
     clean_stop: z.boolean().nullable(),
     error: z.string().min(1).max(512).nullable(),
   })
   .superRefine((value, ctx) => {
+    if (
+      value.reference_destruction &&
+      (value.boot_loss !== undefined ||
+        value.state !== "released" ||
+        value.storage_backend !== "lvm-thin-v1" ||
+        value.clean_stop !== false ||
+        value.thin_guard !== null ||
+        value.kernel_proof.nonlazy_unmount_verified ||
+        value.kernel_proof.creator_fence === null ||
+        value.kernel_proof.creator_fence.scope_sha256 !== value.scope_sha256 ||
+        value.reference_destruction.worker.pool_pod_uid !==
+          value.pool_pod_uid ||
+        value.reference_destruction.worker.device_major !==
+          value.kernel_proof.device_major ||
+        value.reference_destruction.worker.device_minor !==
+          value.kernel_proof.device_minor ||
+        new Set(
+          value.reference_destruction.stopped_writers.map(
+            (w) => w.container_id,
+          ),
+        ).size !== value.reference_destruction.stopped_writers.length ||
+        !value.reference_destruction.stopped_writers.some(
+          (w) =>
+            w.container_id ===
+              value.reference_destruction!.worker.container_id &&
+            w.cgroup_inode === value.reference_destruction!.worker.cgroup_inode,
+        ))
+    )
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "Reference destruction requires exact reaped cleanup custody and same-boot protected absence, never clean sleep",
+      });
     if (
       value.boot_loss &&
       (value.state !== "released" ||
@@ -874,6 +925,7 @@ export const PoolNodeReport = z
           !value.kernel_proof.creator_fence.creation_fds_closed) ||
         (value.state === "released" &&
           value.boot_loss === undefined &&
+          value.reference_destruction === undefined &&
           !value.kernel_proof.nonlazy_unmount_verified) ||
         (value.state === "refused" &&
           !value.kernel_proof.nonlazy_unmount_verified &&

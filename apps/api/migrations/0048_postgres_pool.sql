@@ -63,7 +63,8 @@ CREATE TABLE pool_cleanup_grants (
   claims_json TEXT NOT NULL CHECK(json_valid(claims_json)),
   authority_token TEXT CHECK(authority_token IS NULL OR substr(authority_token,1,4)='pc1.'),
   issued_at INTEGER NOT NULL CHECK(issued_at>=0), expires_at INTEGER NOT NULL CHECK(expires_at>issued_at),
-  maximum_write_bytes INTEGER NOT NULL CHECK(maximum_write_bytes>0),
+  -- Full logical allocation exposure, not a cumulative BIO write-byte cap.
+  allocation_reserve_bytes INTEGER NOT NULL CHECK(allocation_reserve_bytes BETWEEN 1 AND 9007199254740991),
   headroom_authority_revision INTEGER NOT NULL CHECK(headroom_authority_revision>0),
   headroom_snapshot_sha256 TEXT NOT NULL CHECK(length(headroom_snapshot_sha256)=64),
   state TEXT NOT NULL CHECK(state IN('reserved','issued','failed','completed')),
@@ -71,7 +72,8 @@ CREATE TABLE pool_cleanup_grants (
   PRIMARY KEY(binding_id,operation_id), UNIQUE(binding_id,authority_revision),
   CHECK(json_extract(claims_json,'$.binding_id')=binding_id AND json_extract(claims_json,'$.operation_id')=operation_id
     AND json_extract(claims_json,'$.authority_revision')=authority_revision AND json_extract(claims_json,'$.iat')=issued_at
-    AND json_extract(claims_json,'$.exp')=expires_at AND json_extract(claims_json,'$.maximum_write_bytes')=maximum_write_bytes),
+    AND json_extract(claims_json,'$.exp')=expires_at AND json_extract(claims_json,'$.allocation_reserve_bytes') IS allocation_reserve_bytes),
+  CHECK(json_extract(claims_json,'$.cleanup_mode') IS 'drain_unmount'),
   CHECK(state<>'issued' OR authority_token IS NOT NULL)
 ) STRICT;
 CREATE TABLE pool_cleanup_io_attestations (
@@ -85,7 +87,7 @@ CREATE UNIQUE INDEX pool_cleanup_active_binding ON pool_cleanup_grants(binding_i
 CREATE TRIGGER pool_cleanup_grants_immutable BEFORE UPDATE ON pool_cleanup_grants WHEN
   NEW.binding_id IS NOT OLD.binding_id OR NEW.operation_id IS NOT OLD.operation_id OR NEW.authority_revision IS NOT OLD.authority_revision
   OR NEW.claims_json IS NOT OLD.claims_json OR NEW.issued_at IS NOT OLD.issued_at OR NEW.expires_at IS NOT OLD.expires_at
-  OR NEW.maximum_write_bytes IS NOT OLD.maximum_write_bytes OR NEW.headroom_authority_revision IS NOT OLD.headroom_authority_revision
+  OR NEW.allocation_reserve_bytes IS NOT OLD.allocation_reserve_bytes OR NEW.headroom_authority_revision IS NOT OLD.headroom_authority_revision
   OR NEW.headroom_snapshot_sha256 IS NOT OLD.headroom_snapshot_sha256 OR NEW.created_at IS NOT OLD.created_at
   OR (OLD.authority_token IS NOT NULL AND NEW.authority_token IS NOT OLD.authority_token)
   OR (OLD.state='completed' AND NEW.state<>'completed')

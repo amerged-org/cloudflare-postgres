@@ -60,6 +60,7 @@ const names = [
   "PoolStorageReadReport",
   "PoolThinGuardProof",
   "PoolNodeReport",
+  "PoolReferenceDestruction",
   "PoolStorageObservation",
   "PoolSleepRecord",
   "PoolArchiverCommand",
@@ -178,7 +179,9 @@ const cleanupClaims = PoolCleanupClaims.parse({
   storage: thinScope.storage,
   device_major: 253,
   device_minor: 1,
-  maximum_write_bytes: 1048576,
+  // Unit fixture's full logical LV exposure, independent of cumulative BIO traffic.
+  allocation_reserve_bytes: 32 * 1024 ** 2,
+  cleanup_mode: "drain_unmount",
   write_bytes_per_second: 1048576,
   write_iops_per_second: 100,
   iat: 1000,
@@ -385,6 +388,44 @@ const preparation = pool.PoolPodPreparationContext.parse({
   ],
 });
 const preparation_sha256 = await pool.poolPreparationContextHash(preparation);
+const referenceWorker = {
+  ...io.cgroups[0]!,
+  pool_pod_uid: thinScope.pool_pod_uid,
+  executable_sha256: thinScope.host_controller_sha256,
+};
+const referenceDestruction = {
+  ...mounted,
+  state: "released",
+  storage_backend: "lvm-thin-v1",
+  thin_guard: null,
+  clean_stop: false,
+  kernel_proof: {
+    ...mounted.kernel_proof,
+    mount_id: null,
+    dm_open_count: 0,
+    nonlazy_unmount_verified: false,
+    device_major: referenceWorker.device_major,
+    device_minor: referenceWorker.device_minor,
+  },
+  reference_destruction: {
+    v: 1,
+    operation_id: cleanupClaims.operation_id,
+    authority_revision: cleanupClaims.authority_revision,
+    cleanup_io_sha256: cleanupClaims.cleanup_io_sha256,
+    cleanup_mode: "drain_unmount",
+    dispatch_persisted: true,
+    worker: referenceWorker,
+    worker_reaped: true,
+    stopped_writers: thinScope.container_ids.map((container_id) => ({
+      container_id,
+      cgroup_inode:
+        container_id === referenceWorker.container_id
+          ? referenceWorker.cgroup_inode
+          : 31,
+      tenant_tasks_remaining: 0,
+    })),
+  },
+};
 const inspection = pool.PoolStorageReadSignal.parse({
   v: 1,
   command: "inspect_readonly",
@@ -411,6 +452,95 @@ const inspection = pool.PoolStorageReadSignal.parse({
   noload: true,
 });
 const vectors = [
+  {
+    name: "distinct-server-and-client-ca",
+    schema: "PoolTenantBundle",
+    value: {
+      v: 1,
+      scope: thinScope,
+      scope_sha256: await pool.poolBindingScopeHash(thinScope),
+      holder_revision: 3,
+      permission: null,
+      storage_authority: null,
+      server_certificate_pem: "leaf\n",
+      server_private_key_pem: "fixture\n",
+      server_ca_pem: "\nserver\n",
+      client_ca_pem: "client\n",
+      ca_secret_uid: "11111111-1111-4111-8111-111111111111",
+      ca_secret_resource_version: "server-31",
+      ca_sha256: hash,
+      client_ca_secret_uid: "22222222-2222-4222-8222-222222222222",
+      client_ca_secret_resource_version: "client-47",
+      tls_server_name: "database-rw.pgcf-db-" + scope.database_id + ".svc",
+      archive: {
+        destination_path: "s3://fixture/archive",
+        server_name: "database",
+        endpoint_url: "https://archive.invalid",
+        retention_days: 7,
+      },
+    },
+  },
+  {
+    name: "bound-pod-plus-ready-refill",
+    schema: "PoolPodPreparationContext",
+    value: {
+      ...preparation,
+      pods: [
+        ...preparation.pods,
+        {
+          ...preparation.pods[0]!,
+          pod_uid: "11111111-1111-4111-8111-111111111111",
+          pod_name: "ready-refill",
+        },
+      ],
+    },
+  },
+  {
+    name: "same-boot-reference-destruction",
+    schema: "PoolNodeReport",
+    value: referenceDestruction,
+  },
+  {
+    name: "reference-destruction-is-never-clean-sleep",
+    schema: "PoolNodeReport",
+    value: { ...referenceDestruction, clean_stop: true },
+  },
+  {
+    name: "unreaped-cleanup-worker",
+    schema: "PoolNodeReport",
+    value: {
+      ...referenceDestruction,
+      reference_destruction: {
+        ...referenceDestruction.reference_destruction,
+        worker_reaped: false,
+      },
+    },
+  },
+  {
+    name: "cleanup-worker-outside-retained-leaf",
+    schema: "PoolNodeReport",
+    value: {
+      ...referenceDestruction,
+      reference_destruction: {
+        ...referenceDestruction.reference_destruction,
+        worker: {
+          ...referenceWorker,
+          cgroup_inode: referenceWorker.cgroup_inode + 1,
+        },
+      },
+    },
+  },
+  {
+    name: "mixed-boot-loss-and-reference-destruction",
+    schema: "PoolNodeReport",
+    value: {
+      ...referenceDestruction,
+      boot_loss: {
+        holder_boot_id: "11111111-1111-4111-8111-111111111111",
+        storage: thinScope.storage,
+      },
+    },
+  },
   {
     name: "unaccounted-archiver-request",
     schema: "PostgresPoolPolicy",

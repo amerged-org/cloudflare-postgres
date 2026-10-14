@@ -319,7 +319,6 @@ fn semantics(name: &str, value: &Value) -> bool {
                 )
                 && value["qualification_run_id"].is_null()
                     == value["qualification_scope_sha256"].is_null()
-                && pods.len() as u64 <= value["policy"]["target_slots"].as_u64().unwrap_or(0)
                 && pods.iter().all(|pod| {
                     ids.insert(pod["pod_uid"].as_str()) && unique_strings(&pod["container_ids"])
                 })
@@ -461,6 +460,34 @@ fn finite_interval(start: &Value, end: &Value, maximum: u64) -> bool {
 }
 fn node_report_semantics(value: &Value) -> bool {
     let proof = &value["kernel_proof"];
+    let destruction = &value["reference_destruction"];
+    if !destruction.is_null()
+        && (!value["boot_loss"].is_null()
+            || value["state"] != "released"
+            || value["storage_backend"] != "lvm-thin-v1"
+            || value["clean_stop"] != false
+            || !value["thin_guard"].is_null()
+            || proof["nonlazy_unmount_verified"] != false
+            || proof["creator_fence"].is_null()
+            || proof["creator_fence"]["scope_sha256"] != value["scope_sha256"]
+            || destruction["worker"]["pool_pod_uid"] != value["pool_pod_uid"]
+            || destruction["worker"]["device_major"] != proof["device_major"]
+            || destruction["worker"]["device_minor"] != proof["device_minor"]
+            || destruction["stopped_writers"]
+                .as_array()
+                .is_none_or(|writers| {
+                    let mut ids = std::collections::HashSet::new();
+                    !writers
+                        .iter()
+                        .all(|w| ids.insert(w["container_id"].as_str()))
+                        || !writers.iter().any(|w| {
+                            w["container_id"] == destruction["worker"]["container_id"]
+                                && w["cgroup_inode"] == destruction["worker"]["cgroup_inode"]
+                        })
+                }))
+    {
+        return false;
+    }
     if !value["boot_loss"].is_null()
         && (value["state"] != "released"
             || value["clean_stop"] != false
@@ -511,6 +538,7 @@ fn node_report_semantics(value: &Value) -> bool {
                     || proof["creator_fence"]["creation_fds_closed"] == true)
                 && (value["state"] != "released"
                     || !value["boot_loss"].is_null()
+                    || !destruction.is_null()
                     || proof["nonlazy_unmount_verified"] == true)
                 && (value["state"] != "refused"
                     || proof["never_attached_verified"] == true

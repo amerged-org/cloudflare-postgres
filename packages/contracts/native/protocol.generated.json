@@ -1158,7 +1158,7 @@
               "pattern": "^[a-f0-9]{64}$"
             },
             "pods": {
-              "maxItems": 16,
+              "maxItems": 256,
               "type": "array",
               "items": {
                 "type": "object",
