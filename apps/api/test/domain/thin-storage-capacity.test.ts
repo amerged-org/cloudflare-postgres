@@ -28,6 +28,7 @@ import {
   observedBody,
 } from "./fixtures.ts";
 import { recoverStorageProtectedDatabases } from "../../src/domain/lifecycle.ts";
+import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import {
   releaseCoveredStartupReservationsStatement,
   databaseCpuChargeSql,
@@ -334,9 +335,10 @@ it("physical metadata headroom and explicit logical quota maximum constrain a ne
 async function bindVolume(
   f: Awaited<ReturnType<typeof thinFixture>>,
   created: ReturnType<typeof DatabaseWithOperation.parse>,
+  storageGeneration = 1,
 ) {
   const receipt = DatabaseStorageVolumeReceipt.parse({
-    storage_generation: 1,
+    storage_generation: storageGeneration,
     storage_uid: crypto.randomUUID(),
     namespace_uid: crypto.randomUUID(),
     cluster_uid: crypto.randomUUID(),
@@ -354,7 +356,7 @@ async function bindVolume(
   const volume = {
     database_id: created.database.id,
     generation: created.database.generation,
-    storage_generation: 1,
+    storage_generation: storageGeneration,
     storage_uid: receipt.storage_uid,
     namespace_uid: receipt.namespace_uid,
     cluster_uid: receipt.cluster_uid,
@@ -1498,7 +1500,7 @@ it("the existing hold-ledger migration preserves uncertain and acknowledged RAM 
 });
 
 /** Actual local R2 + D1 restore/delete lifecycle; the physical frame is controlled metadata, not Dev evidence. */
-async function deletedUnboundRestore() {
+async function pendingThinRestore() {
   let original: DatabaseWithOperation | undefined;
   const f = await thinFixture(32 * gib, 32 * gib, async (base) => {
     await configureNodeRegionPolicy(env.DB, {
@@ -1582,6 +1584,11 @@ async function deletedUnboundRestore() {
       .bind(restored.operation.id)
       .first("storage_volume_json"),
   ).toBeNull();
+  return { f, source, restored };
+}
+async function deletedUnboundRestore() {
+  const { f, source, restored } = await pendingThinRestore(),
+    id = restored.target_database.id;
   const deletion = DatabaseWithOperation.parse(
     await (
       await request(
@@ -1694,6 +1701,95 @@ async function deletedUnboundRestore() {
     .run();
   return { f, restored, source, receipt, complete, release };
 }
+it("a restored pre-Ready protection is accepted with its real restore operation and the normal capacity turn creates a newer resume", async () => {
+  const { f, restored } = await pendingThinRestore(),
+    id = restored.target_database.id;
+  const bound = await bindVolume(
+    f,
+    DatabaseWithOperation.parse({
+      database: restored.target_database,
+      operation: restored.operation,
+    }),
+    2,
+  );
+  const owner = await env.DB.prepare(
+    "SELECT archive_path,power_operation FROM databases WHERE id=?",
+  )
+    .bind(id)
+    .first<{ archive_path: string; power_operation: string | null }>();
+  expect(owner!.power_operation).toBeNull();
+  expect(owner!.archive_path.slice(-23)).toBe(restored.operation.id);
+  const at = Date.now(),
+    proof: NodeThinStorageAuthority["protections"][number] = {
+      database_id: id,
+      generation: 1,
+      operation_id: restored.operation.id,
+      storage_uid: bound.receipt.storage_uid,
+      namespace_uid: bound.receipt.namespace_uid,
+      cluster_uid: bound.receipt.cluster_uid,
+      node_uid: f.nodeUid,
+      profile_sha256: sha,
+      requested_at: at,
+      hibernation_on: true,
+      pods_absent: true,
+    };
+  const authority = NodeThinStorageAuthority.parse({
+    ...bound.authority,
+    revision: 2,
+    observed_at: new Date(at).toISOString(),
+    captured_at: new Date(at).toISOString(),
+    expires_at: new Date(at + 30000).toISOString(),
+    protections: [{ ...proof, operation_id: null }],
+  });
+  await accepted(f, authority, true);
+  await runNodeCapacity(env, f.region);
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,storage_protected_at FROM databases WHERE id=?",
+    )
+      .bind(id)
+      .first(),
+  ).toEqual({ generation: 1, storage_protected_at: null });
+  await accepted(f, { ...authority, revision: 3, protections: [proof] }, true);
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,storage_protected_operation,observed_power FROM databases WHERE id=?",
+    )
+      .bind(id)
+      .first(),
+  ).toEqual({
+    generation: 1,
+    storage_protected_operation: restored.operation.id,
+    observed_power: "hibernated",
+  });
+  await runNodeCapacity(env, f.region);
+  const recovered = await env.DB.prepare(
+    "SELECT generation,storage_protected_at,power_operation FROM databases WHERE id=?",
+  )
+    .bind(id)
+    .first<{
+      generation: number;
+      storage_protected_at: string | null;
+      power_operation: string;
+    }>();
+  expect(recovered).toMatchObject({
+    generation: 2,
+    storage_protected_at: null,
+  });
+  expect(
+    await env.DB.prepare("SELECT kind,generation FROM operations WHERE id=?")
+      .bind(recovered!.power_operation)
+      .first(),
+  ).toEqual({ kind: "database.resume", generation: 2 });
+  await runNodeCapacity(env, f.region);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.resume'",
+    )
+      .bind(id)
+      .first("n"),
+  ).toBe(1);
+});
 
 it(
   "releases a superseded never-bound restore hold only after confirmed deletion and a later global zero-Thin read while retaining the original thick volume",
