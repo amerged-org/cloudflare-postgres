@@ -700,6 +700,10 @@ pub async fn run(
                                         &containers,
                                         holder.active.clone(),
                                     )?);
+                                    cleanup_scopes
+                                        .entry(holder.state.pool_pod_uid.clone())
+                                        .or_default()
+                                        .extend(holder.state.container_ids.iter().cloned());
                                 }
                             }
                         }
