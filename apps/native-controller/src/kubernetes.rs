@@ -214,6 +214,7 @@ fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
         "Node" => ("/api/v1", "nodes", true),
         "PersistentVolume" => ("/api/v1", "persistentvolumes", true),
         "RuntimeClass" => ("/apis/node.k8s.io/v1", "runtimeclasses", true),
+        "Lease" => ("/apis/coordination.k8s.io/v1", "leases", false),
         "MutatingAdmissionPolicy" => (
             "/apis/admissionregistration.k8s.io/v1",
             "mutatingadmissionpolicies",
@@ -333,6 +334,15 @@ impl Kubernetes {
                 text(&proof["observation"], "controller_epoch").into(),
                 proof["observation"]["watch_epoch"].as_u64().unwrap_or(0),
             ))
+        {
+            return false;
+        }
+        if proof["kind"] == "pool"
+            && !state.objects.iter().any(|((kind, _, _), (uid, version))| {
+                kind == "Namespace"
+                    && Some(uid.as_str()) == proof["pool_namespace_uid"].as_str()
+                    && Some(version.as_str()) == proof["pool_namespace_resource_version"].as_str()
+            })
         {
             return false;
         }
@@ -592,6 +602,24 @@ impl Kubernetes {
                             events
                                 .try_send(id.to_string())
                                 .map_err(|_| "controller hint queue exhausted")?;
+                        } else {
+                            let meta = &event["object"]["metadata"];
+                            let prefix = match kind {
+                                "Pod" if meta["namespace"] == "pgcf-pool" => Some("pool-pod:"),
+                                "Namespace" if meta["name"] == "pgcf-pool" => {
+                                    Some("pool-namespace:")
+                                }
+                                "Node" => Some("pool-node:"),
+                                _ => None,
+                            };
+                            if let Some(prefix) = prefix {
+                                let uid = text(meta, "uid");
+                                if pgcf_native_protocol::valid_pattern("uuid", uid) {
+                                    events
+                                        .try_send(format!("{prefix}{uid}"))
+                                        .map_err(|_| "controller hint queue exhausted")?;
+                                }
+                            }
                         }
                     }
                 }
@@ -907,6 +935,63 @@ impl Kubernetes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pool_namespace_watch_loss_invalidates_only_its_actual_runtime_proof() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let kube = Kubernetes::with_ca(
+            Url::parse("https://localhost/").unwrap(),
+            identity.cert.pem().as_bytes(),
+            PathBuf::from("unused-runtime-proof-token"),
+        )
+        .unwrap();
+        let mut proof = serde_json::json!({"kind":"pool","pool_namespace_uid":"00000000-0000-4000-8000-000000000009","pool_namespace_resource_version":"7","observation":{"expires_at":u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()+1000,"resource_versions":{}}});
+        let pool_namespace = serde_json::json!({"metadata":{"name":"pgcf-pool","uid":proof["pool_namespace_uid"],"resourceVersion":"7"}});
+        {
+            let mut state = kube.continuity.lock().unwrap();
+            for kind in RUNTIME_WATCH_KINDS {
+                state.connected(kind, "7");
+            }
+            for (index, (field, kind, uid)) in [
+                ("namespace", "Namespace", "namespace_uid"),
+                ("cluster", "Cluster", "cnpg_cluster_uid"),
+                ("pod", "Pod", "pod_uid"),
+                ("ca_secret", "Secret", "ca_secret_uid"),
+                ("storage", "ConfigMap", "storage_uid"),
+                ("pvc", "PersistentVolumeClaim", "pvc_uid"),
+                ("pv", "PersistentVolume", "pv_uid"),
+                ("node", "Node", "node_uid"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let id = format!("00000000-0000-4000-8000-{:012}", index + 1);
+                proof[*uid] = id.clone().into();
+                proof["observation"]["resource_versions"][*field] = "7".into();
+                assert!(state.observe(
+                    kind,
+                    &serde_json::json!({"metadata":{"name":field,"uid":id,"resourceVersion":"7"}}),
+                    false
+                ));
+            }
+            assert!(state.observe("Namespace", &pool_namespace, false));
+            proof["observation"]["controller_epoch"] = state.controller_epoch.clone().into();
+            proof["observation"]["watch_epoch"] = state.epoch.into();
+        }
+        assert!(kube.runtime_proof_current(&proof));
+        kube.continuity
+            .lock()
+            .unwrap()
+            .observe("Namespace", &pool_namespace, true);
+        assert!(
+            !kube.runtime_proof_current(&proof),
+            "the pool Pod event may lag its namespace deletion"
+        );
+        proof.as_object_mut().unwrap().remove("kind");
+        assert!(
+            kube.runtime_proof_current(&proof),
+            "CNPG still checks its own tenant namespace"
+        );
+    }
     #[test]
     fn watch_gap_changes_coverage_but_ordinary_events_and_own_publication_do_not() {
         let mut state = WatchContinuity::default();

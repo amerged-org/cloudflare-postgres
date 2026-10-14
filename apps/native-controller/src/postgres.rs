@@ -64,6 +64,43 @@ pub async fn connect(
     password: &str,
     database: &str,
 ) -> Result<Session, Error> {
+    connect_at(db, ca, role, password, database, None).await
+}
+/// TLS keeps the tenant's exact CNPG server name while the socket uses the authenticated pool Pod IP.
+pub async fn connect_pool(
+    db: &Value,
+    scope: &Value,
+    ca: &[u8],
+    role: &str,
+    password: &str,
+    database: &str,
+) -> Result<Session, Error> {
+    if !pgcf_native_protocol::pool::validate("PoolBindingScope", scope)
+        || scope["database_id"] != db["id"]
+        || scope["generation"].as_u64() > db["generation"].as_u64()
+    {
+        return Err("pool PostgreSQL probe scope changed".into());
+    }
+    let address: std::net::IpAddr = scope["pool_pod_ip"]
+        .as_str()
+        .ok_or("pool PostgreSQL address absent")?
+        .parse()?;
+    if !match address {
+        std::net::IpAddr::V4(v) => v.is_private(),
+        std::net::IpAddr::V6(v) => v.is_unique_local(),
+    } {
+        return Err("pool PostgreSQL address is not private".into());
+    }
+    connect_at(db, ca, role, password, database, Some(address)).await
+}
+async fn connect_at(
+    db: &Value,
+    ca: &[u8],
+    role: &str,
+    password: &str,
+    database: &str,
+    address: Option<std::net::IpAddr>,
+) -> Result<Session, Error> {
     let recovery = !db["recovery"].is_null();
     let role_allowed = pgcf_native_protocol::valid_role(role)
         || Some(role) == constant("MAINTENANCE_ROLE").as_str()
@@ -85,6 +122,9 @@ pub async fn connect(
         .options("-c statement_timeout=5000")
         .connect_timeout(Duration::from_secs(5))
         .ssl_mode(SslMode::Require);
+    if let Some(address) = address {
+        config.hostaddr(address);
+    }
     open(&config, ca).await
 }
 /// Opens a session whose TLS is verified against `ca`; `connect` checks the probe authority.
@@ -125,12 +165,62 @@ fn probe_identity_current(
             })
 }
 pub async fn roles(db: &Value, ca: &[u8], primary_address: &str) -> Result<bool, Error> {
+    roles_at(db, ca, primary_address, None).await
+}
+pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
+    roles_at(
+        db,
+        ca,
+        scope["pool_pod_ip"]
+            .as_str()
+            .ok_or("pool PostgreSQL address absent")?,
+        Some(scope),
+    )
+    .await
+}
+/// A drained gateway is necessary but not sufficient: prepared transactions and real
+/// background client backends also prevent a clean pool stop.
+pub async fn pool_idle(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
+    if db["maintenance"].is_null() {
+        return Err("pool maintenance authority absent".into());
+    }
+    let role = text(&db["maintenance"], "role");
+    let session = connect_pool(
+        db,
+        scope,
+        ca,
+        role,
+        text(&db["maintenance"], "password"),
+        text(db, "id"),
+    )
+    .await?;
+    let rows=session.query("SELECT current_database()::text, current_user::text, inet_server_addr()::text, pg_is_in_recovery(), (SELECT count(*)::text FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()), (SELECT count(*)::text FROM pg_prepared_xacts)",&[]).await?;
+    if rows.len() != 1 {
+        return Ok(false);
+    }
+    let row = &rows[0];
+    Ok(probe_identity_current(
+        text(db, "id"),
+        &row.try_get::<_, String>(0)?,
+        text(scope, "pool_pod_ip"),
+        &row.try_get::<_, String>(2)?,
+        row.try_get(3)?,
+    ) && row.try_get::<_, String>(1)? == role
+        && row.try_get::<_, String>(4)? == "0"
+        && row.try_get::<_, String>(5)? == "0")
+}
+async fn roles_at(
+    db: &Value,
+    ca: &[u8],
+    primary_address: &str,
+    scope: Option<&Value>,
+) -> Result<bool, Error> {
     if text(db, "desired_state") != "running" {
         return Ok(false);
     }
     tokio::time::timeout(Duration::from_secs(20),async{
   for role in db["roles"].as_array().ok_or("roles unavailable")?{
-   let session=connect(db,ca,text(role,"name"),text(role,"password"),text(db,"id")).await?;
+   let session=if let Some(scope)=scope {connect_pool(db,scope,ca,text(role,"name"),text(role,"password"),text(db,"id")).await?} else {connect(db,ca,text(role,"name"),text(role,"password"),text(db,"id")).await?};
    let rows=session.query("SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, inet_server_addr()::text, pg_is_in_recovery()",&[]).await?;
    if rows.len()!=1{return Ok::<bool,Error>(false);}let row=&rows[0];let tuning=parameters(db);let shared=text(&tuning,"shared_buffers").trim_end_matches("MB").parse::<u64>()?;let version:String=row.try_get(1)?;let server_num:i32=row.try_get(2)?;let max_connections:i32=row.try_get(3)?;let buffers:String=row.try_get(4)?;let cache:String=row.try_get(5)?;let archive:i32=row.try_get(6)?;
    if row.try_get::<_,String>(0)?!=text(role,"name")||server_num/10000!=18||db["postgres"]["version"].as_str().is_some_and(|pin|version.split_whitespace().next()!=Some(pin))||u64::try_from(max_connections).ok()!=Some(number(&db["size"],"max_connections"))||buffers.parse::<u64>()?!=shared*1024*1024||cache.parse::<u64>()?!=number(&db["size"],"memory_mib")/2*1024*1024||u64::try_from(archive).ok()!=Some(number(&db["size"],"archive_timeout_seconds")){return Ok(false);}

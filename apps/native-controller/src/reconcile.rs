@@ -32,6 +32,13 @@ const SWITCH: &str = "pgcf.io/runtime-switch";
 const PRESTARTED: &str = "pgcf-prestarted";
 const PROFILE: &str = "pgcf.io/compute-profile";
 const ADMISSION: &str = "pgcf-cnpg-prestarted";
+struct RuntimeResources<'a> {
+    namespace: &'a Value,
+    cluster: &'a Value,
+    pod: &'a Value,
+    ca: &'a Value,
+    node: &'a Value,
+}
 pub struct Reconciler {
     pub k8s: Kubernetes,
     pub power: PowerCoordinator,
@@ -39,6 +46,7 @@ pub struct Reconciler {
     pub cluster_uid: String,
     postgres_image: String,
     http: reqwest::Client,
+    pool: Option<crate::pool::Runtime>,
 }
 fn uid(v: &Value) -> Result<&str, Error> {
     let value = text(&v["metadata"], "uid");
@@ -774,8 +782,38 @@ impl Reconciler {
         if db["storage"].is_null() {
             return Ok(());
         }
-        write_ledger(&self.k8s, db, db["storage_authority"].as_str(), decided).await?;
+        if db.get("pool_binding").is_some() {
+            let runtime = self
+                .pool
+                .as_ref()
+                .ok_or("pool authority delivery disabled")?;
+            runtime.verify_write(&db["pool_binding"], crate::pool::clock()?)?;
+            write_ledger(
+                &self.k8s,
+                db,
+                db["pool_binding"]["storage_authority"].as_str(),
+                decided,
+            )
+            .await?;
+        } else {
+            write_ledger(&self.k8s, db, db["storage_authority"].as_str(), decided).await?;
+        }
         Ok(())
+    }
+    pub async fn protect_storage(&self, db: &Value) -> Result<Option<Value>, Error> {
+        if db.get("pool_binding").is_some() {
+            // The host's already-armed physical guard owns expiry protection. CNPG is
+            // retained hibernated throughout a binding; that annotation cannot prove
+            // the independent mounted writer has stopped or authorize automatic recovery.
+            return Ok(Some(observation(
+                db,
+                "error",
+                Some(
+                    "Pool storage write authority is unavailable; physical holder release remains required",
+                ),
+            )));
+        }
+        self.power.protect_storage(db).await
     }
     /// A runtime switch at the same generation relabels the namespace that runtime admission
     /// matches, then deletes only a primary on the other runtime, so that CNPG recreates it on its
@@ -922,26 +960,44 @@ impl Reconciler {
         db: &Value,
         snapshot: &DesiredSnapshot,
     ) -> Result<Option<Value>, Error> {
-        let result=self.reconcile_current(db,snapshot).await?;
-        let Some(value)=&result else { return Ok(result); };
-        if db["admission"].is_null() || text(db,"desired_state")!="running"
-            || (text(value,"state")!="provisioning" && text(value,"state")!="ready")
-            || (value["runtime_attestation"]["v"]==2 && crate::contracts::schema_valid("DatabaseRuntimeAttestation",&value["runtime_attestation"])) {
+        let result = self.reconcile_current(db, snapshot).await?;
+        let Some(value) = &result else {
+            return Ok(result);
+        };
+        if db["admission"].is_null()
+            || text(db, "desired_state") != "running"
+            || (text(value, "state") != "provisioning" && text(value, "state") != "ready")
+            || (value["runtime_attestation"]["v"] == 2
+                && crate::contracts::schema_valid(
+                    "DatabaseRuntimeAttestation",
+                    &value["runtime_attestation"],
+                ))
+        {
             return Ok(result);
         }
         // Same-generation provisioning is ignored by legacy observation consumers. Once a
         // persisted target was admitted, emit the existing error invalidator instead of
         // hiding a missing/currently unverifiable primary, CA or watch proof behind startup.
-        let name=format!("gateway-fence-{}",text(db,"id"));
-        let Some(map)=self.k8s.read("ConfigMap",Some(SYSTEM),&name).await? else { return Ok(result); };
-        owned(&map,db,&name,Some(SYSTEM))?;
-        let Some(raw)=map["data"]["admission_target"].as_str() else { return Ok(result); };
-        let target:Value=serde_json::from_str(raw)?;
-        if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget",&target) || number(&target,"generation")>number(db,"generation") {
+        let name = format!("gateway-fence-{}", text(db, "id"));
+        let Some(map) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+            return Ok(result);
+        };
+        owned(&map, db, &name, Some(SYSTEM))?;
+        let Some(raw) = map["data"]["admission_target"].as_str() else {
+            return Ok(result);
+        };
+        let target: Value = serde_json::from_str(raw)?;
+        if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget", &target)
+            || number(&target, "generation") > number(db, "generation")
+        {
             return Err("admitted target history invalid".into());
         }
-        if target["generation"]==db["generation"] {
-            return Ok(Some(observation(db,"error",Some("Current admitted runtime proof is unavailable"))));
+        if target["generation"] == db["generation"] {
+            return Ok(Some(observation(
+                db,
+                "error",
+                Some("Current admitted runtime proof is unavailable"),
+            )));
         }
         Ok(result)
     }
@@ -953,8 +1009,18 @@ impl Reconciler {
         if !database_valid(db) {
             return Err("invalid desired database".into());
         }
+        // A durable pool holder is an exclusive branch. Disabled, pending, lost and
+        // detaching holders never fall through to CNPG's hibernation-off path.
+        if db.get("pool_binding").is_some() {
+            return self.reconcile_pool(db, snapshot).await;
+        }
+        // Absence of the desired pool branch means CF selected ordinary CNPG. Retained
+        // local records must still be verified/handed back before the normal wake path.
         let state_name = text(db, "desired_state");
         self.k8s.assert_cluster(&self.cluster_uid).await?;
+        if !self.ensure_pool_handoff(db).await? {
+            return Ok(None);
+        }
         if state_name == "deleted" {
             return self
                 .power
@@ -1388,11 +1454,13 @@ impl Reconciler {
                         .runtime_readback(
                             db,
                             &start,
-                            &final_ns,
-                            &cluster,
-                            &pod,
-                            &current_ca,
-                            &node_observed,
+                            &RuntimeResources {
+                                namespace: &final_ns,
+                                cluster: &cluster,
+                                pod: &pod,
+                                ca: &current_ca,
+                                node: &node_observed,
+                            },
                             &volume_identity,
                         )
                         .await?
@@ -1453,17 +1521,504 @@ impl Reconciler {
         }
         Ok(result)
     }
+    async fn cleanup_terminal_pool(
+        &self,
+        db: &Value,
+        details: &Value,
+        handoff_selected: bool,
+    ) -> Result<bool, Error> {
+        if !crate::pool::terminal_report_matches(details, db) {
+            return Err("pool physical terminal outcome unavailable".into());
+        }
+        let binding = &details["binding"]["binding"];
+        let scope = &binding["scope"];
+        let runtime = self
+            .pool
+            .as_ref()
+            .ok_or("pool terminal handoff runtime unavailable")?;
+        let node = self
+            .k8s
+            .read("Node", None, text(db, "node"))
+            .await?
+            .ok_or("pool handoff Node unavailable")?;
+        if !runtime
+            .handoff_current(db, binding, &node, &self.postgres_image)
+            .await?
+        {
+            return Ok(false);
+        }
+        let name = format!("gateway-fence-{}", text(db, "id"));
+        let key = pgcf_native_protocol::pool::constant("binding_record_key")
+            .as_str()
+            .ok_or("pool record key unavailable")?;
+        let before = self
+            .k8s
+            .read("ConfigMap", Some(SYSTEM), &name)
+            .await?
+            .ok_or("pool handoff fence missing")?;
+        owned(&before, db, &name, Some(SYSTEM))?;
+        if before["data"][key].as_str().is_some() {
+            crate::pool::terminal_handoff_patch(&before, binding)?;
+            let raw = serde_json::to_string(binding)?;
+            if before["data"][key] != raw {
+                match self.k8s.patch(&before, &json!({"data":{key:raw}})).await {
+                    Ok(after)
+                        if after["metadata"]["uid"] == before["metadata"]["uid"]
+                            && after["data"][key] == raw => {}
+                    Ok(_) => return Err("pool terminal publication unconfirmed".into()),
+                    Err(error) => {
+                        let after = self
+                            .k8s
+                            .read("ConfigMap", Some(SYSTEM), &name)
+                            .await?
+                            .ok_or("pool terminal fence disappeared")?;
+                        if after["metadata"]["uid"] != before["metadata"]["uid"]
+                            || after["data"][key] != raw
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+        let lease = crate::pool::release_primary_lease(&self.k8s, binding).await?;
+        if lease["spec"]["holderIdentity"]
+            .as_str()
+            .is_none_or(|holder| !holder.is_empty())
+        {
+            return Err("pool primary Lease handback unconfirmed".into());
+        }
+        crate::pool::delete_released_pod(&self.k8s, binding).await?;
+        if self
+            .k8s
+            .read(
+                "Pod",
+                Some(text(scope, "pool_namespace")),
+                text(scope, "pool_pod_name"),
+            )
+            .await?
+            .is_some_and(|pod| pod["metadata"]["uid"] == scope["pool_pod_uid"])
+        {
+            return Ok(false);
+        }
+        let node = self
+            .k8s
+            .read("Node", None, text(db, "node"))
+            .await?
+            .ok_or("pool handoff Node disappeared")?;
+        if !runtime
+            .handoff_current(db, binding, &node, &self.postgres_image)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !handoff_selected {
+            return Ok(true);
+        }
+        if db.get("pool_binding").is_none()
+            && runtime
+                .qualification(text(scope, "node_id"))
+                .await?
+                .is_some_and(|q| q["scope"]["database_id"] == db["id"])
+        {
+            return Ok(false);
+        }
+        let current = self
+            .k8s
+            .read("ConfigMap", Some(SYSTEM), &name)
+            .await?
+            .ok_or("pool handoff fence missing")?;
+        owned(&current, db, &name, Some(SYSTEM))?;
+        if current["data"][key].is_null() {
+            return Ok(true);
+        }
+        let patch = crate::pool::terminal_handoff_patch(&current, binding)?;
+        match self.k8s.patch(&current, &patch).await {
+            Ok(after)
+                if after["data"][key].is_null() && after["data"]["admission_target"].is_null() => {}
+            Ok(_) => return Err("pool handoff fence removal unconfirmed".into()),
+            Err(error) => {
+                let after = self
+                    .k8s
+                    .read("ConfigMap", Some(SYSTEM), &name)
+                    .await?
+                    .ok_or("pool handoff fence disappeared")?;
+                if after["metadata"]["uid"] != current["metadata"]["uid"]
+                    || !after["data"][key].is_null()
+                    || !after["data"]["admission_target"].is_null()
+                {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(true)
+    }
+    async fn ensure_pool_handoff(&self, db: &Value) -> Result<bool, Error> {
+        let name = format!("gateway-fence-{}", text(db, "id"));
+        let Some(map) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+            return Ok(true);
+        };
+        let key = pgcf_native_protocol::pool::constant("binding_record_key")
+            .as_str()
+            .ok_or("pool record key unavailable")?;
+        let Some(raw) = map["data"][key].as_str() else {
+            return Ok(true);
+        };
+        let old: Value = serde_json::from_str(raw)?;
+        if let Some(desired) = db.get("pool_binding") {
+            let next = &desired["binding"];
+            if next["scope"]["binding_id"] == old["scope"]["binding_id"] {
+                return Ok(true);
+            }
+            if !pgcf_native_protocol::pool::binding_valid(next)
+                || next["scope"]["database_id"] != old["scope"]["database_id"]
+                || next["scope"]["route_revision"].as_u64()
+                    <= old["scope"]["route_revision"].as_u64()
+            {
+                return Err("pool successor scope regressed".into());
+            }
+        }
+        let runtime = self
+            .pool
+            .as_ref()
+            .ok_or("retained pool record requires its qualified runtime")?;
+        let details = runtime.details(&old).await?;
+        self.cleanup_terminal_pool(db, &details, true).await
+    }
+    async fn reconcile_pool(
+        &self,
+        db: &Value,
+        snapshot: &DesiredSnapshot,
+    ) -> Result<Option<Value>, Error> {
+        use crate::pool::{HolderStage, SupervisorConnection};
+        let clock = crate::pool::clock()?;
+        let requested = crate::pool::holder_stage(self.pool.is_some(), db, clock)?
+            .ok_or("pool holder missing")?;
+        let runtime = self.pool.as_ref().ok_or("pool runtime disabled")?;
+        self.k8s.assert_cluster(&self.cluster_uid).await?;
+        let details = runtime.details(&db["pool_binding"]["binding"]).await?;
+        let desired = &details["binding"];
+        let binding = &desired["binding"];
+        let scope = &binding["scope"];
+        let mut current = db.clone();
+        current["pool_binding"] = desired.clone();
+        let stage = crate::pool::holder_stage(true, &current, clock)?
+            .ok_or("pool current holder missing")?;
+        if requested == HolderStage::Release && stage != HolderStage::Release {
+            return Err("pool terminal holder regressed".into());
+        }
+        if stage == HolderStage::Release {
+            if text(db, "desired_state") == "deleted"
+                && crate::pool::terminal_report_matches(&details, db)
+            {
+                let node = self
+                    .k8s
+                    .read("Node", None, text(db, "node"))
+                    .await?
+                    .ok_or("pool delete retry Node unavailable")?;
+                if !runtime
+                    .handoff_current(db, binding, &node, &self.postgres_image)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                if self.power.pool_delete_resumable(db, &details).await? {
+                    return self
+                        .power
+                        .delete_database(db, &snapshot.region["storage_nodes"])
+                        .await;
+                }
+            }
+            if !self.cleanup_terminal_pool(db, &details, false).await? {
+                return Ok(None);
+            }
+            if text(db, "desired_state") == "suspended" {
+                return self.power.finish_pool_stopped(db, &details).await;
+            }
+            if text(db, "desired_state") == "deleted" {
+                self.power.begin_pool_delete(db, &details).await?;
+                return self
+                    .power
+                    .delete_database(db, &snapshot.region["storage_nodes"])
+                    .await;
+            }
+            return Ok(Some(observation(
+                db,
+                "provisioning",
+                Some("Pool holder released; awaiting current Cloudflare desired state"),
+            )));
+        }
+        if stage == HolderStage::Retain {
+            return Ok(Some(observation(
+                db,
+                "error",
+                Some("Pool holder requires verified physical cleanup"),
+            )));
+        }
+        if !self.ensure_pool_handoff(db).await? {
+            return Ok(None);
+        }
+        let (pool_ns, pod, node) = crate::pool::binding_pod(&self.k8s, binding).await?;
+        crate::pool::maintain_primary_lease(&self.k8s, desired).await?;
+        self.power.publish_pool_binding(db, binding).await?;
+        let connection = SupervisorConnection::new(&details["pod_attestation"], binding)?;
+        let control = json!({"v":1,"binding_id":scope["binding_id"],"scope_sha256":binding["scope_sha256"],"bundle_nonce":scope["bundle_nonce"]});
+        if stage == HolderStage::Drain {
+            // Gateway closure is only idle closure; its protocol tracker must preserve
+            // every busy/partial transaction. The node's existing guard owns hard expiry.
+            if !self.power.pool_gateway_drained(db, binding).await? {
+                return Ok(None);
+            }
+            let cluster = self
+                .k8s
+                .read("Cluster", Some(&namespace(db)), "database")
+                .await?
+                .ok_or("pool draining retained Cluster missing")?;
+            let Some((ca, _)) = self.ca(db, &cluster).await? else {
+                return Ok(None);
+            };
+            if !postgres::pool_idle(db, scope, &ca).await? {
+                return Ok(None);
+            }
+            let stopped = connection.request("/stop", &control).await?;
+            runtime
+                .report(
+                    &format!(
+                        "/agent/v1/pool-bindings/{}/supervisor",
+                        text(scope, "binding_id")
+                    ),
+                    "PoolSupervisorReport",
+                    &stopped,
+                )
+                .await?;
+            return Ok(Some(observation(
+                db,
+                "provisioning",
+                Some("Pool postmaster stopped; awaiting actual node release"),
+            )));
+        }
+        runtime.verify_write(desired, clock)?;
+        if scope["storage"]["backend"] == "lvm-thin-v1" {
+            write_ledger(&self.k8s, db, desired["storage_authority"].as_str(), None).await?;
+        }
+        let ns = namespace(db);
+        let (tenant, cluster) = tokio::try_join!(
+            self.k8s.read("Namespace", None, &ns),
+            self.k8s.read("Cluster", Some(&ns), "database")
+        )?;
+        let tenant = tenant.ok_or("pool tenant namespace missing")?;
+        let cluster = cluster.ok_or("pool retained Cluster missing")?;
+        owned(&tenant, db, &ns, None)?;
+        owned(&cluster, db, "database", Some(&ns))?;
+        if tenant["metadata"]["uid"] != scope["storage"]["namespace_uid"]
+            || cluster["metadata"]["uid"] != scope["storage"]["cnpg_cluster_uid"]
+        {
+            return Err("pool retained tenant identity changed".into());
+        }
+        let Some((ca, ca_secret)) = self.ca(db, &cluster).await? else {
+            return Ok(None);
+        };
+        let name = text(&cluster["status"]["certificates"], "serverTLSSecret");
+        if name.is_empty() {
+            return Err("pool CNPG server TLS reference unavailable".into());
+        }
+        let server = self
+            .k8s
+            .read("Secret", Some(&ns), name)
+            .await?
+            .ok_or("pool CNPG server TLS missing")?;
+        if !cluster_owned(&server, &cluster) || !server["metadata"]["deletionTimestamp"].is_null() {
+            return Err("pool server TLS ownership changed".into());
+        }
+        let decode = |field: &str| -> Result<String, Error> {
+            let encoded = text(&server["data"], field);
+            if encoded.len() > 64 * 1024 {
+                return Err("pool server TLS exceeds bound".into());
+            }
+            Ok(String::from_utf8(STANDARD.decode(encoded)?)?)
+        };
+        let client_name = text(&cluster["status"]["certificates"], "clientCASecret");
+        if client_name.is_empty() {
+            return Err("pool CNPG client CA reference unavailable".into());
+        }
+        let client_ca = self
+            .k8s
+            .read("Secret", Some(&ns), client_name)
+            .await?
+            .ok_or("pool CNPG client CA missing")?;
+        if !cluster_owned(&client_ca, &cluster)
+            || !client_ca["metadata"]["deletionTimestamp"].is_null()
+        {
+            return Err("pool client CA custody changed".into());
+        }
+        let client_ca_bytes = STANDARD.decode(text(&client_ca["data"], "ca.crt"))?;
+        postgres::validate_ca(&client_ca_bytes)?;
+        let bundle = json!({"v":1,"scope":scope,"scope_sha256":binding["scope_sha256"],"holder_revision":binding["holder_revision"],"permission":desired["permission"],"storage_authority":desired["storage_authority"],"server_certificate_pem":decode("tls.crt")?,"server_private_key_pem":decode("tls.key")?,"server_ca_pem":String::from_utf8(ca.clone())?,"client_ca_pem":String::from_utf8(client_ca_bytes.clone())?,"client_ca_secret_uid":client_ca["metadata"]["uid"],"client_ca_secret_resource_version":client_ca["metadata"]["resourceVersion"],"ca_secret_uid":ca_secret["metadata"]["uid"],"ca_secret_resource_version":ca_secret["metadata"]["resourceVersion"],"ca_sha256":Sha256::digest(&ca).iter().map(|byte|format!("{byte:02x}")).collect::<String>(),"tls_server_name":format!("database-rw.{ns}.svc"),"archive":{"destination_path":db["archive"]["destination_path"],"server_name":"database","endpoint_url":snapshot.region["backup"]["endpoint_url"],"retention_days":db["size"]["backup_retention_days"]}});
+        // Bundle pending is truthful waiting, never runtime admission. Repeated identical
+        // delivery is the supervisor's existing idempotent scope/nonce boundary.
+        let started = std::time::Instant::now();
+        let reply = connection.request("/bundle", &bundle).await?;
+        eprintln!(
+            "{}",
+            json!({"event":"pool_bundle_delivery","database":db["id"],"generation":db["generation"],"milliseconds":started.elapsed().as_millis(),"waiting":reply["waiting"]==true})
+        );
+        if reply["waiting"] == true {
+            return Ok(None);
+        }
+        if !crate::pool::ready_report_current(&reply, binding, crate::pool::clock()?) {
+            return Err("pool supervisor is not currently Ready".into());
+        }
+        runtime
+            .report(
+                &format!(
+                    "/agent/v1/pool-bindings/{}/supervisor",
+                    text(scope, "binding_id")
+                ),
+                "PoolSupervisorReport",
+                &reply,
+            )
+            .await?;
+        if stage == HolderStage::Mount {
+            return Ok(None);
+        }
+        if !postgres::pool_roles(db, scope, &ca).await? {
+            return Ok(None);
+        }
+        let Some(start) = self.k8s.runtime_continuity() else {
+            return Ok(None);
+        };
+        let claim = self
+            .k8s
+            .list("PersistentVolumeClaim", Some(&ns), None)
+            .await?
+            .into_iter()
+            .find(|claim| claim["metadata"]["uid"] == scope["storage"]["pvc_uid"])
+            .ok_or("pool retained PVC missing")?;
+        let pv = self
+            .k8s
+            .read("PersistentVolume", None, text(&claim["spec"], "volumeName"))
+            .await?
+            .ok_or("pool retained PV missing")?;
+        let storage = self
+            .k8s
+            .read(
+                "ConfigMap",
+                Some(SYSTEM),
+                &format!("storage-{}", text(db, "id")),
+            )
+            .await?
+            .ok_or("pool retained storage receipt missing")?;
+        if pv["metadata"]["uid"] != scope["storage"]["pv_uid"]
+            || storage["metadata"]["uid"] != scope["storage"]["storage_uid"]
+        {
+            return Err("pool runtime storage identity changed".into());
+        }
+        let mut versions = json!({});
+        let resources = [
+            ("namespace", &tenant),
+            ("cluster", &cluster),
+            ("pod", &pod),
+            ("ca_secret", &ca_secret),
+            ("node", &node),
+            ("pvc", &claim),
+            ("pv", &pv),
+            ("storage", &storage),
+        ];
+        for (key, value) in resources {
+            let fresh = self
+                .k8s
+                .read(
+                    text(value, "kind"),
+                    value["metadata"]["namespace"].as_str(),
+                    text(&value["metadata"], "name"),
+                )
+                .await?
+                .ok_or("pool runtime resource disappeared")?;
+            if !crate::pool::same_resource(value, &fresh)
+                || !self.k8s.runtime_resource_current(&fresh)
+            {
+                return Ok(None);
+            }
+            versions[key] = fresh["metadata"]["resourceVersion"].clone();
+        }
+        let fresh_ns = self
+            .k8s
+            .read("Namespace", None, "pgcf-pool")
+            .await?
+            .ok_or("pool runtime namespace disappeared")?;
+        let fresh_server = self
+            .k8s
+            .read("Secret", Some(&ns), name)
+            .await?
+            .ok_or("pool server TLS disappeared")?;
+        let fresh_client_ca = self
+            .k8s
+            .read("Secret", Some(&ns), client_name)
+            .await?
+            .ok_or("pool client CA disappeared")?;
+        if !crate::pool::same_resource(&pool_ns, &fresh_ns)
+            || !crate::pool::same_resource(&server, &fresh_server)
+            || !crate::pool::same_resource(&client_ca, &fresh_client_ca)
+            || !self.k8s.runtime_resource_current(&fresh_client_ca)
+            || !self.k8s.runtime_resource_current(&fresh_ns)
+            || self.k8s.runtime_continuity().as_ref() != Some(&start)
+        {
+            return Ok(None);
+        }
+        let verified = crate::pool::clock()?;
+        let expiry = verified
+            .checked_add(
+                constant("DATABASE_RUNTIME_PROOF_MAX_AGE_MS")
+                    .as_u64()
+                    .ok_or("pool runtime proof age missing")?,
+            )
+            .ok_or("pool proof clock exceeded")?;
+        let proof = json!({"v":2,"kind":"pool","database_id":db["id"],"generation":db["generation"],"storage_generation":scope["storage"]["storage_generation"],"region_id":self.power.region(),"node_uid":scope["node_uid"],"boot_id":scope["boot_id"],"cluster_uid":self.cluster_uid,"namespace_uid":tenant["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":storage["metadata"]["uid"],"pvc_uid":claim["metadata"]["uid"],"pv_uid":pv["metadata"]["uid"],"pod_uid":pod["metadata"]["uid"],"container_id":scope["container_id"],"postgres_image_sha256":scope["class"]["postgres_image_sha256"],"memory_request_bytes":scope["class"]["memory_request_bytes"],"memory_limit_bytes":scope["class"]["memory_limit_bytes"],"observed_at":verified,"configuration_fingerprint":scope["configuration_fingerprint"],"route_revision":db["admission"]["route_revision"],"admission_epoch":db["admission"]["admission_epoch"],"applied_role_revisions":db["roles"].as_array().ok_or("pool roles missing")?.iter().map(|role|json!({"name":role["name"],"revision":role["revision"]})).collect::<Vec<_>>(),"tls_server_name":format!("database-rw.{ns}.svc"),"ca_secret_uid":ca_secret["metadata"]["uid"],"ca_secret_resource_version":ca_secret["metadata"]["resourceVersion"],"ca_sha256":bundle["ca_sha256"],"pod_ip":scope["pool_pod_ip"],"postgres_port":5432,"observation":{"v":1,"controller_epoch":start.0,"watch_epoch":start.1,"coverage":"complete","verified_at":verified,"expires_at":expiry,"resource_versions":versions},"binding_id":scope["binding_id"],"scope_sha256":binding["scope_sha256"],"holder_revision":binding["holder_revision"],"pool_namespace_uid":pool_ns["metadata"]["uid"],"pool_namespace_resource_version":pool_ns["metadata"]["resourceVersion"]});
+        let mut result = observation(db, "ready", None);
+        result["runtime_attestation"] = proof.clone();
+        let report = json!({"v":1,"runtime":proof,"supervisor":reply});
+        // Actual IO/expiry proof is checked before publishing CF serving; the existing
+        // sealed running fence and gateway release are preserved without waking CNPG.
+        let Some(result) = self
+            .power
+            .finish_pool_running(
+                db,
+                desired,
+                &details["node_report"],
+                &runtime.storage_trust,
+                result,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        runtime
+            .report(
+                &format!(
+                    "/agent/v1/pool-bindings/{}/serving",
+                    text(scope, "binding_id")
+                ),
+                "PoolServingReport",
+                &report,
+            )
+            .await?;
+        self.persist_admission_target(db, &result).await?;
+        Ok(Some(result))
+    }
     async fn runtime_readback(
         &self,
         db: &Value,
         start: &(String, u64),
-        namespace: &Value,
-        cluster: &Value,
-        pod: &Value,
-        ca: &Value,
-        node: &Value,
+        resources: &RuntimeResources<'_>,
         volume: &Value,
     ) -> Result<Option<Value>, Error> {
+        let (namespace, cluster, pod, ca, node) = (
+            resources.namespace,
+            resources.cluster,
+            resources.pod,
+            resources.ca,
+            resources.node,
+        );
         let ns = crate::contracts::namespace(db);
         let claim = self
             .k8s
@@ -1614,7 +2169,46 @@ impl Reconciler {
             cluster_uid,
             postgres_image,
             http,
+            pool: None,
         })
+    }
+    pub fn with_pool(mut self, runtime: Option<crate::pool::Runtime>) -> Self {
+        self.pool = runtime;
+        self
+    }
+    pub async fn pool_inventory(&self, snapshot: &DesiredSnapshot) -> Result<(), Error> {
+        if let Some(runtime) = &self.pool {
+            self.k8s.assert_cluster(&self.cluster_uid).await?;
+            runtime
+                .inventory(&self.k8s, snapshot, &self.postgres_image)
+                .await?;
+        }
+        Ok(())
+    }
+    pub async fn pool_primary_leases(&self, databases: &[Value]) -> Result<(), Error> {
+        if self.pool.is_none() {
+            return Ok(());
+        }
+        use futures_util::{StreamExt, stream};
+        let results = stream::iter(databases.iter().filter_map(|db| db.get("pool_binding")))
+            .map(|desired| async {
+                if matches!(
+                    desired["binding"]["state"].as_str(),
+                    Some("released" | "refused")
+                ) {
+                    return Ok(());
+                }
+                crate::pool::maintain_primary_lease(&self.k8s, desired)
+                    .await
+                    .map(|_| ())
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<Result<(), Error>>>()
+            .await;
+        for result in results {
+            result?;
+        }
+        Ok(())
     }
     async fn guard(
         &self,
@@ -2254,19 +2848,22 @@ mod runtime_tests {
     }
     #[tokio::test]
     async fn an_existing_current_admitted_target_losing_proof_is_not_hidden_by_provisioning() {
-        let mut f=fixture("native",Some("pgcf-native"),Value::Null).await;
-        f.db["admission"]=json!({"v":1,"admission_epoch":1,"route_revision":1});
+        let mut f = fixture("native", Some("pgcf-native"), Value::Null).await;
+        f.db["admission"] = json!({"v":1,"admission_epoch":1,"route_revision":1});
         assert!(database_valid(&f.db));
         // Initial startup has no admission to withdraw.
-        assert_eq!(observed(&f).await,"provisioning");
-        let target=json!({"v":1,"generation":f.db["generation"],"route_revision":1,"admission_epoch":1,"pod_uid":uid(8),"container_id":"a".repeat(64),"ca_secret_uid":uid(7),"ca_secret_resource_version":"1","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.{}.svc",f.ns)});
-        assert!(pgcf_native_protocol::valid_schema("gatewayAdmissionTarget",&target));
-        let name=format!("gateway-fence-{}",text(&f.db,"id"));
+        assert_eq!(observed(&f).await, "provisioning");
+        let target = json!({"v":1,"generation":f.db["generation"],"route_revision":1,"admission_epoch":1,"pod_uid":uid(8),"container_id":"a".repeat(64),"ca_secret_uid":uid(7),"ca_secret_resource_version":"1","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.{}.svc",f.ns)});
+        assert!(pgcf_native_protocol::valid_schema(
+            "gatewayAdmissionTarget",
+            &target
+        ));
+        let name = format!("gateway-fence-{}", text(&f.db, "id"));
         f.server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":uid(9),"labels":{LABEL:f.db["id"]}},"data":{"admission_target":serde_json::to_string(&target).unwrap()}}));
-        assert_eq!(observed(&f).await,"error");
+        assert_eq!(observed(&f).await, "error");
         // A target from the preceding database generation is an ordinary cold startup.
-        f.db["generation"]=2.into();
-        assert_eq!(observed(&f).await,"provisioning");
+        f.db["generation"] = 2.into();
+        assert_eq!(observed(&f).await, "provisioning");
     }
     /// The CA publication follows the runtime decision, so it shows that reconciliation went on.
     fn published(f: &Fixture) -> bool {

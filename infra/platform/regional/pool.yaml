@@ -1,0 +1,64 @@
+# Pool Pods are created only by the native controller's explicitly enabled, qualified policy.
+# Stable namespace/workload selectors are discovery and network boundaries; late tenant labels
+# are deliberately absent from every authorization rule.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgcf-pool
+  labels:
+    app.kubernetes.io/part-of: pgcf
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pgcf-pool
+  labels:
+    app.kubernetes.io/part-of: pgcf
+value: -1000
+globalDefault: false
+preemptionPolicy: Never
+description: Tenant-free pool Pods cannot preempt PostgreSQL or regional control workloads.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: pgcf-pool
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# The enabled controller adds only exact configured R2-host DNS/HTTPS egress. No API-server,
+# world wildcard or pool-to-pool rule is present in this namespace.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pgcf-pool-ingress
+  namespace: pgcf-pool
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-pool
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pgcf-system
+            app.kubernetes.io/name: pgcf-gateway
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pgcf-system
+            app.kubernetes.io/name: pgcf-agent
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pgcf-system
+            app.kubernetes.io/name: pgcf-agent
+      toPorts:
+        - ports:
+            - port: "18443"
+              protocol: TCP

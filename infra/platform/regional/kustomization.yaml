@@ -2,6 +2,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - config.yaml
+  - pool.yaml
   - rbac.yaml
   - network-policies.yaml
   - cloudflared.yaml

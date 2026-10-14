@@ -41,76 +41,6 @@ use tokio_tungstenite::{
 };
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type WebSocket = WebSocketStream<BudgetedStream>;
-#[cfg(test)]
-mod admission_revision_tests {
-    use super::*;
-    use crate::kubernetes::{Fence, Intent};
-    #[test]
-    fn v4_requires_a_persisted_independent_route_revision_at_the_existing_generation() {
-        let database = "a".repeat(20);
-        let pod = "01234567-89ab-4def-8123-0123456789ab";
-        let claims:RouteClaims=serde_json::from_value(serde_json::json!({"v":4,"db":database,"user":"app","cid":pod,"rg":"eu-test","kid":"test","iat":1,"exp":31,"rev":7,"pod":pod,"route_revision":19})).unwrap();
-        let mut state = FenceState::default();
-        state.records.insert(
-            database.clone(),
-            Fence {
-                uid: pod.into(),
-                intent: Intent {
-                    database: database.clone(),
-                    operation: format!("op_{}", "a".repeat(20)),
-                    revision: 7,
-                    mode: "running".into(),
-                },
-                retired_at: None,
-                deleting: false,
-                admission_target: None,
-            },
-        );
-        assert!(!route_revision_current(&state, &claims));
-        let target = serde_json::json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")});
-        state.records.get_mut(&database).unwrap().admission_target =
-            Some(serde_json::from_value(target).unwrap());
-        assert!(route_revision_current(&state, &claims));
-        state
-            .records
-            .get_mut(&database)
-            .unwrap()
-            .admission_target
-            .as_mut()
-            .unwrap()
-            .route_revision = 20;
-        assert!(!route_revision_current(&state, &claims));
-        state
-            .records
-            .get_mut(&database)
-            .unwrap()
-            .admission_target
-            .as_mut()
-            .unwrap()
-            .route_revision = 19;
-        let mut actual = TargetIdentity {
-            address: "10.0.0.7".parse().unwrap(),
-            pod_uid: pod.into(),
-            node: "customer-us1".into(),
-            storage: None,
-            container_id: None,
-            ca: None,
-        };
-        assert!(!admitted_runtime_current(&state, &claims, &actual));
-        actual.container_id = Some("a".repeat(64));
-        actual.ca = Some(crate::targets::CaIdentity {
-            ca_secret_uid: pod.into(),
-            ca_secret_resource_version: "81".into(),
-            ca_sha256: "b".repeat(64),
-        });
-        assert!(admitted_runtime_current(&state, &claims, &actual));
-        actual.ca.as_mut().unwrap().ca_secret_resource_version = "82".into();
-        assert!(!admitted_runtime_current(&state, &claims, &actual));
-        actual.ca.as_mut().unwrap().ca_secret_resource_version = "81".into();
-        actual.container_id = Some("c".repeat(64));
-        assert!(!admitted_runtime_current(&state, &claims, &actual));
-    }
-}
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
 pub struct Config {
     pub region: String,
@@ -197,10 +127,12 @@ impl Gateway {
         let fences = Arc::new(RwLock::new(FenceState::default()));
         let sessions = Arc::new(Mutex::new(Sessions::default()));
         let measurements = Arc::new(Mutex::new(GatewayMeasurements::new()));
+        let targets = Arc::new(RwLock::new(Targets::default()));
         let control = Control::new(
             config.clone(),
             pod,
             fences.clone(),
+            targets.clone(),
             sessions.clone(),
             measurements.clone(),
         );
@@ -209,7 +141,7 @@ impl Gateway {
             config,
             dial,
             fences,
-            targets: Arc::new(RwLock::new(Targets::default())),
+            targets,
             sessions,
             measurements,
             control,
@@ -930,6 +862,11 @@ fn admitted_runtime_current(
             .and_then(|fence| fence.admission_target.as_ref())
             .is_some_and(|admitted| {
                 target.container_id.as_ref() == Some(&admitted.container_id)
+                    && target.pool.as_ref().is_none_or(|pool| {
+                        admitted.generation == pool.generation
+                            && admitted.admission_epoch >= pool.admission_epoch
+                            && admitted.route_revision >= pool.route_revision
+                    })
                     && target.ca.as_ref().is_some_and(|ca| {
                         ca.ca_secret_uid == admitted.ca_secret_uid
                             && ca.ca_secret_resource_version == admitted.ca_secret_resource_version
@@ -941,6 +878,24 @@ fn admitted_runtime_current(
 /// A v3 route names the verified primary Pod; the cached writer and any storage binding must
 /// be that Pod at that revision. The dial still uses the writer's address and service TLS name.
 fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {
+    match (&target.pool, claims.kind.as_deref()) {
+        (Some(pool), Some("pool")) => {
+            return claims.v == 4
+                && claims.rev == Some(pool.generation)
+                && claims.pod.as_deref() == Some(target.pod_uid.as_str())
+                && claims.binding_id.as_deref() == Some(pool.binding_id.as_str())
+                && claims.node_uid.as_deref() == Some(pool.node_uid.as_str())
+                && claims
+                    .pod_ip
+                    .as_ref()
+                    .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+                    == Some(target.address)
+                && claims.storage_generation == Some(pool.storage_generation)
+                && claims.scope_sha256.as_deref() == Some(pool.scope_sha256.as_str());
+        }
+        (None, None) => {}
+        _ => return false,
+    }
     match (claims.rev, claims.pod.as_deref()) {
         (Some(revision), Some(pod)) => {
             target.pod_uid == pod
@@ -954,7 +909,12 @@ fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {
     }
 }
 fn target_revision_matches(state: &FenceState, database: &str, target: &TargetIdentity) -> bool {
-    target.storage.as_ref().is_none_or(|binding| {
+    target.pool.as_ref().is_none_or(|pool| {
+        state
+            .records
+            .get(database)
+            .is_some_and(|fence| fence.intent.revision == pool.generation)
+    }) && target.storage.as_ref().is_none_or(|binding| {
         state
             .records
             .get(database)
@@ -963,11 +923,12 @@ fn target_revision_matches(state: &FenceState, database: &str, target: &TargetId
 }
 async fn current_mode(gateway: &Gateway, database: &str, requested: Action) -> Action {
     let state = gateway.fences.read().await;
-    match state
+    let intent = state
         .records
         .get(database)
-        .map(|fence| fence.intent.mode.as_str())
-    {
+        .map(|fence| fence.intent.clone());
+    drop(state);
+    match intent.as_ref().map(|intent| intent.mode.as_str()) {
         Some("retired") => Action::Retire,
         Some("quiesce") => {
             if matches!(requested, Action::CloseIdle | Action::CloseAuthentication) {
@@ -975,6 +936,17 @@ async fn current_mode(gateway: &Gateway, database: &str, requested: Action) -> A
             } else {
                 Action::Quiesce
             }
+        }
+        Some("running")
+            if requested == Action::CloseIdle
+                && gateway.targets.read().await.running_pool_close_permitted(
+                    database,
+                    &intent.as_ref().unwrap().operation,
+                    intent.as_ref().unwrap().revision,
+                    control::now(),
+                ) =>
+        {
+            Action::CloseIdle
         }
         _ => Action::Running,
     }
@@ -1073,4 +1045,164 @@ async fn dial_postgres(
     let stream = TcpStream::connect((address, port)).await?;
     stream.set_nodelay(true)?;
     negotiate_tls(stream, host, ca).await
+}
+
+#[cfg(test)]
+mod admission_revision_tests {
+    use super::*;
+    use crate::kubernetes::{Fence, Intent};
+    #[test]
+    fn v4_requires_a_persisted_independent_route_revision_at_the_existing_generation() {
+        let database = "a".repeat(20);
+        let pod = "01234567-89ab-4def-8123-0123456789ab";
+        let claims:RouteClaims=serde_json::from_value(serde_json::json!({"v":4,"db":database,"user":"app","cid":pod,"rg":"eu-test","kid":"test","iat":1,"exp":31,"rev":7,"pod":pod,"route_revision":19})).unwrap();
+        let mut state = FenceState::default();
+        state.records.insert(
+            database.clone(),
+            Fence {
+                uid: pod.into(),
+                intent: Intent {
+                    database: database.clone(),
+                    operation: format!("op_{}", "a".repeat(20)),
+                    revision: 7,
+                    mode: "running".into(),
+                },
+                retired_at: None,
+                deleting: false,
+                admission_target: None,
+            },
+        );
+        assert!(!route_revision_current(&state, &claims));
+        let target = serde_json::json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")});
+        state.records.get_mut(&database).unwrap().admission_target =
+            Some(serde_json::from_value(target).unwrap());
+        assert!(route_revision_current(&state, &claims));
+        state
+            .records
+            .get_mut(&database)
+            .unwrap()
+            .admission_target
+            .as_mut()
+            .unwrap()
+            .route_revision = 20;
+        assert!(!route_revision_current(&state, &claims));
+        state
+            .records
+            .get_mut(&database)
+            .unwrap()
+            .admission_target
+            .as_mut()
+            .unwrap()
+            .route_revision = 19;
+        let mut actual = TargetIdentity {
+            address: "10.0.0.7".parse().unwrap(),
+            pod_uid: pod.into(),
+            node: "customer-us1".into(),
+            storage: None,
+            container_id: None,
+            ca: None,
+            pool: None,
+        };
+        assert!(!admitted_runtime_current(&state, &claims, &actual));
+        actual.container_id = Some("a".repeat(64));
+        actual.ca = Some(crate::targets::CaIdentity {
+            ca_secret_uid: pod.into(),
+            ca_secret_resource_version: "81".into(),
+            ca_sha256: "b".repeat(64),
+        });
+        assert!(admitted_runtime_current(&state, &claims, &actual));
+        actual.ca.as_mut().unwrap().ca_secret_resource_version = "82".into();
+        assert!(!admitted_runtime_current(&state, &claims, &actual));
+        actual.ca.as_mut().unwrap().ca_secret_resource_version = "81".into();
+        actual.container_id = Some("c".repeat(64));
+        assert!(!admitted_runtime_current(&state, &claims, &actual));
+    }
+    #[test]
+    fn pool_route_binds_scope_and_the_fresh_admission_revision_after_ca_refresh() {
+        let pod = "01234567-89ab-4def-8123-0123456789ab";
+        let database = "a".repeat(20);
+        let mut claims:RouteClaims=serde_json::from_value(serde_json::json!({"v":4,"db":database,"user":"app","cid":pod,"rg":"eu-test","kid":"test","iat":1,"exp":31,"rev":7,"pod":pod,"route_revision":19,"kind":"pool","binding_id":pod,"node_uid":pod,"pod_ip":"10.0.0.7","storage_generation":1,"scope_sha256":"c".repeat(64)})).unwrap();
+        let target = TargetIdentity {
+            address: "10.0.0.7".parse().unwrap(),
+            pod_uid: pod.into(),
+            node: "pool-node".into(),
+            storage: None,
+            container_id: Some("a".repeat(64)),
+            ca: Some(crate::targets::CaIdentity {
+                ca_secret_uid: pod.into(),
+                ca_secret_resource_version: "81".into(),
+                ca_sha256: "b".repeat(64),
+            }),
+            pool: Some(crate::targets::PoolIdentity {
+                binding_id: pod.into(),
+                node_uid: pod.into(),
+                boot_id: pod.into(),
+                scope_sha256: "c".repeat(64),
+                storage_generation: 1,
+                generation: 7,
+                admission_epoch: 11,
+                route_revision: 19,
+            }),
+        };
+        let mut state = FenceState::default();
+        let admitted=serde_json::from_value(serde_json::json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")})).unwrap();
+        state.records.insert(
+            database.clone(),
+            Fence {
+                uid: pod.into(),
+                intent: Intent {
+                    database: database.clone(),
+                    operation: format!("op_{}", "a".repeat(20)),
+                    revision: 7,
+                    mode: "running".into(),
+                },
+                retired_at: None,
+                deleting: false,
+                admission_target: Some(admitted),
+            },
+        );
+        assert!(
+            route_target_current(&claims, &target)
+                && admitted_runtime_current(&state, &claims, &target)
+        );
+        // A same-binding CA refresh advances current routing; the original immutable holder stays19.
+        let admitted = state
+            .records
+            .get_mut(&database)
+            .unwrap()
+            .admission_target
+            .as_mut()
+            .unwrap();
+        admitted.route_revision = 20;
+        admitted.admission_epoch = 12;
+        admitted.ca_secret_resource_version = "82".into();
+        admitted.ca_sha256 = "d".repeat(64);
+        assert!(!admitted_runtime_current(&state, &claims, &target));
+        claims.route_revision = Some(20);
+        let mut fresh = target.clone();
+        fresh.ca.as_mut().unwrap().ca_secret_resource_version = "82".into();
+        fresh.ca.as_mut().unwrap().ca_sha256 = "d".repeat(64);
+        assert!(
+            route_target_current(&claims, &fresh)
+                && admitted_runtime_current(&state, &claims, &fresh)
+        );
+        claims.binding_id = Some("11111111-1111-4111-8111-111111111111".into());
+        assert!(!route_target_current(&claims, &fresh));
+        claims.binding_id = Some(pod.into());
+        claims.kind = None;
+        assert!(!route_target_current(&claims, &fresh));
+        claims.kind = Some("pool".into());
+        let mut cnpg = fresh.clone();
+        cnpg.pool = None;
+        assert!(!route_target_current(&claims, &cnpg));
+        state
+            .records
+            .get_mut(&database)
+            .unwrap()
+            .admission_target
+            .as_mut()
+            .unwrap()
+            .admission_epoch = 10;
+        assert!(!admitted_runtime_current(&state, &claims, &fresh));
+    }
 }

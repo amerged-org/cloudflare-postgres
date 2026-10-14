@@ -287,7 +287,7 @@ impl ControlApi {
         }
         Ok(value)
     }
-    async fn request(&self, path: &str, body: Option<&Value>) -> Result<Value, Error> {
+    pub(crate) async fn request(&self, path: &str, body: Option<&Value>) -> Result<Value, Error> {
         let mut request = self
             .client
             .request(

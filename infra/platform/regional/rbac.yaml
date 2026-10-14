@@ -267,3 +267,111 @@ subjects:
   - kind: ServiceAccount
     name: pgcf-gateway
     namespace: pgcf-system
+---
+# Pool mutation rights remain in its fixed restricted namespace. Existing cluster-wide Pod
+# reads/deletes do not authorize workload creation elsewhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcf-pool-controller
+  namespace: pgcf-pool
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [pgcf-pool-bind-keys]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-pool-controller
+  namespace: pgcf-pool
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-pool-controller
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-agent
+    namespace: pgcf-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcf-pool-primary-lease
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [database]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcf-pool-primary-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgcf-pool-primary-lease
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-agent
+    namespace: pgcf-system
+---
+# The gateway discovers actual pool runtime identity; no Secrets or late tenant labels.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcf-pool-gateway
+  namespace: pgcf-pool
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-pool-gateway
+  namespace: pgcf-pool
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-pool-gateway
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-gateway
+    namespace: pgcf-system
+---
+# Node UID/boot checks invalidate a bound target after reboot or hardware replacement.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcf-pool-gateway-nodes
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcf-pool-gateway-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgcf-pool-gateway-nodes
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-gateway
+    namespace: pgcf-system

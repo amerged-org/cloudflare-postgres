@@ -15,7 +15,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_protocol::{route::Keyring, valid_pattern, valid_schema, wire};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
@@ -209,6 +209,47 @@ struct DeleteState {
     completed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     physical_lv_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_handoff: Option<PoolDeleteHandoff>,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PoolDeleteHandoff {
+    binding_id: String,
+    scope_sha256: String,
+    node_report_sha256: String,
+}
+fn pool_delete_handoff(
+    db: &Value,
+    details: &Value,
+) -> std::result::Result<PoolDeleteHandoff, Error> {
+    if text(db, "desired_state") != "deleted" || !crate::pool::terminal_report_matches(details, db)
+    {
+        return Err("pool deletion terminal scope unavailable".into());
+    }
+    Ok(PoolDeleteHandoff {
+        binding_id: text(&details["binding"]["binding"]["scope"], "binding_id").into(),
+        scope_sha256: text(&details["binding"]["binding"], "scope_sha256").into(),
+        node_report_sha256: Sha256::digest(serde_json::to_vec(&details["node_report"])?)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    })
+}
+fn pool_delete_saved_scope_matches(
+    state: &DeleteState,
+    expected: &PoolDeleteHandoff,
+    storage: &Value,
+) -> bool {
+    state.pool_handoff.as_ref() == Some(expected)
+        && (state.completed
+            || (state.namespace_uid.as_deref() == storage["namespace_uid"].as_str()
+                && state.physical_lv_uuid.as_deref() == storage["lv_uuid"].as_str()
+                && state.volumes.iter().all(|v| {
+                    v.uid == text(storage, "pv_uid")
+                        && v.claim_uid == text(storage, "pvc_uid")
+                        && v.handle == text(storage, "volume_handle")
+                })))
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1591,6 +1632,403 @@ impl PowerCoordinator {
         value["message"]="Physical storage protection stopped PostgreSQL; committed WAL is retained locally and archive completion is unknown".into();
         Ok(Some(Some(value)))
     }
+    /// Preserve CNPG's retained hibernation while the independent, CF-assigned pool owns PGDATA.
+    /// The same sealed receipt and exact primary Lease remain necessary; a label never grants custody.
+    pub async fn publish_pool_binding(
+        &self,
+        db: &Value,
+        binding: &Value,
+    ) -> std::result::Result<Value, Error> {
+        if !database_valid(db)
+            || !pgcf_native_protocol::pool::binding_valid(binding)
+            || binding["scope"]["database_id"] != db["id"]
+            || binding["scope"]["generation"].as_u64() > db["generation"].as_u64()
+        {
+            return Err("pool fence binding scope invalid".into());
+        }
+        let (physical, cluster) = self.anchor(db).await?;
+        let scope = &binding["scope"];
+        let storage = &scope["storage"];
+        let identity: Value = serde_json::from_str(&physical.volume_identity)?;
+        if storage["storage_uid"] != physical.storage_uid
+            || storage["namespace_uid"] != physical.namespace_uid
+            || storage["cnpg_cluster_uid"] != physical.cluster_uid
+            || storage["storage_generation"].as_u64() != Some(physical.physical_generation)
+            || storage["pvc_uid"] != physical.claim_uid
+            || storage["pv_uid"] != physical.volume_uid
+            || storage["volume_handle"] != physical.handle
+            || storage["lv_uuid"] != identity["lvUuid"]
+            || (storage["backend"] == "lvm-thin-v1"
+                && physical.storage.as_ref() != Some(&storage["profile"]))
+            || (storage["backend"] == "lvm-thick-v1" && physical.storage.is_some())
+            || cluster["metadata"]["annotations"][HIBERNATION] != "on"
+            || !condition(&cluster, HIBERNATION)
+            || !self
+                .k8s
+                .list(
+                    "Pod",
+                    Some(&namespace(db)),
+                    Some("cnpg.io/cluster=database"),
+                )
+                .await?
+                .is_empty()
+        {
+            return Err("pool retained storage or CNPG hibernation changed".into());
+        }
+        let lease = self
+            .k8s
+            .read("Lease", Some(&namespace(db)), "database")
+            .await?
+            .ok_or("pool primary Lease missing")?;
+        if lease["spec"]["holderIdentity"] != format!("pgcf-pool/{}", text(scope, "binding_id"))
+            || !lease["metadata"]["deletionTimestamp"].is_null()
+        {
+            return Err("pool primary Lease holder changed".into());
+        }
+        let current = self
+            .fence(db)
+            .await?
+            .ok_or("pool retained running fence missing")?;
+        if let Some(previous) = progress_from(&current, self.now())?
+            && !physical.matches(&previous.anchor)
+        {
+            return Err("pool fence physical history changed".into());
+        }
+        let raw = serde_json::to_string(binding)?;
+        if current["data"][pgcf_native_protocol::pool::constant("binding_record_key")
+            .as_str()
+            .ok_or("pool binding key absent")?]
+            == raw
+        {
+            return Ok(current);
+        }
+        let key = pgcf_native_protocol::pool::constant("binding_record_key")
+            .as_str()
+            .ok_or("pool binding key absent")?;
+        if let Some(previous) = current["data"][key].as_str() {
+            let previous: Value = serde_json::from_str(previous)?;
+            if !pgcf_native_protocol::pool::binding_valid(&previous)
+                || (previous["scope"]["binding_id"] == scope["binding_id"]
+                    && (previous["scope"] != *scope
+                        || previous["holder_revision"].as_u64()
+                            > binding["holder_revision"].as_u64()
+                        || previous["updated_at"].as_u64() > binding["updated_at"].as_u64()))
+                || (previous["scope"]["binding_id"] != scope["binding_id"]
+                    && (!matches!(previous["state"].as_str(), Some("released" | "refused"))
+                        || previous["scope"]["route_revision"].as_u64()
+                            >= scope["route_revision"].as_u64()))
+            {
+                return Err("pool fence holder history changed".into());
+            }
+        }
+        match self.k8s.patch(&current, &json!({"data":{key:raw}})).await {
+            Ok(after)
+                if after["metadata"]["uid"] == current["metadata"]["uid"]
+                    && after["data"][key] == raw =>
+            {
+                Ok(after)
+            }
+            Ok(_) => Err("pool fence publication unconfirmed".into()),
+            Err(error) => {
+                let after = self.fence(db).await?.ok_or("pool fence disappeared")?;
+                if after["metadata"]["uid"] == current["metadata"]["uid"]
+                    && after["data"][key] == raw
+                {
+                    Ok(after)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+    /// Detaching closes new pool admissions through the published immutable binding.
+    /// Existing sessions are only asked to close when idle; any busy work remains running.
+    pub async fn pool_gateway_drained(
+        &self,
+        db: &Value,
+        binding: &Value,
+    ) -> std::result::Result<bool, Error> {
+        if !pgcf_native_protocol::pool::binding_valid(binding) || binding["state"] != "detaching" {
+            return Err("pool graceful detach authority unavailable".into());
+        }
+        let map = self.fence(db).await?.ok_or("pool draining fence missing")?;
+        let intent = intent_from(&map, text(db, "id"))?;
+        if intent.mode != "running" || intent.revision != number(&binding["scope"], "generation") {
+            return Err("pool draining immutable running fence changed".into());
+        }
+        let snapshot = self.snapshot().await?;
+        let reports = self.controls(&intent, &snapshot, "close").await?;
+        if reports.iter().any(|report| {
+            report_count(report, "connections").unwrap_or(u64::MAX) != 0
+                || report_count(report, "busyConnections").unwrap_or(u64::MAX) != 0
+                || report_count(report, "pendingDials").unwrap_or(u64::MAX) != 0
+        }) {
+            return Ok(false);
+        }
+        if self.gateways().await? != snapshot.pods {
+            return Ok(false);
+        }
+        let fresh = self
+            .fence(db)
+            .await?
+            .ok_or("pool draining fence disappeared")?;
+        if fresh["metadata"]["uid"] != map["metadata"]["uid"]
+            || intent_from(&fresh, text(db, "id"))? != intent
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    /// Ready pool publication reuses the existing running fence/control release, without
+    /// calling CNPG's hibernation-off path. The caller supplies a verified actual pool runtime.
+    pub async fn finish_pool_running(
+        &self,
+        db: &Value,
+        desired: &Value,
+        node_report: &Value,
+        trust: &pgcf_native_protocol::storage::StorageTrust,
+        observation: Value,
+    ) -> std::result::Result<Option<Value>, Error> {
+        let binding = &desired["binding"];
+        let proof = &observation["runtime_attestation"];
+        if observation["state"] != "ready"
+            || proof["kind"] != "pool"
+            || proof["v"] != 2
+            || !crate::contracts::schema_valid("DatabaseRuntimeAttestation", proof)
+            || !self.k8s.runtime_proof_current(proof)
+            || proof["binding_id"] != binding["scope"]["binding_id"]
+            || proof["scope_sha256"] != binding["scope_sha256"]
+            || proof["holder_revision"] != binding["holder_revision"]
+            || proof["generation"] != db["generation"]
+            || !matches!(binding["state"].as_str(), Some("mounted" | "serving"))
+            || text(db, "desired_state") != "running"
+        {
+            return Err("pool actual readiness proof unavailable".into());
+        }
+        let scope = &binding["scope"];
+        if desired["authority"] != "current"
+            || !pgcf_native_protocol::pool::node_report_valid(node_report)
+            || node_report["state"] != "mounted"
+            || node_report["binding_id"] != scope["binding_id"]
+            || node_report["scope_sha256"] != binding["scope_sha256"]
+            || node_report["node_uid"] != scope["node_uid"]
+            || node_report["boot_id"] != scope["boot_id"]
+            || node_report["pool_pod_uid"] != scope["pool_pod_uid"]
+            || node_report["observed_at"].as_u64().is_none_or(|at| {
+                at > self.now().saturating_add(5000) || at < self.now().saturating_sub(60000)
+            })
+        {
+            return Err("pool actual mounted node proof unavailable".into());
+        }
+        if scope["storage"]["backend"] == "lvm-thin-v1" {
+            let token = desired["storage_authority"]
+                .as_str()
+                .ok_or("pool thin write authority missing")?;
+            pgcf_native_protocol::pool::verify_pool_storage_authority(
+                trust,
+                token,
+                scope,
+                self.now(),
+            )
+            .ok_or("pool thin write authority expired or changed")?;
+            if !crate::pool::mounted_guard_current(trust, node_report, scope, self.now()) {
+                return Err("pool thin expiry protection is not currently proved".into());
+            }
+        }
+        for (proof_field, scope_field) in [
+            ("database_id", "database_id"),
+            ("generation", "generation"),
+            ("node_uid", "node_uid"),
+            ("boot_id", "boot_id"),
+            ("pod_uid", "pool_pod_uid"),
+            ("container_id", "container_id"),
+            ("pool_namespace_uid", "pool_namespace_uid"),
+            ("configuration_fingerprint", "configuration_fingerprint"),
+        ] {
+            if proof[proof_field] != scope[scope_field] {
+                return Err("pool runtime holder identity changed".into());
+            }
+        }
+        for (proof_field, storage_field) in [
+            ("storage_generation", "storage_generation"),
+            ("storage_uid", "storage_uid"),
+            ("namespace_uid", "namespace_uid"),
+            ("cnpg_cluster_uid", "cnpg_cluster_uid"),
+            ("pvc_uid", "pvc_uid"),
+            ("pv_uid", "pv_uid"),
+        ] {
+            if proof[proof_field] != scope["storage"][storage_field] {
+                return Err("pool runtime physical identity changed".into());
+            }
+        }
+        let intent = desired_power(db)?.ok_or("pool running power intent missing")?;
+        if intent.mode != "running" || intent.revision != number(db, "generation") {
+            return Err("pool running power intent changed".into());
+        }
+        let prior = self.publish_pool_binding(db, binding).await?;
+        let (physical, cluster) = self.anchor(db).await?;
+        if cluster["metadata"]["annotations"][HIBERNATION] != "on"
+            || !condition(&cluster, HIBERNATION)
+        {
+            return Err("pool CNPG hibernation changed".into());
+        }
+        let progress = Progress::new(intent.clone(), Phase::Awake, physical, self.now());
+        let current = self
+            .write(db, Some(&prior), Some(&intent), &progress)
+            .await?;
+        self.bind_fence(db, &current).await?;
+        let snapshot = self.snapshot().await?;
+        self.controls(&intent, &snapshot, "release").await?;
+        if self.gateways().await? != snapshot.pods || !self.k8s.runtime_proof_current(proof) {
+            return Ok(None);
+        }
+        let fresh = self
+            .fence(db)
+            .await?
+            .ok_or("pool running fence disappeared")?;
+        if fresh["metadata"]["uid"] != current["metadata"]["uid"]
+            || intent_from(&fresh, text(db, "id"))? != intent
+        {
+            return Ok(None);
+        }
+        let mut value = observation;
+        value["power"] =
+            json!({"operation":intent.operation,"revision":intent.revision,"state":"awake"});
+        Ok(Some(value))
+    }
+
+    /// A terminal host report proves reference closure, not clean Sleep or archive completion.
+    /// Keep the retained CNPG Cluster hibernated and acknowledge only the current stop intent.
+    pub async fn finish_pool_stopped(
+        &self,
+        db: &Value,
+        details: &Value,
+    ) -> std::result::Result<Option<Value>, Error> {
+        if !database_valid(db)
+            || text(db, "desired_state") != "suspended"
+            || !crate::pool::terminal_report_matches(details, db)
+        {
+            return Err("pool stopped outcome unproved".into());
+        }
+        let binding = &details["binding"]["binding"];
+        let scope = &binding["scope"];
+        if scope["database_id"] != db["id"]
+            || scope["generation"].as_u64() > db["generation"].as_u64()
+        {
+            return Err("pool stopped database scope changed".into());
+        }
+        let intent = desired_power(db)?.ok_or("pool stop intent missing")?;
+        if intent.mode != "quiesce" {
+            return Err("pool stop intent changed".into());
+        }
+        let (physical, cluster) = self.anchor(db).await?;
+        let before = self.fence(db).await?.ok_or("pool stopped fence missing")?;
+        if progress_from(&before, self.now())?.is_none_or(|p| !physical.matches(&p.anchor))
+            || cluster["metadata"]["annotations"][HIBERNATION] != "on"
+            || !condition(&cluster, HIBERNATION)
+        {
+            return Err("pool stopped retained physical fence changed".into());
+        }
+        let key = pgcf_native_protocol::pool::constant("binding_record_key")
+            .as_str()
+            .ok_or("pool record key missing")?;
+        let recorded: Value =
+            serde_json::from_str(required(text(&before["data"], key), 64 * 1024)?)?;
+        if recorded != *binding {
+            return Err("pool terminal fence publication unavailable".into());
+        }
+        let lease = self
+            .k8s
+            .read("Lease", Some(&namespace(db)), "database")
+            .await?
+            .ok_or("pool stopped primary Lease missing")?;
+        if lease["spec"]["holderIdentity"]
+            .as_str()
+            .is_none_or(|holder| !holder.is_empty())
+            || !lease["metadata"]["deletionTimestamp"].is_null()
+            || !self
+                .k8s
+                .list(
+                    "Pod",
+                    Some(&namespace(db)),
+                    Some("cnpg.io/cluster=database"),
+                )
+                .await?
+                .is_empty()
+            || self
+                .k8s
+                .read(
+                    "Pod",
+                    Some(text(scope, "pool_namespace")),
+                    text(scope, "pool_pod_name"),
+                )
+                .await?
+                .is_some_and(|pod| pod["metadata"]["uid"] == scope["pool_pod_uid"])
+        {
+            return Ok(None);
+        }
+        let mut progress = Progress::new(
+            intent.clone(),
+            Phase::Hibernating,
+            physical.clone(),
+            self.now(),
+        );
+        let map = self
+            .write(db, Some(&before), Some(&intent), &progress)
+            .await?;
+        self.bind_fence(db, &map).await?;
+        let snapshot = self.snapshot().await?;
+        self.controls(&intent, &snapshot, "begin").await?;
+        let reports = self.controls(&intent, &snapshot, "close").await?;
+        if reports.iter().any(|r| {
+            report_count(r, "connections").unwrap_or(u64::MAX) != 0
+                || report_count(r, "busyConnections").unwrap_or(u64::MAX) != 0
+                || report_count(r, "pendingDials").unwrap_or(u64::MAX) != 0
+        }) || self.gateways().await? != snapshot.pods
+        {
+            return Ok(None);
+        }
+        let (fresh_physical, fresh_cluster) = self.anchor(db).await?;
+        let fresh_lease = self
+            .k8s
+            .read("Lease", Some(&namespace(db)), "database")
+            .await?
+            .ok_or("pool stopped primary Lease disappeared")?;
+        let fresh = self
+            .fence(db)
+            .await?
+            .ok_or("pool stopped fence disappeared")?;
+        if !fresh_physical.matches(&physical)
+            || !condition(&fresh_cluster, HIBERNATION)
+            || fresh_cluster["metadata"]["annotations"][HIBERNATION] != "on"
+            || fresh_lease["metadata"]["uid"] != lease["metadata"]["uid"]
+            || fresh_lease["spec"]["holderIdentity"] != lease["spec"]["holderIdentity"]
+            || fresh["metadata"]["uid"] != map["metadata"]["uid"]
+            || intent_from(&fresh, text(db, "id"))? != intent
+            || fresh["data"][key] != serde_json::to_string(binding)?
+            || !self
+                .k8s
+                .list(
+                    "Pod",
+                    Some(&namespace(db)),
+                    Some("cnpg.io/cluster=database"),
+                )
+                .await?
+                .is_empty()
+        {
+            return Ok(None);
+        }
+        progress.phase = Phase::Hibernated;
+        self.write(db, Some(&fresh), None, &progress).await?;
+        let mut value = observation(db, &intent, "hibernated", None);
+        if details["node_report"]["clean_stop"] != true {
+            value["message"] =
+                "Pool references are closed; clean Sleep and archive completion are not proved"
+                    .into();
+        }
+        Ok(Some(value))
+    }
+
     pub async fn prepare_running(&self, db: &Value) -> std::result::Result<PrepareRunning, Error> {
         if !database_valid(db) || text(db, "desired_state") != "running" {
             return Err("invalid running desired state".into());
@@ -1777,6 +2215,17 @@ fn delete_state(ledger: &Value, now: u64) -> Result<DeleteState> {
     {
         return Err(Fault::Recovery("delete_ledger_invalid"));
     }
+    if state.pool_handoff.as_ref().is_some_and(|p| {
+        !valid_pattern("uuid", &p.binding_id)
+            || [&p.scope_sha256, &p.node_report_sha256].iter().any(|hash| {
+                hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+    }) {
+        return Err(Fault::Recovery("pool_delete_handoff_invalid"));
+    }
     let mut volumes = HashSet::new();
     for volume in &state.volumes {
         for field in [&volume.name, &volume.uid, &volume.claim_uid, &volume.handle] {
@@ -1846,6 +2295,103 @@ fn receipt_from(ledger: &Value, db: &Value, now: u64) -> Result<Option<Retiremen
     Ok(Some(receipt))
 }
 impl PowerCoordinator {
+    /// Only a recorded, exact old-holder closure can resume after deletion removed its Lease/fence.
+    pub async fn pool_delete_resumable(
+        &self,
+        db: &Value,
+        details: &Value,
+    ) -> std::result::Result<bool, Error> {
+        let expected = pool_delete_handoff(db, details)?;
+        let name = format!("delete-{}", text(db, "id"));
+        let Some(ledger) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+            return Ok(false);
+        };
+        let ledger = owned(Some(ledger), &name, text(db, "id"), Some(SYSTEM), false)?;
+        if generation(&ledger) != number(db, "generation") {
+            return Err("pool delete ledger generation changed".into());
+        }
+        let state = delete_state(&ledger, self.now())?;
+        let storage = &details["binding"]["binding"]["scope"]["storage"];
+        if !pool_delete_saved_scope_matches(&state, &expected, storage) {
+            return Err("pool deletion handoff proof missing or changed".into());
+        }
+        receipt_from(&ledger, db, self.now())?;
+        Ok(true)
+    }
+    /// Called after the controller's current-CF/Lease/Pod hand-back proof and before any delete step.
+    pub async fn begin_pool_delete(
+        &self,
+        db: &Value,
+        details: &Value,
+    ) -> std::result::Result<(), Error> {
+        if self.pool_delete_resumable(db, details).await? {
+            return Ok(());
+        }
+        let expected = pool_delete_handoff(db, details)?;
+        let binding = &details["binding"]["binding"];
+        let scope = &binding["scope"];
+        let saved = &scope["storage"];
+        let (physical, cluster) = self.anchor(db).await?;
+        let identity: Value = serde_json::from_str(&physical.volume_identity)?;
+        if physical.namespace_uid != text(saved, "namespace_uid")
+            || physical.storage_uid != text(saved, "storage_uid")
+            || physical.cluster_uid != text(saved, "cnpg_cluster_uid")
+            || physical.claim_uid != text(saved, "pvc_uid")
+            || physical.volume_uid != text(saved, "pv_uid")
+            || physical.handle != text(saved, "volume_handle")
+            || identity["lvUuid"] != saved["lv_uuid"]
+            || physical.physical_generation != number(saved, "storage_generation")
+            || cluster["metadata"]["annotations"][HIBERNATION] != "on"
+            || !condition(&cluster, HIBERNATION)
+            || (saved["backend"] == "lvm-thin-v1"
+                && physical.storage.as_ref() != Some(&saved["profile"]))
+        {
+            return Err("pool delete retained physical scope changed".into());
+        }
+        let lease = self
+            .k8s
+            .read("Lease", Some(&namespace(db)), "database")
+            .await?
+            .ok_or("pool deletion primary Lease missing before handoff persistence")?;
+        if !lease["metadata"]["deletionTimestamp"].is_null()
+            || lease["spec"]["holderIdentity"]
+                .as_str()
+                .is_none_or(|v| !v.is_empty())
+            || !self
+                .k8s
+                .list(
+                    "Pod",
+                    Some(&namespace(db)),
+                    Some("cnpg.io/cluster=database"),
+                )
+                .await?
+                .is_empty()
+            || self
+                .k8s
+                .read(
+                    "Pod",
+                    Some(text(scope, "pool_namespace")),
+                    text(scope, "pool_pod_name"),
+                )
+                .await?
+                .is_some_and(|pod| pod["metadata"]["uid"] == scope["pool_pod_uid"])
+        {
+            return Err("pool delete writer closure changed before persistence".into());
+        }
+        let state = DeleteState {
+            started_at: self.now(),
+            namespace_uid: Some(physical.namespace_uid),
+            volumes: vec![],
+            completed: false,
+            physical_lv_uuid: Some(text(saved, "lv_uuid").into()),
+            pool_handoff: Some(expected.clone()),
+        };
+        self.save_delete(db, &state, None).await?;
+        if !self.pool_delete_resumable(db, details).await? {
+            return Err("pool deletion handoff persistence unconfirmed".into());
+        }
+        Ok(())
+    }
     async fn ledger(&self, db: &Value) -> Result<Value> {
         let id = text(db, "id");
         let name = format!("delete-{id}");
@@ -2241,6 +2787,7 @@ impl PowerCoordinator {
                 volumes: vec![],
                 completed: false,
                 physical_lv_uuid: None,
+                pool_handoff: None,
             }
         };
         if namespace_value.as_ref().is_some_and(|v| {
@@ -4363,5 +4910,37 @@ mod tls_tests {
             json!({"database":db["id"],"operation":restore,"revision":1,"mode":"running"})
         );
         assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn completing_deletion_preserves_the_verified_pool_handoff_anchor_for_resource_absence_retry() {
+        let marker = json!({"bindingId":"11111111-1111-4111-8111-111111111111","scopeSha256":"a".repeat(64),"nodeReportSha256":"b".repeat(64)});
+        let ledger = json!({"data":{"state":json!({"startedAt":1000,"namespaceUid":"22222222-2222-4222-8222-222222222222","volumes":[],"completed":false,"poolHandoff":marker}).to_string()}});
+        let mut state = delete_state(&ledger, 1001).unwrap();
+        state.completed = true;
+        state.namespace_uid = None;
+        state.physical_lv_uuid = None;
+        state.volumes.clear();
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["poolHandoff"],
+            marker,
+            "completed deletion must retain exact old-holder closure, not infer it from absent Lease/fence"
+        );
+        let expected: PoolDeleteHandoff = serde_json::from_value(marker).unwrap();
+        assert!(pool_delete_saved_scope_matches(
+            &state,
+            &expected,
+            &Value::Null
+        ));
+        let mut changed = expected.clone();
+        changed.node_report_sha256 = "c".repeat(64);
+        assert!(
+            !pool_delete_saved_scope_matches(&state, &changed, &Value::Null),
+            "a completed ledger never adopts another terminal proof"
+        );
+        state.pool_handoff = None;
+        assert!(
+            !pool_delete_saved_scope_matches(&state, &expected, &Value::Null),
+            "absent resources never substitute for the recorded anchor"
+        );
     }
 }
