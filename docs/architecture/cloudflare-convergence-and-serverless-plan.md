@@ -10,8 +10,7 @@ Cloudflare is the global control plane: it owns configuration, placement, progre
 provider actions for every region. The fleet is **EU control** (relay host, no customer databases)
 and **customer EU1**. Preserve both servers, existing data and keys; no EU reinstall. The US region
 is cancelled at Contabo (contract ends 2026-11-04); US1 was marked lost on 2026-10-11 and is no longer patched.
-US and Oceania return later from the same region configuration. Automatic EU purchases stay
-enabled under the configured policy; US purchases are off.
+US and Oceania return later from the same region configuration. Purchases and autoscale remain off during the current EU1 acceptance; new paid resources require the owner's explicit, costed go.
 
 **R1-final is frozen:** the qualified Golden image containing the sandbox DNS/hostname fix,
 Talos 1.14.2 and Kubernetes 1.36.5. Its installer and raw image are privately distributed and
@@ -28,7 +27,7 @@ block the standard-runtime fleet acceptance.
 keep their backend and data. Thin activation needs a release-bound receipt from the
 [qualification gates](#thin-storage-qualification-gates).
 
-**Owner priority (2026-10-13):** the product goal is a sleeping database's first SQL below one second through Cloudflare on a shared-pool hit, using the selected R2b thin storage. A thick-only pool hit does not complete this goal. Complete the active R2b transition and the data-preservation checks needed for the approved alternative 8, then prioritize its implementation and measured pool-hit acceptance. Independent administrative features do not delay this path; the full customer-ready scope remains required.
+**Owner priority (2026-10-14):** deliver a sleeping Thin database's first SQL below one second through Cloudflare on a real shared-pool hit. Finish the required execution and data-preservation guards, deploy, and measure this path before broad acceptance repeats, density work or independent administrative features. Reuse valid completed checks; repeat tests only for relevant changes, concrete failures or required CI. A thick-only hit or an already-awake connection does not complete the goal. The full customer-ready scope remains required afterwards.
 
 ## Delivery architecture
 
