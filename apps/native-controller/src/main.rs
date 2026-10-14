@@ -328,44 +328,102 @@ fn host_write_state(db: &Value, snapshot: &DesiredSnapshot, renewals: &Renewals)
     }
     renewals.authority(db, snapshot).map_or(Value::Null,|a|json!({"node_uid":a["node_uid"],"profile_sha256":a["profile_sha256"],"volume_group_uuid":a["volume_group_uuid"],"pool_uuid":a["pool_uuid"],"write_allowed":a["write_allowed"]}))
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageProtectionReason {
+    AuthorityMissing,
+    AuthorityRevoked,
+    AuthorityExpiryInvalid,
+    AuthorityExpired,
+    StartupMissing,
+    StartupScopeChanged,
+    StartupExpiryInvalid,
+    StartupExpired,
+    TokenInvalid,
+    TokenScopeChanged,
+    TokenRevoked,
+    TokenExpired,
+}
+impl StorageProtectionReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::AuthorityMissing => "authority_missing",
+            Self::AuthorityRevoked => "authority_revoked",
+            Self::AuthorityExpiryInvalid => "authority_expiry_invalid",
+            Self::AuthorityExpired => "authority_expired",
+            Self::StartupMissing => "startup_missing",
+            Self::StartupScopeChanged => "startup_scope_changed",
+            Self::StartupExpiryInvalid => "startup_expiry_invalid",
+            Self::StartupExpired => "startup_expired",
+            Self::TokenInvalid => "token_invalid",
+            Self::TokenScopeChanged => "token_scope_changed",
+            Self::TokenRevoked => "token_revoked",
+            Self::TokenExpired => "token_expired",
+        }
+    }
+}
+fn storage_protection_reason(
+    db: &Value,
+    snapshot: &DesiredSnapshot,
+    renewals: &Renewals,
+    clock: i128,
+) -> Option<StorageProtectionReason> {
+    if db["storage"].is_null() || text(db, "desired_state") != "running" {
+        return None;
+    }
+    let Some(authority) = renewals.authority(db, snapshot) else {
+        return Some(StorageProtectionReason::AuthorityMissing);
+    };
+    if authority["write_allowed"] != true {
+        return Some(StorageProtectionReason::AuthorityRevoked);
+    }
+    let Some(expiry) = timestamp_millis(&authority["expires_at"]) else {
+        return Some(StorageProtectionReason::AuthorityExpiryInvalid);
+    };
+    if expiry <= clock {
+        return Some(StorageProtectionReason::AuthorityExpired);
+    }
+    let Some(token) = renewals.token(db) else {
+        let startup = &db["storage_startup"];
+        if startup.is_null() {
+            return Some(StorageProtectionReason::StartupMissing);
+        }
+        if startup["generation"] != db["generation"]
+            || startup["node_uid"] != db["storage"]["node_uid"]
+        {
+            return Some(StorageProtectionReason::StartupScopeChanged);
+        }
+        let Some(expiry) = timestamp_millis(&startup["expires_at"]) else {
+            return Some(StorageProtectionReason::StartupExpiryInvalid);
+        };
+        return (expiry <= clock).then_some(StorageProtectionReason::StartupExpired);
+    };
+    // This only chooses an earlier protective stop. It never authorizes a write:
+    // the gateway independently verifies the deployment-pinned CF signature.
+    let Some(claims) = storage_claims(token) else {
+        return Some(StorageProtectionReason::TokenInvalid);
+    };
+    if claims["database_id"] != db["id"]
+        || claims["generation"] != db["generation"]
+        || claims["node_uid"] != db["storage"]["node_uid"]
+    {
+        return Some(StorageProtectionReason::TokenScopeChanged);
+    }
+    if claims["write_allowed"] != true {
+        return Some(StorageProtectionReason::TokenRevoked);
+    }
+    match integer(&claims, "exp") {
+        Err(_) => Some(StorageProtectionReason::TokenInvalid),
+        Ok(expiry) if i128::from(expiry) <= clock => Some(StorageProtectionReason::TokenExpired),
+        Ok(_) => None,
+    }
+}
 fn storage_protection_due(
     db: &Value,
     snapshot: &DesiredSnapshot,
     renewals: &Renewals,
     clock: i128,
 ) -> bool {
-    if db["storage"].is_null() || text(db, "desired_state") != "running" {
-        return false;
-    }
-    let parse = |v: &Value| {
-        v.as_str()
-            .and_then(|s| {
-                time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
-            })
-            .map(|t| t.unix_timestamp_nanos() / 1_000_000)
-    };
-    let Some(authority) = renewals.authority(db, snapshot) else {
-        return true;
-    };
-    if authority["write_allowed"] != true
-        || parse(&authority["expires_at"]).is_none_or(|expiry| expiry <= clock)
-    {
-        return true;
-    }
-    let Some(token) = renewals.token(db) else {
-        return db["storage_startup"]["generation"] != db["generation"]
-            || db["storage_startup"]["node_uid"] != db["storage"]["node_uid"]
-            || parse(&db["storage_startup"]["expires_at"]).is_none_or(|expiry| expiry <= clock);
-    };
-    // This only chooses an earlier protective stop. It never authorizes a write:
-    // the gateway independently verifies the deployment-pinned CF signature.
-    storage_claims(token).is_none_or(|claims| {
-        claims["database_id"] != db["id"]
-            || claims["generation"] != db["generation"]
-            || claims["node_uid"] != db["storage"]["node_uid"]
-            || claims["write_allowed"] != true
-            || integer(&claims, "exp").map_or(true, |expiry| i128::from(expiry) <= clock)
-    })
+    storage_protection_reason(db, snapshot, renewals, clock).is_some()
 }
 fn timestamp_millis(value: &Value) -> Option<i128> {
     time::OffsetDateTime::parse(
@@ -1037,19 +1095,21 @@ async fn run() -> Result<(), Error> {
                 let marker = cell.hints;
                 let controller = controller.clone();
                 let api = api.clone();
-                let kind =
-                    if storage_protection_due(&cell.db, &cell.snapshot, &renewals, clock_ms()) {
-                        JobKind::Protect
-                    } else if cell.renew && cell.ready {
-                        JobKind::Renew
-                    } else {
-                        JobKind::Reconcile
-                    };
+                let protection =
+                    storage_protection_reason(&cell.db, &cell.snapshot, &renewals, clock_ms());
+                let kind = if protection.is_some() {
+                    JobKind::Protect
+                } else if cell.renew && cell.ready {
+                    JobKind::Renew
+                } else {
+                    JobKind::Reconcile
+                };
                 let job_id = id.clone();
                 let started = Instant::now();
                 let abort = jobs.spawn_local(async move {
                     let result = async {
                         if kind == JobKind::Protect {
+                            eprintln!("{}", json!({"event":"storage_protection_dispatched","database_id":job_id,"generation":generation,"protection_reason":protection.map(StorageProtectionReason::code)}));
                             return controller.power.protect_storage(&db).await;
                         }
                         if kind == JobKind::Renew {
@@ -1345,6 +1405,58 @@ mod tests {
             &Renewals::default(),
             1000
         ));
+    }
+    #[test]
+    fn protection_diagnostics_name_the_existing_stop_without_claims_or_payloads() {
+        let mut db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_startup":{"generation":3,"node_uid":NODE,"expires_at":"1970-01-01T00:00:02.000Z"}});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":NODE,"write_allowed":true,"expires_at":"1970-01-01T00:00:03.000Z"}]});
+        let renewals = Renewals::default();
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 1000),
+            None
+        );
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 2000)
+                .unwrap()
+                .code(),
+            "startup_expired"
+        );
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 3000)
+                .unwrap()
+                .code(),
+            "authority_expired"
+        );
+        state.region["storage_nodes"][0]["write_allowed"] = false.into();
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 1000)
+                .unwrap()
+                .code(),
+            "authority_revoked"
+        );
+        state.region["storage_nodes"][0]["write_allowed"] = true.into();
+        db["storage_authority"] = "private_payload_not_a_token".into();
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 1000)
+                .unwrap()
+                .code(),
+            "token_invalid"
+        );
+        db["storage_authority"] = token(2, 1, 2500).into();
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 1000)
+                .unwrap()
+                .code(),
+            "token_scope_changed"
+        );
+        db["storage_authority"] = token(3, 1, 1500).into();
+        assert_eq!(
+            storage_protection_reason(&db, &state, &renewals, 2000)
+                .unwrap()
+                .code(),
+            "token_expired"
+        );
     }
     #[test]
     fn a_pending_wake_never_waits_behind_unrelated_reconciliation() {

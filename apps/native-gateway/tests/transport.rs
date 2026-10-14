@@ -752,6 +752,17 @@ async fn signed_storage_expiry_closes_quiet_tls_and_blocks_racing_frontend_write
         )
         .unwrap();
     tokio::time::sleep(Duration::from_millis(260)).await;
+    assert_eq!(
+        fixture
+            .gateway
+            .targets
+            .read()
+            .await
+            .target(DATABASE, control::now())
+            .unwrap_err()
+            .to_string(),
+        "storage_authority_expired"
+    );
     let _ = racing.send(Message::Binary(query().into())).await;
     for client in [&mut quiet, &mut racing] {
         let next = timeout(Duration::from_secs(1), client.next())
@@ -807,6 +818,17 @@ async fn same_generation_writer_restart_cannot_reuse_old_signed_io_authority() {
             .await
             .target(DATABASE, control::now())
             .is_err()
+    );
+    assert_eq!(
+        fixture
+            .gateway
+            .targets
+            .read()
+            .await
+            .target(DATABASE, control::now())
+            .unwrap_err()
+            .to_string(),
+        "storage_authority_scope_or_freshness_changed"
     );
     let mut request = format!("ws://127.0.0.1:{}/pg", fixture.port)
         .into_client_request()
@@ -1094,22 +1116,24 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
             .filter_map(|line| serde_json::from_str(&line[line.find('{')?..]).ok())
             .filter(|line: &Value| line["event"] == "conn_stages")
             .collect();
-        assert_eq!(lines.len(), 2, "{stdout}");
+        assert_eq!(lines.len(), 3, "{stdout}");
         for line in &lines {
             // Only these fields: no role, address, token or payload byte.
-            assert_eq!(
-                line.as_object().unwrap().keys().collect::<Vec<_>>(),
-                [
-                    "database",
-                    "dial_ms",
-                    "event",
-                    "first_backend_ms",
-                    "outcome",
-                    "session_ms",
-                    "startup_ms",
-                    "upgrade_ms"
-                ]
-            );
+            let mut keys = vec![
+                "database",
+                "dial_ms",
+                "event",
+                "first_backend_ms",
+                "outcome",
+                "session_ms",
+                "startup_ms",
+                "upgrade_ms",
+            ];
+            if line["outcome"] == "target_unavailable" {
+                keys.push("target_reason");
+                keys.sort();
+            }
+            assert_eq!(line.as_object().unwrap().keys().collect::<Vec<_>>(), keys);
             assert_eq!(line["database"], DATABASE);
         }
         let complete = |name: &str| lines[0][name].as_u64().unwrap();
@@ -1131,6 +1155,12 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
             assert!(lines[1][reached].is_u64(), "{}", lines[1]);
         }
         assert!(lines[1]["dial_ms"].is_null() && lines[1]["first_backend_ms"].is_null());
+        assert_eq!(lines[2]["outcome"], "target_unavailable");
+        assert_eq!(lines[2]["target_reason"], "storage_authority_invalid");
+        for unreached in ["upgrade_ms", "startup_ms", "dial_ms", "first_backend_ms"] {
+            assert!(lines[2][unreached].is_null());
+        }
+        assert!(!stdout.contains("private_bearer_payload_canary"));
         return;
     }
     let mut fixture = Fixture::new().await;
@@ -1153,6 +1183,18 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         .into_data();
     assert!(String::from_utf8_lossy(&error).contains("28000"));
     fixture.ended().await;
+    let issuer = StorageIssuer::new();
+    let now = control::now();
+    let mut maps = issuer.maps(now, now + 60000, 1);
+    maps[0]["data"][wire("storageAuthorityLedgerKey")] = "private_bearer_payload_canary".into();
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("configmaps", &maps, Some(&issuer.trust))
+        .unwrap();
+    assert_eq!(fixture.upgrade(&route_token(962)).await.err(), Some(503));
     fixture.stop().await;
 }
 #[tokio::test]

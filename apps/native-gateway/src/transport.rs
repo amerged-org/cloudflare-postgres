@@ -4,7 +4,7 @@ use crate::{
     control::{self, Control, HttpHead},
     kubernetes::{FenceState, Kubernetes},
     sessions::{Action, Sessions, SharedSessions},
-    targets::{TargetIdentity, Targets},
+    targets::{TargetIdentity, TargetUnavailable, Targets},
     telemetry::GatewayMeasurements,
 };
 use futures_util::{SinkExt, StreamExt, future::BoxFuture};
@@ -203,6 +203,7 @@ impl Drop for SessionLease {
 struct Stages {
     database: String,
     outcome: &'static str,
+    target_reason: Option<TargetUnavailable>,
     received: Instant,
     accepted: Option<Instant>,
     startup: Option<Instant>,
@@ -216,6 +217,7 @@ impl Stages {
             database: database.into(),
             // Kept only when the task is cancelled before it records an end.
             outcome: "aborted",
+            target_reason: None,
             received,
             accepted: None,
             startup: None,
@@ -231,10 +233,11 @@ impl Drop for Stages {
         let between = |from: Option<Instant>, to: Option<Instant>| {
             from.zip(to).map(|(from, to)| ms(to.duration_since(from)))
         };
-        println!(
-            "{}",
-            serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"session_ms":ms(self.received.elapsed())})
-        );
+        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"session_ms":ms(self.received.elapsed())});
+        if let Some(reason) = self.target_reason {
+            observation["target_reason"] = reason.code().into();
+        }
+        println!("{observation}");
     }
 }
 fn upgrade(head: &HttpHead) -> bool {
@@ -337,8 +340,9 @@ pub async fn serve_socket(
         .target(&claims.db, control::now())
     {
         Ok(target) => target,
-        Err(_) => {
+        Err(reason) => {
             stages.outcome = "target_unavailable";
+            stages.target_reason = Some(reason);
             return control::reply(
                 &mut socket,
                 503,

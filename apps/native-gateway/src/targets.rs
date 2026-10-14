@@ -24,6 +24,41 @@ pub struct TargetIdentity {
     pub node: String,
     pub storage: Option<StorageBinding>,
 }
+/// Fixed diagnostic classes only; no discovery object or capability reaches a log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetUnavailable {
+    DiscoveryUnavailable,
+    WriterIdentityUnavailable,
+    StorageAuthorityMissing,
+    StorageAuthorityInvalid,
+    StorageAuthorityScopeOrFreshnessChanged,
+    StorageAuthorityRegressedOrConflicted,
+    StorageAuthorityExpired,
+    StorageAuthorityRefused,
+}
+impl TargetUnavailable {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::DiscoveryUnavailable => "discovery_unavailable",
+            Self::WriterIdentityUnavailable => "writer_identity_unavailable",
+            Self::StorageAuthorityMissing => "storage_authority_missing",
+            Self::StorageAuthorityInvalid => "storage_authority_invalid",
+            Self::StorageAuthorityScopeOrFreshnessChanged => {
+                "storage_authority_scope_or_freshness_changed"
+            }
+            Self::StorageAuthorityRegressedOrConflicted => {
+                "storage_authority_regressed_or_conflicted"
+            }
+            Self::StorageAuthorityExpired => "storage_authority_expired",
+            Self::StorageAuthorityRefused => "storage_authority_refused",
+        }
+    }
+}
+impl std::fmt::Display for TargetUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyStorageBinding {
@@ -41,6 +76,9 @@ pub struct Targets {
     slices: HashMap<String, Value>,
     maps: HashMap<String, Value>,
     gates: HashMap<String, StorageGate>,
+    // The existing gate clears its current claims when verification fails. Retain only the
+    // finite reason from that same evaluation, never an additional authorization decision.
+    authority_refusals: HashMap<String, TargetUnavailable>,
     slices_observed: Option<Instant>,
     maps_observed: Option<Instant>,
 }
@@ -416,6 +454,10 @@ impl Targets {
             self.maps.contains_key(&format!("storage-{database}"))
                 || self.maps.contains_key(&format!("gateway-fence-{database}"))
         });
+        self.authority_refusals.retain(|database, _| {
+            self.maps.contains_key(&format!("storage-{database}"))
+                || self.maps.contains_key(&format!("gateway-fence-{database}"))
+        });
         for database in names {
             self.refresh_gate(&database, trust);
         }
@@ -437,6 +479,7 @@ impl Targets {
         {
             self.identities.remove(database);
             self.gates.remove(database);
+            self.authority_refusals.remove(database);
             return;
         }
         if self.gates.len() >= 4000 && !self.gates.contains_key(database) {
@@ -451,38 +494,75 @@ impl Targets {
         };
         if let Some(binding) = &identity.storage {
             let outcome = (|| {
-                let trust = trust.ok_or("storage signer unavailable")?;
+                let trust = trust.ok_or(TargetUnavailable::StorageAuthorityMissing)?;
                 let raw = text(
                     &self.maps[&format!("storage-{database}")]["data"],
                     wire("storageAuthorityLedgerKey"),
-                )?;
-                gate.update(trust.verify(raw, now)?, binding, now)
+                )
+                .map_err(|_| TargetUnavailable::StorageAuthorityMissing)?;
+                let verified = trust
+                    .verify(raw, now)
+                    .map_err(|_| TargetUnavailable::StorageAuthorityInvalid)?;
+                gate.update(verified, binding, now)
+                    .map_err(|reason| match reason {
+                        "storage authority identity or freshness changed" => {
+                            TargetUnavailable::StorageAuthorityScopeOrFreshnessChanged
+                        }
+                        "storage authority regressed or conflicted" => {
+                            TargetUnavailable::StorageAuthorityRegressedOrConflicted
+                        }
+                        _ => TargetUnavailable::StorageAuthorityInvalid,
+                    })
             })();
-            if outcome.is_err() {
+            if let Err(reason) = outcome {
                 gate.disconnect();
+                self.authority_refusals.insert(database.into(), reason);
+            } else {
+                self.authority_refusals.remove(database);
             }
+        } else {
+            self.authority_refusals.remove(database);
         }
         self.identities.insert(database.into(), identity);
     }
-    fn current_target(&self, database: &str, now: u64) -> Result<&TargetIdentity, &'static str> {
+    fn current_target(
+        &self,
+        database: &str,
+        now: u64,
+    ) -> Result<&TargetIdentity, TargetUnavailable> {
         if !valid_pattern("database", database) || !self.synchronized() {
-            return Err("writer discovery unavailable");
+            return Err(TargetUnavailable::DiscoveryUnavailable);
         }
         let target = self
             .identities
             .get(database)
-            .ok_or("writer target unavailable")?;
+            .ok_or(TargetUnavailable::WriterIdentityUnavailable)?;
         if target.storage.as_ref().is_some_and(|binding| {
             !self
                 .gates
                 .get(database)
                 .is_some_and(|gate| gate.permits(binding, now))
         }) {
-            return Err("physical write authority unavailable");
+            return Err(self
+                .authority_refusals
+                .get(database)
+                .copied()
+                .unwrap_or_else(|| {
+                    if self
+                        .gates
+                        .get(database)
+                        .and_then(StorageGate::deadline)
+                        .is_some_and(|expiry| expiry <= now)
+                    {
+                        TargetUnavailable::StorageAuthorityExpired
+                    } else {
+                        TargetUnavailable::StorageAuthorityRefused
+                    }
+                }));
         }
         Ok(target)
     }
-    pub fn target(&self, database: &str, now: u64) -> Result<TargetIdentity, &'static str> {
+    pub fn target(&self, database: &str, now: u64) -> Result<TargetIdentity, TargetUnavailable> {
         self.current_target(database, now).cloned()
     }
     pub fn write_budget(&self, database: &str, now: u64) -> Duration {
@@ -731,5 +811,25 @@ mod tests {
         assert!(Targets::with_legacy("{}").is_err());
         assert!(Targets::with_legacy("[{\"database_id\":\"invalid\"}]").is_err());
         assert!(Targets::with_legacy("[]").unwrap().legacy.is_empty());
+    }
+    #[test]
+    fn target_refusal_distinguishes_discovery_from_missing_writer_identity() {
+        let mut state = Targets::default();
+        assert_eq!(
+            state
+                .target("aaaaaaaaaaaaaaaaaaaa", 0)
+                .unwrap_err()
+                .to_string(),
+            "discovery_unavailable"
+        );
+        state.replace("endpointslices", &[], None).unwrap();
+        state.replace("configmaps", &[], None).unwrap();
+        assert_eq!(
+            state
+                .target("aaaaaaaaaaaaaaaaaaaa", 0)
+                .unwrap_err()
+                .to_string(),
+            "writer_identity_unavailable"
+        );
     }
 }
