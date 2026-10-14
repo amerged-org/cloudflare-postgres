@@ -340,6 +340,7 @@ def main():
             gateway_peer = prefix + "-gateway-peer"
             containers.append(gateway_peer)
             result = run("docker", "run", "--rm", "--name", gateway_peer, "--platform", "linux/amd64", "--network", network, "--user", "0:0", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--read-only", "-v", args.gateway_peer_volume + ":/peer-binary:ro", "-v", str(fixture) + ":/peer:ro", "--entrypoint", gateway_binary, BARMAN, "--binding-file", "/peer/gateway-binding.json", "--ca-file", "/peer/server-ca.crt", "--role-file", "/peer/gateway-role.txt", check=False)
+            private(base / (prefix + "-gateway-peer.stdout"), result.stdout)
             if result.returncode:
                 diagnostic = base / (prefix + "-gateway-peer.stderr")
                 private(diagnostic, result.stderr)
@@ -352,7 +353,11 @@ def main():
                 if code in ("running pool busy close refused or forced", "running pool idle close refused", "actual committed row readback failed", "uncommitted expired transaction was replayed", "peer_refused", "target_refused:discovery_unavailable", "target_refused:writer_identity_unavailable", "target_refused:storage_authority_missing", "target_refused:storage_authority_invalid", "target_refused:storage_authority_scope_or_freshness_changed", "target_refused:storage_authority_regressed_or_conflicted", "target_refused:storage_authority_expired", "target_refused:storage_authority_refused"):
                     raise RuntimeError(code)
                 raise RuntimeError("actual gateway peer failed; raw diagnostics withheld")
-            peer = json.loads(result.stdout)
+            records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+            proof_fields = {"gateway_pool_expiry_disconnect", "expired_transaction_replay", "busy_detach_commit", "committed_row_readback", "idle_close", "kernel_mount_acceptance", "cloudflare_first_sql_acceptance"}
+            proofs = [record for record in records if isinstance(record, dict) and set(record) == proof_fields]
+            assert len(proofs) == 1, "actual peer must emit exactly one complete proof; telemetry alone is not acceptance"
+            peer = proofs[0]
             assert peer["busy_detach_commit"] == "passed" and peer["committed_row_readback"] == "passed" and peer["idle_close"] == "passed"
             assert peer["gateway_pool_expiry_disconnect"] == "passed" and peer["expired_transaction_replay"] == "absent"
             assert peer["kernel_mount_acceptance"] is False and peer["cloudflare_first_sql_acceptance"] is False
