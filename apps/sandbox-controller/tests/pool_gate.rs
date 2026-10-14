@@ -4,6 +4,11 @@ use pgcf_sandbox_controller::pool_gate::{GateRoot, Record};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 fn root() -> std::path::PathBuf {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "root-custody fixture requires EUID 0"
+    );
     let path = std::env::temp_dir().join(format!(
         "pgcf-pool-gate-{}-{}",
         std::process::id(),
@@ -18,6 +23,7 @@ fn root() -> std::path::PathBuf {
 }
 
 #[test]
+#[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
 fn host_start_provisions_missing_custody_before_first_csi_publish() {
     use std::os::unix::fs::MetadataExt;
     let parent = root();
@@ -52,6 +58,7 @@ fn host_start_provisions_missing_custody_before_first_csi_publish() {
 }
 
 #[test]
+#[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
 fn durable_denial_outlives_owner_and_queued_publish_checks_after_lock() {
     let path = root();
     let gate = GateRoot::open(&path).unwrap();
@@ -60,7 +67,12 @@ fn durable_denial_outlives_owner_and_queued_publish_checks_after_lock() {
     assert!(lock.publish_allowed().unwrap());
     let record = Record::new(handle, &"a".repeat(64), &format!("LVM-{}", "x".repeat(64))).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "queued_publish_process", "--nocapture"])
+        .args([
+            "--exact",
+            "queued_publish_process",
+            "--ignored",
+            "--nocapture",
+        ])
         .env("PGCF_GATE_TEST_ROOT", &path)
         .env("PGCF_GATE_TEST_HANDLE", handle)
         .spawn()
@@ -90,6 +102,7 @@ fn durable_denial_outlives_owner_and_queued_publish_checks_after_lock() {
 }
 
 #[test]
+#[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
 fn malformed_record_and_symlink_are_denials() {
     let path = root();
     let gate = GateRoot::open(&path).unwrap();
@@ -105,10 +118,15 @@ fn malformed_record_and_symlink_are_denials() {
 }
 
 #[test]
+#[ignore = "root-custody subprocess helper; invoked only by its owning test"]
 fn queued_publish_process() {
-    let Ok(path) = std::env::var("PGCF_GATE_TEST_ROOT") else {
-        return;
-    };
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "root-custody helper requires EUID 0"
+    );
+    let path =
+        std::env::var("PGCF_GATE_TEST_ROOT").expect("root-custody helper requires its owning test");
     let handle = std::env::var("PGCF_GATE_TEST_HANDLE").unwrap();
     fs::write(std::path::Path::new(&path).join("queued"), b"ready").unwrap();
     let gate = GateRoot::open(std::path::Path::new(&path)).unwrap();
@@ -117,11 +135,12 @@ fn queued_publish_process() {
 }
 
 #[test]
+#[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
 fn owner_sigkill_does_not_remove_durable_denial() {
     let path = root();
     let handle = "pvc-real-agent-crash";
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "claim_process", "--nocapture"])
+        .args(["--exact", "claim_process", "--ignored", "--nocapture"])
         .env("PGCF_GATE_TEST_ROOT", &path)
         .env("PGCF_GATE_TEST_HANDLE", handle)
         .spawn()
@@ -141,10 +160,15 @@ fn owner_sigkill_does_not_remove_durable_denial() {
 }
 
 #[test]
+#[ignore = "root-custody subprocess helper; invoked only by its owning test"]
 fn claim_process() {
-    let Ok(path) = std::env::var("PGCF_GATE_TEST_ROOT") else {
-        return;
-    };
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "root-custody helper requires EUID 0"
+    );
+    let path =
+        std::env::var("PGCF_GATE_TEST_ROOT").expect("root-custody helper requires its owning test");
     let handle = std::env::var("PGCF_GATE_TEST_HANDLE").unwrap();
     let gate = GateRoot::open(std::path::Path::new(&path)).unwrap();
     let mut locked = gate.lock(&handle).unwrap();
@@ -156,6 +180,7 @@ fn claim_process() {
 }
 
 #[test]
+#[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
 fn owned_waiter_has_finite_deadline_without_erasing_custody() {
     let path = root();
     let handle = "pvc-real-lock-deadline";
@@ -165,7 +190,12 @@ fn owned_waiter_has_finite_deadline_without_erasing_custody() {
         .claim(&Record::new(handle, &"d".repeat(64), &format!("LVM-{}", "x".repeat(64))).unwrap())
         .unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "bounded_wait_process", "--nocapture"])
+        .args([
+            "--exact",
+            "bounded_wait_process",
+            "--ignored",
+            "--nocapture",
+        ])
         .env("PGCF_GATE_TEST_ROOT", &path)
         .env("PGCF_GATE_TEST_HANDLE", handle)
         .spawn()
@@ -191,16 +221,22 @@ fn owned_waiter_has_finite_deadline_without_erasing_custody() {
     );
 }
 #[test]
+#[ignore = "root-custody subprocess helper; invoked only by its owning test"]
 fn bounded_wait_process() {
-    let Ok(path) = std::env::var("PGCF_GATE_TEST_ROOT") else {
-        return;
-    };
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "root-custody helper requires EUID 0"
+    );
+    let path =
+        std::env::var("PGCF_GATE_TEST_ROOT").expect("root-custody helper requires its owning test");
     let handle = std::env::var("PGCF_GATE_TEST_HANDLE").unwrap();
     let gate = GateRoot::open(std::path::Path::new(&path)).unwrap();
     assert!(gate.lock(&handle).is_err());
 }
 
 #[test]
+#[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
 fn accepted_signed_qualification_hands_the_same_durable_deny_to_the_exact_binding() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use pgcf_native_protocol::{pool, qualification};

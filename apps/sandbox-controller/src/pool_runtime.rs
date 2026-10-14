@@ -1068,7 +1068,13 @@ mod recovery_tests {
         .unwrap()
     }
     #[test]
+    #[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
     fn real_host_process_restart_selects_only_prior_durable_bindings() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "root-custody fixture requires EUID 0"
+        );
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "pool-restart-selection-{}-{}",
@@ -1083,6 +1089,7 @@ mod recovery_tests {
                 .args([
                     "--exact",
                     "pool_runtime::recovery_tests::restart_selection_process",
+                    "--ignored",
                     "--nocapture",
                 ])
                 .env("PGCF_RESTART_TEST_ROOT", &root)
@@ -1108,10 +1115,15 @@ mod recovery_tests {
         assert!(status.success());
     }
     #[test]
+    #[ignore = "root-custody subprocess helper; invoked only by its owning test"]
     fn restart_selection_process() {
-        let Ok(root) = std::env::var("PGCF_RESTART_TEST_ROOT") else {
-            return;
-        };
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "root-custody helper requires EUID 0"
+        );
+        let root = std::env::var("PGCF_RESTART_TEST_ROOT")
+            .expect("root-custody helper requires its owning test");
         let root = Path::new(&root);
         let prior = restart_state(false);
         if std::env::var("PGCF_RESTART_TEST_ACTION").unwrap() == "record" {
@@ -1158,7 +1170,13 @@ mod recovery_tests {
         assert!(initial.acknowledge(&details).is_ok());
     }
     #[test]
+    #[ignore = "requires root ownership; explicitly executed by the CI root-custody step"]
     fn terminal_report_and_ack_survive_restart_and_cannot_be_rewritten() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "root-custody fixture requires EUID 0"
+        );
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!(
             "pool-recovery-journal-{}-{}",

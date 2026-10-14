@@ -187,6 +187,7 @@ jobs:
           node packages/contracts/native/generate-qualification.ts --check
           cargo fmt --all -- --check
           cargo test --workspace --locked
+          node scripts/ci/root-custody-tests.mjs
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo clippy -p pgcf-edge-rust --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Build the Worker once for actual Workerd tests
