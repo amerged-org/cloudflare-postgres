@@ -4,10 +4,10 @@ pub mod activity;
 #[path = "constants.generated.rs"]
 pub mod generated;
 pub mod pool;
+pub mod qualification;
 pub mod route;
 pub mod scoped_tokens;
 pub mod startup;
-pub mod qualification;
 
 use regex::Regex;
 use serde_json::Value;
