@@ -1,0 +1,7 @@
+# The native v4 route verifies the actual running postgres container under its published Pod UID.
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch]

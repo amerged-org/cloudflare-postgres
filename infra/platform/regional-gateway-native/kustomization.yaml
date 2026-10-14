@@ -5,3 +5,9 @@ resources:
   - ../regional
 patches:
   - path: gateway.yaml
+  - path: rbac.yaml
+    target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: ClusterRole
+      name: pgcf-gateway-endpoints

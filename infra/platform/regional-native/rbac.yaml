@@ -14,3 +14,11 @@
     resources: [mutatingadmissionpolicies, mutatingadmissionpolicybindings]
     resourceNames: [pgcf-cnpg-prestarted]
     verbs: [get]
+
+# Native runtime attestations retain metadata-only watch continuity for these actual identities.
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [""]
+    resources: [secrets, configmaps, persistentvolumes, nodes]
+    verbs: [list, watch]
