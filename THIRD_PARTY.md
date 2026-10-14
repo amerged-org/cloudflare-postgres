@@ -64,7 +64,7 @@ own extension upgrade after the image update; a new package alone does not chang
 
 **OpenEBS storage image:** `infra/storage/Dockerfile` inherits the pinned official
 OpenEBS LVM LocalPV 1.10.1 image and unchanged LVM/runtime packages. It rebuilds the
-upstream driver with an exporter-only metadata patch; CSI device-path validation
+upstream driver with metadata readers and a durable per-volume CSI pool gate; device-path validation
 and capacity-discovery source remain unchanged, while compiled machine bytes differ.
 The pinned upstream archive, applied patch, Apache-2.0 license and modification
 notice accompany the runtime image. The driver is compiled with Go 1.27.2 from the pinned official
@@ -161,10 +161,13 @@ vendor-published digest. The compiler is not shipped in PGCF runtime images.
 
 The native sandbox-controller adapter uses unchanged Apache-2.0 protobuf definitions from
 [containerd 2.3.6](https://github.com/containerd/containerd/tree/v2.3.6/api),
-[Kubernetes CRI API 0.36.5](https://github.com/kubernetes/cri-api/tree/v0.36.5) and
-[containerd ttrpc 1.2.7](https://github.com/containerd/ttrpc/tree/v1.2.7).
+[Kubernetes CRI API 0.36.5](https://github.com/kubernetes/cri-api/tree/v0.36.5),
+[containerd ttrpc 1.2.7](https://github.com/containerd/ttrpc/tree/v1.2.7), and
+[CSI specification 1.9.0](https://github.com/container-storage-interface/spec/tree/v1.9.0),
+matching the pinned OpenEBS driver's CSI dependency. The CSI client is restricted to fixed
+qualification denial requests through the exact locally verified driver socket.
 Exact source paths and SHA256 values are retained in
-`apps/sandbox-controller/proto/sources.json`, with all three upstream licenses beside them.
+`apps/sandbox-controller/proto/sources.json`, with their upstream licenses beside them.
 The adapter's direct crates are tonic/tonic-prost/tonic-prost-build 0.14.6 (MIT),
 prost/prost-types 0.14.4 (Apache-2.0), tokio 1.53.2 and tokio-stream 0.1.19 (MIT),
 tower 0.5.3 (MIT), hyper-util 0.1.21 (MIT), serde 1.0.229 and serde_json 1.0.151

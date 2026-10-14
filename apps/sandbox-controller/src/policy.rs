@@ -178,6 +178,238 @@ impl Client {
         &self.local
     }
     #[cfg(target_os = "linux")]
+    async fn pool_read(&self, suffix: &str, schema: &str) -> Result<serde_json::Value, Status> {
+        let mut response = self
+            .http
+            .get(format!(
+                "{}/agent/v1/{suffix}",
+                self.local.api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.key)
+            .send()
+            .await
+            .map_err(|_| Status::unavailable("postgres_pool_read_unconfirmed"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Status::permission_denied("postgres_pool_read_refused"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk)
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !pgcf_native_protocol::pool::validate(schema, &value) {
+            return Err(invalid());
+        }
+        Ok(value)
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn pool_binding_details(&self, id: &str) -> Result<serde_json::Value, Status> {
+        if !pgcf_native_protocol::valid_pattern("uuid", id) {
+            return Err(invalid());
+        }
+        let details = self
+            .pool_read(&format!("pool-bindings/{id}"), "PoolBindingDetails")
+            .await?;
+        if details["binding"]["binding"]["scope"]["binding_id"] != id
+            || details["binding"]["binding"]["scope"]["node_uid"] != self.local.node_uid
+        {
+            return Err(invalid());
+        }
+        Ok(details)
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn pool_qualification(&self) -> Result<serde_json::Value, Status> {
+        let mut response = self
+            .http
+            .get(format!(
+                "{}/agent/v1/nodes/{}/postgres-pool/qualification",
+                self.local.api_url.trim_end_matches('/'),
+                self.local.node_id
+            ))
+            .bearer_auth(&self.key)
+            .send()
+            .await
+            .map_err(|_| Status::unavailable("pool_qualification_read_unconfirmed"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Status::permission_denied("pool_qualification_read_refused"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk)
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !value["qualification"].is_null()
+            && !pgcf_native_protocol::qualification::validate(
+                "PostgresPoolQualificationInput",
+                &value["qualification"],
+            )
+        {
+            return Err(invalid());
+        }
+        Ok(value)
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn report_qualification(&self, value: &serde_json::Value) -> Result<(), Status> {
+        if !pgcf_native_protocol::qualification::validate("PostgresPoolQualificationReport", value)
+            || value["node_uid"] != self.local.node_uid
+        {
+            return Err(invalid());
+        }
+        let response = self
+            .http
+            .post(format!(
+                "{}/agent/v1/nodes/{}/postgres-pool/qualification",
+                self.local.api_url.trim_end_matches('/'),
+                self.local.node_id
+            ))
+            .bearer_auth(&self.key)
+            .json(value)
+            .send()
+            .await
+            .map_err(|_| Status::unavailable("pool_qualification_report_unconfirmed"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Status::permission_denied(
+                "pool_qualification_report_refused",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn report_pool_storage(&self, value: &serde_json::Value) -> Result<(), Status> {
+        if !pgcf_native_protocol::pool::validate("PoolStorageObservation", value)
+            || value["node_uid"] != self.local.node_uid
+        {
+            return Err(invalid());
+        }
+        let id = value["database_id"].as_str().ok_or_else(invalid)?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/agent/v1/databases/{id}/postgres-pool/storage",
+                self.local.api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.key)
+            .json(value)
+            .send()
+            .await
+            .map_err(|_| Status::unavailable("pool_storage_report_unconfirmed"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Status::permission_denied("pool_storage_report_refused"));
+        }
+        Ok(())
+    }
+    /// Pool reads reuse the authenticated, bounded node channel; no Kubernetes credential is needed.
+    #[cfg(target_os = "linux")]
+    pub async fn pool_bindings(&self, after: Option<u64>) -> Result<serde_json::Value, Status> {
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/agent/v1/nodes/{}/postgres-pool/bindings",
+            self.local.api_url.trim_end_matches('/'),
+            self.local.node_id,
+        ))
+        .map_err(|_| invalid())?;
+        if let Some(revision) = after {
+            url.query_pairs_mut()
+                .append_pair("after", &revision.to_string())
+                .append_pair("wait_ms", "0");
+        }
+        let mut response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.key)
+            .send()
+            .await
+            .map_err(|_| Status::unavailable("postgres_pool_snapshot_unavailable"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Status::permission_denied("postgres_pool_snapshot_refused"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(Status::resource_exhausted(
+                    "postgres_pool_snapshot_exceeded",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !pgcf_native_protocol::pool::validate("PoolBindingSnapshot", &snapshot)
+            || snapshot["node_id"] != self.local.node_id
+            || snapshot["node_uid"] != self.local.node_uid
+            || snapshot["boot_id"] != crate::storage::current_boot_id()?
+            || snapshot["issued_at"]
+                .as_u64()
+                .is_none_or(|issued| i128::from(issued) > now_ms() + 5000)
+            || snapshot["expires_at"]
+                .as_u64()
+                .is_none_or(|expires| i128::from(expires) <= now_ms())
+            || snapshot["issued_at"]
+                .as_u64()
+                .zip(snapshot["expires_at"].as_u64())
+                .is_none_or(|(issued, expires)| expires <= issued || expires - issued > 120000)
+            || snapshot["bindings"].as_array().is_none_or(|bindings| {
+                bindings.iter().any(|desired| {
+                    !pgcf_native_protocol::pool::binding_valid(&desired["binding"])
+                        || desired["binding"]["scope"]["node_id"] != self.local.node_id
+                        || desired["binding"]["scope"]["node_uid"] != self.local.node_uid
+                })
+            })
+        {
+            return Err(Status::failed_precondition(
+                "postgres_pool_snapshot_unconfirmed",
+            ));
+        }
+        Ok(snapshot)
+    }
+    /// The closed set of typed observation endpoints exposes no arbitrary path or command.
+    #[cfg(target_os = "linux")]
+    pub async fn report_pool(&self, schema: &str, value: &serde_json::Value) -> Result<(), Status> {
+        if !pgcf_native_protocol::pool::validate(schema, value) {
+            return Err(invalid());
+        }
+        let suffix = match schema {
+            "PoolPodInventory"
+                if value["node_id"] == self.local.node_id
+                    && value["node_uid"] == self.local.node_uid =>
+            {
+                format!("nodes/{}/postgres-pool/inventory", self.local.node_id)
+            }
+            "PoolIoAttestation" if value["node_uid"] == self.local.node_uid => format!(
+                "pool-bindings/{}/io",
+                value["binding_id"].as_str().ok_or_else(invalid)?
+            ),
+            "PoolNodeReport" if value["node_uid"] == self.local.node_uid => format!(
+                "pool-bindings/{}/node",
+                value["binding_id"].as_str().ok_or_else(invalid)?
+            ),
+            "PoolCleanupIoAttestation" if value["node_uid"] == self.local.node_uid => format!(
+                "pool-bindings/{}/cleanup-io",
+                value["binding_id"].as_str().ok_or_else(invalid)?
+            ),
+            _ => return Err(invalid()),
+        };
+        let response = self
+            .http
+            .post(format!(
+                "{}/agent/v1/{suffix}",
+                self.local.api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.key)
+            .json(value)
+            .send()
+            .await
+            .map_err(|_| Status::unavailable("postgres_pool_report_unconfirmed"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Status::permission_denied("postgres_pool_report_refused"));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
     pub async fn reclaim_intents(&self) -> Result<serde_json::Value, Status> {
         let mut response = self
             .http

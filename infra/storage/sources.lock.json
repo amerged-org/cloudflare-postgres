@@ -8,7 +8,7 @@
     "source": "https://github.com/openebs/lvm-localpv",
     "source_commit": "e8a234cbfeef5fa16fde1330c8de2d91e31831f1",
     "license": "Apache-2.0",
-    "binary_sha256": "753e722293eec85a490212eb1b44ffd01611d04ba65866072de0f42295d72fba",
+    "binary_sha256": "a40d565e57266594e1602e1a9388327c170bd20979cdb3a78e979afd043594ba",
     "lvm_binary_sha256": "fdc5aa9706d9982553ff4ee8497e4236dbfba4e790a8b81883789739e0176546",
     "runtime_config": {
       "Env": [
@@ -35,12 +35,12 @@
       "source_archive_bytes": 421865,
       "source_archive_path": "/usr/share/pgcf/lvm-localpv-e8a234cbfeef5fa16fde1330c8de2d91e31831f1.tar.gz",
       "patch_file": "exporter-metadata.patch",
-      "patch_sha256": "e803cc8f736f05c372e3841d6e24efd080bb3b3d1b9bdb3685451f393dfd222e",
+      "patch_sha256": "f88f388bba5b66a41ba5e51b8eea2ca35574a8f90db8802031c0279bd29cf82c",
       "patch_path": "/usr/share/pgcf/lvm-localpv-exporter.patch",
       "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
       "license_path": "/usr/share/licenses/pgcf-lvm-localpv/LICENSE",
       "notice_path": "/usr/share/licenses/pgcf-lvm-localpv/NOTICE",
-      "notice_sha256": "6b739ae5bdcf5f0f785d9be6743ac587c74c8602af059206be8fc708dd1d6ef9",
+      "notice_sha256": "adecbdfb771dd9de099f05da63db1558b93aa0f21451e4f6dfa6c3f6f7582fd9",
       "go_license_path": "/usr/share/licenses/pgcf-lvm-localpv/Go-LICENSE",
       "dependency_notices_path": "/usr/share/licenses/pgcf-lvm-localpv/dependencies",
       "go_license_sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad",
@@ -55,7 +55,20 @@
       },
       "dependency_notice_files": 108
     },
-    "binary_bytes": 54939772
+    "binary_bytes": 54956156,
+    "pool_gate": {
+      "protocol": 1,
+      "root": "/var/lib/kubelet/pgcf-pool-gates",
+      "key": "sha256-lowercase-volume-handle",
+      "lock_suffix": ".lock",
+      "denial_suffix": ".deny",
+      "serialized_operations": [
+        "NodePublishVolume",
+        "NodeExpandVolume",
+        "node-volume-reconciliation",
+        "node-snapshot-reconciliation"
+      ]
+    }
   },
   "thin_tools": {
     "package": "thin-provisioning-tools",

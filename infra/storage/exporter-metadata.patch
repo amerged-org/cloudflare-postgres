@@ -1,4 +1,4 @@
---- /dev/null
+--- a/pkg/lvm/exporter_metadata.go
 +++ b/pkg/lvm/exporter_metadata.go
 @@ -0,0 +1,195 @@
 +// Copyright 2026 PGCF contributors
@@ -196,7 +196,7 @@
 +	}
 +	return decodeVgsMetricsJSON(output)
 +}
---- /dev/null
+--- a/pkg/lvm/metrics_metadata_test.go
 +++ b/pkg/lvm/metrics_metadata_test.go
 @@ -0,0 +1,116 @@
 +// Copyright 2026 PGCF contributors
@@ -315,7 +315,7 @@
 +		t.Fatal("LVM's explicitly empty healthy status was lost")
 +	}
 +}
---- /dev/null
+--- a/pkg/collector/exporter_metadata_test.go
 +++ b/pkg/collector/exporter_metadata_test.go
 @@ -0,0 +1,40 @@
 +// Copyright 2026 PGCF contributors
@@ -457,3 +457,360 @@
  	if err != nil {
  		klog.Errorf("error in getting the list of lvm volume groups: %v", err)
  	} else {
+--- a/pkg/volumegate/gate.go
++++ b/pkg/volumegate/gate.go
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: Apache-2.0
++// PGCF protocol 1: serialize platform volume access against a crash-durable owner denial.
++package volumegate
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"os"
++	"path/filepath"
++	"syscall"
++	"time"
++)
++
++const Root = "/var/lib/kubelet/pgcf-pool-gates"
++
++var ErrDenied = errors.New("pool_creator_fence_denied")
++
++type Guard struct {
++	file   *os.File
++	record string
++}
++
++func validVolume(volume string) bool {
++	if len(volume) == 0 || len(volume) > 128 {
++		return false
++	}
++	for _, c := range volume {
++		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
++			return false
++		}
++	}
++	return true
++}
++func acquireAt(root, volume string) (*Guard, error) {
++	return acquire(context.Background(), root, volume)
++}
++func acquire(ctx context.Context, root, volume string) (*Guard, error) {
++	if !validVolume(volume) {
++		return nil, ErrDenied
++	}
++	if err := os.Mkdir(root, 0700); err != nil && !os.IsExist(err) {
++		return nil, ErrDenied
++	}
++	resolved, err := filepath.EvalSymlinks(root)
++	if err != nil || resolved != root {
++		return nil, ErrDenied
++	}
++	meta, err := os.Lstat(root)
++	if err != nil || !meta.IsDir() || meta.Mode().Perm() != 0700 {
++		return nil, ErrDenied
++	}
++	stat, ok := meta.Sys().(*syscall.Stat_t)
++	if !ok || stat.Uid != 0 {
++		return nil, ErrDenied
++	}
++	sum := sha256.Sum256([]byte(volume))
++	key := hex.EncodeToString(sum[:])
++	fd, err := syscall.Open(filepath.Join(root, key+".lock"), syscall.O_RDWR|syscall.O_CREAT|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
++	if err != nil {
++		return nil, ErrDenied
++	}
++	file := os.NewFile(uintptr(fd), "pool-volume-lock")
++	meta, err = file.Stat()
++	if err != nil {
++		file.Close()
++		return nil, ErrDenied
++	}
++	stat, ok = meta.Sys().(*syscall.Stat_t)
++	if !ok || !meta.Mode().IsRegular() || meta.Mode().Perm() != 0600 || stat.Uid != 0 || stat.Nlink != 1 {
++		file.Close()
++		return nil, ErrDenied
++	}
++	for {
++		err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
++		if err == nil {
++			break
++		}
++		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
++			file.Close()
++			return nil, ErrDenied
++		}
++		select {
++		case <-ctx.Done():
++			file.Close()
++			return nil, ErrDenied
++		case <-time.After(10 * time.Millisecond):
++		}
++	}
++	return &Guard{file: file, record: filepath.Join(root, key+".deny")}, nil
++}
++
++// Acquire checks durable absence AFTER serialization. Presence, invalidity and stale state all deny.
++func Acquire(ctx context.Context, volume string) (*Guard, error) {
++	guard, err := acquire(ctx, Root, volume)
++	if err != nil {
++		return nil, ErrDenied
++	}
++	if !guard.allowed() {
++		guard.Close()
++		return nil, ErrDenied
++	}
++	return guard, nil
++}
++func (g *Guard) allowed() bool {
++	_, err := os.Lstat(g.record)
++	return os.IsNotExist(err)
++}
++
++// Do not unlink either file: queued waiters must retain the shared lock inode; only agent clears denial.
++func (g *Guard) Close() error { return g.file.Close() }
+--- a/pkg/volumegate/gate_test.go
++++ b/pkg/volumegate/gate_test.go
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: Apache-2.0
++package volumegate
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestQueuedPublishSeesDurableDenialAfterOwnerUnlock(t *testing.T) {
++	root := t.TempDir()
++	if err := os.Chmod(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	volume := "pvc-real-process-queue"
++	owner, err := acquireAt(root, volume)
++	if err != nil {
++		t.Fatal(err)
++	}
++	child := exec.Command(os.Args[0], "-test.run=^TestQueuedPublishChild$")
++	child.Env = append(os.Environ(), "PGCF_GATE_TEST_ROOT="+root, "PGCF_GATE_TEST_VOLUME="+volume)
++	if err = child.Start(); err != nil {
++		t.Fatal(err)
++	}
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		if _, err = os.Stat(filepath.Join(root, "queued")); err == nil {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("real queued publisher did not start")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	// This is an actual record written by the owner while holding the shared inode lock.
++	if err = os.WriteFile(owner.record, []byte(`{"v":1,"volume_handle":"pvc-real-process-queue","scope_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err = owner.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err = child.Wait(); err != nil {
++		t.Fatal("queued publisher bypassed durable denial")
++	}
++	// Restart/death cannot turn an existing record into an allowed operation.
++	restarted, err := acquireAt(root, volume)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer restarted.Close()
++	if restarted.allowed() {
++		t.Fatal("owner restart cleared denial")
++	}
++}
++
++func TestQueuedPublishChild(t *testing.T) {
++	root := os.Getenv("PGCF_GATE_TEST_ROOT")
++	if root == "" {
++		return
++	}
++	if err := os.WriteFile(filepath.Join(root, "queued"), []byte("ready"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	guard, err := acquireAt(root, os.Getenv("PGCF_GATE_TEST_VOLUME"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer guard.Close()
++	if guard.allowed() {
++		t.Fatal("publish allowed after claim")
++	}
++}
++
++func TestSymlinkOrMalformedRecordCannotPermitPublish(t *testing.T) {
++	root := t.TempDir()
++	if err := os.Chmod(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	guard, err := acquireAt(root, "pvc-real-invalid-record")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer guard.Close()
++	if err = os.Symlink("/not-present", guard.record); err != nil {
++		t.Fatal(err)
++	}
++	if guard.allowed() {
++		t.Fatal("dangling symlink treated as absent record")
++	}
++}
+--- a/pkg/driver/agent.go
++++ b/pkg/driver/agent.go
+@@ -46,6 +46,7 @@
+ 	"github.com/openebs/lvm-localpv/pkg/mgmt/lvmnode"
+ 	"github.com/openebs/lvm-localpv/pkg/mgmt/snapshot"
+ 	"github.com/openebs/lvm-localpv/pkg/mgmt/volume"
++	"github.com/openebs/lvm-localpv/pkg/volumegate"
+ 
+ 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+ )
+@@ -250,6 +251,12 @@
+ 	if err = ns.validateNodePublishReq(req); err != nil {
+ 		return nil, err
+ 	}
++
++	gate, err := volumegate.Acquire(ctx, strings.ToLower(req.GetVolumeId()))
++	if err != nil {
++		return nil, status.Error(codes.FailedPrecondition, "pool_creator_fence_denied")
++	}
++	defer gate.Close()
+ 
+ 	vol, mountInfo, err := GetVolAndMountInfo(req)
+ 	if err != nil {
+@@ -454,6 +461,12 @@
+ 		)
+ 	}
+ 
++	gate, err := volumegate.Acquire(ctx, strings.ToLower(volumeID))
++	if err != nil {
++		return nil, status.Error(codes.FailedPrecondition, "pool_creator_fence_denied")
++	}
++	defer gate.Close()
++
+ 	vol, err := lvm.GetLVMVolume(volumeID)
+ 
+ 	if err != nil {
+--- a/pkg/driver/pool_gate_test.go
++++ b/pkg/driver/pool_gate_test.go
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: Apache-2.0
++package driver
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"github.com/container-storage-interface/spec/lib/go/csi"
++	"github.com/openebs/lvm-localpv/pkg/volumegate"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestPoolDenialPrecedesEveryPublishAndExpansionPath(t *testing.T) {
++	// These are the actual CSI methods, with a real durable on-disk denial. No API/mount is mocked.
++	if err := os.MkdirAll(volumegate.Root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Chmod(volumegate.Root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	volume := "pvc-real-driver-denial"
++	sum := sha256.Sum256([]byte(volume))
++	base := filepath.Join(volumegate.Root, hex.EncodeToString(sum[:]))
++	if err := os.WriteFile(base+".deny", []byte("actual durable denial"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base + ".deny")
++	defer os.Remove(base + ".lock")
++	ns := &node{}
++	mount := &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}}}
++	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{VolumeId: volume, VolumeCapability: mount, TargetPath: "/tmp/pool-gate-forbidden"})
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatal("filesystem publish did not refuse before external reads/mount")
++	}
++	block := &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}}
++	_, err = ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{VolumeId: volume, VolumeCapability: block, TargetPath: "/tmp/pool-gate-forbidden"})
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatal("raw-block publish did not refuse before external reads/mount")
++	}
++	_, err = ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{VolumeId: volume, VolumePath: "/tmp/pool-gate-forbidden", VolumeCapability: mount})
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatal("expansion did not refuse before external reads/resize")
++	}
++}
+--- a/pkg/mgmt/volume/volume.go
++++ b/pkg/mgmt/volume/volume.go
+@@ -17,6 +17,7 @@
+ package volume
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"reflect"
+ 	"regexp"
+@@ -35,6 +36,7 @@
+ 
+ 	apis "github.com/openebs/lvm-localpv/pkg/apis/openebs.io/lvm/v1alpha1"
+ 	"github.com/openebs/lvm-localpv/pkg/lvm"
++	"github.com/openebs/lvm-localpv/pkg/volumegate"
+ )
+ 
+ // isDeletionCandidate checks if a lvm volume is a deletion candidate.
+@@ -177,6 +179,11 @@
+ // synVol is the function which tries to converge to a desired state for the
+ // LVMVolume
+ func (c *VolController) syncVol(vol *apis.LVMVolume) error {
++	gate, gateErr := volumegate.Acquire(context.Background(), vol.Name)
++	if gateErr != nil {
++		return gateErr
++	}
++	defer gate.Close()
+ 	var err error
+ 	// LVM Volume should be deleted. Check if deletion timestamp is set
+ 	if c.isDeletionCandidate(vol) {
+--- a/pkg/mgmt/snapshot/snapshot.go
++++ b/pkg/mgmt/snapshot/snapshot.go
+@@ -17,6 +17,7 @@
+ package snapshot
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"time"
+ 
+@@ -30,6 +31,7 @@
+ 
+ 	apis "github.com/openebs/lvm-localpv/pkg/apis/openebs.io/lvm/v1alpha1"
+ 	"github.com/openebs/lvm-localpv/pkg/lvm"
++	"github.com/openebs/lvm-localpv/pkg/volumegate"
+ )
+ 
+ // isDeletionCandidate checks if a lvm snapshot is a deletion candidate.
+@@ -82,6 +84,11 @@
+ // synSnap is the function which tries to converge to a desired state for the
+ // LVMSnapshot
+ func (c *SnapController) syncSnap(snap *apis.LVMSnapshot) error {
++	gate, gateErr := volumegate.Acquire(context.Background(), snap.Labels[lvm.LVMVolKey])
++	if gateErr != nil {
++		return gateErr
++	}
++	defer gate.Close()
+ 	var err error
+ 	// LVMSnapshot should be deleted. Check if deletion timestamp is set
+ 	if c.isDeletionCandidate(snap) {

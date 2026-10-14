@@ -2,7 +2,8 @@
   "versions": {
     "containerd": "v2.3.6",
     "cri-api": "v0.36.5",
-    "ttrpc": "v1.2.7"
+    "ttrpc": "v1.2.7",
+    "csi-spec": "v1.9.0"
   },
   "files": [
     {
@@ -74,6 +75,16 @@
       "path": "types/task/task.proto",
       "sha256": "c05245dcad502ec63a9cf8296b973f300fba3a61d38acd621048849227873253",
       "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/task/task.proto"
+    },
+    {
+      "path": "csi.proto",
+      "sha256": "0b625eff0484fa61a1ddb06570a71c118e6af3b8f73e4d860f43d477412e4d55",
+      "source": "https://github.com/container-storage-interface/spec/blob/v1.9.0/csi.proto"
+    },
+    {
+      "path": "csi.LICENSE",
+      "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+      "source": "https://github.com/container-storage-interface/spec/blob/v1.9.0/LICENSE"
     }
   ]
 }

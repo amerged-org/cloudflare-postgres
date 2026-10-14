@@ -1515,6 +1515,7 @@ dependencies = [
  "pgcf-node-runtime",
  "prost",
  "prost-types",
+ "rcgen",
  "reqwest",
  "ring",
  "rustls",
@@ -1529,6 +1530,7 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "webpki-roots 1.0.9",
+ "x509-parser",
 ]
 
 [[package]]
