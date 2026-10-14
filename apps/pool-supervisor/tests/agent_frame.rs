@@ -3,10 +3,12 @@ use pgcf_pool_supervisor::agent_frame::receive;
 use serde_json::json;
 use std::{
     ffi::CString,
+    io::Write,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
+    time::{Duration, Instant},
 };
 
 fn descriptor() -> OwnedFd {
@@ -20,6 +22,25 @@ fn descriptor() -> OwnedFd {
     };
     assert!(fd >= 0);
     unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+#[test]
+fn actual_socket_drip_cannot_extend_the_aggregate_receive_deadline() {
+    let (mut writer, reader) = UnixStream::pair().unwrap();
+    let sender = std::thread::spawn(move || {
+        writer.write_all(b"{").unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = writer.write_all(b" ");
+        std::thread::sleep(Duration::from_secs(4));
+    });
+    let began = Instant::now();
+    assert!(receive(&reader).is_err());
+    let elapsed = began.elapsed();
+    sender.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "frame deadline drifted: {elapsed:?}"
+    );
 }
 fn send(socket: &UnixStream, fds: &[&OwnedFd]) {
     let bytes = b"{\"signal\":{\"command\":\"inspect_readonly\"}}";

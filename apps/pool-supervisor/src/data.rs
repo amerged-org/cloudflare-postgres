@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Read-only pre-start and post-stop checks against unmodified PostgreSQL's own control tool.
-use crate::Error;
+use crate::{Error, now};
 use std::{
     fs,
     io::Read,
@@ -9,7 +9,8 @@ use std::{
         unix::{fs::OpenOptionsExt, process::CommandExt},
     },
     path::Path,
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone)]
@@ -30,7 +31,165 @@ pub fn control(path: &Path) -> Result<Control, Error> {
 
 /// Consume an agent-owned read-only directory descriptor; no caller path reaches the tool.
 /// The directory is deliberately inherited by only the fixed stock child, never through stdin.
-pub fn readonly_control(directory: OwnedFd) -> Result<Control, Error> {
+#[derive(Default)]
+pub struct ReadonlyReader {
+    child: Option<Child>,
+    started: bool,
+}
+impl ReadonlyReader {
+    pub fn pending(&self) -> bool {
+        self.child.is_some()
+    }
+    pub fn started(&self) -> bool {
+        self.started
+    }
+    /// Actual wait/reap is the only local closure witness; elapsed time and SIGKILL are not.
+    pub fn reap(&mut self) -> Result<(), Error> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.child = None;
+                Ok(())
+            }
+            Ok(None) => Err(Error("pool_control_cleanup_pending")),
+            Err(_) => Err(Error("pool_control_cleanup_unknown")),
+        }
+    }
+    pub fn read(&mut self, directory: OwnedFd, deadline: u64) -> Result<Control, Error> {
+        self.reap()?;
+        self.started = false;
+        let remaining = deadline.saturating_sub(now()).min(30000);
+        if remaining == 0 {
+            return Err(Error("pool_control_deadline_elapsed"));
+        }
+        let stop = Instant::now() + Duration::from_millis(remaining);
+        let descriptor = directory.as_raw_fd();
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        let mut filesystem: libc::statvfs = unsafe { std::mem::zeroed() };
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if unsafe { libc::fstat(descriptor, &mut metadata) } != 0
+            || metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || unsafe { libc::fstatvfs(descriptor, &mut filesystem) } != 0
+            || filesystem.f_flag & libc::ST_RDONLY == 0
+            || flags < 0
+            || flags & libc::O_PATH == 0
+        {
+            return Err(Error("pool_readonly_descriptor_refused"));
+        }
+        let inherited = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+        if inherited < 0 {
+            return Err(Error("pool_readonly_descriptor_refused"));
+        }
+        let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
+        let child_fd = inherited.as_raw_fd();
+        let mut command = Command::new("/pgcf/bin/pgcf-supervisor");
+        command.arg("readonly-control").env("LC_ALL", "C");
+        unsafe {
+            command.pre_exec(move || {
+                if child_fd != 3 && libc::dup2(child_fd, 3) != 3 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if now() >= deadline {
+            return Err(Error("pool_control_deadline_elapsed"));
+        }
+        self.child = Some(
+            command
+                .spawn()
+                .map_err(|_| Error("pool_control_unavailable"))?,
+        );
+        self.started = true;
+        // Only the fixed child retains the inherited data reference while it executes.
+        drop(inherited);
+        drop(directory);
+        let child = self.child.as_mut().expect("spawned fixed child");
+        for fd in [
+            child.stdout.as_ref().map(AsRawFd::as_raw_fd),
+            child.stderr.as_ref().map(AsRawFd::as_raw_fd),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return self.cancel(Error("pool_control_unavailable"));
+            }
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            let child = self.child.as_mut().expect("tracked fixed child");
+            if drain(child.stdout.as_mut(), &mut stdout).is_err()
+                || drain(child.stderr.as_mut(), &mut stderr).is_err()
+            {
+                return self.cancel(Error("pool_control_invalid"));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if drain(child.stdout.as_mut(), &mut stdout).is_err()
+                        || drain(child.stderr.as_mut(), &mut stderr).is_err()
+                    {
+                        self.child = None;
+                        return Err(Error("pool_control_invalid"));
+                    }
+                    self.child = None;
+                    if Instant::now() >= stop || now() >= deadline {
+                        return Err(Error("pool_control_deadline_elapsed"));
+                    }
+                    if stdout.is_empty() && stderr == b"pool_readonly_descriptor_refused\n" {
+                        return Err(Error("pool_readonly_descriptor_refused"));
+                    }
+                    if !stderr.is_empty() {
+                        return Err(Error("pool_control_invalid"));
+                    }
+                    return parse_control(Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => return self.cancel(Error("pool_control_unavailable")),
+            }
+            if Instant::now() >= stop || now() >= deadline {
+                return self.cancel(Error("pool_control_deadline_elapsed"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn cancel(&mut self, failure: Error) -> Result<Control, Error> {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        let until = Instant::now() + Duration::from_millis(250);
+        loop {
+            match self.reap() {
+                Ok(()) => return Err(failure),
+                Err(Error("pool_control_cleanup_pending")) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+/// Only the installed, fixed helper owns potentially blocking inode lookup. It executes the
+/// unmodified stock tool in this same tracked process, with one fixed descriptor and argument.
+pub fn readonly_helper() -> Result<(), Error> {
+    if unsafe { libc::geteuid() } != 26 || unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
+        return Err(Error("pool_readonly_descriptor_refused"));
+    }
+    crate::private::protect_process_memory()?;
+    let directory = unsafe { OwnedFd::from_raw_fd(3) };
     let descriptor = directory.as_raw_fd();
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
     let mut filesystem: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -76,32 +235,38 @@ pub fn readonly_control(directory: OwnedFd) -> Result<Control, Error> {
     {
         return Err(Error("pool_readonly_descriptor_refused"));
     }
-    let inherited = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
-    if inherited < 0 {
+
+    drop(control);
+    drop(global);
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, 0) } != 0 {
         return Err(Error("pool_readonly_descriptor_refused"));
     }
-    let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
-    let child_fd = inherited.as_raw_fd();
-    let mut command = Command::new("/usr/lib/postgresql/18/bin/pg_controldata");
-    command
-        .arg(format!("/proc/self/fd/{child_fd}"))
-        .env("LC_ALL", "C");
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(child_fd, libc::F_SETFD, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
+    let _error = Command::new("/usr/lib/postgresql/18/bin/pg_controldata")
+        .arg("/proc/self/fd/3")
+        .env("LC_ALL", "C")
+        .exec();
+    Err(Error("pool_control_unavailable"))
+}
+
+fn drain<R: Read>(pipe: Option<&mut R>, bytes: &mut Vec<u8>) -> Result<(), Error> {
+    let Some(pipe) = pipe else {
+        return Err(Error("pool_control_unavailable"));
+    };
+    loop {
+        let mut buffer = [0u8; 4096];
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.len() > 65536 {
+                    return Err(Error("pool_control_invalid"));
+                }
             }
-            Ok(())
-        });
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(_) => return Err(Error("pool_control_unavailable")),
+        }
     }
-    let output = command
-        .output()
-        .map_err(|_| Error("pool_control_unavailable"))?;
-    // Stock pg_controldata can exit zero with a CRC/version warning; that is not valid evidence.
-    if !output.stderr.is_empty() {
-        return Err(Error("pool_control_invalid"));
-    }
-    parse_control(output)
 }
 
 fn parse_control(output: Output) -> Result<Control, Error> {

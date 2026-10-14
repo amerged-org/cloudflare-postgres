@@ -16,6 +16,7 @@ pub fn inspect(
     identity: &Identity,
     keys: &HashMap<String, Vec<u8>>,
     keys_sha256: &str,
+    reader: &mut data::ReadonlyReader,
     request: Value,
     descriptor: OwnedFd,
 ) -> Result<Value, Error> {
@@ -80,6 +81,7 @@ pub fn inspect(
         "supervisor_image",
         "supervisor_sha256",
         "archiver_image",
+        "host_controller_sha256",
     ] {
         if policy[field] != software[field] {
             return Err(Error("pool_inspection_software_changed"));
@@ -113,7 +115,11 @@ pub fn inspect(
     let device_major = libc::major(metadata.st_dev);
     let device_minor = libc::minor(metadata.st_dev);
     // This call consumes/closes every directory and child descriptor before any acknowledgement.
-    let measured = data::readonly_control(descriptor);
+    let deadline = number(&claims, "exp")?.min(number(signal, "expires_at")?);
+    let measured = reader.read(descriptor, deadline);
+    if reader.pending() {
+        return Err(Error("pool_control_cleanup_pending"));
+    }
     if number(&claims, "exp")? <= now() || number(signal, "expires_at")? <= now() {
         return Err(Error("pool_inspection_deadline_elapsed"));
     }

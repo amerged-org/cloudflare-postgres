@@ -53,6 +53,13 @@ fn main() {
         }
         return;
     }
+    if args.len() == 2 && args[1] == "readonly-control" {
+        if let Err(error) = pgcf_pool_supervisor::data::readonly_helper() {
+            eprintln!("{}", error.0);
+            std::process::exit(1);
+        }
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

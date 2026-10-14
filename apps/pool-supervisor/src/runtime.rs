@@ -33,19 +33,28 @@ pub struct Runtime {
     ready_at: Option<u64>,
     consumed: bool,
     stopped: Option<Value>,
+    readonly: data::ReadonlyReader,
 }
 impl Runtime {
     pub fn inspect_readonly(
-        &self,
+        &mut self,
         request: Value,
         descriptor: std::os::fd::OwnedFd,
     ) -> Result<Value, Error> {
         if self.consumed || self.child.is_some() || self.mount.is_some() || self.bundle.is_some() {
             return Err(Error("pool_inspection_holder_assigned"));
         }
+        self.readonly.reap()?;
         let pin = std::env::var("PGCF_POOL_BIND_KEYS_SHA256")
             .map_err(|_| Error("pool_trust_pin_missing"))?;
-        crate::inspection::inspect(&self.identity, &self.keys, &pin, request, descriptor)
+        crate::inspection::inspect(
+            &self.identity,
+            &self.keys,
+            &pin,
+            &mut self.readonly,
+            request,
+            descriptor,
+        )
     }
     pub fn new(
         identity: Identity,
@@ -63,9 +72,11 @@ impl Runtime {
             ready_at: None,
             consumed: false,
             stopped: None,
+            readonly: data::ReadonlyReader::default(),
         }
     }
     pub fn mounted(&mut self, signal: Value) -> Result<(), Error> {
+        self.readonly.reap()?;
         let signal = protocol::valid("PoolMountSignal", signal)?;
         let metadata = fs::metadata(protocol::constant("pgdata")?)
             .map_err(|_| Error("pool_data_unavailable"))?;
@@ -146,6 +157,7 @@ impl Runtime {
         Ok(())
     }
     pub fn bundle(&mut self, bundle: Value) -> Result<(), Error> {
+        self.readonly.reap()?;
         let bundle = protocol::valid("PoolTenantBundle", bundle)?;
         self.identity(&bundle["scope"])?;
         protocol::storage_authority(
@@ -377,6 +389,11 @@ impl Runtime {
         Ok(())
     }
     pub fn check_running(&mut self) -> Result<(), Error> {
+        // A suspended device may retain the killed tool. Keep the fence without blocking
+        // the supervisor event loop; the node still needs its own global DM0 witness.
+        if self.readonly.pending() {
+            let _ = self.readonly.reap();
+        }
         if let Some(child) = self.child.as_mut() {
             if child
                 .try_wait()
@@ -391,6 +408,7 @@ impl Runtime {
         Ok(())
     }
     pub async fn shutdown(&mut self) -> Result<Option<Value>, Error> {
+        self.readonly.reap()?;
         if let Some(bundle) = &self.bundle
             && (self.child.is_some() || self.stopped.is_some())
         {

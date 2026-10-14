@@ -7,16 +7,21 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub fn receive(socket: &UnixStream) -> Result<(Value, Option<OwnedFd>), Error> {
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| Error("pool_agent_frame_unavailable"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut bytes = Vec::new();
     let mut descriptors = Vec::new();
     loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(Error("pool_agent_frame_unavailable"))?;
+        socket
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| Error("pool_agent_frame_unavailable"))?;
         let mut buffer = [0u8; 8192];
         let mut control = [0usize; 8];
         let mut vector = libc::iovec {

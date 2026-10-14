@@ -61,6 +61,7 @@ fn signed_preparation_reads_real_control_and_does_not_authorize_other_contexts()
         ("supervisor_image", "supervisor_image"),
         ("supervisor_sha256", "supervisor_sha256"),
         ("archiver_image", "archiver_image"),
+        ("host_controller_sha256", "host_controller_sha256"),
     ] {
         preparation["policy"][policy] = claims["scope"]["software"][software].clone();
     }
@@ -104,11 +105,13 @@ fn signed_preparation_reads_real_control_and_does_not_authorize_other_contexts()
         executable: signal["supervisor_sha256"].as_str().unwrap().into(),
         key: String::new(),
     };
+    let mut reader = pgcf_pool_supervisor::data::ReadonlyReader::default();
     let request = json!({"signal":signal,"preparation":preparation});
     let clean = inspection::inspect(
         &identity,
         &keys,
         &pin,
+        &mut reader,
         request.clone(),
         directory(&Path::new(&root).join("clean")),
     )
@@ -119,11 +122,44 @@ fn signed_preparation_reads_real_control_and_does_not_authorize_other_contexts()
         &identity,
         &keys,
         &pin,
+        &mut reader,
         request.clone(),
         directory(&Path::new(&root).join("dirty")),
     )
     .unwrap();
     assert_eq!(dirty["control_state"], "in production");
+    let mut host_changed = request.clone();
+    host_changed["preparation"]["policy"]["host_controller_sha256"] = json!("b".repeat(64));
+    let digest = pool::preparation_hash(&host_changed["preparation"]).unwrap();
+    let mut host_claims = claims.clone();
+    host_claims["preparation_sha256"] = json!(digest);
+    host_changed["signal"]["preparation_sha256"] = json!(digest);
+    host_changed["signal"]["permission"] = json!(sign(&key.0, &host_claims));
+    assert!(pool::validate("PoolStorageReadRequest", &host_changed));
+    assert!(
+        qualification::verify_qualification_permission(
+            host_changed["signal"]["permission"].as_str().unwrap(),
+            &keys,
+            now()
+        )
+        .is_some()
+    );
+    assert!(
+        matches!(
+            inspection::inspect(
+                &identity,
+                &keys,
+                &pin,
+                &mut reader,
+                host_changed,
+                directory(&Path::new(&root).join("clean"))
+            ),
+            Err(pgcf_pool_supervisor::Error(
+                "pool_inspection_software_changed"
+            ))
+        ),
+        "Valid signed preparation with another host ELF pin must be refused"
+    );
     let mut changed = request.clone();
     changed["preparation"]["pods"][0]["container_ids"][0] = json!("f".repeat(64));
     assert!(
@@ -131,6 +167,7 @@ fn signed_preparation_reads_real_control_and_does_not_authorize_other_contexts()
             &identity,
             &keys,
             &pin,
+            &mut reader,
             changed,
             directory(&Path::new(&root).join("clean"))
         )
@@ -143,6 +180,7 @@ fn signed_preparation_reads_real_control_and_does_not_authorize_other_contexts()
             &identity,
             &keys,
             &pin,
+            &mut reader,
             json!({"signal":signal,"preparation":request["preparation"]}),
             directory(&Path::new(&root).join("clean"))
         )
