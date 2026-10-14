@@ -256,7 +256,24 @@ impl Client {
     }
     #[cfg(target_os = "linux")]
     pub async fn report_qualification(&self, value: &serde_json::Value) -> Result<(), Status> {
-        if !pgcf_native_protocol::qualification::validate("PostgresPoolQualificationReport", value)
+        self.post_qualification("PostgresPoolQualificationReport", value)
+            .await
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn report_qualification_progress(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<(), Status> {
+        self.post_qualification("PostgresPoolQualificationProgressReport", value)
+            .await
+    }
+    #[cfg(target_os = "linux")]
+    async fn post_qualification(
+        &self,
+        schema: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), Status> {
+        if !pgcf_native_protocol::qualification::validate(schema, value)
             || value["node_uid"] != self.local.node_uid
         {
             return Err(invalid());

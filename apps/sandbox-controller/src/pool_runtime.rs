@@ -569,6 +569,12 @@ pub async fn run(
         if crate::pool_child::reap().await.is_err() {
             eprintln!("pool_worker_cleanup_pending");
         }
+        if crate::pool_qualification::reap_pending_owner()
+            .await
+            .is_err()
+        {
+            eprintln!("pool_qualification_owner_cleanup_pending");
+        }
         if updates.has_changed().unwrap_or(false) {
             client = updates.borrow_and_update().clone()
         }
@@ -586,6 +592,22 @@ pub async fn run(
             holders.remove(&id);
         }
         let result: Result<(), Status> = async {
+            if let Ok(q) = client.pool_qualification().await {
+                let input = &q["qualification"];
+                if input["challenge"]["gate"] == "finite_creator_fence" {
+                    // Driver replacement can outlive preparation freshness. Finite scope and full
+                    // progress are independently signed and verified by the node producer.
+                    if let Ok(Some(report)) =
+                        crate::pool_qualification::finite_creator(&settings, &client, input).await
+                    {
+                        if report.get("progress").is_some() {
+                            client.report_qualification_progress(&report).await?;
+                        } else {
+                            client.report_qualification(&report).await?;
+                        }
+                    }
+                }
+            }
             crate::pool_recovery::reconcile(
                 &settings,
                 &client,
