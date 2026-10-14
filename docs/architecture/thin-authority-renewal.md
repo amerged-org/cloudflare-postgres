@@ -5,6 +5,19 @@ Implementation is in progress; CI, deployment and live acceptance remain require
 [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) records the current Done/Open state.
 Options 2 and 3 in section 12 remain comparison material.
 
+Implementation correction, 2026-10-14: the pinned kernel exempts metadata and swap bios from
+ordinary `io.max` throttling. The rate-window formulas below do not establish a hard bound on
+all physical allocation and are superseded for admission and renewal by conservative accounting:
+reserve each retained Thin LV's full measured logical size, deduplicate only exact matching
+volume reservations by their maximum, and retain unmatched obligations additively. Missing or
+ambiguous physical identities fail closed. An expired write permission does not erase an LV's
+exposure; retained inventory may inform conservative accounting without granting write authority.
+
+Suspension flags, Pod absence and per-LV used bytes do not release this reserve. Release currently
+requires exact physical reclamation. This is a temporary safety constraint: sleeping overbooking
+still needs a proven global no-write state and fenced resumption before its reserve can be released.
+Cloudflare remains the sole signer and the two-proof renewal design remains unchanged.
+
 Citations: `path:line` refer to origin/main `ab07c82`. `plan` is the
 [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) and `ops` is
 [recovery.md](../operations/recovery.md); `api/` is `apps/api/src/`, `dom/` is
