@@ -11,8 +11,20 @@ import {
 } from "../../src/domain/admission-mutations.ts";
 import { reconcileDatabaseActors } from "../../src/domain/database-actor-sync.ts";
 import { placePendingDatabases } from "../../src/domain/node-capacity.ts";
+import {
+  admissionSnapshotFixture,
+  admissionFixtureReleases,
+} from "./admission-snapshot-fixture.ts";
+import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
+import { admissionSnapshotCapable } from "../../src/domain/fleet-releases.ts";
 
-afterEach(cleanupFixtures);
+afterEach(async () => {
+  await cleanupFixtures();
+  for (const id of admissionFixtureReleases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
+});
 const actorFor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
 async function ready() {
@@ -150,15 +162,11 @@ it("a capability rollback cannot route or start CNPG while a pool holder outcome
   );
 });
 
-it("a committed role change cannot admit the preceding ready runtime without a power operation", async () => {
-  const f = await fixture();
-  const created = DatabaseWithOperation.parse(await (await f.create()).json());
-  const id = created.database.id;
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_generation=generation,power_operation=NULL WHERE id=?",
-  )
-    .bind(id)
-    .run();
+it("a committed v4 role change cannot admit the preceding ready runtime without a power operation", async () => {
+  const f = await admissionSnapshotFixture(),
+    id = f.id;
+  expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(true);
+  expect(await publishDatabaseAdmission(env, id)).toBe(true);
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
   expect((await actor.admit(id, "app")).ok).toBe(true);
   const changed = await request(
@@ -166,7 +174,7 @@ it("a committed role change cannot admit the preceding ready runtime without a p
     f.integrator,
     "POST",
     {
-      name: "reader",
+      name: "unrelated",
     },
   );
   expect(changed.status).toBe(201);
@@ -180,15 +188,15 @@ it("a committed role change cannot admit the preceding ready runtime without a p
       power_operation: null;
     }>();
   expect(row).toEqual({
-    generation: 2,
-    observed_generation: 1,
+    generation: f.proof.generation + 1,
+    observed_generation: f.proof.generation,
     power_operation: null,
   });
   expect(await actor.admit(id, "app")).toEqual({
     ok: false,
     sqlstate: "57P03",
   });
-  expect(await actor.admit(id, "reader")).toEqual({
+  expect(await actor.admit(id, "unrelated")).toEqual({
     ok: false,
     sqlstate: "57P03",
   });
@@ -414,7 +422,9 @@ it("pending placement cannot join a node or region while its scope is closed", a
 });
 
 it("actual role create and password reset acquire their admission fence before touching credentials", async () => {
-  const f = await ready();
+  const f = await admissionSnapshotFixture();
+  expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(true);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   await env.DB.exec(
     `CREATE TRIGGER role_admission_insert BEFORE INSERT ON roles WHEN NEW.database_id='${f.id}' AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.database_id AND e.mutation_id IS NOT NULL AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'credential write lacks admission fence'); END`,
   );
@@ -425,14 +435,14 @@ it("actual role create and password reset acquire their admission fence before t
     expect(
       (
         await request(`/v1/databases/${f.id}/roles`, f.integrator, "POST", {
-          name: "reader",
+          name: "unrelated",
         })
       ).status,
     ).toBe(201);
     expect(
       (
         await request(
-          `/v1/databases/${f.id}/roles/reader/reset-password`,
+          `/v1/databases/${f.id}/roles/unrelated/reset-password`,
           f.integrator,
           "POST",
         )
@@ -440,7 +450,7 @@ it("actual role create and password reset acquire their admission fence before t
     ).toBe(200);
     expect(
       await env.DB.prepare(
-        "SELECT password_revision FROM roles WHERE database_id=? AND name='reader'",
+        "SELECT password_revision FROM roles WHERE database_id=? AND name='unrelated'",
       )
         .bind(f.id)
         .first<number>("password_revision"),
