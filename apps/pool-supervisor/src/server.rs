@@ -28,6 +28,7 @@ fn environment(name: &str) -> Result<String, Error> {
         .ok_or(Error("pool_identity_missing"))
 }
 pub async fn serve() -> Result<(), Error> {
+    private::protect_process_memory()?;
     use rcgen::PublicKeyData;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     let ip = environment("PGCF_POOL_POD_IP")?;

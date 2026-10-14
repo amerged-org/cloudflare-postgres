@@ -7,6 +7,17 @@ use std::{
     path::Path,
 };
 
+/// Keep the trusted holder's memory and environment inaccessible to same-UID workload children.
+/// This must run before creating its control key or accepting tenant/archive configuration.
+pub fn protect_process_memory() -> Result<(), Error> {
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0
+    {
+        return Err(Error("pool_process_custody_refused"));
+    }
+    Ok(())
+}
+
 pub fn directory(path: &Path) -> Result<(), Error> {
     fs::create_dir_all(path).map_err(|_| Error("pool_private_directory_unavailable"))?;
     let meta =

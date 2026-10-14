@@ -101,6 +101,9 @@ def main():
         run("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--user", "26:26", *mounts,
             "-v", args.binary_volume + ":/target:ro", "--entrypoint", "/target/debug/pgcf-pool-supervisor", PG,
             "install", "/pgcf/bin/pgcf-supervisor", "/pgcf/control/private", "/controller/run/private", "/controller/certificates/private")
+        run("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--user", "26:26", *mounts,
+            "-v", args.binary_volume + ":/target:ro", "--entrypoint", "/bin/cp", PG,
+            "/target/debug/examples/custody-probe", "/pgcf/bin/custody-probe")
         # Setup alone runs initdb. Product serve never does and remains tenant-free until both inputs.
         run("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--user", "26:26", *mounts,
             "--entrypoint", "initdb", PG, "-D", "/var/lib/postgresql/data/pgdata", "--no-sync", "--auth-local=trust", "--auth-host=reject")
@@ -212,6 +215,27 @@ def main():
         repeated = json.loads(execute(controller, signal_code))
         if repeated.get("error") is not None: raise RuntimeError(repeated["error"])
         assert repeated["postmaster_pid"] == ready["postmaster_pid"], "notification retry must read back the same postmaster"
+        custody_probes = []
+        for holder in (pool_name, archiver):
+            custody = json.loads(run("docker", "exec", holder, "/pgcf/bin/custody-probe").stdout)
+            # Access outcomes only; the child never reads environment/map/memory contents.
+            print(json.dumps({"custody_target": "supervisor" if holder == pool_name else "archiver", "custody_probe": custody}), flush=True)
+            custody_probes.append(custody)
+        for custody in custody_probes:
+            assert custody["target_uid_26"] and custody["self_environ"]["opened"]
+            assert custody["target_environ_owner_uid"] == 0, "trusted holder must disable same-UID process inspection"
+            assert all(not custody[field]["opened"] for field in ("target_environ", "target_maps", "target_mem"))
+            assert all(custody[field]["errno"] == 1 for field in ("process_vm_read", "process_vm_write", "ptrace_attach"))
+        inspector_code = "import hashlib,json,os,pathlib; status=pathlib.Path('/proc/1/status').read_text(); fields=dict(line.split(':',1) for line in status.splitlines() if ':' in line); own=dict(line.split(':',1) for line in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in line); namespaces=[os.readlink('/proc/1/ns/'+kind) for kind in ('pid','mnt')]; print(json.dumps({'target_uid_26':all(v=='26' for v in fields['Uid'].split()),'proc_owner_root':os.stat('/proc/1/environ').st_uid==0,'exe_sha256':hashlib.sha256(pathlib.Path('/proc/1/exe').read_bytes()).hexdigest(),'namespace_handles_read':len(namespaces)==2,'stat_read':bool(pathlib.Path('/proc/1/stat').read_text()),'cgroup_read':bool(pathlib.Path('/proc/1/cgroup').read_text()),'cap_sys_ptrace':bool(int(own['CapEff'].strip(),16)&(1<<19))}))"
+        inspector_executable_matches = []
+        for holder in (pool_name, archiver):
+            inspected = json.loads(run("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--pid", "container:"+holder, "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "SYS_PTRACE", "--security-opt", "no-new-privileges:true", "--read-only", "--entrypoint", "python3", BARMAN, "-c", inspector_code).stdout)
+            assert all(inspected[field] for field in ("target_uid_26","proc_owner_root","namespace_handles_read","stat_read","cgroup_read","cap_sys_ptrace"))
+            assert len(inspected["exe_sha256"]) == 64, "authorized root inspector must still read the actual executable"
+            # AMD64 user-mode emulation may expose its interpreter as /proc/PID/exe.
+            # This proves privileged inspection permission; native Talos executable custody
+            # remains a separate qualification gate with the unchanged exact hash check.
+            inspector_executable_matches.append(inspected["exe_sha256"] == attestation["supervisor_sha256"])
         peer_proved = False
         if args.controller_peer_volume:
             assert args.controller_peer_sha256 and len(args.controller_peer_sha256) == 64
@@ -325,7 +349,7 @@ def main():
         stopped = json.loads(execute(controller, http, "stop", "control.json", pool_ip))
         assert stopped["state"] == "stopped" and stopped["control_state"] == "shut down" and stopped["postmaster_pid"] is None
         assert json.loads(execute(controller, http, "stop", "control.json", pool_ip)) == stopped
-        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"pending_bundle_replay":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
+        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"same_uid_custody_sealed":True,"privileged_process_inspection_preserved":True,"inspector_executable_matches_attestation":all(inspector_executable_matches),"native_process_executable_identity_acceptance":False,"pending_bundle_replay":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
     finally:
         for container in reversed(containers): run("docker", "rm", "-f", container, check=False)
         for volume in reversed(volumes): run("docker", "volume", "rm", volume, check=False)

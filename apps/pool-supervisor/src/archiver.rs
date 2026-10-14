@@ -406,6 +406,7 @@ async fn backup(
     Ok(report)
 }
 pub async fn serve() -> Result<(), Error> {
+    private::protect_process_memory()?;
     use std::os::unix::fs::PermissionsExt;
     let path = Path::new(protocol::constant("archiver_socket")?);
     let probe = crate::isolation::child()?;
