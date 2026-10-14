@@ -2,13 +2,19 @@
 // Real D1/DO ownership metadata; no live CNPG hand-back is claimed.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
-import { claimedPostgresPoolFixture } from "./postgres-pool-fixture.ts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
+import {
+  claimedPostgresPoolFixture,
+  servingPostgresPoolFixture,
+  currentPoolStartInventory,
+} from "./postgres-pool-fixture.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
-import { cleanupFixtures } from "./fixtures.ts";
+import { cleanupFixtures, request } from "./fixtures.ts";
 import {
   recordPostgresPoolNodeReport,
   readDesiredPostgresPoolBinding,
 } from "../../src/domain/postgres-pool.ts";
+const extraClasses: string[] = [];
 
 afterEach(async () => {
   await cleanupFixtures();
@@ -21,6 +27,146 @@ afterEach(async () => {
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
       .bind(id)
       .run();
+  for (const id of extraClasses.splice(0))
+    await env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(id).run();
+});
+
+it("selects the exact newer resize owner after the old serving generation finishes draining", async () => {
+  const f = await servingPostgresPoolFixture({
+    thin: true,
+    qualifiedThin: true,
+  });
+  await currentPoolStartInventory(f);
+  const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
+  extraClasses.push(target);
+  await env.DB.prepare(
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,cpu_request_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    SELECT ?,memory_mib,cpu_millicores,cpu_request_millicores,storage_gib,max_connections+1,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at FROM size_classes WHERE id=?`,
+  )
+    .bind(target, f.size)
+    .run();
+  const changed = await request(
+    `/v1/databases/${f.id}`,
+    f.integrator,
+    "PATCH",
+    { size_class_id: target },
+    crypto.randomUUID(),
+  );
+  expect(changed.status).toBe(202);
+  const operation = DatabaseWithOperation.parse(await changed.json()).operation;
+  expect(operation.kind).toBe("database.resize");
+  expect(operation.generation).toBe(f.binding.scope.generation + 1);
+  expect(
+    await env.DB.prepare(
+      "SELECT state FROM database_runtime_holders WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first("state"),
+  ).toBe("detaching");
+  await recordPostgresPoolNodeReport(env, f.binding.scope.binding_id, {
+    ...f.mounted,
+    state: "released",
+    thin_guard: null,
+    clean_stop: true,
+    observed_at: Date.now(),
+    kernel_proof: {
+      ...f.mounted.kernel_proof,
+      mount_id: null,
+      dm_open_count: 0,
+      nonlazy_unmount_verified: true,
+    },
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT kind,state,binding_id FROM database_runtime_holders WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ kind: "cnpg", state: "active", binding_id: null });
+  expect((await readDesiredPostgresPoolBinding(env, f.id)) === undefined).toBe(
+    true,
+  );
+  expect(
+    await env.DB.prepare(
+      "SELECT state,node_report_json IS NOT NULL retained FROM pool_bindings WHERE id=?",
+    )
+      .bind(f.binding.scope.binding_id)
+      .first(),
+  ).toEqual({ state: "released", retained: 1 });
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,size_class_id FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ generation: operation.generation, size_class_id: target });
+});
+
+it("selects a newer owned resume after the original holder completes its older suspend drain", async () => {
+  const f = await servingPostgresPoolFixture({
+    thin: true,
+    qualifiedThin: true,
+  });
+  await currentPoolStartInventory(f);
+  expect(
+    (
+      await request(
+        `/v1/databases/${f.id}/suspend`,
+        f.integrator,
+        "POST",
+        undefined,
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(202);
+  await currentPoolStartInventory(f);
+  const resumed = await request(
+    `/v1/databases/${f.id}/resume`,
+    f.integrator,
+    "POST",
+    undefined,
+    crypto.randomUUID(),
+  );
+  expect(resumed.status).toBe(202);
+  const next = DatabaseWithOperation.parse(await resumed.json()).operation;
+  expect(next.generation).toBe(f.binding.scope.generation + 2);
+  expect(
+    await env.DB.prepare(
+      "SELECT state FROM database_runtime_holders WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first("state"),
+  ).toBe("detaching");
+  await recordPostgresPoolNodeReport(env, f.binding.scope.binding_id, {
+    ...f.mounted,
+    state: "released",
+    thin_guard: null,
+    clean_stop: true,
+    observed_at: Date.now(),
+    kernel_proof: {
+      ...f.mounted.kernel_proof,
+      mount_id: null,
+      dm_open_count: 0,
+      nonlazy_unmount_verified: true,
+    },
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT kind,state,binding_id FROM database_runtime_holders WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ kind: "cnpg", state: "active", binding_id: null });
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,power_operation FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ generation: next.generation, power_operation: next.id });
+  expect((await readDesiredPostgresPoolBinding(env, f.id)) === undefined).toBe(
+    true,
+  );
 });
 
 it("selects ordinary CNPG for the same owned wake after an exact never-attached refusal and retains cleanup history", async () => {

@@ -12,12 +12,18 @@ import {
   PoolCleanupClaims,
   signPoolCleanupAuthority,
 } from "@pgcf/contracts/pool-cleanup-authority";
-import { servingPostgresPoolFixture } from "./postgres-pool-fixture.ts";
+import {
+  servingPostgresPoolFixture,
+  currentPoolStartInventory,
+} from "./postgres-pool-fixture.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { nodeProofSigningKey } from "../../src/domain/node-proof-session.ts";
 import { readCurrentNodeThinStorage } from "../../src/domain/node-thin-storage.ts";
-import { recordPostgresPoolCleanupIoAttestation } from "../../src/domain/postgres-pool.ts";
+import {
+  recordPostgresPoolCleanupIoAttestation,
+  readDesiredPostgresPoolBinding,
+} from "../../src/domain/postgres-pool.ts";
 
 afterEach(async () => {
   await cleanupFixtures();
@@ -33,7 +39,11 @@ afterEach(async () => {
 });
 
 it("accepts same-boot reference destruction only for its retained exact fixed grant and leaves credentials unapplied", async () => {
-  const f = await servingPostgresPoolFixture({ thin: true });
+  const f = await servingPostgresPoolFixture({
+    thin: true,
+    qualifiedThin: true,
+  });
+  await currentPoolStartInventory(f);
   const scope = f.binding.scope;
   if (scope.storage.backend !== "lvm-thin-v1") throw new Error("Thin required");
   const response = await request(
@@ -260,4 +270,51 @@ it("accepts same-boot reference destruction only for its retained exact fixed gr
     suspension_reason: "idle",
     generation: scope.generation + 1,
   });
+  await currentPoolStartInventory(f);
+  const resumed = await request(
+    `/v1/databases/${f.id}/resume`,
+    f.integrator,
+    "POST",
+    undefined,
+    crypto.randomUUID(),
+  );
+  const resumedFailure =
+    resumed.status === 202
+      ? undefined
+      : ((await resumed.clone().json()) as {
+          error: { code: string; message: string };
+        });
+  expect(resumed.status, resumedFailure?.error.message).toBe(202);
+  const next = DatabaseWithOperation.parse(await resumed.json()).operation;
+  expect(next.kind).toBe("database.resume");
+  expect(next.generation).toBe(scope.generation + 2);
+  expect(
+    await env.DB.prepare(
+      "SELECT kind,state,binding_id,sleep_json FROM database_runtime_holders WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({
+    kind: "cnpg",
+    state: "active",
+    binding_id: null,
+    sleep_json: null,
+  });
+  expect((await readDesiredPostgresPoolBinding(env, f.id)) === undefined).toBe(
+    true,
+  );
+  expect(
+    await env.DB.prepare(
+      "SELECT state,node_report_json FROM pool_bindings WHERE id=?",
+    )
+      .bind(scope.binding_id)
+      .first(),
+  ).toEqual({ state: "released", node_report_json: JSON.stringify(report) });
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,power_operation FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ generation: next.generation, power_operation: next.id });
 });

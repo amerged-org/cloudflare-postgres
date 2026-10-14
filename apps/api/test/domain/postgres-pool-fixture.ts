@@ -534,6 +534,51 @@ export async function claimedPostgresPoolFixture(
   return { ...f, binding };
 }
 
+/** Controlled accepted slow-identity metadata for later-start tests; no physical read is claimed. */
+export async function currentPoolStartInventory(
+  f: Awaited<ReturnType<typeof postgresPoolFixture>>,
+) {
+  const { readCurrentNodeThinStorage } =
+    await import("../../src/domain/node-thin-storage.ts");
+  const current = (await readCurrentNodeThinStorage(env, f.node))!;
+  const row = await env.DB.prepare(
+    "SELECT generation,storage_volume_json FROM databases WHERE id=?",
+  )
+    .bind(f.id)
+    .first<{ generation: number; storage_volume_json: string }>();
+  if (!current.authority || !row?.storage_volume_json)
+    throw new Error("Controlled physical receipt required");
+  const now = Date.now(),
+    at = new Date(now).toISOString();
+  const authority = NodeThinStorageAuthority.parse({
+    ...current.authority,
+    observed_at: at,
+    captured_at: at,
+    expires_at: new Date(
+      now + current.profile.guard_seconds * 1000,
+    ).toISOString(),
+    ...(current.authority.inventory_observed_at
+      ? {
+          inventory_observed_at: at,
+          inventory_expires_at: new Date(now + 120000).toISOString(),
+        }
+      : {}),
+    volumes: current.authority.volumes.map((volume) =>
+      volume.database_id === f.id
+        ? { ...volume, generation: row.generation }
+        : volume,
+    ),
+  });
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE node_thin_storage SET authority_json=?,authority_received_at=? WHERE node_id=?",
+    ).bind(JSON.stringify(authority), at, f.node),
+    env.DB.prepare(
+      "UPDATE database_start_admissions SET storage_volume_json=? WHERE database_id=? AND generation=?",
+    ).bind(row.storage_volume_json, f.id, row.generation),
+  ]);
+}
+
 export async function qualificationPostgresPoolFixture(
   options: { prewake?: "waiting" | "accepted" } = { prewake: "accepted" },
 ) {

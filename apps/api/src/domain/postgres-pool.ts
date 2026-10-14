@@ -1193,7 +1193,6 @@ export async function recordPostgresPoolNodeReport(
       ...(terminal(target)
         ? postgresPoolCnpgSelectionStatements(env.DB, {
             databaseId: scope.database_id,
-            generation: scope.generation,
             now,
             guard: originalGuard,
           })
