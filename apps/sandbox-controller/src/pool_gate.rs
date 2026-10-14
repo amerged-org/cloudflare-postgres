@@ -92,6 +92,37 @@ pub struct GateRoot {
     directory: File,
 }
 impl GateRoot {
+    /// Host startup must establish custody before the first CSI volume operation.
+    pub fn provision(path: &Path) -> Result<Self, Status> {
+        let parent = path.parent().ok_or_else(refused)?;
+        if unsafe { libc::geteuid() } != 0
+            || !path.is_absolute()
+            || fs::canonicalize(parent).map_err(|_| refused())? != parent
+        {
+            return Err(refused());
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)
+            .map_err(|_| refused())?;
+        let meta = directory.metadata().map_err(|_| refused())?;
+        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Err(refused());
+        }
+        let name = std::ffi::CString::new(path.file_name().ok_or_else(refused)?.as_encoded_bytes())
+            .map_err(|_| refused())?;
+        // Existing custody is never repaired or emptied. mkdirat anchors the only mutation in
+        // the verified parent; the ordinary opener rejects symlinks and unexpected permissions.
+        if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+        {
+            return Err(refused());
+        }
+        let root = Self::open(path)?;
+        directory.sync_all().map_err(|_| refused())?;
+        Ok(root)
+    }
     /// The root is provisioned before use. Missing, mutable or symlinked roots refuse all work.
     pub fn open(path: &Path) -> Result<Self, Status> {
         if !path.is_absolute() || fs::canonicalize(path).map_err(|_| refused())? != path {
@@ -103,7 +134,7 @@ impl GateRoot {
             .open(path)
             .map_err(|_| refused())?;
         let meta = directory.metadata().map_err(|_| refused())?;
-        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o777 != 0o700 {
+        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o7777 != 0o700 {
             return Err(refused());
         }
         Ok(Self {

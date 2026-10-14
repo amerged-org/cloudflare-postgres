@@ -464,6 +464,7 @@ pub async fn run(
         .clone()
         .ok_or_else(refused)?;
     let trusted = trust(&config)?;
+    GateRoot::provision(Path::new(ROOT))?;
     protect_journals(&config, &client.local().node_uid)?;
     let mut holders: BTreeMap<String, Holder> = BTreeMap::new();
     let mut last_revision = 0u64;

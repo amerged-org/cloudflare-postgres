@@ -18,6 +18,40 @@ fn root() -> std::path::PathBuf {
 }
 
 #[test]
+fn host_start_provisions_missing_custody_before_first_csi_publish() {
+    use std::os::unix::fs::MetadataExt;
+    let parent = root();
+    let path = parent.join("gates");
+    assert!(!path.exists());
+    let gate = GateRoot::provision(&path).unwrap();
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.mode() & 0o7777, 0o700);
+    let handle = "pvc-real-first-host-start";
+    let mut lock = gate.lock(handle).unwrap();
+    lock.claim(&Record::new(handle, &"e".repeat(64), &format!("LVM-{}", "x".repeat(64))).unwrap())
+        .unwrap();
+    drop(lock);
+    drop(gate);
+    let restarted = GateRoot::provision(&path).unwrap();
+    assert!(!restarted.lock(handle).unwrap().publish_allowed().unwrap());
+    drop(restarted);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(GateRoot::provision(&path).is_err());
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o755);
+    let alias = parent.join("alias");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    assert!(GateRoot::provision(&alias).is_err());
+    let unsafe_parent = parent.join("mutable");
+    fs::create_dir(&unsafe_parent).unwrap();
+    fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(GateRoot::provision(&unsafe_parent.join("gates")).is_err());
+    assert!(!unsafe_parent.join("gates").exists());
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
 fn durable_denial_outlives_owner_and_queued_publish_checks_after_lock() {
     let path = root();
     let gate = GateRoot::open(&path).unwrap();
