@@ -1157,8 +1157,7 @@ export async function recordPostgresPoolQualificationProgress(
         m.requested_at < snapshotIntentRecorded.received_at - SKEW_MS ||
         m.deleted_at < m.requested_at ||
         m.absent_at < m.deleted_at ||
-        m.absent_at > report.observed_at + SKEW_MS ||
-        m.physical_snapshot_count !== 0
+        m.absent_at > report.observed_at + SKEW_MS
       )
         conflict();
       break;
@@ -1277,11 +1276,28 @@ async function measuredHolder(
       snapshotPart = parts.find(
         (e) => e.progress.phase === "snapshot_removed",
       )?.progress,
+      physicalAfter = parts.find(
+        (e) => e.progress.phase === "snapshot_removed",
+      )?.received_at,
+      host = journal(row).entries.find(
+        (e) => e.measurement.gate === "host_mount_context",
+      )?.measurement,
       snapshot = m.denied_operations.find(
         (o) => o.operation === "snapshot_create",
       );
     if (
       parts.length !== 6 ||
+      physicalAfter === undefined ||
+      !host ||
+      "failure_code" in host ||
+      host.gate !== "host_mount_context" ||
+      m.progress_sha256 !==
+        (await postgresPoolQualificationProgressHash(journal(row).progress)) ||
+      m.physical_observed_at < physicalAfter - SKEW_MS ||
+      m.physical_observed_at > report.observed_at + SKEW_MS ||
+      !fresh(m.physical_observed_at, Date.now()) ||
+      m.device_major !== host.storage_observation.kernel_proof.device_major ||
+      m.device_minor !== host.storage_observation.kernel_proof.device_minor ||
       !nodePart ||
       nodePart.phase !== "node_fence_ready" ||
       !driverPart ||

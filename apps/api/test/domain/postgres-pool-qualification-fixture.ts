@@ -183,6 +183,11 @@ export async function qualificationCompletionState(
       ],
       surviving_creation_descriptors: 0,
       final_dm_open_count: 0,
+      physical_snapshot_count: 0,
+      physical_observed_at: at - 800,
+      progress_sha256: "a".repeat(64),
+      device_major: 253,
+      device_minor: 2,
     },
     {
       gate: "single_writer",

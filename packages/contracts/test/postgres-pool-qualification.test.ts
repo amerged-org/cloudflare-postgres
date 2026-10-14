@@ -319,19 +319,39 @@ it("allows the finite creator experiment before any tenant binding exists", asyn
       surviving_creation_descriptors: 0,
       final_dm_open_count: 0,
     };
-  expect(PostgresPoolQualificationMeasurement.safeParse(m).success).toBe(true);
+  expect(PostgresPoolQualificationMeasurement.safeParse(m).success).toBe(false);
+  const measured = {
+    ...m,
+    physical_snapshot_count: 0,
+    physical_observed_at: 3,
+    progress_sha256: "a".repeat(64),
+    device_major: 253,
+    device_minor: 2,
+  };
+  expect(PostgresPoolQualificationMeasurement.safeParse(measured).success).toBe(
+    true,
+  );
   expect(
     postgresPoolQualificationGatePassed(
       s,
-      PostgresPoolQualificationMeasurement.parse(m),
+      PostgresPoolQualificationMeasurement.parse(measured),
     ),
   ).toBe(true);
   expect(
     postgresPoolQualificationGatePassed(
       s,
       PostgresPoolQualificationMeasurement.parse({
-        ...m,
+        ...measured,
         final_dm_open_count: 1,
+      }),
+    ),
+  ).toBe(false);
+  expect(
+    postgresPoolQualificationGatePassed(
+      s,
+      PostgresPoolQualificationMeasurement.parse({
+        ...measured,
+        physical_snapshot_count: 1,
       }),
     ),
   ).toBe(false);

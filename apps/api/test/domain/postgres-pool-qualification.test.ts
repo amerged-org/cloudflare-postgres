@@ -704,6 +704,11 @@ it("waits for authenticated driver replacement before consuming finite creator e
       ],
       surviving_creation_descriptors: 0,
       final_dm_open_count: 0,
+      physical_snapshot_count: 0,
+      physical_observed_at: measuredAt,
+      progress_sha256: "a".repeat(64),
+      device_major: 253,
+      device_minor: 2,
     },
     report = {
       run_id: run.id,
@@ -870,10 +875,26 @@ it("waits for authenticated driver replacement before consuming finite creator e
         source_volume_handle: measurement.volume_handle,
         state_at_denial: "Pending",
         error: "pool_creator_fence_denied",
-        requested_at: snapshotIntentReceived - 5_001,
+        requested_at: measuredAt,
         deleted_at: measuredAt,
         absent_at: measuredAt,
         physical_snapshot_count: 0,
+      })
+    ).status,
+  ).toBe(400);
+  expect((await progressJournal()).progress).toHaveLength(5);
+  expect(
+    (
+      await piece("controller", {
+        gate: "finite_creator_fence",
+        phase: "snapshot_removed",
+        snapshot_uid: snapshot.snapshot_uid,
+        source_volume_handle: measurement.volume_handle,
+        state_at_denial: "Pending",
+        error: "pool_creator_fence_denied",
+        requested_at: snapshotIntentReceived - 5_001,
+        deleted_at: measuredAt,
+        absent_at: measuredAt,
       })
     ).status,
   ).toBe(409);
@@ -890,11 +911,47 @@ it("waits for authenticated driver replacement before consuming finite creator e
         requested_at: measuredAt,
         deleted_at: measuredAt,
         absent_at: measuredAt,
-        physical_snapshot_count: 0,
       })
     ).status,
   ).toBe(200);
   // Final gate evidence must match the independently recorded producer pieces.
+  const snapshotRemovedReceived = (await progressJournal()).progress.find(
+    (e) => e.progress.phase === "snapshot_removed",
+  )!.received_at;
+  const finalInput = (
+    (await (await request(url, f.agent)).json()) as {
+      qualification: PostgresPoolQualificationInput;
+    }
+  ).qualification;
+  const finalClaims = await verifyPoolQualificationPermission(
+    finalInput.permission,
+    await importBootstrapVerificationKeys(
+      JSON.parse(env.BOOTSTRAP_VERIFIER_KEYS),
+    ),
+  );
+  expect(finalClaims).not.toBeNull();
+  measurement.progress_sha256 = finalClaims!.progress_sha256;
+  measurement.physical_observed_at = Date.now();
+  report.observed_at = measurement.physical_observed_at;
+  expect(
+    (
+      await request(url, f.agent, "POST", {
+        ...report,
+        measurement: { ...measurement, progress_sha256: "b".repeat(64) },
+      })
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await request(url, f.agent, "POST", {
+        ...report,
+        measurement: {
+          ...measurement,
+          physical_observed_at: snapshotRemovedReceived - 5_001,
+        },
+      })
+    ).status,
+  ).toBe(409);
   expect((await request(url, f.agent, "POST", report)).status).toBe(200);
   expect((await request(url, f.agent, "POST", report)).status).toBe(409);
   const recorded = (await (

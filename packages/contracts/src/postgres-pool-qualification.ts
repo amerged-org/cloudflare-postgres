@@ -201,6 +201,12 @@ const MeasuredQualification = z.discriminatedUnion("gate", [
       .max(4),
     surviving_creation_descriptors: Counter,
     final_dm_open_count: Counter,
+    /** Actual node read after the controller's recorded snapshot absence. */
+    physical_snapshot_count: Counter,
+    physical_observed_at: Counter,
+    progress_sha256: Hash,
+    device_major: Counter,
+    device_minor: Counter,
   }),
   z.strictObject({
     gate: z.literal("single_writer"),
@@ -400,7 +406,8 @@ export function postgresPoolQualificationGatePassed(
                 o.absent_at >= o.deleted_at),
         ) &&
         m.surviving_creation_descriptors === 0 &&
-        m.final_dm_open_count === 0
+        m.final_dm_open_count === 0 &&
+        m.physical_snapshot_count === 0
       );
     case "single_writer":
       return (
@@ -616,7 +623,6 @@ export const PostgresPoolQualificationProgress = z.discriminatedUnion("phase", [
     requested_at: Counter,
     deleted_at: Counter,
     absent_at: Counter,
-    physical_snapshot_count: Counter,
   }),
   z.strictObject({
     gate: z.literal("cleanup"),

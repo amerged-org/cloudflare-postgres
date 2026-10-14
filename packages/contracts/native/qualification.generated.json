@@ -1748,6 +1748,30 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 9007199254740991
+                    },
+                    "physical_snapshot_count": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "physical_observed_at": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "progress_sha256": {
+                      "type": "string",
+                      "pattern": "^[a-f0-9]{64}$"
+                    },
+                    "device_major": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "device_minor": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
                     }
                   },
                   "required": [
@@ -1773,7 +1797,12 @@
                     "before_claim_requests_completed",
                     "denied_operations",
                     "surviving_creation_descriptors",
-                    "final_dm_open_count"
+                    "final_dm_open_count",
+                    "physical_snapshot_count",
+                    "physical_observed_at",
+                    "progress_sha256",
+                    "device_major",
+                    "device_minor"
                   ],
                   "additionalProperties": false
                 },
@@ -3355,6 +3384,30 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
+                },
+                "physical_snapshot_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "physical_observed_at": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "progress_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "device_major": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "device_minor": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "required": [
@@ -3380,7 +3433,12 @@
                 "before_claim_requests_completed",
                 "denied_operations",
                 "surviving_creation_descriptors",
-                "final_dm_open_count"
+                "final_dm_open_count",
+                "physical_snapshot_count",
+                "physical_observed_at",
+                "progress_sha256",
+                "device_major",
+                "device_minor"
               ],
               "additionalProperties": false
             },
@@ -5056,6 +5114,30 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 9007199254740991
+                    },
+                    "physical_snapshot_count": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "physical_observed_at": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "progress_sha256": {
+                      "type": "string",
+                      "pattern": "^[a-f0-9]{64}$"
+                    },
+                    "device_major": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "device_minor": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
                     }
                   },
                   "required": [
@@ -5081,7 +5163,12 @@
                     "before_claim_requests_completed",
                     "denied_operations",
                     "surviving_creation_descriptors",
-                    "final_dm_open_count"
+                    "final_dm_open_count",
+                    "physical_snapshot_count",
+                    "physical_observed_at",
+                    "progress_sha256",
+                    "device_major",
+                    "device_minor"
                   ],
                   "additionalProperties": false
                 },
@@ -7314,6 +7401,30 @@
                             "type": "integer",
                             "minimum": 0,
                             "maximum": 9007199254740991
+                          },
+                          "physical_snapshot_count": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "physical_observed_at": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "progress_sha256": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "device_major": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "device_minor": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
                           }
                         },
                         "required": [
@@ -7339,7 +7450,12 @@
                           "before_claim_requests_completed",
                           "denied_operations",
                           "surviving_creation_descriptors",
-                          "final_dm_open_count"
+                          "final_dm_open_count",
+                          "physical_snapshot_count",
+                          "physical_observed_at",
+                          "progress_sha256",
+                          "device_major",
+                          "device_minor"
                         ],
                         "additionalProperties": false
                       },
@@ -8860,11 +8976,6 @@
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 9007199254740991
-                      },
-                      "physical_snapshot_count": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 9007199254740991
                       }
                     },
                     "required": [
@@ -8876,8 +8987,7 @@
                       "error",
                       "requested_at",
                       "deleted_at",
-                      "absent_at",
-                      "physical_snapshot_count"
+                      "absent_at"
                     ],
                     "additionalProperties": false
                   },
@@ -10265,6 +10375,30 @@
                             "type": "integer",
                             "minimum": 0,
                             "maximum": 9007199254740991
+                          },
+                          "physical_snapshot_count": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "physical_observed_at": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "progress_sha256": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "device_major": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "device_minor": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
                           }
                         },
                         "required": [
@@ -10290,7 +10424,12 @@
                           "before_claim_requests_completed",
                           "denied_operations",
                           "surviving_creation_descriptors",
-                          "final_dm_open_count"
+                          "final_dm_open_count",
+                          "physical_snapshot_count",
+                          "physical_observed_at",
+                          "progress_sha256",
+                          "device_major",
+                          "device_minor"
                         ],
                         "additionalProperties": false
                       },
@@ -12029,6 +12168,30 @@
                               "type": "integer",
                               "minimum": 0,
                               "maximum": 9007199254740991
+                            },
+                            "physical_snapshot_count": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "physical_observed_at": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "progress_sha256": {
+                              "type": "string",
+                              "pattern": "^[a-f0-9]{64}$"
+                            },
+                            "device_major": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "device_minor": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
                             }
                           },
                           "required": [
@@ -12054,7 +12217,12 @@
                             "before_claim_requests_completed",
                             "denied_operations",
                             "surviving_creation_descriptors",
-                            "final_dm_open_count"
+                            "final_dm_open_count",
+                            "physical_snapshot_count",
+                            "physical_observed_at",
+                            "progress_sha256",
+                            "device_major",
+                            "device_minor"
                           ],
                           "additionalProperties": false
                         },
@@ -13283,11 +13451,6 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 9007199254740991
-            },
-            "physical_snapshot_count": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -13299,8 +13462,7 @@
             "error",
             "requested_at",
             "deleted_at",
-            "absent_at",
-            "physical_snapshot_count"
+            "absent_at"
           ],
           "additionalProperties": false
         },
@@ -13718,11 +13880,6 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
-                },
-                "physical_snapshot_count": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 9007199254740991
                 }
               },
               "required": [
@@ -13734,8 +13891,7 @@
                 "error",
                 "requested_at",
                 "deleted_at",
-                "absent_at",
-                "physical_snapshot_count"
+                "absent_at"
               ],
               "additionalProperties": false
             },
@@ -14229,11 +14385,6 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
-                },
-                "physical_snapshot_count": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 9007199254740991
                 }
               },
               "required": [
@@ -14245,8 +14396,7 @@
                 "error",
                 "requested_at",
                 "deleted_at",
-                "absent_at",
-                "physical_snapshot_count"
+                "absent_at"
               ],
               "additionalProperties": false
             },
