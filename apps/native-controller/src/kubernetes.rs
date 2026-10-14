@@ -5,7 +5,13 @@ use reqwest::{Client, Method, StatusCode, Url};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -72,6 +78,117 @@ pub struct Kubernetes {
     client: Client,
     origin: Url,
     token: PathBuf,
+    continuity: Arc<Mutex<WatchContinuity>>,
+}
+pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
+    "Namespace",
+    "Node",
+    "PersistentVolume",
+    "Pod",
+    "Cluster",
+    "PersistentVolumeClaim",
+    "Secret",
+    "ConfigMap",
+];
+#[derive(Debug)]
+struct WatchContinuity {
+    controller_epoch: String,
+    epoch: u64,
+    kinds: HashMap<String, (String, Instant, bool)>,
+    objects: HashMap<(String, String, String), (String, String)>,
+}
+impl Default for WatchContinuity {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let material = format!(
+            "{}:{}:{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        Self {
+            controller_epoch: Sha256::digest(material.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            epoch: 1,
+            kinds: HashMap::new(),
+            objects: HashMap::new(),
+        }
+    }
+}
+impl WatchContinuity {
+    fn connected(&mut self, kind: &str, version: &str) {
+        self.kinds
+            .insert(kind.into(), (version.into(), Instant::now(), true));
+    }
+    fn observe(&mut self, kind: &str, object: &Value, deleted: bool) -> bool {
+        let metadata = &object["metadata"];
+        let name = text(metadata, "name");
+        let uid = text(metadata, "uid");
+        let rv = text(metadata, "resourceVersion");
+        if name.is_empty()
+            || name.len() > 253
+            || uid.is_empty()
+            || uid.len() > 128
+            || rv.is_empty()
+            || rv.len() > 128
+        {
+            return false;
+        }
+        let key = (kind.into(), text(metadata, "namespace").into(), name.into());
+        if deleted {
+            self.objects.remove(&key);
+        } else {
+            if self.objects.len() >= 4096 && !self.objects.contains_key(&key) {
+                return false;
+            }
+            self.objects.insert(key, (uid.into(), rv.into()));
+        }
+        true
+    }
+    fn resource_current(&self, kind: &str, resource: &Value) -> bool {
+        let meta = &resource["metadata"];
+        let key = (
+            kind.into(),
+            text(meta, "namespace").into(),
+            text(meta, "name").into(),
+        );
+        self.kinds
+            .get(kind)
+            .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
+            && self.objects.get(&key).is_some_and(|(uid, version)| {
+                Some(uid.as_str()) == meta["uid"].as_str()
+                    && Some(version.as_str()) == meta["resourceVersion"].as_str()
+            })
+    }
+    fn gap(&mut self, kind: &str) {
+        self.epoch += 1;
+        self.kinds.remove(kind);
+        self.objects.retain(|(resource, _, _), _| resource != kind);
+    }
+    fn snapshot(&self) -> Option<(String, u64)> {
+        RUNTIME_WATCH_KINDS
+            .iter()
+            .all(|kind| {
+                self.kinds
+                    .get(*kind)
+                    .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
+            })
+            .then(|| (self.controller_epoch.clone(), self.epoch))
+    }
+}
+struct WatchGuard {
+    state: Arc<Mutex<WatchContinuity>>,
+    kind: String,
+}
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().gap(&self.kind);
+    }
 }
 fn identifier(value: &str) -> bool {
     !value.is_empty()
@@ -189,6 +306,59 @@ pub async fn bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<
     Ok(bytes)
 }
 impl Kubernetes {
+    pub fn runtime_continuity(&self) -> Option<(String, u64)> {
+        self.continuity.lock().unwrap().snapshot()
+    }
+    pub fn runtime_resource_current(&self, resource: &Value) -> bool {
+        self.continuity
+            .lock()
+            .unwrap()
+            .resource_current(text(resource, "kind"), resource)
+    }
+    pub fn runtime_proof_current(&self, proof: &Value) -> bool {
+        let state = self.continuity.lock().unwrap();
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        if clock.is_none_or(|now| {
+            proof["observation"]["expires_at"]
+                .as_u64()
+                .is_none_or(|expiry| expiry <= now)
+        }) {
+            return false;
+        }
+        if state.snapshot().as_ref()
+            != Some(&(
+                text(&proof["observation"], "controller_epoch").into(),
+                proof["observation"]["watch_epoch"].as_u64().unwrap_or(0),
+            ))
+        {
+            return false;
+        }
+        [
+            ("namespace", "Namespace", "namespace_uid"),
+            ("cluster", "Cluster", "cnpg_cluster_uid"),
+            ("pod", "Pod", "pod_uid"),
+            ("ca_secret", "Secret", "ca_secret_uid"),
+            ("storage", "ConfigMap", "storage_uid"),
+            ("pvc", "PersistentVolumeClaim", "pvc_uid"),
+            ("pv", "PersistentVolume", "pv_uid"),
+            ("node", "Node", "node_uid"),
+        ]
+        .iter()
+        .all(|(key, kind, uid)| {
+            state
+                .objects
+                .iter()
+                .any(|((resource, _, _), (actual, rv))| {
+                    resource == kind
+                        && Some(actual.as_str()) == proof[*uid].as_str()
+                        && Some(rv.as_str())
+                            == proof["observation"]["resource_versions"][*key].as_str()
+                })
+        })
+    }
     pub async fn version(&self) -> Result<Value, Error> {
         self.request(Method::GET, "/version", None)
             .await?
@@ -304,25 +474,44 @@ impl Kubernetes {
         kind: &str,
         events: tokio::sync::mpsc::Sender<String>,
     ) -> Result<(), Error> {
-        if !["Pod", "Cluster", "PersistentVolumeClaim"].contains(&kind) {
+        if !RUNTIME_WATCH_KINDS.contains(&kind) {
             return Err("unsupported controller watch".into());
         }
+        let _guard = WatchGuard {
+            state: self.continuity.clone(),
+            kind: kind.into(),
+        };
         let path = collection(kind, None)?;
         let mut url = self.origin.join(&path)?;
-        url.query_pairs_mut()
-            .append_pair("limit", "1")
-            .append_pair("labelSelector", "pgcf.io/database-id");
-        let initial = self
-            .request(
-                Method::GET,
-                &format!("{}?{}", url.path(), url.query().unwrap_or("")),
-                None,
+        url.query_pairs_mut().append_pair("limit", "512");
+        let token = tokio::fs::read_to_string(&self.token).await?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token.trim())
+            .header(
+                "Accept",
+                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
             )
+            .send()
             .await?
-            .ok_or("watch baseline missing")?;
+            .error_for_status()?;
+        let initial: Value = serde_json::from_slice(&bounded(response, 2 * 1024 * 1024).await?)?;
         let mut version = text(&initial["metadata"], "resourceVersion").to_string();
-        if version.is_empty() {
-            return Err("watch baseline has no resource version".into());
+        let items = initial["items"]
+            .as_array()
+            .filter(|items| items.len() <= 512)
+            .ok_or("watch baseline incomplete")?;
+        if version.is_empty()
+            || version.len() > 128
+            || !text(&initial["metadata"], "continue").is_empty()
+        {
+            return Err("watch baseline incomplete or missing revision".into());
+        }
+        for item in items {
+            if !self.continuity.lock().unwrap().observe(kind, item, false) {
+                return Err("watch baseline metadata invalid".into());
+            }
         }
         loop {
             let mut url = self.origin.join(&path)?;
@@ -330,13 +519,16 @@ impl Kubernetes {
                 .append_pair("watch", "true")
                 .append_pair("allowWatchBookmarks", "true")
                 .append_pair("timeoutSeconds", "60")
-                .append_pair("resourceVersion", &version)
-                .append_pair("labelSelector", "pgcf.io/database-id");
+                .append_pair("resourceVersion", &version);
             let token = tokio::fs::read_to_string(&self.token).await?;
             let response = tokio::time::timeout(
                 Duration::from_secs(10),
                 self.client
                     .get(url)
+                    .header(
+                        "Accept",
+                        "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+                    )
                     .bearer_auth(token.trim())
                     .timeout(Duration::from_secs(65))
                     .send(),
@@ -347,6 +539,7 @@ impl Kubernetes {
                     status: response.status().as_u16(),
                 }));
             }
+            self.continuity.lock().unwrap().connected(kind, &version);
             let mut stream = response.bytes_stream();
             let mut pending = Vec::new();
             while let Some(bytes) = stream.next().await {
@@ -369,15 +562,32 @@ impl Kubernetes {
                         return Err("Kubernetes watch event invalid".into());
                     }
                     let rv = text(&event["object"]["metadata"], "resourceVersion");
-                    if rv.is_empty() {
+                    if rv.is_empty() || rv.len() > 128 {
                         return Err("Kubernetes watch revision missing".into());
                     }
                     version = rv.to_string();
+                    self.continuity.lock().unwrap().connected(kind, rv);
+                    if event_type != "BOOKMARK"
+                        && !self.continuity.lock().unwrap().observe(
+                            kind,
+                            &event["object"],
+                            event_type == "DELETED",
+                        )
+                    {
+                        return Err("watch object metadata invalid".into());
+                    }
                     if event_type != "BOOKMARK" {
-                        let id = text(
+                        let labelled = text(
                             &event["object"]["metadata"]["labels"],
                             "pgcf.io/database-id",
                         );
+                        let id = if labelled.is_empty() {
+                            text(&event["object"]["metadata"], "namespace")
+                                .strip_prefix("pgcf-db-")
+                                .unwrap_or("")
+                        } else {
+                            labelled
+                        };
                         if pgcf_native_protocol::valid_pattern("database", id) {
                             events
                                 .try_send(id.to_string())
@@ -388,6 +598,9 @@ impl Kubernetes {
             }
             if !pending.is_empty() {
                 return Err("Kubernetes watch frame was interrupted".into());
+            }
+            if let Some(kind) = self.continuity.lock().unwrap().kinds.get_mut(kind) {
+                kind.2 = false;
             }
         }
     }
@@ -429,6 +642,7 @@ impl Kubernetes {
             client,
             origin,
             token,
+            continuity: Arc::new(Mutex::new(WatchContinuity::default())),
         })
     }
     async fn request(
@@ -693,6 +907,41 @@ impl Kubernetes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn watch_gap_changes_coverage_but_ordinary_events_and_own_publication_do_not() {
+        let mut state = WatchContinuity::default();
+        assert!(state.snapshot().is_none());
+        for kind in RUNTIME_WATCH_KINDS {
+            state.connected(kind, "7");
+        }
+        let selected = serde_json::json!({"kind":"Secret","metadata":{"name":"database-ca","namespace":"pgcf-db-aaaaaaaaaaaaaaaaaaaa","uid":"01234567-89ab-4def-8123-0123456789ab","resourceVersion":"7"}});
+        state.observe("Secret", &selected, false);
+        let before = state.snapshot().unwrap();
+        let publication = serde_json::json!({"metadata":{"name":"gateway-fence-aaaaaaaaaaaaaaaaaaaa","namespace":"pgcf-system","uid":"01234567-89ab-4def-8123-0123456789ab","resourceVersion":"8"}});
+        state.observe("ConfigMap", &publication, false);
+        assert_eq!(before, state.snapshot().unwrap());
+        assert!(state.resource_current("Secret", &selected));
+        let mut replaced = selected.clone();
+        replaced["metadata"]["resourceVersion"] = "9".into();
+        state.observe("Secret", &replaced, false);
+        assert!(!state.resource_current("Secret", &selected));
+        assert_eq!(before, state.snapshot().unwrap());
+        state.gap("Secret");
+        assert!(state.snapshot().is_none());
+        state.connected("Secret", "10");
+        assert_ne!(before, state.snapshot().unwrap());
+        assert!(!state.resource_current("Secret", &replaced));
+    }
+    #[test]
+    fn expired_watch_is_never_complete_coverage() {
+        let mut state = WatchContinuity::default();
+        for kind in RUNTIME_WATCH_KINDS {
+            state.connected(kind, "7");
+        }
+        state.kinds.get_mut("Node").unwrap().1 =
+            std::time::Instant::now() - std::time::Duration::from_secs(71);
+        assert!(state.snapshot().is_none());
+    }
     #[test]
     fn kubelet_certificate_requires_exact_leaf_and_exact_node_san() {
         use rustls::client::danger::ServerCertVerifier;

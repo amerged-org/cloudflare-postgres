@@ -495,6 +495,9 @@ fn recovery_observation(db: &Value, message: &str) -> Value {
     json!({"id":db["id"],"generation":db["generation"],"state":"error","message":format!("{message}; recovery required"),"archive":{"continuous":false,"ready_wal_files":null}})
 }
 impl PowerCoordinator {
+    pub fn region(&self) -> &str {
+        &self.region
+    }
     pub fn new(
         k8s: Kubernetes,
         region: String,

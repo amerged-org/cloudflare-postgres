@@ -108,16 +108,33 @@ async fn open(config: &tokio_postgres::Config, ca: &[u8]) -> Result<Session, Err
     Ok(Session { client, task })
 }
 
-pub async fn roles(db: &Value, ca: &[u8]) -> Result<bool, Error> {
+fn probe_identity_current(
+    database: &str,
+    actual_database: &str,
+    address: &str,
+    actual_address: &str,
+    recovery: bool,
+) -> bool {
+    !recovery
+        && database == actual_database
+        && address
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_some_and(|expected| {
+                actual_address.parse::<std::net::IpAddr>().ok() == Some(expected)
+            })
+}
+pub async fn roles(db: &Value, ca: &[u8], primary_address: &str) -> Result<bool, Error> {
     if text(db, "desired_state") != "running" {
         return Ok(false);
     }
     tokio::time::timeout(Duration::from_secs(20),async{
   for role in db["roles"].as_array().ok_or("roles unavailable")?{
    let session=connect(db,ca,text(role,"name"),text(role,"password"),text(db,"id")).await?;
-   let rows=session.query("SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int",&[]).await?;
+   let rows=session.query("SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, inet_server_addr()::text, pg_is_in_recovery()",&[]).await?;
    if rows.len()!=1{return Ok::<bool,Error>(false);}let row=&rows[0];let tuning=parameters(db);let shared=text(&tuning,"shared_buffers").trim_end_matches("MB").parse::<u64>()?;let version:String=row.try_get(1)?;let server_num:i32=row.try_get(2)?;let max_connections:i32=row.try_get(3)?;let buffers:String=row.try_get(4)?;let cache:String=row.try_get(5)?;let archive:i32=row.try_get(6)?;
    if row.try_get::<_,String>(0)?!=text(role,"name")||server_num/10000!=18||db["postgres"]["version"].as_str().is_some_and(|pin|version.split_whitespace().next()!=Some(pin))||u64::try_from(max_connections).ok()!=Some(number(&db["size"],"max_connections"))||buffers.parse::<u64>()?!=shared*1024*1024||cache.parse::<u64>()?!=number(&db["size"],"memory_mib")/2*1024*1024||u64::try_from(archive).ok()!=Some(number(&db["size"],"archive_timeout_seconds")){return Ok(false);}
+   if !probe_identity_current(text(db,"id"),&row.try_get::<_,String>(7)?,primary_address,&row.try_get::<_,String>(8)?,row.try_get::<_,bool>(9)?){return Ok(false);}
    let privileges=session.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user",&[]).await?;
    if privileges.len()!=1||!(0..5).all(|i|privileges[0].try_get::<_,bool>(i).is_ok_and(|v|!v))||!privileges[0].try_get::<_,bool>(5)?{return Ok(false);}
   }
@@ -128,6 +145,21 @@ pub async fn roles(db: &Value, ca: &[u8]) -> Result<bool, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_sql_identity_is_bound_to_the_published_primary_address() {
+        assert!(probe_identity_current(
+            "database", "database", "10.0.0.7", "10.0.0.7", false
+        ));
+        assert!(!probe_identity_current(
+            "database", "other", "10.0.0.7", "10.0.0.7", false
+        ));
+        assert!(!probe_identity_current(
+            "database", "database", "10.0.0.7", "10.0.0.8", false
+        ));
+        assert!(!probe_identity_current(
+            "database", "database", "10.0.0.7", "10.0.0.7", true
+        ));
+    }
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
     use tokio::{

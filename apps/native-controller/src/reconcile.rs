@@ -16,7 +16,7 @@ use base64::{
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     net::IpAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -922,6 +922,34 @@ impl Reconciler {
         db: &Value,
         snapshot: &DesiredSnapshot,
     ) -> Result<Option<Value>, Error> {
+        let result=self.reconcile_current(db,snapshot).await?;
+        let Some(value)=&result else { return Ok(result); };
+        if db["admission"].is_null() || text(db,"desired_state")!="running"
+            || (text(value,"state")!="provisioning" && text(value,"state")!="ready")
+            || (value["runtime_attestation"]["v"]==2 && crate::contracts::schema_valid("DatabaseRuntimeAttestation",&value["runtime_attestation"])) {
+            return Ok(result);
+        }
+        // Same-generation provisioning is ignored by legacy observation consumers. Once a
+        // persisted target was admitted, emit the existing error invalidator instead of
+        // hiding a missing/currently unverifiable primary, CA or watch proof behind startup.
+        let name=format!("gateway-fence-{}",text(db,"id"));
+        let Some(map)=self.k8s.read("ConfigMap",Some(SYSTEM),&name).await? else { return Ok(result); };
+        owned(&map,db,&name,Some(SYSTEM))?;
+        let Some(raw)=map["data"]["admission_target"].as_str() else { return Ok(result); };
+        let target:Value=serde_json::from_str(raw)?;
+        if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget",&target) || number(&target,"generation")>number(db,"generation") {
+            return Err("admitted target history invalid".into());
+        }
+        if target["generation"]==db["generation"] {
+            return Ok(Some(observation(db,"error",Some("Current admitted runtime proof is unavailable"))));
+        }
+        Ok(result)
+    }
+    async fn reconcile_current(
+        &self,
+        db: &Value,
+        snapshot: &DesiredSnapshot,
+    ) -> Result<Option<Value>, Error> {
         if !database_valid(db) {
             return Err("invalid desired database".into());
         }
@@ -1271,7 +1299,8 @@ impl Reconciler {
         }) {
             return Ok(Some(observation(db, "provisioning", None)));
         }
-        if !postgres::roles(db, &ca).await? {
+        let proof_continuity = self.k8s.runtime_continuity();
+        if !postgres::roles(db, &ca, text(&pod["status"], "podIP")).await? {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         for actual in &applied {
@@ -1352,7 +1381,60 @@ impl Reconciler {
                 .strip_prefix("containerd://")
                 .unwrap_or("");
             let boot = text(&node_observed["status"]["nodeInfo"], "bootID");
-            let proof = json!({"v":1,"database_id":db["id"],"generation":db["generation"],"storage_generation":optional_number(db,"storage_generation",1),"node_uid":node_observed["metadata"]["uid"],"boot_id":boot,"cluster_uid":self.cluster_uid,"namespace_uid":final_ns["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":fence.as_ref().ok_or("runtime storage receipt absent")?["metadata"]["uid"],"pvc_uid":volume_identity["claimUid"],"pv_uid":volume_identity["volumeUid"],"pod_uid":pod["metadata"]["uid"],"container_id":cid,"postgres_image_sha256":expected_image.rsplit("@sha256:").next().ok_or("runtime image digest absent")?,"memory_request_bytes":quantity(&postgres_container["resources"]["requests"]["memory"]),"memory_limit_bytes":quantity(&postgres_container["resources"]["limits"]["memory"]),"observed_at":u64::try_from(now()).map_err(|_|"runtime clock invalid")?,"configuration_fingerprint":crate::contracts::configuration_fingerprint(db,&self.postgres_image)?});
+            let mut proof = json!({"v":1,"database_id":db["id"],"generation":db["generation"],"storage_generation":optional_number(db,"storage_generation",1),"node_uid":node_observed["metadata"]["uid"],"boot_id":boot,"cluster_uid":self.cluster_uid,"namespace_uid":final_ns["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":fence.as_ref().ok_or("runtime storage receipt absent")?["metadata"]["uid"],"pvc_uid":volume_identity["claimUid"],"pv_uid":volume_identity["volumeUid"],"pod_uid":pod["metadata"]["uid"],"container_id":cid,"postgres_image_sha256":expected_image.rsplit("@sha256:").next().ok_or("runtime image digest absent")?,"memory_request_bytes":quantity(&postgres_container["resources"]["requests"]["memory"]),"memory_limit_bytes":quantity(&postgres_container["resources"]["limits"]["memory"]),"observed_at":u64::try_from(now()).map_err(|_|"runtime clock invalid")?,"configuration_fingerprint":crate::contracts::configuration_fingerprint(db,&self.postgres_image)?});
+            if !db["admission"].is_null() {
+                if let Some(start) = proof_continuity {
+                    if let Some(mut continuity) = self
+                        .runtime_readback(
+                            db,
+                            &start,
+                            &final_ns,
+                            &cluster,
+                            &pod,
+                            &current_ca,
+                            &node_observed,
+                            &volume_identity,
+                        )
+                        .await?
+                    {
+                        proof["v"] = 2.into();
+                        proof["region_id"] = self.power.region().into();
+                        proof["route_revision"] = db["admission"]["route_revision"].clone();
+                        proof["admission_epoch"] = db["admission"]["admission_epoch"].clone();
+                        proof["applied_role_revisions"] = db["roles"]
+                            .as_array()
+                            .ok_or("runtime role set missing")?
+                            .iter()
+                            .map(|role| json!({"name":role["name"],"revision":role["revision"]}))
+                            .collect();
+                        proof["tls_server_name"] = format!("database-rw.{ns}.svc").into();
+                        proof["ca_secret_uid"] = current_ca["metadata"]["uid"].clone();
+                        proof["ca_secret_resource_version"] =
+                            current_ca["metadata"]["resourceVersion"].clone();
+                        proof["ca_sha256"] = Sha256::digest(&ca)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                            .into();
+                        proof["pod_ip"] = pod["status"]["podIP"].clone();
+                        proof["postgres_port"] = 5432.into();
+                        let verified = proof["observed_at"]
+                            .as_u64()
+                            .ok_or("runtime clock missing")?;
+                        continuity["verified_at"] = verified.into();
+                        continuity["expires_at"] = (verified
+                            + constant("DATABASE_RUNTIME_PROOF_MAX_AGE_MS")
+                                .as_u64()
+                                .ok_or("runtime proof lifetime missing")?)
+                        .into();
+                        proof["observation"] = continuity;
+                    } else {
+                        proof = Value::Null;
+                    }
+                } else {
+                    proof = Value::Null;
+                }
+            }
             if crate::contracts::schema_valid("DatabaseRuntimeAttestation", &proof) {
                 result["runtime_attestation"] = proof;
             }
@@ -1360,12 +1442,157 @@ impl Reconciler {
         if generation(&final_ns) != number(db, "generation") {
             self.k8s.patch(&final_ns,&json!({"metadata":{"annotations":{GENERATION:number(db,"generation").to_string(),ACCEPTED:number(db,"generation").to_string()}}})).await?;
         }
-        if let Some(intent) = intent {
+        let result = if let Some(intent) = intent {
             let intent = serde_json::to_value(intent)?;
-            self.power.finish_running(db, result, Some(&intent)).await
+            self.power.finish_running(db, result, Some(&intent)).await?
         } else {
-            self.power.publish_ready_fence(db, result).await
+            self.power.publish_ready_fence(db, result).await?
+        };
+        if let Some(result) = &result {
+            self.persist_admission_target(db, result).await?;
         }
+        Ok(result)
+    }
+    async fn runtime_readback(
+        &self,
+        db: &Value,
+        start: &(String, u64),
+        namespace: &Value,
+        cluster: &Value,
+        pod: &Value,
+        ca: &Value,
+        node: &Value,
+        volume: &Value,
+    ) -> Result<Option<Value>, Error> {
+        let ns = crate::contracts::namespace(db);
+        let claim = self
+            .k8s
+            .read(
+                "PersistentVolumeClaim",
+                Some(&ns),
+                text(&pod["metadata"], "name"),
+            )
+            .await?
+            .ok_or("runtime PVC missing")?;
+        let pv = self
+            .k8s
+            .read("PersistentVolume", None, text(&claim["spec"], "volumeName"))
+            .await?
+            .ok_or("runtime PV missing")?;
+        let storage = self
+            .k8s
+            .read(
+                "ConfigMap",
+                Some(SYSTEM),
+                &format!("storage-{}", text(db, "id")),
+            )
+            .await?
+            .ok_or("runtime storage receipt missing")?;
+        if claim["metadata"]["uid"] != volume["claimUid"]
+            || pv["metadata"]["uid"] != volume["volumeUid"]
+        {
+            return Ok(None);
+        }
+        let mut versions = json!({});
+        let resources = [
+            ("namespace", namespace),
+            ("cluster", cluster),
+            ("pod", pod),
+            ("ca_secret", ca),
+            ("node", node),
+            ("pvc", &claim),
+            ("pv", &pv),
+            ("storage", &storage),
+        ];
+        for (key, resource) in resources {
+            let Some(fresh) = self
+                .k8s
+                .read(
+                    text(resource, "kind"),
+                    resource["metadata"]["namespace"].as_str(),
+                    text(&resource["metadata"], "name"),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            if fresh["metadata"]["uid"] != resource["metadata"]["uid"]
+                || fresh["metadata"]["resourceVersion"] != resource["metadata"]["resourceVersion"]
+                || !fresh["metadata"]["deletionTimestamp"].is_null()
+                || !self.k8s.runtime_resource_current(&fresh)
+            {
+                return Ok(None);
+            }
+            versions[key] = fresh["metadata"]["resourceVersion"].clone();
+        }
+        if self.k8s.runtime_continuity().as_ref() != Some(start)
+            || resources
+                .iter()
+                .any(|(_, resource)| !self.k8s.runtime_resource_current(resource))
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            json!({"v":1,"controller_epoch":start.0,"watch_epoch":start.1,"coverage":"complete","resource_versions":versions}),
+        ))
+    }
+    async fn persist_admission_target(&self, db: &Value, observation: &Value) -> Result<(), Error> {
+        let proof = &observation["runtime_attestation"];
+        if proof["v"] != 2 {
+            return Ok(());
+        }
+        let map = self
+            .k8s
+            .read(
+                "ConfigMap",
+                Some(SYSTEM),
+                &format!("gateway-fence-{}", text(db, "id")),
+            )
+            .await?
+            .ok_or("admitted running fence missing")?;
+        owned(
+            &map,
+            db,
+            &format!("gateway-fence-{}", text(db, "id")),
+            Some(SYSTEM),
+        )?;
+        let intent: Value = serde_json::from_str(text(&map["data"], "intent.json"))?;
+        if intent["database"] != db["id"]
+            || intent["revision"] != db["generation"]
+            || intent["mode"] != "running"
+        {
+            return Err("admitted fence revision changed".into());
+        }
+        let target = json!({"v":1,"generation":proof["generation"],"route_revision":proof["route_revision"],"admission_epoch":proof["admission_epoch"],"pod_uid":proof["pod_uid"],"container_id":proof["container_id"],"ca_secret_uid":proof["ca_secret_uid"],"ca_secret_resource_version":proof["ca_secret_resource_version"],"ca_sha256":proof["ca_sha256"],"tls_server_name":proof["tls_server_name"]});
+        if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget", &target) {
+            return Err("admitted target contract invalid".into());
+        }
+        if !self.k8s.runtime_proof_current(proof) {
+            return Err("runtime proof changed before target publication".into());
+        }
+        if let Some(raw) = map["data"]["admission_target"].as_str() {
+            let prior: Value = serde_json::from_str(raw)?;
+            if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget", &prior)
+                || prior["route_revision"].as_u64() > target["route_revision"].as_u64()
+                || prior["admission_epoch"].as_u64() > target["admission_epoch"].as_u64()
+                || prior["generation"].as_u64() > target["generation"].as_u64()
+            {
+                return Err("admitted target history regressed".into());
+            }
+            if prior == target {
+                return Ok(());
+            }
+        }
+        self.k8s
+            .patch(
+                &map,
+                &json!({"data":{"admission_target":serde_json::to_string(&target)?}}),
+            )
+            .await?;
+        if !self.k8s.runtime_proof_current(proof) {
+            return Err("runtime proof changed during target publication".into());
+        }
+        Ok(())
     }
     pub fn new(
         k8s: Kubernetes,
@@ -1623,7 +1850,10 @@ impl Reconciler {
         }
         let ca = STANDARD.decode(encoded)?;
         postgres::validate_ca(&ca)?;
-        let manifest = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{}",text(db,"id")),"namespace":SYSTEM,"labels":{LABEL:db["id"]}},"data":{"ca.crt":String::from_utf8(ca.clone())?}});
+        let mut manifest = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{}",text(db,"id")),"namespace":SYSTEM,"labels":{LABEL:db["id"]}},"data":{"ca.crt":String::from_utf8(ca.clone())?}});
+        if !db["admission"].is_null() {
+            manifest["metadata"]["annotations"] = json!({"pgcf.io/source-ca-secret-uid":secret["metadata"]["uid"],"pgcf.io/source-ca-secret-resource-version":secret["metadata"]["resourceVersion"]});
+        }
         self.apply(db, &manifest).await?;
         Ok(Some((ca, secret)))
     }
@@ -2021,6 +2251,22 @@ mod runtime_tests {
             .unwrap()
             .unwrap()["state"]
             .clone()
+    }
+    #[tokio::test]
+    async fn an_existing_current_admitted_target_losing_proof_is_not_hidden_by_provisioning() {
+        let mut f=fixture("native",Some("pgcf-native"),Value::Null).await;
+        f.db["admission"]=json!({"v":1,"admission_epoch":1,"route_revision":1});
+        assert!(database_valid(&f.db));
+        // Initial startup has no admission to withdraw.
+        assert_eq!(observed(&f).await,"provisioning");
+        let target=json!({"v":1,"generation":f.db["generation"],"route_revision":1,"admission_epoch":1,"pod_uid":uid(8),"container_id":"a".repeat(64),"ca_secret_uid":uid(7),"ca_secret_resource_version":"1","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.{}.svc",f.ns)});
+        assert!(pgcf_native_protocol::valid_schema("gatewayAdmissionTarget",&target));
+        let name=format!("gateway-fence-{}",text(&f.db,"id"));
+        f.server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":uid(9),"labels":{LABEL:f.db["id"]}},"data":{"admission_target":serde_json::to_string(&target).unwrap()}}));
+        assert_eq!(observed(&f).await,"error");
+        // A target from the preceding database generation is an ordinary cold startup.
+        f.db["generation"]=2.into();
+        assert_eq!(observed(&f).await,"provisioning");
     }
     /// The CA publication follows the runtime decision, so it shows that reconciliation went on.
     fn published(f: &Fixture) -> bool {

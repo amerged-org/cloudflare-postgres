@@ -820,7 +820,7 @@ async fn run() -> Result<(), Error> {
     )?);
     let (hints, mut incoming) = mpsc::channel(512);
     tokio::task::spawn_local(link(api.clone(), hints.clone()));
-    for kind in ["Pod", "Cluster", "PersistentVolumeClaim"] {
+    for kind in pgcf_native_controller::kubernetes::RUNTIME_WATCH_KINDS {
         let kube = kube.clone();
         let hints = hints.clone();
         tokio::task::spawn_local(async move {
