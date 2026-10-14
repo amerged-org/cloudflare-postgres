@@ -30,7 +30,11 @@ import {
   ADMISSION_DEADLINE_MS,
 } from "../src/session-policy.ts";
 import type { Env, DatabaseAdmission } from "../src/env.ts";
-import { seedKnownDatabase, publishPowerObservation } from "./actor-entry.js";
+import {
+  seedKnownDatabase,
+  publishPowerObservation,
+  createUnrelatedRole,
+} from "./actor-entry.js";
 
 const testEnv = env as unknown as Env & { DB: D1Database; GATEWAY: Fetcher };
 const origin = `https://${["edge", "invalid"].join(".")}`;
@@ -752,12 +756,27 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   });
 
   it("keeps ready routing available across an unrelated role configuration revision", async () => {
-    await testEnv.DB.prepare(
-      "UPDATE databases SET generation = generation + 1 WHERE id = ?",
-    )
-      .bind(database)
-      .run();
+    const ctx = createExecutionContext();
+    expect((await createUnrelatedRole(testEnv, ctx, database)).status).toBe(
+      201,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(
+      await testEnv.DB.prepare(
+        "SELECT generation,observed_generation,observed_state,observed_power FROM databases WHERE id=?",
+      )
+        .bind(database)
+        .first(),
+    ).toEqual({
+      generation: 3,
+      observed_generation: 2,
+      observed_state: "ready",
+      observed_power: "awake",
+    });
     const connection = await open();
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
+      "accepted",
+    );
     const startup = encodeStartup({ user: "app", database });
     connection.socket.send(startup);
     await expect
@@ -1472,6 +1491,29 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     );
     expect(
       await verifyRouteToken((await stats())[0]!.token, {
+        region,
+        keys: keyring.keys,
+      }),
+    ).toMatchObject({
+      ok: true,
+      claims: { v: 3, db: database, user: "app", rg: region, rev: 2, pod },
+    });
+    const ctx = createExecutionContext();
+    expect((await createUnrelatedRole(testEnv, ctx, database)).status).toBe(
+      201,
+    );
+    await waitOnExecutionContext(ctx);
+    const unchanged = await open();
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
+      "accepted",
+    );
+    const startup = encodeStartup({ user: "app", database });
+    unchanged.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[1]?.bytes)
+      .toEqual([...startup]);
+    expect(
+      await verifyRouteToken((await stats())[1]!.token, {
         region,
         keys: keyring.keys,
       }),

@@ -5,6 +5,12 @@ export function seedKnownDatabase(
   id: string,
 ): Promise<void>;
 
+export function createUnrelatedRole(
+  env: object,
+  ctx: ExecutionContext,
+  database: string,
+): Promise<Response>;
+
 export function publishPowerObservation(
   env: object,
   ctx: ExecutionContext,

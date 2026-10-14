@@ -25,6 +25,43 @@ afterEach(async () => {
 const actorFor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
 
+it("a v4 snapshot refuses stale runtime generation after an unrelated role change", async () => {
+  const f = await admissionSnapshotFixture();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
+  expect(
+    (
+      await request(`/v1/databases/${f.id}/roles`, f.integrator, "POST", {
+        name: "unrelated",
+      })
+    ).status,
+  ).toBe(201);
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,observed_generation,observed_state,observed_power FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({
+    generation: f.proof.generation + 1,
+    observed_generation: f.proof.generation,
+    observed_state: "ready",
+    observed_power: "awake",
+  });
+  expect(
+    (await readDatabaseAdmissionSnapshot(env, f.id))?.snapshot.admissible,
+  ).toBe(false);
+  expect(await actorFor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  expect(
+    await actorFor(f.id).ensureAwake(f.id, "app", {
+      deadline: Date.now() + 50,
+    }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+});
+
 it("a bounded legacy reconciliation clears a previously capable snapshot rather than retaining its cached route", async () => {
   const f = await admissionSnapshotFixture();
   expect(await publishDatabaseAdmission(env, f.id)).toBe(true);

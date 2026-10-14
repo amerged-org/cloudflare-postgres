@@ -19,7 +19,10 @@ import {
   reclaimScopeFromRuntime,
 } from "@pgcf/contracts/reclaim";
 import { nodeProofSigningKey } from "./domain/node-proof-session.ts";
-import { routeTokenV3Sql } from "./domain/fleet-releases.ts";
+import {
+  routeTokenV3Sql,
+  admissionSnapshotSql,
+} from "./domain/fleet-releases.ts";
 import { warmReclaimCandidate } from "./domain/warm-reclaim.ts";
 interface ReclaimState {
   revision: number;
@@ -71,12 +74,14 @@ export const DatabasePresence = z
 export type DatabasePresence = z.infer<typeof DatabasePresence>;
 export type { DatabaseAdmission } from "@pgcf/contracts";
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
+  d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,
+  CASE WHEN ${admissionSnapshotSql("g")} THEN 1 ELSE 0 END admission_snapshot_capable,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) AND NOT ${hasNonterminalPoolHolderSql("d")} THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL WHERE d.id=? LIMIT 1`;
 interface AdmissionRow {
+  admission_snapshot_capable: number;
   generation: number;
   observed_generation: number;
   observed_power: string;
@@ -792,13 +797,26 @@ export class DatabaseActor extends DurableObject<Env> {
         row.desired_state !== "running" ||
         row.observed_state !== "ready" ||
         row.observed_power !== "awake" ||
-        row.observed_generation !== row.generation
+        !this.readyRevision(row)
       )
         return { ok: false, sqlstate: "57P03" };
       return admittedRoute(row, id.data);
     } catch {
       return { ok: false, sqlstate: "08006" };
     }
+  }
+  private readyRevision(row: AdmissionRow): boolean {
+    if (row.observed_generation === row.generation) return true;
+    // Legacy role configuration advances desired metadata without restarting
+    // the live server. Its D1 path still revalidates the role and all admission
+    // fences. V3 still verifies the observed Pod/revision in admittedRoute;
+    // snapshot-capable routing requires the exact current generation.
+    return (
+      row.observed_generation > 0 &&
+      row.observed_generation < row.generation &&
+      row.admission_snapshot_capable === 0 &&
+      !this.admissionState()?.snapshot?.cache_capable
+    );
   }
   private async known(
     id: string,
@@ -1103,7 +1121,7 @@ export class DatabaseActor extends DurableObject<Env> {
         current.desired_state === "running" &&
         current.observed_state === "ready" &&
         current.observed_power === "awake" &&
-        current.observed_generation === current.generation
+        this.readyRevision(current)
       )
         return (
           this.snapshotAdmission(role.data) ?? admittedRoute(current, id.data)
