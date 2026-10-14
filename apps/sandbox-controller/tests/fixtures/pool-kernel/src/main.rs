@@ -172,6 +172,7 @@ fn main() {
         terminal_report: None,
         terminal_history: vec![],
         terminal_acknowledged: false,
+            cleanup: None,
     };
     let journal =
         pool_journal::Journal::open(&gate_path.join(format!("{}.state", "a".repeat(64)))).unwrap();

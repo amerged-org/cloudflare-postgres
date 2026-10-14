@@ -60,6 +60,23 @@ pub struct State {
     pub terminal_history: Vec<serde_json::Value>,
     #[serde(default)]
     pub terminal_acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<Cleanup>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Cleanup {
+    pub holder: serde_json::Value,
+    pub supervisor_report: serde_json::Value,
+    pub worker: serde_json::Value,
+    pub worker_caller_pid: u32,
+    pub io: Option<serde_json::Value>,
+    pub authority: Option<String>,
+    pub dispatched: bool,
+    pub nonlazy_completed: bool,
+    pub worker_reaped: bool,
+    pub write_bytes_before: Option<u64>,
+    pub write_bytes_after: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -178,6 +195,7 @@ impl Journal {
 impl State {
     pub fn valid(&self) -> Result<(), Status> {
         self.record.bytes()?;
+        self.cleanup_valid()?;
         if self.v != 1
             || !uuid(&self.binding_id)
             || !uuid(&self.node_uid)
@@ -261,7 +279,77 @@ impl State {
         }
         Ok(())
     }
+    fn cleanup_valid(&self) -> Result<(), Status> {
+        let Some(c) = &self.cleanup else {
+            return Ok(());
+        };
+        let scope = self.scope.as_ref().ok_or_else(refused)?;
+        if !matches!(
+            self.phase,
+            Phase::Mounted | Phase::DetachDispatched | Phase::Detached
+        ) || c.worker_caller_pid == 0
+            || c.worker["container_id"] != scope["container_id"]
+            || c.worker["pool_pod_uid"] != self.pool_pod_uid
+            || c.worker["executable_sha256"] != scope["host_controller_sha256"]
+            || c.worker["pid"].as_u64().is_none_or(|p| p == 0)
+            || c.worker["start_ticks"].as_u64().is_none_or(|p| p == 0)
+            || c.worker["pid_namespace"].as_u64().is_none_or(|p| p == 0)
+            || c.holder["binding_id"] != self.binding_id
+            || c.holder["scope_sha256"] != self.record.scope_sha256
+            || c.holder["holder_boot_id"] != self.boot_id
+            || !self.groups.iter().any(|g| {
+                c.worker["container_id"] == g.container_id
+                    && c.worker["cgroup_inode"] == g.cgroup_inode
+            })
+            || c.io.as_ref().is_some_and(|io| {
+                io["binding_id"] != self.binding_id
+                    || io["scope_sha256"] != self.record.scope_sha256
+                    || io["worker"] != c.worker
+            })
+            || c.authority
+                .as_ref()
+                .is_some_and(|s| !s.starts_with("pc1.") || s.len() > 8192 || c.io.is_none())
+            || (c.dispatched && (c.authority.is_none() || self.phase == Phase::Mounted))
+            || (c.nonlazy_completed && !c.dispatched)
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
     fn successor(&self, next: &Self) -> Result<(), Status> {
+        if self.cleanup.is_none()
+            && let Some(c) = &next.cleanup
+            && (self.phase != Phase::Mounted
+                || next.phase != Phase::Mounted
+                || c.io.is_some()
+                || c.authority.is_some()
+                || c.dispatched
+                || c.nonlazy_completed
+                || c.worker_reaped
+                || c.write_bytes_before.is_some()
+                || c.write_bytes_after.is_some())
+        {
+            return Err(refused());
+        }
+        if let Some(old) = &self.cleanup {
+            let new = next.cleanup.as_ref().ok_or_else(refused)?;
+            if old.holder != new.holder
+                || old.supervisor_report != new.supervisor_report
+                || old.worker != new.worker
+                || old.worker_caller_pid != new.worker_caller_pid
+                || (old.io.is_some() && old.io != new.io)
+                || (old.authority.is_some() && old.authority != new.authority)
+                || (old.dispatched && !new.dispatched)
+                || (old.nonlazy_completed && !new.nonlazy_completed)
+                || (old.worker_reaped && !new.worker_reaped)
+                || (old.write_bytes_before.is_some()
+                    && old.write_bytes_before != new.write_bytes_before)
+                || (old.write_bytes_after.is_some()
+                    && old.write_bytes_after != new.write_bytes_after)
+            {
+                return Err(refused());
+            }
+        }
         if self.record != next.record
             || self.binding_id != next.binding_id
             || self.node_uid != next.node_uid

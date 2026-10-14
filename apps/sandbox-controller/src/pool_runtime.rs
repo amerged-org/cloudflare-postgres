@@ -105,6 +105,25 @@ pub(crate) struct Payload {
     pub(crate) path: PathBuf,
 }
 impl Payload {
+    pub(crate) fn grant<T: serde::Serialize>(&self, value: &T) -> Result<(), Status> {
+        let bytes = serde_json::to_vec(value).map_err(|_| refused())?;
+        if bytes.len() > 131072 {
+            return Err(refused());
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.directory.join("grant.json"))
+            .map_err(|_| refused())?;
+        file.write_all(&bytes).map_err(|_| refused())?;
+        file.sync_all().map_err(|_| refused())?;
+        File::open(&self.directory)
+            .map_err(|_| refused())?
+            .sync_all()
+            .map_err(|_| refused())
+    }
     pub(crate) fn create<T: serde::Serialize>(request: &T) -> Result<Self, Status> {
         GateRoot::open(Path::new(ROOT))?;
         let mut entropy = [0u8; 16];
@@ -147,6 +166,7 @@ impl Payload {
 }
 impl Drop for Payload {
     fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.directory.join("grant.json"));
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_dir(&self.directory);
     }
@@ -179,7 +199,8 @@ struct Holder {
     scope: Value,
     record: Record,
     state: State,
-    active: Active,
+    active: std::sync::Arc<Active>,
+    cleanup: Option<crate::pool_cleanup::Session>,
     report: Value,
 }
 struct PendingResume {
@@ -355,7 +376,6 @@ async fn begin(
     )?;
     let gate = GateRoot::open(Path::new(ROOT))?;
     let mut locked = gate.lock_until(&record.volume_handle, permission.deadline())?;
-    locked.claim(&record)?;
     let journal = Journal::open(&journal_path(&record))?;
     if journal.read()?.is_some() {
         return Err(refused());
@@ -366,6 +386,30 @@ async fn begin(
         text(&scope, "driver_sha256")?,
     )
     .await?;
+    if locked.claim(&record).is_err() {
+        let q = client.pool_qualification().await?;
+        let input = &q["qualification"];
+        let claims = crate::pool_qualification::claims(input, client)?;
+        let zero = crate::pool_device::zero_thin(
+            text(storage, "volume_group_uuid")?,
+            text(storage, "lv_uuid")?,
+            text(storage, "volume_handle")?,
+            text(&storage["profile"], "pool_uuid")?,
+            metadata.thin_id,
+        )
+        .map_err(|_| refused())?;
+        let physical = &input["accepted_evidence"][1]["measurement"];
+        if driver.pod_uid != claims["execution"]["driver_pod_uid"]
+            || !zero.still_zero().map_err(|_| refused())?
+            || zero.device != metadata.device
+            || physical["device_major"] != libc::major(metadata.device)
+            || physical["device_minor"] != libc::minor(metadata.device)
+        {
+            return Err(refused());
+        }
+        driver.recheck()?;
+        locked.claim_qualified(&record, current, input, preparation, &anchors, now())?;
+    }
     let mut pending = PendingResume {
         authority: authority.clone(),
         armed: false,
@@ -389,7 +433,7 @@ async fn begin(
         &client.local().node_uid,
         processes(&scope, containers)?,
     )?;
-    let active = Active::start(armed);
+    let active = std::sync::Arc::new(Active::start(armed));
     pending.armed = true;
     let mut state = State {
         v: 1,
@@ -415,6 +459,7 @@ async fn begin(
         terminal_report: None,
         terminal_history: vec![],
         terminal_acknowledged: false,
+        cleanup: None,
         groups: inventory
             .processes
             .iter()
@@ -450,6 +495,7 @@ async fn begin(
         record,
         state,
         active,
+        cleanup: None,
         report,
     })
 }
@@ -526,8 +572,27 @@ pub async fn run(
         if updates.has_changed().unwrap_or(false) {
             client = updates.borrow_and_update().clone()
         }
+        let mut completed = Vec::new();
+        for (id, holder) in &mut holders {
+            if let Some(cleanup) = holder.cleanup.as_mut() {
+                match cleanup.poll(&settings, &client, &holder.state).await {
+                    Ok(true) => completed.push(id.clone()),
+                    Ok(false) => {}
+                    Err(_) => eprintln!("pool_cleanup_pending"),
+                }
+            }
+        }
+        for id in completed {
+            holders.remove(&id);
+        }
         let result: Result<(), Status> = async {
-            crate::pool_recovery::reconcile(&settings, &client, &restarted).await?;
+            crate::pool_recovery::reconcile(
+                &settings,
+                &client,
+                &restarted,
+                &holders.keys().cloned().collect(),
+            )
+            .await?;
             let snapshot = client.pool_bindings(None).await;
             if let Ok(snapshot) = snapshot {
                 let revision = snapshot["revision"].as_u64().ok_or_else(refused)?;
@@ -542,6 +607,9 @@ pub async fn run(
                     let id = text(scope, "binding_id")?.to_owned();
                     seen.insert(id.clone());
                     if let Some(holder) = holders.get_mut(&id) {
+                        if holder.cleanup.is_some() {
+                            continue;
+                        }
                         let action = existing_holder_action(&holder.scope, entry);
                         if action == ExistingHolderAction::Protect {
                             let _ = holder.active.revoke();
@@ -575,6 +643,34 @@ pub async fn run(
                         {
                             if action != ExistingHolderAction::Drain || schema != "PoolNodeReport" {
                                 client.report_pool(schema, &observation).await?;
+                            }
+                        }
+                        if action == ExistingHolderAction::Drain {
+                            let details = client.pool_binding_details(&id).await?;
+                            if details["supervisor_report"]["state"] == "stopped" {
+                                let lease = client.storage_lease().await?;
+                                if lease.node_uid != client.local().node_uid
+                                    || lease.boot_id.as_deref()
+                                        != Some(crate::storage::current_boot_id()?.as_str())
+                                    || lease.expires_at <= now()
+                                {
+                                    return Err(refused());
+                                }
+                                if let Some(custody) =
+                                    lease.databases.iter().filter_map(|d| d.pool.as_ref()).find(
+                                        |p| p["binding_id"] == id && !p["cleanup_intent"].is_null(),
+                                    )
+                                {
+                                    crate::pool_child::reap().await?;
+                                    holder.cleanup = Some(crate::pool_cleanup::Session::start(
+                                        &settings,
+                                        scope,
+                                        custody,
+                                        &details["supervisor_report"],
+                                        &containers,
+                                        holder.active.clone(),
+                                    )?);
+                                }
                             }
                         }
                     }
@@ -830,6 +926,7 @@ mod recovery_tests {
             terminal_report: None,
             terminal_history: vec![],
             terminal_acknowledged: false,
+            cleanup: None,
         }
     }
     #[test]

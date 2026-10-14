@@ -2,7 +2,7 @@
 //! Separate CF sa1 clock for the actual ordinary pool Pod. PB1 never permits physical writes.
 use crate::{
     pool_device::{Backend, Device},
-    pool_io::{Process, SharedBudget},
+    pool_io::{Process, SharedBudget, StoppedNamespace},
 };
 use pgcf_native_protocol::{
     pool,
@@ -42,6 +42,12 @@ fn replace_grant(old: &StorageWriteClaims, next: &StorageWriteClaims) -> Result<
     // A later IO observation cannot extend this local clock at the same revision.
     Ok(next.exp <= old.exp)
 }
+struct Cleanup {
+    worker: Process,
+    _stopped: Vec<StoppedNamespace>,
+    permission: Option<crate::pool_cleanup_permission::Permission>,
+    revoked: bool,
+}
 pub struct Armed {
     scope: Value,
     token: String,
@@ -53,6 +59,8 @@ pub struct Armed {
     expiry_latched: bool,
     physical_quiesced: bool,
     shared: SharedBudget,
+    cleanup: Option<Cleanup>,
+    retired: bool,
 }
 impl Armed {
     pub fn arm(
@@ -134,6 +142,8 @@ impl Armed {
             expiry_latched: false,
             physical_quiesced: false,
             shared,
+            cleanup: None,
+            retired: false,
         })
     }
     pub fn refresh(&mut self, trust: &StorageTrust, token: &str) -> Result<(), Status> {
@@ -186,7 +196,8 @@ impl Armed {
         Ok(())
     }
     pub fn permits(&self) -> bool {
-        !self.expiry_latched
+        self.cleanup.is_none()
+            && !self.expiry_latched
             && now() < self.authority.claims().exp
             && self.received.elapsed() < self.remaining
     }
@@ -201,6 +212,27 @@ impl Armed {
     }
     /// Expiry blocks the entire verified thin device before stopping the exact writer groups.
     pub fn protect(&mut self) -> Result<(), Status> {
+        if self.retired {
+            return Ok(());
+        }
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            if !cleanup.revoked && cleanup.permission.as_ref().is_some_and(|p| p.current()) {
+                return Ok(());
+            }
+            if let Some(permission) = &cleanup.permission {
+                crate::storage_dm::suspend_cleanup(permission)?;
+            } else {
+                crate::storage_dm::suspend(&self.authority)?;
+            }
+            self.physical_quiesced = true;
+            if cleanup.revoked || cleanup.permission.is_some() {
+                cleanup.revoked = true;
+                if !cleanup.worker.exited()? {
+                    cleanup.worker.stop_group()?;
+                }
+            }
+            return Ok(());
+        }
         if self.permits() {
             return Ok(());
         }
@@ -219,8 +251,89 @@ impl Armed {
         self.physical_quiesced
     }
     pub fn revoke(&mut self) -> Result<(), Status> {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.revoked = true;
+        }
         self.expiry_latched = true;
         self.protect()
+    }
+    fn handoff(&mut self, stopped: Vec<StoppedNamespace>, worker: Process) -> Result<(), Status> {
+        if self.cleanup.is_some()
+            || stopped.len() != self.processes.len()
+            || self
+                .processes
+                .iter()
+                .any(|p| stopped.iter().filter(|s| s.matches(p)).count() != 1)
+            || worker.container_id != text(&self.scope, "container_id")?
+            || !self.processes.iter().any(|p| {
+                p.container_id == worker.container_id && p.cgroup_inode == worker.cgroup_inode
+            })
+        {
+            return Err(refused());
+        }
+        worker.recheck()?;
+        if crate::policy::digest(std::path::Path::new(&format!("/proc/{}/exe", worker.pid)))?
+            != text(&self.scope, "host_controller_sha256")?
+        {
+            return Err(refused());
+        }
+        let profile = &self.scope["storage"]["profile"];
+        let bps = number(profile, "write_bytes_per_second")?;
+        let iops = number(profile, "write_iops_per_second")?;
+        if !worker.io_matches(self.device, bps, iops)?
+            || !self.shared.io_matches(self.device, bps, iops)?
+        {
+            return Err(refused());
+        }
+        crate::pool_io::CapturedGroup::restore(&worker.group_record())?.only_process(worker.pid)?;
+        crate::storage_dm::suspend(&self.authority)?;
+        self.physical_quiesced = true;
+        self.expiry_latched = true;
+        self.cleanup = Some(Cleanup {
+            worker,
+            _stopped: stopped,
+            permission: None,
+            revoked: false,
+        });
+        Ok(())
+    }
+    fn grant_cleanup(
+        &mut self,
+        permission: crate::pool_cleanup_permission::Permission,
+    ) -> Result<(), Status> {
+        let cleanup = self.cleanup.as_mut().ok_or_else(refused)?;
+        if cleanup.revoked
+            || cleanup.permission.is_some()
+            || !permission.current()
+            || pool::scope_hash(&self.scope).as_deref()
+                != permission.claims()["scope_sha256"].as_str()
+        {
+            return Err(refused());
+        }
+        cleanup.worker.recheck()?;
+        if crate::policy::digest(std::path::Path::new(&format!(
+            "/proc/{}/exe",
+            cleanup.worker.pid
+        )))? != text(&self.scope, "host_controller_sha256")?
+        {
+            return Err(refused());
+        }
+        let hosts = crate::pool_io::host_pids(std::slice::from_ref(&cleanup.worker))?;
+        if !permission.worker_matches(
+            &cleanup.worker,
+            *hosts.get(&cleanup.worker.pid).ok_or_else(refused)?,
+        ) {
+            return Err(refused());
+        }
+        crate::pool_io::CapturedGroup::restore(&cleanup.worker.group_record())?
+            .only_process(cleanup.worker.pid)?;
+        permission.device()?;
+        if !permission.current() {
+            return Err(refused());
+        }
+        cleanup.permission = Some(permission);
+        self.physical_quiesced = false;
+        Ok(())
     }
     pub fn cgroups(&self) -> &[Process] {
         &self.processes
@@ -264,6 +377,31 @@ pub struct Current {
     pub expires_at: u64,
 }
 impl Active {
+    /// Retire this clock under the retained CSI lock after durable exact CF acknowledgment.
+    /// Otherwise Drop could suspend a later holder after the creator deny was removed.
+    pub(crate) fn retire_cleanup(
+        &self,
+        state: &crate::pool_journal::State,
+        zero: &crate::pool_device::ZeroDevice,
+    ) -> Result<(), Status> {
+        let mut guard = self.inner.lock().map_err(|_| refused())?;
+        if !state.terminal_acknowledged
+            || state.phase != crate::pool_journal::Phase::Detached
+            || state
+                .cleanup
+                .as_ref()
+                .is_none_or(|c| !c.dispatched || !c.worker_reaped)
+            || pool::scope_hash(&guard.scope).as_deref() != Some(state.record.scope_sha256.as_str())
+            || zero.uuid != state.record.device_uuid
+            || zero.handle != state.record.volume_handle
+            || !zero.still_zero().map_err(|_| refused())?
+        {
+            return Err(refused());
+        }
+        guard.retired = true;
+        self.clock.abort();
+        Ok(())
+    }
     pub fn start(armed: Armed) -> Self {
         let inner = std::sync::Arc::new(std::sync::Mutex::new(armed));
         let clock_guard = inner.clone();
@@ -297,6 +435,35 @@ impl Active {
     pub fn revoke(&self) -> Result<(), Status> {
         self.inner.lock().map_err(|_| refused())?.revoke()
     }
+    /// Only after each original private namespace is positively empty and the exact worker is sole.
+    pub fn handoff_cleanup(
+        &self,
+        stopped: Vec<StoppedNamespace>,
+        worker: Process,
+    ) -> Result<(), Status> {
+        if self.clock.is_finished() {
+            self.revoke()?;
+            return Err(refused());
+        }
+        self.inner
+            .lock()
+            .map_err(|_| refused())?
+            .handoff(stopped, worker)
+    }
+    pub fn grant_cleanup(
+        &self,
+        permission: crate::pool_cleanup_permission::Permission,
+    ) -> Result<(), Status> {
+        if self.clock.is_finished() {
+            self.revoke()?;
+            return Err(refused());
+        }
+        self.inner
+            .lock()
+            .map_err(|_| refused())?
+            .grant_cleanup(permission)
+    }
+
     pub fn proof(&self) -> Result<Value, Status> {
         if !self.current() {
             return Err(refused());

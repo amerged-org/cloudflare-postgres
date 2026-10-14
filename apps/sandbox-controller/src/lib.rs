@@ -67,6 +67,12 @@ pub mod pool_attestation;
 #[cfg(target_os = "linux")]
 mod pool_child;
 #[cfg(target_os = "linux")]
+pub mod pool_cleanup;
+#[cfg(target_os = "linux")]
+pub mod pool_cleanup_permission;
+#[cfg(target_os = "linux")]
+pub mod pool_cleanup_worker;
+#[cfg(target_os = "linux")]
 pub mod pool_csi;
 #[cfg(target_os = "linux")]
 pub mod pool_custody;

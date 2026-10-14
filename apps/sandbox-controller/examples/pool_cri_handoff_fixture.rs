@@ -332,6 +332,15 @@ SystemdCgroup = false
     let pid = u32::try_from(info["pid"].as_u64().ok_or("actual CRI PID absent")?)?;
     let original = Process::capture(pid, &pod, &container)?;
     assert_eq!(process_identity(pid)?["namespace_pid"], 1);
+    let original_namespace = original
+        .private_namespace()
+        .map_err(|_| "original_private_pid_capture")?;
+    assert!(original_namespace.matches(&original));
+    assert!(
+        !original_namespace
+            .stopped()
+            .map_err(|_| "original_live_namespace_observation")?
+    );
     let captured = CapturedGroup::restore(&original.group_record())?;
     let files = std::env::temp_dir().join(format!("pgcf-handoff-{pod}"));
     fs::DirBuilder::new().mode(0o700).create(&files)?;
@@ -360,10 +369,10 @@ SystemdCgroup = false
         worker_identity["pid_namespace"],
         original.pid_namespace.inode
     );
-    assert_eq!(
-        Process::capture(worker_pid, &pod, &container)?.cgroup_inode,
-        original.cgroup_inode
-    );
+    let captured_worker = Process::capture(worker_pid, &pod, &container)?;
+    assert_eq!(captured_worker.cgroup_inode, original.cgroup_inode);
+    assert!(captured_worker.private_namespace().is_err());
+    assert!(!original_namespace.matches(&captured_worker));
     assert_eq!(fs::metadata(&worker_group)?.ino(), inode_before);
     private_file(
         &files.join("dispatch.json"),
@@ -402,6 +411,11 @@ SystemdCgroup = false
         pause().await;
     }
     assert!(original.recheck().is_err());
+    assert!(
+        original_namespace
+            .stopped()
+            .map_err(|_| "original_stopped_namespace_observation")?
+    );
     println!(
         "actual_cri_stop_requested=true original_pidfd_exited=true original_pid_namespace_tasks=0 private_pid_namespace_verified=true"
     );

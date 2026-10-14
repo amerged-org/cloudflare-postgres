@@ -4,6 +4,15 @@ compile_error!("pgcf-sandbox-controller requires Linux namespace and runc APIs")
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.len() == 3 && args[1] == "--pool-cleanup-worker" {
+        if pgcf_sandbox_controller::pool_cleanup_worker::run(std::path::Path::new(&args[2]))
+            .is_err()
+        {
+            eprintln!("pool_cleanup_worker_unconfirmed");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.len() == 3 && args[1] == "--pool-read-worker" {
         let result = pgcf_sandbox_controller::pool_worker::bind_parent()
             .and_then(|()| {

@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
         unix::fs::MetadataExt,
     },
     path::PathBuf,
@@ -101,6 +101,93 @@ pub struct Process {
     directory: File,
     pidfd: OwnedFd,
     pod_uid: String,
+}
+/// Captured while the original private PID-namespace initializer is still alive.
+/// Retaining the namespace descriptor prevents its identity from being recycled during the proof.
+/// This is a no-write observation capability; it never grants resume or cleanup authority.
+pub struct PrivateNamespace {
+    group: GroupRecord,
+    pid: u32,
+    start_ticks: u64,
+    identity: NamespaceIdentity,
+    namespace: File,
+    proc: File,
+    pidfd: OwnedFd,
+}
+/// A retained, positively empty original namespace; no public constructor can invent this fact.
+pub struct StoppedNamespace(PrivateNamespace);
+impl StoppedNamespace {
+    pub fn matches(&self, process: &Process) -> bool {
+        self.0.matches(process)
+    }
+}
+fn pid_namespace(file: &File) -> Result<NamespaceIdentity, Status> {
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0xb703) } != libc::CLONE_NEWPID {
+        return Err(refused());
+    }
+    pgcf_node_runtime::linux::namespace_identity(file.as_fd()).map_err(|_| refused())
+}
+impl PrivateNamespace {
+    pub fn matches(&self, process: &Process) -> bool {
+        self.pid == process.pid
+            && self.start_ticks == process.start_ticks
+            && self.identity == process.pid_namespace
+            && self.group == process.group_record()
+    }
+    pub fn confirm(self) -> Result<StoppedNamespace, Status> {
+        if !self.stopped()? {
+            return Err(refused());
+        }
+        Ok(StoppedNamespace(self))
+    }
+    /// A signaled pidfd plus a complete current census is required. Neither a disappeared
+    /// cgroup path nor a stop request is evidence that the original namespace is empty.
+    pub fn stopped(&self) -> Result<bool, Status> {
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        if !(0..=1).contains(&result) || (result == 1 && poll.revents & libc::POLLIN == 0) {
+            return Err(refused());
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        if pid_namespace(&self.namespace)? != self.identity {
+            return Err(refused());
+        }
+        let mut scanned = 0;
+        let root = format!("/proc/self/fd/{}", self.proc.as_raw_fd());
+        for entry in fs::read_dir(root).map_err(|_| refused())? {
+            let entry = entry.map_err(|_| refused())?;
+            if entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_none()
+            {
+                continue;
+            }
+            scanned += 1;
+            if scanned > 65536 {
+                return Err(refused());
+            }
+            let file = match File::open(entry.path().join("ns/pid")) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(refused()),
+            };
+            if pid_namespace(&file)? == self.identity {
+                return Ok(false);
+            }
+        }
+        if scanned == 0 {
+            return Err(refused());
+        }
+        Ok(true)
+    }
 }
 /// Shared io.max configuration and measured IO for the exact Pod/device, including its host worker.
 /// These limits do not bound metadata/swap BIOs or replace Cloudflare's allocation reservation.
@@ -284,6 +371,18 @@ impl Process {
         out.recheck()?;
         Ok(out)
     }
+    pub fn exited(&self) -> Result<bool, Status> {
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        if !(0..=1).contains(&result) || (result == 1 && poll.revents & libc::POLLIN == 0) {
+            return Err(refused());
+        }
+        Ok(result == 1)
+    }
     pub fn recheck(&self) -> Result<(), Status> {
         let mut poll = libc::pollfd {
             fd: self.pidfd.as_raw_fd(),
@@ -303,6 +402,54 @@ impl Process {
             return Err(refused());
         }
         self.group_recheck()
+    }
+    pub fn private_namespace(&self) -> Result<PrivateNamespace, Status> {
+        self.recheck()?;
+        let root = File::open("/proc").map_err(|_| refused())?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(root.as_raw_fd(), &mut stat) } != 0
+            || i128::from(stat.f_type) != i128::from(libc::PROC_SUPER_MAGIC)
+        {
+            return Err(refused());
+        }
+        let status = read(&root, &format!("{}/status", self.pid))?;
+        let rows = status
+            .lines()
+            .filter_map(|line| line.strip_prefix("NSpid:"))
+            .collect::<Vec<_>>();
+        if rows.len() != 1 {
+            return Err(refused());
+        }
+        let pids = rows[0]
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| refused())?;
+        if pids.first() != Some(&self.pid) || pids.last() != Some(&1) {
+            return Err(refused());
+        }
+        let namespace = File::open(format!("/proc/{}/ns/pid", self.pid)).map_err(|_| refused())?;
+        if pid_namespace(&namespace)? != self.pid_namespace
+            || self.pid_namespace
+                == pid_namespace(&File::open("/proc/self/ns/pid").map_err(|_| refused())?)?
+        {
+            return Err(refused());
+        }
+        let duplicate = unsafe { libc::fcntl(self.pidfd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(refused());
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        self.recheck()?;
+        Ok(PrivateNamespace {
+            group: self.group_record(),
+            pid: self.pid,
+            start_ticks: self.start_ticks,
+            identity: self.pid_namespace,
+            namespace,
+            proc: root,
+            pidfd,
+        })
     }
     /// This already-captured immutable group may still hold descendants after PID1 exits.
     /// It grants protection/cleanup custody only, never a new writer or process identity.
@@ -508,14 +655,20 @@ impl CapturedGroup {
         self.only_worker()
     }
     pub fn only_worker(&self) -> Result<(), Status> {
+        self.only_process(std::process::id())
+    }
+    pub fn only_process(&self, pid: u32) -> Result<(), Status> {
         self.recheck()?;
+        if pid == 0 {
+            return Err(refused());
+        }
         let raw = read(&self.directory, "cgroup.procs")?;
         let pids = raw
             .split_whitespace()
             .map(str::parse::<u32>)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| refused())?;
-        if pids != [std::process::id()] {
+        if pids != [pid] {
             return Err(refused());
         }
         // Ordinary container groups have no nested tasks at pre-grant; any populated subgroup refuses.
