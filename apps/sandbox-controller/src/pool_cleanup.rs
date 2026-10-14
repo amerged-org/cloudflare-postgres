@@ -70,6 +70,7 @@ pub(crate) struct Session {
     dispatched: bool,
     failed: bool,
     reaped: bool,
+    released: bool,
 }
 impl Session {
     pub(crate) fn start(
@@ -153,6 +154,7 @@ impl Session {
             dispatched: false,
             failed: false,
             reaped: false,
+            released: false,
         })
     }
     fn fail(&mut self) {
@@ -183,6 +185,9 @@ impl Session {
         client: &Client,
         original_state: &State,
     ) -> Result<bool, Status> {
+        if self.released {
+            return self.metadata_retired(settings).await;
+        }
         let journal = journal(original_state)?;
         if self.failed {
             // A failed command is never replayed. Its actual reap may still permit the existing
@@ -400,7 +405,48 @@ impl Session {
         for stop in self.stops.drain(..) {
             stop.await.map_err(|_| refused())??;
         }
-        crate::pool_recovery::finish_cleanup(settings, client, journal, Some(&self.active)).await
+        if !crate::pool_recovery::finish_cleanup(settings, client, journal, Some(&self.active))
+            .await?
+        {
+            return Ok(false);
+        }
+        self.released = true;
+        self.metadata_retired(settings).await
+    }
+    /// CF terminal ACK and physical release already completed. Keep the exact local exclusion
+    /// until the controller removes CRI records; absence here retires bookkeeping only.
+    async fn metadata_retired(&self, settings: &Settings) -> Result<bool, Status> {
+        use crate::containerd::services::containers::v1 as containers;
+        let channel = crate::transport::connect(&settings.containerd_socket).await?;
+        let listed = containers::containers_client::ContainersClient::new(channel)
+            .list(crate::transport::namespaced(
+                containers::ListContainersRequest { filters: vec![] },
+                &settings.namespace,
+            )?)
+            .await?
+            .into_inner()
+            .containers;
+        if listed.len() > 10000 {
+            return Err(refused());
+        }
+        let ids = self.scope["container_ids"].as_array().ok_or_else(refused)?;
+        let mut present = false;
+        for container in listed {
+            if !ids.iter().any(|id| *id == container.id) {
+                continue;
+            }
+            let spec = container
+                .spec
+                .as_ref()
+                .filter(|s| s.value.len() <= 512 * 1024)
+                .ok_or_else(refused)?;
+            let spec: Value = serde_json::from_slice(&spec.value).map_err(|_| refused())?;
+            if spec["annotations"]["io.kubernetes.cri.sandbox-uid"] != self.scope["pool_pod_uid"] {
+                return Err(refused());
+            }
+            present = true;
+        }
+        Ok(!present)
     }
 }
 impl Drop for Session {

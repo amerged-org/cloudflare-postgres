@@ -591,6 +591,13 @@ pub async fn run(
         for id in completed {
             holders.remove(&id);
         }
+        let mut cleanup_scopes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for holder in holders.values().filter(|holder| holder.cleanup.is_some()) {
+            cleanup_scopes
+                .entry(holder.state.pool_pod_uid.clone())
+                .or_default()
+                .extend(holder.state.container_ids.iter().cloned());
+        }
         let result: Result<(), Status> = async {
             if let Ok(q) = client.pool_qualification().await {
                 let input = &q["qualification"];
@@ -645,7 +652,8 @@ pub async fn run(
                             let _ = holder.active.revoke();
                             continue;
                         }
-                        let containers = crate::pool_custody::running(&settings).await?;
+                        let containers =
+                            crate::pool_custody::running_except(&settings, &cleanup_scopes).await?;
                         let driver = crate::pool_driver::verify(
                             &settings,
                             text(scope, "driver_image")?,
@@ -715,11 +723,13 @@ pub async fn run(
                     return Err(refused());
                 }
                 if let Some(preparations) = lease.preparations {
-                    let containers = crate::pool_custody::running(&settings).await?;
+                    let containers =
+                        crate::pool_custody::running_except(&settings, &cleanup_scopes).await?;
                     for preparation in preparations {
                         let q = client.pool_qualification().await?;
                         let input = &q["qualification"];
                         if !input.is_null()
+                            && cleanup_scopes.is_empty()
                             && input["challenge"]["gate"] == "host_mount_context"
                             && preparation["qualification_run_id"] == input["scope"]["run_id"]
                             && preparation["qualification_scope_sha256"] == input["scope_sha256"]

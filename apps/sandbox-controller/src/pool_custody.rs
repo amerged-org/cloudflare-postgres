@@ -8,7 +8,10 @@ use crate::{
     transport,
 };
 use serde_json::Value;
-use std::{collections::BTreeSet, fs};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 use tonic::Status;
 fn refused() -> Status {
     Status::failed_precondition("pool_oci_process_custody_unconfirmed")
@@ -130,6 +133,17 @@ pub fn oci_safe(spec: &Value) -> bool {
     true
 }
 pub async fn running(settings: &Settings) -> Result<Vec<Container>, Status> {
+    running_except(settings, &BTreeMap::new()).await
+}
+fn requires_task(pod: &str, cid: &str, retained: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    !retained.get(pod).is_some_and(|ids| ids.contains(cid))
+}
+/// Only locally retained cleanup sessions may remove their exact original tuples from ordinary
+/// inventory. This is not a death observation and never supplies a stopped-writer attestation.
+pub(crate) async fn running_except(
+    settings: &Settings,
+    retained: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<Vec<Container>, Status> {
     let channel = transport::connect(&settings.containerd_socket).await?;
     let listed = containers::containers_client::ContainersClient::new(channel.clone())
         .list(transport::namespaced(
@@ -186,6 +200,9 @@ pub async fn running(settings: &Settings) -> Result<Vec<Container>, Status> {
             || !seen.insert(container.id.clone())
         {
             return Err(refused());
+        }
+        if !requires_task(uid, &container.id, retained) {
+            continue;
         }
         let task = tasks
             .get(transport::namespaced(
@@ -259,4 +276,24 @@ pub fn image_matches(configured: &str, actual: &str, expected: &str) -> bool {
         .filter(|i| *i > slash)
         .map_or(repository, |i| &repository[..i]);
     actual == expected || actual == format!("{without_tag}@sha256:{digest}")
+}
+
+#[cfg(test)]
+mod cleanup_selection_tests {
+    use super::*;
+    #[test]
+    fn stopping_inventory_excludes_only_retained_exact_pod_and_container() {
+        let retained = std::collections::BTreeMap::from([(
+            "pod-original".to_owned(),
+            BTreeSet::from(["cid-original".to_owned()]),
+        )]);
+        assert!(!requires_task("pod-original", "cid-original", &retained));
+        assert!(requires_task("pod-replacement", "cid-original", &retained));
+        assert!(requires_task("pod-original", "cid-replacement", &retained));
+        assert!(requires_task(
+            "pod-original",
+            "cid-original",
+            &std::collections::BTreeMap::new()
+        ));
+    }
 }
