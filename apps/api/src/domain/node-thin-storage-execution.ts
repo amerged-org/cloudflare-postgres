@@ -894,7 +894,10 @@ async function acceptIdentityProof(
       a.physical,
       headroom,
     );
-  if (a.write_allowed && !proofWriteAllowed) return closed();
+  // A first identity still sees its newly measured LV and an unbound startup hold separately.
+  // Preserve that conservative denial while installing verified receipts under the existing CAS.
+  // Only a later fresh sample can use the installed exact bindings to remove double exposure;
+  // the executor's earlier hold-only decision never grants writes on Cloudflare's behalf.
   for (const v of a.volumes) {
     const database = lease.databases.find((d) => d.id === v.database_id);
     // A power, role, resize or restore request may supersede a valid executor input during its

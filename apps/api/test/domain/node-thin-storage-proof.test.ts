@@ -492,6 +492,135 @@ function boundVolumeProof(
   };
 }
 
+async function firstVolumeIdentity() {
+  const f = await thinExecutionFixture(releases, {
+    guard_seconds: 10,
+    initial_data_bytes: 8 * gib,
+  });
+  const physical = {
+    ...f.authority.physical,
+    free_bytes: 80 * gib,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_total_bytes: 8 * gib,
+    },
+  };
+  await identityProof(f, { physical });
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const receipt = DatabaseStorageVolumeReceipt.parse({
+    storage_generation: 1,
+    storage_uid: crypto.randomUUID(),
+    namespace_uid: crypto.randomUUID(),
+    cluster_uid: crypto.randomUUID(),
+    node_uid: f.uid,
+    volume_group_uuid: f.authority.volume_group_uuid,
+    pool_uuid: f.authority.pool_uuid,
+    volume_handle: `pvc-${crypto.randomUUID()}`,
+    lv_uuid: "FIRSTX-1234-1234-1234-1234-1234-ABCDEF",
+    pvc_uid: crypto.randomUUID(),
+    pv_uid: crypto.randomUUID(),
+  });
+  const proof = boundVolumeProof(f, { created, receipt, physical });
+  return { f, created, receipt, physical, proof };
+}
+
+it("binds a first volume under non-write authority before a fresh sample deduplicates its startup reserve", async () => {
+  const { f, created, receipt, physical, proof } = await firstVolumeIdentity();
+  const input = await prepareThinStorageLease(f.local, f.node, false);
+  expect(input!.lease.required_data_free_bytes).toBe(
+    f.profile.data_reserve_bytes + 5 * gib,
+  );
+  // The executor used the issued hold-only requirement. The first identity must not turn the
+  // new full LV and its still-unbound hold into permission before their exact receipts land.
+  expect(await report(f, { ...proof, write_allowed: true })).toMatchObject({
+    accepted: true,
+    write_allowed: false,
+  });
+  expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
+  const installed = await env.DB.prepare(
+    "SELECT d.storage_volume_json current_receipt,h.storage_volume_json held_receipt FROM databases d JOIN database_start_admissions h ON h.database_id=d.id WHERE d.id=?",
+  )
+    .bind(created.database.id)
+    .first<{ current_receipt: string; held_receipt: string }>();
+  expect(JSON.parse(installed!.current_receipt)).toEqual(receipt);
+  expect(JSON.parse(installed!.held_receipt)).toEqual(receipt);
+  const sampled = NodeStorageHeadroomResponse.parse(
+    (
+      await post(
+        f,
+        sample(f, await nonce(f), {
+          physical,
+          lvs: [
+            {
+              name: "pgcf_thinpool",
+              segtype: "thin-pool",
+              size_bytes: 8 * gib,
+            },
+            {
+              name: receipt.volume_handle,
+              segtype: "thin",
+              size_bytes: 5 * gib,
+            },
+          ],
+          lv_count: 2,
+        }),
+      )
+    ).body,
+  );
+  expect(sampled.accepted).toBe(true);
+  expect(sampled.authority?.write_allowed).toBe(true);
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
+});
+
+it("does not authorize a first volume when its actual receipt installation is ignored", async () => {
+  const { f, created, receipt, physical, proof } = await firstVolumeIdentity();
+  await prepareThinStorageLease(f.local, f.node, false);
+  await env.DB.exec(
+    `CREATE TRIGGER ignore_first_volume_receipt BEFORE UPDATE OF storage_volume_json ON databases WHEN OLD.id='${created.database.id}' BEGIN SELECT RAISE(IGNORE); END`,
+  );
+  try {
+    expect(await report(f, { ...proof, write_allowed: true })).toMatchObject({
+      accepted: true,
+      write_allowed: false,
+    });
+    const installed = await env.DB.prepare(
+      "SELECT d.storage_volume_json current_receipt,h.storage_volume_json held_receipt FROM databases d JOIN database_start_admissions h ON h.database_id=d.id WHERE d.id=?",
+    )
+      .bind(created.database.id)
+      .first();
+    expect(installed).toEqual({ current_receipt: null, held_receipt: null });
+    const sampled = NodeStorageHeadroomResponse.parse(
+      (
+        await post(
+          f,
+          sample(f, await nonce(f), {
+            physical,
+            lvs: [
+              {
+                name: "pgcf_thinpool",
+                segtype: "thin-pool",
+                size_bytes: 8 * gib,
+              },
+              {
+                name: receipt.volume_handle,
+                segtype: "thin",
+                size_bytes: 5 * gib,
+              },
+            ],
+            lv_count: 2,
+          }),
+        )
+      ).body,
+    );
+    expect(sampled.accepted).toBe(true);
+    expect(sampled.authority?.write_allowed).toBe(false);
+    expect(sampled.tokens).toEqual([]);
+    expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
+  } finally {
+    await env.DB.exec("DROP TRIGGER ignore_first_volume_receipt");
+  }
+});
+
 it("reinitializes only a positively complete empty thin inventory after the pool is reclaimed", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
   await identityProof(f, {
