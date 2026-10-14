@@ -12,6 +12,7 @@ import { cleanupFixtures, request } from "./fixtures.ts";
 import {
   postgresPoolCapable,
   postgresPoolQualificationCapable,
+  readDesiredFleetRelease,
 } from "../../src/domain/fleet-releases.ts";
 afterEach(async () => {
   await cleanupFixtures();
@@ -82,6 +83,20 @@ it("gates an isolated candidate on the whole confirmed fleet and strips CF metad
   ]);
   expect(await postgresPoolQualificationCapable(env.DB, f.region)).toBe(true);
   expect(await postgresPoolCapable(env.DB, f.region)).toBe(false);
+  // Use the direct real-D1 reader so projection failures expose their contract
+  // issue here instead of being hidden behind the public error response.
+  const projected = (await readDesiredFleetRelease(env.DB, f.region))!;
+  expect(projected.release.spec.components).toContainEqual(
+    candidate.components.find((c) => c.name === "pool-supervisor"),
+  );
+  for (const role of Object.values(projected.release.spec.roles))
+    expect(role.components).not.toContain("pool-supervisor");
+  const incomplete = structuredClone(candidate);
+  incomplete.roles.customer.components =
+    incomplete.roles.customer.components.filter(
+      (name) => name !== "pool-supervisor",
+    );
+  expect(FleetReleaseSpec.safeParse(incomplete).success).toBe(false);
   const desired = DesiredResponse.parse(
     await (await request("/agent/v1/desired", f.agent)).json(),
   );

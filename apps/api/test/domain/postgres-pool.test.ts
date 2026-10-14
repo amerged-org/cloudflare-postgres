@@ -1190,6 +1190,26 @@ it("exposes the Pod policy through the canonical discriminated compute-pool API 
       .bind(f.id)
       .first(),
   ).toEqual(before);
+  const { readDesiredFleetRelease } =
+      await import("../../src/domain/fleet-releases.ts"),
+    projected = (await readDesiredFleetRelease(env.DB, f.region))!;
+  expect(
+    projected.release.spec.components.some((c) => c.name === "pool-supervisor"),
+  ).toBe(true);
+  for (const role of Object.values(projected.release.spec.roles))
+    expect(role.components).not.toContain("pool-supervisor");
+  const qualified = FleetReleaseSpec.parse(
+    JSON.parse(
+      (await env.DB.prepare("SELECT spec_json FROM fleet_releases WHERE id=?")
+        .bind(f.poolReleaseId)
+        .first<string>("spec_json"))!,
+    ),
+  );
+  qualified.roles.customer.components =
+    qualified.roles.customer.components.filter(
+      (name) => name !== "pool-supervisor",
+    );
+  expect(FleetReleaseSpec.safeParse(qualified).success).toBe(false);
   const nativeDesired = await request("/agent/v1/desired", f.agent);
   expect(nativeDesired.status).toBe(200);
   expect(

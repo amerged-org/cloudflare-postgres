@@ -470,6 +470,7 @@ export const FleetReleaseSpec = z
           "node-bootstrap",
           "postgres",
           "barman",
+          "pool-supervisor",
           "sandbox-controller",
           "image/cert-manager/cert-manager-startupapicheck",
         ].includes(name)
