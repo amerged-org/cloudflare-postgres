@@ -561,11 +561,66 @@ export function storageHoldVolumeStatements(
   return statements;
 }
 
+/** No receipt can be inferred for an older grant. A deleted obligation can instead be
+ * discharged by a later qualified closed-world read proving no Thin storage anywhere
+ * in its immutable node/VG/profile scope. Known retained thick storage is preserved. */
+function globallyAbsentDeletedStorageHoldSql(admission: string): string {
+  return `EXISTS(SELECT 1 FROM databases storage_db
+    JOIN operations start_op ON start_op.id=${admission}.operation_id AND start_op.database_id=storage_db.id AND start_op.project_id=storage_db.project_id
+    JOIN nodes n ON n.id=storage_db.node_id AND n.region_id=storage_db.region_id
+    JOIN node_thin_storage t ON t.node_id=n.id AND t.node_uid=n.node_uid
+    WHERE (${admission}.storage_volume_json IS NULL AND ${admission}.storage_budget_bytes>0
+      AND storage_db.id=${admission}.database_id AND storage_db.node_id=${admission}.node_id AND n.node_uid=${admission}.node_uid
+      AND start_op.generation=${admission}.generation AND ${admission}.generation<=storage_db.generation
+      AND start_op.kind IN('database.create','database.restore','database.resume','database.wake','database.resize'))
+      AND (storage_db.desired_state='deleted' AND storage_db.observed_state='deleted'
+      AND storage_db.observed_generation=storage_db.generation AND storage_db.deleted_at IS NOT NULL
+      AND julianday(${admission}.granted_at)<=julianday(storage_db.updated_at))
+      AND (n.ready=1 AND n.lost_at IS NULL AND t.error_code IS NULL
+      AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))
+      AND ${qualifiedThinStorageSql()}
+      AND (json_extract(storage_db.storage_profile_json,'$.backend')='lvm-thin-v1'
+      AND json_extract(storage_db.storage_profile_json,'$.node_uid')=t.node_uid
+      AND json_extract(storage_db.storage_profile_json,'$.volume_group_uuid')=t.volume_group_uuid
+      AND json_extract(storage_db.storage_profile_json,'$.profile_sha256')=t.profile_sha256
+      AND json_extract(storage_db.storage_profile_json,'$.profile_revision')<=t.profile_revision)
+      AND (json_extract(t.authority_json,'$.revision')=t.authority_revision
+      AND json_extract(t.authority_json,'$.node_id')=t.node_id AND json_extract(t.authority_json,'$.name')=n.k8s_node_name
+      AND json_extract(t.authority_json,'$.node_uid')=t.node_uid AND json_extract(t.authority_json,'$.cluster_uid')=t.cluster_uid
+      AND json_extract(t.authority_json,'$.volume_group_uuid')=t.volume_group_uuid
+      AND json_extract(t.authority_json,'$.physical.volume_group_uuid')=t.volume_group_uuid
+      AND json_extract(t.authority_json,'$.profile_sha256')=t.profile_sha256
+      AND json_extract(t.authority_json,'$.profile_revision')=t.profile_revision
+      AND json_extract(t.authority_json,'$.driver_image')=t.qualified_driver_image
+      AND json_extract(t.authority_json,'$.data_accounting_complete')=1)
+      AND (julianday(t.authority_received_at)>=julianday('now','-120 seconds') AND julianday(t.authority_received_at)<=julianday('now','+5 seconds')
+      AND julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds') AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
+      AND julianday(${inventoryExpiresSql()})>julianday('now')
+      AND julianday(${inventoryObservedSql()})>julianday(${admission}.ready_at,'+5 seconds')
+      AND julianday(${inventoryObservedSql()})>julianday(storage_db.updated_at,'+5 seconds'))
+      AND EXISTS(SELECT 1 FROM node_memory_samples current_memory WHERE current_memory.node_id=n.id AND current_memory.node_uid=n.node_uid
+        AND julianday(current_memory.observed_at)>julianday(storage_db.updated_at,'+5 seconds'))
+      AND (json_type(t.authority_json,'$.pool_uuid')='null' AND json_type(t.authority_json,'$.physical.thin_pool')='null'
+      AND json_type(t.authority_json,'$.physical_lvs')='array' AND json_type(t.authority_json,'$.volumes')='array' AND json_type(t.authority_json,'$.active_lv_uuids')='array')
+      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.physical_lvs') lv WHERE json_extract(lv.value,'$.segtype') IS NOT 'linear')
+      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.volumes') volume WHERE json_extract(volume.value,'$.storage_class') IS NOT 'pgcf-lvm')
+      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.active_lv_uuids') active WHERE NOT EXISTS(
+        SELECT 1 FROM json_each(t.authority_json,'$.physical_lvs') lv WHERE json_extract(lv.value,'$.lv_uuid')=active.value AND json_extract(lv.value,'$.segtype')='linear'))
+      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.physical_lvs') lv WHERE NOT EXISTS(
+        SELECT 1 FROM json_each(t.authority_json,'$.volumes') volume WHERE json_extract(volume.value,'$.lv_uuid')=json_extract(lv.value,'$.lv_uuid') AND json_extract(volume.value,'$.volume_handle')=json_extract(lv.value,'$.name')))
+      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.volumes') volume WHERE NOT EXISTS(
+        SELECT 1 FROM json_each(t.authority_json,'$.physical_lvs') lv WHERE json_extract(lv.value,'$.lv_uuid')=json_extract(volume.value,'$.lv_uuid') AND json_extract(lv.value,'$.name')=json_extract(volume.value,'$.volume_handle')))
+      AND (SELECT count(*) FROM json_each(t.authority_json,'$.physical_lvs'))=(SELECT count(DISTINCT json_extract(value,'$.lv_uuid')) FROM json_each(t.authority_json,'$.physical_lvs'))
+      AND (SELECT count(*) FROM json_each(t.authority_json,'$.physical_lvs'))=(SELECT count(DISTINCT json_extract(value,'$.name')) FROM json_each(t.authority_json,'$.physical_lvs'))
+      AND (SELECT count(*) FROM json_each(t.authority_json,'$.volumes'))=(SELECT count(DISTINCT json_extract(value,'$.lv_uuid')) FROM json_each(t.authority_json,'$.volumes'))
+  )`;
+}
+
 /** A later Native read must cover the actual bound volume (or prove its physical absence).
  * A RAM heartbeat by itself cannot settle a thin startup debit. */
 export function coveredStorageHoldSql(admissionAlias = "a"): string {
   const admission = identifier(admissionAlias);
-  return `(${admission}.storage_budget_bytes=0 OR EXISTS(
+  return `(${admission}.storage_budget_bytes=0 OR ${globallyAbsentDeletedStorageHoldSql(admission)} OR EXISTS(
     SELECT 1 FROM databases storage_db JOIN node_thin_storage t ON t.node_id=storage_db.node_id
     WHERE (storage_db.id=${admission}.database_id AND t.node_uid=${admission}.node_uid) AND ${qualifiedThinStorageSql()} AND ${holdReceiptMatchesCurrentSql(admission, "storage_db")}
       AND (json_extract(storage_db.storage_profile_json,'$.node_uid')=t.node_uid

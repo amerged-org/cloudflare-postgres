@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import {
   DatabaseWithOperation,
+  DatabaseRestored,
   DesiredResponse,
   DatabaseStorageVolumeReceipt,
   NodeThinStorageAuthority,
@@ -44,7 +45,10 @@ const vg = "ABCDEF-1234-1234-1234-1234-1234-ABCDEF",
 const thinProjects: string[] = [];
 const extraClasses: string[] = [];
 const qualifiedReleases: string[] = [];
+const recoveryArchiveKeys: string[] = [];
 afterEach(async () => {
+  if (recoveryArchiveKeys.length)
+    await env.ARCHIVE.delete(recoveryArchiveKeys.splice(0));
   for (const project of thinProjects.splice(0))
     await env.DB.prepare(
       "UPDATE databases SET storage_protected_operation=NULL WHERE project_id=?",
@@ -61,10 +65,15 @@ afterEach(async () => {
       .bind(size)
       .run();
 });
-async function thinFixture(dataFree = 32 * gib, poolData = 32 * gib) {
+async function thinFixture(
+  dataFree = 32 * gib,
+  poolData = 32 * gib,
+  beforeThin?: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>,
+) {
   const f = await fixture(8192, 1),
     now = Date.now(),
     observed = new Date(now).toISOString();
+  if (beforeThin) await beforeThin(f);
   thinProjects.push(f.project);
   const node = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
     .bind(f.node)
@@ -1485,3 +1494,296 @@ it("the existing hold-ledger migration preserves uncertain and acknowledged RAM 
     ).run();
   }
 });
+
+/** Actual local R2 + D1 restore/delete lifecycle; the physical frame is controlled metadata, not Dev evidence. */
+async function deletedUnboundRestore() {
+  let original: DatabaseWithOperation | undefined;
+  const f = await thinFixture(32 * gib, 32 * gib, async (base) => {
+    await configureNodeRegionPolicy(env.DB, {
+      region_id: base.region,
+      max_nodes: 2,
+      purchases_enabled: false,
+      order: null,
+      placement_mode: "actual_ram",
+      maximum_database_memory_mib: 4096,
+      postgres_memory_request_mib: 128,
+    });
+    const prior = Date.now() - 60000,
+      uid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+        .bind(base.node)
+        .first<string>("node_uid");
+    await env.DB.prepare(
+      "INSERT INTO node_memory_samples(node_id,node_uid,minute,observed_at,working_set_bytes,capacity_memory_bytes,available_bytes,memory_pressure) VALUES(?,?,?,?,?,?,?,0)",
+    )
+      .bind(
+        base.node,
+        uid,
+        Math.floor(prior / 60000),
+        new Date(prior).toISOString(),
+        1024 * mib,
+        8192 * mib,
+        7168 * mib,
+      )
+      .run();
+    await env.DB.prepare("UPDATE nodes SET storage_gib_total=95 WHERE id=?")
+      .bind(base.node)
+      .run();
+    original = DatabaseWithOperation.parse(
+      await (await base.create("retained_thick_original")).json(),
+    );
+  });
+  const source = original!,
+    archive = await env.DB.prepare(
+      "SELECT archive_path FROM databases WHERE id=?",
+    )
+      .bind(source.database.id)
+      .first<string>("archive_path");
+  const prefix =
+      archive!.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "") + "/database/",
+    begin = new Date(Date.now() - 3600000).toISOString(),
+    end = new Date(Date.now() - 3480000).toISOString(),
+    backup = begin.replace(/[-:]/g, "").slice(0, 15);
+  const objects = [
+    [
+      `${prefix}base/${backup}/backup.info`,
+      `status=DONE\nbegin_time=${begin}\nend_time=${end}\nbegin_wal=00000001${"0".repeat(15)}1\nend_wal=00000001${"0".repeat(15)}1\nxlog_segment_size=16777216\n`,
+    ],
+    [`${prefix}base/${backup}/data.tar.gz`, "local-fixture"],
+    [
+      `${prefix}wals/00000001${"0".repeat(8)}/00000001${"0".repeat(15)}1.gz`,
+      "local-wal",
+    ],
+  ];
+  for (const [key, value] of objects) {
+    recoveryArchiveKeys.push(key!);
+    await env.ARCHIVE.put(key!, value!);
+  }
+  const restoredResponse = await request(
+    `/v1/databases/${source.database.id}/restore`,
+    f.integrator,
+    "POST",
+    { mode: "full", name: "cancelled_before_receipt" },
+  );
+  expect(restoredResponse.status).toBe(202);
+  const restored = DatabaseRestored.parse(await restoredResponse.json()),
+    id = restored.target_database.id;
+  expect(restored.operation.kind).toBe("database.restore");
+  expect(
+    await env.DB.prepare("SELECT storage_generation FROM databases WHERE id=?")
+      .bind(id)
+      .first("storage_generation"),
+  ).toBe(2);
+  expect(
+    await env.DB.prepare(
+      "SELECT storage_volume_json FROM database_start_admissions WHERE operation_id=?",
+    )
+      .bind(restored.operation.id)
+      .first("storage_volume_json"),
+  ).toBeNull();
+  const deletion = DatabaseWithOperation.parse(
+    await (
+      await request(
+        `/v1/databases/${id}`,
+        f.integrator,
+        "DELETE",
+        undefined,
+        crypto.randomUUID(),
+      )
+    ).json(),
+  );
+  expect(deletion.database.generation).toBe(2);
+  // The first current receipt arrives only after the restore grant is already superseded.
+  const receipt = DatabaseStorageVolumeReceipt.parse({
+    storage_generation: 2,
+    storage_uid: crypto.randomUUID(),
+    namespace_uid: crypto.randomUUID(),
+    cluster_uid: crypto.randomUUID(),
+    node_uid: f.nodeUid,
+    volume_group_uuid: vg,
+    pool_uuid: pool,
+    lv_uuid: "RESTOR-1234-1234-1234-1234-1234-ABCDEF",
+    pvc_uid: crypto.randomUUID(),
+    pv_uid: crypto.randomUUID(),
+    volume_handle: "pvc-" + crypto.randomUUID(),
+  });
+  await env.DB.prepare("UPDATE databases SET storage_volume_json=? WHERE id=?")
+    .bind(JSON.stringify(receipt), id)
+    .run();
+  const pvc = crypto.randomUUID(),
+    thick = {
+      database_id: source.database.id,
+      generation: source.database.generation,
+      storage_generation: 1,
+      storage_uid: crypto.randomUUID(),
+      namespace_uid: crypto.randomUUID(),
+      cluster_uid: crypto.randomUUID(),
+      pvc_uid: pvc,
+      pv_uid: crypto.randomUUID(),
+      volume_handle: "pvc-" + pvc,
+      lv_uuid: "THICKX-1234-1234-1234-1234-1234-ABCDEF",
+      storage_class: "pgcf-lvm",
+      volume_attributes_class: null,
+      io: [],
+    };
+  const frame = (revision: number) => {
+    const at = Date.now() + 1;
+    return NodeThinStorageAuthority.parse({
+      ...f.authority,
+      revision,
+      pool_uuid: null,
+      write_allowed: false,
+      observed_at: new Date(at).toISOString(),
+      captured_at: new Date(at).toISOString(),
+      expires_at: new Date(at + 30000).toISOString(),
+      physical: {
+        ...f.authority.physical,
+        thin_pool: null,
+        thick_allocated_bytes: 5 * gib,
+        free_bytes: 95 * gib,
+      },
+      physical_lvs: [
+        {
+          name: thick.volume_handle,
+          lv_uuid: thick.lv_uuid,
+          size_bytes: 5 * gib,
+          segtype: "linear",
+        },
+      ],
+      active_lv_uuids: [thick.lv_uuid],
+      volumes: [thick],
+    });
+  };
+  await accepted(f, frame(2));
+  const observationResponse = await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    observedBody([observation(id, 2, "deleted")]),
+  );
+  expect(observationResponse.status).toBe(200);
+  expect(
+    await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
+      .bind(id)
+      .first("observed_state"),
+  ).toBe("deleted");
+  const retained = await env.DB.prepare(
+    "SELECT generation,storage_volume_json,ready_at FROM database_start_admissions WHERE operation_id=?",
+  )
+    .bind(restored.operation.id)
+    .first<{
+      generation: number;
+      storage_volume_json: string | null;
+      ready_at: string | null;
+    }>();
+  expect(retained).toMatchObject({ generation: 1, storage_volume_json: null });
+  expect(retained!.ready_at).not.toBeNull();
+  const release = () =>
+    releaseCoveredStartupReservationsStatement(env.DB, {
+      nodeId: f.node,
+      nodeUid: f.nodeUid,
+    }).run();
+  expect((await release()).meta.changes).toBe(0);
+  await new Promise((resolve) => setTimeout(resolve, 5100));
+  const complete = frame(3);
+  await env.DB.prepare(
+    "UPDATE node_memory_samples SET observed_at=? WHERE node_id=? AND node_uid=?",
+  )
+    .bind(complete.observed_at, f.node, f.nodeUid)
+    .run();
+  return { f, restored, source, receipt, complete, release };
+}
+
+it(
+  "releases a superseded never-bound restore hold only after confirmed deletion and a later global zero-Thin read while retaining the original thick volume",
+  { timeout: 15000 },
+  async () => {
+    const { f, restored, source, complete, release } =
+      await deletedUnboundRestore();
+    await accepted(f, complete);
+    expect((await release()).meta.changes).toBe(1);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) n FROM database_start_admissions WHERE operation_id=?",
+      )
+        .bind(restored.operation.id)
+        .first("n"),
+    ).toBe(0);
+    expect(
+      await env.DB.prepare(
+        "SELECT desired_state,storage_profile_json FROM databases WHERE id=?",
+      )
+        .bind(source.database.id)
+        .first(),
+    ).toEqual({ desired_state: "running", storage_profile_json: null });
+    expect(
+      JSON.parse(
+        (await env.DB.prepare(
+          "SELECT authority_json FROM node_thin_storage WHERE node_id=?",
+        )
+          .bind(f.node)
+          .first<string>("authority_json"))!,
+      ).active_lv_uuids,
+    ).toEqual(complete.active_lv_uuids);
+  },
+);
+
+it(
+  "retains the never-bound restore obligation for a remaining Thin LV, unknown active mapper or changed physical identity",
+  { timeout: 15000 },
+  async () => {
+    const { f, restored, receipt, complete, release } =
+      await deletedUnboundRestore();
+    await accepted(
+      f,
+      NodeThinStorageAuthority.parse({
+        ...complete,
+        physical_lvs: [
+          ...complete.physical_lvs,
+          {
+            name: receipt.volume_handle,
+            lv_uuid: receipt.lv_uuid,
+            size_bytes: 5 * gib,
+            segtype: "thin",
+          },
+        ],
+      }),
+    );
+    expect((await release()).meta.changes).toBe(0);
+    await accepted(
+      f,
+      NodeThinStorageAuthority.parse({
+        ...complete,
+        revision: 4,
+        active_lv_uuids: [...complete.active_lv_uuids, receipt.lv_uuid],
+      }),
+    );
+    expect((await release()).meta.changes).toBe(0);
+    await accepted(
+      f,
+      NodeThinStorageAuthority.parse({
+        ...complete,
+        revision: 5,
+        inventory_revision: 5,
+        inventory_observed_at: new Date(Date.now() - 121000).toISOString(),
+        inventory_expires_at: new Date(Date.now() + 60000).toISOString(),
+      }),
+    );
+    expect((await release()).meta.changes).toBe(0);
+    await accepted(
+      f,
+      NodeThinStorageAuthority.parse({
+        ...complete,
+        revision: 6,
+        node_uid: crypto.randomUUID(),
+      }),
+    );
+    expect((await release()).meta.changes).toBe(0);
+    expect(
+      await env.DB.prepare(
+        "SELECT storage_volume_json,storage_budget_bytes FROM database_start_admissions WHERE operation_id=?",
+      )
+        .bind(restored.operation.id)
+        .first(),
+    ).toEqual({ storage_volume_json: null, storage_budget_bytes: 5 * gib });
+  },
+);
