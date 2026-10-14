@@ -60,6 +60,40 @@ it("charges candidate preparation for actual PostgreSQL and archiver Pod request
   expect(setup?.policy.idle_memory_mib).toBe(
     Math.ceil(f.policy.class.memory_request_bytes / 1024 ** 2) + 128,
   );
+  expect(setup?.policy.host_controller_sha256).toBe(
+    f.qualificationScope.software.host_controller_sha256,
+  );
+});
+
+it("refuses candidate setup and a delayed claim after its sealed host executable profile changes", async () => {
+  const f = await qualificationPostgresPoolFixture(),
+    { readPostgresPoolQualificationSetup } =
+      await import("../../src/domain/postgres-pool-qualification-authority.ts");
+  const setup = await readPostgresPoolQualificationSetup(
+    env,
+    f.id,
+    f.sleep.generation + 1,
+  );
+  expect(setup).toBeDefined();
+  const pin = f.qualificationScope.software.host_controller_sha256,
+    changed = (pin[0] === "a" ? "b" : "a") + pin.slice(1);
+  await env.DB.prepare(
+    "UPDATE node_compute_pool_policies SET policy_json=json_set(policy_json,'$.profile.controller_sha256',?) WHERE node_id=?",
+  )
+    .bind(changed, f.node)
+    .run();
+  expect(
+    await readPostgresPoolQualificationSetup(env, f.id, f.sleep.generation + 1),
+  ).toBeUndefined();
+  expect(
+    (
+      await env.DB.prepare(
+        `UPDATE databases SET updated_at=updated_at WHERE id=? AND ${setup!.fence.sql}`,
+      )
+        .bind(f.id, ...setup!.fence.bindings)
+        .run()
+    ).meta.changes,
+  ).toBe(0);
 });
 
 it("grants qualification cleanup only to its exact current stop and fences a delayed commit after the run ends", async () => {
