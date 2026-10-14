@@ -13,7 +13,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsFd, AsRawFd},
         unix::{fs::MetadataExt, net::UnixStream},
     },
     time::Duration,
@@ -160,11 +160,9 @@ pub fn inspect(
         return Err(refused());
     }
     let meta = pgdata.metadata().map_err(|_| refused())?;
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     if !meta.is_dir()
         || unsafe { libc::fcntl(pgdata.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH == 0
-        || unsafe { libc::fstatfs(pgdata.as_raw_fd(), &mut stat) } != 0
-        || stat.f_flags as u64 & libc::ST_RDONLY == 0
+        || !crate::pool_mount::descriptor_readonly(pgdata.as_fd()).map_err(|_| refused())?
     {
         return Err(refused());
     }

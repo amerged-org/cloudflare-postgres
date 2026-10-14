@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::fs::{FileTypeExt, MetadataExt},
     },
     path::Path,
@@ -15,6 +15,14 @@ use std::{
 const TMPFS_MAGIC: i128 = 0x0102_1994;
 fn refused() -> io::Error {
     io::Error::other("pool_mount_identity_unconfirmed")
+}
+/// libc exposes mount flags portably through statvfs on both GNU and musl targets.
+pub(crate) fn descriptor_readonly(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.f_flag & libc::ST_RDONLY != 0)
 }
 fn owned(value: libc::c_long) -> io::Result<OwnedFd> {
     if value < 0 {
@@ -344,13 +352,8 @@ impl Ext4Creation {
         if actual != meta.rdev() {
             return Err(refused());
         }
-        if readonly {
-            let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstatfs(mount.as_raw_fd(), &mut stat) } != 0
-                || stat.f_flags as u64 & libc::ST_RDONLY == 0
-            {
-                return Err(refused());
-            }
+        if readonly && !descriptor_readonly(mount.as_fd())? {
+            return Err(refused());
         }
         Ok(Self {
             context,
@@ -406,10 +409,8 @@ impl Ext4ReadOnly {
     pub fn pgdata(&self) -> io::Result<File> {
         let root = File::from(self.creation.mount.try_clone()?);
         let data = beneath(&root, "pgdata")?;
-        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
         if data.metadata()?.dev() != self.creation.device
-            || unsafe { libc::fstatfs(data.as_raw_fd(), &mut stat) } != 0
-            || stat.f_flags as u64 & libc::ST_RDONLY == 0
+            || !descriptor_readonly(data.as_fd())?
         {
             return Err(refused());
         }
