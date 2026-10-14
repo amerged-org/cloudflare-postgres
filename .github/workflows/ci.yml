@@ -58,6 +58,8 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Install the pinned Buildx CLI plugin
+        run: node scripts/ci/toolchain.mjs install-buildx
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
@@ -310,6 +312,9 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Install the pinned Buildx CLI plugin
+        if: steps.entries.outputs.present == 'true'
+        run: node scripts/ci/toolchain.mjs install-buildx
       - name: Validate the native CI toolchain
         if: steps.entries.outputs.present == 'true'
         run: node scripts/ci/toolchain.mjs check
@@ -418,6 +423,8 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Install the pinned Buildx CLI plugin
+        run: node scripts/ci/toolchain.mjs install-buildx
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
@@ -528,6 +535,8 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Install the pinned Buildx CLI plugin
+        run: node scripts/ci/toolchain.mjs install-buildx
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
@@ -715,6 +724,8 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Install the pinned Buildx CLI plugin
+        run: node scripts/ci/toolchain.mjs install-buildx
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
@@ -786,6 +797,8 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Install the pinned Buildx CLI plugin
+        run: node scripts/ci/toolchain.mjs install-buildx
       - name: Validate the native CI toolchain
         run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies

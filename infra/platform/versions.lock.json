@@ -285,6 +285,13 @@
     "dockerClient": "28.0.4",
     "dockerServer": "28.0.4",
     "buildx": "0.37.2",
+    "buildxBinary": {
+      "url": "https://github.com/docker/buildx/releases/download/v0.37.2/buildx-v0.37.2.linux-amd64",
+      "sha256": "982ca20490b45ed1ec8d99795974d3d874a358f75938c9c237305010e6b7e548",
+      "bytes": 65806498,
+      "checksumURL": "https://github.com/docker/buildx/releases/download/v0.37.2/checksums.txt",
+      "checksumSha256": "7025de9fb8d44aabd1b1f42ecb70f7dc7e33531de356e03e50524e2461b0f9bb"
+    },
     "platform": "linux",
     "architecture": "x64",
     "distribution": "ubuntu",

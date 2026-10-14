@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -12,12 +15,16 @@ interface ToolchainPins {
   dockerClient: string;
   dockerServer: string;
   buildx: string;
+  buildxBinary: { url: string; sha256: string; bytes: number };
   distribution: string;
   distributionVersion: string;
   rust: string;
   rustTargets: string[];
 }
-interface ActualToolchain extends Omit<ToolchainPins, "rust" | "rustTargets"> {
+interface ActualToolchain extends Omit<
+  ToolchainPins,
+  "rust" | "rustTargets" | "buildxBinary"
+> {
   dockerOs: string;
   dockerArchitecture: string;
   rust?: string;
@@ -26,10 +33,15 @@ interface ActualToolchain extends Omit<ToolchainPins, "rust" | "rustTargets"> {
 }
 // Dynamic URL import keeps this TypeScript test independent of JS declaration generation.
 // Importing the module must not execute its CLI probes.
-const { readToolchain, validateToolchain } = (await import(
+const { readToolchain, validateToolchain, installBuildxBytes } = (await import(
   new URL("./toolchain.mjs", import.meta.url).href
 )) as {
   readToolchain(root?: string): ToolchainPins;
+  installBuildxBytes(
+    bytes: Uint8Array,
+    pins: ToolchainPins,
+    directory: string,
+  ): string;
   validateToolchain(
     actual: ActualToolchain,
     pins: ToolchainPins,
@@ -264,11 +276,61 @@ test("every Linux build job validates the shared toolchain before dependencies a
   assert.ok(jobs.length > 0);
   for (const job of jobs) {
     const setup = job.indexOf("node-version:"),
+      install = job.indexOf("node scripts/ci/toolchain.mjs install-buildx\n"),
       check = job.indexOf("node scripts/ci/toolchain.mjs check\n"),
       dependencies = job.indexOf("pnpm install"),
       build = job.indexOf("docker build");
-    assert.ok(setup >= 0 && check > setup);
+    assert.ok(setup >= 0 && install > setup && check > install);
     assert.ok(dependencies > check);
     assert.ok(build > check);
+  }
+});
+
+test("installs actual pinned Buildx bytes atomically and refuses corruption without replacing the existing plugin", async () => {
+  assert.equal(typeof installBuildxBytes, "function");
+  const asset = join(root, ".local/buildx/buildx-v0.37.2.linux-amd64"),
+    installed = join(
+      process.env.DOCKER_CONFIG ?? join(homedir(), ".docker"),
+      "cli-plugins/docker-buildx",
+    );
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(process.platform === "linux" ? installed : asset);
+  } catch {
+    // Fresh local checkouts use the same real upstream asset as the CI installer.
+    const response = await fetch(pins.buildxBinary.url, {
+      signal: AbortSignal.timeout(60_000),
+    });
+    assert.equal(response.ok, true);
+    bytes = Buffer.from(await response.arrayBuffer());
+  }
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-buildx-test-"));
+  try {
+    const executable = installBuildxBytes(bytes, pins, directory);
+    assert.equal(
+      createHash("sha256")
+        .update(await readFile(executable))
+        .digest("hex"),
+      pins.buildxBinary.sha256,
+    );
+    assert.equal((await stat(executable)).mode & 0o777, 0o755);
+    const changed = Buffer.from(bytes);
+    changed[0] = changed[0]! ^ 1;
+    assert.throws(
+      () => installBuildxBytes(changed, pins, directory),
+      /unsupported_ci_toolchain:buildxIntegrity/,
+    );
+    assert.throws(
+      () => installBuildxBytes(bytes.subarray(1), pins, directory),
+      /unsupported_ci_toolchain:buildxIntegrity/,
+    );
+    assert.equal(
+      createHash("sha256")
+        .update(await readFile(executable))
+        .digest("hex"),
+      pins.buildxBinary.sha256,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });

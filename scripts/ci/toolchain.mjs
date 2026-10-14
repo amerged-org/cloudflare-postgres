@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-import { readFileSync } from "node:fs";
+/* global fetch, AbortSignal */
+import {
+  readFileSync,
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  chmodSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { URL, fileURLToPath, pathToFileURL } from "node:url";
 import process from "node:process";
@@ -38,7 +49,66 @@ export function readToolchain(root = repository) {
     !pins.rustTargets.includes("wasm32-unknown-unknown")
   )
     throw new Error("invalid_ci_toolchain:rustTargets");
+  if (
+    pins.buildxBinary?.url !==
+      `https://github.com/docker/buildx/releases/download/v${pins.buildx}/buildx-v${pins.buildx}.linux-amd64` ||
+    !/^[a-f0-9]{64}$/.test(pins.buildxBinary.sha256 ?? "") ||
+    !Number.isSafeInteger(pins.buildxBinary.bytes) ||
+    pins.buildxBinary.bytes <= 0 ||
+    pins.buildxBinary.bytes > 128 * 1024 ** 2
+  )
+    throw new Error("invalid_ci_toolchain:buildxBinary");
   return pins;
+}
+
+/** Verify the complete pinned release bytes before touching an existing plugin. */
+export function installBuildxBytes(bytes, pins, directory) {
+  if (
+    bytes.length !== pins.buildxBinary.bytes ||
+    createHash("sha256").update(bytes).digest("hex") !==
+      pins.buildxBinary.sha256
+  )
+    throw new Error("unsupported_ci_toolchain:buildxIntegrity");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = mkdtempSync(join(directory, ".pgcf-buildx-")),
+    staged = join(temporary, "docker-buildx"),
+    executable = join(directory, "docker-buildx");
+  try {
+    writeFileSync(staged, bytes, { flag: "wx", mode: 0o600 });
+    chmodSync(staged, 0o755);
+    renameSync(staged, executable);
+    return executable;
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+async function installBuildx(pins) {
+  equal(process.platform, pins.platform, "platform");
+  equal(process.arch, pins.architecture, "architecture");
+  equal(process.versions.node, pins.node, "node");
+  const response = await fetch(pins.buildxBinary.url, {
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) throw new Error("unsupported_ci_toolchain:buildxDownload");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  installBuildxBytes(
+    bytes,
+    pins,
+    join(
+      process.env.DOCKER_CONFIG || join(homedir(), ".docker"),
+      "cli-plugins",
+    ),
+  );
+  const version = /^github\.com\/docker\/buildx v(\d+\.\d+\.\d+)(?:\s|$)/.exec(
+    command("docker", ["buildx", "version"], "buildx"),
+  )?.[1];
+  equal(version, pins.buildx, "buildx");
+  return {
+    buildx: version,
+    sha256: pins.buildxBinary.sha256,
+    bytes: bytes.length,
+  };
 }
 
 function equal(actual, expected, field) {
@@ -143,6 +213,8 @@ if (
       throw new Error("unsupported_ci_toolchain:arguments");
     if (action === "github-output") process.stdout.write(`node=${pins.node}\n`);
     else if (action === "node-version") process.stdout.write(`${pins.node}\n`);
+    else if (action === "install-buildx")
+      process.stdout.write(JSON.stringify(await installBuildx(pins)) + "\n");
     else if (action === "check" || action === "check-rust")
       process.stdout.write(
         JSON.stringify(check(pins, action === "check-rust")) + "\n",
