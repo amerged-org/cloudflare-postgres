@@ -367,19 +367,34 @@ async function productSample(
     return refuse("thin_storage_sample_pool_changed");
   // Every other LV is one the identity proof read; new thin LVs only for unbound startup holds.
   const holds = await storageHolds(env, nodeId, row.node_uid, identity),
-    read = new Map(identity.physical_lvs.map((lv) => [lv.name, lv.segtype]));
+    read = new Map(identity.physical_lvs.map((lv) => [lv.name, lv]));
   let thin = 0,
-    unbound = 0;
+    unbound = 0,
+    unboundBytes = 0;
   for (const lv of body.lvs) {
     if (lv.segtype !== "thin") {
-      if (read.get(lv.name) !== lv.segtype)
+      if (read.get(lv.name)?.segtype !== lv.segtype)
         return refuse("thin_storage_sample_volumes_changed");
       continue;
     }
     thin++;
-    if (read.get(lv.name) !== "thin") unbound++;
+    const known = read.get(lv.name);
+    if (!known) {
+      unbound++;
+      unboundBytes += lv.size_bytes;
+    } else if (known.segtype !== "thin" || known.size_bytes !== lv.size_bytes)
+      // A changed logical size needs a new UUID-bound identity read; a fast scrape renews none.
+      return refuse("thin_storage_sample_volumes_changed");
   }
-  if (unbound > holds.newVolumes || thin > profile.maximum_volumes)
+  const unknownBudget = [...holds.exposures]
+    .filter(([key]) => key.startsWith("unknown:"))
+    .reduce((sum, [, bytes]) => sum + bytes, 0);
+  if (
+    unbound > holds.newVolumes ||
+    !Number.isSafeInteger(unboundBytes) ||
+    unboundBytes > unknownBudget ||
+    thin > profile.maximum_volumes
+  )
     return refuse("thin_storage_sample_volumes_changed");
   // The fresher of this sample and the reading the current authority holds.
   const held = Date.parse(identity.observed_at),

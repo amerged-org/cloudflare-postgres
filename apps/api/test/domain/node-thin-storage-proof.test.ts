@@ -492,6 +492,74 @@ function boundVolumeProof(
   };
 }
 
+it("reinitializes only a positively complete empty thin inventory after the pool is reclaimed", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await identityProof(f, {
+    pool_uuid: null,
+    write_allowed: false,
+    physical: { ...f.authority.physical, thin_pool: null },
+    physical_lvs: [
+      {
+        name: "retained-thick",
+        lv_uuid: "THICKX-1234-1234-1234-1234-1234-ABCDEF",
+        size_bytes: 5 * gib,
+        segtype: "linear",
+      },
+    ],
+    active_lv_uuids: [],
+    volumes: [],
+  });
+  const input = await prepareThinStorageLease(f.local, f.node);
+  expect(input?.lease.required_data_free_bytes).toBe(
+    f.profile.data_reserve_bytes,
+  );
+  expect(input?.lease.action?.kind).toBe("initialize");
+  expect(input?.lease.action?.target_data_bytes).toBe(
+    f.profile.initial_data_bytes,
+  );
+});
+
+it("retains full advisory LV exposure after write expiry without turning retained identity into write permission", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
+    bound = await boundDatabase(f),
+    physical = {
+      ...bound.physical,
+      thin_pool: {
+        ...bound.physical.thin_pool,
+        data_used_bytes_upper_bound: 12 * gib,
+      },
+    },
+    read = Date.now() - 20000;
+  await env.DB.prepare(
+    "DELETE FROM database_start_admissions WHERE database_id=?",
+  )
+    .bind(bound.created.database.id)
+    .run();
+  await identityProof(f, {
+    ...boundVolumeProof(f, bound),
+    physical,
+    observed_at: iso(read),
+    expires_at: iso(read + 10000),
+    inventory_observed_at: iso(read),
+    inventory_expires_at: iso(read + 300000),
+  });
+  expect(
+    (await readCurrentNodeThinStorage(f.local, f.node))?.authority,
+  ).toBeNull();
+  const input = await prepareThinStorageLease(f.local, f.node, false);
+  expect(input?.lease.required_data_free_bytes).toBe(
+    f.profile.data_reserve_bytes + 5 * gib,
+  );
+  expect(input?.lease.action).toBeNull();
+  expect(
+    await report(f, {
+      ...boundVolumeProof(f, bound),
+      physical,
+      write_allowed: false,
+    }),
+  ).toMatchObject({ accepted: true, write_allowed: false });
+});
+
 it("refuses a stale database generation during an identity turn without blocking the node", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
     bound = await boundDatabase(f);

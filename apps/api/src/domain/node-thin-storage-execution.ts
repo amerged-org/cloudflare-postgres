@@ -7,7 +7,6 @@ import {
   THIN_INVENTORY_MAX_SECONDS,
   thinStorageClass,
   thinStorageInventory,
-  thinWriteExposure,
   NodeThinStorageAuthority,
   type NodePhysicalStorage,
   type ThinStorageProfile,
@@ -48,6 +47,7 @@ import {
   storageProtectionStatements,
   storageHoldVolumeStatements,
   knownStorageHoldVolume,
+  thinLogicalVolumeExposures,
   currentStorageStopSql,
 } from "./storage-capacity.ts";
 import {
@@ -215,31 +215,45 @@ export async function storageHolds(
     newVolumes: unknownVolumes,
     ids: new Set(rows.results.map((r) => r.database_id)),
     operations: rows.results.map((r) => r.operation_id),
+    exposures,
   };
 }
 export function minimumHeadroom(
   profile: NodeThinStorageLease["profile"],
   authority: NodeThinStorageAuthority | null,
-  holds: { bytes: number; newVolumes: number; ids: ReadonlySet<string> },
+  holds: {
+    bytes: number;
+    newVolumes: number;
+    ids: ReadonlySet<string>;
+    exposures?: ReadonlyMap<string, number>;
+  },
 ) {
-  const window = profile.guard_seconds + profile.drain_seconds;
-  const io =
-    authority?.volumes.flatMap((v) =>
-      v.storage_class === "pgcf-lvm" || holds.ids.has(v.database_id)
-        ? []
-        : v.io,
-    ) ?? [];
-  const bytes = io.reduce((n, v) => n + v.write_bytes_per_second * window, 0),
-    iops = io.reduce((n, v) => n + v.write_iops_per_second * window, 0);
-  const exposure = thinWriteExposure(bytes, iops),
-    chunks = exposure.chunks + Math.ceil(holds.bytes / 65536);
-  return {
-    data: profile.data_reserve_bytes + holds.bytes + exposure.data_bytes,
+  const retained = authority
+    ? thinLogicalVolumeExposures(authority)
+    : new Map();
+  const unknown = {
+    data: Number.MAX_SAFE_INTEGER,
+    metadata: Number.MAX_SAFE_INTEGER,
+  };
+  if (!retained) return unknown;
+  for (const [key, bytes] of holds.exposures ?? [])
+    retained.set(key, Math.max(retained.get(key) ?? 0, bytes));
+  const bytes =
+      [...retained.values()].reduce((sum, value) => sum + value, 0) +
+      (holds.exposures ? 0 : holds.bytes),
+    chunks = Math.ceil(bytes / 65536);
+  if (!Number.isSafeInteger(bytes)) return unknown;
+  const required = {
+    data: profile.data_reserve_bytes + bytes,
     metadata:
       profile.metadata_reserve_bytes +
       4 * Math.ceil(chunks / 126) * 4096 +
       holds.newVolumes * 16384,
   };
+  return Number.isSafeInteger(required.data) &&
+    Number.isSafeInteger(required.metadata)
+    ? required
+    : unknown;
 }
 /** Cloudflare's write decision for one reading under one identity proof; the rule the slow report
  * has always been held to: complete data accounting, the profile's geometry and free data and
@@ -345,13 +359,19 @@ export async function reserveThinStorageLease(
   const profile = current.profile,
     now = new Date().toISOString(),
     operation = newOperationId();
+  // Expiry ends permission, not a retained LV's physical exposure. This is advisory input only.
+  const advisory =
+    current.authority ??
+    current.reclamation ??
+    retainedPoolAuthority(current.row);
   const holds = await storageHolds(
     env,
     nodeId,
     row.node_uid,
-    current.row.current_qualified === 1 ? current.authority : null,
+    advisory,
+    current.authority ? Date.now() : Date.parse(advisory?.observed_at ?? now),
   );
-  const required = minimumHeadroom(profile, current.authority, holds);
+  const required = minimumHeadroom(profile, advisory, holds);
   // A queued first start cannot obtain its bounded hold until the measured pool fits it.
   // Grow the existing finite pool for one eligible request; this is not a physical quota debit
   // for established databases and never creates a VPS order below the regional RAM trigger.
@@ -388,7 +408,7 @@ export async function reserveThinStorageLease(
       // CSI removes the pool with its last LV. A deleted database's hold remains until a
       // newer identity read proves reclamation: keep that read possible without authorizing
       // a replacement pool or discarding the hold while its physical outcome is unproved.
-      if (holds.count === 0)
+      if (holds.count === 0 && required.data <= profile.maximum_data_bytes)
         action = NodeThinPoolAction.parse({
           kind: "initialize",
           state: "pending",
@@ -403,6 +423,7 @@ export async function reserveThinStorageLease(
         });
     } else if (
       current.authority &&
+      required.data <= profile.maximum_data_bytes &&
       pool.metadata_total_bytes < profile.metadata_bytes
     ) {
       action = NodeThinPoolAction.parse({
@@ -419,6 +440,7 @@ export async function reserveThinStorageLease(
       });
     } else if (
       current.authority &&
+      required.data <= profile.maximum_data_bytes &&
       thinPoolDataGrowthNeeded(profile, pool, required, nextStartup)
     ) {
       const target = Math.min(
@@ -557,16 +579,23 @@ async function buildThinStorageInput(
         storage_budget_bytes: number | null;
       }
     >();
+  const advisory =
+    current.authority ??
+    current.reclamation ??
+    retainedPoolAuthority(current.row);
   const requiredHeadroom =
     required ??
     minimumHeadroom(
       current.profile,
-      current.authority,
+      advisory,
       await storageHolds(
         env,
         nodeId,
         row.node_uid,
-        current.row.current_qualified === 1 ? current.authority : null,
+        advisory,
+        current.authority
+          ? Date.now()
+          : Date.parse(advisory?.observed_at ?? row.updated_at),
       ),
     );
   const callback = new URL(
@@ -681,41 +710,24 @@ export async function dispatchThinPoolAction(
   return { dispatched: true };
 }
 
-/** What Cloudflare allowed the pool to gain since a reading: every live writer's measured io.max
- * over the elapsed time plus drain, and the current startup holds (which bound held writers). */
+/** Temporary full-volume exposure across both identity reads and exact captured holds.
+ * io.max's metadata/swap bypass cannot justify a rate-only physical growth bound. */
 function thinWriteAllowance(
-  profile: ThinStorageProfile,
   writers: readonly (NodeThinStorageAuthority | null)[],
-  holds: { bytes: number; ids: ReadonlySet<string> },
-  elapsedMilliseconds: number,
+  holds: { bytes: number; exposures?: ReadonlyMap<string, number> },
 ) {
-  const window =
-      Math.ceil(Math.max(0, elapsedMilliseconds) / 1000) +
-      profile.drain_seconds,
-    io = new Map<string, { bytes: number; operations: number }>();
-  for (const authority of writers)
-    for (const volume of authority?.volumes ?? [])
-      if (
-        volume.storage_class !== "pgcf-lvm" &&
-        !holds.ids.has(volume.database_id)
-      )
-        for (const writer of volume.io) {
-          const known = io.get(writer.pod_uid);
-          io.set(writer.pod_uid, {
-            bytes: Math.max(known?.bytes ?? 0, writer.write_bytes_per_second),
-            operations: Math.max(
-              known?.operations ?? 0,
-              writer.write_iops_per_second,
-            ),
-          });
-        }
-  const rates = [...io.values()];
-  return (
-    thinWriteExposure(
-      rates.reduce((n, v) => n + v.bytes * window, 0),
-      rates.reduce((n, v) => n + v.operations * window, 0),
-    ).data_bytes + holds.bytes
-  );
+  const exposure = new Map(holds.exposures);
+  for (const authority of writers) {
+    if (!authority) continue;
+    const retained = thinLogicalVolumeExposures(authority);
+    if (!retained) return Number.MAX_SAFE_INTEGER;
+    for (const [key, bytes] of retained)
+      exposure.set(key, Math.max(exposure.get(key) ?? 0, bytes));
+  }
+  const total =
+    [...exposure.values()].reduce((sum, value) => sum + value, 0) +
+    (holds.exposures ? 0 : holds.bytes);
+  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
 }
 
 /** The slow report is an identity proof: its read started at the lease's issue, it stays usable
@@ -876,13 +888,7 @@ async function acceptIdentityProof(
     row.lease_sample_data_used_bytes !== null
   ) {
     const allowed =
-      row.lease_sample_data_used_bytes +
-      thinWriteAllowance(
-        lease.profile,
-        [stored, a],
-        holds,
-        now - Date.parse(row.lease_sample_observed_at),
-      );
+      row.lease_sample_data_used_bytes + thinWriteAllowance([stored, a], holds);
     // Both LVM readers round percentages to hundredths and charge another hundredth. The
     // conservative upper bound can rise after growth without a write; compare its lower bound.
     const proofUsedLowerBound = Math.max(

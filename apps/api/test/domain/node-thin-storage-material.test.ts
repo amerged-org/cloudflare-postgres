@@ -211,6 +211,15 @@ it("retains running thin bindings and finite read counters across material chang
         segtype: "thin" as const,
       },
     ],
+    // Healthy material convergence needs enough actual pool headroom for the retained full LV.
+    physical: {
+      ...f.authority.physical,
+      free_bytes: 80 * 1024 ** 3,
+      thin_pool: {
+        ...f.authority.physical.thin_pool!,
+        data_total_bytes: 16 * 1024 ** 3,
+      },
+    },
     active_lv_uuids: [receipt.lv_uuid],
     volumes: [volume],
   };

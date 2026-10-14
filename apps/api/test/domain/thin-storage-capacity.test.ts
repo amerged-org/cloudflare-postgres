@@ -31,6 +31,11 @@ import {
   releaseCoveredStartupReservationsStatement,
   databaseCpuChargeSql,
 } from "../../src/domain/startup-admission.ts";
+import {
+  minimumHeadroom,
+  storageHolds,
+} from "../../src/domain/node-thin-storage-execution.ts";
+import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 const mib = 1024 ** 2,
   gib = 1024 ** 3,
   sha = "a".repeat(64);
@@ -386,6 +391,115 @@ async function accepted(
   ]);
   return authority;
 }
+
+it("charges each potentially writable thin LV at its full measured size and shares only an exact full hold", async () => {
+  const f = await thinFixture(8 * gib, 8 * gib),
+    created = DatabaseWithOperation.parse(await (await f.create()).json()),
+    bound = await bindVolume(f, created),
+    active = await accepted(f, {
+      ...bound.authority,
+      active_lv_uuids: [bound.receipt.lv_uuid],
+      volumes: [{ ...bound.volume, quiesced: false }],
+    });
+  const held = await storageHolds(env, f.node, f.nodeUid, active);
+  expect(held.bytes).toBe(5 * gib);
+  expect(minimumHeadroom(f.profile, active, held).data).toBe(
+    f.profile.data_reserve_bytes + 5 * gib,
+  );
+  // Controlled metadata represents a completed start; no mount or runtime acceptance is claimed.
+  await env.DB.prepare(
+    "DELETE FROM database_start_admissions WHERE database_id=?",
+  )
+    .bind(created.database.id)
+    .run();
+  const unheld = await storageHolds(env, f.node, f.nodeUid, active);
+  expect
+    .soft(minimumHeadroom(f.profile, active, unheld).data)
+    .toBe(f.profile.data_reserve_bytes + 5 * gib);
+  // Eight physical GiB cannot cover this existing five-GiB writer plus a new five-GiB start.
+  expect.soft(await fits(f)).toBe(0);
+  const stopped = { ...active, volumes: [{ ...bound.volume, quiesced: true }] };
+  await publish(f, stopped);
+  expect(minimumHeadroom(f.profile, stopped, unheld).data).toBe(
+    f.profile.data_reserve_bytes + 5 * gib,
+  );
+  expect(await fits(f)).toBe(0);
+});
+
+it("cannot exempt an ambiguous LV identity or renew a suspended-volume exemption from an expired identity read", async () => {
+  const f = await thinFixture(8 * gib, 8 * gib),
+    created = DatabaseWithOperation.parse(await (await f.create()).json()),
+    bound = await bindVolume(f, created);
+  await env.DB.prepare(
+    "DELETE FROM database_start_admissions WHERE database_id=?",
+  )
+    .bind(created.database.id)
+    .run();
+  const missing = { ...bound.authority, physical_lvs: [] };
+  await publish(f, missing);
+  expect(await fits(f)).toBe(0);
+  const now = Date.now(),
+    stale = {
+      ...bound.authority,
+      volumes: [{ ...bound.volume, quiesced: true }],
+      inventory_revision: bound.authority.revision,
+      inventory_observed_at: new Date(now - 300000).toISOString(),
+      inventory_expires_at: new Date(now - 1).toISOString(),
+    };
+  await publish(f, stale);
+  expect(await fits(f)).toBe(0);
+});
+
+it("requires a new identity read when the sampler observes a retained thin LV's changed logical size", async () => {
+  const f = await thinFixture(8 * gib, 8 * gib),
+    created = DatabaseWithOperation.parse(await (await f.create()).json()),
+    bound = await bindVolume(f, created),
+    authority = await accepted(f, {
+      ...bound.authority,
+      physical_lvs: [
+        ...bound.authority.physical_lvs,
+        {
+          name: "pgcf_thinpool",
+          lv_uuid: pool,
+          size_bytes: 8 * gib,
+          segtype: "thin-pool",
+        },
+      ],
+    });
+  const body = {
+    nonce: null,
+    node_uid: f.nodeUid,
+    captured_at: new Date().toISOString(),
+    physical: authority.physical,
+    lvs: [
+      { name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 8 * gib },
+      {
+        name: bound.receipt.volume_handle,
+        segtype: "thin",
+        size_bytes: 6 * gib,
+      },
+    ],
+    lv_count: 2,
+    witnesses: {
+      cluster_uid: authority.cluster_uid,
+      boot_id: f.bootId,
+      volume_group_uuid: vg,
+      driver_pod_uid: authority.driver_pod_uid,
+      driver_image: f.profile.driver_image,
+    },
+    scrape_milliseconds: 0,
+  };
+  const url = `/agent/v1/nodes/${f.node}/storage-headroom`,
+    nonce = NodeStorageHeadroomResponse.parse(
+      await (await request(url, f.agent, "POST", body)).json(),
+    ).nonce;
+  const result = NodeStorageHeadroomResponse.parse(
+    await (await request(url, f.agent, "POST", { ...body, nonce })).json(),
+  );
+  expect(result.accepted).toBe(false);
+  expect(result.reason).toBe("thin_storage_sample_volumes_changed");
+  expect(result.authority).toBeNull();
+});
 async function protectiveStop() {
   const f = await thinFixture(),
     created = DatabaseWithOperation.parse(await (await f.create()).json()),
