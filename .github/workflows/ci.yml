@@ -183,6 +183,8 @@ jobs:
           node packages/contracts/native/generate-measurements.ts --check
           node packages/contracts/native/generate-bootstrap.ts --check
           node packages/contracts/native/generate-reclaim.ts --check
+          node packages/contracts/native/generate-postgres-pool.ts --check
+          node packages/contracts/native/generate-qualification.ts --check
           cargo fmt --all -- --check
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
