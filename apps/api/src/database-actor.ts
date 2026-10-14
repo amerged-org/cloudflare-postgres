@@ -803,6 +803,7 @@ export class DatabaseActor extends DurableObject<Env> {
   private async known(
     id: string,
     user: string,
+    joinOwnPoolWake = false,
   ): Promise<AdmissionRow | DatabaseAdmission> {
     const snapshot = this.presence();
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
@@ -830,10 +831,41 @@ export class DatabaseActor extends DurableObject<Env> {
     if (
       row.node_id === null ||
       row.lost_at !== null ||
-      row.admission_blocked !== 0
+      (row.admission_blocked !== 0 &&
+        (!joinOwnPoolWake || !(await this.canJoinOwnPoolWake(id, row))))
     )
       return { ok: false, sqlstate: "57P03" };
     return row;
+  }
+  /** An exact owned wake may wait for its current holder; this never admits a connection. */
+  private async canJoinOwnPoolWake(id: string, row: AdmissionRow) {
+    if (this.admissionState()?.barrier || row.desired_state !== "running")
+      return false;
+    const owned = this.ctx.storage.sql
+      .exec<{ operation: string; revision: number }>(
+        "SELECT operation,revision FROM database_wake WHERE singleton=1",
+      )
+      .toArray()[0];
+    if (
+      !owned ||
+      owned.revision !== row.generation ||
+      owned.operation !== row.power_operation
+    )
+      return false;
+    const confirmed = await this.env.DB.prepare(
+      `SELECT 1 FROM databases d JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation=d.generation
+       JOIN database_admission_epochs e ON e.database_id=d.id
+       JOIN database_runtime_holders h ON h.database_id=d.id AND h.kind='pool'
+       JOIN pool_bindings b ON b.id=h.binding_id AND b.database_id=d.id AND b.holder_revision=h.revision AND b.state=h.state
+       JOIN nodes n ON n.id=d.node_id AND n.node_uid=b.node_uid AND n.region_id=d.region_id
+       WHERE d.id=? AND d.generation=? AND d.power_operation=? AND d.desired_state='running' AND d.deleted_at IS NULL
+         AND o.kind IN('database.wake','database.resume') AND o.status IN('pending','running','succeeded')
+         AND b.generation=d.generation AND b.node_id=d.node_id AND b.state IN('claimed','mounted','serving')
+         AND e.mutation_id IS NULL AND e.route_revision>=b.route_revision AND e.admission_revision>=b.admission_epoch`,
+    )
+      .bind(id, owned.revision, owned.operation)
+      .first();
+    return !!confirmed && !this.admissionState()?.barrier;
   }
   private earlyAdmission(
     databaseId: unknown,
@@ -875,7 +907,7 @@ export class DatabaseActor extends DurableObject<Env> {
   > {
     return this.ctx.blockConcurrencyWhile(async () => {
       try {
-        const authorized = await this.known(id, user);
+        const authorized = await this.known(id, user, true);
         if ("ok" in authorized) return undefined;
         let row = await this.env.DB.prepare(
           "SELECT * FROM databases WHERE id=?",
@@ -1065,7 +1097,7 @@ export class DatabaseActor extends DurableObject<Env> {
     try {
       if (!(await this.revokeBeforeAdmission(id.data, deadline)))
         return { ok: false, sqlstate: "57P03" };
-      const current = await this.known(id.data, role.data);
+      const current = await this.known(id.data, role.data, true);
       if ("ok" in current) return current;
       if (
         current.desired_state === "running" &&

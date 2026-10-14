@@ -89,6 +89,13 @@ function poolPodIdentity(pod: PoolPodAttestation) {
       ),
   };
 }
+async function hintPostgresPoolProgress(env: Env, binding: PoolBinding) {
+  const scope = binding.scope;
+  const link = env.REGION_LINK.get(env.REGION_LINK.idFromName(scope.region_id));
+  await link.notify([scope.database_id]);
+  const delivery = await readDesiredPostgresPoolBinding(env, scope.database_id);
+  if (delivery) await link.notifyPoolBinding(scope.node_id, delivery);
+}
 async function currentNode(env: Env, id: string, region?: string) {
   const node = await env.DB.prepare(
     `SELECT n.id,n.region_id,n.node_uid,json_extract(o.facts_json,'$.boot_id') boot_id FROM nodes n
@@ -1142,7 +1149,7 @@ export async function recordPostgresPoolNodeReport(
       report.state === "mounted" && binding.state === "claimed"
         ? "mounted"
         : binding.state;
-    await env.DB.batch([
+    const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE pool_bindings SET state=?,node_report_json=?,updated_at=?,mounted_at=CASE WHEN ?='mounted' THEN COALESCE(mounted_at,?) ELSE mounted_at END WHERE id=? AND scope_sha256=? AND state=?
         AND EXISTS(SELECT 1 FROM databases d JOIN database_admission_epochs ae ON ae.database_id=d.id WHERE d.id=pool_bindings.database_id AND d.generation=pool_bindings.generation
@@ -1159,7 +1166,7 @@ export async function recordPostgresPoolNodeReport(
         binding.state,
       ),
       env.DB.prepare(
-        "UPDATE database_runtime_holders SET state=?,updated_at=? WHERE database_id=? AND binding_id=? AND revision=? AND EXISTS(SELECT 1 FROM pool_bindings b WHERE b.id=? AND b.state=?)",
+        "UPDATE database_runtime_holders SET state=?,updated_at=? WHERE database_id=? AND binding_id=? AND revision=? AND EXISTS(SELECT 1 FROM pool_bindings b WHERE b.id=? AND b.state=? AND b.node_report_json=?)",
       ).bind(
         next,
         now,
@@ -1168,8 +1175,11 @@ export async function recordPostgresPoolNodeReport(
         binding.holder_revision,
         bindingId,
         next,
+        JSON.stringify(report),
       ),
     ]);
+    if (results.some((result) => result.meta.changes !== 1)) throw conflict();
+    await hintPostgresPoolProgress(env, binding);
     return;
   }
   if (terminal(binding.state)) {
@@ -1303,6 +1313,7 @@ export async function recordPostgresPoolNodeReport(
   await (
     await import("./roles.ts")
   ).finalizeDeferredPoolRoleChange(env, scope.database_id);
+  await hintPostgresPoolProgress(env, binding);
 }
 export async function recordPostgresPoolServing(
   env: Env,
@@ -1395,6 +1406,7 @@ export async function recordPostgresPoolServing(
     ),
   ]);
   if (results.some((result) => result.meta.changes !== 1)) throw conflict();
+  await hintPostgresPoolProgress(env, binding);
 }
 export function postgresPoolIdleChargeSql(
   nodeAlias: string,
@@ -1675,6 +1687,7 @@ export async function recordPostgresPoolSupervisorReport(
     .bind(JSON.stringify(report), Date.now(), id, binding.scope_sha256)
     .run();
   if (result.meta.changes !== 1) throw conflict();
+  await hintPostgresPoolProgress(env, binding);
 }
 
 function poolStorageProfileMatches(
@@ -1875,14 +1888,7 @@ export async function recordPostgresPoolIoAttestation(
     )
     .run();
   if (result.meta.changes !== 1) throw conflict();
-  const delivery = await readDesiredPostgresPoolBinding(
-    env,
-    binding.scope.database_id,
-  );
-  if (delivery)
-    await env.REGION_LINK.get(
-      env.REGION_LINK.idFromName(binding.scope.region_id),
-    ).notifyPoolBinding(binding.scope.node_id, delivery);
+  await hintPostgresPoolProgress(env, binding);
 }
 async function thinGuardMatches(
   env: Env,
