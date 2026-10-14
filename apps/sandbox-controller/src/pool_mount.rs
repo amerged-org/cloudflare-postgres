@@ -409,9 +409,7 @@ impl Ext4ReadOnly {
     pub fn pgdata(&self) -> io::Result<File> {
         let root = File::from(self.creation.mount.try_clone()?);
         let data = beneath(&root, "pgdata")?;
-        if data.metadata()?.dev() != self.creation.device
-            || !descriptor_readonly(data.as_fd())?
-        {
+        if data.metadata()?.dev() != self.creation.device || !descriptor_readonly(data.as_fd())? {
             return Err(refused());
         }
         Ok(data)
