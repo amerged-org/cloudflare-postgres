@@ -39,6 +39,16 @@ test("pool supervisor source selects its own immutable native image", () => {
   );
 });
 
+test("qualification verifier schema rebuilds its native consumers", () => {
+  const inputs = selectImageInputs(
+    ["packages/contracts/native/qualification.generated.json"],
+    "push",
+  );
+  assert.equal(inputs.pool_supervisor, true);
+  assert.equal(inputs.native_controller, true);
+  assert.equal(inputs.sandbox_controller, true);
+});
+
 test("supervisor manifest and auto-discovered targets invalidate every shipped workspace metadata file", () => {
   const manifest = selectImageInputs(
     ["apps/pool-supervisor/Cargo.toml"],

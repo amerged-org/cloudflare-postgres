@@ -97,6 +97,7 @@ const nativeSchemaInputs = new Set(
     "reclaim",
     "compute-pool",
     "postgres-pool",
+    "qualification",
   ].map((name) => `packages/contracts/native/${name}.generated.json`),
 );
 function rustInputs(path: string, directory: string): boolean {

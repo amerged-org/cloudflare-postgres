@@ -38,6 +38,53 @@ import {
 import { sandboxImagePlan } from "../../infra/talos/sandbox/images.ts";
 import versions from "../../infra/platform/versions.lock.json" with { type: "json" };
 
+test("supervisor qualification binds the actual inspection verifier schema", async () => {
+  const check = runtimeChecks("pool-supervisor")[0]!;
+  const sha = async (path: string) =>
+    createHash("sha256")
+      .update(await readFile(path))
+      .digest("hex");
+  const version = {
+    program: "pgcf-pool-supervisor",
+    version: "0.1.0",
+    rustVersion,
+    sourceRevision: "a".repeat(40),
+    versionsLockSha256: "b".repeat(64),
+    cargoLockSha256: "c".repeat(64),
+    protocolSha256: await sha(
+      "packages/contracts/native/protocol.generated.json",
+    ),
+    poolContractSha256: await sha(
+      "packages/contracts/native/postgres-pool.generated.json",
+    ),
+    qualificationContractSha256: await sha(
+      "packages/contracts/native/qualification.generated.json",
+    ),
+  };
+  const result = (value: unknown) => ({
+    stdout: JSON.stringify(value),
+    stderr: "",
+    exit: 0,
+  });
+  assert.doesNotThrow(() => validateRuntimeResult(check, result(version)));
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        check,
+        result({ ...version, qualificationContractSha256: undefined }),
+      ),
+    /runtime_generated_input_invalid/,
+  );
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        check,
+        result({ ...version, qualificationContractSha256: "d".repeat(64) }),
+      ),
+    /runtime_generated_input_invalid/,
+  );
+});
+
 test("bootstrap runtime checks follow changed lock versions without second constants", () => {
   const previous = [
     versions.target.talosVersion,

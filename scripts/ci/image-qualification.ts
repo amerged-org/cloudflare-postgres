@@ -955,7 +955,9 @@ export function validateRuntimeResult(
         value.protocolSha256 ===
           sha("packages/contracts/native/protocol.generated.json") &&
           value.poolContractSha256 ===
-            sha("packages/contracts/native/postgres-pool.generated.json"),
+            sha("packages/contracts/native/postgres-pool.generated.json") &&
+          value.qualificationContractSha256 ===
+            sha("packages/contracts/native/qualification.generated.json"),
         `runtime_generated_input_invalid:${check.stage}`,
       );
     }
@@ -1237,6 +1239,10 @@ export async function verifyRustAssembly(
           [
             "postgres-pool.generated.json",
             "packages/contracts/native/postgres-pool.generated.json",
+          ],
+          [
+            "qualification.generated.json",
+            "packages/contracts/native/qualification.generated.json",
           ],
         ]
       : []),
