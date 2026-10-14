@@ -15,6 +15,7 @@ import {
 import {
   qualificationScopeFixture,
   qualificationHostFixture,
+  qualificationOrdinaryIoFixture,
 } from "./postgres-pool-qualification.fixture.ts";
 
 it("scopes qualification to one thin volume, physical node and candidate", () => {
@@ -245,7 +246,7 @@ it("signs only a bounded current qualification challenge and detects tampering a
   ).toBe("a".repeat(64));
 });
 
-it("retains the measured writer PID namespace when matching the actual IO attestation", () => {
+it("refuses configured IO tuples without a measured paired scratch experiment", () => {
   const s = qualificationScopeFixture();
   expect(
     PostgresPoolQualificationMeasurement.safeParse({
@@ -267,7 +268,75 @@ it("retains the measured writer PID namespace when matching the actual IO attest
         },
       ],
     }).success,
-  ).toBe(true);
+  ).toBe(false);
+});
+
+it("requires equal direct work, both writer counters and unchanged inherited caps", () => {
+  const s = PostgresPoolQualificationScope.parse(qualificationScopeFixture()),
+    measured = PostgresPoolQualificationMeasurement.parse({
+      gate: "thin_io_limits",
+      binding_id: s.run_id,
+      device_major: 253,
+      device_minor: 2,
+      ordinary_direct_io: qualificationOrdinaryIoFixture(s),
+      writer_cgroups: ["a", "b"].map((id, i) => ({
+        container_id: id.repeat(64),
+        cgroup_inode: 4 + i,
+        pid: 12 + i,
+        start_ticks: 13 + i,
+        pid_namespace: 0xeffffffc,
+        device_major: 253,
+        device_minor: 2,
+        write_bytes_per_second: s.storage.write_bytes_per_second,
+        write_iops_per_second: s.storage.write_iops_per_second,
+      })),
+    });
+  expect(postgresPoolQualificationGatePassed(s, measured)).toBe(true);
+  if (measured.gate !== "thin_io_limits" || "failure_code" in measured)
+    throw Error("Expected IO vector");
+  const reset = structuredClone(measured);
+  reset.ordinary_direct_io.capped.writers[0]!.after.wbytes =
+    reset.ordinary_direct_io.capped.writers[0]!.before.wbytes - 1;
+  expect(postgresPoolQualificationGatePassed(s, reset)).toBe(false);
+  const changed = structuredClone(measured);
+  changed.ordinary_direct_io.inherited_limits_after[0]!.write_bytes_per_second =
+    null;
+  expect(postgresPoolQualificationGatePassed(s, changed)).toBe(false);
+  const unfinished = structuredClone(measured);
+  unfinished.ordinary_direct_io.capped.writers[1]!.completed_bytes = 0;
+  expect(postgresPoolQualificationGatePassed(s, unfinished)).toBe(false);
+  const ineffective = structuredClone(measured);
+  ineffective.ordinary_direct_io.capped.end_offset_nanoseconds =
+    ineffective.ordinary_direct_io.capped.start_offset_nanoseconds + 500000000;
+  expect(postgresPoolQualificationGatePassed(s, ineffective)).toBe(false);
+  const jitter = structuredClone(measured);
+  jitter.ordinary_direct_io.capped.end_offset_nanoseconds =
+    jitter.ordinary_direct_io.capped.start_offset_nanoseconds +
+    jitter.ordinary_direct_io.baseline.end_offset_nanoseconds -
+    jitter.ordinary_direct_io.baseline.start_offset_nanoseconds +
+    1;
+  expect(postgresPoolQualificationGatePassed(s, jitter)).toBe(false);
+  const tooSmall = structuredClone(measured);
+  tooSmall.ordinary_direct_io.scratch_file_bytes = 8192;
+  tooSmall.ordinary_direct_io.workers.forEach((w) => {
+    w.work_bytes = 4096;
+  });
+  for (const phase of [
+    tooSmall.ordinary_direct_io.baseline,
+    tooSmall.ordinary_direct_io.capped,
+  ])
+    phase.writers.forEach((w) => {
+      w.completed_bytes = 4096;
+    });
+  expect(postgresPoolQualificationGatePassed(s, tooSmall)).toBe(false);
+  const transient = structuredClone(measured);
+  transient.ordinary_direct_io.baseline.end_offset_nanoseconds = 100000000;
+  transient.ordinary_direct_io.capped.start_offset_nanoseconds = 110000000;
+  transient.ordinary_direct_io.capped.end_offset_nanoseconds = 410000000;
+  expect(postgresPoolQualificationGatePassed(s, transient)).toBe(false);
+  const notClean = structuredClone(measured);
+  notClean.ordinary_direct_io.remaining_probe_descriptors = 1;
+  expect(postgresPoolQualificationGatePassed(s, notClean)).toBe(false);
 });
 
 it("allows the finite creator experiment before any tenant binding exists", async () => {

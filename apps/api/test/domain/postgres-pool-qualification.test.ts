@@ -24,15 +24,129 @@ import type { Env } from "../../src/env.ts";
 import {
   currentFence,
   readThinQualificationFence,
+  readPoolQualificationIoFence,
 } from "../../src/domain/postgres-pool-qualification.ts";
 import {
   PoolPodPreparationContext,
   poolPreparationContextHash,
+  PoolBindingScope,
+  PoolIoAttestation,
 } from "@pgcf/contracts/postgres-pool";
 import { readPostgresPoolQualificationSetup } from "../../src/domain/postgres-pool-qualification-authority.ts";
 
 const runs: string[] = [];
 const releases: string[] = [];
+it("joins scratch IO to the actual holder ancestor and fences later attestation changes", async () => {
+  const f = await poolQualificationSource(releases),
+    started = await request(
+      `/v1/nodes/${f.node}/postgres-pool/qualifications`,
+      f.admin,
+      "POST",
+      f.request,
+    );
+  expect(started.status).toBe(202);
+  const run = (await started.json()) as PostgresPoolQualificationRun;
+  runs.push(run.id);
+  const prepared = await qualificationCompletionState(f, run),
+    holder = (await env.DB.prepare(
+      "SELECT scope_json,scope_sha256 FROM pool_bindings WHERE id=?",
+    )
+      .bind(prepared.bindingId)
+      .first<{ scope_json: string; scope_sha256: string }>())!,
+    binding = PoolBindingScope.parse(JSON.parse(holder.scope_json)),
+    journal = JSON.parse(
+      (await env.DB.prepare(
+        "SELECT evidence_json FROM postgres_pool_qualification_runs WHERE id=?",
+      )
+        .bind(run.id)
+        .first<string>("evidence_json"))!,
+    ) as { entries: { measurement: PostgresPoolQualificationMeasurement }[] },
+    measured = journal.entries.find(
+      (e) => e.measurement.gate === "thin_io_limits",
+    )!.measurement;
+  if (measured.gate !== "thin_io_limits" || "failure_code" in measured)
+    throw Error("Expected IO vector");
+  const io = PoolIoAttestation.parse({
+    v: 1,
+    binding_id: prepared.bindingId,
+    scope_sha256: holder.scope_sha256,
+    node_uid: run.scope.node_uid,
+    boot_id: run.scope.boot_id,
+    pool_namespace_uid: binding.pool_namespace_uid,
+    pool_pod_uid: binding.pool_pod_uid,
+    observed_at: Date.now(),
+    device: {
+      volume_group_uuid: run.scope.volume.volume_group_uuid,
+      lv_uuid: run.scope.volume.lv_uuid,
+      thin_id: run.scope.thin_id,
+      device_major: measured.device_major,
+      device_minor: measured.device_minor,
+    },
+    shared_pod_io: {
+      pod_cgroup_inode:
+        measured.ordinary_direct_io.inherited_limits_before[0]!.cgroup_inode,
+      device_major: measured.device_major,
+      device_minor: measured.device_minor,
+      write_bytes_per_second: run.scope.storage.write_bytes_per_second,
+      write_iops_per_second: run.scope.storage.write_iops_per_second,
+      io_max_verified: true,
+      all_writer_cgroups_descendants: true,
+    },
+    cgroups: measured.writer_cgroups.map((c) => ({
+      ...c,
+      io_max_verified: true,
+    })),
+  });
+  await env.DB.prepare(
+    "INSERT INTO pool_io_attestations(binding_id,attestation_json,observed_at) VALUES(?,?,?)",
+  )
+    .bind(prepared.bindingId, JSON.stringify(io), io.observed_at)
+    .run();
+  const changedAncestor = structuredClone(measured);
+  changedAncestor.ordinary_direct_io.inherited_limits_before[0]!.cgroup_inode++;
+  changedAncestor.ordinary_direct_io.inherited_limits_after[0]!.cgroup_inode++;
+  await expect(
+    readPoolQualificationIoFence(
+      env,
+      run.scope,
+      binding,
+      holder.scope_sha256,
+      changedAncestor,
+    ),
+  ).rejects.toThrow();
+  const fence = await readPoolQualificationIoFence(
+      env,
+      run.scope,
+      binding,
+      holder.scope_sha256,
+      measured,
+    ),
+    readback = () =>
+      env.DB.prepare(`SELECT 1 current WHERE ${fence.sql}`)
+        .bind(...fence.bindings)
+        .first();
+  expect(await readback()).not.toBeNull();
+  const expired = await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE pool_io_attestations SET observed_at=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)-60001 WHERE binding_id=?",
+    ).bind(prepared.bindingId),
+    env.DB.prepare(`SELECT 1 current WHERE ${fence.sql}`).bind(
+      ...fence.bindings,
+    ),
+  ]);
+  expect(expired[1]!.results).toEqual([]);
+  await env.DB.prepare(
+    "UPDATE pool_io_attestations SET observed_at=? WHERE binding_id=?",
+  )
+    .bind(io.observed_at, prepared.bindingId)
+    .run();
+  await env.DB.prepare(
+    "UPDATE pool_io_attestations SET attestation_json=json_set(attestation_json,'$.shared_pod_io.pod_cgroup_inode',?) WHERE binding_id=?",
+  )
+    .bind(io.shared_pod_io.pod_cgroup_inode + 1, prepared.bindingId)
+    .run();
+  expect(await readback()).toBeNull();
+});
 it("publishes pending progress separately from challenge consumption", async () => {
   const f = await fixture();
   const response = await request("/agent/v1/openapi.json", f.agent);

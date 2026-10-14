@@ -25,6 +25,7 @@ import {
   POSTGRES_POOL_QUALIFICATION_GATES,
   PostgresPoolQualificationScope,
   PostgresPoolQualificationReport,
+  type PostgresPoolQualificationMeasurement,
   PostgresPoolQualificationChallenge,
   PostgresPoolQualificationEvidence,
   PostgresPoolQualificationRun,
@@ -1569,37 +1570,14 @@ async function measuredHolder(
     ).join("");
     if (digest !== m.authority_sha256) conflict();
   }
-  if (m.gate === "thin_io_limits") {
-    const stored = await env.DB.prepare(
-        "SELECT attestation_json FROM pool_io_attestations WHERE binding_id=?",
-      )
-        .bind(m.binding_id)
-        .first<{ attestation_json: string }>(),
-      io = PoolIoAttestation.safeParse(
-        stored ? JSON.parse(stored.attestation_json) : null,
-      );
-    if (
-      !io.success ||
-      io.data.scope_sha256 !== holder.scope_sha256 ||
-      io.data.node_uid !== s.node_uid ||
-      io.data.boot_id !== s.boot_id ||
-      !fresh(io.data.observed_at, Date.now()) ||
-      m.device_major !== io.data.device.device_major ||
-      m.device_minor !== io.data.device.device_minor ||
-      !equal(
-        [...m.writer_cgroups.map((c) => c.container_id)].sort(),
-        [...binding.container_ids].sort(),
-      ) ||
-      !equal(
-        m.writer_cgroups,
-        io.data.cgroups.map(({ io_max_verified: verified, ...c }) => {
-          void verified;
-          return c;
-        }),
-      )
-    )
-      conflict();
-  }
+  if (m.gate === "thin_io_limits")
+    return readPoolQualificationIoFence(
+      env,
+      s,
+      binding,
+      holder.scope_sha256,
+      m,
+    );
   if (
     m.gate === "wal_archive" ||
     m.gate === "base_backup" ||
@@ -1652,6 +1630,60 @@ async function measuredHolder(
       !node.data.kernel_proof.named_namespace_scan_complete)
   )
     conflict();
+}
+
+/** Read the actual holder IO witness; the returned SQL fences this exact read after awaits. */
+export async function readPoolQualificationIoFence(
+  env: Pick<Env, "DB">,
+  s: PostgresPoolQualificationScope,
+  binding: PoolBindingScope,
+  scopeHash: string,
+  m: Extract<PostgresPoolQualificationMeasurement, { gate: "thin_io_limits" }>,
+) {
+  const stored = await env.DB.prepare(
+      "SELECT attestation_json FROM pool_io_attestations WHERE binding_id=?",
+    )
+      .bind(m.binding_id)
+      .first<{ attestation_json: string }>(),
+    io = PoolIoAttestation.safeParse(
+      stored ? JSON.parse(stored.attestation_json) : null,
+    ),
+    inherited = io.success
+      ? m.ordinary_direct_io.inherited_limits_before.find(
+          (l) => l.cgroup_inode === io.data.shared_pod_io.pod_cgroup_inode,
+        )
+      : undefined;
+  if (
+    !io.success ||
+    !inherited ||
+    inherited.write_bytes_per_second !==
+      io.data.shared_pod_io.write_bytes_per_second ||
+    inherited.write_iops_per_second !==
+      io.data.shared_pod_io.write_iops_per_second ||
+    binding.binding_id !== m.binding_id ||
+    io.data.scope_sha256 !== scopeHash ||
+    io.data.node_uid !== s.node_uid ||
+    io.data.boot_id !== s.boot_id ||
+    !fresh(io.data.observed_at, Date.now()) ||
+    m.device_major !== io.data.device.device_major ||
+    m.device_minor !== io.data.device.device_minor ||
+    !equal(
+      [...m.writer_cgroups.map((c) => c.container_id)].sort(),
+      [...binding.container_ids].sort(),
+    ) ||
+    !equal(
+      m.writer_cgroups,
+      io.data.cgroups.map(({ io_max_verified: verified, ...c }) => {
+        void verified;
+        return c;
+      }),
+    )
+  )
+    conflict();
+  return {
+    sql: "EXISTS(SELECT 1 FROM pool_io_attestations WHERE binding_id=? AND attestation_json=? AND observed_at>=(julianday('now')-2440587.5)*86400000-60000 AND observed_at<=(julianday('now')-2440587.5)*86400000+5000)",
+    bindings: [m.binding_id, stored!.attestation_json],
+  };
 }
 
 export async function reportPostgresPoolQualification(

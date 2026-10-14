@@ -95,6 +95,90 @@ export type PostgresPoolQualificationRequest = z.infer<
 
 const Counter = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const Positive = Counter.positive();
+/** Fixed, disposable ordinary-data experiment; these limits never bound metadata/swap BIOs. */
+export const POOL_QUALIFICATION_ORDINARY_IO = {
+  purpose: "ordinary_direct_data_effectiveness",
+  scratch_name_prefix: ".pgcf-q-io-",
+  maximum_file_bytes: 67_108_864,
+  block_bytes: 4096,
+  writer_count: 2,
+  // Linux v6.18.54 blk-throttle.c DFL_THROTL_SLICE is HZ/10.
+  throttle_slice_milliseconds: 100,
+  // Chosen experiment thresholds, not a kernel bandwidth or all-BIO guarantee.
+  minimum_slices: 20,
+  minimum_slowdown_factor: 2,
+} as const;
+const IoCounters = z.strictObject({ wbytes: Counter, wios: Counter });
+const IoLimits = z.strictObject({
+  write_bytes_per_second: Positive.nullable(),
+  write_iops_per_second: Positive.nullable(),
+});
+const IoWorker = z.strictObject({
+  pid: Positive.max(2147483647),
+  start_ticks: Positive,
+  pid_namespace: Positive,
+  cgroup_inode: Positive,
+});
+const IoPhase = z.strictObject({
+  start_offset_nanoseconds: Counter,
+  end_offset_nanoseconds: Positive,
+  scratch_file_inode: Positive,
+  limits_before: IoLimits,
+  limits_after: IoLimits,
+  ancestor_before: IoCounters,
+  ancestor_after: IoCounters,
+  writers: z
+    .array(
+      z.strictObject({
+        ...IoWorker.shape,
+        before: IoCounters,
+        after: IoCounters,
+        completed_bytes: Counter,
+        /** Actual pwrite and fsync completion; an unknown/failed completion never passes. */
+        completion_errno: Counter.max(4095),
+      }),
+    )
+    .length(POOL_QUALIFICATION_ORDINARY_IO.writer_count),
+});
+export const PostgresPoolQualificationOrdinaryIo = z.strictObject({
+  purpose: z.literal(POOL_QUALIFICATION_ORDINARY_IO.purpose),
+  volume_handle: z.string().regex(/^pvc-[a-f0-9-]{36}$/),
+  /** Created exclusively at the mounted volume root, outside its pgdata subdirectory. */
+  scratch_relative_name: z.string().regex(/^\.pgcf-q-io-[a-f0-9-]{36}\.bin$/),
+  scratch_file_inode: Positive,
+  scratch_file_bytes: Positive.max(
+    POOL_QUALIFICATION_ORDINARY_IO.maximum_file_bytes,
+  ),
+  device_major: Counter,
+  device_minor: Counter,
+  dedicated_group_inode: Positive,
+  inherited_limits_before: z
+    .array(z.strictObject({ cgroup_inode: Positive, ...IoLimits.shape }))
+    .min(1)
+    .max(32),
+  inherited_limits_after: z
+    .array(z.strictObject({ cgroup_inode: Positive, ...IoLimits.shape }))
+    .min(1)
+    .max(32),
+  workers: z
+    .array(
+      z.strictObject({
+        ...IoWorker.shape,
+        work_bytes: Positive,
+        block_bytes: z.literal(POOL_QUALIFICATION_ORDINARY_IO.block_bytes),
+      }),
+    )
+    .length(POOL_QUALIFICATION_ORDINARY_IO.writer_count),
+  baseline: IoPhase,
+  capped: IoPhase,
+  unlink_errno: Counter.max(4095),
+  remaining_probe_processes: Counter,
+  remaining_probe_descriptors: Counter,
+  group_remove_errno: Counter.max(4095),
+});
+export type PostgresPoolQualificationOrdinaryIo = z.infer<
+  typeof PostgresPoolQualificationOrdinaryIo
+>;
 const { nonce: consumedNonce, ...readFields } = PoolStorageReadReport.shape;
 void consumedNonce;
 export const PostgresPoolQualificationRead = z
@@ -251,6 +335,7 @@ const MeasuredQualification = z.discriminatedUnion("gate", [
     ...Binding,
     device_major: Counter,
     device_minor: Counter,
+    ordinary_direct_io: PostgresPoolQualificationOrdinaryIo,
     writer_cgroups: z
       .array(
         z.strictObject({
@@ -349,6 +434,115 @@ export type PostgresPoolQualificationMeasurement = z.infer<
   typeof PostgresPoolQualificationMeasurement
 >;
 
+/** A paired observation of this fixed direct-data workload, never an all-BIO allocation bound. */
+export function postgresPoolQualificationOrdinaryIoPassed(
+  scope: PostgresPoolQualificationScope,
+  io: PostgresPoolQualificationOrdinaryIo,
+): boolean {
+  const sameLimits = (
+      a: z.infer<typeof IoLimits>,
+      b: z.infer<typeof IoLimits>,
+    ) =>
+      a.write_bytes_per_second === b.write_bytes_per_second &&
+      a.write_iops_per_second === b.write_iops_per_second,
+    sameWorker = (a: z.infer<typeof IoWorker>, b: z.infer<typeof IoWorker>) =>
+      a.pid === b.pid &&
+      a.start_ticks === b.start_ticks &&
+      a.pid_namespace === b.pid_namespace &&
+      a.cgroup_inode === b.cgroup_inode,
+    b = io.baseline,
+    c = io.capped,
+    cappedLimits = c.limits_before,
+    baselineElapsed = b.end_offset_nanoseconds - b.start_offset_nanoseconds,
+    cappedElapsed = c.end_offset_nanoseconds - c.start_offset_nanoseconds,
+    minimumElapsed =
+      POOL_QUALIFICATION_ORDINARY_IO.throttle_slice_milliseconds *
+      POOL_QUALIFICATION_ORDINARY_IO.minimum_slices *
+      1_000_000;
+  if (
+    io.volume_handle !== scope.volume.volume_handle ||
+    io.scratch_relative_name !==
+      `${POOL_QUALIFICATION_ORDINARY_IO.scratch_name_prefix}${scope.run_id}.bin` ||
+    io.unlink_errno !== 0 ||
+    io.remaining_probe_processes !== 0 ||
+    io.remaining_probe_descriptors !== 0 ||
+    io.group_remove_errno !== 0 ||
+    io.workers.reduce((n, w) => n + w.work_bytes, 0) !==
+      io.scratch_file_bytes ||
+    io.workers.some((w) => w.work_bytes % w.block_bytes !== 0) ||
+    new Set(io.workers.map((w) => w.pid)).size !== io.workers.length ||
+    new Set([
+      io.dedicated_group_inode,
+      ...io.workers.map((w) => w.cgroup_inode),
+      ...io.inherited_limits_before.map((l) => l.cgroup_inode),
+    ]).size !==
+      1 + io.workers.length + io.inherited_limits_before.length ||
+    io.inherited_limits_before.length !== io.inherited_limits_after.length ||
+    io.inherited_limits_before.some(
+      (l, i) =>
+        l.cgroup_inode !== io.inherited_limits_after[i]!.cgroup_inode ||
+        !sameLimits(l, io.inherited_limits_after[i]!),
+    ) ||
+    b.limits_before.write_bytes_per_second !== null ||
+    b.limits_before.write_iops_per_second !== null ||
+    !sameLimits(b.limits_before, b.limits_after) ||
+    !sameLimits(c.limits_before, c.limits_after) ||
+    cappedLimits.write_bytes_per_second === null ||
+    cappedLimits.write_iops_per_second === null ||
+    cappedLimits.write_bytes_per_second >=
+      scope.storage.write_bytes_per_second ||
+    cappedLimits.write_iops_per_second >= scope.storage.write_iops_per_second ||
+    io.inherited_limits_before.some(
+      (l) =>
+        (l.write_bytes_per_second !== null &&
+          cappedLimits.write_bytes_per_second! >= l.write_bytes_per_second) ||
+        (l.write_iops_per_second !== null &&
+          cappedLimits.write_iops_per_second! >= l.write_iops_per_second),
+    ) ||
+    b.end_offset_nanoseconds <= b.start_offset_nanoseconds ||
+    c.end_offset_nanoseconds <= c.start_offset_nanoseconds ||
+    c.start_offset_nanoseconds < b.end_offset_nanoseconds ||
+    c.end_offset_nanoseconds >
+      POOL_QUALIFICATION_PERMISSION.maximum_milliseconds * 1_000_000 ||
+    // Twenty nominal slices of requested direct-data work and observed time
+    // avoid a short transient; the twofold slowdown tests material effectiveness.
+    cappedElapsed < minimumElapsed ||
+    BigInt(io.scratch_file_bytes) * 1_000_000_000n <
+      BigInt(cappedLimits.write_bytes_per_second) * BigInt(minimumElapsed) ||
+    BigInt(cappedElapsed) <
+      BigInt(baselineElapsed) *
+        BigInt(POOL_QUALIFICATION_ORDINARY_IO.minimum_slowdown_factor)
+  )
+    return false;
+  for (const phase of [b, c]) {
+    if (
+      phase.scratch_file_inode !== io.scratch_file_inode ||
+      phase.ancestor_after.wbytes <= phase.ancestor_before.wbytes ||
+      phase.ancestor_after.wios <= phase.ancestor_before.wios ||
+      phase.writers.some(
+        (w, i) =>
+          !sameWorker(w, io.workers[i]!) ||
+          w.completed_bytes !== io.workers[i]!.work_bytes ||
+          w.completion_errno !== 0 ||
+          w.after.wbytes - w.before.wbytes < w.completed_bytes ||
+          w.after.wios <= w.before.wios,
+      ) ||
+      BigInt(phase.ancestor_after.wbytes - phase.ancestor_before.wbytes) <
+        phase.writers.reduce(
+          (n, w) => n + BigInt(w.after.wbytes - w.before.wbytes),
+          0n,
+        ) ||
+      BigInt(phase.ancestor_after.wios - phase.ancestor_before.wios) <
+        phase.writers.reduce(
+          (n, w) => n + BigInt(w.after.wios - w.before.wios),
+          0n,
+        )
+    )
+      return false;
+  }
+  return true;
+}
+
 export function postgresPoolQualificationGatePassed(
   scope: PostgresPoolQualificationScope,
   raw: PostgresPoolQualificationMeasurement,
@@ -435,6 +629,12 @@ export function postgresPoolQualificationGatePassed(
       );
     case "thin_io_limits":
       return (
+        postgresPoolQualificationOrdinaryIoPassed(
+          scope,
+          m.ordinary_direct_io,
+        ) &&
+        m.ordinary_direct_io.device_major === m.device_major &&
+        m.ordinary_direct_io.device_minor === m.device_minor &&
         new Set(m.writer_cgroups.map((c) => c.container_id)).size ===
           m.writer_cgroups.length &&
         m.writer_cgroups.every(

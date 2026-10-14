@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Structural contract fixtures; never live qualification evidence.
-import type { PostgresPoolQualificationScope } from "../src/postgres-pool-qualification.ts";
+import type {
+  PostgresPoolQualificationScope,
+  PostgresPoolQualificationOrdinaryIo,
+} from "../src/postgres-pool-qualification.ts";
 import { postgresPoolQualificationNonceHash } from "../src/postgres-pool-qualification.ts";
 export function qualificationScopeFixture() {
   const uuid = (n: number) =>
@@ -138,5 +141,92 @@ export async function qualificationHostFixture(
       },
       observed_at: at,
     },
+  };
+}
+
+/** Structural counter vector for schema/authority tests, never a measured IO receipt. */
+export function qualificationOrdinaryIoFixture(
+  s: PostgresPoolQualificationScope,
+): PostgresPoolQualificationOrdinaryIo {
+  const work = 524288,
+    file = 123,
+    workers = [0, 1].map((i) => ({
+      pid: 20 + i,
+      start_ticks: 100 + i,
+      pid_namespace: 0xeffffffc,
+      cgroup_inode: 2001 + i,
+      work_bytes: work,
+      block_bytes: 4096 as const,
+    })),
+    inherited = [
+      {
+        cgroup_inode: 1000,
+        write_bytes_per_second: s.storage.write_bytes_per_second,
+        write_iops_per_second: s.storage.write_iops_per_second,
+      },
+    ],
+    caps = {
+      write_bytes_per_second: Math.max(
+        1,
+        Math.floor(s.storage.write_bytes_per_second / 4),
+      ),
+      write_iops_per_second: Math.max(
+        1,
+        Math.floor(s.storage.write_iops_per_second / 4),
+      ),
+    },
+    phase = (second: boolean) => ({
+      start_offset_nanoseconds: second ? 1010000000 : 0,
+      end_offset_nanoseconds: second ? 5010000000 : 1000000000,
+      scratch_file_inode: file,
+      limits_before: second
+        ? caps
+        : { write_bytes_per_second: null, write_iops_per_second: null },
+      limits_after: second
+        ? caps
+        : { write_bytes_per_second: null, write_iops_per_second: null },
+      ancestor_before: {
+        wbytes: 8192 + (second ? work * 2 : 0),
+        wios: 2 + (second ? (work * 2) / 4096 : 0),
+      },
+      ancestor_after: {
+        wbytes: 8192 + (second ? work * 4 : work * 2),
+        wios: 2 + (second ? (work * 4) / 4096 : (work * 2) / 4096),
+      },
+      writers: workers.map((worker) => ({
+        pid: worker.pid,
+        start_ticks: worker.start_ticks,
+        pid_namespace: worker.pid_namespace,
+        cgroup_inode: worker.cgroup_inode,
+        before: {
+          wbytes: 4096 + (second ? work : 0),
+          wios: 1 + (second ? work / 4096 : 0),
+        },
+        after: {
+          wbytes: 4096 + (second ? work * 2 : work),
+          wios: 1 + (second ? (work * 2) / 4096 : work / 4096),
+        },
+        completed_bytes: worker.work_bytes,
+        completion_errno: 0,
+      })),
+    });
+  return {
+    purpose: "ordinary_direct_data_effectiveness",
+    volume_handle: s.volume.volume_handle,
+    scratch_relative_name: `.pgcf-q-io-${s.run_id}.bin`,
+    scratch_file_inode: file,
+    scratch_file_bytes: work * 2,
+    device_major: 253,
+    device_minor: 2,
+    dedicated_group_inode: 2000,
+    inherited_limits_before: inherited,
+    inherited_limits_after: structuredClone(inherited),
+    workers,
+    baseline: phase(false),
+    capped: phase(true),
+    unlink_errno: 0,
+    remaining_probe_processes: 0,
+    remaining_probe_descriptors: 0,
+    group_remove_errno: 0,
   };
 }

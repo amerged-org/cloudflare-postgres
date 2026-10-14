@@ -24,6 +24,7 @@ import generated from "../../../../packages/contracts/native/postgres-pool.gener
 import {
   qualificationScopeFixture,
   qualificationHostFixture,
+  qualificationOrdinaryIoFixture,
 } from "../../../../packages/contracts/test/postgres-pool-qualification.fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { readPostgresPoolDatabaseContext } from "../../src/domain/postgres-pool-context.ts";
@@ -230,6 +231,7 @@ export async function qualificationCompletionState(
       binding_id: bindingId,
       device_major: 253,
       device_minor: 2,
+      ordinary_direct_io: qualificationOrdinaryIoFixture(s),
       writer_cgroups: binding.container_ids.map((container_id, i) => ({
         container_id,
         cgroup_inode: 100 + i,

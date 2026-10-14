@@ -18,11 +18,16 @@ import {
   PostgresPoolQualificationProgress,
   PostgresPoolQualificationProgressReport,
   PostgresPoolQualificationProgressEvidence,
+  PostgresPoolQualificationOrdinaryIo,
+  POOL_QUALIFICATION_ORDINARY_IO,
   postgresPoolQualificationScopeHash,
   postgresPoolQualificationProgressHash,
   postgresPoolQualificationNonceHash,
 } from "../src/postgres-pool-qualification.ts";
-import { qualificationScopeFixture } from "../test/postgres-pool-qualification.fixture.ts";
+import {
+  qualificationScopeFixture,
+  qualificationOrdinaryIoFixture,
+} from "../test/postgres-pool-qualification.fixture.ts";
 const scope = PostgresPoolQualificationScope.parse(qualificationScopeFixture()),
   scopeHash = await postgresPoolQualificationScopeHash(scope),
   claims = PoolQualificationClaims.parse({
@@ -108,7 +113,11 @@ const progress = [
   }),
 ];
 const document = {
-  constants: { ...POOL_QUALIFICATION_PERMISSION, clock_skew_ms: 5000 },
+  constants: {
+    ...POOL_QUALIFICATION_PERMISSION,
+    clock_skew_ms: 5000,
+    ordinary_direct_io: POOL_QUALIFICATION_ORDINARY_IO,
+  },
   gates: POSTGRES_POOL_QUALIFICATION_GATES,
   schemas: Object.fromEntries(
     Object.entries({
@@ -124,12 +133,14 @@ const document = {
       PostgresPoolQualificationProgress,
       PostgresPoolQualificationProgressReport,
       PostgresPoolQualificationProgressEvidence,
+      PostgresPoolQualificationOrdinaryIo,
     }).map(([name, schema]) => [name, z.toJSONSchema(schema)]),
   ),
   fixture: {
     claims,
     progress,
     progress_sha256: await postgresPoolQualificationProgressHash(progress),
+    ordinary_direct_io: qualificationOrdinaryIoFixture(scope),
   },
 };
 const path = new URL("qualification.generated.json", import.meta.url),
