@@ -34,7 +34,8 @@ import { readPostgresPoolQualificationSetup } from "../../src/domain/postgres-po
 const runs: string[] = [];
 const releases: string[] = [];
 it("publishes pending progress separately from challenge consumption", async () => {
-  const response = await request("/agent/v1/openapi.json");
+  const f = await fixture();
+  const response = await request("/agent/v1/openapi.json", f.agent);
   expect(response.status).toBe(200);
   const doc = (await response.json()) as {
     paths: Record<
