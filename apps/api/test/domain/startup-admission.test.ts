@@ -428,7 +428,7 @@ it("keeps busy compensation on the existing awake path but refuses an unknown re
     .first("power_operation")) as string;
   expect(
     await recoverQuiescence(
-      env.DB,
+      env,
       { databaseId: unknownId, operation: unknown, revision: 2 },
       "unknown",
     ),
@@ -445,7 +445,7 @@ it("keeps busy compensation on the existing awake path but refuses an unknown re
     .first("power_operation")) as string;
   expect(
     await recoverQuiescence(
-      env.DB,
+      env,
       { databaseId: busyId, operation: busy, revision: 2 },
       "busy",
     ),
@@ -493,7 +493,7 @@ it("does not let a stale busy refusal reopen a same-timestamp confirmed hibernat
   );
   expect(
     await recoverQuiescence(
-      env.DB,
+      env,
       { databaseId: id, operation: row!.power_operation, revision: 2 },
       "busy",
     ),

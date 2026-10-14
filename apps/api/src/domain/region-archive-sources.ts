@@ -9,6 +9,7 @@ import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
+import { withAdmissionMutation } from "./admission-mutations.ts";
 import {
   decryptCustodyDocument,
   encryptCustodyDocument,
@@ -103,55 +104,86 @@ export async function updateRegionArchiveSource(
         scope(target, source, next),
         JSON.stringify(body.credentials),
       );
-      const result = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `INSERT INTO region_archive_sources(target_region_id,source_region_id,revision,bucket,endpoint_url,kid,iv,ciphertext,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,? FROM regions s JOIN regions t ON t.id=? WHERE s.id=?
-          AND s.backup_bucket=? AND s.backup_endpoint_url=?
-          AND (?=0 OR EXISTS(SELECT 1 FROM region_archive_sources a WHERE a.target_region_id=? AND a.source_region_id=? AND a.revision=?))
-          AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN databases d ON d.id=x.target_database_id
-            JOIN operations o ON o.id=x.operation_id JOIN databases src ON src.id=x.source_database_id
-            WHERE d.region_id=? AND src.region_id=? AND d.deleted_at IS NULL AND o.status<>'succeeded')
-          ON CONFLICT(target_region_id,source_region_id) DO UPDATE SET revision=excluded.revision,bucket=excluded.bucket,
-            endpoint_url=excluded.endpoint_url,kid=excluded.kid,iv=excluded.iv,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at
-          WHERE region_archive_sources.revision=?`,
-        ).bind(
-          target,
-          source,
-          next,
-          body.bucket,
-          body.endpoint_url,
-          envelope.kid,
-          envelope.iv,
-          envelope.ciphertext,
-          now,
-          target,
-          source,
-          body.bucket,
-          body.endpoint_url,
-          body.expected_revision,
-          target,
-          source,
-          body.expected_revision,
-          target,
-          source,
-          body.expected_revision,
-        ),
-        lease.completeStatement(`${target}/${source}`, 200, {
-          sql: "changes()=1",
-          bindings: [],
-        }),
-        c.env.DB.prepare(
-          `UPDATE databases SET generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
-          WHERE changes()=1 AND region_id=? AND deleted_at IS NULL AND desired_state IN('running','suspended')
-          AND id IN(SELECT x.target_database_id FROM database_restores x JOIN databases src ON src.id=x.source_database_id
-            WHERE src.region_id=?)`,
-        ).bind(now, target, source),
-      ]);
-      if (result[0]!.meta.changes !== 1)
-        throw new ApiError(
-          "conflict",
-          "Archive source revision changed or a referencing restore is unfinished",
+      let affected: string[] = [];
+      await withAdmissionMutation(
+        c.env,
+        [],
+        async (mutation) => {
+          const membership = mutation.scopeGuard();
+          affected = mutation.intents.map((intent) => intent.database_id);
+          const published =
+            "EXISTS(SELECT 1 FROM region_archive_sources committed_source WHERE committed_source.target_region_id=? AND committed_source.source_region_id=? AND committed_source.revision=? AND committed_source.ciphertext=?)";
+          const binding = [target, source, next, envelope.ciphertext];
+          const result = await mutation.batch([
+            c.env.DB.prepare(
+              `INSERT INTO region_archive_sources(target_region_id,source_region_id,revision,bucket,endpoint_url,kid,iv,ciphertext,updated_at)
+            SELECT ?,?,?,?,?,?,?,?,? FROM regions s JOIN regions t ON t.id=? WHERE s.id=? AND s.backup_bucket=? AND s.backup_endpoint_url=?
+            AND (?=0 OR EXISTS(SELECT 1 FROM region_archive_sources a WHERE a.target_region_id=? AND a.source_region_id=? AND a.revision=?))
+            AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN databases d ON d.id=x.target_database_id JOIN operations o ON o.id=x.operation_id JOIN databases src ON src.id=x.source_database_id WHERE d.region_id=? AND src.region_id=? AND d.deleted_at IS NULL AND o.status<>'succeeded') AND (${membership.sql})
+            ON CONFLICT(target_region_id,source_region_id) DO UPDATE SET revision=excluded.revision,bucket=excluded.bucket,endpoint_url=excluded.endpoint_url,kid=excluded.kid,iv=excluded.iv,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at WHERE region_archive_sources.revision=? AND (${membership.sql})`,
+            ).bind(
+              target,
+              source,
+              next,
+              body.bucket,
+              body.endpoint_url,
+              envelope.kid,
+              envelope.iv,
+              envelope.ciphertext,
+              now,
+              target,
+              source,
+              body.bucket,
+              body.endpoint_url,
+              body.expected_revision,
+              target,
+              source,
+              body.expected_revision,
+              target,
+              source,
+              ...membership.bindings,
+              body.expected_revision,
+              ...membership.bindings,
+            ),
+            ...mutation.intents.map((intent) => {
+              const guard = mutation.guard(intent.database_id);
+              return c.env.DB.prepare(
+                `UPDATE databases SET generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=? WHERE id=? AND region_id=? AND deleted_at IS NULL AND desired_state IN('running','suspended')
+              AND EXISTS(SELECT 1 FROM database_restores x JOIN databases src ON src.id=x.source_database_id WHERE x.target_database_id=databases.id AND src.region_id=?) AND ${published} AND (${guard.sql})`,
+              ).bind(
+                now,
+                intent.database_id,
+                target,
+                source,
+                ...binding,
+                ...guard.bindings,
+              );
+            }),
+            lease.completeStatement(`${target}/${source}`, 200, {
+              sql: `${published} AND (${membership.sql})`,
+              bindings: [...binding, ...membership.bindings],
+            }),
+          ]);
+          if (result[0]!.meta.changes !== 1)
+            throw new ApiError(
+              "conflict",
+              "Archive source revision changed or a referencing restore is unfinished",
+            );
+        },
+        {
+          kind: "region",
+          id: target,
+          databases: {
+            sql: "d.deleted_at IS NULL AND d.desired_state IN('running','suspended') AND EXISTS(SELECT 1 FROM database_restores selected_restore JOIN databases selected_source ON selected_source.id=selected_restore.source_database_id WHERE selected_restore.target_database_id=d.id AND selected_source.region_id=?)",
+            bindings: [source],
+          },
+        },
+      );
+      if (affected.length)
+        c.executionCtx.waitUntil(
+          c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(target))
+            .notify(affected)
+            .catch(() => undefined),
         );
       return getRegionArchiveSource(c, target, source);
     },

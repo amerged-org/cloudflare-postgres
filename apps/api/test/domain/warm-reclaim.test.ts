@@ -5,6 +5,7 @@ import {
   evictDurableObject,
   createExecutionContext,
   waitOnExecutionContext,
+  runInDurableObject,
 } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
 import {
@@ -50,6 +51,32 @@ const policy = {
   budget_bytes: 32 * 1024 ** 2,
   step_bytes: 1024 ** 2,
 };
+it("exposes a reclaim change barrier without inventing connection activity", async () => {
+  const f = await ready();
+  const lastAdmitted = () =>
+    runInDurableObject(actor(f.id), async (_instance, context) => {
+      if (
+        !context.storage.sql
+          .exec(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='database_reclaim'",
+          )
+          .toArray().length
+      )
+        return 0;
+      return (
+        context.storage.sql
+          .exec<{ value: number }>(
+            "SELECT COALESCE(json_extract(state,'$.last_admitted_at'),0) value FROM database_reclaim WHERE singleton=1",
+          )
+          .toArray()[0]?.value ?? 0
+      );
+    });
+  const before = await lastAdmitted();
+  expect(await actor(f.id).revokeBeforeChange(f.id, Date.now() + 3000)).toBe(
+    true,
+  );
+  expect(await lastAdmitted()).toBe(before);
+});
 async function ready(actualRam = false) {
   const f = await fixture(8192);
   if (actualRam) {
@@ -302,6 +329,66 @@ async function ack(
     },
   );
 }
+it("policy and qualification commits wait for the existing reclaim revocation acknowledgement", async () => {
+  const f = await qualified();
+  expect((await actor(f.id).requestIdle(f.id, 1)).ok).toBe(true);
+  let completed = false;
+  const changing = request(
+    `/v1/databases/${f.id}/warm-reclaim`,
+    f.admin,
+    "PUT",
+    {
+      expected_revision: 1,
+      expected_generation: 1,
+      policy: {
+        ...policy,
+        budget_bytes: policy.budget_bytes + policy.step_bytes,
+      },
+    },
+  ).then((response) => {
+    completed = true;
+    return response;
+  });
+  await expect
+    .poll(async () => (await signed((await snapshot(f)).tokens[0]!)).mode)
+    .toBe("revoked");
+  expect(completed).toBe(false);
+  expect(
+    (await (
+      await request(`/v1/databases/${f.id}/warm-reclaim`, f.admin)
+    ).json()) as { revision: number },
+  ).toMatchObject({ revision: 1 });
+  const revoked = await signed((await snapshot(f)).tokens[0]!);
+  expect(await (await ack(f, revoked)).json()).toEqual({ accepted: 1 });
+  expect((await changing).status).toBe(200);
+  const activity = new Date().toISOString();
+  expect(
+    await actor(f.id).recordActivity(f.id, {
+      revision: 1,
+      observed_at: activity,
+      last_activity_at: new Date(Date.now() - 120000).toISOString(),
+      active_connections: 0,
+    }),
+  ).toBe(true);
+  expect((await actor(f.id).requestIdle(f.id, 1)).ok).toBe(true);
+  let disabled = false;
+  const removing = request(
+    `/v1/nodes/${f.node}/warm-reclaim-qualification`,
+    f.admin,
+    "PUT",
+    { expected_revision: 1, node_uid: f.uid, qualification: null },
+  ).then((response) => {
+    disabled = true;
+    return response;
+  });
+  await expect
+    .poll(async () => (await signed((await snapshot(f)).tokens[0]!)).mode)
+    .toBe("revoked");
+  expect(disabled).toBe(false);
+  const nodeRevoked = await signed((await snapshot(f)).tokens[0]!);
+  expect(await (await ack(f, nodeRevoked)).json()).toEqual({ accepted: 1 });
+  expect((await removing).status).toBe(200);
+});
 it("keeps cold idle behavior until explicit policy and isolated-node qualification exist", async () => {
   const f = await ready();
   expect(

@@ -432,19 +432,26 @@ it("revokes an issued rotation capability when its region is superseded while an
   expect(await f.pointer()).toEqual({ revision: 1, provenance: null });
 });
 
-it("rejects an activation race at the actual custody UPDATE without changing active revision or staged ciphertext", async () => {
+it("rejects authority superseded after preflight before the guarded custody batch without changing its pointer or ciphertext", async () => {
   const f = await setup(),
-    before = (await f.custody()).results,
-    racing = beforeUpdate(env.DB, custodyUpdate, f.supersede);
-  await expect(
-    activateNativeRegionBootstrapRotation(
-      { ...f.runtime, DB: racing.DB },
-      f.region,
-      f.intent.rollout_id,
-      f.activation,
-    ),
-  ).rejects.toThrow(/authority|identity|changed/i);
-  expect(racing.updates()).toBe(1);
+    before = (await f.custody()).results;
+  // A real SQL trigger changes authoritative Fleet revision after preflight, while the
+  // scope reservation executes. The business batch must observe the lost authority.
+  await env.DB.exec(
+    `CREATE TRIGGER supersede_material_authority BEFORE UPDATE OF mutation_id ON admission_scope_fences WHEN NEW.kind='region' AND NEW.scope_id='${f.region}' AND NEW.mutation_status='pending' BEGIN UPDATE fleet_region_releases SET revision=revision+1 WHERE region_id='${f.region}'; END`,
+  );
+  try {
+    await expect(
+      activateNativeRegionBootstrapRotation(
+        f.runtime,
+        f.region,
+        f.intent.rollout_id,
+        f.activation,
+      ),
+    ).rejects.toThrow(/authority|identity|changed/i);
+  } finally {
+    await env.DB.exec("DROP TRIGGER supersede_material_authority");
+  }
   expect(await f.pointer()).toEqual({ revision: 1, provenance: null });
   expect((await f.custody()).results).toEqual(before);
   expect(await readFleetRolloutIntent(env.DB, f.intent.rollout_id)).toEqual(
@@ -455,17 +462,24 @@ it("rejects an activation race at the actual custody UPDATE without changing act
 it("resolves exact native activation replay after pointer revision two without rewriting custody", async () => {
   const f = await setup(),
     before = (await f.custody()).results;
-  expect(
-    await activateNativeRegionBootstrapRotation(
-      f.runtime,
-      f.region,
-      f.intent.rollout_id,
-      f.activation,
-    ),
-  ).toMatchObject({
-    revision: 2,
-    provenance_sha256: f.activation.verification_sha256,
-  });
+  await env.DB.exec(
+    `CREATE TRIGGER native_material_admission BEFORE UPDATE OF bootstrap_material_revision ON regions WHEN NEW.id='${f.region}' AND NEW.bootstrap_material_revision<>OLD.bootstrap_material_revision AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id=NEW.id AND s.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'native pointer lacks admission fence'); END`,
+  );
+  try {
+    expect(
+      await activateNativeRegionBootstrapRotation(
+        f.runtime,
+        f.region,
+        f.intent.rollout_id,
+        f.activation,
+      ),
+    ).toMatchObject({
+      revision: 2,
+      provenance_sha256: f.activation.verification_sha256,
+    });
+  } finally {
+    await env.DB.exec("DROP TRIGGER native_material_admission");
+  }
   const replay = beforeUpdate(env.DB, custodyUpdate, async () => {
     throw Error(
       "exact activation replay must not execute another custody UPDATE",

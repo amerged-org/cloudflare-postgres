@@ -2,6 +2,8 @@
 import { DatabaseId, RegionId, DESIRED_PAGE_LIMIT_MAX } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
 import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
+import { recoverDeferredPoolRoleChanges } from "./domain/roles.ts";
+import { recoverAdmissionMutations } from "./domain/admission-mutations.ts";
 import { recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
@@ -24,6 +26,8 @@ export async function runCron(
 }> {
   const timestamp = new Date(now).toISOString(),
     cutoff = new Date(now - 20 * 60_000).toISOString();
+  await recoverAdmissionMutations(env, now);
+  await recoverDeferredPoolRoleChanges(env);
   await runResourceProfileRollouts(env, now);
   await env.DB.prepare(
     "INSERT INTO power_timeout_cursor(singleton,database_id) VALUES(1,NULL) ON CONFLICT(singleton) DO NOTHING",
@@ -48,7 +52,7 @@ export async function runCron(
   const recoveredRegions = new Map<string, Set<string>>();
   for (const row of expiredPower.results.slice(0, 8)) {
     const recovery = await recoverQuiescence(
-      env.DB,
+      env,
       {
         databaseId: row.id,
         operation: row.power_operation,
@@ -98,7 +102,7 @@ export async function runCron(
     DatabaseId.parse(hintCursor.database_id);
   }
   const pending = await env.DB.prepare(
-    `SELECT d.region_id,d.id FROM databases d WHERE d.node_id IS NOT NULL AND (d.generation>d.observed_generation OR EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')))
+    `SELECT d.region_id,d.id FROM databases d WHERE d.node_id IS NOT NULL AND (d.generation>d.observed_generation OR (EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')) OR EXISTS(SELECT 1 FROM pool_role_mutations pr WHERE pr.database_id=d.id AND pr.status='pending')))
       AND (d.region_id>? OR (d.region_id=? AND d.id>?)) ORDER BY d.region_id,d.id LIMIT 201`,
   )
     .bind(

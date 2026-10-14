@@ -19,8 +19,18 @@ import {
 import type { ApiContext } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
 import type { DatabaseRow, RoleRow } from "./rows.ts";
-import { readDesiredFleetRelease } from "./fleet-releases.ts";
+import {
+  readDesiredFleetRelease,
+  admissionSnapshotCapable,
+  postgresPoolCapable,
+} from "./fleet-releases.ts";
+import {
+  hasNonterminalPoolHolderSql,
+  readDesiredPostgresPoolBinding,
+  readPostgresPoolPolicies,
+} from "./postgres-pool.ts";
 import { desiredRegionArchiveSources } from "./region-archive-sources.ts";
+import { desiredDeferredPoolRole } from "./roles.ts";
 
 import {
   desiredRegionStorageNodes,
@@ -28,6 +38,8 @@ import {
 } from "./node-thin-storage.ts";
 import { desiredRegionStorageSamples } from "./node-thin-storage-samples.ts";
 interface DesiredRow extends DatabaseRow, DesiredSize {
+  admission_revision: number;
+  route_revision: number;
   k8s_node_name: string;
   storage_startup_operation: string | null;
   storage_startup_generation: number | null;
@@ -58,6 +70,11 @@ export async function desired(
   query: DesiredQuery,
 ): Promise<Response> {
   const region = await agentRegion(c);
+  const admissionCapable = await admissionSnapshotCapable(c.env.DB, region.id);
+  const poolCapable = await postgresPoolCapable(c.env.DB, region.id);
+  const postgresPools = poolCapable
+    ? await readPostgresPoolPolicies(c.env, region.id)
+    : [];
   const policy = await c.env.DB.prepare(
     "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json FROM node_region_policies WHERE region_id=?",
   )
@@ -79,7 +96,7 @@ export async function desired(
   const storageNodes = await desiredRegionStorageNodes(c.env, region.id),
     storageSamples = await desiredRegionStorageSamples(c.env, region.id);
   const result = await c.env.DB.prepare(
-    `SELECT d.*,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
+    `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
@@ -87,6 +104,7 @@ export async function desired(
     x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status,
     src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
+    LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id
     LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL
       AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation)
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
@@ -96,14 +114,26 @@ export async function desired(
     LEFT JOIN databases src ON src.id=x.source_database_id AND src.project_id=d.project_id
     LEFT JOIN regions sr ON sr.id=src.region_id
     WHERE d.region_id=? AND d.node_id IS NOT NULL AND (d.desired_state='deleted' OR (n.schedulable=1 AND n.lost_at IS NULL)) AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
+    AND (?=1 OR NOT ${hasNonterminalPoolHolderSql("d")})
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
-    .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)
+    .bind(
+      region.id,
+      Number(poolCapable),
+      ...(query.after ? [query.after] : []),
+      query.limit + 1,
+    )
     .all<DesiredRow>();
   const rows = result.results.slice(0, query.limit),
     databases: DesiredDatabase[] = [];
   const credentials = keyring(c.env.CREDENTIAL_KEYS);
   for (const row of rows) {
+    const poolBinding = poolCapable
+      ? await readDesiredPostgresPoolBinding(c.env, row.id)
+      : undefined;
+    const pendingPoolRole = poolCapable
+      ? await desiredDeferredPoolRole(c.env, row.id)
+      : undefined;
     const roles: DesiredDatabase["roles"] = [];
     let maintenance: MaintenanceCredential | undefined;
     // Deletion can recover even if a credential key has been retired.
@@ -236,6 +266,17 @@ export async function desired(
           backup_retention_days: row.backup_retention_days,
         },
         roles,
+        ...(admissionCapable
+          ? {
+              admission: {
+                v: 1,
+                admission_epoch: row.admission_revision,
+                route_revision: row.route_revision,
+              },
+            }
+          : {}),
+        ...(poolBinding ? { pool_binding: poolBinding } : {}),
+        ...(pendingPoolRole ? { pending_pool_role: pendingPoolRole } : {}),
         ...(maintenance === undefined ? {} : { maintenance }),
         creation:
           row.creation_operation_id === null
@@ -269,6 +310,7 @@ export async function desired(
           ? {}
           : { recovery_sources: recoverySources }),
         ...(scheduling ? { scheduling } : {}),
+        ...(postgresPools.length ? { postgres_pools: postgresPools } : {}),
         backup: {
           bucket: region.backup_bucket,
           endpoint_url: region.backup_endpoint_url,

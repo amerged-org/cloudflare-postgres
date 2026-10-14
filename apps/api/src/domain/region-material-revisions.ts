@@ -33,6 +33,7 @@ import { FleetRolloutIntent } from "@pgcf/contracts/fleet-rollouts";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { fleetRolloutAuthoritySql } from "./fleet-rollouts.ts";
 import { fleetPatchSupersededSql } from "./fleet-patches.ts";
+import { withAdmissionMutation } from "./admission-mutations.ts";
 
 const refuse = (): never => {
   throw new ApiError(
@@ -380,25 +381,49 @@ export async function activateRegionBootstrapRotation(
           value.verified,
           rows,
         );
-      await c.env.DB.batch([
-        c.env.DB.prepare(
-          `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=? WHERE ${guard.sql}`,
-        ).bind(
-          next,
-          value.verification_sha256,
-          new Date().toISOString(),
-          ...guard.bindings,
-        ),
-        lease.completeStatement(`${regionId}:${next}`, 200, {
-          sql: `EXISTS(SELECT 1 FROM regions WHERE id=? AND bootstrap_material_revision=? AND bootstrap_material_provenance_sha256=? AND ${rows.map(() => sameEnvelopeSql).join(" AND ")})`,
-          bindings: [
-            regionId,
-            next,
-            value.verification_sha256,
-            ...envelopeBindings(rows),
-          ],
-        }),
-      ]);
+      try {
+        await withAdmissionMutation(
+          c.env,
+          [],
+          async (mutation) => {
+            const admission = mutation.scopeGuard();
+            await mutation.batch([
+              c.env.DB.prepare(
+                `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=? WHERE ${guard.sql} AND (${admission.sql})`,
+              ).bind(
+                next,
+                value.verification_sha256,
+                new Date().toISOString(),
+                ...guard.bindings,
+                ...admission.bindings,
+              ),
+              lease.completeStatement(`${regionId}:${next}`, 200, {
+                sql: `EXISTS(SELECT 1 FROM regions WHERE id=? AND bootstrap_material_revision=? AND bootstrap_material_provenance_sha256=? AND ${rows.map(() => sameEnvelopeSql).join(" AND ")})`,
+                bindings: [
+                  regionId,
+                  next,
+                  value.verification_sha256,
+                  ...envelopeBindings(rows),
+                ],
+              }),
+            ]);
+          },
+          { kind: "region", id: regionId },
+        );
+      } catch (error) {
+        // Identical concurrent activation resolves only from the exact committed pointer;
+        // the mutation callback is never replayed on a contested or unknown scope.
+        if (!(error instanceof ApiError) || error.code !== "conflict")
+          throw error;
+        const response = await read();
+        await lease
+          .completeStatement(`${regionId}:${next}`, 200, {
+            sql: "EXISTS(SELECT 1 FROM regions WHERE id=? AND bootstrap_material_revision=? AND bootstrap_material_provenance_sha256=?)",
+            bindings: [regionId, next, value.verification_sha256],
+          })
+          .run();
+        return response;
+      }
       // No new mutation on a lost CAS: only the exact selected hashes/provenance can resolve it.
       return read();
     },
@@ -479,22 +504,31 @@ export async function activateNativeRegionBootstrapRotation(
     ...stored.rows,
   ]);
   const fleet = fleetRolloutAuthoritySql(intent);
-  await env.DB.prepare(
-    `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=? WHERE ${guard.sql} AND ${fleet.sql}
-     AND NOT EXISTS(SELECT 1 FROM json_each(?) member WHERE NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.node_id=json_extract(member.value,'$.node_id') AND p.node_uid=json_extract(member.value,'$.node_uid') AND p.release_id=? AND p.assignment_revision=json_extract(member.value,'$.assignment_revision') AND p.region_revision=? AND p.cluster_uid=? AND p.stage IN('complete','host_ready') AND p.state='confirmed'))`,
-  )
-    .bind(
-      value.expected_revision + 1,
-      value.verification_sha256,
-      new Date().toISOString(),
-      ...guard.bindings,
-      ...fleet.bindings,
-      JSON.stringify(region.nodes),
-      intent.release_id,
-      region.revision,
-      region.cluster_uid,
-    )
-    .run();
+  await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const admission = mutation.scopeGuard();
+      await mutation.batch([
+        env.DB.prepare(
+          `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=? WHERE ${guard.sql} AND ${fleet.sql}
+     AND NOT EXISTS(SELECT 1 FROM json_each(?) member WHERE NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.node_id=json_extract(member.value,'$.node_id') AND p.node_uid=json_extract(member.value,'$.node_uid') AND p.release_id=? AND p.assignment_revision=json_extract(member.value,'$.assignment_revision') AND p.region_revision=? AND p.cluster_uid=? AND p.stage IN('complete','host_ready') AND p.state='confirmed')) AND (${admission.sql})`,
+        ).bind(
+          value.expected_revision + 1,
+          value.verification_sha256,
+          new Date().toISOString(),
+          ...guard.bindings,
+          ...fleet.bindings,
+          JSON.stringify(region.nodes),
+          intent.release_id,
+          region.revision,
+          region.cluster_uid,
+          ...admission.bindings,
+        ),
+      ]);
+    },
+    { kind: "region", id: regionId },
+  );
   const current = await readRegionBootstrapMaterial(env, regionId);
   if (
     current.revision !== value.expected_revision + 1 ||
@@ -554,7 +588,7 @@ export async function readRegionBootstrapMaterial(
 
 /** Only an administrator's verified readback may change version metadata; key material is copied. */
 export async function synchronizeRegionBootstrapMaterial(
-  env: Pick<Env, "DB" | "CREDENTIAL_KEYS">,
+  env: Env,
   id: string,
   input: RegionBootstrapMaterialUpdate,
 ): Promise<RegionBootstrapMaterialStatus> {
@@ -683,8 +717,15 @@ export async function synchronizeRegionBootstrapMaterial(
     () => `EXISTS(SELECT 1 FROM region_bootstrap_credentials c
     WHERE c.region_id=regions.id AND c.purpose=? AND c.revision=? AND c.version=? AND c.kid=? AND c.iv=? AND c.ciphertext=?)`;
   const nodes = JSON.stringify(value.observed.nodes);
-  const result = await env.DB.prepare(
-    `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=?
+  const result = await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const admission = mutation.scopeGuard();
+      return (
+        await mutation.batch([
+          env.DB.prepare(
+            `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=?
      WHERE id=? AND bootstrap_material_revision=? AND bootstrap_material_provenance_sha256 IS ? AND ${idleSql()}
        AND julianday(?)>=julianday('now','-120 seconds') AND julianday(?)<=julianday('now','+5 seconds')
        AND (SELECT COUNT(*) FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL)=?
@@ -694,29 +735,33 @@ export async function synchronizeRegionBootstrapMaterial(
            AND n.provider_instance_id=json_extract(expected.value,'$.provider_instance_id')
            AND n.lost_at IS NULL AND n.ready=1 AND julianday(n.last_observed_at)>=julianday('now','-180 seconds')
            AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')))
-       AND ${allRows.map(sameEnvelope).join(" AND ")}`,
-  )
-    .bind(
-      nextRevision,
-      value.provenance_sha256,
-      new Date().toISOString(),
-      regionId,
-      before.revision,
-      before.provenance,
-      value.observed.observed_at,
-      value.observed.observed_at,
-      value.observed.nodes.length,
-      nodes,
-      ...allRows.flatMap((row) => [
-        row.purpose,
-        row.revision,
-        row.version,
-        row.kid,
-        row.iv,
-        row.ciphertext,
-      ]),
-    )
-    .run();
+       AND ${allRows.map(sameEnvelope).join(" AND ")} AND (${admission.sql})`,
+          ).bind(
+            nextRevision,
+            value.provenance_sha256,
+            new Date().toISOString(),
+            regionId,
+            before.revision,
+            before.provenance,
+            value.observed.observed_at,
+            value.observed.observed_at,
+            value.observed.nodes.length,
+            nodes,
+            ...allRows.flatMap((row) => [
+              row.purpose,
+              row.revision,
+              row.version,
+              row.kid,
+              row.iv,
+              row.ciphertext,
+            ]),
+            ...admission.bindings,
+          ),
+        ])
+      )[0]!;
+    },
+    { kind: "region", id: regionId },
+  );
   if (result.meta.changes !== 1) return refuse();
   const active = await readRegionBootstrapMaterial(env, regionId);
   if (

@@ -21,6 +21,7 @@ import { archiveDestinationPath, newNodeId } from "@pgcf/contracts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
 import { placePendingDatabases } from "../../src/domain/node-capacity.ts";
+import { withAdmissionMutation } from "../../src/domain/admission-mutations.ts";
 const keys: string[] = [];
 afterEach(async () => {
   if (keys.length) await env.ARCHIVE.delete(keys.splice(0));
@@ -73,6 +74,48 @@ async function archived(
     before,
   };
 }
+it("keeps a fresh restore target denied and refuses restore creation while its project scope is fenced", async () => {
+  const f = await archived();
+  const restored = await request(
+    `/v1/databases/${f.id}/restore`,
+    f.integrator,
+    "POST",
+    { name: "fresh-denied-target", mode: "full" },
+  );
+  expect(restored.status).toBe(202);
+  const target = (await restored.json()) as { target_database: { id: string } };
+  const actor = env.DATABASE_ACTOR.get(
+    env.DATABASE_ACTOR.idFromName(target.target_database.id),
+  );
+  expect((await actor.admit(target.target_database.id, "app")).ok).toBe(false);
+  await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const refused = await request(
+        `/v1/databases/${f.id}/restore`,
+        f.integrator,
+        "POST",
+        { name: "scope-fenced-target", mode: "full" },
+      );
+      expect(refused.status).toBe(409);
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) n FROM databases WHERE project_id=? AND name='scope-fenced-target'",
+        )
+          .bind(f.project)
+          .first("n"),
+      ).toBe(0);
+      const guard = mutation.scopeGuard();
+      await mutation.batch([
+        env.DB.prepare(
+          `UPDATE projects SET updated_at=? WHERE id=? AND ${guard.sql}`,
+        ).bind(new Date().toISOString(), f.project, ...guard.bindings),
+      ]);
+    },
+    { kind: "project", id: f.project },
+  );
+});
 it("holds startup RAM for a placed restore and admits an unplaced restore later with its original operation", async () => {
   const uid = crypto.randomUUID(),
     provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!),

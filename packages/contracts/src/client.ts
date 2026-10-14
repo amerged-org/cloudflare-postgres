@@ -162,7 +162,9 @@ export class PgcfClient {
     }
     try {
       return JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+          bytes,
+        ),
       );
     } catch {
       throw new PgcfClientError("invalid_response", response.status);
@@ -172,7 +174,7 @@ export class PgcfClient {
   async #request<T extends z.ZodType>(
     path: string,
     method: string,
-    status: number,
+    status: number | readonly number[],
     schema: T,
     body?: unknown,
     idempotencyKey?: string,
@@ -202,7 +204,7 @@ export class PgcfClient {
       });
       if (
         response.redirected ||
-        response.type === "opaqueredirect" ||
+        String(response.type) === "opaqueredirect" ||
         (response.status >= 300 && response.status < 400)
       ) {
         void response.body?.cancel().catch(() => undefined);
@@ -221,7 +223,12 @@ export class PgcfClient {
         );
       }
       const parsed = schema.safeParse(value);
-      if (response.status !== status || !parsed.success)
+      if (
+        !(typeof status === "number"
+          ? response.status === status
+          : status.includes(response.status)) ||
+        !parsed.success
+      )
         throw new PgcfClientError("invalid_response", response.status);
       return parsed.data;
     };
@@ -329,12 +336,12 @@ export class PgcfClient {
     id: string,
     body: RoleCreate,
     idempotencyKey: string,
-  ): Promise<Role> {
+  ): Promise<Role | DatabaseWithOperation> {
     return this.#request(
       `/v1/databases/${input(DatabaseId, id)}/roles`,
       "POST",
-      201,
-      Role,
+      [201, 202],
+      z.union([Role, DatabaseWithOperation]),
       input(RoleCreate, body),
       input(IdempotencyKey, idempotencyKey),
     );
@@ -351,12 +358,12 @@ export class PgcfClient {
     id: string,
     role: string,
     idempotencyKey: string,
-  ): Promise<Role> {
+  ): Promise<Role | DatabaseWithOperation> {
     return this.#request(
       `/v1/databases/${input(DatabaseId, id)}/roles/${input(RoleName, role)}/reset-password`,
       "POST",
-      200,
-      Role,
+      [200, 202],
+      z.union([Role, DatabaseWithOperation]),
       undefined,
       input(IdempotencyKey, idempotencyKey),
     );

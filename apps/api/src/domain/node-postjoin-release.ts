@@ -20,6 +20,7 @@ import {
 } from "./bootstrap-jobs.ts";
 import { readRegionBootstrapMaterial } from "./region-material-revisions.ts";
 import { ensurePendingNodeHostConfiguration } from "./node-host-configuration.ts";
+import { withAdmissionMutation } from "./admission-mutations.ts";
 
 const refuse = (): never => {
   throw new ApiError(
@@ -201,29 +202,39 @@ export async function prepareNodePostjoinRuntime(
     expected.region_revision,
     template.compute_pool_json,
   ];
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at)
-      SELECT ?,?,?,'customer',1,? WHERE ${predicate} ON CONFLICT(node_id) DO NOTHING`,
-    ).bind(
-      job.node_id,
-      binding.node_uid,
-      expected.release_id,
-      now,
-      ...bindings,
-    ),
-    env.DB.prepare(
-      `INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at)
-      SELECT ?,?,1,?,?,? WHERE ${predicate} ON CONFLICT(node_id) DO NOTHING`,
-    ).bind(
-      job.node_id,
-      binding.node_uid,
-      expected.release_id,
-      policyJson,
-      now,
-      ...bindings,
-    ),
-  ]);
+  await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const guard = mutation.scopeGuard();
+      await mutation.batch([
+        env.DB.prepare(
+          `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at)
+      SELECT ?,?,?,'customer',1,? WHERE ${predicate} AND (${guard.sql}) ON CONFLICT(node_id) DO NOTHING`,
+        ).bind(
+          job.node_id,
+          binding.node_uid,
+          expected.release_id,
+          now,
+          ...bindings,
+          ...guard.bindings,
+        ),
+        env.DB.prepare(
+          `INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at)
+      SELECT ?,?,1,?,?,? WHERE ${predicate} AND (${guard.sql}) ON CONFLICT(node_id) DO NOTHING`,
+        ).bind(
+          job.node_id,
+          binding.node_uid,
+          expected.release_id,
+          policyJson,
+          now,
+          ...bindings,
+          ...guard.bindings,
+        ),
+      ]);
+    },
+    { kind: "region", id: job.region_id },
+  );
   const actual = await env.DB.prepare(
     `SELECT a.node_uid,a.release_id,a.role,p.policy_json FROM fleet_node_releases a
     JOIN node_compute_pool_policies p ON p.node_id=a.node_id AND p.node_uid=a.node_uid AND p.release_id=a.release_id WHERE a.node_id=?`,

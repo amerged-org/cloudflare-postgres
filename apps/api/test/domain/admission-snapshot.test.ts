@@ -4,6 +4,7 @@ import { evictDurableObject } from "cloudflare:test";
 import { DesiredResponse, newNodeId, newOperationId } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { admissionSnapshotCapable } from "../../src/domain/fleet-releases.ts";
+import { reconcileDatabaseActors } from "../../src/domain/database-actor-sync.ts";
 import {
   readDatabaseAdmissionSnapshot,
   publishDatabaseAdmission,
@@ -23,6 +24,30 @@ afterEach(async () => {
 });
 const actorFor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
+
+it("a bounded legacy reconciliation clears a previously capable snapshot rather than retaining its cached route", async () => {
+  const f = await admissionSnapshotFixture();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
+  // Controlled current Fleet metadata rollback; this does not model a live release write.
+  await env.DB.prepare("DELETE FROM fleet_region_releases WHERE region_id=?")
+    .bind(f.region)
+    .run();
+  await reconcileDatabaseActors(env);
+  await env.DB.exec(
+    "ALTER TABLE databases RENAME TO withheld_legacy_databases",
+  );
+  try {
+    expect(await actorFor(f.id).admit(f.id, "app")).toEqual({
+      ok: false,
+      sqlstate: "08006",
+    });
+  } finally {
+    await env.DB.exec(
+      "ALTER TABLE withheld_legacy_databases RENAME TO databases",
+    );
+  }
+});
 async function replaceProof(id: string, proof: unknown) {
   await env.DB.prepare(
     "UPDATE databases SET runtime_attestation_json=? WHERE id=?",

@@ -13,6 +13,7 @@ import type { ApiContext, Env } from "../env.ts";
 import { MEMORY_SAMPLE_MAX_AGE_MS } from "./memory-capacity.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
+import { withAdmissionMutationScopes } from "./admission-mutations.ts";
 import {
   loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
@@ -839,90 +840,112 @@ export async function createFleetRollout(
         )
         .first();
       if (active) return changed();
-      const raw = JSON.stringify(FleetRolloutIntent.parse(intent)),
-        snapshotJson = JSON.stringify(snapshot),
-        anchor = intent.regions[0]!;
-      const guard = `NOT EXISTS(SELECT 1 FROM json_each(?) targets LEFT JOIN regions r ON r.id=json_extract(targets.value,'$.region_id') LEFT JOIN fleet_region_releases f ON f.region_id=r.id WHERE r.id IS NULL OR COALESCE(f.revision,0)<>json_extract(targets.value,'$.revision') OR f.rollout_json IS NOT json_extract(targets.value,'$.rollout_json') OR r.bootstrap_material_revision<>json_extract(targets.value,'$.material_revision') OR (SELECT count(*) FROM nodes WHERE region_id=r.id AND lost_at IS NULL)<>json_array_length(targets.value,'$.nodes')) AND NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members LEFT JOIN nodes n ON n.id=json_extract(members.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id IS NULL OR n.region_id<>json_extract(regions.value,'$.region_id') OR n.node_uid<>json_extract(members.value,'$.node_uid') OR n.lost_at IS NOT NULL OR n.ready<>1 OR julianday(n.last_observed_at)<julianday('now','-180 seconds') OR julianday(n.last_observed_at)>julianday('now','+5 seconds') OR n.last_observed_at IS NULL OR COALESCE(a.revision,0)<>json_extract(members.value,'$.expected_revision') OR (json_type(members.value,'$.compute_pool') IS NOT NULL AND COALESCE((SELECT revision FROM node_compute_pool_policies WHERE node_id=n.id),0)<>json_extract(members.value,'$.compute_pool.expected_revision'))) AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND p.stage<>'complete' AND NOT(p.stage='host_ready' AND p.state='confirmed') AND NOT ${fleetPatchSupersededSql("p")} AND (p.release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=p.node_id AND json_extract(members.value,'$.node_uid')=p.node_uid AND json_extract(members.value,'$.assignment_revision')=p.assignment_revision AND json_extract(regions.value,'$.revision')=p.region_revision)))`;
-      const owner =
-        "EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND rollout_json=?)";
-      const replacement = replaced
-        ? quiescentRolloutSql(replaced)
-        : { sql: "1=1", bindings: [] };
-      const statements: D1PreparedStatement[] = [
-        c.env.DB.prepare(
-          `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${guard} AND (${replacement.sql}) ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
-        ).bind(
-          anchor.region_id,
-          intent.release_id,
-          anchor.revision,
-          intent.created_at,
-          raw,
-          snapshotJson,
-          snapshotJson,
-          JSON.stringify(intent.regions),
-          intent.release_id,
-          JSON.stringify(intent.regions),
-          ...replacement.bindings,
-        ),
-      ];
-      for (const region of intent.regions) {
-        if (region !== anchor)
-          statements.push(
+      const rolloutId = await withAdmissionMutationScopes(
+        c.env,
+        intent.regions.map((region) => ({
+          kind: "region",
+          id: region.region_id,
+        })),
+        async (mutation) => {
+          const noHolders = `NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?))
+        AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=held_database.id AND b.state NOT IN('released','refused'))
+          OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=held_database.id AND h.kind='pool' AND h.state NOT IN('released','refused'))))`;
+          const regionsJson = JSON.stringify(intent.regions);
+          if (
+            !(await c.env.DB.prepare(`SELECT 1 WHERE ${noHolders}`)
+              .bind(regionsJson)
+              .first())
+          )
+            return changed();
+          const raw = JSON.stringify(FleetRolloutIntent.parse(intent)),
+            snapshotJson = JSON.stringify(snapshot),
+            anchor = intent.regions[0]!;
+          const guard = `NOT EXISTS(SELECT 1 FROM json_each(?) targets LEFT JOIN regions r ON r.id=json_extract(targets.value,'$.region_id') LEFT JOIN fleet_region_releases f ON f.region_id=r.id WHERE r.id IS NULL OR COALESCE(f.revision,0)<>json_extract(targets.value,'$.revision') OR f.rollout_json IS NOT json_extract(targets.value,'$.rollout_json') OR r.bootstrap_material_revision<>json_extract(targets.value,'$.material_revision') OR (SELECT count(*) FROM nodes WHERE region_id=r.id AND lost_at IS NULL)<>json_array_length(targets.value,'$.nodes')) AND NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members LEFT JOIN nodes n ON n.id=json_extract(members.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id IS NULL OR n.region_id<>json_extract(regions.value,'$.region_id') OR n.node_uid<>json_extract(members.value,'$.node_uid') OR n.lost_at IS NOT NULL OR n.ready<>1 OR julianday(n.last_observed_at)<julianday('now','-180 seconds') OR julianday(n.last_observed_at)>julianday('now','+5 seconds') OR n.last_observed_at IS NULL OR COALESCE(a.revision,0)<>json_extract(members.value,'$.expected_revision') OR (json_type(members.value,'$.compute_pool') IS NOT NULL AND COALESCE((SELECT revision FROM node_compute_pool_policies WHERE node_id=n.id),0)<>json_extract(members.value,'$.compute_pool.expected_revision'))) AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND p.stage<>'complete' AND NOT(p.stage='host_ready' AND p.state='confirmed') AND NOT ${fleetPatchSupersededSql("p")} AND (p.release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=p.node_id AND json_extract(members.value,'$.node_uid')=p.node_uid AND json_extract(members.value,'$.assignment_revision')=p.assignment_revision AND json_extract(regions.value,'$.revision')=p.region_revision)))`;
+          const owner =
+            "EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND rollout_json=?)";
+          const replacement = replaced
+            ? quiescentRolloutSql(replaced)
+            : { sql: "1=1", bindings: [] };
+          const statements: D1PreparedStatement[] = [
             c.env.DB.prepare(
-              `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${owner} ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
+              `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${guard} AND (${replacement.sql}) AND (${mutation.guard.sql}) AND ${noHolders} ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
             ).bind(
-              region.region_id,
+              anchor.region_id,
               intent.release_id,
-              region.revision,
+              anchor.revision,
               intent.created_at,
               raw,
-              anchor.region_id,
-              raw,
+              snapshotJson,
+              snapshotJson,
+              JSON.stringify(intent.regions),
+              intent.release_id,
+              JSON.stringify(intent.regions),
+              ...replacement.bindings,
+              ...mutation.guard.bindings,
+              regionsJson,
             ),
-          );
-        for (const node of region.nodes) {
-          if (node.compute_pool)
-            statements.push(
-              c.env.DB.prepare(
-                `INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at) SELECT ?,?,?,?,?,? WHERE ${owner} ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,revision=excluded.revision,release_id=excluded.release_id,policy_json=excluded.policy_json,updated_at=excluded.updated_at`,
-              ).bind(
-                node.node_id,
-                node.node_uid,
-                node.compute_pool.expected_revision + 1,
-                intent.release_id,
-                JSON.stringify(
-                  ComputePoolPolicy.parse(node.compute_pool.policy),
+          ];
+          for (const region of intent.regions) {
+            if (region !== anchor)
+              statements.push(
+                c.env.DB.prepare(
+                  `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${owner} ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
+                ).bind(
+                  region.region_id,
+                  intent.release_id,
+                  region.revision,
+                  intent.created_at,
+                  raw,
+                  anchor.region_id,
+                  raw,
                 ),
-                intent.created_at,
-                anchor.region_id,
-                raw,
-              ),
-            );
+              );
+            for (const node of region.nodes) {
+              if (node.compute_pool)
+                statements.push(
+                  c.env.DB.prepare(
+                    `INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at) SELECT ?,?,?,?,?,? WHERE ${owner} ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,revision=excluded.revision,release_id=excluded.release_id,policy_json=excluded.policy_json,updated_at=excluded.updated_at`,
+                  ).bind(
+                    node.node_id,
+                    node.node_uid,
+                    node.compute_pool.expected_revision + 1,
+                    intent.release_id,
+                    JSON.stringify(
+                      ComputePoolPolicy.parse(node.compute_pool.policy),
+                    ),
+                    intent.created_at,
+                    anchor.region_id,
+                    raw,
+                  ),
+                );
+              statements.push(
+                c.env.DB.prepare(
+                  `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT ?,?,?,?,?,? WHERE ${owner} ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,release_id=excluded.release_id,role=excluded.role,revision=excluded.revision,updated_at=excluded.updated_at`,
+                ).bind(
+                  node.node_id,
+                  node.node_uid,
+                  intent.release_id,
+                  node.role,
+                  node.assignment_revision,
+                  intent.created_at,
+                  anchor.region_id,
+                  raw,
+                ),
+              );
+            }
+          }
           statements.push(
-            c.env.DB.prepare(
-              `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT ?,?,?,?,?,? WHERE ${owner} ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,release_id=excluded.release_id,role=excluded.role,revision=excluded.revision,updated_at=excluded.updated_at`,
-            ).bind(
-              node.node_id,
-              node.node_uid,
-              intent.release_id,
-              node.role,
-              node.assignment_revision,
-              intent.created_at,
-              anchor.region_id,
-              raw,
-            ),
+            lease.completeStatement(intent.rollout_id, 202, {
+              sql: owner,
+              bindings: [anchor.region_id, raw],
+            }),
           );
-        }
-      }
-      statements.push(
-        lease.completeStatement(intent.rollout_id, 202, {
-          sql: owner,
-          bindings: [anchor.region_id, raw],
-        }),
+          const committed = await mutation.batch(statements);
+          if (committed[0]!.meta.changes !== 1) return changed();
+          return intent.rollout_id;
+        },
       );
-      const committed = await c.env.DB.batch(statements);
-      if (committed[0]!.meta.changes !== 1) return changed();
-      return output(intent.rollout_id);
+      return output(rolloutId);
     },
   });
 }

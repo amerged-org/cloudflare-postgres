@@ -16,6 +16,7 @@ import {
   RECLAIM_LIMITS,
   signReclaimIntent,
   DatabaseRuntimeAttestation,
+  reclaimScopeFromRuntime,
 } from "@pgcf/contracts/reclaim";
 import { nodeProofSigningKey } from "./domain/node-proof-session.ts";
 import { routeTokenV3Sql } from "./domain/fleet-releases.ts";
@@ -35,6 +36,22 @@ import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
+import {
+  AdmissionMutationIntent,
+  DatabaseAdmissionSnapshot,
+} from "./domain/admission-state.ts";
+import { withAdmissionMutation } from "./domain/admission-mutations.ts";
+import { readDatabaseAdmissionSnapshot } from "./domain/database-admission-snapshot.ts";
+import {
+  hasNonterminalPoolHolderSql,
+  preparePostgresPoolClaim,
+} from "./domain/postgres-pool.ts";
+const PersistedAdmissionMutationIntent = AdmissionMutationIntent.extend({
+  started_at: z.number().int().nonnegative().default(0),
+});
+type PersistedAdmissionMutationIntent = z.infer<
+  typeof PersistedAdmissionMutationIntent
+>;
 
 /** A committed ready observation's push starts the wake loop's D1 read at once; this bounded read only recovers a lost push. */
 const WAKE_FALLBACK_READ_MS = 1000;
@@ -54,7 +71,8 @@ export const DatabasePresence = z
 export type DatabasePresence = z.infer<typeof DatabasePresence>;
 export type { DatabaseAdmission } from "@pgcf/contracts";
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at
+  d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
+  CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) AND NOT ${hasNonterminalPoolHolderSql("d")} THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL WHERE d.id=? LIMIT 1`;
@@ -76,6 +94,7 @@ interface AdmissionRow {
   gateway_binding: string | null;
   node_id: string | null;
   lost_at: string | null;
+  admission_blocked: number;
 }
 
 function admittedRoute(
@@ -129,6 +148,208 @@ export class DatabaseActor extends DurableObject<Env> {
   private wake: { operation: string; revision: number } | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private interruptPoll: (() => void) | undefined;
+  private admissionState() {
+    if (!this.presence()) return undefined;
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS database_snapshot(singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot TEXT,barrier TEXT)",
+    );
+    const row = this.ctx.storage.sql
+      .exec<{ snapshot: string | null; barrier: string | null }>(
+        "SELECT snapshot,barrier FROM database_snapshot WHERE singleton=1",
+      )
+      .toArray()[0];
+    return {
+      snapshot: row?.snapshot
+        ? DatabaseAdmissionSnapshot.parse(JSON.parse(row.snapshot))
+        : undefined,
+      barrier: row?.barrier
+        ? PersistedAdmissionMutationIntent.parse(JSON.parse(row.barrier))
+        : undefined,
+    };
+  }
+  private saveAdmissionState(
+    snapshot: DatabaseAdmissionSnapshot | undefined,
+    barrier: PersistedAdmissionMutationIntent | undefined,
+  ) {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO database_snapshot(singleton,snapshot,barrier) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET snapshot=excluded.snapshot,barrier=excluded.barrier",
+      snapshot ? JSON.stringify(snapshot) : null,
+      barrier ? JSON.stringify(barrier) : null,
+    );
+  }
+  /** Trusted mutation RPC. The closed barrier is durable before the caller can touch desired state. */
+  async beginAdmissionMutation(value: unknown): Promise<boolean> {
+    const intent = AdmissionMutationIntent.parse(value);
+    this.identity(intent.database_id);
+    return this.ctx.blockConcurrencyWhile(() =>
+      this.beginAdmissionMutationLocked(intent),
+    );
+  }
+  private async beginAdmissionMutationLocked(
+    intent: AdmissionMutationIntent,
+  ): Promise<boolean> {
+    const state = this.admissionState();
+    if (!state) return false;
+    if (state.barrier?.mutation_id === intent.mutation_id) return true;
+    if (
+      state.barrier &&
+      intent.admission_revision <= state.barrier.admission_revision
+    )
+      return false;
+    if (
+      state.snapshot &&
+      intent.admission_revision < state.snapshot.admission_revision
+    )
+      return false;
+    this.saveAdmissionState(state.snapshot, {
+      ...intent,
+      started_at: Date.now(),
+    });
+    await this.revokeReclaimLocked();
+    return true;
+  }
+  /** Repairs interruption before a D1 reservation existed; a positive CAS fences late reservations too. */
+  async repairAdmissionMutation(): Promise<boolean> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const barrier = this.admissionState()?.barrier;
+      if (!barrier || barrier.started_at > Date.now() - 60000) return false;
+      try {
+        const result = await this.env.DB.prepare(
+          `UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1,completed_mutation_id=?,mutation_outcome='fenced'
+          WHERE database_id=? AND admission_revision=? AND route_revision=? AND mutation_id IS NULL
+            AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.mutation_id=?)`,
+        )
+          .bind(
+            barrier.mutation_id,
+            barrier.database_id,
+            barrier.admission_revision,
+            barrier.route_revision,
+            barrier.mutation_id,
+          )
+          .run();
+        return result.meta.changes === 1;
+      } catch {
+        return false;
+      }
+    });
+  }
+  /** Only the trusted full publisher may release a matching committed/fenced mutation. */
+  async publishAdmissionSnapshot(
+    value: unknown,
+    completedMutation: string | null = null,
+  ): Promise<boolean> {
+    const snapshot = DatabaseAdmissionSnapshot.parse(value);
+    this.identity(snapshot.database_id);
+    return this.ctx.blockConcurrencyWhile(() =>
+      this.publishAdmissionSnapshotLocked(snapshot, completedMutation),
+    );
+  }
+  private async publishAdmissionSnapshotLocked(
+    snapshot: DatabaseAdmissionSnapshot,
+    completedMutation: string | null,
+  ): Promise<boolean> {
+    if (!this.presence()) return false;
+    const state = this.admissionState()!;
+    if (
+      state.snapshot &&
+      snapshot.admission_revision < state.snapshot.admission_revision
+    )
+      return false;
+    if (state.snapshot?.deleted && !snapshot.deleted) return false;
+    const epoch = await this.env.DB.prepare(
+      "SELECT admission_revision,route_revision,mutation_id,completed_mutation_id FROM database_admission_epochs WHERE database_id=?",
+    )
+      .bind(snapshot.database_id)
+      .first<{
+        admission_revision: number;
+        route_revision: number;
+        mutation_id: string | null;
+        completed_mutation_id: string | null;
+      }>();
+    if (
+      !epoch ||
+      epoch.mutation_id !== null ||
+      epoch.admission_revision !== snapshot.admission_revision ||
+      epoch.route_revision !== snapshot.route_revision
+    )
+      return false;
+    if (
+      state.barrier &&
+      (completedMutation !== state.barrier.mutation_id ||
+        epoch.completed_mutation_id !== completedMutation ||
+        snapshot.admission_revision <= state.barrier.admission_revision)
+    )
+      return false;
+    if (
+      state.snapshot?.runtime &&
+      snapshot.runtime &&
+      snapshot.admission_revision === state.snapshot.admission_revision &&
+      snapshot.runtime.observed_at < state.snapshot.runtime.observed_at
+    )
+      return false;
+    this.saveAdmissionState(snapshot, undefined);
+    if (
+      this.waiters.size &&
+      snapshot.admissible &&
+      this.wake?.revision === snapshot.generation
+    ) {
+      this.pushed = true;
+      this.interruptPoll?.();
+    }
+    return true;
+  }
+  private localAdmissionActor(databaseId: string) {
+    return {
+      database_id: databaseId,
+      begin: (intent: AdmissionMutationIntent) =>
+        this.beginAdmissionMutationLocked(intent),
+      publish: async (completedMutation: string) => {
+        const state = await readDatabaseAdmissionSnapshot(this.env, databaseId);
+        return state
+          ? this.publishAdmissionSnapshotLocked(
+              state.snapshot,
+              completedMutation,
+            )
+          : false;
+      },
+    };
+  }
+  private snapshotAdmission(user: string): DatabaseAdmission | undefined {
+    const state = this.admissionState();
+    if (state?.barrier) return { ok: false, sqlstate: "57P03" };
+    const snapshot = state?.snapshot;
+    if (!snapshot?.cache_capable) return undefined;
+    if (snapshot.deleted) return { ok: false, sqlstate: "3D000" };
+    if (!snapshot.roles.some((role) => role.name === user))
+      return { ok: false, sqlstate: "28P01" };
+    const runtime = snapshot.runtime;
+    if (
+      !snapshot.admissible ||
+      !runtime ||
+      runtime.observation.expires_at <= Date.now() ||
+      runtime.observed_at > Date.now() + 1000
+    )
+      return { ok: false, sqlstate: "57P03" };
+    const target =
+      "kind" in runtime && runtime.kind === "pool"
+        ? {
+            kind: "pool" as const,
+            revision: snapshot.generation,
+            pod_uid: runtime.pod_uid,
+            route_revision: snapshot.route_revision,
+            binding_id: runtime.binding_id,
+            node_uid: runtime.node_uid,
+            pod_ip: runtime.pod_ip,
+            storage_generation: runtime.storage_generation,
+            scope_sha256: runtime.scope_sha256,
+          }
+        : {
+            revision: snapshot.generation,
+            pod_uid: runtime.pod_uid,
+            route_revision: snapshot.route_revision,
+          };
+    return { ok: true, region: snapshot.region, target };
+  }
   private reclaimState(): ReclaimState {
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_reclaim(singleton INTEGER PRIMARY KEY CHECK(singleton=1),state TEXT NOT NULL)",
@@ -193,15 +414,30 @@ export class DatabaseActor extends DurableObject<Env> {
     this.identity(DatabaseId.parse(databaseId));
     await this.ctx.blockConcurrencyWhile(() => this.revokeReclaimLocked());
   }
+  /** Mutations revoke reclaim under the same real acknowledgement/expiry rule, without activity. */
+  async revokeBeforeChange(
+    databaseId: string,
+    deadline = Date.now() + 30000,
+  ): Promise<boolean> {
+    this.identity(DatabaseId.parse(databaseId));
+    return this.revokeBeforeAdmission(
+      databaseId,
+      Math.min(deadline, Date.now() + 30000),
+      false,
+    );
+  }
   private async revokeBeforeAdmission(
     databaseId: string,
     deadline: number,
+    recordAdmission = true,
   ): Promise<boolean> {
     this.identity(databaseId);
     await this.ctx.blockConcurrencyWhile(async () => {
       const state = this.reclaimState();
-      state.last_admitted_at = Date.now();
-      this.saveReclaim(state);
+      if (recordAdmission) {
+        state.last_admitted_at = Date.now();
+        this.saveReclaim(state);
+      }
       await this.revokeReclaimLocked();
     });
     while (Date.now() < deadline) {
@@ -371,8 +607,8 @@ export class DatabaseActor extends DurableObject<Env> {
     )
       return null;
     const key = await nodeProofSigningKey(this.env),
-      { observed_at, configuration_fingerprint, ...runtime } = current.runtime;
-    void observed_at;
+      configuration_fingerprint = current.runtime.configuration_fingerprint,
+      runtime = reclaimScopeFromRuntime(current.runtime);
     const claims: ReclaimClaims = {
       ...runtime,
       kid: key.kid,
@@ -445,11 +681,26 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Management RPC only: incoming hints never invoke seeding or authoritative repair. */
   async seed(value: unknown): Promise<void> {
+    return this.seedPresence(value, false);
+  }
+  /** A trusted current legacy Fleet page may only remove cached admission, never enable it. */
+  async seedLegacyPresence(value: unknown): Promise<boolean> {
+    await this.seedPresence(value, true);
+    return this.admissionState()?.barrier !== undefined;
+  }
+  private async seedPresence(
+    value: unknown,
+    clearAdmissionSnapshot: boolean,
+  ): Promise<void> {
     const parsed = DatabasePresence.safeParse(value);
     if (!parsed.success) throw new Error("invalid_actor_snapshot");
     this.identity(parsed.data.database_id);
     await this.ctx.blockConcurrencyWhile(async () => {
       this.initializeSchema();
+      if (clearAdmissionSnapshot) {
+        const state = this.admissionState();
+        if (state) this.saveAdmissionState(undefined, state.barrier);
+      }
       let next = parsed.data;
       const previous = this.presence();
       if (previous?.deleted) return;
@@ -521,6 +772,8 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "28P01" };
       if (!(await this.revokeBeforeAdmission(id.data, Date.now() + 30000)))
         return { ok: false, sqlstate: "57P03" };
+      const cached = this.snapshotAdmission(role.data);
+      if (cached) return cached;
       const row = await this.env.DB.prepare(DATABASE_ADMISSION_QUERY)
         .bind(role.data, id.data)
         .first<AdmissionRow>();
@@ -534,12 +787,12 @@ export class DatabaseActor extends DurableObject<Env> {
       if (row.role_name !== role.data) return { ok: false, sqlstate: "28P01" };
       if (
         row.node_id === null ||
+        row.admission_blocked !== 0 ||
         row.lost_at !== null ||
         row.desired_state !== "running" ||
         row.observed_state !== "ready" ||
         row.observed_power !== "awake" ||
-        (row.power_operation !== null &&
-          row.observed_generation !== row.generation)
+        row.observed_generation !== row.generation
       )
         return { ok: false, sqlstate: "57P03" };
       return admittedRoute(row, id.data);
@@ -554,6 +807,15 @@ export class DatabaseActor extends DurableObject<Env> {
     const snapshot = this.presence();
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
     if (!snapshot.roles.includes(user)) return { ok: false, sqlstate: "28P01" };
+    const cached = this.snapshotAdmission(user);
+    // Expired/nonready proof may use authoritative cold preparation; a closed barrier never can.
+    if (
+      cached &&
+      (cached.ok ||
+        cached.sqlstate !== "57P03" ||
+        this.admissionState()?.barrier)
+    )
+      return cached;
     const row = await this.env.DB.prepare(DATABASE_ADMISSION_QUERY)
       .bind(user, id)
       .first<AdmissionRow>();
@@ -565,7 +827,11 @@ export class DatabaseActor extends DurableObject<Env> {
     )
       return { ok: false, sqlstate: "3D000" };
     if (row.role_name !== user) return { ok: false, sqlstate: "28P01" };
-    if (row.node_id === null || row.lost_at !== null)
+    if (
+      row.node_id === null ||
+      row.lost_at !== null ||
+      row.admission_blocked !== 0
+    )
       return { ok: false, sqlstate: "57P03" };
     return row;
   }
@@ -629,16 +895,43 @@ export class DatabaseActor extends DurableObject<Env> {
             .first();
           if (!sleepingIntent) return undefined;
           const operation = newOperationId(),
-            now = new Date().toISOString();
-          const result = await this.env.DB.batch(
-            powerTransitionStatements(
-              this.env.DB,
-              row,
-              "wake",
-              operation,
-              now,
-              user,
-            ),
+            now = new Date().toISOString(),
+            previous = row;
+          const result = await withAdmissionMutation(
+            this.env,
+            [id],
+            async (mutation) => {
+              const plan = await preparePostgresPoolClaim(
+                this.env,
+                id,
+                previous.generation + 1,
+                mutation,
+              );
+              if (
+                plan &&
+                plan.statements.length === 0 &&
+                (await plan.finish()).kind === "blocked"
+              )
+                throw new Error("pool_holder_unresolved");
+              const statements = powerTransitionStatements(
+                this.env.DB,
+                previous,
+                "wake",
+                operation,
+                now,
+                user,
+                mutation.guard(id),
+              );
+              const committed = await mutation.batch([
+                ...(plan?.statements ?? []),
+                ...statements,
+              ]);
+              if (plan && (await plan.finish()).kind === "blocked")
+                throw new Error("pool_claim_commit_unconfirmed");
+              return committed.slice(plan?.statements.length ?? 0);
+            },
+            undefined,
+            this.localAdmissionActor(id),
           );
           if (result[0]!.meta.changes !== 1) return undefined;
           row = await this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
@@ -778,10 +1071,11 @@ export class DatabaseActor extends DurableObject<Env> {
         current.desired_state === "running" &&
         current.observed_state === "ready" &&
         current.observed_power === "awake" &&
-        (!current.power_operation ||
-          current.observed_generation === current.generation)
+        current.observed_generation === current.generation
       )
-        return admittedRoute(current, id.data);
+        return (
+          this.snapshotAdmission(role.data) ?? admittedRoute(current, id.data)
+        );
       if (
         current.desired_state === "suspended" &&
         current.suspension_reason !== "idle"
@@ -792,6 +1086,7 @@ export class DatabaseActor extends DurableObject<Env> {
       const wake = await this.claimWake(id.data, role.data);
       if (wake && "failure" in wake)
         return { ok: false, sqlstate: wake.failure };
+      if (!wake && deadline > Date.now()) return this.admit(id.data, role.data);
       if (!wake || deadline <= Date.now() || this.waiters.size >= 32)
         return { ok: false, sqlstate: "57P03" };
       if (
@@ -874,8 +1169,19 @@ export class DatabaseActor extends DurableObject<Env> {
           row.observed_generation === this.wake.revision &&
           row.observed_power === "awake"
         ) {
-          this.finishWaiters(true);
-          break;
+          const state = this.admissionState(),
+            snapshot = state?.snapshot;
+          if (
+            !state?.barrier &&
+            (!snapshot?.cache_capable ||
+              (snapshot.admissible &&
+                snapshot.generation === this.wake.revision &&
+                snapshot.runtime &&
+                snapshot.runtime.observation.expires_at > Date.now()))
+          ) {
+            this.finishWaiters(true);
+            break;
+          }
         }
         // A push that arrived during this read asks for another one at once.
         if (this.pushed) continue;
@@ -1027,14 +1333,23 @@ export class DatabaseActor extends DurableObject<Env> {
       await this.revokeReclaimLocked();
       const operation = newOperationId(),
         now = new Date().toISOString();
-      const result = await this.env.DB.batch(
-        powerTransitionStatements(
-          this.env.DB,
-          row,
-          "hibernate",
-          operation,
-          now,
-        ),
+      const result = await withAdmissionMutation(
+        this.env,
+        [databaseId],
+        async (mutation) =>
+          mutation.batch(
+            powerTransitionStatements(
+              this.env.DB,
+              row,
+              "hibernate",
+              operation,
+              now,
+              undefined,
+              mutation.guard(databaseId),
+            ),
+          ),
+        undefined,
+        this.localAdmissionActor(databaseId),
       );
       if (result[0]!.meta.changes !== 1)
         return { ok: false, reason: "changed" };

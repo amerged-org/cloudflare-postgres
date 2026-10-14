@@ -29,6 +29,11 @@ import {
   FleetReleaseSpec,
   thinStorageReleaseGuardPinned,
 } from "@pgcf/contracts/releases";
+import {
+  withAdmissionMutation,
+  type AdmissionMutation,
+  type AdmissionSqlGuard,
+} from "./admission-mutations.ts";
 
 interface Row extends HostStatus {
   kid: string;
@@ -146,10 +151,11 @@ function same(
   );
 }
 /** Internal patch caller may omit expected_revision; administration always supplies its reviewed CAS. */
-export async function ensureNodeHostConfiguration(
+async function prepareHostConfiguration(
   env: Env,
   input: { node_id: string; node_uid: string; expected_revision?: number },
-): Promise<HostStatus> {
+  guard?: AdmissionSqlGuard,
+): Promise<{ status: HostStatus; statement: D1PreparedStatement | null }> {
   const source = await authority(env, input.node_id, input.node_uid),
     previous = await row(env, input.node_id);
   if (
@@ -185,7 +191,10 @@ export async function ensureNodeHostConfiguration(
     ),
     sha256 = await installationHash(files);
   if (previous && same(source, previous) && previous.sha256 === sha256)
-    return NodeHostConfigurationStatus.strip().parse(previous);
+    return {
+      status: NodeHostConfigurationStatus.strip().parse(previous),
+      statement: null,
+    };
   const status = NodeHostConfigurationStatus.parse({
       ...base,
       sha256,
@@ -197,38 +206,77 @@ export async function ensureNodeHostConfiguration(
     scope(status),
     canonicalInstallation(payload),
   );
-  const stored = await env.DB.prepare(
+  const statement = env.DB.prepare(
     `INSERT INTO node_host_configurations(node_id,node_uid,region_id,cluster_uid,material_revision,revision,sha256,release_id,pool_policy_revision,profile_sha256,kid,iv,ciphertext,created_at)
  SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN node_compute_pool_policies p ON p.node_id=n.id AND p.node_uid=n.node_uid JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=p.release_id WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND r.bootstrap_material_revision=? AND p.release_id=? AND p.revision=? AND p.policy_json=? AND ?=EXISTS(SELECT 1 FROM node_thin_storage thin WHERE thin.node_id=n.id AND thin.node_uid=n.node_uid) AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))
+ AND (${guard?.sql ?? "1=1"}) AND NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id=? AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=held_database.id AND b.state NOT IN('released','refused')) OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=held_database.id AND h.kind='pool' AND h.state NOT IN('released','refused'))))
  ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,region_id=excluded.region_id,cluster_uid=excluded.cluster_uid,material_revision=excluded.material_revision,revision=excluded.revision,sha256=excluded.sha256,release_id=excluded.release_id,pool_policy_revision=excluded.pool_policy_revision,profile_sha256=excluded.profile_sha256,kid=excluded.kid,iv=excluded.iv,ciphertext=excluded.ciphertext,created_at=excluded.created_at WHERE node_host_configurations.revision=?`,
+  ).bind(
+    status.node_id,
+    status.node_uid,
+    status.region_id,
+    status.cluster_uid,
+    status.material_revision,
+    status.revision,
+    status.sha256,
+    status.release_id,
+    status.pool_policy_revision,
+    status.profile_sha256,
+    encrypted.kid,
+    encrypted.iv,
+    encrypted.ciphertext,
+    status.created_at,
+    status.node_id,
+    status.node_uid,
+    status.material_revision,
+    status.release_id,
+    status.pool_policy_revision,
+    source.policy_json,
+    source.thin_selected,
+    ...(guard?.bindings ?? []),
+    source.region_id,
+    previous?.revision ?? 0,
+  );
+  return { status, statement };
+}
+/** Fleet creation includes host custody in its one fenced authoritative batch. */
+export async function prepareNodeHostConfiguration(
+  env: Env,
+  input: { node_id: string; node_uid: string; expected_revision?: number },
+  mutation: AdmissionMutation,
+) {
+  const prepared = await prepareHostConfiguration(
+    env,
+    input,
+    mutation.scopeGuard(),
+  );
+  if (
+    mutation.scope?.kind !== "region" ||
+    mutation.scope.id !== prepared.status.region_id
   )
-    .bind(
-      status.node_id,
-      status.node_uid,
-      status.region_id,
-      status.cluster_uid,
-      status.material_revision,
-      status.revision,
-      status.sha256,
-      status.release_id,
-      status.pool_policy_revision,
-      status.profile_sha256,
-      encrypted.kid,
-      encrypted.iv,
-      encrypted.ciphertext,
-      status.created_at,
-      status.node_id,
-      status.node_uid,
-      status.material_revision,
-      status.release_id,
-      status.pool_policy_revision,
-      source.policy_json,
-      source.thin_selected,
-      previous?.revision ?? 0,
-    )
-    .run();
-  if (stored.meta.changes !== 1) return closed();
-  return readNodeHostConfiguration(env, status.node_id);
+    return closed();
+  return prepared;
+}
+/** Public and postjoin writers close the complete regional snapshot before changing sealed host custody. */
+export async function ensureNodeHostConfiguration(
+  env: Env,
+  input: { node_id: string; node_uid: string; expected_revision?: number },
+): Promise<HostStatus> {
+  const candidate = await prepareHostConfiguration(env, input);
+  if (!candidate.statement) return candidate.status;
+  return withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const prepared = await prepareNodeHostConfiguration(env, input, mutation);
+      const results = await mutation.batch(
+        prepared.statement ? [prepared.statement] : [],
+      );
+      if (prepared.statement && results[0]?.meta.changes !== 1) return closed();
+      return readNodeHostConfiguration(env, input.node_id);
+    },
+    { kind: "region", id: candidate.status.region_id },
+  );
 }
 /** Private leaf, callable only after the fleet patch's independent operation authority check. */
 export async function loadNodeHostConfiguration(

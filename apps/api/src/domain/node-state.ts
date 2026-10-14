@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
+import type { AdmissionMutation } from "./admission-mutations.ts";
 import {
   bytesToHex,
   newNodeId,
@@ -151,6 +152,12 @@ export async function readNodeAddition(
 export async function configureNodeRegionPolicy(
   db: D1Database,
   value: unknown,
+  mutation?: AdmissionMutation,
+  expectedRuntime?: {
+    placement_mode: string | null;
+    postgres_memory_request_mib: number | null;
+    compute_pool_json: string | null;
+  },
 ): Promise<void> {
   const policy = NodeRegionPolicy.parse(value);
   const previous = await db
@@ -180,10 +187,13 @@ export async function configureNodeRegionPolicy(
     );
   // Assigned databases may change request geometry only after confirmed manual
   // suspension; the next resume still needs a fresh full-peak startup grant.
-  const result = await db
+  const admission = mutation?.scopeGuard();
+  const statement = db
     .prepare(
       `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled)
     SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
+      AND (${admission?.sql ?? "1=1"})
+      AND (?=0 OR ((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT compute_pool_json FROM node_region_policies WHERE region_id=r.id) IS ?))
       AND (?=1 OR (SELECT ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=r.id) IS ?)
       AND (?=1 OR COALESCE((SELECT autoscale_enabled FROM node_region_policies WHERE region_id=r.id),0)=?)
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
@@ -242,6 +252,11 @@ export async function configureNodeRegionPolicy(
         ? null
         : Number(policy.cap_warning_enabled),
       policy.region_id,
+      ...(admission?.bindings ?? []),
+      Number(expectedRuntime !== undefined),
+      expectedRuntime?.placement_mode ?? null,
+      expectedRuntime?.postgres_memory_request_mib ?? null,
+      expectedRuntime?.compute_pool_json ?? null,
       Number(policy.ram_expansion_threshold_ppm !== undefined),
       previous?.ram_expansion_threshold_ppm ?? null,
       Number(policy.autoscale_enabled !== undefined),
@@ -266,8 +281,10 @@ export async function configureNodeRegionPolicy(
       Number(policy.node_cpu_warning_threshold_ppm !== undefined),
       Number(policy.node_storage_warning_threshold_ppm !== undefined),
       Number(policy.cap_warning_enabled !== undefined),
-    )
-    .run();
+    );
+  const result = mutation
+    ? (await mutation.batch([statement]))[0]!
+    : await statement.run();
   if (result.meta.changes !== 1) {
     const region = await db
       .prepare("SELECT 1 FROM regions WHERE id=? AND provider='contabo'")
@@ -306,16 +323,26 @@ export async function markNodeLost(
   db: D1Database,
   nodeId: string,
   value: NodeMarkLost,
+  mutation?: AdmissionMutation,
 ): Promise<NodeLoss> {
   NodeId.parse(nodeId);
   const request = NodeMarkLost.parse(value);
   const now = new Date().toISOString();
-  await db
-    .prepare(
-      "UPDATE nodes SET lost_at=?,lost_reason=?,ready=0,schedulable=0,updated_at=? WHERE id=? AND node_uid=? AND lost_at IS NULL",
-    )
-    .bind(now, request.reason, now, nodeId, request.expected_node_uid)
-    .run();
+  const guard = mutation?.scopeGuard(),
+    statement = db
+      .prepare(
+        `UPDATE nodes SET lost_at=?,lost_reason=?,ready=0,schedulable=0,updated_at=? WHERE id=? AND node_uid=? AND lost_at IS NULL AND (${guard?.sql ?? "1=1"})`,
+      )
+      .bind(
+        now,
+        request.reason,
+        now,
+        nodeId,
+        request.expected_node_uid,
+        ...(guard?.bindings ?? []),
+      );
+  if (mutation) await mutation.batch([statement]);
+  else await statement.run();
   const row = await db
     .prepare(
       "SELECT id node_id,region_id,node_uid,provider_instance_id,lost_at,lost_reason reason FROM nodes WHERE id=?",

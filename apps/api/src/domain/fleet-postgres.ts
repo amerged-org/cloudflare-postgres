@@ -4,6 +4,7 @@ import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import { scheduleDatabaseResize } from "./databases.ts";
+import { withAdmissionMutation } from "./admission-mutations.ts";
 import {
   assertFleetPatchAuthority,
   fleetPatchAuthoritySql,
@@ -94,27 +95,36 @@ export async function reconcileFleetPostgresRelease(
     }
     try {
       if (row.node_id === null) {
-        const result = await env.DB.prepare(
-          `UPDATE databases SET desired_postgres_release_id=?,desired_postgres_image=?,desired_postgres_version=?,desired_postgres_schema_revision=?,generation=generation+1,updated_at=?
+        const result = await withAdmissionMutation(
+          env,
+          [row.id],
+          async (mutation) => {
+            const guard = mutation.guard(row.id);
+            const results = await mutation.batch([
+              env.DB.prepare(
+                `UPDATE databases SET desired_postgres_release_id=?,desired_postgres_image=?,desired_postgres_version=?,desired_postgres_schema_revision=?,generation=generation+1,updated_at=?
           WHERE id=? AND project_id=? AND region_id=? AND node_id IS NULL AND generation=? AND updated_at=?
             AND desired_state='running' AND observed_state='pending' AND observed_generation=0 AND deleted_at IS NULL
             AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=databases.id AND o.project_id=databases.project_id AND o.generation<=databases.generation AND o.kind IN('database.create','database.restore') AND o.status='pending')
-            AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL) AND (${authority.sql})`,
-        )
-          .bind(
-            releaseId,
-            pin.data.image,
-            pin.data.version,
-            pin.data.configuration_schema_revision,
-            new Date().toISOString(),
-            row.id,
-            row.project_id,
-            regionId,
-            row.generation,
-            row.updated_at,
-            ...authority.bindings,
-          )
-          .run();
+            AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL) AND (${authority.sql}) AND (${guard.sql})`,
+              ).bind(
+                releaseId,
+                pin.data.image,
+                pin.data.version,
+                pin.data.configuration_schema_revision,
+                new Date().toISOString(),
+                row.id,
+                row.project_id,
+                regionId,
+                row.generation,
+                row.updated_at,
+                ...authority.bindings,
+                ...guard.bindings,
+              ),
+            ]);
+            return results[0]!;
+          },
+        );
         if (result.meta.changes !== 1)
           throw new ApiError(
             "conflict",
@@ -123,7 +133,7 @@ export async function reconcileFleetPostgresRelease(
         continue;
       }
       await scheduleDatabaseResize(
-        env.DB,
+        env,
         row,
         row.size_class_id,
         new Date().toISOString(),

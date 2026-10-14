@@ -2,6 +2,7 @@
 import { DatabaseId } from "@pgcf/contracts";
 import { DatabasePresence } from "../database-actor.ts";
 import type { ApiContext, Env } from "../env.ts";
+import { admissionSnapshotSql } from "./fleet-releases.ts";
 
 export async function readDatabasePresence(
   db: D1Database,
@@ -40,13 +41,32 @@ export async function syncDatabaseActor(
 ): Promise<boolean> {
   return sync(c.env, id);
 }
-async function sync(env: Env, id: string): Promise<boolean> {
+async function sync(
+  env: Env,
+  id: string,
+  cacheCapable?: boolean,
+): Promise<boolean> {
   DatabaseId.parse(id);
   const snapshot = await readDatabasePresence(env.DB, id);
   if (!snapshot) return false;
-  await env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id)).seed(
-    snapshot,
-  );
+  if (cacheCapable === false) {
+    // Legacy cron convergence remains presence-only; it explicitly clears any prior v4 cache.
+    // Capable regions always take the complete publisher below.
+    const closed = await env.DATABASE_ACTOR.get(
+      env.DATABASE_ACTOR.idFromName(id),
+    ).seedLegacyPresence(snapshot);
+    if (closed) {
+      // Recovery still requires a positive epoch fence/readback; a clear-only legacy seed
+      // never removes an orphan barrier itself.
+      const { publishDatabaseAdmission } =
+        await import("./database-admission-snapshot.ts");
+      await publishDatabaseAdmission(env, id, undefined, snapshot);
+    }
+    return true;
+  }
+  const { publishDatabaseAdmission } =
+    await import("./database-admission-snapshot.ts");
+  await publishDatabaseAdmission(env, id, undefined, snapshot);
   return true;
 }
 
@@ -60,11 +80,13 @@ export async function reconcileDatabaseActors(
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200)
     throw new Error("invalid_actor_page_limit");
   const page = await env.DB.prepare(
-    `SELECT id FROM databases ${after ? "WHERE id>?" : ""} ORDER BY id LIMIT ?`,
+    `SELECT d.id,CASE WHEN ${admissionSnapshotSql("r")} THEN 1 ELSE 0 END cache_capable
+      FROM databases d JOIN regions r ON r.id=d.region_id ${after ? "WHERE d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(...(after ? [after, limit] : [limit]))
-    .all<{ id: string }>();
-  for (const row of page.results) await sync(env, DatabaseId.parse(row.id));
+    .all<{ id: string; cache_capable: number }>();
+  for (const row of page.results)
+    await sync(env, DatabaseId.parse(row.id), row.cache_capable === 1);
   const ids = page.results.map((row) => row.id);
   return { ids, next: ids.length === limit ? ids.at(-1)! : null };
 }

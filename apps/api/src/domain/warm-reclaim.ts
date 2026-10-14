@@ -24,6 +24,7 @@ import {
 } from "../crypto/bootstrap-credentials.ts";
 import { installationHash } from "./node-installation.ts";
 import { storageAuthorityPublicKeys } from "./storage-authority.ts";
+import { withAdmissionMutation } from "./admission-mutations.ts";
 const Safe = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const WarmReclaimPolicyState = z.strictObject({
   database_id: DatabaseId,
@@ -243,32 +244,47 @@ export async function setWarmReclaimPolicy(
           "conflict",
           "Database or warm policy revision changed",
         );
-      await c.env.DATABASE_ACTOR.get(
-        c.env.DATABASE_ACTOR.idFromName(id),
-      ).revokeWarmReclaim(id);
-      const doc = JSON.stringify({
-        revision: body.expected_revision + 1,
-        policy: body.policy,
+      await withAdmissionMutation(c.env, [id], async (mutation) => {
+        if (
+          !(await c.env.DATABASE_ACTOR.get(
+            c.env.DATABASE_ACTOR.idFromName(id),
+          ).revokeBeforeChange(id))
+        )
+          throw new ApiError(
+            "conflict",
+            "Warm reclaim revocation is not acknowledged or expired",
+          );
+        const guard = mutation.guard(id),
+          doc = JSON.stringify({
+            revision: body.expected_revision + 1,
+            policy: body.policy,
+          });
+        const result = await mutation.batch([
+          c.env.DB.prepare(
+            `UPDATE databases SET warm_reclaim_policy_json=? WHERE id=? AND generation=? AND warm_reclaim_policy_json IS ? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL) AND (${guard.sql})`,
+          ).bind(
+            doc,
+            id,
+            body.expected_generation,
+            database.warm_reclaim_policy_json ?? null,
+            ...guard.bindings,
+          ),
+          lease.completeStatement(id, 200, {
+            sql: `EXISTS(SELECT 1 FROM databases WHERE id=? AND warm_reclaim_policy_json=?) AND (${guard.sql})`,
+            bindings: [id, doc, ...guard.bindings],
+          }),
+        ]);
+        if (result[0]!.meta.changes !== 1)
+          throw new ApiError(
+            "conflict",
+            "Database changed before warm policy commit",
+          );
       });
-      const result = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `UPDATE databases SET warm_reclaim_policy_json=? WHERE id=? AND generation=? AND warm_reclaim_policy_json IS ? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)`,
-        ).bind(
-          doc,
-          id,
-          body.expected_generation,
-          database.warm_reclaim_policy_json ?? null,
-        ),
-        lease.completeStatement(id, 200, {
-          sql: "EXISTS(SELECT 1 FROM databases WHERE id=? AND warm_reclaim_policy_json=?)",
-          bindings: [id, doc],
-        }),
-      ]);
-      if (result[0]!.meta.changes !== 1)
-        throw new ApiError(
-          "conflict",
-          "Database changed before warm policy commit",
-        );
+      c.executionCtx.waitUntil(
+        c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(database.region_id))
+          .notify([id])
+          .catch(() => undefined),
+      );
       return getWarmReclaimPolicy(c, id);
     },
   });
@@ -342,52 +358,76 @@ export async function setWarmReclaimQualification(
     replay: () => getWarmReclaimQualification(c, id),
     execute: async (lease) => {
       if (old.revision !== body.expected_revision) closed();
-      const assigned = await c.env.DB.prepare(
-        "SELECT id FROM databases WHERE node_id=? AND deleted_at IS NULL LIMIT ?",
-      )
-        .bind(id, RECLAIM_LIMITS.max_tasks + 1)
-        .all<{ id: string }>();
-      if (assigned.results.length > RECLAIM_LIMITS.max_tasks) closed();
-      for (const db of assigned.results)
-        await c.env.DATABASE_ACTOR.get(
-          c.env.DATABASE_ACTOR.idFromName(db.id),
-        ).revokeWarmReclaim(db.id);
-      const doc = JSON.stringify({
-          revision: body.expected_revision + 1,
-          qualification: body.qualification,
-        }),
-        oldDoc =
-          old.revision === 0
-            ? null
-            : JSON.stringify({
-                revision: old.revision,
-                qualification: old.qualification,
-              });
-      const result = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `UPDATE nodes SET warm_reclaim_qualification_json=? WHERE id=? AND node_uid=? AND warm_reclaim_qualification_json IS ? AND lost_at IS NULL ${body.qualification ? "AND EXISTS(SELECT 1 FROM regions r JOIN fleet_node_releases a ON a.node_id=nodes.id AND a.node_uid=nodes.node_uid JOIN fleet_region_releases f ON f.region_id=r.id AND f.release_id=a.release_id WHERE r.id=nodes.region_id AND r.bootstrap_material_revision=? AND a.release_id=? AND a.revision=? AND f.revision=? AND EXISTS(SELECT 1 FROM fleet_node_release_observations o JOIN node_host_configurations h ON h.node_id=o.node_id AND h.node_uid=o.node_uid WHERE o.node_id=nodes.id AND o.node_uid=nodes.node_uid AND o.assignment_revision=a.revision AND o.agent_key_hash=r.agent_key_hash AND json_extract(o.facts_json,'$.boot_id')=? AND h.sha256=? AND julianday(o.observed_at)>=julianday('now','-180 seconds') AND julianday(o.observed_at)<=julianday('now','+5 seconds')))" : ""}`,
-        ).bind(
-          doc,
+      let affected: string[] = [];
+      await withAdmissionMutation(
+        c.env,
+        [],
+        async (mutation) => {
+          if (mutation.intents.length > RECLAIM_LIMITS.max_tasks) closed();
+          for (const db of mutation.intents)
+            if (
+              !(await c.env.DATABASE_ACTOR.get(
+                c.env.DATABASE_ACTOR.idFromName(db.database_id),
+              ).revokeBeforeChange(db.database_id))
+            )
+              closed();
+          const doc = JSON.stringify({
+              revision: body.expected_revision + 1,
+              qualification: body.qualification,
+            }),
+            oldDoc =
+              old.revision === 0
+                ? null
+                : JSON.stringify({
+                    revision: old.revision,
+                    qualification: old.qualification,
+                  });
+          affected = mutation.intents.map((intent) => intent.database_id);
+          const guard = mutation.scopeGuard();
+          const result = await mutation.batch([
+            c.env.DB.prepare(
+              `UPDATE nodes SET warm_reclaim_qualification_json=? WHERE id=? AND node_uid=? AND warm_reclaim_qualification_json IS ? AND lost_at IS NULL ${body.qualification ? "AND EXISTS(SELECT 1 FROM regions r JOIN fleet_node_releases a ON a.node_id=nodes.id AND a.node_uid=nodes.node_uid JOIN fleet_region_releases f ON f.region_id=r.id AND f.release_id=a.release_id WHERE r.id=nodes.region_id AND r.bootstrap_material_revision=? AND a.release_id=? AND a.revision=? AND f.revision=? AND EXISTS(SELECT 1 FROM fleet_node_release_observations o JOIN node_host_configurations h ON h.node_id=o.node_id AND h.node_uid=o.node_uid WHERE o.node_id=nodes.id AND o.node_uid=nodes.node_uid AND o.assignment_revision=a.revision AND o.agent_key_hash=r.agent_key_hash AND json_extract(o.facts_json,'$.boot_id')=? AND h.sha256=? AND julianday(o.observed_at)>=julianday('now','-180 seconds') AND julianday(o.observed_at)<=julianday('now','+5 seconds')))" : ""} AND (${guard.sql})`,
+            ).bind(
+              doc,
+              id,
+              body.node_uid,
+              oldDoc,
+              ...(body.qualification
+                ? [
+                    source!.material_revision,
+                    source!.release_id,
+                    source!.assignment_revision,
+                    source!.region_revision,
+                    source!.boot_id,
+                    source!.host_sha256,
+                  ]
+                : []),
+              ...guard.bindings,
+            ),
+            lease.completeStatement(id, 200, {
+              sql: `EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND warm_reclaim_qualification_json=?) AND (${guard.sql})`,
+              bindings: [id, body.node_uid, doc, ...guard.bindings],
+            }),
+          ]);
+          if (result[0]!.meta.changes !== 1) closed();
+        },
+        {
+          kind: "node",
           id,
-          body.node_uid,
-          oldDoc,
-          ...(body.qualification
-            ? [
-                source!.material_revision,
-                source!.release_id,
-                source!.assignment_revision,
-                source!.region_revision,
-                source!.boot_id,
-                source!.host_sha256,
-              ]
-            : []),
-        ),
-        lease.completeStatement(id, 200, {
-          sql: "EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND warm_reclaim_qualification_json=?)",
-          bindings: [id, body.node_uid, doc],
-        }),
-      ]);
-      if (result[0]!.meta.changes !== 1) closed();
+          databases: { sql: "d.deleted_at IS NULL", bindings: [] },
+        },
+      );
+      const node = await c.env.DB.prepare(
+        "SELECT region_id FROM nodes WHERE id=?",
+      )
+        .bind(id)
+        .first<{ region_id: string }>();
+      if (node && affected.length)
+        c.executionCtx.waitUntil(
+          c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(node.region_id))
+            .notify(affected)
+            .catch(() => undefined),
+        );
       return getWarmReclaimQualification(c, id);
     },
   });

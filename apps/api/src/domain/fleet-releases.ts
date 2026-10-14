@@ -19,6 +19,14 @@ import { agentRegion } from "./agent-auth.ts";
 import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
 import { assertThinQualificationReceipt } from "./thin-qualification.ts";
 import { page } from "../platform/pagination.ts";
+import {
+  withAdmissionMutation,
+  type AdmissionMutation,
+} from "./admission-mutations.ts";
+import {
+  assertPostgresPoolQualificationReceipt,
+  hasNonterminalPoolHolderSql,
+} from "./postgres-pool.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -103,6 +111,11 @@ export async function approveFleetRelease(
       c.env.DB,
       spec.thin_storage_qualification,
     );
+  if (spec.postgres_pool_qualification)
+    await assertPostgresPoolQualificationReceipt(
+      c.env.DB,
+      spec.postgres_pool_qualification,
+    );
   const read = async () => {
     const current = await release(c.env.DB, id);
     if (current.spec_sha256 !== hash || canonical(current.spec) !== specJson)
@@ -165,29 +178,41 @@ export async function assignFleetRegionRelease(
   return withIdempotency(c, {
     replay: read,
     execute: async (lease) => {
-      const results = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at)
+      const results = await withAdmissionMutation(
+        c.env,
+        [],
+        async (mutation) => {
+          const guard = mutation.scopeGuard();
+          return mutation.batch([
+            c.env.DB.prepare(
+              `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at)
           SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM regions WHERE id=?)
+            AND ${guard.sql}
+            AND NOT EXISTS(SELECT 1 FROM databases pd WHERE pd.region_id=? AND ${hasNonterminalPoolHolderSql("pd")})
             AND (?=0 OR EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND revision=?))
           ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,
             revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_region_releases.revision=?`,
-        ).bind(
-          regionId,
-          input.release_id,
-          input.expected_revision + 1,
-          new Date().toISOString(),
-          regionId,
-          input.expected_revision,
-          regionId,
-          input.expected_revision,
-          input.expected_revision,
-        ),
-        lease.completeStatement(regionId, 200, {
-          sql: "changes()=1",
-          bindings: [],
-        }),
-      ]);
+            ).bind(
+              regionId,
+              input.release_id,
+              input.expected_revision + 1,
+              new Date().toISOString(),
+              regionId,
+              ...guard.bindings,
+              regionId,
+              input.expected_revision,
+              regionId,
+              input.expected_revision,
+              input.expected_revision,
+            ),
+            lease.completeStatement(regionId, 200, {
+              sql: "changes()=1",
+              bindings: [],
+            }),
+          ]);
+        },
+        { kind: "region", id: regionId },
+      );
       if (results[0]!.meta.changes !== 1)
         return conflict("Region release assignment changed");
       return read();
@@ -509,7 +534,7 @@ export async function assignFleetNodeRelease(
 ): Promise<Response> {
   await requireScope(c, "admin");
   await release(c.env.DB, input.release_id);
-  await nodeRow(c.env.DB, id);
+  const node = await nodeRow(c.env.DB, id);
   const read = async () => {
     const row = await nodeRow(c.env.DB, id);
     if (
@@ -529,28 +554,43 @@ export async function assignFleetNodeRelease(
       const guard =
         "EXISTS(SELECT 1 FROM nodes n JOIN fleet_region_releases r ON r.region_id=n.region_id WHERE n.id=? AND n.node_uid=? AND n.lost_at IS NULL AND r.release_id=?)";
       const identity = [id, input.node_uid, input.release_id];
-      const results = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at)
+      const results = await withAdmissionMutation(
+        c.env,
+        [],
+        async (mutation) => {
+          const admission = mutation.scopeGuard();
+          return mutation.batch([
+            c.env.DB.prepare(
+              `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at)
           SELECT ?,?,?,?,?,? WHERE ${guard}
+            AND ${admission.sql}
+            AND NOT EXISTS(SELECT 1 FROM databases pd WHERE pd.region_id=? AND ${hasNonterminalPoolHolderSql("pd")})
             AND (?=0 OR EXISTS(SELECT 1 FROM fleet_node_releases WHERE node_id=? AND revision=?))
           ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,release_id=excluded.release_id,
             role=excluded.role,revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_node_releases.revision=?`,
-        ).bind(
-          id,
-          input.node_uid,
-          input.release_id,
-          input.role,
-          input.expected_revision + 1,
-          new Date().toISOString(),
-          ...identity,
-          input.expected_revision,
-          id,
-          input.expected_revision,
-          input.expected_revision,
-        ),
-        lease.completeStatement(id, 200, { sql: "changes()=1", bindings: [] }),
-      ]);
+            ).bind(
+              id,
+              input.node_uid,
+              input.release_id,
+              input.role,
+              input.expected_revision + 1,
+              new Date().toISOString(),
+              ...identity,
+              ...admission.bindings,
+              node.region_id,
+              input.expected_revision,
+              id,
+              input.expected_revision,
+              input.expected_revision,
+            ),
+            lease.completeStatement(id, 200, {
+              sql: "changes()=1",
+              bindings: [],
+            }),
+          ]);
+        },
+        { kind: "region", id: node.region_id },
+      );
       if (results[0]!.meta.changes !== 1)
         return conflict("Node release assignment changed");
       return read();
@@ -749,41 +789,71 @@ export async function observeFleetNodeRelease(
             before.facts_json,
           ],
         };
-  const result = await c.env.DB.prepare(
-    `INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at)
+  const identity = (value: typeof facts | null) =>
+    value === null
+      ? null
+      : canonical({
+          boot_id: value.boot_id,
+          talos_version: value.talos_version,
+          talos_installer: value.talos_installer,
+          talos_schematic_sha256: value.talos_schematic_sha256,
+          platform_source_commit: value.platform_source_commit,
+          configuration_schema_revision: value.configuration_schema_revision,
+          kubernetes_version: value.kubernetes_version,
+          kubelet_version: value.kubelet_version,
+          kubernetes_control_plane: value.kubernetes_control_plane,
+          components: [...value.components].sort((a, b) =>
+            a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+          ),
+        });
+  const invalidates =
+    selected.spec.admission_snapshot_version === 1 &&
+    identity(old) !== identity(facts);
+  const execute = async (mutation?: AdmissionMutation) => {
+    const admission = mutation?.scopeGuard(),
+      statement = c.env.DB.prepare(
+        `INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at)
     SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id
       WHERE n.id=? AND n.region_id=? AND n.node_uid=? AND n.lost_at IS NULL AND r.agent_key_hash=? AND a.node_uid=n.node_uid AND a.revision=?
         AND a.release_id=? AND a.role=? AND EXISTS(SELECT 1 FROM fleet_releases f WHERE f.id=a.release_id AND f.spec_sha256=?))
       AND julianday(?)>=julianday('now','-180 seconds') AND julianday(?)<=julianday('now','+5 seconds')
       AND (${previous.sql})
+      AND (${admission?.sql ?? "1=1"})
     ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,assignment_revision=excluded.assignment_revision,
       agent_key_hash=excluded.agent_key_hash,facts_json=excluded.facts_json,observed_at=excluded.observed_at,received_at=excluded.received_at
       WHERE excluded.observed_at>fleet_node_release_observations.observed_at
         OR (excluded.observed_at=fleet_node_release_observations.observed_at AND excluded.node_uid=fleet_node_release_observations.node_uid
           AND excluded.assignment_revision=fleet_node_release_observations.assignment_revision AND excluded.agent_key_hash=fleet_node_release_observations.agent_key_hash
           AND excluded.facts_json=fleet_node_release_observations.facts_json)`,
-  )
-    .bind(
-      input.node_id,
-      input.node_uid,
-      input.assignment_revision,
-      region.agent_key_hash,
-      canonical(facts),
-      input.observed_at,
-      new Date(now).toISOString(),
-      input.node_id,
-      region.id,
-      input.node_uid,
-      region.agent_key_hash,
-      input.assignment_revision,
-      before.release_id,
-      before.role,
-      selected.spec_sha256,
-      input.observed_at,
-      input.observed_at,
-      ...previous.bindings,
-    )
-    .run();
+      ).bind(
+        input.node_id,
+        input.node_uid,
+        input.assignment_revision,
+        region.agent_key_hash,
+        canonical(facts),
+        input.observed_at,
+        new Date(now).toISOString(),
+        input.node_id,
+        region.id,
+        input.node_uid,
+        region.agent_key_hash,
+        input.assignment_revision,
+        before.release_id,
+        before.role,
+        selected.spec_sha256,
+        input.observed_at,
+        input.observed_at,
+        ...previous.bindings,
+        ...(admission?.bindings ?? []),
+      );
+    return mutation ? (await mutation.batch([statement]))[0]! : statement.run();
+  };
+  const result = invalidates
+    ? await withAdmissionMutation(c.env, [], execute, {
+        kind: "region",
+        id: region.id,
+      })
+    : await execute();
   if (result.meta.changes !== 1)
     return conflict("Fleet observation authority or node identity changed");
   return c.json({ accepted: true }, 200);
@@ -799,7 +869,7 @@ export function routeTokenV3Sql(region: string) {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_route_token_region_alias");
   return `EXISTS(SELECT 1 FROM fleet_region_releases vf JOIN fleet_releases vs ON vs.id=vf.release_id
-    WHERE vf.region_id=${region}.id AND json_extract(vs.spec_json,'$.route_token_version')=3
+    WHERE vf.region_id=${region}.id AND json_extract(vs.spec_json,'$.route_token_version') IN(3,4)
     AND EXISTS(SELECT 1 FROM nodes vn JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL)
     AND NOT EXISTS(SELECT 1 FROM nodes vn JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL
       AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations vp WHERE vp.node_id=vn.id AND vp.node_uid=vn.node_uid AND vp.release_id=vf.release_id
@@ -826,6 +896,69 @@ export async function thinStorageSamplingCapable(
     await db
       .prepare(
         `SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")}`,
+      )
+      .bind(regionId)
+      .first(),
+  );
+}
+/** Full snapshot wire fields require every current physical member's exact confirmed release. */
+export function admissionSnapshotSql(region: string) {
+  if (!/^[a-z][a-z0-9_]*$/.test(region))
+    throw new Error("invalid_admission_region_alias");
+  return `EXISTS(SELECT 1 FROM fleet_region_releases af JOIN fleet_releases ars ON ars.id=af.release_id
+    WHERE af.region_id=${region}.id AND json_extract(ars.spec_json,'$.route_token_version')=4
+      AND json_extract(ars.spec_json,'$.runtime_attestation_version')=2 AND json_extract(ars.spec_json,'$.admission_snapshot_version')=1
+      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations pending_patch WHERE pending_patch.region_id=af.region_id
+        AND pending_patch.stage NOT IN('complete','host_ready')
+        AND NOT(pending_patch.stage IN('flux','platform','regional') AND pending_patch.state='halted' AND pending_patch.error_code IS 'operator_hold_superseded'))
+      AND EXISTS(SELECT 1 FROM nodes an WHERE an.region_id=af.region_id AND an.lost_at IS NULL)
+      AND NOT EXISTS(SELECT 1 FROM nodes an LEFT JOIN fleet_node_releases aa ON aa.node_id=an.id
+        WHERE an.region_id=af.region_id AND an.lost_at IS NULL
+          AND (aa.node_id IS NULL OR aa.node_uid<>an.node_uid OR aa.release_id<>af.release_id
+            OR NOT EXISTS(SELECT 1 FROM fleet_patch_operations ap WHERE ap.node_id=an.id AND ap.node_uid=an.node_uid
+              AND ap.release_id=af.release_id AND ap.spec_sha256=ars.spec_sha256 AND ap.assignment_revision=aa.revision
+              AND ap.region_revision=af.revision AND ap.stage='complete' AND ap.state='confirmed' AND ap.error_code IS NULL)
+            OR EXISTS(SELECT 1 FROM fleet_node_release_observations ao WHERE ao.node_id=an.id AND (ao.node_uid<>an.node_uid OR ao.assignment_revision<>aa.revision OR ao.agent_key_hash<>${region}.agent_key_hash
+              OR EXISTS(SELECT 1 FROM json_each(ars.spec_json,'$.components') ac WHERE json_extract(ac.value,'$.name') IN('native-controller','native-gateway') AND NOT EXISTS(SELECT 1 FROM json_each(ao.facts_json,'$.components') oc WHERE json_extract(oc.value,'$.name')=json_extract(ac.value,'$.name') AND json_extract(oc.value,'$.sha256')=json_extract(ac.value,'$.sha256'))))))))`;
+}
+export async function admissionSnapshotCapable(
+  db: D1Database,
+  regionId: string,
+) {
+  return Boolean(
+    await db
+      .prepare(
+        `SELECT 1 FROM regions ar WHERE ar.id=? AND ${admissionSnapshotSql("ar")}`,
+      )
+      .bind(regionId)
+      .first(),
+  );
+}
+export function postgresPoolSql(region: string) {
+  return `(${admissionSnapshotSql(region)}) AND EXISTS(SELECT 1 FROM fleet_region_releases pf JOIN fleet_releases ps ON ps.id=pf.release_id WHERE pf.region_id=${region}.id AND json_extract(ps.spec_json,'$.postgres_pool_version')=1)`;
+}
+export async function postgresPoolCapable(db: D1Database, regionId: string) {
+  return Boolean(
+    await db
+      .prepare(
+        `SELECT 1 FROM regions pr WHERE pr.id=? AND ${postgresPoolSql("pr")}`,
+      )
+      .bind(regionId)
+      .first(),
+  );
+}
+/** Isolated qualification is separate from receipt-gated ordinary pool admission. */
+export function postgresPoolQualificationSql(region: string) {
+  return `(${admissionSnapshotSql(region)}) AND EXISTS(SELECT 1 FROM fleet_region_releases qf JOIN fleet_releases qs ON qs.id=qf.release_id WHERE qf.region_id=${region}.id AND json_extract(qs.spec_json,'$.postgres_pool_qualification_version')=1)`;
+}
+export async function postgresPoolQualificationCapable(
+  db: D1Database,
+  regionId: string,
+) {
+  return Boolean(
+    await db
+      .prepare(
+        `SELECT 1 FROM regions qr WHERE qr.id=? AND ${postgresPoolQualificationSql("qr")}`,
       )
       .bind(regionId)
       .first(),
@@ -860,11 +993,45 @@ export async function readDesiredFleetRelease(
     talos_raw_image: provisioningImage,
     route_token_version: routeTokenVersion,
     thin_storage_sampling_version: samplingVersion,
+    runtime_attestation_version: runtimeAttestationVersion,
+    admission_snapshot_version: admissionSnapshotVersion,
+    postgres_pool_version: postgresPoolVersion,
+    postgres_pool_qualification: postgresPoolQualification,
+    postgres_pool_qualification_version: postgresPoolQualificationVersion,
+    postgres_pool_candidate: postgresPoolCandidate,
     ...runtimeSpec
   } = selected.spec;
   void provisioningImage;
+  void postgresPoolVersion;
+  void postgresPoolQualification;
+  void postgresPoolQualificationVersion;
+  void postgresPoolCandidate;
   void routeTokenVersion;
   void samplingVersion;
+  void runtimeAttestationVersion;
+  void admissionSnapshotVersion;
+  if (
+    !(await postgresPoolCapable(db, regionId)) &&
+    !(await postgresPoolQualificationCapable(db, regionId))
+  ) {
+    runtimeSpec.components = runtimeSpec.components.filter(
+      (component) => component.name !== "pool-supervisor",
+    );
+    runtimeSpec.roles = {
+      control_relay: {
+        ...runtimeSpec.roles.control_relay,
+        components: runtimeSpec.roles.control_relay.components.filter(
+          (name) => name !== "pool-supervisor",
+        ),
+      },
+      customer: {
+        ...runtimeSpec.roles.customer,
+        components: runtimeSpec.roles.customer.components.filter(
+          (name) => name !== "pool-supervisor",
+        ),
+      },
+    };
+  }
   return FleetDesiredRelease.parse({
     region_id: regionId,
     region_revision: state.revision,

@@ -8,7 +8,7 @@ import {
   Timestamp,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
-import type { ApiContext } from "../env.ts";
+import type { ApiContext, Env } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
@@ -18,6 +18,10 @@ import {
 } from "./startup-admission.ts";
 
 import { storageProtectionCurrentSql } from "./storage-capacity.ts";
+import {
+  withAdmissionMutation,
+  type AdmissionSqlGuard,
+} from "./admission-mutations.ts";
 export type PowerAction = "suspend" | "resume" | "hibernate" | "wake";
 export function powerTransitionStatements(
   db: D1Database,
@@ -26,6 +30,7 @@ export function powerTransitionStatements(
   operation: string,
   now: string,
   wakeRole?: string,
+  admission?: AdmissionSqlGuard,
 ): D1PreparedStatement[] {
   const sleeping = action === "suspend" || action === "hibernate";
   const authorizedRole = action === "wake" ? RoleName.parse(wakeRole) : null;
@@ -38,7 +43,8 @@ export function powerTransitionStatements(
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND ((observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle') OR ${sleeping ? storageProtectionCurrentSql() : "0=1"})))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
       AND ${sleeping ? "1=1" : databaseStartupHeadroomSql()}
-      AND ${sleeping ? "1=1" : `(storage_protected_at IS NULL OR ${storageProtectionCurrentSql()})`}`,
+      AND ${sleeping ? "1=1" : `(storage_protected_at IS NULL OR ${storageProtectionCurrentSql()})`}
+      AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
         sleeping ? "suspended" : "running",
@@ -60,11 +66,12 @@ export function powerTransitionStatements(
         action,
         Number(action === "wake"),
         authorizedRole,
+        ...(admission?.bindings ?? []),
       ),
     db
       .prepare(
         `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
-      SELECT ?,?,'pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND power_operation=?`,
+      SELECT ?,?,'pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND power_operation=? AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
         operation,
@@ -75,12 +82,13 @@ export function powerTransitionStatements(
         row.project_id,
         row.generation + 1,
         operation,
+        ...(admission?.bindings ?? []),
       ),
     db
       .prepare(
         `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded',updated_at=?,completed_at=?
       WHERE database_id=? AND generation<? AND kind IN ('database.suspend','database.resume','database.hibernate','database.wake') AND status IN ('pending','running')
-      AND EXISTS(SELECT 1 FROM databases WHERE id=? AND power_operation=? AND generation=?)`,
+      AND EXISTS(SELECT 1 FROM databases WHERE id=? AND power_operation=? AND generation=?) AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
         now,
@@ -90,6 +98,7 @@ export function powerTransitionStatements(
         row.id,
         operation,
         row.generation + 1,
+        ...(admission?.bindings ?? []),
       ),
   ];
   if (!sleeping && row.node_id !== null)
@@ -190,13 +199,28 @@ export async function changePower(
         throw new ApiError("conflict", "Database configuration is not ready");
       const op = newOperationId(),
         now = new Date().toISOString();
-      const result = await c.env.DB.batch([
-        ...powerTransitionStatements(c.env.DB, row, action, op, now),
-        lease.completeStatement(op, 202, {
-          sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
-          bindings: [op, row.project_id],
-        }),
-      ]);
+      const result = await withAdmissionMutation(
+        c.env,
+        [id],
+        async (mutation) => {
+          const guard = mutation.guard(id);
+          return mutation.batch([
+            ...powerTransitionStatements(
+              c.env.DB,
+              row,
+              action,
+              op,
+              now,
+              undefined,
+              guard,
+            ),
+            lease.completeStatement(op, 202, {
+              sql: `EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?) AND (${guard.sql})`,
+              bindings: [op, row.project_id, ...guard.bindings],
+            }),
+          ]);
+        },
+      );
       if (result[0]!.meta.changes !== 1)
         throw new ApiError("conflict", "Database changed; retry the request");
       hint(c, row.region_id, [id]);
@@ -207,11 +231,12 @@ export async function changePower(
 
 /** Exact compensation for a refused/timed-out quiesce. It never invents an awake observation. */
 export async function recoverQuiescence(
-  db: D1Database,
+  env: Env,
   expected: { databaseId: string; operation: string; revision: number },
   reason: "busy" | "archive" | "unknown" | "timeout",
   now = new Date().toISOString(),
 ): Promise<{ operation: string; revision: number; regionId: string } | null> {
+  const db = env.DB;
   DatabaseId.parse(expected.databaseId);
   OperationId.parse(expected.operation);
   Timestamp.parse(now);
@@ -228,83 +253,92 @@ export async function recoverQuiescence(
     .bind(expected.databaseId, expected.revision, expected.operation)
     .first<DatabaseRow>();
   if (!row) return null;
-  const operation = newOperationId();
-  const mayRestart = reason === "unknown" || reason === "timeout";
-  const statements = [
-    db
-      .prepare(
-        `UPDATE databases SET desired_state='running',suspension_reason=NULL,power_operation=?,generation=generation+1,observed_state='provisioning',status_message='Power transition refused',updated_at=? WHERE id=? AND generation=? AND updated_at=? AND desired_state='suspended' AND power_operation=?
+  return withAdmissionMutation(env, [row.id], async (mutation) => {
+    const guard = mutation.guard(row.id);
+    const operation = newOperationId();
+    const mayRestart = reason === "unknown" || reason === "timeout";
+    const statements = [
+      db
+        .prepare(
+          `UPDATE databases SET desired_state='running',suspension_reason=NULL,power_operation=?,generation=generation+1,observed_state='provisioning',status_message='Power transition refused',updated_at=? WHERE id=? AND generation=? AND updated_at=? AND desired_state='suspended' AND power_operation=?
           AND observed_state=? AND observed_generation=? AND observed_power=? AND suspension_reason IS ? AND node_id IS ?
           AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
           AND EXISTS(SELECT 1 FROM operations o WHERE o.id=databases.power_operation AND o.database_id=databases.id AND o.project_id=databases.project_id
             AND o.generation<=databases.generation AND o.kind IN('database.suspend','database.hibernate') AND o.status IN('pending','running'))
-          AND ${mayRestart ? databaseStartupHeadroomSql() : "1=1"}`,
-      )
-      .bind(
-        operation,
-        now,
-        row.id,
-        row.generation,
-        row.updated_at,
-        row.power_operation,
-        row.observed_state,
-        row.observed_generation,
-        row.observed_power,
-        row.suspension_reason ?? null,
-        row.node_id,
-      ),
-    db
-      .prepare(
-        `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,?,'pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND power_operation=?`,
-      )
-      .bind(
-        operation,
-        row.suspension_reason === "idle" ? "database.wake" : "database.resume",
-        now,
-        now,
-        row.id,
-        operation,
-      ),
-    db
-      .prepare(
-        `UPDATE operations SET status='failed',error_code=?,error_message='Power transition refused',updated_at=?,completed_at=? WHERE id=? AND database_id=? AND generation<=? AND status IN('pending','running') AND EXISTS(SELECT 1 FROM databases WHERE id=? AND power_operation=? AND generation=?)`,
-      )
-      .bind(
-        `power_${reason}`,
-        now,
-        now,
-        row.power_operation,
-        row.id,
-        row.generation,
-        row.id,
-        operation,
-        row.generation + 1,
-      ),
-  ];
-  if (mayRestart && row.node_id !== null)
-    statements.splice(
-      2,
-      0,
-      startupReservationStatement(db, {
-        databaseId: row.id,
-        operationId: operation,
-        generation: row.generation + 1,
-        nodeId: row.node_id,
-        now,
-      }),
-    );
-  const result = await db.batch(statements);
-  return result[0]!.meta.changes === 1
-    ? { operation, revision: row.generation + 1, regionId: row.region_id }
-    : null;
+          AND ${mayRestart ? databaseStartupHeadroomSql() : "1=1"} AND (${guard.sql})`,
+        )
+        .bind(
+          operation,
+          now,
+          row.id,
+          row.generation,
+          row.updated_at,
+          row.power_operation,
+          row.observed_state,
+          row.observed_generation,
+          row.observed_power,
+          row.suspension_reason ?? null,
+          row.node_id,
+          ...guard.bindings,
+        ),
+      db
+        .prepare(
+          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,?,'pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND power_operation=? AND (${guard.sql})`,
+        )
+        .bind(
+          operation,
+          row.suspension_reason === "idle"
+            ? "database.wake"
+            : "database.resume",
+          now,
+          now,
+          row.id,
+          operation,
+          ...guard.bindings,
+        ),
+      db
+        .prepare(
+          `UPDATE operations SET status='failed',error_code=?,error_message='Power transition refused',updated_at=?,completed_at=? WHERE id=? AND database_id=? AND generation<=? AND status IN('pending','running') AND EXISTS(SELECT 1 FROM databases WHERE id=? AND power_operation=? AND generation=?) AND (${guard.sql})`,
+        )
+        .bind(
+          `power_${reason}`,
+          now,
+          now,
+          row.power_operation,
+          row.id,
+          row.generation,
+          row.id,
+          operation,
+          row.generation + 1,
+          ...guard.bindings,
+        ),
+    ];
+    if (mayRestart && row.node_id !== null)
+      statements.splice(
+        2,
+        0,
+        startupReservationStatement(db, {
+          databaseId: row.id,
+          operationId: operation,
+          generation: row.generation + 1,
+          nodeId: row.node_id,
+          now,
+        }),
+      );
+    const result = await mutation.batch(statements);
+    return result[0]!.meta.changes === 1
+      ? { operation, revision: row.generation + 1, regionId: row.region_id }
+      : null;
+  });
 }
 
 /** The normal capacity turn resumes current protective stops once physical and startup budgets permit. */
 export async function recoverStorageProtectedDatabases(
-  db: D1Database,
+  env: Env,
   regionId: string,
   limit = 8,
 ): Promise<string[]> {
+  const db = env.DB;
   RegionId.parse(regionId);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8)
     throw new Error("invalid_storage_recovery_limit");
@@ -321,8 +355,21 @@ export async function recoverStorageProtectedDatabases(
   for (const row of rows.results) {
     const operation = newOperationId(),
       now = new Date().toISOString();
-    const result = await db.batch(
-      powerTransitionStatements(db, row, "resume", operation, now),
+    const result = await withAdmissionMutation(
+      env,
+      [row.id],
+      async (mutation) =>
+        mutation.batch(
+          powerTransitionStatements(
+            db,
+            row,
+            "resume",
+            operation,
+            now,
+            undefined,
+            mutation.guard(row.id),
+          ),
+        ),
     );
     if (result[0]!.meta.changes === 1) recovered.push(row.id);
   }

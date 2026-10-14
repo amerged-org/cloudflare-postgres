@@ -201,6 +201,23 @@ it("activates only the exact verified pair and resolves replay from state withou
     ),
   ).toEqual(f.next);
 });
+
+it("fences the regional admission scope before the verified key-material pointer switches", async () => {
+  const f = await setup();
+  expect(
+    (await request(`${f.path}/stage`, f.admin, "POST", f.stage)).status,
+  ).toBe(200);
+  await env.DB.exec(
+    `CREATE TRIGGER rotation_admission BEFORE UPDATE OF bootstrap_material_revision ON regions WHEN NEW.id='${f.region}' AND NEW.bootstrap_material_revision<>OLD.bootstrap_material_revision AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id=NEW.id AND s.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'key pointer lacks admission fence'); END`,
+  );
+  try {
+    expect(
+      (await request(`${f.path}/activate`, f.admin, "POST", f.activate)).status,
+    ).toBe(200);
+  } finally {
+    await env.DB.exec("DROP TRIGGER rotation_admission");
+  }
+});
 it("resolves two simultaneous identical activation requests to the same selected revision", async () => {
   const f = await setup();
   expect(

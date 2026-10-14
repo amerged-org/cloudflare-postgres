@@ -397,6 +397,44 @@ it("converges queued image pins without making maintenance wait for placement it
   });
 });
 
+it("a queued PostgreSQL image pin reserves its admission fence before changing the persisted image", async () => {
+  const f = await setup(),
+    queued = DatabaseWithOperation.parse(
+      await (await f.create("queued-fenced-pin")).json(),
+    );
+  await env.DB.prepare(
+    "UPDATE databases SET desired_postgres_release_id=NULL,desired_postgres_image=NULL,desired_postgres_version=NULL,desired_postgres_schema_revision=NULL WHERE id=?",
+  )
+    .bind(queued.database.id)
+    .run();
+  await env.DB.exec(
+    `CREATE TRIGGER queued_postgres_admission_fence BEFORE UPDATE OF desired_postgres_image ON databases WHEN NEW.id='${queued.database.id}' AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.id AND e.mutation_id IS NOT NULL AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'queued image mutation lacks admission fence'); END`,
+  );
+  try {
+    expect(await f.run()).toMatchObject({ queued_unassigned: 1, errors: [] });
+    expect(
+      await env.DB.prepare(
+        "SELECT generation,desired_postgres_image FROM databases WHERE id=?",
+      )
+        .bind(queued.database.id)
+        .first(),
+    ).toEqual({ generation: 2, desired_postgres_image: f.image });
+    expect(
+      await env.DB.prepare(
+        "SELECT mutation_id,mutation_outcome FROM database_admission_epochs WHERE database_id=?",
+      )
+        .bind(queued.database.id)
+        .first(),
+    ).toEqual({ mutation_id: null, mutation_outcome: "committed" });
+    const actor = env.DATABASE_ACTOR.get(
+      env.DATABASE_ACTOR.idFromName(queued.database.id),
+    );
+    expect((await actor.admit(queued.database.id, "app")).ok).toBe(false);
+  } finally {
+    await env.DB.exec("DROP TRIGGER queued_postgres_admission_fence");
+  }
+});
+
 it("patches only the current patch node and leaves another assigned database generation unchanged", async () => {
   const f = await setup();
   await env.DB.prepare(

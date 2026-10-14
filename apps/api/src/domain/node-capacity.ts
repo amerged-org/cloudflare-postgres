@@ -44,6 +44,7 @@ import {
   selectedStorageProfileSql,
 } from "./storage-capacity.ts";
 import { recoverStorageProtectedDatabases } from "./lifecycle.ts";
+import { admissionScopesOpenSql } from "./admission-state.ts";
 /** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
 export async function startupPlacementNodes(
   db: D1Database,
@@ -107,6 +108,7 @@ export async function placePendingDatabases(
           AND o.kind IN('database.create','database.restore') AND o.status='pending')
         AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=databases.size_class_id AND s.enabled=1
           WHERE (n.id=? AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1)
+          AND ${admissionScopesOpenSql("databases.project_id", "databases.region_id", "n.id")}
           AND ((${nodePlacementGuard()})
           AND ${nodeDatabasePlacementGuard()}
           AND ${startupHeadroomSql()}
@@ -198,7 +200,7 @@ export async function runNodeCapacity(
     }>();
   const recovered = dryRun
     ? []
-    : await recoverStorageProtectedDatabases(env.DB, regionId);
+    : await recoverStorageProtectedDatabases(env, regionId);
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
   if (placed.length || recovered.length)
     await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify([

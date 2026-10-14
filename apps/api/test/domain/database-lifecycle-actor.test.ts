@@ -352,7 +352,8 @@ it("does not wake for a role revoked after the authorization read", async () => 
   });
   expect(
     await actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 1000 }),
-  ).toEqual({ ok: false, sqlstate: "57P03" });
+    // The barrier's trusted publication now removes the revoked role from presence too.
+  ).toEqual({ ok: false, sqlstate: "28P01" });
   expect(
     await env.DB.prepare(
       "SELECT desired_state,generation FROM databases WHERE id=?",

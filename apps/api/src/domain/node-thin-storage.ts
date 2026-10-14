@@ -14,7 +14,18 @@ import {
 import type { Env } from "../env.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
-import { thinStorageSamplingCapable } from "./fleet-releases.ts";
+import {
+  thinStorageSamplingCapable,
+  postgresPoolCapable,
+  postgresPoolSql,
+  postgresPoolQualificationCapable,
+} from "./fleet-releases.ts";
+import {
+  PoolBinding,
+  PoolHostCustody,
+  poolBindingScopeHash,
+  POSTGRES_POOL,
+} from "@pgcf/contracts/postgres-pool";
 import {
   currentStorageStopSql,
   storageDrainReservationStatement,
@@ -278,6 +289,19 @@ export async function storageWriteAuthorityForDatabase(
   now = Date.now(),
   snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
 ): Promise<string | undefined> {
+  const { readPostgresPoolBindingForDatabase, hasNonterminalPoolHolderSql } =
+    await import("./postgres-pool.ts");
+  const pool = await readPostgresPoolBindingForDatabase(env, database.id);
+  if (pool && !["released", "refused"].includes(pool.state))
+    return issuePostgresPoolStorageAuthority(env, pool, now, snapshot);
+  if (
+    await env.DB.prepare(
+      `SELECT 1 FROM databases d WHERE d.id=? AND ${hasNonterminalPoolHolderSql("d")}`,
+    )
+      .bind(database.id)
+      .first()
+  )
+    return undefined;
   if (
     !database.node_id ||
     !database.storage_profile_json ||
@@ -378,7 +402,344 @@ export async function storageWriteAuthorityForDatabase(
   return signStorageWriteAuthority(claims, key.privateKey, now);
 }
 
+/** Real pre-grant cgroup/device custody can precede the mount. It is not PG readiness.
+ * Only CF combines that reading with current physical headroom and a bounded startup hold. */
+export async function issuePostgresPoolStorageAuthority(
+  env: Env,
+  value: PoolBinding,
+  now = Date.now(),
+  snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
+): Promise<string | undefined> {
+  const binding = PoolBinding.parse(value),
+    scope = binding.scope;
+  if (
+    scope.storage.backend !== "lvm-thin-v1" ||
+    !["claimed", "mounted", "serving", "detaching"].includes(binding.state) ||
+    (await poolBindingScopeHash(scope)) !== binding.scope_sha256
+  )
+    return undefined;
+  if (
+    await env.DB.prepare(
+      "SELECT 1 FROM pool_cleanup_grants WHERE binding_id=? AND state<>'completed'",
+    )
+      .bind(scope.binding_id)
+      .first()
+  )
+    return undefined;
+  const normal = await postgresPoolCapable(env.DB, scope.region_id);
+  const qualification = normal
+    ? undefined
+    : await (
+        await import("./postgres-pool.ts")
+      ).readPostgresPoolQualificationAuthority(
+        env,
+        scope.database_id,
+        scope.generation,
+        now,
+      );
+  if (
+    !normal &&
+    (!qualification ||
+      qualification.scope.node_id !== scope.node_id ||
+      qualification.scope.node_uid !== scope.node_uid ||
+      qualification.scope.boot_id !== scope.boot_id ||
+      qualification.scope.database_generation !== scope.generation ||
+      qualification.scope.thin_id !== scope.storage.thin_id ||
+      JSON.stringify(qualification.scope.storage) !==
+        JSON.stringify(scope.storage.profile) ||
+      qualification.scope.configuration_fingerprint !==
+        scope.configuration_fingerprint ||
+      qualification.scope.software.driver_image !== scope.driver_image ||
+      qualification.scope.software.driver_sha256 !== scope.driver_sha256 ||
+      qualification.scope.software.supervisor_sha256 !==
+        scope.supervisor_sha256 ||
+      JSON.stringify(qualification.policy.class) !==
+        JSON.stringify(scope.class))
+  )
+    return undefined;
+  const capability = qualification?.fence ?? {
+    sql: postgresPoolSql("r"),
+    bindings: [],
+  };
+  const storage = scope.storage,
+    profile = storage.profile;
+  const row = await env.DB.prepare(
+    `SELECT d.*,e.admission_revision,e.route_revision,e.mutation_id,b.state binding_state,b.scope_sha256,b.scope_json,b.detaching_at,b.node_report_json,
+    h.state holder_state,h.revision holder_revision,s.storage_gib,
+    (SELECT MIN(q.drain_deadline) FROM pool_role_mutations q WHERE q.binding_id=b.id AND q.status='pending') role_deadline
+    FROM pool_bindings b JOIN database_runtime_holders h ON h.binding_id=b.id AND h.database_id=b.database_id AND h.kind='pool'
+    JOIN databases d ON d.id=b.database_id JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
+    JOIN database_admission_epochs e ON e.database_id=d.id JOIN size_classes s ON s.id=d.size_class_id WHERE b.id=?`,
+  )
+    .bind(scope.binding_id)
+    .first<
+      DatabaseRow & {
+        admission_revision: number;
+        route_revision: number;
+        mutation_id: string | null;
+        binding_state: string;
+        scope_sha256: string;
+        scope_json: string;
+        detaching_at: number | null;
+        node_report_json: string | null;
+        holder_state: string;
+        holder_revision: number;
+        storage_gib: number;
+        role_deadline: number | null;
+      }
+    >();
+  if (
+    !row ||
+    row.id !== scope.database_id ||
+    row.node_id !== scope.node_id ||
+    row.region_id !== scope.region_id ||
+    row.binding_state !== binding.state ||
+    row.holder_state !== binding.state ||
+    row.holder_revision !== binding.holder_revision ||
+    row.scope_sha256 !== binding.scope_sha256 ||
+    row.mutation_id !== null ||
+    row.admission_revision < scope.admission_epoch ||
+    row.route_revision < scope.route_revision ||
+    (binding.state !== "detaching" &&
+      (row.generation !== scope.generation ||
+        row.desired_state !== "running" ||
+        row.deleted_at !== null)) ||
+    (["claimed", "mounted"].includes(binding.state) &&
+      (row.admission_revision !== scope.admission_epoch ||
+        row.route_revision !== scope.route_revision ||
+        now >= binding.created_at + POSTGRES_POOL.permission_ms)) ||
+    (row.storage_protected_at != null &&
+      (row.storage_protected_generation ?? 0) >= scope.generation)
+  )
+    return undefined;
+  const receipt = DatabaseStorageVolumeReceipt.safeParse(
+      row.storage_volume_json ? JSON.parse(row.storage_volume_json) : null,
+    ),
+    currentProfile = DesiredDatabaseStorage.safeParse(
+      row.storage_profile_json ? JSON.parse(row.storage_profile_json) : null,
+    );
+  if (
+    !receipt.success ||
+    !currentProfile.success ||
+    JSON.stringify(currentProfile.data) !== JSON.stringify(profile) ||
+    receipt.data.storage_generation !== storage.storage_generation ||
+    (row.storage_generation ?? 1) !== storage.storage_generation ||
+    receipt.data.storage_uid !== storage.storage_uid ||
+    receipt.data.node_uid !== scope.node_uid ||
+    receipt.data.namespace_uid !== storage.namespace_uid ||
+    receipt.data.cluster_uid !== storage.cnpg_cluster_uid ||
+    receipt.data.volume_group_uuid !== storage.volume_group_uuid ||
+    receipt.data.pool_uuid !== profile.pool_uuid ||
+    receipt.data.volume_handle !== storage.volume_handle ||
+    receipt.data.lv_uuid !== storage.lv_uuid ||
+    receipt.data.pvc_uid !== storage.pvc_uid ||
+    receipt.data.pv_uid !== storage.pv_uid
+  )
+    return undefined;
+  const current =
+      snapshot === undefined
+        ? await readCurrentNodeThinStorage(env, scope.node_id, now)
+        : snapshot,
+    authority = current?.authority;
+  if (
+    !authority ||
+    !current ||
+    !thinStorageAuthorityMatches(profile, authority, undefined, now) ||
+    current.row.current_qualified !== 1 ||
+    current.row.node_uid !== scope.node_uid ||
+    current.row.region_id !== scope.region_id ||
+    (
+      JSON.parse(current.row.qualification_json ?? "null") as {
+        boot_id?: unknown;
+      } | null
+    )?.boot_id !== scope.boot_id ||
+    thinStorageInventory(authority).expires_at <= now ||
+    storageWriterProtected({ ...row, generation: scope.generation }, authority)
+  )
+    return undefined;
+  const lv = authority.physical_lvs.find(
+    (lv) =>
+      lv.lv_uuid === storage.lv_uuid &&
+      lv.name === storage.volume_handle &&
+      lv.segtype === "thin",
+  );
+  const volume = authority.volumes.find(
+    (v) =>
+      v.database_id === scope.database_id &&
+      v.storage_generation === storage.storage_generation,
+  );
+  if (
+    !lv ||
+    !volume ||
+    volume.storage_uid !== storage.storage_uid ||
+    volume.namespace_uid !== storage.namespace_uid ||
+    volume.cluster_uid !== storage.cnpg_cluster_uid ||
+    volume.lv_uuid !== storage.lv_uuid ||
+    volume.volume_handle !== storage.volume_handle ||
+    volume.pvc_uid !== storage.pvc_uid ||
+    volume.pv_uid !== storage.pv_uid ||
+    volume.storage_class !== profile.storage_class ||
+    volume.volume_attributes_class !== profile.volume_attributes_class
+  )
+    return undefined;
+  if (["claimed", "mounted"].includes(binding.state)) {
+    const held = await env.DB.prepare(
+      "SELECT 1 FROM database_start_admissions a JOIN operations o ON o.id=a.operation_id WHERE a.database_id=? AND a.generation=? AND a.node_id=? AND a.node_uid=? AND a.budget_bytes>0 AND a.storage_budget_bytes>=? AND a.ready_at IS NULL AND o.status IN('pending','running') AND o.generation=a.generation",
+    )
+      .bind(
+        scope.database_id,
+        scope.generation,
+        scope.node_id,
+        scope.node_uid,
+        Math.max(
+          lv.size_bytes,
+          profile.startup_reserve_bytes,
+          row.storage_gib * 1024 ** 3,
+        ),
+      )
+      .first();
+    if (!held) return undefined;
+  }
+  const { readPostgresPoolIoAttestation } = await import("./postgres-pool.ts"),
+    io = await readPostgresPoolIoAttestation(env, binding, now);
+  if (!io) return undefined;
+  let expires = Math.min(
+    Date.parse(authority.expires_at),
+    io.observed_at + POSTGRES_POOL.observation_max_age_ms,
+  );
+  if (qualification) expires = Math.min(expires, qualification.expires_at);
+  if (binding.state === "detaching") {
+    // A retained mount proves an existing holder. Detaching never grants a late new PG start.
+    const { PoolNodeReport } = await import("@pgcf/contracts/postgres-pool");
+    const mounted = PoolNodeReport.safeParse(
+      row.node_report_json ? JSON.parse(row.node_report_json) : null,
+    );
+    if (
+      !mounted.success ||
+      mounted.data.state !== "mounted" ||
+      mounted.data.pool_pod_uid !== scope.pool_pod_uid ||
+      mounted.data.scope_sha256 !== binding.scope_sha256
+    )
+      return undefined;
+    expires = Math.min(
+      expires,
+      row.role_deadline ??
+        (row.detaching_at === null
+          ? 0
+          : row.detaching_at + profile.drain_seconds * 1000),
+    );
+  }
+  if (expires <= now) return undefined;
+  // Bind the last read to the exact authority, holder, IO receipt and current epochs before signing.
+  const eligible = await env.DB.prepare(
+    `SELECT 1 FROM pool_bindings b JOIN database_runtime_holders h ON h.binding_id=b.id JOIN databases d ON d.id=b.database_id
+    JOIN database_admission_epochs e ON e.database_id=d.id JOIN nodes n ON n.id=d.node_id JOIN regions r ON r.id=d.region_id JOIN node_thin_storage t ON t.node_id=n.id
+    JOIN pool_io_attestations i ON i.binding_id=b.id WHERE b.id=? AND b.scope_sha256=? AND b.state=? AND h.state=b.state AND h.revision=?
+    AND d.generation=? AND d.storage_profile_json=? AND d.storage_volume_json=? AND d.storage_protected_at IS ? AND d.storage_protected_generation IS ?
+    AND e.admission_revision=? AND e.route_revision=? AND e.mutation_id IS NULL AND i.attestation_json=? AND t.authority_revision=? AND t.authority_json=? AND t.status='ready'
+    AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM pool_cleanup_grants cleanup WHERE cleanup.binding_id=b.id AND cleanup.state<>'completed') AND ${qualifiedThinStorageSql("t")} AND (${capability.sql})`,
+  )
+    .bind(
+      scope.binding_id,
+      binding.scope_sha256,
+      binding.state,
+      binding.holder_revision,
+      row.generation,
+      row.storage_profile_json,
+      row.storage_volume_json,
+      row.storage_protected_at ?? null,
+      row.storage_protected_generation ?? null,
+      row.admission_revision,
+      row.route_revision,
+      JSON.stringify(io),
+      authority.revision,
+      current.row.authority_json,
+      scope.node_uid,
+      ...capability.bindings,
+    )
+    .first();
+  if (!eligible) return undefined;
+  const key = await nodeProofSigningKey(env),
+    observed = Date.parse(authority.observed_at);
+  return signStorageWriteAuthority(
+    {
+      v: 1,
+      kid: key.kid,
+      database_id: scope.database_id,
+      generation: scope.generation,
+      authority_revision: authority.revision,
+      storage_uid: storage.storage_uid,
+      node_uid: scope.node_uid,
+      volume_group_uuid: storage.volume_group_uuid,
+      pool_uuid: profile.pool_uuid,
+      profile_sha256: profile.profile_sha256,
+      volume_handle: storage.volume_handle,
+      lv_uuid: storage.lv_uuid,
+      pvc_uid: storage.pvc_uid,
+      pv_uid: storage.pv_uid,
+      pod_uid: scope.pool_pod_uid,
+      observed_at: observed,
+      iat: observed,
+      exp: expires,
+      guard_seconds: profile.guard_seconds,
+      drain_seconds: profile.drain_seconds,
+      write_allowed: true,
+    },
+    key.privateKey,
+    now,
+  );
+}
+
 /** The protected host reads this over strict CF HTTPS; regional inputs never issue startup grants. */
+/** Metadata custody only. Native independently measures all original writer leaves and their shared ancestor. */
+export async function poolHostCustodyForDatabase(
+  env: Env,
+  id: string,
+  capable: boolean,
+  now = Date.now(),
+  issueCleanup = false,
+): Promise<PoolHostCustody | undefined> {
+  if (!capable) return undefined;
+  const { readPostgresPoolBindingForDatabase, readPostgresPoolIoAttestation } =
+    await import("./postgres-pool.ts");
+  const binding = await readPostgresPoolBindingForDatabase(env, id);
+  if (!binding) return undefined;
+  const io = await readPostgresPoolIoAttestation(env, binding, now);
+  const cleanupModule = await import("./postgres-pool-cleanup-authority.ts"),
+    intent = await cleanupModule.readPostgresPoolCleanupIntent(env, binding);
+  const cleanup = issueCleanup
+    ? await cleanupModule.issuePostgresPoolCleanupAuthority(env, binding, now)
+    : undefined;
+  const { readPostgresPoolCleanupGrant, readPostgresPoolCleanupIoAttestation } =
+    await import("./postgres-pool.ts");
+  const grant = cleanup
+    ? await readPostgresPoolCleanupGrant(env, binding.scope.binding_id)
+    : undefined;
+  const cleanupIo = grant
+    ? await readPostgresPoolCleanupIoAttestation(
+        env,
+        binding,
+        grant.claims.operation_id,
+        now,
+      )
+    : undefined;
+  return PoolHostCustody.parse({
+    v: 1,
+    binding_id: binding.scope.binding_id,
+    scope_sha256: binding.scope_sha256,
+    holder_revision: binding.holder_revision,
+    holder_generation: binding.scope.generation,
+    holder_boot_id: binding.scope.boot_id,
+    state: binding.state,
+    pool_namespace: binding.scope.pool_namespace,
+    pool_namespace_uid: binding.scope.pool_namespace_uid,
+    pool_pod_uid: binding.scope.pool_pod_uid,
+    container_ids: binding.scope.container_ids,
+    device: cleanupIo?.device ?? io?.device ?? null,
+    cleanup_authority: cleanup ?? null,
+    ...(intent ? { cleanup_intent: intent } : {}),
+  });
+}
 export async function hostStorageLease(
   c: import("../env.ts").ApiContext,
   id: string,
@@ -434,6 +795,14 @@ export async function hostStorageLease(
     )
       .bind(id, node.node_uid)
       .first<string>("boot"));
+  const poolCapable =
+    (await postgresPoolCapable(c.env.DB, region.id)) ||
+    (await postgresPoolQualificationCapable(c.env.DB, region.id));
+  const preparations = poolCapable
+    ? await (
+        await import("./postgres-pool-preparation.ts")
+      ).readPostgresPoolPreparationContexts(c.env, id, now)
+    : [];
   if (!bootId && rows.results.some((row) => row.storage_profile_json))
     throw new ApiError(
       "conflict",
@@ -474,12 +843,33 @@ export async function hostStorageLease(
       ),
     );
     const writerProtected = storageWriterProtected(row, authority);
-    const runtimeAuthority = await storageWriteAuthorityForDatabase(
+    const { readPostgresPoolBindingForDatabase, hasNonterminalPoolHolderSql } =
+      await import("./postgres-pool.ts");
+    const heldPool = await readPostgresPoolBindingForDatabase(c.env, row.id);
+    const unresolvedPool =
+      heldPool !== undefined ||
+      Boolean(
+        await c.env.DB.prepare(
+          `SELECT 1 FROM databases d WHERE d.id=? AND ${hasNonterminalPoolHolderSql("d")}`,
+        )
+          .bind(row.id)
+          .first(),
+      );
+    const pool = await poolHostCustodyForDatabase(
       c.env,
-      row,
+      row.id,
+      poolCapable,
       now,
-      current,
+      true,
     );
+    const poolMayWrite =
+      !unresolvedPool ||
+      (pool !== undefined &&
+        pool.device !== null &&
+        pool.holder_boot_id === bootId);
+    const runtimeAuthority = poolMayWrite
+      ? await storageWriteAuthorityForDatabase(c.env, row, now, current)
+      : undefined;
     // Startup authority cannot substitute forever for missing IO evidence of a Ready writer.
     const readyWithoutWriter =
       row.desired_state === "running" &&
@@ -488,6 +878,10 @@ export async function hostStorageLease(
       runtimeAuthority === undefined;
     const admitted =
       row.desired_state === "running" &&
+      poolMayWrite &&
+      (!unresolvedPool ||
+        (["claimed", "mounted"].includes(pool!.state) &&
+          runtimeAuthority !== undefined)) &&
       !writerProtected &&
       !readyWithoutWriter &&
       row.startup_operation !== null &&
@@ -501,6 +895,7 @@ export async function hostStorageLease(
       null;
     if (
       row.stop_operation &&
+      !unresolvedPool &&
       receipt &&
       current?.row.current_qualified === 1 &&
       authority
@@ -558,6 +953,7 @@ export async function hostStorageLease(
           : row.desired_state === "deleted"
             ? !reclaimed
             : writerProtected ||
+              (unresolvedPool && runtimeAuthority === undefined) ||
               readyWithoutWriter ||
               !current ||
               current.row.error_code !== null ||
@@ -573,6 +969,7 @@ export async function hostStorageLease(
       volume: reclaimed ? null : receipt,
       runtime_authority: runtimeAuthority ?? null,
       drain,
+      ...(pool ? { pool } : {}),
     });
   }
   return c.json(
@@ -585,6 +982,7 @@ export async function hostStorageLease(
       expires_at: now + 120000,
       legacy,
       databases,
+      ...(preparations.length > 0 ? { preparations } : {}),
     }),
     200,
   );

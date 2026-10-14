@@ -10,6 +10,7 @@ import {
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
 import { projectRow, type Row } from "./rows.ts";
+import { withAdmissionMutation } from "../domain/admission-mutations.ts";
 
 export async function createProject(
   c: ApiContext,
@@ -106,25 +107,32 @@ export async function deleteProject(
         .first();
       if (!row) throw new ApiError("not_found", "Project not found");
       const now = new Date().toISOString();
-      const results = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM databases WHERE project_id = projects.id AND observed_state <> 'deleted')`,
-        ).bind(now, now, id),
-        c.env.DB.prepare(
-          `UPDATE api_keys SET revoked_at = ? WHERE project_id = ? AND revoked_at IS NULL
-          AND EXISTS (SELECT 1 FROM projects WHERE id = ? AND deleted_at = ?)`,
-        ).bind(now, id, id, now),
-        lease.completeStatement(id, 204, {
-          sql: "EXISTS (SELECT 1 FROM projects WHERE id = ? AND deleted_at = ?)",
-          bindings: [id, now],
-        }),
-      ]);
-      if (results[0]!.meta.changes === 0)
-        throw new ApiError(
-          "conflict",
-          "Project still has databases awaiting deletion",
-        );
+      await withAdmissionMutation(
+        c.env,
+        [],
+        async (mutation) => {
+          const guard = mutation.scopeGuard();
+          const results = await mutation.batch([
+            c.env.DB.prepare(
+              `UPDATE projects SET deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL
+            AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.project_id=projects.id AND (d.desired_state<>'deleted' OR d.observed_state<>'deleted' OR d.observed_generation<>d.generation OR d.deleted_at IS NULL)) AND (${guard.sql})`,
+            ).bind(now, now, id, ...guard.bindings),
+            c.env.DB.prepare(
+              `UPDATE api_keys SET revoked_at=? WHERE project_id=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=? AND deleted_at=?) AND (${guard.sql})`,
+            ).bind(now, id, id, now, ...guard.bindings),
+            lease.completeStatement(id, 204, {
+              sql: `EXISTS(SELECT 1 FROM projects WHERE id=? AND deleted_at=?) AND (${guard.sql})`,
+              bindings: [id, now, ...guard.bindings],
+            }),
+          ]);
+          if (results[0]!.meta.changes !== 1)
+            throw new ApiError(
+              "conflict",
+              "Project still has databases awaiting deletion",
+            );
+        },
+        { kind: "project", id },
+      );
       return c.body(null, 204);
     },
   });

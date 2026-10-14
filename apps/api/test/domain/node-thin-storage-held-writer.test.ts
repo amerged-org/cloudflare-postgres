@@ -293,6 +293,100 @@ it("denies every current protected generation but preserves an authorized newer 
   });
 });
 
+it("a slow physical protection closes an admitted Actor before committing its database marker", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f);
+  expect((await held.ready()).status).toBe(200);
+  const actor = env.DATABASE_ACTOR.get(
+    env.DATABASE_ACTOR.idFromName(held.created.id),
+  );
+  expect((await actor.admit(held.created.id, "app")).ok).toBe(true);
+  await env.DB.exec(
+    `CREATE TRIGGER thin_protection_admission BEFORE UPDATE OF storage_protected_at ON databases WHEN NEW.id='${held.created.id}' AND NEW.storage_protected_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.id AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'physical protection lacks admission fence'); END`,
+  );
+  try {
+    await prepareThinStorageLease(f.local, f.node, false);
+    expect(
+      await report(f, {
+        physical: held.authority.physical,
+        physical_lvs: held.authority.physical_lvs,
+        active_lv_uuids: held.authority.active_lv_uuids,
+        volumes: held.authority.volumes.map((volume) => ({
+          ...volume,
+          quiesced: true,
+        })),
+      }),
+    ).toMatchObject({ accepted: true });
+    expect(await actor.admit(held.created.id, "app")).toEqual({
+      ok: false,
+      sqlstate: "57P03",
+    });
+    const before = await env.DB.prepare(
+      "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
+    )
+      .bind(held.created.id)
+      .first();
+    await prepareThinStorageLease(f.local, f.node, false);
+    expect(
+      await report(f, {
+        physical: held.authority.physical,
+        physical_lvs: held.authority.physical_lvs,
+        active_lv_uuids: held.authority.active_lv_uuids,
+        volumes: held.authority.volumes.map((volume) => ({
+          ...volume,
+          quiesced: true,
+        })),
+      }),
+    ).toMatchObject({ accepted: true });
+    expect(
+      await env.DB.prepare(
+        "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
+      )
+        .bind(held.created.id)
+        .first(),
+    ).toEqual(before);
+  } finally {
+    await env.DB.exec("DROP TRIGGER thin_protection_admission");
+  }
+});
+
+it("slow protection fences a startup generation as well as an already admitted database", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f);
+  await env.DB.exec(
+    `CREATE TRIGGER startup_protection_admission BEFORE UPDATE OF storage_protected_at ON databases WHEN NEW.id='${held.created.id}' AND NEW.storage_protected_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.id AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'startup protection lacks admission fence'); END`,
+  );
+  try {
+    await prepareThinStorageLease(f.local, f.node, false);
+    expect(
+      await report(f, {
+        physical: held.authority.physical,
+        physical_lvs: held.authority.physical_lvs,
+        active_lv_uuids: held.authority.active_lv_uuids,
+        volumes: held.authority.volumes.map((volume) => ({
+          ...volume,
+          quiesced: true,
+        })),
+      }),
+    ).toMatchObject({ accepted: true });
+    expect(
+      await env.DB.prepare(
+        "SELECT storage_protected_generation FROM databases WHERE id=?",
+      )
+        .bind(held.created.id)
+        .first("storage_protected_generation"),
+    ).toBe(held.created.generation);
+    expect((await held.ready()).status).toBe(200);
+    expect(
+      await env.DATABASE_ACTOR.get(
+        env.DATABASE_ACTOR.idFromName(held.created.id),
+      ).admit(held.created.id, "app"),
+    ).toEqual({ ok: false, sqlstate: "57P03" });
+  } finally {
+    await env.DB.exec("DROP TRIGGER startup_protection_admission");
+  }
+});
+
 it("signs a first token for a held writer the controller attests, before any IO evidence", async () => {
   const f = await thinExecutionFixture(releases),
     held = await heldWriter(f);

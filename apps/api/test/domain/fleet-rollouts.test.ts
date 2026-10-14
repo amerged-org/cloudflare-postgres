@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
   waitOnExecutionContext,
+  introspectWorkflowInstance,
 } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
 import { ComputePoolPolicy } from "@pgcf/contracts/compute-pool";
@@ -222,6 +223,33 @@ async function setup() {
   }
   return { ...f, release, spec, input, runtime, started, send, us, control };
 }
+it("fences every declared region before the atomic cross-region rollout assignment", async () => {
+  const f = await setup();
+  await env.DB.exec(
+    `CREATE TRIGGER admission_rollout_insert BEFORE INSERT ON fleet_region_releases WHEN NEW.region_id IN('${f.region}','${f.foreign}') AND (SELECT COUNT(*) FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id IN('${f.region}','${f.foreign}') AND s.mutation_status='pending')<>2 BEGIN SELECT RAISE(ABORT,'rollout has incomplete admission fences'); END`,
+  );
+  try {
+    const response = await request(
+      "/v1/fleet/rollouts",
+      f.admin,
+      "POST",
+      f.input,
+      crypto.randomUUID(),
+    );
+    expect(response.status).toBe(202);
+  } finally {
+    await env.DB.exec("DROP TRIGGER admission_rollout_insert");
+    const patches = await env.DB.prepare(
+      "SELECT operation_id FROM fleet_patch_operations WHERE region_id IN(?,?)",
+    )
+      .bind(f.region, f.foreign)
+      .all<{ operation_id: string }>();
+    for (const patch of patches.results)
+      await (
+        await introspectWorkflowInstance(env.PATCH_NODE, patch.operation_id)
+      ).dispose();
+  }
+});
 it("an explicit quiescent held rollout replacement preserves its immediate predecessor and completed receipts without inheriting the operator hold", async () => {
   const f = await setup(),
     original = structuredClone(

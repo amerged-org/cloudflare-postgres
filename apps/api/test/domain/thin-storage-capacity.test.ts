@@ -554,7 +554,7 @@ it("a proven protective stop releases CPU and recovers through one real bounded 
       .bind(id)
       .first("charge"),
   ).toBe(0);
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([]);
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
   const now = Date.now();
   await accepted(f, {
     ...f.authority,
@@ -563,10 +563,8 @@ it("a proven protective stop releases CPU and recovers through one real bounded 
     expires_at: new Date(now + 30000).toISOString(),
     write_allowed: true,
   });
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([
-    id,
-  ]);
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([]);
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([id]);
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
   expect(
     await env.DB.prepare(
       `SELECT ${databaseCpuChargeSql()} charge FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
@@ -605,7 +603,7 @@ it("manual suspension wins over a current protective stop and stale Native repea
   );
   expect(suspended.status).toBe(202);
   await env.DB.batch(storageProtectionStatements(env.DB, f.authority));
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([]);
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
   expect(
     await env.DB.prepare(
       "SELECT desired_state,generation,storage_protected_at FROM databases WHERE id=?",
@@ -1012,7 +1010,7 @@ it("recovers one quiesced physical LV in an8GiB pool while keeping both real5GiB
       .bind(created.database.id)
       .first("valid"),
   ).toBe(1);
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([
     created.database.id,
   ]);
   const holds = (
@@ -1049,7 +1047,7 @@ it("recovers one quiesced physical LV in an8GiB pool while keeping both real5GiB
     },
     true,
   );
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([
     created.database.id,
   ]);
   const current = await env.DB.prepare(
@@ -1184,7 +1182,7 @@ it("unknown or different-LV old holds cannot share a new startup or overwrite th
     ).bind(JSON.stringify(a), a.observed_at, f.node),
     ...storageProtectionStatements(env.DB, a),
   ]);
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([]);
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
   const different = JSON.stringify({
     ...bound.receipt,
     lv_uuid: "OTHERX-1234-1234-1234-1234-1234-ABCDEF",
@@ -1195,7 +1193,7 @@ it("unknown or different-LV old holds cannot share a new startup or overwrite th
     .bind(different, created.operation.id)
     .run();
   await accepted(f, a, true);
-  expect(await recoverStorageProtectedDatabases(env.DB, f.region)).toEqual([]);
+  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
   await expect(
     env.DB.prepare(
       "UPDATE database_start_admissions SET storage_volume_json=? WHERE operation_id=?",

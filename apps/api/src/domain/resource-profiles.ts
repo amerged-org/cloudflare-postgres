@@ -287,7 +287,7 @@ export async function runResourceProfileRollouts(
   for (const row of rows.results.slice(0, 8)) {
     try {
       await scheduleDatabaseResize(
-        env.DB,
+        env,
         row,
         row.target_size,
         new Date(now).toISOString(),

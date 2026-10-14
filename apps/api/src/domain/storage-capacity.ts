@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Env } from "../env.ts";
+import type { AdmissionSqlGuard } from "./admission-mutations.ts";
 import { qualifiedThinStorageSql } from "./node-thin-storage.ts";
 import {
   NodeThinStorageAuthority as AuthoritySchema,
@@ -16,6 +17,19 @@ const identifier = (value: string) => {
   return value;
 };
 const field = (name: string) => `json_extract(t.profile_json,'$.${name}')`;
+/** Immutable cleanup budgets remain charged after expiry and uncertainty until physical release. */
+export function poolCleanupExposureSql(alias = "cleanup") {
+  const grant = identifier(alias);
+  return `(((${grant}.maximum_write_bytes+65535)/65536)+json_extract(${grant}.claims_json,'$.write_iops_per_second')*((${grant}.expires_at-${grant}.issued_at+999)/1000))*65536`;
+}
+export function poolCleanupReceiptSql(alias = "cleanup") {
+  const grant = identifier(alias),
+    storage = `${grant}.claims_json`;
+  return `json_object('storage_generation',json_extract(${storage},'$.storage.storage_generation'),'storage_uid',json_extract(${storage},'$.storage.storage_uid'),
+    'namespace_uid',json_extract(${storage},'$.storage.namespace_uid'),'cluster_uid',json_extract(${storage},'$.storage.cnpg_cluster_uid'),'node_uid',json_extract(${storage},'$.node_uid'),
+    'volume_group_uuid',json_extract(${storage},'$.storage.volume_group_uuid'),'pool_uuid',json_extract(${storage},'$.storage.profile.pool_uuid'),
+    'volume_handle',json_extract(${storage},'$.storage.volume_handle'),'lv_uuid',json_extract(${storage},'$.storage.lv_uuid'),'pvc_uid',json_extract(${storage},'$.storage.pvc_uid'),'pv_uid',json_extract(${storage},'$.storage.pv_uid'))`;
+}
 /** When the identity proof behind an authority started its read, and until when it may be used.
  * Facts that need a read after an event use these; a fast renewal only moves observed_at. An
  * authority recorded before composition carries neither and was itself one complete read. */
@@ -361,6 +375,11 @@ export function nodeThinStorageHeadroomSql(
       FROM physical p JOIN database_start_admissions a ON a.node_id=p.node_id AND a.node_uid=p.node_uid JOIN databases held_db ON held_db.id=a.database_id
       WHERE a.storage_budget_bytes>0
       UNION ALL SELECT storage_budget_bytes,volume_key FROM retained
+      UNION ALL
+      SELECT cleanup_hold.storage_budget_bytes,CASE WHEN ${knownHoldBindingSql("cleanup_hold", "held_db", "p")} THEN ${volumeKeySql("held_db")} ELSE 'op:'||cleanup_hold.operation_id END
+      FROM physical p JOIN (SELECT cleanup.operation_id,b.database_id,b.node_id,b.node_uid,${poolCleanupExposureSql()} storage_budget_bytes,${poolCleanupReceiptSql()} storage_volume_json
+        FROM pool_cleanup_grants cleanup JOIN pool_bindings b ON b.id=cleanup.binding_id WHERE cleanup.state<>'completed') cleanup_hold ON cleanup_hold.node_id=p.node_id AND cleanup_hold.node_uid=p.node_uid
+      JOIN databases held_db ON held_db.id=cleanup_hold.database_id
     ), held_volumes AS (
       SELECT volume_key,MAX(storage_budget_bytes) bytes,SUM(CASE WHEN substr(volume_key,1,3)='op:' THEN 1 ELSE 0 END) new_volumes FROM held_rows GROUP BY volume_key
     ), held AS (
@@ -595,6 +614,7 @@ export function coveredStorageHoldSql(admissionAlias = "a"): string {
 export function storageProtectionStatements(
   db: D1Database,
   raw: NodeThinStorageAuthority,
+  admissionGuards: ReadonlyMap<string, AdmissionSqlGuard> = new Map(),
 ): D1PreparedStatement[] {
   const authority = AuthoritySchema.parse(raw),
     serialized = JSON.stringify(authority),
@@ -621,6 +641,7 @@ export function storageProtectionStatements(
       proof.profile_sha256 !== authority.profile_sha256
     )
       continue;
+    const admission = admissionGuards.get(proof.database_id);
     statements.push(
       db
         .prepare(
@@ -643,7 +664,7 @@ export function storageProtectionStatements(
             OR (o.kind='database.resize' AND o.generation=databases.generation)))
         AND ${accepted}
         AND (storage_protected_generation IS NOT generation OR storage_protected_operation IS NOT ?
-          OR storage_protected_at IS NULL OR observed_power<>'hibernated' OR observed_generation<>generation)`,
+          OR storage_protected_at IS NULL OR observed_power<>'hibernated' OR observed_generation<>generation) AND (${admission?.sql ?? "1=1"})`,
         )
         .bind(
           proof.operation_id,
@@ -663,6 +684,7 @@ export function storageProtectionStatements(
           proof.operation_id,
           ...bindings,
           proof.operation_id,
+          ...(admission?.bindings ?? []),
         ),
     );
     statements.push(
@@ -698,6 +720,7 @@ export function storageProtectionStatements(
       )
     )
       continue;
+    const admission = admissionGuards.get(volume.database_id);
     const operation = `COALESCE(power_operation,(SELECT id FROM operations current_resize WHERE current_resize.database_id=databases.id AND current_resize.project_id=databases.project_id AND current_resize.generation=databases.generation AND current_resize.kind='database.resize' ORDER BY created_at DESC,id DESC LIMIT 1),(SELECT id FROM operations original_create WHERE original_create.id=substr(databases.archive_path,-23) AND original_create.database_id=databases.id AND original_create.project_id=databases.project_id AND original_create.kind IN('database.create','database.restore')))`;
     statements.push(
       db
@@ -709,7 +732,8 @@ export function storageProtectionStatements(
       AND (json_extract(storage_volume_json,'$.storage_generation')=storage_generation AND json_extract(storage_volume_json,'$.node_uid')=? AND json_extract(storage_volume_json,'$.volume_group_uuid')=? AND json_extract(storage_volume_json,'$.pool_uuid')=?)
       AND (json_extract(storage_volume_json,'$.storage_uid')=? AND json_extract(storage_volume_json,'$.namespace_uid')=? AND json_extract(storage_volume_json,'$.cluster_uid')=?)
       AND (json_extract(storage_volume_json,'$.volume_handle')=? AND json_extract(storage_volume_json,'$.lv_uuid')=? AND json_extract(storage_volume_json,'$.pvc_uid')=? AND json_extract(storage_volume_json,'$.pv_uid')=?)
-      AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL) AND ${accepted}`,
+      AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL) AND ${accepted}
+      AND (storage_protected_at IS NULL OR storage_protected_generation IS NOT generation OR storage_protected_operation IS NOT ${operation} OR observed_state<>'provisioning') AND (${admission?.sql ?? "1=1"})`,
         )
         .bind(
           read,
@@ -734,6 +758,7 @@ export function storageProtectionStatements(
           volume.pvc_uid,
           volume.pv_uid,
           ...bindings,
+          ...(admission?.bindings ?? []),
         ),
     );
   }

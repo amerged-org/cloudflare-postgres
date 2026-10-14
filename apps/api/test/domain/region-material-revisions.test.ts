@@ -142,6 +142,31 @@ it("activates only a metadata revision after verified upgrade while keeping hist
   ).toEqual(f.join);
 });
 
+it("closes the regional admission scope before activating a different bootstrap material pointer", async () => {
+  const f = await setup();
+  await env.DB.exec(
+    `CREATE TRIGGER material_admission BEFORE UPDATE OF bootstrap_material_revision ON regions WHEN NEW.id='${f.region}' AND NEW.bootstrap_material_revision<>OLD.bootstrap_material_revision AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id=NEW.id AND s.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'bootstrap pointer lacks admission fence'); END`,
+  );
+  try {
+    const response = await request(
+      `/v1/regions/${f.region}/bootstrap-material`,
+      f.admin,
+      "POST",
+      f.body,
+    );
+    expect(response.status).toBe(200);
+    expect(
+      await env.DB.prepare(
+        "SELECT mutation_id,revision FROM admission_scope_fences WHERE kind='region' AND scope_id=?",
+      )
+        .bind(f.region)
+        .first(),
+    ).toEqual({ mutation_id: null, revision: 2 });
+  } finally {
+    await env.DB.exec("DROP TRIGGER material_admission");
+  }
+});
+
 it("does not activate an immutable staged pair and resolves an exact replay without new custody writes", async () => {
   const f = await setup();
   await storeRegionSeed(

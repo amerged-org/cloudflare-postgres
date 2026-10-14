@@ -267,9 +267,9 @@ it("timeout compensation is exact, monotonic and cannot undo a later resume or d
     operation: suspended.operation.id,
     revision: 2,
   };
-  const recovery = await recoverQuiescence(env.DB, expected, "timeout");
+  const recovery = await recoverQuiescence(env, expected, "timeout");
   expect(recovery).toMatchObject({ revision: 3, regionId: f.region });
-  expect(await recoverQuiescence(env.DB, expected, "timeout")).toBeNull();
+  expect(await recoverQuiescence(env, expected, "timeout")).toBeNull();
   expect(
     await env.DB.prepare("SELECT status,error_code FROM operations WHERE id=?")
       .bind(suspended.operation.id)
@@ -283,7 +283,7 @@ it("timeout compensation is exact, monotonic and cannot undo a later resume or d
       .first(),
   ).toEqual({ observed_state: "provisioning", observed_generation: 1 });
   await request(`/v1/databases/${f.id}`, f.integrator, "DELETE");
-  expect(await recoverQuiescence(env.DB, expected, "timeout")).toBeNull();
+  expect(await recoverQuiescence(env, expected, "timeout")).toBeNull();
   expect(
     await env.DB.prepare("SELECT desired_state FROM databases WHERE id=?")
       .bind(f.id)

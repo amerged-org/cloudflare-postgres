@@ -755,6 +755,15 @@ it("older revisions and timestamps cannot reintroduce roles while fresh sync rep
     .bind(newer.revision, newer.updated_at, f.id)
     .run();
   await sync(f.id);
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  await env.DB.prepare(
+    "UPDATE databases SET observed_generation=generation WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
   expect((await actor(f.id).admit(f.id, "app")).ok).toBe(true);
 });
 

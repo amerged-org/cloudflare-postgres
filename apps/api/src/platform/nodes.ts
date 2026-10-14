@@ -21,6 +21,11 @@ import {
 import { NodeProofNetworkPlan } from "@pgcf/contracts/node-proof";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
+import {
+  withAdmissionMutation,
+  type AdmissionMutation,
+} from "../domain/admission-mutations.ts";
+import { installationHash } from "../domain/node-installation.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -208,7 +213,22 @@ export async function markLostNode(
   raw: NodeMarkLost,
 ): Promise<Response> {
   await requireScope(c, "admin");
-  return c.json(await markNodeLost(c.env.DB, id, raw));
+  const row = await c.env.DB.prepare(
+    "SELECT node_uid,lost_at FROM nodes WHERE id=?",
+  )
+    .bind(id)
+    .first<{ node_uid: string | null; lost_at: string | null }>();
+  if (!row) throw new ApiError("not_found", "Node not found");
+  if (row.lost_at !== null)
+    return c.json(await markNodeLost(c.env.DB, id, raw));
+  return c.json(
+    await withAdmissionMutation(
+      c.env,
+      [],
+      (mutation) => markNodeLost(c.env.DB, id, raw, mutation),
+      { kind: "node", id },
+    ),
+  );
 }
 export async function listNodeAdditions(c: ApiContext): Promise<Response> {
   await requireScope(c, "admin");
@@ -334,31 +354,78 @@ export async function setCapacityPolicy(
       "invalid_request",
       "Policy region differs from the route",
     );
-  await configureNodeRegionPolicy(c.env.DB, {
-    region_id: id,
-    max_nodes: policy.max_nodes,
-    ram_expansion_threshold_ppm: policy.ram_expansion_threshold_ppm,
-    ram_warning_threshold_ppm: policy.ram_warning_threshold_ppm,
-    node_ram_warning_threshold_ppm: policy.node_ram_warning_threshold_ppm,
-    node_cpu_warning_threshold_ppm: policy.node_cpu_warning_threshold_ppm,
-    node_storage_warning_threshold_ppm:
-      policy.node_storage_warning_threshold_ppm,
-    cap_warning_enabled: policy.cap_warning_enabled,
-    purchases_enabled: policy.purchases_enabled,
-    order: policy.order,
-    placement_mode: policy.placement_mode,
-    maximum_database_memory_mib: policy.maximum_database_memory_mib,
-    postgres_memory_request_mib: policy.postgres_memory_request_mib,
-    standing_cost_profile: policy.standing_cost_profile,
-    ...(policy.compute_pool === undefined
-      ? {}
-      : { compute_pool: policy.compute_pool }),
-    ...(policy.thin_storage === undefined
-      ? {}
-      : { thin_storage: policy.thin_storage }),
-    autoscale_enabled: policy.autoscale_enabled,
-    adopt_instance_ids: policy.adopt_instance_ids,
-  });
+  const previous = await c.env.DB.prepare(
+    "SELECT placement_mode,postgres_memory_request_mib,compute_pool_json FROM node_region_policies WHERE region_id=?",
+  )
+    .bind(id)
+    .first<{
+      placement_mode: string;
+      postgres_memory_request_mib: number | null;
+      compute_pool_json: string | null;
+    }>();
+  const templateRuntime = (value: unknown) => {
+    if (!value) return null;
+    const policy = value as NonNullable<
+      z.infer<typeof NodeCapacityPolicy>["compute_pool"]
+    >;
+    return {
+      profile: policy.profile,
+      per_slot_cpu_millicores: policy.per_slot_cpu_millicores,
+      per_slot_memory_mib: policy.per_slot_memory_mib,
+    };
+  };
+  const changesRuntime =
+    policy.placement_mode !== (previous?.placement_mode ?? "reserved") ||
+    (policy.placement_mode === "actual_ram" &&
+      policy.postgres_memory_request_mib !==
+        (previous?.postgres_memory_request_mib ?? null)) ||
+    (policy.compute_pool !== undefined &&
+      (await installationHash(templateRuntime(policy.compute_pool))) !==
+        (await installationHash(
+          templateRuntime(
+            previous?.compute_pool_json
+              ? JSON.parse(previous.compute_pool_json)
+              : null,
+          ),
+        )));
+  const execute = async (mutation?: AdmissionMutation) =>
+    configureNodeRegionPolicy(
+      c.env.DB,
+      {
+        region_id: id,
+        max_nodes: policy.max_nodes,
+        ram_expansion_threshold_ppm: policy.ram_expansion_threshold_ppm,
+        ram_warning_threshold_ppm: policy.ram_warning_threshold_ppm,
+        node_ram_warning_threshold_ppm: policy.node_ram_warning_threshold_ppm,
+        node_cpu_warning_threshold_ppm: policy.node_cpu_warning_threshold_ppm,
+        node_storage_warning_threshold_ppm:
+          policy.node_storage_warning_threshold_ppm,
+        cap_warning_enabled: policy.cap_warning_enabled,
+        purchases_enabled: policy.purchases_enabled,
+        order: policy.order,
+        placement_mode: policy.placement_mode,
+        maximum_database_memory_mib: policy.maximum_database_memory_mib,
+        postgres_memory_request_mib: policy.postgres_memory_request_mib,
+        standing_cost_profile: policy.standing_cost_profile,
+        ...(policy.compute_pool === undefined
+          ? {}
+          : { compute_pool: policy.compute_pool }),
+        ...(policy.thin_storage === undefined
+          ? {}
+          : { thin_storage: policy.thin_storage }),
+        autoscale_enabled: policy.autoscale_enabled,
+        adopt_instance_ids: policy.adopt_instance_ids,
+      },
+      mutation,
+      previous ?? {
+        placement_mode: null,
+        postgres_memory_request_mib: null,
+        compute_pool_json: null,
+      },
+    );
+  if (changesRuntime)
+    await withAdmissionMutation(c.env, [], execute, { kind: "region", id });
+  else await execute();
   return getCapacityPolicy(c, id);
 }
 export async function configureNodeBootstrap(

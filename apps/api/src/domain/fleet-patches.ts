@@ -63,10 +63,14 @@ import { retainedThickStorageAssignments } from "./storage-capacity.ts";
 import { installationHash } from "./node-installation.ts";
 import { storageAuthorityPublicKeys } from "./storage-authority.ts";
 import {
-  ensureNodeHostConfiguration,
+  prepareNodeHostConfiguration,
   loadNodeHostConfiguration,
 } from "./node-host-configuration.ts";
 import { page } from "../platform/pagination.ts";
+import {
+  withAdmissionMutation,
+  type AdmissionMutation,
+} from "./admission-mutations.ts";
 
 interface PatchRow {
   operation_id: string;
@@ -182,7 +186,11 @@ const baseFleetPatchAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN regions r 
   AND (SELECT count(*) FROM nodes WHERE region_id=fleet_patch_operations.region_id AND lost_at IS NULL) = json_array_length(fleet_patch_operations.cluster_nodes_json) AND (fleet_patch_operations.host_configuration_revision IS NULL OR EXISTS(SELECT 1 FROM node_host_configurations h WHERE h.node_id=fleet_patch_operations.node_id AND h.node_uid=fleet_patch_operations.node_uid AND h.cluster_uid=fleet_patch_operations.cluster_uid AND h.material_revision=fleet_patch_operations.material_revision AND h.release_id=fleet_patch_operations.release_id AND h.revision=fleet_patch_operations.host_configuration_revision AND h.sha256=fleet_patch_operations.host_configuration_sha256))`;
 const parentAuthoritySql = ` AND (fleet_patch_operations.bootstrap_operation_id IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j JOIN node_additions a ON a.operation_id=j.operation_id JOIN nodes n ON n.id=j.node_id WHERE j.operation_id=fleet_patch_operations.bootstrap_operation_id AND j.node_id=fleet_patch_operations.node_id AND j.region_id=fleet_patch_operations.region_id AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0 AND j.admission_authorized=1 AND a.status='bootstrapping' AND n.provider_instance_id=a.provider_instance_id AND json_extract(j.admission_binding_json,'$.node_uid')=fleet_patch_operations.node_uid AND json_extract(j.admission_binding_json,'$.kube_system_uid')=fleet_patch_operations.cluster_uid AND json_extract(a.checkpoint_json,'$.stage')='joined' AND json_extract(a.checkpoint_json,'$.reference')=fleet_patch_operations.bootstrap_joined_reference AND json_extract(a.network_json,'$.checkpoint_reference')=fleet_patch_operations.bootstrap_joined_reference AND json_extract(a.capacity_json,'$.checkpoint_reference')=fleet_patch_operations.bootstrap_joined_reference AND j.input_hash||':'||json_extract(j.admission_binding_json,'$.checkpoint_revision')=fleet_patch_operations.bootstrap_joined_reference))`;
 export const fleetPatchAuthoritySql =
-  baseFleetPatchAuthoritySql + parentAuthoritySql;
+  baseFleetPatchAuthoritySql +
+  parentAuthoritySql +
+  ` AND NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id=fleet_patch_operations.region_id
+  AND (EXISTS(SELECT 1 FROM pool_bindings held_binding WHERE held_binding.database_id=held_database.id AND held_binding.state NOT IN('released','refused'))
+    OR EXISTS(SELECT 1 FROM database_runtime_holders held_runtime WHERE held_runtime.database_id=held_database.id AND held_runtime.kind='pool' AND held_runtime.state NOT IN('released','refused'))))`;
 const authoritySql = fleetPatchAuthoritySql;
 /** Declarative platform stages: Flux applies idempotent desired state after every OS, host and
  *  Kubernetes-version write has completed. */
@@ -855,22 +863,35 @@ export async function ensureFleetPatchFinalization(
       )))
   )
     return null;
-  const creation = await prepareFleetPatchInsert(
-    env,
-    source.node_id,
-    {
-      node_uid: source.node_uid,
-      assignment_revision: source.assignment_revision,
-      release_id: source.release_id,
-      address: source.address,
-      maintenance_acknowledged: true,
-    },
-    undefined,
-    source,
-  );
+  let creationId: string;
   try {
-    const result = await creation.insert.run();
-    if (result.meta.changes !== 1) return closed();
+    creationId = await withFleetPatchCreation(
+      env,
+      source.node_id,
+      async (mutation) => {
+        const creation = await prepareFleetPatchInsert(
+          env,
+          source.node_id,
+          {
+            node_uid: source.node_uid,
+            assignment_revision: source.assignment_revision,
+            release_id: source.release_id,
+            address: source.address,
+            maintenance_acknowledged: true,
+          },
+          mutation,
+          undefined,
+          source,
+        );
+        const offset = creation.hostStatement ? 1 : 0;
+        const result = await mutation.batch([
+          ...(creation.hostStatement ? [creation.hostStatement] : []),
+          creation.insert,
+        ]);
+        if (result[offset]?.meta.changes !== 1) return closed();
+        return creation.id;
+      },
+    );
   } catch (error) {
     const committed = await env.DB.prepare(
       "SELECT operation_id FROM fleet_patch_operations WHERE finalization_of=?",
@@ -881,8 +902,8 @@ export async function ensureFleetPatchFinalization(
     await startFleetPatch(env, committed.operation_id);
     return status(await readFleetPatch(env, committed.operation_id));
   }
-  await startFleetPatch(env, creation.id);
-  return status(await readFleetPatch(env, creation.id));
+  await startFleetPatch(env, creationId);
+  return status(await readFleetPatch(env, creationId));
 }
 /** The last host-qualified member starts one pending final pass; repeated Workflow turns select the same row. */
 export async function continueFleetPatchRegion(
@@ -1022,20 +1043,30 @@ export async function restoreFleetPatchPlacements(
       return false;
   }
   // A closure that a superseded predecessor owned is this release's when its operation recorded it unchanged.
-  await env.DB.prepare(
-    `UPDATE nodes SET database_placement_closed_at=NULL,updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.region_id=nodes.region_id AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.bootstrap_operation_id IS NULL AND p.stage IN('host_ready','complete') AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND ((json_extract(j.value,'$.previous_placement_closed_at') IS NULL AND nodes.database_placement_closed_at=p.created_at)
+  await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const guard = mutation.scopeGuard();
+      const result = await mutation.batch([
+        env.DB.prepare(
+          `UPDATE nodes SET database_placement_closed_at=NULL,updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.region_id=nodes.region_id AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.bootstrap_operation_id IS NULL AND p.stage IN('host_ready','complete') AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND ((json_extract(j.value,'$.previous_placement_closed_at') IS NULL AND nodes.database_placement_closed_at=p.created_at)
       OR EXISTS(SELECT 1 FROM fleet_patch_operations s,json_each(s.cluster_nodes_json) k WHERE s.region_id=p.region_id AND s.bootstrap_operation_id IS NULL AND ${fleetPatchSupersededSql("s")} AND json_extract(k.value,'$.node_id')=nodes.id AND json_extract(k.value,'$.node_uid')=nodes.node_uid AND json_extract(k.value,'$.previous_placement_closed_at') IS NULL AND s.created_at=json_extract(j.value,'$.previous_placement_closed_at') AND nodes.database_placement_closed_at=s.created_at)))
-    AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND NOT ${fleetPatchSupersededSql()})`,
-  )
-    .bind(
-      new Date().toISOString(),
-      row.region_id,
-      row.release_id,
-      row.spec_sha256,
-      row.region_revision,
-      row.region_id,
-    )
-    .run();
+    AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND NOT ${fleetPatchSupersededSql()}) AND (${guard.sql})`,
+        ).bind(
+          new Date().toISOString(),
+          row.region_id,
+          row.release_id,
+          row.spec_sha256,
+          row.region_revision,
+          row.region_id,
+          ...guard.bindings,
+        ),
+      ]);
+      return result;
+    },
+    { kind: "region", id: row.region_id },
+  );
   return true;
 }
 /** A final pass starts from the source's last facts and keeps verifying retained thick storage
@@ -1053,6 +1084,7 @@ async function prepareFleetPatchInsert(
   env: Env,
   nodeId: string,
   input: FleetPatchRequest,
+  mutation: AdmissionMutation,
   parent?: { operation_id: string; joined_reference: string },
   finalization?: PatchRow,
 ) {
@@ -1088,6 +1120,20 @@ async function prepareFleetPatchInsert(
     Date.parse(selected.last_observed_at) > Date.now() + 5000
   )
     return closed();
+  if (
+    mutation.scope?.kind !== "region" ||
+    mutation.scope.id !== selected.region_id
+  )
+    return closed();
+  if (
+    await env.DB.prepare(
+      "SELECT 1 held FROM databases d WHERE d.region_id=? AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=d.id AND b.state NOT IN('released','refused')) OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=d.id AND h.kind='pool' AND h.state NOT IN('released','refused'))) LIMIT 1",
+    )
+      .bind(selected.region_id)
+      .first()
+  )
+    return closed();
+  const guard = mutation.scopeGuard();
   const ref = await loadCurrentRegionMaterialReference(
       env.DB,
       selected.region_id,
@@ -1118,10 +1164,14 @@ async function prepareFleetPatchInsert(
     input.release_id,
   );
   const host = selectedSpec.roles[selected.role].host_configuration_required
-    ? await ensureNodeHostConfiguration(env, {
-        node_id: nodeId,
-        node_uid: input.node_uid,
-      })
+    ? await prepareNodeHostConfiguration(
+        env,
+        {
+          node_id: nodeId,
+          node_uid: input.node_uid,
+        },
+        mutation,
+      )
     : undefined;
   const id = newOperationId(),
     now = new Date().toISOString();
@@ -1134,7 +1184,8 @@ async function prepareFleetPatchInsert(
       AND NOT EXISTS(SELECT 1 FROM json_each(?) j LEFT JOIN nodes n ON n.id=json_extract(j.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id
         WHERE n.id IS NULL OR a.node_id IS NULL OR n.region_id<>? OR n.node_uid<>json_extract(j.value,'$.node_uid') OR n.lost_at IS NOT NULL OR a.node_uid<>n.node_uid OR a.release_id<>? OR a.revision<>json_extract(j.value,'$.assignment_revision') OR n.database_placement_closed_at IS NOT json_extract(j.value,'$.previous_placement_closed_at'))
       AND (SELECT count(*) FROM nodes WHERE region_id=? AND lost_at IS NULL)=?
-      AND (? IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j JOIN node_additions a ON a.operation_id=j.operation_id JOIN nodes n ON n.id=j.node_id WHERE j.operation_id=? AND j.node_id=? AND j.region_id=? AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0 AND j.admission_authorized=1 AND a.status='bootstrapping' AND n.provider_instance_id=a.provider_instance_id AND json_extract(j.admission_binding_json,'$.node_uid')=? AND json_extract(j.admission_binding_json,'$.kube_system_uid')=? AND json_extract(a.checkpoint_json,'$.stage')='joined' AND json_extract(a.checkpoint_json,'$.reference')=? AND json_extract(a.network_json,'$.checkpoint_reference')=? AND json_extract(a.capacity_json,'$.checkpoint_reference')=? AND j.input_hash||':'||json_extract(j.admission_binding_json,'$.checkpoint_revision')=?))`,
+      AND (? IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j JOIN node_additions a ON a.operation_id=j.operation_id JOIN nodes n ON n.id=j.node_id WHERE j.operation_id=? AND j.node_id=? AND j.region_id=? AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0 AND j.admission_authorized=1 AND a.status='bootstrapping' AND n.provider_instance_id=a.provider_instance_id AND json_extract(j.admission_binding_json,'$.node_uid')=? AND json_extract(j.admission_binding_json,'$.kube_system_uid')=? AND json_extract(a.checkpoint_json,'$.stage')='joined' AND json_extract(a.checkpoint_json,'$.reference')=? AND json_extract(a.network_json,'$.checkpoint_reference')=? AND json_extract(a.capacity_json,'$.checkpoint_reference')=? AND j.input_hash||':'||json_extract(j.admission_binding_json,'$.checkpoint_revision')=?))
+      AND (${guard.sql}) AND NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id=? AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=held_database.id AND b.state NOT IN('released','refused')) OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=held_database.id AND h.kind='pool' AND h.state NOT IN('released','refused'))))`,
   ).bind(
     id,
     nodeId,
@@ -1150,8 +1201,8 @@ async function prepareFleetPatchInsert(
     JSON.stringify(clusterNodes.results),
     parent?.operation_id ?? null,
     parent?.joined_reference ?? null,
-    host?.revision ?? null,
-    host?.sha256 ?? null,
+    host?.status.revision ?? null,
+    host?.status.sha256 ?? null,
     finalization?.operation_id ?? null,
     finalization ? finalizationBaseline(finalization) : null,
     finalization?.observed_json ?? null,
@@ -1188,10 +1239,12 @@ async function prepareFleetPatchInsert(
     parent?.joined_reference ?? null,
     parent?.joined_reference ?? null,
     parent?.joined_reference ?? null,
+    ...guard.bindings,
+    selected.region_id,
   );
   const closePlacements = env.DB.prepare(
-    `UPDATE nodes SET database_placement_closed_at=COALESCE(database_placement_closed_at,?),updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.operation_id=? AND p.bootstrap_operation_id IS NULL AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND nodes.database_placement_closed_at IS json_extract(j.value,'$.previous_placement_closed_at'))`,
-  ).bind(now, now, selected.region_id, id);
+    `UPDATE nodes SET database_placement_closed_at=COALESCE(database_placement_closed_at,?),updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.operation_id=? AND p.bootstrap_operation_id IS NULL AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND nodes.database_placement_closed_at IS json_extract(j.value,'$.previous_placement_closed_at')) AND (${guard.sql})`,
+  ).bind(now, now, selected.region_id, id, ...guard.bindings);
   return {
     id,
     now,
@@ -1199,7 +1252,22 @@ async function prepareFleetPatchInsert(
     count: count.count,
     insert,
     closePlacements,
+    hostStatement: host?.statement ?? null,
   };
+}
+async function withFleetPatchCreation<T>(
+  env: Env,
+  nodeId: string,
+  execute: (mutation: AdmissionMutation) => Promise<T>,
+) {
+  const region = await env.DB.prepare("SELECT region_id FROM nodes WHERE id=?")
+    .bind(nodeId)
+    .first<string>("region_id");
+  if (!region) return closed();
+  return withAdmissionMutation(env, [], execute, {
+    kind: "region",
+    id: region,
+  });
 }
 export async function createFleetPatch(
   c: ApiContext,
@@ -1224,21 +1292,35 @@ export async function createFleetPatch(
   return withIdempotency(c, {
     replay: output,
     execute: async (lease) => {
-      const creation = await prepareFleetPatchInsert(c.env, nodeId, input);
-      const results = await c.env.DB.batch([
-        creation.insert,
-        lease.completeStatement(creation.id, 202, {
-          sql: "changes()=1",
-          bindings: [],
-        }),
-        creation.closePlacements,
-      ]);
-      if (
-        results[0]!.meta.changes !== 1 ||
-        results[2]!.meta.changes !== creation.count
-      )
-        return closed();
-      return output(creation.id);
+      const id = await withFleetPatchCreation(
+        c.env,
+        nodeId,
+        async (mutation) => {
+          const creation = await prepareFleetPatchInsert(
+            c.env,
+            nodeId,
+            input,
+            mutation,
+          );
+          const offset = creation.hostStatement ? 1 : 0;
+          const results = await mutation.batch([
+            ...(creation.hostStatement ? [creation.hostStatement] : []),
+            creation.insert,
+            lease.completeStatement(creation.id, 202, {
+              sql: "changes()=1",
+              bindings: [],
+            }),
+            creation.closePlacements,
+          ]);
+          if (
+            results[offset]!.meta.changes !== 1 ||
+            results[offset + 2]!.meta.changes !== creation.count
+          )
+            return closed();
+          return creation.id;
+        },
+      );
+      return output(id);
     },
   });
 }
@@ -1278,17 +1360,28 @@ export async function ensureRetainedFleetPatch(
     }
     return status(await readFleetPatch(env, existing.operation_id));
   }
-  const creation = await prepareFleetPatchInsert(env, nodeId, input);
+  let creationId: string;
   try {
-    const result = await env.DB.batch([
-      creation.insert,
-      creation.closePlacements,
-    ]);
-    if (
-      result[0]!.meta.changes !== 1 ||
-      result[1]!.meta.changes !== creation.count
-    )
-      return closed();
+    creationId = await withFleetPatchCreation(env, nodeId, async (mutation) => {
+      const creation = await prepareFleetPatchInsert(
+        env,
+        nodeId,
+        input,
+        mutation,
+      );
+      const offset = creation.hostStatement ? 1 : 0;
+      const result = await mutation.batch([
+        ...(creation.hostStatement ? [creation.hostStatement] : []),
+        creation.insert,
+        creation.closePlacements,
+      ]);
+      if (
+        result[offset]!.meta.changes !== 1 ||
+        result[offset + 1]!.meta.changes !== creation.count
+      )
+        return closed();
+      return creation.id;
+    });
   } catch (error) {
     // A committed row is the only authority to recover a lost D1 response; never insert blindly again.
     const committed = await read();
@@ -1296,8 +1389,8 @@ export async function ensureRetainedFleetPatch(
     await startFleetPatch(env, committed.operation_id);
     return status(await readFleetPatch(env, committed.operation_id));
   }
-  await startFleetPatch(env, creation.id);
-  return status(await readFleetPatch(env, creation.id));
+  await startFleetPatch(env, creationId);
+  return status(await readFleetPatch(env, creationId));
 }
 /** Future AddNode only. This never reopens an admitted job and never closes existing capacity. */
 export async function ensureBootstrapFleetPatch(
@@ -1352,24 +1445,37 @@ export async function ensureBootstrapFleetPatch(
     .bind(job.node_id, binding.node_uid, reference.release_id)
     .first<{ revision: number }>();
   if (!assignment) return closed();
-  const creation = await prepareFleetPatchInsert(
-    env,
-    job.node_id,
-    {
-      node_uid: binding.node_uid,
-      assignment_revision: assignment.revision,
-      release_id: reference.release_id,
-      address: sealed.spec.hardware.ipv4,
-      maintenance_acknowledged: true,
-    },
-    {
-      operation_id: parentOperationId,
-      joined_reference: `${current.input_hash}:${binding.checkpoint_revision}`,
-    },
-  );
+  let creationId: string;
   try {
-    const result = await creation.insert.run();
-    if (result.meta.changes !== 1) return closed();
+    creationId = await withFleetPatchCreation(
+      env,
+      job.node_id,
+      async (mutation) => {
+        const creation = await prepareFleetPatchInsert(
+          env,
+          job.node_id,
+          {
+            node_uid: binding.node_uid,
+            assignment_revision: assignment.revision,
+            release_id: reference.release_id,
+            address: sealed.spec.hardware.ipv4,
+            maintenance_acknowledged: true,
+          },
+          mutation,
+          {
+            operation_id: parentOperationId,
+            joined_reference: `${current.input_hash}:${binding.checkpoint_revision}`,
+          },
+        );
+        const offset = creation.hostStatement ? 1 : 0;
+        const result = await mutation.batch([
+          ...(creation.hostStatement ? [creation.hostStatement] : []),
+          creation.insert,
+        ]);
+        if (result[offset]?.meta.changes !== 1) return closed();
+        return creation.id;
+      },
+    );
   } catch (error) {
     const committed = await env.DB.prepare(
       "SELECT * FROM fleet_patch_operations WHERE bootstrap_operation_id=?",
@@ -1382,9 +1488,9 @@ export async function ensureBootstrapFleetPatch(
       await startFleetPatch(env, committed.operation_id);
     return status(committed);
   }
-  const created = await readFleetPatch(env, creation.id);
+  const created = await readFleetPatch(env, creationId);
   await assertBootstrapFleetParent(env, created);
-  await startFleetPatch(env, creation.id);
+  await startFleetPatch(env, creationId);
   return status(created);
 }
 export async function getFleetPatch(c: ApiContext, id: string) {
@@ -1422,12 +1528,20 @@ export async function haltFleetPatch(c: ApiContext, id: string) {
       "Only a Flux, platform or regional stage can be superseded",
     );
   await assertFleetPatchAuthority(c.env, row, true);
-  const updated = await c.env.DB.prepare(
-    `UPDATE fleet_patch_operations SET revision=revision+1,state='halted',error_code='operator_hold_superseded',updated_at=? WHERE operation_id=? AND revision=? AND stage IN('flux','platform','regional') AND state<>'halted' AND ${authoritySql}`,
-  )
-    .bind(new Date().toISOString(), id, row.revision)
-    .run();
-  if (updated.meta.changes !== 1) return closed();
+  await withAdmissionMutation(
+    c.env,
+    [],
+    async (mutation) => {
+      const guard = mutation.scopeGuard();
+      const [updated] = await mutation.batch([
+        c.env.DB.prepare(
+          `UPDATE fleet_patch_operations SET revision=revision+1,state='halted',error_code='operator_hold_superseded',updated_at=? WHERE operation_id=? AND revision=? AND stage IN('flux','platform','regional') AND state<>'halted' AND ${authoritySql} AND (${guard.sql})`,
+        ).bind(new Date().toISOString(), id, row.revision, ...guard.bindings),
+      ]);
+      if (updated?.meta.changes !== 1) return closed();
+    },
+    { kind: "region", id: row.region_id },
+  );
   return c.json(status(await readFleetPatch(c.env, id)), 200);
 }
 export async function startFleetPatch(env: Env, id: string) {
@@ -1652,41 +1766,51 @@ export async function recordFleetPatchCheckpoint(
       observationBindings = [row.node_id];
     }
   }
-  const update = env.DB.prepare(
-    `UPDATE fleet_patch_operations SET revision=revision+1,stage=?,state=?,baseline_json=COALESCE(baseline_json,?),observed_json=?,talos_upgrade_receipt_json=COALESCE(talos_upgrade_receipt_json,?),postgres_progress_json=COALESCE(?,postgres_progress_json),error_code=?,updated_at=? WHERE operation_id=? AND revision=? AND ${authoritySql} AND julianday(deadline_at)>julianday('now') AND (${observationFence})`,
-  ).bind(
-    input.stage,
-    input.state,
-    JSON.stringify(input.facts),
-    JSON.stringify(input.facts),
-    input.talos_upgrade_receipt
-      ? JSON.stringify(input.talos_upgrade_receipt)
-      : null,
-    postgresProgress ? JSON.stringify(postgresProgress) : null,
-    input.error_code,
-    new Date().toISOString(),
-    id,
-    row.revision,
-    ...observationBindings,
-  );
-  const updates = [update];
-  if (["complete", "host_ready"].includes(input.stage)) {
-    updates.push(
-      env.DB.prepare(
-        `INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at)
-      SELECT p.node_id,p.node_uid,p.assignment_revision,r.agent_key_hash,?,?,? FROM fleet_patch_operations p JOIN regions r ON r.id=p.region_id WHERE p.operation_id=? AND p.stage IN('complete','host_ready') AND p.revision=?
-      ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,assignment_revision=excluded.assignment_revision,agent_key_hash=excluded.agent_key_hash,facts_json=excluded.facts_json,observed_at=excluded.observed_at,received_at=excluded.received_at WHERE excluded.observed_at>=fleet_node_release_observations.observed_at`,
+  await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      const guard = mutation.scopeGuard();
+      const update = env.DB.prepare(
+        `UPDATE fleet_patch_operations SET revision=revision+1,stage=?,state=?,baseline_json=COALESCE(baseline_json,?),observed_json=?,talos_upgrade_receipt_json=COALESCE(talos_upgrade_receipt_json,?),postgres_progress_json=COALESCE(?,postgres_progress_json),error_code=?,updated_at=? WHERE operation_id=? AND revision=? AND ${authoritySql} AND julianday(deadline_at)>julianday('now') AND (${observationFence}) AND (${guard.sql})`,
       ).bind(
-        JSON.stringify(input.facts.release_facts),
-        inventoryObservedAt,
+        input.stage,
+        input.state,
+        JSON.stringify(input.facts),
+        JSON.stringify(input.facts),
+        input.talos_upgrade_receipt
+          ? JSON.stringify(input.talos_upgrade_receipt)
+          : null,
+        postgresProgress ? JSON.stringify(postgresProgress) : null,
+        input.error_code,
         new Date().toISOString(),
         id,
-        row.revision + 1,
-      ),
-    );
-  }
-  const result = await env.DB.batch(updates);
-  if (result[0]!.meta.changes !== 1) return closed();
+        row.revision,
+        ...observationBindings,
+        ...guard.bindings,
+      );
+      const updates = [update];
+      if (["complete", "host_ready"].includes(input.stage)) {
+        updates.push(
+          env.DB.prepare(
+            `INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at)
+      SELECT p.node_id,p.node_uid,p.assignment_revision,r.agent_key_hash,?,?,? FROM fleet_patch_operations p JOIN regions r ON r.id=p.region_id WHERE p.operation_id=? AND p.stage IN('complete','host_ready') AND p.revision=? AND changes()=1 AND (${guard.sql})
+      ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,assignment_revision=excluded.assignment_revision,agent_key_hash=excluded.agent_key_hash,facts_json=excluded.facts_json,observed_at=excluded.observed_at,received_at=excluded.received_at WHERE excluded.observed_at>=fleet_node_release_observations.observed_at`,
+          ).bind(
+            JSON.stringify(input.facts.release_facts),
+            inventoryObservedAt,
+            new Date().toISOString(),
+            id,
+            row.revision + 1,
+            ...guard.bindings,
+          ),
+        );
+      }
+      const result = await mutation.batch(updates);
+      if (result[0]!.meta.changes !== 1) return closed();
+    },
+    { kind: "region", id: row.region_id },
+  );
   if (
     input.stage === "complete" &&
     !selected.spec.roles[selected.role].host_configuration_required

@@ -15,7 +15,12 @@ import {
   type DesiredPostgres,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
-import type { ApiContext } from "../env.ts";
+import { admissionScopesOpenSql } from "./admission-state.ts";
+import type { ApiContext, Env } from "../env.ts";
+import {
+  withAdmissionMutation,
+  type AdmissionSqlGuard,
+} from "./admission-mutations.ts";
 import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
 import {
   withIdempotency,
@@ -115,6 +120,7 @@ export function databaseInsertStatement(
       SELECT ?,p.id,r.id,NULL,?,s.id,'running',1,?,'Waiting for verified regional capacity',?,?,${postgresSelection}
       FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
+      AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
       AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?
       AND (COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')='reserved' OR (s.memory_mib%256=0 AND (SELECT maximum_database_memory_mib FROM node_region_policies WHERE region_id=r.id)>=s.memory_mib AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id)<=s.memory_mib))
       AND (${snapshot.authority?.sql ?? "1=1"})`,
@@ -145,6 +151,7 @@ export function databaseInsertStatement(
             SELECT ?,p.id,n.region_id,n.id,?,s.id,'running',1,?,?,?,${selectedStorageProfileSql()},${postgresSelection} FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
             WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
+            AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
             AND ${startupHeadroomSql()}
             AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?+${computePoolOverheadSql("d", "memory_mib")}) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?+${computePoolOverheadSql("n", "memory_mib")}`)}
             AND n.platform_reserved_cpu_millicores IS NOT NULL
@@ -390,6 +397,7 @@ export function databaseResizeStatement(
   now: string,
   authority?: DatabaseInsertSnapshot["authority"],
   postgres?: DesiredPostgres,
+  admission?: AdmissionSqlGuard,
 ): D1PreparedStatement {
   const imageUpdate = postgres
     ? "desired_postgres_release_id=?,desired_postgres_image=?,desired_postgres_version=?,desired_postgres_schema_revision=?,"
@@ -423,7 +431,7 @@ export function databaseResizeStatement(
              OR EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=databases.region_id
                AND target.memory_mib BETWEEN 256 AND p.maximum_database_memory_mib AND target.memory_mib%256=0
                AND p.postgres_memory_request_mib BETWEEN 1 AND target.memory_mib)))
-         AND (${authority?.sql ?? "1=1"})`,
+         AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
         ...imageBindings,
@@ -447,6 +455,7 @@ export function databaseResizeStatement(
         size.archive_timeout_seconds,
         size.backup_retention_days,
         ...(authority?.bindings ?? []),
+        ...(admission?.bindings ?? []),
       );
   return db
     .prepare(
@@ -465,7 +474,7 @@ export function databaseResizeStatement(
           AND ${nodeStoragePlacementSql("n", "s", "databases")}
           AND ((s.memory_mib=? AND s.cpu_millicores=? AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=? AND s.max_connections=?)
           AND (s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?)))
-      AND (${authority?.sql ?? "1=1"})`,
+      AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
     )
     .bind(
       ...imageBindings,
@@ -490,12 +499,13 @@ export function databaseResizeStatement(
       size.archive_timeout_seconds,
       size.backup_retention_days,
       ...(authority?.bindings ?? []),
+      ...(admission?.bindings ?? []),
     );
 }
 
 /** The API and central profile rollout share the same atomic resize and startup admission. */
 export async function scheduleDatabaseResize(
-  db: D1Database,
+  env: Env,
   row: DatabaseRow,
   targetId: string,
   now: string,
@@ -503,6 +513,7 @@ export async function scheduleDatabaseResize(
   authority?: DatabaseInsertSnapshot["authority"],
   postgres?: DesiredPostgres,
 ): Promise<string> {
+  const db = env.DB;
   if (
     row.deleted_at !== null ||
     !["running", "suspended"].includes(row.desired_state)
@@ -634,76 +645,90 @@ export async function scheduleDatabaseResize(
         "Current node has insufficient memory, CPU or storage",
       );
   }
-  const generation = row.generation + 1;
-  const statements = [
-    databaseResizeStatement(db, row, target, now, authority, postgres),
-    db
-      .prepare(
-        `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
+  const nodeId = row.node_id;
+  return withAdmissionMutation(env, [row.id], async (mutation) => {
+    const guard = mutation.guard(row.id),
+      generation = row.generation + 1;
+    const statements = [
+      databaseResizeStatement(db, row, target, now, authority, postgres, guard),
+      db
+        .prepare(
+          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
        SELECT ?,'database.resize','pending',project_id,id,generation,?,? FROM databases
-       WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND size_class_id=?`,
-      )
-      .bind(op, now, now, row.id, row.project_id, generation, target.id),
-  ];
-  if (!sleeping)
+       WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND size_class_id=? AND (${guard.sql})`,
+        )
+        .bind(
+          op,
+          now,
+          now,
+          row.id,
+          row.project_id,
+          generation,
+          target.id,
+          ...guard.bindings,
+        ),
+    ];
+    if (!sleeping)
+      statements.push(
+        startupReservationStatement(db, {
+          databaseId: row.id,
+          operationId: op,
+          generation,
+          nodeId,
+          now,
+        }),
+      );
     statements.push(
-      startupReservationStatement(db, {
-        databaseId: row.id,
-        operationId: op,
-        generation,
-        nodeId: row.node_id,
-        now,
-      }),
-    );
-  statements.push(
-    db
-      .prepare(
-        `UPDATE operations SET status='failed',error_code='superseded',error_message='Resource configuration superseded',updated_at=?,completed_at=?
+      db
+        .prepare(
+          `UPDATE operations SET status='failed',error_code='superseded',error_message='Resource configuration superseded',updated_at=?,completed_at=?
      WHERE database_id=? AND project_id=? AND kind='database.resize' AND generation<? AND status IN('pending','running')
        AND EXISTS(SELECT 1 FROM databases d JOIN operations current ON current.database_id=d.id AND current.project_id=d.project_id
          WHERE d.id=operations.database_id AND d.generation=? AND d.size_class_id=? AND d.updated_at=?
-           AND current.id=? AND current.generation=d.generation AND current.kind='database.resize')`,
+           AND current.id=? AND current.generation=d.generation AND current.kind='database.resize') AND (${guard.sql})`,
+        )
+        .bind(
+          now,
+          now,
+          row.id,
+          row.project_id,
+          generation,
+          generation,
+          target.id,
+          now,
+          op,
+          ...guard.bindings,
+        ),
+    );
+    if (lease)
+      statements.push(
+        lease.completeStatement(op, 202, {
+          sql: `EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?) AND (${guard.sql})`,
+          bindings: [op, row.project_id, ...guard.bindings],
+        }),
+      );
+    const result = await mutation.batch(statements);
+    if (result[0]!.meta.changes !== 1) {
+      const current = await db
+        .prepare("SELECT * FROM databases WHERE id=?")
+        .bind(row.id)
+        .first<DatabaseRow>();
+      if (
+        !current ||
+        current.generation !== row.generation ||
+        current.desired_state !== row.desired_state ||
+        current.size_class_id !== row.size_class_id ||
+        current.updated_at !== row.updated_at ||
+        sleeping
       )
-      .bind(
-        now,
-        now,
-        row.id,
-        row.project_id,
-        generation,
-        generation,
-        target.id,
-        now,
-        op,
-      ),
-  );
-  if (lease)
-    statements.push(
-      lease.completeStatement(op, 202, {
-        sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
-        bindings: [op, row.project_id],
-      }),
-    );
-  const result = await db.batch(statements);
-  if (result[0]!.meta.changes !== 1) {
-    const current = await db
-      .prepare("SELECT * FROM databases WHERE id=?")
-      .bind(row.id)
-      .first<DatabaseRow>();
-    if (
-      !current ||
-      current.generation !== row.generation ||
-      current.desired_state !== row.desired_state ||
-      current.size_class_id !== row.size_class_id ||
-      current.updated_at !== row.updated_at ||
-      sleeping
-    )
-      throw new ApiError("conflict", "Database changed; retry the request");
-    throw new ApiError(
-      "capacity_exhausted",
-      "Current node capacity changed; retry the request",
-    );
-  }
-  return op;
+        throw new ApiError("conflict", "Database changed; retry the request");
+      throw new ApiError(
+        "capacity_exhausted",
+        "Current node capacity changed; retry the request",
+      );
+    }
+    return op;
+  });
 }
 
 export async function resizeDatabase(
@@ -723,7 +748,7 @@ export async function resizeDatabase(
       )
         throw new ApiError("conflict", "Database generation changed");
       const op = await scheduleDatabaseResize(
-        c.env.DB,
+        c.env,
         row,
         body.size_class_id,
         new Date().toISOString(),
@@ -757,43 +782,74 @@ export async function deleteDatabase(
       const op = newOperationId(),
         now = new Date().toISOString(),
         generation = row.generation + 1;
-      const result = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=?
-        WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)`,
-        ).bind(now, now, id, row.project_id, row.generation),
-        c.env.DB.prepare(
-          `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
+      const result = await withAdmissionMutation(
+        c.env,
+        [id],
+        async (mutation) => {
+          const guard = mutation.guard(id);
+          return mutation.batch([
+            c.env.DB.prepare(
+              `UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=?
+        WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL) AND (${guard.sql})`,
+            ).bind(
+              now,
+              now,
+              id,
+              row.project_id,
+              row.generation,
+              ...guard.bindings,
+            ),
+            c.env.DB.prepare(
+              `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
           SELECT d.id,d.project_id,d.region_id,d.archive_path,d.storage_generation,
           (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'updated_at',r.updated_at)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
           d.deleted_at,strftime('%Y-%m-%dT%H:%M:%fZ',d.deleted_at,'+'||s.backup_retention_days||' days')
-          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=?`,
-        ).bind(id, row.project_id, generation, now),
-        c.env.DB.prepare(
-          `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
-        SELECT ?,'database.delete','pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=?`,
-        ).bind(op, now, now, id, row.project_id, generation),
-        c.env.DB.prepare(
-          `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded by deletion',updated_at=?,completed_at=? WHERE database_id=? AND generation<? AND kind IN('database.suspend','database.resume','database.hibernate','database.wake') AND status IN('pending','running') AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=? AND generation=? AND kind='database.delete')`,
-        ).bind(now, now, id, generation, op, id, generation),
-        c.env.DB.prepare(
-          `UPDATE databases SET observed_state='deleted',observed_generation=generation,status_message=NULL
+          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=? AND (${guard.sql})`,
+            ).bind(id, row.project_id, generation, now, ...guard.bindings),
+            c.env.DB.prepare(
+              `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
+        SELECT ?,'database.delete','pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND (${guard.sql})`,
+            ).bind(
+              op,
+              now,
+              now,
+              id,
+              row.project_id,
+              generation,
+              ...guard.bindings,
+            ),
+            c.env.DB.prepare(
+              `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded by deletion',updated_at=?,completed_at=? WHERE database_id=? AND generation<? AND kind IN('database.suspend','database.resume','database.hibernate','database.wake') AND status IN('pending','running') AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=? AND generation=? AND kind='database.delete') AND (${guard.sql})`,
+            ).bind(
+              now,
+              now,
+              id,
+              generation,
+              op,
+              id,
+              generation,
+              ...guard.bindings,
+            ),
+            c.env.DB.prepare(
+              `UPDATE databases SET observed_state='deleted',observed_generation=generation,status_message=NULL
           WHERE id=? AND project_id=? AND generation=? AND desired_state='deleted' AND node_id IS NULL
-          AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=databases.id AND kind='database.delete')`,
-        ).bind(id, row.project_id, generation, op),
-        c.env.DB.prepare(
-          `UPDATE operations SET status='succeeded',completed_at=?,updated_at=? WHERE id=? AND kind='database.delete'
-          AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted' AND d.observed_generation=operations.generation)`,
-        ).bind(now, now, op),
-        c.env.DB.prepare(
-          `UPDATE operations SET status='failed',completed_at=?,updated_at=?,error_code='superseded',error_message='Unplaced creation cancelled by deletion'
-          WHERE database_id=? AND kind='database.create' AND status='pending' AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted')`,
-        ).bind(now, now, id),
-        lease.completeStatement(op, 202, {
-          sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
-          bindings: [op, row.project_id],
-        }),
-      ]);
+          AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=databases.id AND kind='database.delete') AND (${guard.sql})`,
+            ).bind(id, row.project_id, generation, op, ...guard.bindings),
+            c.env.DB.prepare(
+              `UPDATE operations SET status='succeeded',completed_at=?,updated_at=? WHERE id=? AND kind='database.delete'
+          AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted' AND d.observed_generation=operations.generation) AND (${guard.sql})`,
+            ).bind(now, now, op, ...guard.bindings),
+            c.env.DB.prepare(
+              `UPDATE operations SET status='failed',completed_at=?,updated_at=?,error_code='superseded',error_message='Unplaced creation cancelled by deletion'
+          WHERE database_id=? AND kind='database.create' AND status='pending' AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted') AND (${guard.sql})`,
+            ).bind(now, now, id, ...guard.bindings),
+            lease.completeStatement(op, 202, {
+              sql: `EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?) AND (${guard.sql})`,
+              bindings: [op, row.project_id, ...guard.bindings],
+            }),
+          ]);
+        },
+      );
       if (result[0]!.meta.changes !== 1)
         throw new ApiError("conflict", "Database changed; retry the request");
       hint(c, row.region_id, [id]);

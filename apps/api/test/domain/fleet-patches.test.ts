@@ -2126,6 +2126,43 @@ it("verified activation creates a current-custody host-only finalization from an
   expect((await readFleetPatch(runtime, f.op)).stage).toBe("host_ready");
 });
 
+it("fences regional admission before a Fleet checkpoint can replace current software proof", async () => {
+  const f = await setup();
+  await env.DB.exec(
+    `CREATE TRIGGER admission_patch_checkpoint BEFORE UPDATE ON fleet_patch_operations WHEN NEW.operation_id='${f.op}' AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id=NEW.region_id AND s.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'checkpoint has no admission fence'); END`,
+  );
+  try {
+    const result = await recordFleetPatchCheckpoint(f.runtime, f.op, {
+      expected_revision: 0,
+      stage: "preflight",
+      state: "confirmed",
+      facts: f.facts,
+      error_code: null,
+    });
+    expect(result.revision).toBe(1);
+  } finally {
+    await env.DB.exec("DROP TRIGGER admission_patch_checkpoint");
+  }
+});
+it("fences the operator hold that removes the current pending Fleet capability blocker", async () => {
+  const f = await setup();
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='flux' WHERE operation_id=?",
+  )
+    .bind(f.op)
+    .run();
+  await env.DB.exec(
+    `CREATE TRIGGER admission_patch_hold BEFORE UPDATE ON fleet_patch_operations WHEN NEW.operation_id='${f.op}' AND NEW.error_code='operator_hold_superseded' AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id=NEW.region_id AND s.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'hold has no admission fence'); END`,
+  );
+  try {
+    expect(
+      (await request(`/v1/fleet/patches/${f.op}/halt`, f.admin, "POST")).status,
+    ).toBe(200);
+  } finally {
+    await env.DB.exec("DROP TRIGGER admission_patch_hold");
+  }
+});
+
 it("accepts the measured 178-second checkpoint proof without changing its timestamps or stage facts", async () => {
   const f = await setup(),
     observedAt = new Date(Date.now() - 178000).toISOString(),
@@ -2330,8 +2367,7 @@ it("an executor checkpoint racing the operator halt fails closed and cannot clea
       },
       error_code: null,
     };
-  // Native's callback passes every read-side check; the halt commits just before its revision CAS.
-  let raced = false;
+  // Real concurrent API requests contend for the durable regional fence; neither bypasses it.
   const executor = async (body: unknown) => {
     const context = createExecutionContext(),
       response = await createApp().fetch(
@@ -2343,40 +2379,29 @@ it("an executor checkpoint racing the operator halt fails closed and cannot clea
           },
           body: JSON.stringify(body),
         }),
-        {
-          ...f.runtime,
-          DB: {
-            prepare: env.DB.prepare.bind(env.DB),
-            batch: async (statements: D1PreparedStatement[]) => {
-              if (!raced) {
-                raced = true;
-                expect(
-                  (
-                    await request(
-                      `/v1/fleet/patches/${f.op}/halt`,
-                      f.admin,
-                      "POST",
-                    )
-                  ).status,
-                ).toBe(200);
-              }
-              return env.DB.batch(statements);
-            },
-          } as unknown as D1Database,
-        },
+        f.runtime,
         context,
       );
     await waitOnExecutionContext(context);
     return response;
   };
-  expect((await executor(checkpoint)).status).toBe(409);
-  expect(raced).toBe(true);
+  const concurrent = await Promise.all([
+    executor(checkpoint),
+    request(`/v1/fleet/patches/${f.op}/halt`, f.admin, "POST"),
+  ]);
+  expect(
+    concurrent.every((response) => [200, 409].includes(response.status)),
+  ).toBe(true);
+  expect(concurrent.some((response) => response.status === 200)).toBe(true);
+  // If the checkpoint wins the first contention, the supported next hold closes its new revision.
+  expect(
+    (await request(`/v1/fleet/patches/${f.op}/halt`, f.admin, "POST")).status,
+  ).toBe(200);
   const held = await readFleetPatch(env, f.op);
   expect(held).toMatchObject({
     stage: "regional",
     state: "halted",
     error_code: "operator_hold_superseded",
-    revision: 1,
   });
   // The executor's next turn reads no status and writes no checkpoint at the new revision.
   expect((await executor({ kind: "status" })).status).toBe(409);

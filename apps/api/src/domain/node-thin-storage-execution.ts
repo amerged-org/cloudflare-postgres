@@ -41,6 +41,7 @@ import type { Env, ApiContext } from "../env.ts";
 import { bearer } from "../middleware/auth.ts";
 import {
   readCurrentNodeThinStorage,
+  poolHostCustodyForDatabase,
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import {
@@ -57,6 +58,14 @@ import {
 import { bootstrapTransportSigningKey } from "./bootstrap-relay.ts";
 import { readBootstrapRelayIdentity } from "./node-inspection.ts";
 import type { DatabaseRow } from "./rows.ts";
+import {
+  withAdmissionMutation,
+  type AdmissionMutation,
+} from "./admission-mutations.ts";
+import {
+  postgresPoolCapable,
+  postgresPoolQualificationCapable,
+} from "./fleet-releases.ts";
 const closed = (): never => {
   throw new ApiError(
     "conflict",
@@ -167,7 +176,10 @@ function retainedPoolAuthority(
     : null;
 }
 
-export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM database_start_admissions storage_hold WHERE (storage_hold.node_id=node_thin_storage.node_id AND storage_hold.node_uid=node_thin_storage.node_uid AND storage_hold.storage_budget_bytes>0) AND NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
+export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM (
+  SELECT h.operation_id FROM database_start_admissions h WHERE h.node_id=node_thin_storage.node_id AND h.node_uid=node_thin_storage.node_uid AND h.storage_budget_bytes>0
+  UNION ALL SELECT cleanup.operation_id FROM pool_cleanup_grants cleanup JOIN pool_bindings b ON b.id=cleanup.binding_id WHERE b.node_id=node_thin_storage.node_id AND b.node_uid=node_thin_storage.node_uid AND cleanup.state<>'completed'
+) storage_hold WHERE NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
 export async function storageHolds(
   env: Env,
   nodeId: string,
@@ -175,10 +187,14 @@ export async function storageHolds(
   authority: NodeThinStorageAuthority | null | undefined,
   now = Date.now(),
 ) {
+  const { poolCleanupExposureSql, poolCleanupReceiptSql } =
+    await import("./storage-capacity.ts");
   const rows = await env.DB.prepare(
-    "SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id",
+    `SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0
+    UNION ALL SELECT cleanup.operation_id,b.database_id,${poolCleanupExposureSql()},${poolCleanupReceiptSql()},d.storage_volume_json,d.storage_profile_json,d.storage_generation
+    FROM pool_cleanup_grants cleanup JOIN pool_bindings b ON b.id=cleanup.binding_id JOIN databases d ON d.id=b.database_id WHERE b.node_id=? AND b.node_uid=? AND cleanup.state<>'completed' ORDER BY operation_id`,
   )
-    .bind(nodeId, nodeUid)
+    .bind(nodeId, nodeUid, nodeId, nodeUid)
     .all<{
       operation_id: string;
       database_id: string;
@@ -405,10 +421,14 @@ export async function reserveThinStorageLease(
           .run();
         return null;
       }
-      // CSI removes the pool with its last LV. A deleted database's hold remains until a
-      // newer identity read proves reclamation: keep that read possible without authorizing
-      // a replacement pool or discarding the hold while its physical outcome is unproved.
-      if (holds.count === 0 && required.data <= profile.maximum_data_bytes)
+      const unresolved = await env.DB.prepare(
+        `SELECT EXISTS(SELECT 1 FROM pool_bindings b WHERE b.node_id=? AND b.state NOT IN('released','refused') AND json_extract(b.scope_json,'$.storage.backend')='lvm-thin-v1')
+        OR EXISTS(SELECT 1 FROM database_runtime_holders h JOIN databases d ON d.id=h.database_id WHERE d.node_id=? AND d.storage_profile_json IS NOT NULL AND h.kind='pool' AND h.state NOT IN('released','refused')) held`,
+      )
+        .bind(nodeId, nodeId)
+        .first<number>("held");
+      // Deleted obligations need a new absence proof, never replacement-pool permission.
+      if (holds.count === 0 && !unresolved && required.data <= profile.maximum_data_bytes)
         action = NodeThinPoolAction.parse({
           kind: "initialize",
           state: "pending",
@@ -470,7 +490,11 @@ export async function reserveThinStorageLease(
   ).toISOString();
   // The newest sample accepted before this lease bounds what its own LVM reading may show.
   const result = await env.DB.prepare(
-    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=?,lease_sample_observed_at=sample_observed_at,lease_sample_data_used_bytes=sample_data_used_bytes WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}`,
+    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=?,lease_sample_observed_at=sample_observed_at,lease_sample_data_used_bytes=sample_data_used_bytes WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}
+      AND (?=0 OR ((NOT EXISTS(SELECT 1 FROM database_start_admissions a WHERE a.node_id=node_thin_storage.node_id AND a.storage_budget_bytes>0)
+        AND NOT EXISTS(SELECT 1 FROM pool_bindings b WHERE b.node_id=node_thin_storage.node_id AND b.state NOT IN('released','refused') AND json_extract(b.scope_json,'$.storage.backend')='lvm-thin-v1'))
+        AND (NOT EXISTS(SELECT 1 FROM database_runtime_holders h JOIN databases d ON d.id=h.database_id WHERE d.node_id=node_thin_storage.node_id AND d.storage_profile_json IS NOT NULL AND h.kind='pool' AND h.state NOT IN('released','refused'))
+        AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.node_id=node_thin_storage.node_id AND d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.storage_profile_json IS NOT NULL))))`,
   )
     .bind(
       operation,
@@ -480,6 +504,7 @@ export async function reserveThinStorageLease(
       nodeId,
       row.profile_revision,
       row.lease_revision,
+      Number(action?.kind === "initialize"),
     )
     .run();
   if (result.meta.changes !== 1) return null;
@@ -583,6 +608,20 @@ async function buildThinStorageInput(
     current.authority ??
     current.reclamation ??
     retainedPoolAuthority(current.row);
+  const poolCapable =
+    (await postgresPoolCapable(env.DB, row.region_id)) ||
+    (await postgresPoolQualificationCapable(env.DB, row.region_id));
+  const poolCustody = new Map(
+    await Promise.all(
+      records.results.map(
+        async (record) =>
+          [
+            record.id,
+            await poolHostCustodyForDatabase(env, record.id, poolCapable),
+          ] as const,
+      ),
+    ),
+  );
   const requiredHeadroom =
     required ??
     minimumHeadroom(
@@ -660,6 +699,7 @@ async function buildThinStorageInput(
               expires_at: row.lease_expires_at,
             }
           : null,
+        ...(poolCustody.get(r.id) ? { pool: poolCustody.get(r.id) } : {}),
       })),
     },
     host_extension: {
@@ -910,7 +950,11 @@ async function acceptIdentityProof(
       return block("thin_storage_headroom_inconsistent");
     }
   }
-  const receipts = [];
+  const receipts: {
+    database: (typeof lease.databases)[number];
+    storage: NonNullable<(typeof lease.databases)[number]["storage"]>;
+    value: string;
+  }[] = [];
   for (const volume of a.volumes) {
     const database = lease.databases.find((d) => d.id === volume.database_id)!;
     if (!database.storage) continue;
@@ -991,46 +1035,87 @@ async function acceptIdentityProof(
       serialized = JSON.stringify(composed),
       received = new Date(Date.now()).toISOString(),
       accepted = `EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.authority_revision=? AND t.authority_json=?)`,
-      bindings = [nodeId, composed.revision, serialized],
-      statements = [
-        env.DB.prepare(
-          `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,inventory_physical_json=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql} AND NOT EXISTS(SELECT 1 FROM json_each(?) volume WHERE NOT EXISTS(SELECT 1 FROM databases d WHERE d.id=json_extract(volume.value,'$.database_id') AND d.node_id=node_thin_storage.node_id AND d.generation=json_extract(volume.value,'$.generation') AND d.storage_generation=json_extract(volume.value,'$.storage_generation')))`,
-        ).bind(
-          composed.revision,
-          serialized,
-          received,
-          JSON.stringify(a.physical),
-          qualification,
-          writeAllowed ? "ready" : "blocked",
-          nodeId,
-          row.lease_revision,
-          row.authority_revision,
-          row.profile_revision,
-          heldOperations,
-          reportedVolumes,
-        ),
-      ];
-    for (const { database, storage, value } of receipts)
-      statements.push(
-        env.DB.prepare(
-          `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,
-        ).bind(
-          value,
-          database.id,
-          nodeId,
-          database.generation,
-          database.storage_generation,
-          storage.node_uid,
-          storage.pool_uuid,
-          value,
-          ...bindings,
-        ),
+      bindings = [nodeId, composed.revision, serialized];
+    const protectionSubjects = [
+      ...new Set([
+        ...composed.protections.map((proof) => proof.database_id),
+        ...composed.volumes
+          .filter((volume) => volume.quiesced === true)
+          .map((volume) => volume.database_id),
+      ]),
+    ];
+    const protectedAdmissions = protectionSubjects.length
+      ? (
+          await env.DB.prepare(
+            `SELECT id FROM databases WHERE node_id=? AND id IN(SELECT value FROM json_each(?))
+      AND desired_state='running' AND deleted_at IS NULL
+      AND (storage_protected_at IS NULL OR storage_protected_generation IS NOT generation OR storage_protected_operation IS NULL
+        OR observed_state<>'provisioning'
+        OR EXISTS(SELECT 1 FROM json_each(?) changed_proof WHERE json_extract(changed_proof.value,'$.database_id')=databases.id
+          AND json_extract(changed_proof.value,'$.operation_id') IS NOT NULL
+          AND (json_extract(changed_proof.value,'$.operation_id') IS NOT storage_protected_operation
+            OR observed_power<>'hibernated' OR observed_generation<>generation)))`,
+          )
+            .bind(
+              nodeId,
+              JSON.stringify(protectionSubjects),
+              JSON.stringify(composed.protections),
+            )
+            .all<{ id: string }>()
+        ).results.map((record) => record.id)
+      : [];
+    const execute = async (mutation?: AdmissionMutation) => {
+      const guards = new Map(
+        protectedAdmissions.map((id) => [id, mutation!.guard(id)]),
       );
-    statements.push(
-      ...storageHoldVolumeStatements(env.DB, composed),
-      ...storageProtectionStatements(env.DB, composed),
-    );
-    const results = await env.DB.batch(statements);
+      const allGuards = [...guards.values()],
+        allGuardSql = allGuards.length
+          ? allGuards.map((guard) => `(${guard.sql})`).join(" AND ")
+          : "1=1",
+        statements = [
+          env.DB.prepare(
+            `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,inventory_physical_json=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql} AND NOT EXISTS(SELECT 1 FROM json_each(?) volume WHERE NOT EXISTS(SELECT 1 FROM databases d WHERE d.id=json_extract(volume.value,'$.database_id') AND d.node_id=node_thin_storage.node_id AND d.generation=json_extract(volume.value,'$.generation') AND d.storage_generation=json_extract(volume.value,'$.storage_generation'))) AND (${allGuardSql})`,
+          ).bind(
+            composed.revision,
+            serialized,
+            received,
+            JSON.stringify(a.physical),
+            qualification,
+            writeAllowed ? "ready" : "blocked",
+            nodeId,
+            row.lease_revision,
+            row.authority_revision,
+            row.profile_revision,
+            heldOperations,
+            reportedVolumes,
+            ...allGuards.flatMap((guard) => guard.bindings),
+          ),
+        ];
+      for (const { database, storage, value } of receipts)
+        statements.push(
+          env.DB.prepare(
+            `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,
+          ).bind(
+            value,
+            database.id,
+            nodeId,
+            database.generation,
+            database.storage_generation,
+            storage.node_uid,
+            storage.pool_uuid,
+            value,
+            ...bindings,
+          ),
+        );
+      statements.push(
+        ...storageHoldVolumeStatements(env.DB, composed),
+        ...storageProtectionStatements(env.DB, composed, guards),
+      );
+      return mutation ? mutation.batch(statements) : env.DB.batch(statements);
+    };
+    const results = protectedAdmissions.length
+      ? await withAdmissionMutation(env, protectedAdmissions, execute)
+      : await execute();
     if (results[0]!.meta.changes === 1)
       return {
         accepted: true,

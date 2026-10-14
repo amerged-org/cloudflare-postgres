@@ -15,6 +15,7 @@ import {
   serializeRouteKeyring,
 } from "@pgcf/contracts/route-token";
 import { ApiError } from "../app.ts";
+import { withAdmissionMutation } from "../domain/admission-mutations.ts";
 import {
   agentKeyReference,
   encryptAgentKey,
@@ -283,23 +284,32 @@ export async function updateRegionConfiguration(
       const now = new Date(
         Math.max(Date.now(), Date.parse(String(before.updated_at)) + 1),
       ).toISOString();
-      const results = await c.env.DB.batch([
-        c.env.DB.prepare(
-          `UPDATE regions SET gateway_url=?,gateway_binding=?,updated_at=?
-          WHERE ${configurationFields.map((field) => `${field} IS ?`).join(" AND ")}`,
-        ).bind(
-          body.gateway_url,
-          body.gateway_binding,
-          now,
-          ...configurationFields.map(
-            (field) => before[field] as string | number | null,
-          ),
-        ),
-        lease.completeStatement(id, 200, {
-          sql: "changes() = 1",
-          bindings: [],
-        }),
-      ]);
+      const results = await withAdmissionMutation(
+        c.env,
+        [],
+        async (mutation) => {
+          const guard = mutation.scopeGuard();
+          return mutation.batch([
+            c.env.DB.prepare(
+              `UPDATE regions SET gateway_url=?,gateway_binding=?,updated_at=?
+          WHERE ${configurationFields.map((field) => `${field} IS ?`).join(" AND ")} AND ${guard.sql}`,
+            ).bind(
+              body.gateway_url,
+              body.gateway_binding,
+              now,
+              ...configurationFields.map(
+                (field) => before[field] as string | number | null,
+              ),
+              ...guard.bindings,
+            ),
+            lease.completeStatement(id, 200, {
+              sql: "changes() = 1",
+              bindings: [],
+            }),
+          ]);
+        },
+        { kind: "region", id },
+      );
       if (results[0]!.meta.changes !== 1)
         throw new ApiError(
           "conflict",

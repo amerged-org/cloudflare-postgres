@@ -159,13 +159,30 @@ export async function operationForRequest(
   id: string,
 ): Promise<OperationRow> {
   await getAuth(c);
-  const row = await c.env.DB.prepare(
-    "SELECT o.* FROM operations o JOIN projects p ON p.id=o.project_id AND p.deleted_at IS NULL JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id WHERE o.id=?",
+  let row = await c.env.DB.prepare(
+    `SELECT o.* FROM (SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM operations
+      UNION ALL SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM pool_role_mutations) o
+      JOIN projects p ON p.id=o.project_id AND p.deleted_at IS NULL JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id WHERE o.id=?`,
   )
     .bind(id)
     .first<OperationRow>();
   if (!row) throw new ApiError("not_found", "Operation not found");
   await assertProjectAccess(c, row.project_id);
+  if (
+    (row.kind === "database.role.create" ||
+      row.kind === "database.role.reset_password") &&
+    row.status === "running"
+  ) {
+    await (
+      await import("./roles.ts")
+    ).refreshDeferredPoolRoleOperations(c.env, row.database_id);
+    row =
+      (await c.env.DB.prepare(
+        "SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM pool_role_mutations WHERE id=? AND project_id=?",
+      )
+        .bind(id, row.project_id)
+        .first<OperationRow>()) ?? row;
+  }
   return row;
 }
 export function isConstraintError(error: unknown): boolean {
