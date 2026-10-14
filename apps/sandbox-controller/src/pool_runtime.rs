@@ -466,6 +466,11 @@ pub async fn run(
     let trusted = trust(&config)?;
     GateRoot::provision(Path::new(ROOT))?;
     protect_journals(&config, &client.local().node_uid)?;
+    let restarted = crate::pool_recovery::Restarted::capture(
+        Path::new(ROOT),
+        &client.local().node_uid,
+        &crate::storage::current_boot_id()?,
+    )?;
     let mut holders: BTreeMap<String, Holder> = BTreeMap::new();
     let mut last_revision = 0u64;
     loop {
@@ -476,7 +481,7 @@ pub async fn run(
             client = updates.borrow_and_update().clone()
         }
         let result: Result<(), Status> = async {
-            crate::pool_recovery::reconcile(&settings, &client).await?;
+            crate::pool_recovery::reconcile(&settings, &client, &restarted).await?;
             let snapshot = client.pool_bindings(None).await;
             if let Ok(snapshot) = snapshot {
                 let revision = snapshot["revision"].as_u64().ok_or_else(refused)?;
@@ -739,13 +744,14 @@ fn protection_device_matches(
 mod recovery_tests {
     use super::*;
     fn state() -> State {
-        let scope = pool::CONTRACT["vectors"]
+        let mut scope = pool::CONTRACT["vectors"]
             .as_array()
             .unwrap()
             .iter()
             .find(|v| v["name"] == "thin-scope")
             .unwrap()["value"]
             .clone();
+        scope["boot_id"] = crate::storage::current_boot_id().unwrap().into();
         State {
             v: 1,
             record: Record::new(
@@ -810,6 +816,98 @@ mod recovery_tests {
         state.phase = Phase::Detached;
         state.mount_id = None;
         assert!(state.valid().is_err());
+    }
+    fn restart_state(later: bool) -> State {
+        let mut state = state();
+        state.phase = Phase::Prepared;
+        state.ever_attached = false;
+        state.mount_id = None;
+        if later {
+            state.binding_id = "aa001122-3344-4556-8778-990011223344".to_owned();
+            let scope = state.scope.as_mut().unwrap();
+            scope["binding_id"] = state.binding_id.clone().into();
+            scope["storage"]["volume_handle"] = "pvc-aa001122-3344-4556-8778-990011223344".into();
+            state.record = Record::new(
+                scope["storage"]["volume_handle"].as_str().unwrap(),
+                &pool::scope_hash(scope).unwrap(),
+                &state.record.device_uuid,
+            )
+            .unwrap();
+        }
+        state
+    }
+    fn restart_journal(root: &Path, state: &State) -> Journal {
+        Journal::open(&root.join(format!(
+            "{}.state",
+            crate::pool_gate::digest(state.record.volume_handle.as_bytes())
+        )))
+        .unwrap()
+    }
+    #[test]
+    fn real_host_process_restart_selects_only_prior_durable_bindings() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "pool-restart-selection-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = |action: &str| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "pool_runtime::recovery_tests::restart_selection_process",
+                    "--nocapture",
+                ])
+                .env("PGCF_RESTART_TEST_ROOT", &root)
+                .env("PGCF_RESTART_TEST_ACTION", action);
+            command
+        };
+        assert!(command("record").status().unwrap().success());
+        let mut restarted = command("observe").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.join("captured").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // This real durable mount dispatch appears after the new process's startup census,
+        // while registration of its eventual active guard is still pending.
+        let later = restart_state(true);
+        let journal = restart_journal(&root, &later);
+        journal.store(&later).unwrap();
+        journal.store(&later.dispatch_mount().unwrap()).unwrap();
+        std::fs::write(root.join("continue"), b"ready").unwrap();
+        let status = restarted.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(status.success());
+    }
+    #[test]
+    fn restart_selection_process() {
+        let Ok(root) = std::env::var("PGCF_RESTART_TEST_ROOT") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let prior = restart_state(false);
+        if std::env::var("PGCF_RESTART_TEST_ACTION").unwrap() == "record" {
+            restart_journal(root, &prior).store(&prior).unwrap();
+            return;
+        }
+        let selected =
+            crate::pool_recovery::Restarted::capture(root, &prior.node_uid, &prior.boot_id)
+                .unwrap();
+        std::fs::write(root.join("captured"), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.join("continue").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let prior = restart_journal(root, &prior).read().unwrap().unwrap();
+        let later = restart_state(true);
+        let later = restart_journal(root, &later).read().unwrap().unwrap();
+        assert!(selected.needs_observation(&prior, &prior.boot_id));
+        assert!(!selected.needs_observation(&later, &later.boot_id));
     }
     #[test]
     fn delayed_terminal_commit_acknowledges_the_original_observed_report() {

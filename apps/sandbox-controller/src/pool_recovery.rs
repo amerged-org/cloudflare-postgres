@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! No-write reboot recovery. Historical permissions never authorize resume or filesystem creation.
+//! No-write restart recovery. Historical permissions never authorize resume or filesystem creation.
 use crate::{
     policy::Client,
     pool_gate::{GateRoot, ROOT},
@@ -8,7 +8,7 @@ use crate::{
 };
 use pgcf_native_protocol::pool;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 use tonic::Status;
 
 fn refused() -> Status {
@@ -19,6 +19,52 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, Status> {
 }
 fn now() -> u64 {
     u64::try_from(crate::policy::now_ms()).unwrap_or(0)
+}
+/// Frozen immediately after startup protection, before any new holder or worker can dispatch.
+/// Later missing guard registration is never evidence that a current dispatch was lost.
+pub(crate) struct Restarted {
+    scopes: BTreeMap<String, String>,
+}
+impl Restarted {
+    pub(crate) fn capture(root: &Path, node_uid: &str, boot: &str) -> Result<Self, Status> {
+        GateRoot::open(root)?;
+        let mut scopes = BTreeMap::new();
+        let mut count = 0;
+        for entry in std::fs::read_dir(root).map_err(|_| refused())? {
+            let entry = entry.map_err(|_| refused())?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.len() != 70
+                || !name.ends_with(".state")
+                || !name[..64]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                continue;
+            }
+            count += 1;
+            if count > 2000 {
+                return Err(refused());
+            }
+            let state = Journal::open(&entry.path())?.read()?.ok_or_else(refused)?;
+            if state.node_uid != node_uid {
+                return Err(refused());
+            }
+            if state.boot_id == boot
+                && scopes
+                    .insert(state.binding_id, state.record.scope_sha256)
+                    .is_some()
+            {
+                return Err(refused());
+            }
+        }
+        Ok(Self { scopes })
+    }
+    pub(crate) fn needs_observation(&self, state: &State, boot: &str) -> bool {
+        state.boot_id != boot
+            || state.terminal_report.is_some()
+            || self.scopes.get(&state.binding_id) == Some(&state.record.scope_sha256)
+    }
 }
 fn scoped_details(state: &State, details: &Value) -> Result<(), Status> {
     let binding = &details["binding"]["binding"];
@@ -55,7 +101,7 @@ fn report(
 ) -> Result<Value, Status> {
     let scope = state.scope.as_ref().ok_or_else(refused)?;
     let s = &scope["storage"];
-    if state.boot_id == boot || !survey.named_namespace_scan_complete {
+    if (released && state.boot_id == boot) || !survey.named_namespace_scan_complete {
         return Err(refused());
     }
     let mut value = json!({
@@ -63,7 +109,7 @@ fn report(
         "node_uid":state.node_uid,"boot_id":boot,"pool_pod_uid":state.pool_pod_uid,
         "state":if released {"released"} else {"lost"},"observed_at":now(),
         "storage_backend":"lvm-thin-v1","thin_guard":null,"clean_stop":false,
-        "error":if released {Value::Null} else {json!("pool_boot_loss_cleanup_pending")},
+        "error":if released {Value::Null} else if state.boot_id == boot {json!("pool_process_restart_cleanup_pending")} else {json!("pool_boot_loss_cleanup_pending")},
         "kernel_proof":{
             "device_major":libc::major(device.device),"device_minor":libc::minor(device.device),
             "mount_id":null,"dm_open_count":device.open_count,"foreign_mounts":survey.aliases.len(),
@@ -81,6 +127,10 @@ fn report(
     });
     if released {
         value["boot_loss"] = json!({"holder_boot_id":state.boot_id,"storage":s});
+    } else if state.boot_id == boot {
+        // A prior sameboot worker may still be dying in a kernel operation. Durable denial
+        // and driver readback do not prove its creation descriptors have closed.
+        value["kernel_proof"]["creator_fence"] = Value::Null;
     }
     if !pool::node_report_valid(&value) {
         return Err(refused());
@@ -89,7 +139,11 @@ fn report(
 }
 
 /// Every attempt reads retained Cloudflare details. Snapshot omission is never release authority.
-pub async fn reconcile(settings: &Settings, client: &Client) -> Result<(), Status> {
+pub(crate) async fn reconcile(
+    settings: &Settings,
+    client: &Client,
+    restarted: &Restarted,
+) -> Result<(), Status> {
     let boot = crate::storage::current_boot_id()?;
     let root = GateRoot::open(Path::new(ROOT))?;
     let mut count = 0;
@@ -116,11 +170,23 @@ pub async fn reconcile(settings: &Settings, client: &Client) -> Result<(), Statu
         if state.node_uid != client.local().node_uid {
             return Err(refused());
         }
-        if state.boot_id == boot && state.terminal_report.is_none() {
+        if !restarted.needs_observation(&state, &boot) {
             continue;
         }
         let details = client.pool_binding_details(&state.binding_id).await?;
         scoped_details(&state, &details)?;
+        let sameboot_loss = state.boot_id == boot && state.terminal_report.is_none();
+        if sameboot_loss && details["binding"]["binding"]["state"] == "lost" {
+            continue;
+        }
+        if sameboot_loss
+            && matches!(
+                details["binding"]["binding"]["state"].as_str(),
+                Some("released" | "refused")
+            )
+        {
+            return Err(refused());
+        }
         // A lost POST response can be acknowledged from exact retained history before retrying.
         if state.terminal_report.is_some() {
             match state.acknowledge(&details) {
@@ -173,6 +239,17 @@ pub async fn reconcile(settings: &Settings, client: &Client) -> Result<(), Statu
             },
         )?;
         driver.recheck()?;
+        if sameboot_loss {
+            // Startup protection and this actual survey establish a loss observation only.
+            // Even global zero does not establish a sameboot terminal/unmount outcome.
+            client
+                .report_pool(
+                    "PoolNodeReport",
+                    &report(&state, &boot, &actual, &survey, &driver, false)?,
+                )
+                .await?;
+            continue;
+        }
         if actual.open_count != 0 || !survey.aliases.is_empty() {
             if !state.terminal_acknowledged
                 && state.boot_id != boot
