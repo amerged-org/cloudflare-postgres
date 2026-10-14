@@ -113,5 +113,9 @@ erDiagram
 - [apps/api/migrations/0044_fleet_patch_superseded.sql:1](../../../apps/api/migrations/0044_fleet_patch_superseded.sql#L1)
 - [apps/api/migrations/0045_fleet_patch_confirmed_node.sql:1](../../../apps/api/migrations/0045_fleet_patch_confirmed_node.sql#L1)
 - [apps/api/migrations/0046_thin_authority_renewal.sql:1](../../../apps/api/migrations/0046_thin_authority_renewal.sql#L1)
+- [apps/api/migrations/0047_admission_snapshots.sql:1](../../../apps/api/migrations/0047_admission_snapshots.sql#L1)
+- [apps/api/migrations/0048_postgres_pool.sql:1](../../../apps/api/migrations/0048_postgres_pool.sql#L1)
+- [apps/api/migrations/0049_postgres_pool_qualification.sql:1](../../../apps/api/migrations/0049_postgres_pool_qualification.sql#L1)
+- [apps/api/migrations/0050_pool_role_mutations.sql:1](../../../apps/api/migrations/0050_pool_role_mutations.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

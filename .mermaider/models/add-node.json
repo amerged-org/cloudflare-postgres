@@ -46,8 +46,8 @@
           {
             "path": "apps/api/src/domain/node-capacity.ts",
             "symbol": "placePendingDatabases",
-            "line": 65,
-            "sha256": "73c66a6c51589c8ff46a1b737fe6b5826cad4c7957b1d3ca665c12d7e5673bfa"
+            "line": 66,
+            "sha256": "546802dff9a880766acd317944cb3691cab2d0e3f3a8dc7b3e933d34cbce3828"
           }
         ]
       },
@@ -166,8 +166,8 @@
           {
             "path": "apps/api/src/domain/fleet-patches.ts",
             "symbol": "ensureBootstrapFleetPatch",
-            "line": 1200,
-            "sha256": "a79fdae8d570f57bc5afc02efb24d471bf8feae8191655f4aae37f882ec4a664"
+            "line": 1396,
+            "sha256": "2e7b0d2f4050f26e682e0552f8ff06eeb612e9a672c3cf860167c623901539cf"
           },
           {
             "path": "apps/api/src/domain/node-thin-storage-bootstrap.ts",
