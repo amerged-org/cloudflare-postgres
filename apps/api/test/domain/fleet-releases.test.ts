@@ -1048,3 +1048,112 @@ it("the agent inventory view leaves the Cloudflare-side route-token capability o
   expect(desired.release.spec).not.toHaveProperty("route_token_version");
   expect(desired.release.spec_sha256).toBe(full.spec_sha256);
 });
+
+it("pool per-holder images do not require resident Pods for candidate fleet convergence", async () => {
+  const f = await setup();
+  for (const name of [
+    "native-gateway",
+    "native-controller",
+    "pool-supervisor",
+    "pgcf-sandbox-controller",
+  ]) {
+    f.value.components.push({
+      name,
+      kind: "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    });
+    for (const role of Object.values(f.value.roles)) role.components.push(name);
+  }
+  for (const role of Object.values(f.value.roles))
+    role.talos_extensions.push("pgcf-sandbox-controller");
+  const candidate = Object.assign(f.value, {
+    route_token_version: 4,
+    runtime_attestation_version: 2,
+    admission_snapshot_version: 1,
+    postgres_pool_qualification_version: 1,
+    postgres_pool_candidate: {
+      driver_sha256: "e".repeat(64),
+      supervisor_sha256: "f".repeat(64),
+      host_controller_sha256: "a".repeat(64),
+    },
+  });
+  const approved = await f.approve();
+  expect(approved.status).toBe(200);
+  const full = (await approved.json()) as {
+    spec: typeof candidate;
+    spec_sha256: string;
+  };
+  expect((await f.assignRegion()).status).toBe(200);
+  expect(
+    (
+      await request(`/v1/nodes/${f.node}/release`, f.admin, "PUT", {
+        expected_revision: 0,
+        release_id: f.id,
+        node_uid: f.uid,
+        role: "control_relay",
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    await env.DB.prepare("SELECT count(*) count FROM pool_pods WHERE node_id=?")
+      .bind(f.node)
+      .first<number>("count"),
+  ).toBe(0);
+  const auxiliary = new Set(["postgres", "barman", "pool-supervisor"]),
+    observation = f.inventory();
+  observation.facts.components = observation.facts.components.filter(
+    (component) => !auxiliary.has(component.name),
+  );
+  const { readDesiredFleetRelease, mismatches } =
+      await import("../../src/domain/fleet-releases.ts"),
+    desired = (await readDesiredFleetRelease(env.DB, f.region))!;
+  expect(
+    mismatches(
+      FleetReleaseSpec.parse(candidate),
+      "control_relay",
+      observation.facts,
+    ),
+  ).toEqual([]);
+  // Previously recorded auxiliary image facts cannot become unexpected resident
+  // components when the candidate marker is selected.
+  expect(
+    mismatches(
+      FleetReleaseSpec.parse(candidate),
+      "control_relay",
+      f.inventory().facts,
+    ),
+  ).toEqual([]);
+  for (const role of Object.values(desired.release.spec.roles))
+    expect(role.components.some((name) => auxiliary.has(name))).toBe(false);
+  expect(desired.release.spec_sha256).toBe(full.spec_sha256);
+  expect(
+    await (await request(`/v1/fleet/releases/${f.id}`, f.admin)).json(),
+  ).toMatchObject({ spec: full.spec, spec_sha256: full.spec_sha256 });
+  const {
+    postgres_pool_qualification_version,
+    postgres_pool_candidate,
+    ...legacy
+  } = candidate;
+  void postgres_pool_qualification_version;
+  void postgres_pool_candidate;
+  expect(
+    mismatches(
+      FleetReleaseSpec.parse(legacy),
+      "control_relay",
+      observation.facts,
+    ),
+  ).toEqual([
+    "unobserved/components/barman",
+    "unobserved/components/pool-supervisor",
+    "unobserved/components/postgres",
+  ]);
+  const drift = structuredClone(observation.facts);
+  drift.components.find(
+    (component) => component.name === "native-controller",
+  )!.sha256 = "c".repeat(64);
+  expect(
+    mismatches(FleetReleaseSpec.parse(candidate), "control_relay", drift),
+  ).toEqual(["components/native-controller"]);
+});

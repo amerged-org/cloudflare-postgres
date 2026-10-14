@@ -249,6 +249,16 @@ async function nodeRow(db: D1Database, id: string): Promise<NodeReleaseRow> {
   if (!row) throw new ApiError("not_found", "Node not found");
   return row;
 }
+/** These images are consumed by scoped, single-use pool holders, not resident
+ * regional deployments. Their full release pins and per-holder proofs stay intact. */
+function poolHolderImage(spec: FleetReleaseSpec, name: string) {
+  return (
+    (spec.postgres_pool_qualification_version === 1 ||
+      spec.postgres_pool_version === 1) &&
+    ["postgres", "barman", "pool-supervisor"].includes(name)
+  );
+}
+
 export function mismatches(
   spec: FleetReleaseSpec,
   roleName: "control_relay" | "customer",
@@ -314,9 +324,14 @@ export function mismatches(
       }
     }
   }
-  const wantedNames = new Set([...role.components, ...role.talos_extensions]);
+  const wantedNames = new Set([
+    ...role.components.filter((name) => !poolHolderImage(spec, name)),
+    ...role.talos_extensions,
+  ]);
   const observed = new Map(
-    facts.components.map((value) => [value.name, value]),
+    facts.components
+      .filter((value) => !poolHolderImage(spec, value.name))
+      .map((value) => [value.name, value]),
   );
   for (const component of spec.components.filter((value) =>
     wantedNames.has(value.name),
@@ -1032,6 +1047,23 @@ export async function readDesiredFleetRelease(
       },
     };
   }
+  // A candidate can converge before its first scoped Pod exists, and a Control
+  // member with target_slots=0 never needs a tenant Pod. Keep the same resident
+  // inventory view used by status; pool setup/serving validate the retained pins.
+  runtimeSpec.roles = {
+    control_relay: {
+      ...runtimeSpec.roles.control_relay,
+      components: runtimeSpec.roles.control_relay.components.filter(
+        (name) => !poolHolderImage(selected.spec, name),
+      ),
+    },
+    customer: {
+      ...runtimeSpec.roles.customer,
+      components: runtimeSpec.roles.customer.components.filter(
+        (name) => !poolHolderImage(selected.spec, name),
+      ),
+    },
+  };
   return FleetDesiredRelease.parse({
     region_id: regionId,
     region_revision: state.revision,
