@@ -3353,9 +3353,27 @@ fn protection_key() -> &'static str {
 fn storage_operation(db: &Value) -> Value {
     db["power"]["operation"]
         .as_str()
+        .or_else(|| db["recovery"]["operation_id"].as_str())
         .or_else(|| db["creation"]["operation_id"].as_str())
         .map(|v| Value::String(v.into()))
         .unwrap_or(Value::Null)
+}
+#[cfg(test)]
+#[test]
+fn a_protected_restore_keeps_the_current_cloudflare_restore_operation_for_node_readback() {
+    let restore = format!("op_{}", "r".repeat(20));
+    let mut db = json!({"power":null,"creation":{"operation_id":null},"recovery":{"operation_id":restore,"status":"running"}});
+    assert_eq!(
+        storage_operation(&db),
+        db["recovery"]["operation_id"],
+        "a restore archive suffix and NodeBootstrap protection witness name this operation"
+    );
+    db["power"] = json!({"operation":format!("op_{}","w".repeat(20))});
+    assert_eq!(
+        storage_operation(&db),
+        db["power"]["operation"],
+        "a later CF resume remains the current protection owner"
+    );
 }
 impl PowerCoordinator {
     /// Physical lease failure is not a Cloudflare suspend operation. This path
