@@ -188,7 +188,7 @@ export async function recordPostgresPoolPreparationContext(
         ...guard.bindings,
       ),
       assertion(env, {
-        sql: `(${guard.sql}) AND EXISTS(SELECT 1 FROM pool_preparation_contexts WHERE node_id=? AND context_json=? AND expires_at>unixepoch('now')*1000)`,
+        sql: `(${guard.sql}) AND EXISTS(SELECT 1 FROM pool_preparation_contexts WHERE node_id=? AND context_json=? AND julianday(expires_at/1000.0,'unixepoch')>julianday('now'))`,
         bindings: [...guard.bindings, nodeId, serialized],
       }),
     ]);

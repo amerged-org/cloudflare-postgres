@@ -7,7 +7,10 @@ import {
   PoolPodAttestation,
   PoolPodPreparationContext,
 } from "@pgcf/contracts/postgres-pool";
-import { servingPostgresPoolFixture } from "./postgres-pool-fixture.ts";
+import {
+  servingPostgresPoolFixture,
+  postgresPoolFixture,
+} from "./postgres-pool-fixture.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import { recordPostgresPoolPreparationContext } from "../../src/domain/postgres-pool-preparation.ts";
@@ -67,7 +70,7 @@ it("refills one free slot alongside its immutable bound holder without charging 
 });
 
 async function refillInputs(
-  f: Awaited<ReturnType<typeof servingPostgresPoolFixture>>,
+  f: Awaited<ReturnType<typeof postgresPoolFixture>>,
 ) {
   const now = Date.now();
   const ids = f.pod.container_ids.map(() =>
@@ -285,4 +288,117 @@ it("keeps concurrent complete refill observations within one free slot and the p
       idle_memory_current_bytes: f.policy.max_idle_memory_mib * 1024 ** 2 + 1,
     }),
   ).rejects.toThrow();
+});
+
+it("retires only never-claimed free inventory after a current qualified boot replacement", async () => {
+  const f = await postgresPoolFixture({ thin: true, qualifiedThin: true });
+  const base = {
+    v: 1 as const,
+    node_id: f.node,
+    node_uid: f.nodeUid,
+    boot_id: f.proof.boot_id,
+    policy_revision: 1,
+    observed_at: Date.now(),
+    pods: [f.pod],
+    idle_memory_current_bytes: 32 * 1024 ** 2,
+    idle_cpu_usage_usec: 12,
+  };
+  await recordPostgresPoolInventory(env, f.node, base);
+  const boot = crypto.randomUUID(),
+    at = new Date().toISOString();
+  // Controlled current host/Fleet/thin readbacks in real D1, not a physical reboot claim.
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE fleet_node_release_observations SET facts_json=json_set(facts_json,'$.boot_id',?),observed_at=?,received_at=? WHERE node_id=?",
+    ).bind(boot, at, at, f.node),
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET observed_json=json_set(observed_json,'$.boot_id',?),updated_at=? WHERE node_id=?",
+    ).bind(boot, at, f.node),
+    env.DB.prepare(
+      "UPDATE node_thin_storage SET qualification_json=json_set(qualification_json,'$.boot_id',?),authority_json=json_set(authority_json,'$.observed_at',?,'$.captured_at',?,'$.expires_at',?),authority_received_at=? WHERE node_id=?",
+    ).bind(
+      boot,
+      at,
+      at,
+      new Date(Date.now() + 10000).toISOString(),
+      at,
+      f.node,
+    ),
+  ]);
+  const { readCurrentNodeThinStorage } =
+    await import("../../src/domain/node-thin-storage.ts");
+  const current = await readCurrentNodeThinStorage(env, f.node);
+  expect(current?.row.current_qualified).toBe(1);
+  expect(current?.authority).not.toBeNull();
+  expect(JSON.parse(current!.row.qualification_json!).boot_id).toBe(boot);
+  const { context, free, inventory } = await refillInputs(f);
+  const replacement = PoolPodAttestation.parse({ ...free, boot_id: boot });
+  await recordPostgresPoolPreparationContext(env, f.node, {
+    ...context,
+    boot_id: boot,
+    pods: [
+      {
+        pod_uid: replacement.pool_pod_uid,
+        pod_name: replacement.pool_pod_name,
+        pod_ip: replacement.pool_pod_ip,
+        container_ids: replacement.container_ids,
+      },
+    ],
+  });
+  await expect(
+    recordPostgresPoolInventory(env, f.node, {
+      ...inventory,
+      boot_id: boot,
+      pods: [replacement],
+    }),
+  ).resolves.toBeUndefined();
+  expect(
+    await env.DB.prepare(
+      "SELECT state,binding_id,boot_id FROM pool_pods WHERE pod_uid=?",
+    )
+      .bind(f.pod.pool_pod_uid)
+      .first(),
+  ).toEqual({ state: "retired", binding_id: null, boot_id: f.proof.boot_id });
+  expect(
+    await env.DB.prepare(
+      "SELECT state,binding_id,boot_id FROM pool_pods WHERE pod_uid=?",
+    )
+      .bind(replacement.pool_pod_uid)
+      .first(),
+  ).toEqual({ state: "ready", binding_id: null, boot_id: boot });
+});
+
+it("rolls back preparation publication if its expiry passes within the current SQLite second", async () => {
+  const f = await servingPostgresPoolFixture({ thin: true }),
+    { context } = await refillInputs(f);
+  const before = await env.DB.prepare(
+    "SELECT context_json,expires_at FROM pool_preparation_contexts WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first();
+  // Leave a real subsecond window; no clock replacement or mocked D1 outcome.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const remainder = await env.DB.prepare(
+      "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)%1000 ms",
+    ).first<number>("ms");
+    if (remainder! >= 100 && remainder! < 500) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await env.DB.exec(
+    `CREATE TRIGGER refill_precise_expiry AFTER UPDATE ON pool_preparation_contexts WHEN NEW.node_id='${f.node}' AND NEW.expires_at>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) BEGIN UPDATE pool_preparation_contexts SET expires_at=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)-1 WHERE node_id=NEW.node_id; END`,
+  );
+  try {
+    await expect(
+      recordPostgresPoolPreparationContext(env, f.node, context),
+    ).rejects.toThrow();
+    expect(
+      await env.DB.prepare(
+        "SELECT context_json,expires_at FROM pool_preparation_contexts WHERE node_id=?",
+      )
+        .bind(f.node)
+        .first(),
+    ).toEqual(before);
+  } finally {
+    await env.DB.exec("DROP TRIGGER refill_precise_expiry");
+  }
 });

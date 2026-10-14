@@ -153,7 +153,7 @@ export async function recordPostgresPoolInventory(
   const retained = JSON.parse(view ?? "[]") as Prior[],
     present = new Set(inventory.pods.map((p) => p.pool_pod_uid));
   const authority: AdmissionSqlGuard = {
-    sql: `(${selected!.guard.sql}) AND EXISTS(SELECT 1 FROM pool_preparation_contexts WHERE node_id=? AND node_uid=? AND boot_id=? AND context_json=? AND expires_at>? AND expires_at>unixepoch('now')*1000)
+    sql: `(${selected!.guard.sql}) AND EXISTS(SELECT 1 FROM pool_preparation_contexts WHERE node_id=? AND node_uid=? AND boot_id=? AND context_json=? AND expires_at>? AND julianday(expires_at/1000.0,'unixepoch')>julianday('now'))
       AND EXISTS(SELECT 1 FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid JOIN fleet_node_release_observations o ON o.node_id=n.id AND o.node_uid=n.node_uid AND o.assignment_revision=a.revision
         WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.schedulable=1 AND n.lost_at IS NULL AND json_extract(o.facts_json,'$.boot_id')=? AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds') AND julianday(o.observed_at)>=julianday('now','-180 seconds') AND julianday(o.observed_at)<=julianday('now','+5 seconds'))
       AND NOT EXISTS(SELECT 1 FROM admission_scope_fences WHERE kind='node' AND scope_id=? AND mutation_id IS NOT NULL)`,
@@ -180,14 +180,13 @@ export async function recordPostgresPoolInventory(
       bindings: [...authority.bindings, nodeId, view],
     }),
   ];
-  // An authenticated complete current-boot observation can retire absent FREE inventory only.
+  // An authenticated complete current-boot observation can retire absent never-claimed FREE inventory, including old-boot Pods.
   // Missing bound/failed/lost custody is retained; labels never release a holder.
   for (const previous of retained) {
     if (
       previous[5] === "ready" &&
       previous[6] === null &&
       previous[1] === node.node_uid &&
-      previous[2] === node.boot_id &&
       previous[8] === (inventory.qualification_run_id ?? null) &&
       previous[9] === (inventory.qualification_scope_sha256 ?? null) &&
       !present.has(previous[0])
@@ -198,7 +197,7 @@ export async function recordPostgresPoolInventory(
         );
       statements.push(
         env.DB.prepare(
-          `UPDATE pool_pods SET state='retired' WHERE pod_uid=? AND state='ready' AND binding_id IS NULL AND attestation_json=? AND last_observed_at<=? AND (${authority.sql})`,
+          `UPDATE pool_pods SET state='retired' WHERE pod_uid=? AND state='ready' AND binding_id IS NULL AND NOT EXISTS(SELECT 1 FROM pool_bindings b WHERE b.pool_pod_uid=pool_pods.pod_uid) AND attestation_json=? AND last_observed_at<=? AND (${authority.sql})`,
         ).bind(
           previous[0],
           previous[4],
