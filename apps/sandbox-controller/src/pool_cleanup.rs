@@ -28,6 +28,16 @@ fn text<'a>(v: &'a Value, k: &str) -> Result<&'a str, Status> {
 fn now() -> u64 {
     u64::try_from(crate::policy::now_ms()).unwrap_or(0)
 }
+fn reap_dispatched(
+    child: &mut tokio::process::Child,
+    cleanup: &mut Cleanup,
+) -> Result<bool, Status> {
+    if child.try_wait().map_err(|_| refused())?.is_none() || !cleanup.dispatched {
+        return Ok(false);
+    }
+    cleanup.worker_reaped = true;
+    Ok(true)
+}
 fn journal(state: &State) -> Result<Journal, Status> {
     Journal::open(&Path::new(crate::pool_gate::ROOT).join(format!(
         "{}.state",
@@ -173,16 +183,15 @@ impl Session {
         client: &Client,
         original_state: &State,
     ) -> Result<bool, Status> {
+        let journal = journal(original_state)?;
         if self.failed {
-            if !self.reaped && self.child.try_wait().map_err(|_| refused())?.is_some() {
-                self.reaped = true;
-            }
-            return Err(refused());
+            // A failed command is never replayed. Its actual reap may still permit the existing
+            // no-write reference-destruction observation after a fresh complete physical survey.
+            return self.finish_after_worker(settings, client, &journal).await;
         }
         if !self.dispatched && self.started.elapsed() > Duration::from_secs(60) {
             return Err(refused());
         }
-        let journal = journal(original_state)?;
         if self.worker.is_none() {
             let read = tokio::time::timeout(
                 Duration::from_millis(10),
@@ -363,12 +372,25 @@ impl Session {
             stdin.write_all(b"execute\n").await.map_err(|_| refused())?;
             drop(stdin);
         }
+        self.finish_after_worker(settings, client, &journal).await
+    }
+    async fn finish_after_worker(
+        &mut self,
+        settings: &Settings,
+        client: &Client,
+        journal: &Journal,
+    ) -> Result<bool, Status> {
+        let mut state = journal.read()?.ok_or_else(refused)?;
+        if state.cleanup.as_ref().is_none_or(|c| !c.dispatched) {
+            if self.child.try_wait().map_err(|_| refused())?.is_some() {
+                self.reaped = true;
+            }
+            return Ok(false);
+        }
         if !self.reaped {
-            if self.child.try_wait().map_err(|_| refused())?.is_none() {
+            if !reap_dispatched(&mut self.child, state.cleanup.as_mut().ok_or_else(refused)?)? {
                 return Ok(false);
             }
-            let mut state = journal.read()?.ok_or_else(refused)?;
-            state.cleanup.as_mut().ok_or_else(refused)?.worker_reaped = true;
             journal.store(&state)?;
             self.reaped = true;
         }
@@ -378,7 +400,7 @@ impl Session {
         for stop in self.stops.drain(..) {
             stop.await.map_err(|_| refused())??;
         }
-        crate::pool_recovery::finish_cleanup(settings, client, &journal, Some(&self.active)).await
+        crate::pool_recovery::finish_cleanup(settings, client, journal, Some(&self.active)).await
     }
 }
 impl Drop for Session {
@@ -386,5 +408,47 @@ impl Drop for Session {
         if !self.reaped {
             self.fail();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn failed_dispatch_becomes_recoverable_only_after_actual_child_reap() {
+        let mut cleanup = Cleanup {
+            holder: Value::Null,
+            supervisor_report: Value::Null,
+            worker: Value::Null,
+            worker_caller_pid: 1,
+            io: None,
+            authority: None,
+            dispatched: true,
+            nonlazy_completed: false,
+            worker_reaped: false,
+            write_bytes_before: None,
+            write_bytes_after: None,
+        };
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(!reap_dispatched(&mut child, &mut cleanup).unwrap());
+        assert!(!cleanup.worker_reaped);
+        child.start_kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reap_dispatched(&mut child, &mut cleanup).unwrap() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(cleanup.worker_reaped);
+        cleanup.dispatched = false;
+        cleanup.worker_reaped = false;
+        assert!(!reap_dispatched(&mut child, &mut cleanup).unwrap());
+        assert!(
+            !cleanup.worker_reaped,
+            "a reaped predispatch worker cannot invent cleanup dispatch"
+        );
     }
 }
