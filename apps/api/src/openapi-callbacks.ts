@@ -47,6 +47,12 @@ type Params = NonNullable<NonNullable<RouteConfig["request"]>["params"]>;
 
 /** Agent auth is regional; handler reads and state fences determine the remaining refusals. */
 export const agentRouteErrors: Readonly<Record<string, readonly number[]>> = {
+  "GET /agent/v1/nodes/{id}/postgres-pool/qualification": [
+    400, 401, 404, 409, 500,
+  ],
+  "POST /agent/v1/nodes/{id}/postgres-pool/qualification": [
+    400, 401, 404, 409, 500,
+  ],
   "POST /agent/v1/nodes/{id}/postgres-pool/preparations": [400, 401, 409, 500],
   "GET /agent/v1/nodes/{id}/postgres-pool/bindings": [400, 401, 409, 500],
   "POST /agent/v1/nodes/{id}/postgres-pool/inventory": [400, 401, 409, 500],

@@ -31,6 +31,7 @@ import { authenticateReclaimRequest } from "./domain/warm-reclaim.ts";
 import { registerReclaim } from "./routes/reclaim.ts";
 import { registerNodeThinStorage } from "./routes/node-thin-storage.ts";
 import { registerThinQualification } from "./routes/thin-qualification.ts";
+import { registerPostgresPoolQualification } from "./routes/postgres-pool-qualification.ts";
 import { authenticateThinQualification } from "./domain/thin-qualification.ts";
 import { registerPostgresPool } from "./routes/postgres-pool.ts";
 import { registerComputePool } from "./routes/compute-pool.ts";
@@ -443,6 +444,7 @@ export function createApp(): ApiApp {
   registerPostgresPool(app);
   registerNodeThinStorage(app);
   registerThinQualification(app);
+  registerPostgresPoolQualification(app);
   registerReclaim(app);
   registerNodeHostConfiguration(app);
   registerNodeInstallation(app);

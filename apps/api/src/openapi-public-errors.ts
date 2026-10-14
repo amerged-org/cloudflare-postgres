@@ -6,6 +6,13 @@
  * assertProjectAccess/databaseForRequest hide foreign project resources as 404, not 403.
  */
 export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
+  "POST /v1/nodes/{id}/postgres-pool/qualifications": [
+    400, 401, 403, 404, 409, 500,
+  ],
+  "GET /v1/postgres-pool/qualifications/{id}": [400, 401, 403, 404, 500],
+  "POST /v1/postgres-pool/qualifications/{id}/cancel": [
+    400, 401, 403, 404, 500,
+  ],
   // serveFleetImage returns empty 404 for invalid/unapproved digests; only GET evaluates Range.
   "GET /fleet-images/v1/raw/{digest}": [404, 416, 500],
   "HEAD /fleet-images/v1/raw/{digest}": [404, 500],
@@ -170,6 +177,7 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
  * Other configuration/approval/cancel/inspection handlers do not gain idempotency from their method.
  */
 export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
+  "POST /v1/nodes/{id}/postgres-pool/qualifications",
   "POST /v1/api-keys",
   "DELETE /v1/api-keys/{id}",
   "POST /v1/projects",

@@ -17,6 +17,31 @@ const route = (
 /** Human-authored operation identities and summaries for the actual registered interfaces.
  * This describes routes; it neither installs a handler nor changes its validation or authorization. */
 export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
+  "POST /v1/nodes/{id}/postgres-pool/qualifications": route(
+    "startPostgresPoolQualification",
+    "Start one scoped thin-backed PostgreSQL pool qualification",
+    "admin",
+  ),
+  "GET /v1/postgres-pool/qualifications/{id}": route(
+    "getPostgresPoolQualification",
+    "Read measured pool qualification evidence and cleanup",
+    "admin",
+  ),
+  "POST /v1/postgres-pool/qualifications/{id}/cancel": route(
+    "cancelPostgresPoolQualification",
+    "Cancel measurements while retaining the cleanup reservation",
+    "admin",
+  ),
+  "GET /agent/v1/nodes/{id}/postgres-pool/qualification": route(
+    "getPostgresPoolQualificationInput",
+    "Read the current scoped one-use measurement challenge",
+    "agent",
+  ),
+  "POST /agent/v1/nodes/{id}/postgres-pool/qualification": route(
+    "reportPostgresPoolQualification",
+    "Consume a scoped challenge with actual measured gate evidence",
+    "agent",
+  ),
   "POST /agent/v1/nodes/{id}/postgres-pool/preparations": route(
     "reportPostgresPoolPreparation",
     "Report authenticated tenant-free Kubernetes preparation",
