@@ -13,9 +13,7 @@
       "kind": "LVMVolume",
       "listKind": "LVMVolumeList",
       "plural": "lvmvolumes",
-      "shortNames": [
-        "lvmvol"
-      ],
+      "shortNames": ["lvmvol"],
       "singular": "lvmvolume"
     },
     "scope": "Namespaced",
@@ -108,10 +106,7 @@
                   },
                   "shared": {
                     "description": "Shared specifies whether the volume can be shared among multiple pods.\nIf it is not set to \"yes\", then the LVM LocalPV Driver will not allow\nthe volumes to be mounted by more than one pods.",
-                    "enum": [
-                      "yes",
-                      "no"
-                    ],
+                    "enum": ["yes", "no"],
                     "type": "string"
                   },
                   "source": {
@@ -120,10 +115,7 @@
                   },
                   "thinProvision": {
                     "description": "ThinProvision specifies whether logical volumes can be thinly provisioned.\nIf it is set to \"yes\", then the LVM LocalPV Driver will create\nthinProvision i.e. logical volumes that are larger than the available extents.",
-                    "enum": [
-                      "yes",
-                      "no"
-                    ],
+                    "enum": ["yes", "no"],
                     "type": "string"
                   },
                   "vgPattern": {
@@ -161,20 +153,14 @@
                   },
                   "state": {
                     "description": "State specifies the current state of the volume provisioning request.\nThe state \"Pending\" means that the volume creation request has not\nprocessed yet. The state \"Ready\" means that the volume has been created\nand it is ready for the use. \"Failed\" means that volume provisioning\nhas been failed and will not be retried by node agent controller.",
-                    "enum": [
-                      "Pending",
-                      "Ready",
-                      "Failed"
-                    ],
+                    "enum": ["Pending", "Ready", "Failed"],
                     "type": "string"
                   }
                 },
                 "type": "object"
               }
             },
-            "required": [
-              "spec"
-            ],
+            "required": ["spec"],
             "type": "object"
           }
         },

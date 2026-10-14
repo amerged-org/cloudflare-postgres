@@ -55,10 +55,7 @@
                     "type": "string"
                   }
                 },
-                "required": [
-                  "ownerNodeID",
-                  "volGroup"
-                ],
+                "required": ["ownerNodeID", "volGroup"],
                 "type": "object"
               },
               "status": {
@@ -84,10 +81,7 @@
                 "type": "object"
               }
             },
-            "required": [
-              "spec",
-              "status"
-            ],
+            "required": ["spec", "status"],
             "type": "object"
           }
         },

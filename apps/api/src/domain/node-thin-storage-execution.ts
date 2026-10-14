@@ -428,7 +428,11 @@ export async function reserveThinStorageLease(
         .bind(nodeId, nodeId)
         .first<number>("held");
       // Deleted obligations need a new absence proof, never replacement-pool permission.
-      if (holds.count === 0 && !unresolved && required.data <= profile.maximum_data_bytes)
+      if (
+        holds.count === 0 &&
+        !unresolved &&
+        required.data <= profile.maximum_data_bytes
+      )
         action = NodeThinPoolAction.parse({
           kind: "initialize",
           state: "pending",
