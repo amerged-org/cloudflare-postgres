@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Read-only pre-start and post-stop checks against unmodified PostgreSQL's own control tool.
 use crate::Error;
-use std::{fs, io::Read, os::unix::fs::OpenOptionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    io::Read,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{fs::OpenOptionsExt, process::CommandExt},
+    },
+    path::Path,
+    process::{Command, Output},
+};
 
 #[derive(Clone)]
 pub struct Control {
@@ -16,6 +25,86 @@ pub fn control(path: &Path) -> Result<Control, Error> {
         .env("LC_ALL", "C")
         .output()
         .map_err(|_| Error("pool_control_unavailable"))?;
+    parse_control(output)
+}
+
+/// Consume an agent-owned read-only directory descriptor; no caller path reaches the tool.
+/// The directory is deliberately inherited by only the fixed stock child, never through stdin.
+pub fn readonly_control(directory: OwnedFd) -> Result<Control, Error> {
+    let descriptor = directory.as_raw_fd();
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    let mut filesystem: libc::statvfs = unsafe { std::mem::zeroed() };
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if unsafe { libc::fstat(descriptor, &mut metadata) } != 0
+        || metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || unsafe { libc::fstatvfs(descriptor, &mut filesystem) } != 0
+        || filesystem.f_flag & libc::ST_RDONLY == 0
+        || flags < 0
+        || flags & libc::O_PATH == 0
+    {
+        return Err(Error("pool_readonly_descriptor_refused"));
+    }
+    let global = unsafe {
+        libc::openat(
+            descriptor,
+            c"global".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if global < 0 {
+        return Err(Error("pool_readonly_descriptor_refused"));
+    }
+    let global = unsafe { OwnedFd::from_raw_fd(global) };
+    let control = unsafe {
+        libc::openat(
+            global.as_raw_fd(),
+            c"pg_control".as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if control < 0 {
+        return Err(Error("pool_readonly_descriptor_refused"));
+    }
+    let control = unsafe { OwnedFd::from_raw_fd(control) };
+    let mut global_metadata: libc::stat = unsafe { std::mem::zeroed() };
+    let mut control_metadata: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(global.as_raw_fd(), &mut global_metadata) } != 0
+        || unsafe { libc::fstat(control.as_raw_fd(), &mut control_metadata) } != 0
+        || control_metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || global_metadata.st_dev != metadata.st_dev
+        || control_metadata.st_dev != metadata.st_dev
+    {
+        return Err(Error("pool_readonly_descriptor_refused"));
+    }
+    let inherited = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+    if inherited < 0 {
+        return Err(Error("pool_readonly_descriptor_refused"));
+    }
+    let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
+    let child_fd = inherited.as_raw_fd();
+    let mut command = Command::new("/usr/lib/postgresql/18/bin/pg_controldata");
+    command
+        .arg(format!("/proc/self/fd/{child_fd}"))
+        .env("LC_ALL", "C");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(child_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command
+        .output()
+        .map_err(|_| Error("pool_control_unavailable"))?;
+    // Stock pg_controldata can exit zero with a CRC/version warning; that is not valid evidence.
+    if !output.stderr.is_empty() {
+        return Err(Error("pool_control_invalid"));
+    }
+    parse_control(output)
+}
+
+fn parse_control(output: Output) -> Result<Control, Error> {
     if !output.status.success() || output.stdout.len() > 65536 {
         return Err(Error("pool_control_unavailable"));
     }

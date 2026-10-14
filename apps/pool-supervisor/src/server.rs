@@ -118,22 +118,12 @@ pub async fn serve() -> Result<(), Error> {
                 });
             }
             incoming = agent.accept() => {
-                let (mut stream, _) = incoming.map_err(|_| Error("pool_agent_unavailable"))?;
+                let (stream, _) = incoming.map_err(|_| Error("pool_agent_unavailable"))?;
                 let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let result = async {
-                        let peer = stream.peer_cred().map_err(|_| Error("pool_agent_peer_refused"))?;
-                        if peer.uid() != 0 || peer.pid() != Some(0) { return Err(Error("pool_agent_peer_refused")); }
-                        let bytes = tokio::time::timeout(Duration::from_secs(5), bounded(&mut stream, MAXIMUM)).await.map_err(|_| Error("pool_request_timeout"))??;
-                        let signal = serde_json::from_slice(&bytes).map_err(|_| Error("pool_request_invalid"))?;
-                        let mut runtime = state.runtime.lock().await;
-                        runtime.mounted(signal)?;
-                        Ok(runtime.start().await?.unwrap_or_else(|| json!({"accepted":true,"waiting":true})))
-                    }.await;
-                    let value = result.unwrap_or_else(|error| json!({"error":error.0}));
-                    if let Ok(bytes) = serde_json::to_vec(&value) { let _ = stream.write_all(&bytes).await; }
+                    let _ = agent_control(stream,state).await;
                 });
             }
         }
@@ -146,6 +136,66 @@ pub async fn serve() -> Result<(), Error> {
         )?;
     }
     result
+}
+
+async fn agent_control(mut stream: tokio::net::UnixStream, state: Arc<State>) -> Result<(), Error> {
+    let peer = stream
+        .peer_cred()
+        .map_err(|_| Error("pool_agent_peer_refused"))?;
+    if peer.uid() != 0 || peer.pid() != Some(0) {
+        if let Ok(bytes) = serde_json::to_vec(&json!({"error":"pool_agent_peer_refused"})) {
+            let _ = stream.write_all(&bytes).await;
+        }
+        return Err(Error("pool_agent_peer_refused"));
+    }
+    let socket = stream
+        .into_std()
+        .map_err(|_| Error("pool_agent_unavailable"))?;
+    socket
+        .set_nonblocking(false)
+        .map_err(|_| Error("pool_agent_unavailable"))?;
+    let (socket, frame) = tokio::task::spawn_blocking(move || {
+        let frame = crate::agent_frame::receive(&socket);
+        (socket, frame)
+    })
+    .await
+    .map_err(|_| Error("pool_agent_unavailable"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|_| Error("pool_agent_unavailable"))?;
+    let mut stream =
+        tokio::net::UnixStream::from_std(socket).map_err(|_| Error("pool_agent_unavailable"))?;
+    let result = async {
+        let (request, descriptor) = frame?;
+        if request["signal"]["command"] == "inspect_readonly" {
+            let descriptor = descriptor.ok_or(Error("pool_inspection_descriptor_missing"))?;
+            tokio::task::spawn_blocking(move || {
+                state
+                    .runtime
+                    .blocking_lock()
+                    .inspect_readonly(request, descriptor)
+            })
+            .await
+            .map_err(|_| Error("pool_inspection_unavailable"))?
+        } else {
+            if descriptor.is_some() {
+                return Err(Error("pool_agent_descriptors_refused"));
+            }
+            let mut runtime = state.runtime.lock().await;
+            runtime.mounted(request)?;
+            Ok(runtime
+                .start()
+                .await?
+                .unwrap_or_else(|| json!({"accepted":true,"waiting":true})))
+        }
+    }
+    .await;
+    let value = result.unwrap_or_else(|error| json!({"error":error.0}));
+    let bytes = serde_json::to_vec(&value).map_err(|_| Error("pool_report_invalid"))?;
+    stream
+        .write_all(&bytes)
+        .await
+        .map_err(|_| Error("pool_agent_unavailable"))
 }
 
 async fn control(state: &State, method: &str, path: &str, body: Value) -> Result<Value, Error> {
@@ -191,18 +241,6 @@ async fn control(state: &State, method: &str, path: &str, body: Value) -> Result
         "/stop" => runtime.stop(&body).await,
         _ => Err(Error("pool_request_invalid")),
     }
-}
-async fn bounded(stream: &mut (impl AsyncRead + Unpin), maximum: usize) -> Result<Vec<u8>, Error> {
-    let mut bytes = Vec::new();
-    stream
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| Error("pool_request_invalid"))?;
-    if bytes.len() > maximum {
-        return Err(Error("pool_request_oversized"));
-    }
-    Ok(bytes)
 }
 async fn http_request(
     stream: &mut (impl AsyncRead + Unpin),

@@ -26,11 +26,13 @@ RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && export PGCF_VERSIONS_LOCK_SHA256="$(sha256sum infra/platform/versions.lock.json | cut -d ' ' -f 1)" \
  && export PGCF_PROTOCOL_SHA256="$(sha256sum packages/contracts/native/protocol.generated.json | cut -d ' ' -f 1)" \
  && export PGCF_POOL_CONTRACT_SHA256="$(sha256sum packages/contracts/native/postgres-pool.generated.json | cut -d ' ' -f 1)" \
+ && export PGCF_QUALIFICATION_CONTRACT_SHA256="$(sha256sum packages/contracts/native/qualification.generated.json | cut -d ' ' -f 1)" \
  && cargo build --release --locked -p pgcf-pool-supervisor \
  && cargo metadata --locked --offline --no-deps --format-version 1 > /licenses/workspace-metadata.json \
  && mkdir -p /licenses/provenance \
  && cp Cargo.lock /licenses/provenance/Cargo.lock \
  && cp packages/contracts/native/postgres-pool.generated.json /licenses/provenance/postgres-pool.generated.json \
+ && cp packages/contracts/native/qualification.generated.json /licenses/provenance/qualification.generated.json \
  && cp packages/contracts/native/protocol.generated.json /licenses/provenance/protocol.generated.json \
  && cp packages/native-protocol/src/constants.generated.rs /licenses/provenance/constants.generated.rs \
  && cp infra/platform/versions.lock.json /licenses/provenance/versions.lock.json \

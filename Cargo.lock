@@ -1494,6 +1494,7 @@ dependencies = [
  "pgcf-native-protocol",
  "rcgen",
  "reqwest",
+ "ring",
  "rustls",
  "serde_json",
  "sha2",

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod agent_frame;
 pub mod archiver;
 pub mod data;
+pub mod inspection;
 pub mod isolation;
 pub mod private;
 pub mod protocol;

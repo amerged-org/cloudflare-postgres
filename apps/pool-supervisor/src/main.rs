@@ -71,7 +71,8 @@ async fn run() {
                 let versions=build_identity(option_env!("PGCF_VERSIONS_LOCK_SHA256"),64)?;
                 let protocol=build_identity(option_env!("PGCF_PROTOCOL_SHA256"),64)?;
                 let pool=build_identity(option_env!("PGCF_POOL_CONTRACT_SHA256"),64)?;
-                println!("{}", serde_json::json!({"program":"pgcf-pool-supervisor","version":env!("CARGO_PKG_VERSION"),"sourceRevision":source,"rustVersion":compiler,"cargoLockSha256":cargo,"versionsLockSha256":versions,"protocolSha256":protocol,"poolContractSha256":pool}));
+                let qualification=build_identity(option_env!("PGCF_QUALIFICATION_CONTRACT_SHA256"),64)?;
+                println!("{}", serde_json::json!({"program":"pgcf-pool-supervisor","version":env!("CARGO_PKG_VERSION"),"sourceRevision":source,"rustVersion":compiler,"cargoLockSha256":cargo,"versionsLockSha256":versions,"protocolSha256":protocol,"poolContractSha256":pool,"qualificationContractSha256":qualification}));
                 Ok(())
             }
             Some("install") if (3..=6).contains(&args.len()) => install(Path::new(&args[2]), &args[3..]),

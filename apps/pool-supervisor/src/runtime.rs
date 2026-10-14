@@ -35,6 +35,18 @@ pub struct Runtime {
     stopped: Option<Value>,
 }
 impl Runtime {
+    pub fn inspect_readonly(
+        &self,
+        request: Value,
+        descriptor: std::os::fd::OwnedFd,
+    ) -> Result<Value, Error> {
+        if self.consumed || self.child.is_some() || self.mount.is_some() || self.bundle.is_some() {
+            return Err(Error("pool_inspection_holder_assigned"));
+        }
+        let pin = std::env::var("PGCF_POOL_BIND_KEYS_SHA256")
+            .map_err(|_| Error("pool_trust_pin_missing"))?;
+        crate::inspection::inspect(&self.identity, &self.keys, &pin, request, descriptor)
+    }
     pub fn new(
         identity: Identity,
         keys: HashMap<String, Vec<u8>>,

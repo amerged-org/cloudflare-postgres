@@ -137,6 +137,7 @@ def main():
         controller = prefix + "-controller"
         containers.append(controller)
         run("docker", "run", "-d", "--name", controller, "--platform", "linux/amd64", "--network", network, "--user", "0:0", "-v", prefix + "-control:/pgcf/control", "-v", str(fixture) + ":/fixture:ro",
+            "-v", prefix + "-data:/read-data:ro",
             "--entrypoint", "python3", BARMAN, "-c", "import time; time.sleep(3600)")
         read_attestation = "import pathlib,time; p=pathlib.Path('/pgcf/control/private/attestation.json');\nfor i in range(100):\n if p.exists(): print(p.read_text()); break\n time.sleep(.05)\nelse: raise RuntimeError('public attestation missing')"
         attestation = json.loads(execute(controller, read_attestation))
@@ -165,6 +166,44 @@ def main():
         scope["driver_image"] = driver["upstream_image"] + "@" + driver["image_index_digest"]
         scope["driver_sha256"] = driver["upstream_binary_sha256"]
         digest = hashlib.sha256(json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        # pq1 grants only this fixed read. Fixture volume fields do not qualify LVM or CF.
+        pool_contract = json.loads((ROOT / "packages/contracts/native/postgres-pool.generated.json").read_text())
+        qualification = json.loads((ROOT / "packages/contracts/native/qualification.generated.json").read_text())["fixture"]["claims"]
+        preparation = pool_contract["preparation"]
+        boot = execute(controller, "import pathlib; print(pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip())").decode().strip()
+        qualification["kid"] = "fixture"
+        qscope = qualification["scope"]
+        qscope["node_uid"] = node_uid; qscope["boot_id"] = boot; qscope["database_id"] = database
+        qscope["storage"]["node_uid"] = node_uid; qscope["volume"]["node_uid"] = node_uid
+        qscope["software"]["postgres_image"] = PG
+        qscope["software"]["supervisor_sha256"] = attestation["supervisor_sha256"]
+        qhash = hashlib.sha256(json.dumps(qscope, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        qualification["scope_sha256"] = qhash
+        qat = int(time.time()*1000)
+        qualification.update(iat=qat, exp=qat+30000)
+        qualification["challenge"].update(scope_sha256=qhash, gate="host_mount_context", issued_at=qat, expires_at=qat+30000)
+        qualification["execution"].update(node_uid=node_uid, boot_id=boot, verifier_keys_sha256=hashlib.sha256(keys.encode()).hexdigest())
+        preparation.update(node_id=qscope["node_id"], node_uid=node_uid, boot_id=boot, qualification_run_id=qscope["run_id"], qualification_scope_sha256=qhash, observed_at=qat, expires_at=qat+30000)
+        preparation["pods"] = [{"pod_uid":pod_uid,"pod_name":pool_name,"pod_ip":pool_ip,"container_ids":scope["container_ids"]}]
+        preparation["policy"]["release_id"] = qscope["candidate_release_id"]
+        for field in ("driver_image","driver_sha256","supervisor_image","supervisor_sha256","archiver_image"):
+            preparation["policy"][field] = qscope["software"][field]
+        preparation["policy"]["archiver_sha256"] = qscope["software"]["archiver_image"].split("@sha256:")[1]
+        preparation["policy"]["class"]["postgres_image_sha256"] = PG.split("@sha256:")[1]
+        phash = hashlib.sha256(json.dumps(preparation, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        qualification["preparation_sha256"] = phash
+        qencoded = b64(json.dumps(qualification, separators=(",", ":")).encode())
+        private(fixture / "inspect-sign-input", "pgcf-pool-qualification/v1\n" + qencoded)
+        qsignature = run("openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(fixture / "bind.key"), "-in", str(fixture / "inspect-sign-input")).stdout
+        volume=qscope["volume"]
+        read_storage={field:volume[field] for field in ("storage_generation","storage_uid","namespace_uid","pvc_uid","pv_uid","volume_handle","volume_group_uuid","lv_uuid")}
+        read_storage.update(backend="lvm-thin-v1",cnpg_cluster_uid=volume["cluster_uid"],thin_id=qscope["thin_id"],profile=qscope["storage"])
+        read_signal={"v":1,"command":"inspect_readonly","permission":"pq1."+qencoded+"."+b64(qsignature),"qualification_run_id":qscope["run_id"],"qualification_scope_sha256":qhash,"preparation_sha256":phash,"nonce":qualification["challenge"]["nonce"],"database_id":database,"source_generation":qscope["database_generation"]-1,"configuration_fingerprint":qscope["configuration_fingerprint"],"node_uid":node_uid,"boot_id":boot,"storage":read_storage,"pool_namespace":"pgcf-pool","pool_namespace_uid":preparation["pool_namespace_uid"],"pool_pod_uid":pod_uid,"container_ids":scope["container_ids"],"postgres_image_sha256":PG.split("sha256:")[1],"supervisor_sha256":attestation["supervisor_sha256"],"issued_at":qat,"expires_at":qat+30000,"readonly":True,"noload":True}
+        private(fixture / "inspect.json", json.dumps({"signal":read_signal,"preparation":preparation}))
+        inspection_code="import os,socket,array,json; fd=os.open('/read-data/data/pgdata',os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW); s=socket.socket(socket.AF_UNIX); s.connect('/pgcf/control/private/agent.sock'); s.sendmsg([open('/fixture/inspect.json','rb').read()],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[fd]))]); s.shutdown(socket.SHUT_WR); result=s.makefile().read(65537); os.close(fd); s.close(); print(result)"
+        inspection = json.loads(execute(controller, inspection_code))
+        if inspection.get("error") is not None: raise RuntimeError(inspection["error"])
+        assert inspection["state"] == "read" and inspection["control_state"] == "shut down" and inspection["system_identifier"] == system_id and inspection["timeline"] == timeline
         at = int(time.time()*1000)
         claims = {"v":1,"kid":"fixture","scope":scope,"scope_sha256":digest,"holder_revision":1,"iat":at,"exp":at+5000}
         encoded = b64(json.dumps(claims, separators=(",", ":")).encode())
@@ -198,6 +237,8 @@ def main():
         assert waiting == {"accepted":True,"waiting":True}
         replay = json.loads(execute(controller, http, "bundle", "bundle.json", pool_ip))
         assert replay == waiting, "the same pending bundle must resolve a lost reply without consuming a second holder"
+        assigned_inspection = json.loads(execute(controller, inspection_code))
+        assert assigned_inspection.get("error") == "pool_inspection_holder_assigned", "inspection must never read an assigned supervisor's data"
         private(fixture / "changed-pending.json", json.dumps(dict(bundle, holder_revision=2)))
         changed = json.loads(execute(controller, http, "bundle", "changed-pending.json", pool_ip))
         assert "error" in changed, "pending bundle replay must reject a changed holder"
@@ -349,7 +390,7 @@ def main():
         stopped = json.loads(execute(controller, http, "stop", "control.json", pool_ip))
         assert stopped["state"] == "stopped" and stopped["control_state"] == "shut down" and stopped["postmaster_pid"] is None
         assert json.loads(execute(controller, http, "stop", "control.json", pool_ip)) == stopped
-        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"same_uid_custody_sealed":True,"privileged_process_inspection_preserved":True,"inspector_executable_matches_attestation":all(inspector_executable_matches),"native_process_executable_identity_acceptance":False,"pending_bundle_replay":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
+        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"same_uid_custody_sealed":True,"privileged_process_inspection_preserved":True,"inspector_executable_matches_attestation":all(inspector_executable_matches),"native_process_executable_identity_acceptance":False,"pending_bundle_replay":True,"readonly_inspection":True,"assigned_inspection_refused":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
     finally:
         for container in reversed(containers): run("docker", "rm", "-f", container, check=False)
         for volume in reversed(volumes): run("docker", "volume", "rm", volume, check=False)
