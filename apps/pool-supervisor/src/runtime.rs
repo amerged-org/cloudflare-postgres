@@ -176,7 +176,7 @@ impl Runtime {
         {
             return Err(Error("pool_tls_identity_changed"));
         }
-        if crate::sha256(text(&bundle, "client_ca_pem")?.as_bytes()) != text(&bundle, "ca_sha256")?
+        if crate::sha256(text(&bundle, "server_ca_pem")?.as_bytes()) != text(&bundle, "ca_sha256")?
         {
             return Err(Error("pool_ca_identity_changed"));
         }
@@ -445,6 +445,7 @@ fn certificates(bundle: &Value) -> Result<(), Error> {
     for (field, name) in [
         ("server_certificate_pem", "server.crt"),
         ("server_private_key_pem", "server.key"),
+        ("server_ca_pem", "server-ca.crt"),
         ("client_ca_pem", "client-ca.crt"),
     ] {
         private::replace(&root.join(name), text(bundle, field)?.as_bytes())?;

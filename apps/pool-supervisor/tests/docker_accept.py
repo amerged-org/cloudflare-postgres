@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--binary-volume", default="pgcf-pool-supervisor-target-amd64")
     parser.add_argument("--controller-peer-volume")
     parser.add_argument("--controller-peer-sha256")
+    parser.add_argument("--gateway-peer-volume")
+    parser.add_argument("--gateway-peer-sha256")
     args = parser.parse_args()
     os.umask(0o077)
     prefix = "pgcf-pool-test-" + secrets.token_hex(6)
@@ -148,19 +150,31 @@ def main():
         system_id, timeline = fields["Database system identifier"], int(fields["Latest checkpoint's TimeLineID"])
         config = "listen_addresses='*'\nport=5432\narchive_mode=on\nwal_level=replica\nmax_wal_senders=4\narchive_timeout=1\nunix_socket_directories='/controller/run'\nssl=on\nssl_cert_file='/controller/certificates/server.crt'\nssl_key_file='/controller/certificates/server.key'\nssl_ca_file='/controller/certificates/client-ca.crt'\n"
         private(fixture / "postgresql.conf", config)
-        private(fixture / "pg_hba.conf", "local all all peer map=local\nhostssl all all 0.0.0.0/0 trust\nhostssl all all ::/0 trust\n")
+        private(fixture / "pg_hba.conf", "local all all peer map=local\nhostssl all pool_mtls 0.0.0.0/0 cert\nhostssl all pool_mtls ::/0 cert\nhostssl all all 0.0.0.0/0 trust\nhostssl all all ::/0 trust\n")
         private(fixture / "pg_ident.conf", "local postgres postgres\n")
         run("docker","run","--rm","--platform","linux/amd64","--network","none","--user","0:0","-v",str(fixture)+":/fixture:ro","-v",prefix+"-data:/var/lib/postgresql","--entrypoint","/bin/sh",PG,"-c","cp /fixture/postgresql.conf /fixture/pg_hba.conf /fixture/pg_ident.conf /var/lib/postgresql/data/pgdata/; chown 26:26 /var/lib/postgresql/data/pgdata/postgresql.conf /var/lib/postgresql/data/pgdata/pg_hba.conf /var/lib/postgresql/data/pgdata/pg_ident.conf")
         database = "d" + secrets.token_hex(10)[1:]
         tls_name = "database-rw.pgcf-db-" + database + ".svc"
-        run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=" + tls_name, "-addext", "subjectAltName=DNS:" + tls_name,
-            "-keyout", str(fixture / "server.key"), "-out", str(fixture / "server.crt"))
-        for file in (fixture / "server.key", fixture / "server.crt"): file.chmod(0o600)
+        # CNPG independently owns server and client trust roots. Use real distinct CAs,
+        # including a separate signed server leaf; a shared self-signed leaf hid this boundary.
+        for name in ("server-ca", "client-ca"):
+            run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=" + name,
+                "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", str(fixture / (name + ".key")), "-out", str(fixture / (name + ".crt")))
+        run("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=" + tls_name,
+            "-keyout", str(fixture / "server.key"), "-out", str(fixture / "postgres.csr"))
+        private(fixture / "postgres-ext.cnf", "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:" + tls_name + "\n")
+        run("openssl", "x509", "-req", "-in", str(fixture / "postgres.csr"), "-CA", str(fixture / "server-ca.crt"), "-CAkey", str(fixture / "server-ca.key"), "-CAcreateserial", "-days", "1", "-sha256", "-extfile", str(fixture / "postgres-ext.cnf"), "-out", str(fixture / "server.crt"))
+        run("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=pool_mtls", "-keyout", str(fixture / "client.key"), "-out", str(fixture / "client.csr"))
+        private(fixture / "client-ext.cnf", "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n")
+        run("openssl", "x509", "-req", "-in", str(fixture / "client.csr"), "-CA", str(fixture / "client-ca.crt"), "-CAkey", str(fixture / "client-ca.key"), "-CAcreateserial", "-days", "1", "-sha256", "-extfile", str(fixture / "client-ext.cnf"), "-out", str(fixture / "client.crt"))
+        for name in ("server-ca.key", "server-ca.crt", "server-ca.srl", "client-ca.key", "client-ca.crt", "client-ca.srl", "server.key", "server.crt", "postgres.csr", "client.key", "client.crt", "client.csr"):
+            (fixture / name).chmod(0o600)
         scope = {"v":1,"binding_id":binding,"database_id":database,"generation":1,"route_revision":1,"admission_epoch":1,"configuration_fingerprint":hashlib.sha256(config.encode()).hexdigest(),"region_id":"eu-dev","node_id":"nod_" + secrets.token_hex(10),"node_uid":node_uid,"boot_id":str(uuid.uuid4()),"pool_pod_uid":pod_uid,"pool_pod_name":pool_name,"pool_pod_ip":"127.0.0.1","container_id":run("docker", "inspect", "--format", "{{.Id}}", pool_name).stdout.decode().strip(),"supervisor_key_sha256":attestation["supervisor_key_sha256"],"supervisor_sha256":attestation["supervisor_sha256"],"class":{"postgres_image_sha256":PG.split("sha256:")[1],"cpu_request_millicores":1000,"cpu_limit_millicores":1000,"memory_request_bytes":268435456,"memory_limit_bytes":268435456,"configuration_profile_sha256":hashlib.sha256(config.encode()).hexdigest()},"storage":{"backend":"lvm-thick-v1","storage_generation":1,"storage_uid":str(uuid.uuid4()),"namespace_uid":str(uuid.uuid4()),"cnpg_cluster_uid":str(uuid.uuid4()),"pvc_uid":str(uuid.uuid4()),"pv_uid":str(uuid.uuid4()),"volume_handle":"pvc-" + str(uuid.uuid4()),"volume_group_uuid":"AAAAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAAAA","lv_uuid":"BBBBBB-BBBB-BBBB-BBBB-BBBB-BBBB-BBBBBB"},"system_identifier":system_id,"timeline":timeline,"bundle_nonce":nonce}
         scope["pool_pod_ip"] = pool_ip
         scope["pool_namespace"]="pgcf-pool"
         scope["pool_namespace_uid"]=str(uuid.uuid4())
         scope["container_ids"]=[scope["container_id"],run("docker","inspect","--format","{{.Id}}",archiver).stdout.decode().strip()]
+        scope["host_controller_sha256"]=json.loads((ROOT / "packages/contracts/native/postgres-pool.generated.json").read_text())["scope"]["host_controller_sha256"]
         digest = hashlib.sha256(json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         driver = json.loads((ROOT / "infra/storage/sources.lock.json").read_text())["driver"]
         scope["driver_image"] = driver["upstream_image"] + "@" + driver["image_index_digest"]
@@ -186,7 +200,7 @@ def main():
         preparation.update(node_id=qscope["node_id"], node_uid=node_uid, boot_id=boot, qualification_run_id=qscope["run_id"], qualification_scope_sha256=qhash, observed_at=qat, expires_at=qat+30000)
         preparation["pods"] = [{"pod_uid":pod_uid,"pod_name":pool_name,"pod_ip":pool_ip,"container_ids":scope["container_ids"]}]
         preparation["policy"]["release_id"] = qscope["candidate_release_id"]
-        for field in ("driver_image","driver_sha256","supervisor_image","supervisor_sha256","archiver_image"):
+        for field in ("driver_image","driver_sha256","supervisor_image","supervisor_sha256","archiver_image","host_controller_sha256"):
             preparation["policy"][field] = qscope["software"][field]
         preparation["policy"]["archiver_sha256"] = qscope["software"]["archiver_image"].split("@sha256:")[1]
         preparation["policy"]["class"]["postgres_image_sha256"] = PG.split("@sha256:")[1]
@@ -210,8 +224,10 @@ def main():
         private(fixture / "sign-input", "pgcf-pool-bind/v1\n" + encoded)
         signature = run("openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(fixture / "bind.key"), "-in", str(fixture / "sign-input")).stdout
         permission = "pb1." + encoded + "." + b64(signature)
-        ca = (fixture / "server.crt").read_text()
-        bundle = {"v":1,"scope":scope,"scope_sha256":digest,"holder_revision":1,"permission":permission,"server_certificate_pem":ca,"server_private_key_pem":(fixture / "server.key").read_text(),"client_ca_pem":ca,"ca_secret_uid":str(uuid.uuid4()),"ca_secret_resource_version":"1","ca_sha256":hashlib.sha256(ca.encode()).hexdigest(),"tls_server_name":tls_name,"archive":{"destination_path":"s3://pgcf-fixture/"+archive_prefix,"server_name":"database","endpoint_url":"https://minio:9000","retention_days":1}}
+        server_ca = (fixture / "server-ca.crt").read_text()
+        client_ca = (fixture / "client-ca.crt").read_text()
+        assert server_ca != client_ca
+        bundle = {"v":1,"scope":scope,"scope_sha256":digest,"holder_revision":1,"permission":permission,"server_certificate_pem":(fixture / "server.crt").read_text(),"server_private_key_pem":(fixture / "server.key").read_text(),"client_ca_pem":client_ca,"server_ca_pem":server_ca,"client_ca_secret_uid":str(uuid.uuid4()),"client_ca_secret_resource_version":"1","ca_secret_uid":str(uuid.uuid4()),"ca_secret_resource_version":"1","ca_sha256":hashlib.sha256(server_ca.encode()).hexdigest(),"tls_server_name":tls_name,"archive":{"destination_path":"s3://pgcf-fixture/"+archive_prefix,"server_name":"database","endpoint_url":"https://minio:9000","retention_days":1}}
         bundle["storage_authority"]=None
         thin_scope=json.loads(json.dumps(scope))
         thin_storage=json.loads((ROOT / "packages/contracts/native/postgres-pool.generated.json").read_text())["thin_scope"]["storage"]
@@ -301,7 +317,46 @@ def main():
             assert peer["state"] == "ready" and peer["system_identifier"] == "matched" and peer["timeline"] == "matched"
             peer_proved = True
         sql = "CREATE TABLE pool_marker(value text); INSERT INTO pool_marker VALUES ('acknowledged');"
-        tls_dsn = "host=" + tls_name + " hostaddr=" + pool_ip + " sslmode=verify-full sslrootcert=/controller/certificates/client-ca.crt user=postgres dbname=postgres"
+        tls_dsn = "host=" + tls_name + " hostaddr=" + pool_ip + " sslmode=verify-full sslrootcert=/controller/certificates/server-ca.crt user=postgres dbname=postgres"
+        run("docker", "exec", pool_name, "psql", tls_dsn, "-v", "ON_ERROR_STOP=1", "-c", "CREATE ROLE pool_mtls LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;")
+        run("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--user", "0:0", "-v", str(fixture) + ":/fixture:ro", "-v", prefix + "-control:/control", "--entrypoint", "/bin/sh", PG, "-c", "cp /fixture/client.crt /fixture/client.key /control/private/; chown 26:26 /control/private/client.crt /control/private/client.key; chmod 600 /control/private/client.crt /control/private/client.key")
+        mtls_dsn = tls_dsn.replace("user=postgres", "user=pool_mtls") + " sslcert=/pgcf/control/client.crt sslkey=/pgcf/control/client.key"
+        assert run("docker", "exec", pool_name, "psql", mtls_dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT current_user").stdout.strip() == b"pool_mtls"
+        roots = {Path(path).name.removesuffix("-ca.crt"):digest for digest,path in (line.split() for line in run("docker", "exec", pool_name, "sha256sum", "/controller/certificates/server-ca.crt", "/controller/certificates/client-ca.crt").stdout.decode().splitlines())}
+        assert roots == {"server":hashlib.sha256(server_ca.encode()).hexdigest(), "client":hashlib.sha256(client_ca.encode()).hexdigest()}, "separate CA files must preserve the exact owned bundle bytes"
+        print(json.dumps({"phase":"distinct_ca_authenticated","distinct_server_client_ca":True,"exact_ca_bytes":True,"client_certificate_authenticated":True}), flush=True)
+        gateway_peer_proved = False
+        if args.gateway_peer_volume:
+            # Real PostgreSQL/TLS through the actual native Gateway. Generated CF/THIN
+            # watch inputs prove signature/expiry wiring, not node or Cloudflare acceptance.
+            assert args.gateway_peer_sha256 and len(args.gateway_peer_sha256) == 64 and all(c in "0123456789abcdef" for c in args.gateway_peer_sha256)
+            run("docker", "exec", pool_name, "psql", tls_dsn, "-v", "ON_ERROR_STOP=1", "-c", "CREATE ROLE pool_peer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;")
+            run("docker", "exec", pool_name, "psql", tls_dsn, "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE " + database + " OWNER pool_peer;")
+            private(fixture / "gateway-role.txt", "pool_peer")
+            private(fixture / "gateway-binding.json", json.dumps({"v":1,"scope":scope,"scope_sha256":digest,"holder_revision":1,"state":"serving","created_at":at,"updated_at":int(time.time()*1000)}))
+            gateway_binary = "/peer-binary/peer-receipts/gateway/" + args.gateway_peer_sha256 + "/pool-gateway-peer"
+            measured = run("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--user", "0:0", "-v", args.gateway_peer_volume + ":/peer-binary:ro", "--entrypoint", "python3", BARMAN, "-c", "import hashlib,pathlib,sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())", gateway_binary).stdout.decode().strip()
+            assert measured == args.gateway_peer_sha256, "gateway peer must match its measured build receipt"
+            gateway_peer = prefix + "-gateway-peer"
+            containers.append(gateway_peer)
+            result = run("docker", "run", "--rm", "--name", gateway_peer, "--platform", "linux/amd64", "--network", network, "--user", "0:0", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--read-only", "-v", args.gateway_peer_volume + ":/peer-binary:ro", "-v", str(fixture) + ":/peer:ro", "--entrypoint", gateway_binary, BARMAN, "--binding-file", "/peer/gateway-binding.json", "--ca-file", "/peer/server-ca.crt", "--role-file", "/peer/gateway-role.txt", check=False)
+            if result.returncode:
+                diagnostic = base / (prefix + "-gateway-peer.stderr")
+                private(diagnostic, result.stderr)
+                print(json.dumps({"phase":"gateway_peer_failed","diagnostic_file":str(diagnostic)}), flush=True)
+                try:
+                    failure = json.loads(result.stderr)
+                except (ValueError, UnicodeDecodeError):
+                    failure = None
+                code = failure.get("code") if isinstance(failure, dict) and failure.get("gateway_pool_peer") == "failed" else None
+                if code in ("running pool busy close refused or forced", "running pool idle close refused", "actual committed row readback failed", "uncommitted expired transaction was replayed", "peer_refused", "target_refused:discovery_unavailable", "target_refused:writer_identity_unavailable", "target_refused:storage_authority_missing", "target_refused:storage_authority_invalid", "target_refused:storage_authority_scope_or_freshness_changed", "target_refused:storage_authority_regressed_or_conflicted", "target_refused:storage_authority_expired", "target_refused:storage_authority_refused"):
+                    raise RuntimeError(code)
+                raise RuntimeError("actual gateway peer failed; raw diagnostics withheld")
+            peer = json.loads(result.stdout)
+            assert peer["busy_detach_commit"] == "passed" and peer["committed_row_readback"] == "passed" and peer["idle_close"] == "passed"
+            assert peer["gateway_pool_expiry_disconnect"] == "passed" and peer["expired_transaction_replay"] == "absent"
+            assert peer["kernel_mount_acceptance"] is False and peer["cloudflare_first_sql_acceptance"] is False
+            gateway_peer_proved = True
         run("docker", "exec", pool_name, "psql", tls_dsn, "-v", "ON_ERROR_STOP=1", "-c", sql)
         wal = run("docker", "exec", pool_name, "psql", tls_dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT pg_walfile_name(pg_switch_wal())").stdout.decode().strip()
         assert len(wal) == 24 and all(c in "0123456789ABCDEF" for c in wal)
@@ -325,10 +380,12 @@ def main():
         backend_pid=int(busy.stdout.readline().strip())
         while int(time.time()*1000)<=claims["exp"]: time.sleep(.05)
         busy.stdin.write(b"SELECT pg_sleep(1); SELECT 17;\n"); busy.stdin.flush()
-        run("openssl","req","-x509","-newkey","rsa:2048","-nodes","-days","1","-subj","/CN="+tls_name,"-addext","subjectAltName=DNS:"+tls_name,"-keyout",str(fixture/"renewed.key"),"-out",str(fixture/"renewed.crt"))
+        run("openssl","req","-x509","-newkey","rsa:2048","-nodes","-days","1","-subj","/CN=renewed-server-ca","-addext","basicConstraints=critical,CA:TRUE","-keyout",str(fixture/"renewed-ca.key"),"-out",str(fixture/"renewed-ca.crt"))
+        run("openssl","req","-new","-newkey","rsa:2048","-nodes","-subj","/CN="+tls_name,"-keyout",str(fixture/"renewed.key"),"-out",str(fixture/"renewed.csr"))
+        run("openssl","x509","-req","-in",str(fixture/"renewed.csr"),"-CA",str(fixture/"renewed-ca.crt"),"-CAkey",str(fixture/"renewed-ca.key"),"-CAcreateserial","-days","1","-sha256","-extfile",str(fixture/"postgres-ext.cnf"),"-out",str(fixture/"renewed.crt"))
         for file in (fixture/"renewed.key",fixture/"renewed.crt"): file.chmod(0o600)
-        renewed_ca=(fixture/"renewed.crt").read_text()
-        renewed=dict(bundle,permission=None,client_ca_pem=renewed_ca,server_certificate_pem=renewed_ca,server_private_key_pem=(fixture/"renewed.key").read_text(),ca_sha256=hashlib.sha256(renewed_ca.encode()).hexdigest(),ca_secret_resource_version="2")
+        renewed_ca=(fixture/"renewed-ca.crt").read_text()
+        renewed=dict(bundle,permission=None,server_ca_pem=renewed_ca,server_certificate_pem=(fixture/"renewed.crt").read_text(),server_private_key_pem=(fixture/"renewed.key").read_text(),ca_sha256=hashlib.sha256(renewed_ca.encode()).hexdigest(),ca_secret_resource_version="2")
         private(fixture/"renewed.json",json.dumps(renewed))
         renewal=json.loads(execute(controller,http,"bundle","renewed.json",pool_ip))
         if renewal.get("error") is not None: raise RuntimeError(renewal["error"])
@@ -343,6 +400,7 @@ def main():
             if refreshed.returncode==0: break
             time.sleep(.1)
         assert refreshed.returncode==0 and refreshed.stdout.strip()==b"acknowledged", "fresh connection must verify the refreshed CA"
+        assert run("docker", "exec", pool_name, "psql", mtls_dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT current_user").stdout.strip() == b"pool_mtls", "client CA remains independent across server CA refresh"
         control = {"v":1,"binding_id":binding,"scope_sha256":digest,"bundle_nonce":nonce}
         private(fixture / "backup.json", json.dumps(dict(control, backup_name="backup-" + prefix)))
         # A real object-store outage before dispatch is safe to retry under the same identity.
@@ -390,7 +448,7 @@ def main():
         stopped = json.loads(execute(controller, http, "stop", "control.json", pool_ip))
         assert stopped["state"] == "stopped" and stopped["control_state"] == "shut down" and stopped["postmaster_pid"] is None
         assert json.loads(execute(controller, http, "stop", "control.json", pool_ip)) == stopped
-        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"same_uid_custody_sealed":True,"privileged_process_inspection_preserved":True,"inspector_executable_matches_attestation":all(inspector_executable_matches),"native_process_executable_identity_acceptance":False,"pending_bundle_replay":True,"readonly_inspection":True,"assigned_inspection_refused":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
+        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"same_uid_custody_sealed":True,"privileged_process_inspection_preserved":True,"inspector_executable_matches_attestation":all(inspector_executable_matches),"native_process_executable_identity_acceptance":False,"pending_bundle_replay":True,"readonly_inspection":True,"assigned_inspection_refused":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"gateway_busy_commit":gateway_peer_proved,"distinct_server_client_ca":True,"client_certificate_authenticated":True,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
     finally:
         for container in reversed(containers): run("docker", "rm", "-f", container, check=False)
         for volume in reversed(volumes): run("docker", "volume", "rm", volume, check=False)
