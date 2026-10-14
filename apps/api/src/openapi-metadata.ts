@@ -17,6 +17,61 @@ const route = (
 /** Human-authored operation identities and summaries for the actual registered interfaces.
  * This describes routes; it neither installs a handler nor changes its validation or authorization. */
 export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
+  "POST /agent/v1/nodes/{id}/postgres-pool/preparations": route(
+    "reportPostgresPoolPreparation",
+    "Report authenticated tenant-free Kubernetes preparation",
+    "agent",
+  ),
+  "GET /agent/v1/nodes/{id}/postgres-pool/bindings": route(
+    "readNodePostgresPoolBindings",
+    "Read complete durable pool holder inventory",
+    "agent",
+  ),
+  "POST /agent/v1/nodes/{id}/postgres-pool/inventory": route(
+    "reportPostgresPoolInventory",
+    "Report actual attested pool Pod inventory",
+    "agent",
+  ),
+  "GET /agent/v1/pool-bindings/{id}": route(
+    "readPostgresPoolBinding",
+    "Read immutable binding and retained runtime cleanup evidence",
+    "agent",
+  ),
+  "POST /agent/v1/databases/{id}/postgres-pool/storage": route(
+    "reportPostgresPoolStorage",
+    "Report exact physical pool volume readback",
+    "agent",
+  ),
+  "POST /agent/v1/databases/{id}/postgres-pool/sleep": route(
+    "reportPostgresPoolSleep",
+    "Report verified clean PostgreSQL sleep",
+    "agent",
+  ),
+  "POST /agent/v1/pool-bindings/{id}/node": route(
+    "reportPostgresPoolNodeOutcome",
+    "Report actual pool mount or physical release outcome",
+    "agent",
+  ),
+  "POST /agent/v1/pool-bindings/{id}/serving": route(
+    "reportPostgresPoolServing",
+    "Report joint verified pool runtime readiness",
+    "agent",
+  ),
+  "POST /agent/v1/pool-bindings/{id}/supervisor": route(
+    "reportPostgresPoolSupervisor",
+    "Report actual scoped PostgreSQL supervisor state",
+    "agent",
+  ),
+  "POST /agent/v1/pool-bindings/{id}/io": route(
+    "reportPostgresPoolIo",
+    "Report every actual writer and shared Pod IO budget",
+    "agent",
+  ),
+  "POST /agent/v1/pool-bindings/{id}/cleanup-io": route(
+    "reportPostgresPoolCleanupIo",
+    "Report stopped tenant writers and actual cleanup worker IO custody",
+    "agent",
+  ),
   "GET /fleet-images/v1/raw/{digest}": route(
     "downloadFleetRawImage",
     "Download an approved immutable Talos image",
