@@ -579,7 +579,8 @@ it("retains one immutable cleanup budget across polls and completes it only with
     storage: scope.storage,
     device_major: 253,
     device_minor: 1,
-    maximum_write_bytes: 1048576,
+    allocation_reserve_bytes: 5 * 1024 ** 3,
+    cleanup_mode: "drain_unmount",
     write_bytes_per_second: scope.storage.profile.write_bytes_per_second,
     write_iops_per_second: scope.storage.profile.write_iops_per_second,
     iat: now,
@@ -587,7 +588,7 @@ it("retains one immutable cleanup budget across polls and completes it only with
   };
 
   await env.DB.prepare(
-    "INSERT INTO pool_cleanup_grants(binding_id,operation_id,authority_revision,claims_json,issued_at,expires_at,maximum_write_bytes,headroom_authority_revision,headroom_snapshot_sha256,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'reserved',?,?)",
+    "INSERT INTO pool_cleanup_grants(binding_id,operation_id,authority_revision,claims_json,issued_at,expires_at,allocation_reserve_bytes,headroom_authority_revision,headroom_snapshot_sha256,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'reserved',?,?)",
   )
     .bind(
       scope.binding_id,
@@ -596,7 +597,7 @@ it("retains one immutable cleanup budget across polls and completes it only with
       JSON.stringify(claims),
       now,
       now + 5000,
-      1048576,
+      claims.allocation_reserve_bytes,
       1,
       "a".repeat(64),
       now,

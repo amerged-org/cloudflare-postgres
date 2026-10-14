@@ -20,7 +20,7 @@ const field = (name: string) => `json_extract(t.profile_json,'$.${name}')`;
 /** Immutable cleanup budgets remain charged after expiry and uncertainty until physical release. */
 export function poolCleanupExposureSql(alias = "cleanup") {
   const grant = identifier(alias);
-  return `(((${grant}.maximum_write_bytes+65535)/65536)+json_extract(${grant}.claims_json,'$.write_iops_per_second')*((${grant}.expires_at-${grant}.issued_at+999)/1000))*65536`;
+  return `${grant}.allocation_reserve_bytes`;
 }
 export function poolCleanupReceiptSql(alias = "cleanup") {
   const grant = identifier(alias),

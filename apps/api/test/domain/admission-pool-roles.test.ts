@@ -15,7 +15,10 @@ import {
   finalizeDeferredPoolRoleChange,
   recoverDeferredPoolRoleChanges,
 } from "../../src/domain/roles.ts";
-import { recordPostgresPoolNodeReport } from "../../src/domain/postgres-pool.ts";
+import {
+  recordPostgresPoolNodeReport,
+  readDesiredPostgresPoolBinding,
+} from "../../src/domain/postgres-pool.ts";
 import {
   Operation,
   DatabaseWithOperation,
@@ -324,6 +327,16 @@ it("applies a deferred password exactly once after actual validated nonlazy rele
   });
   // The report callback may already finalize; repeat is an idempotent refusal, never a second password.
   await finalizeDeferredPoolRoleChange(env, f.id);
+  expect(
+    await env.DB.prepare(
+      "SELECT kind,binding_id,state FROM database_runtime_holders WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ kind: "cnpg", binding_id: null, state: "active" });
+  expect((await readDesiredPostgresPoolBinding(env, f.id)) === undefined).toBe(
+    true,
+  );
   const revision = await env.DB.prepare(
     "SELECT password_revision FROM roles WHERE database_id=? AND name='app'",
   )

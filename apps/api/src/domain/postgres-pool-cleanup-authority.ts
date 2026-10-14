@@ -4,7 +4,6 @@ import {
   DesiredDatabaseStorage,
   thinStorageAuthorityMatches,
   thinStorageInventory,
-  thinWriteExposure,
 } from "@pgcf/contracts";
 import {
   PoolBinding,
@@ -28,7 +27,11 @@ import {
 } from "./node-thin-storage.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
 import { installationHash } from "./node-installation.ts";
-import { currentStorageStopSql } from "./storage-capacity.ts";
+import {
+  currentStorageStopSql,
+  knownStorageHoldVolume,
+  thinLogicalVolumeExposures,
+} from "./storage-capacity.ts";
 import {
   minimumHeadroom,
   storageHolds,
@@ -125,7 +128,7 @@ function operationFence(
         ],
       };
 }
-/** A one-shot cleanup budget. Old SA1, tenant IO and a timeout never issue this permission. */
+/** Fixed drain/unmount permission with a full logical allocation reserve, not a BIO byte cap. */
 export async function issuePostgresPoolCleanupAuthority(
   env: Env,
   value: PoolBinding,
@@ -244,6 +247,26 @@ export async function issuePostgresPoolCleanupAuthority(
     )
   )
     return undefined;
+  const allocationKey = knownStorageHoldVolume({
+    binding: stored.storage_volume_json,
+    current: stored.storage_volume_json,
+    profile: stored.storage_profile_json,
+    storageGeneration: stored.storage_generation,
+    databaseId: scope.database_id,
+    authority,
+    now,
+  });
+  const allocation =
+    allocationKey === null
+      ? undefined
+      : thinLogicalVolumeExposures(authority)?.get(allocationKey);
+  if (
+    allocationKey === null ||
+    allocation === undefined ||
+    !Number.isSafeInteger(allocation) ||
+    allocation <= 0
+  )
+    return undefined;
   const fleet = await readPostgresPoolFleetFence(env.DB, scope.region_id),
     qualification = fleet
       ? undefined
@@ -267,7 +290,9 @@ export async function issuePostgresPoolCleanupAuthority(
       !poolCleanupValidAt(existing.claims, now) ||
       existing.claims.cleanup_io_sha256 !== ioHash ||
       existing.claims.database_generation !== stored.generation ||
-      existing.claims.boot_id !== io.boot_id)
+      existing.claims.boot_id !== io.boot_id ||
+      existing.claims.cleanup_mode !== "drain_unmount" ||
+      existing.claims.allocation_reserve_bytes !== allocation)
   )
     return undefined;
   const held = await storageHolds(
@@ -281,25 +306,16 @@ export async function issuePostgresPoolCleanupAuthority(
       Date.parse(authority.expires_at),
       now + Math.min(POOL_CLEANUP_MAX_MS, profile.drain_seconds * 1000),
     );
-  const bytes = Math.floor(
-      (io.shared_pod_io.write_bytes_per_second * (expires - now)) / 1000,
-    ),
-    operations =
-      io.shared_pod_io.write_iops_per_second *
-      Math.ceil((expires - now) / 1000);
-  if (
-    !existing &&
-    (expires <= now ||
-      !Number.isSafeInteger(bytes) ||
-      bytes <= 0 ||
-      !Number.isSafeInteger(operations))
-  )
-    return undefined;
-  const extra = existing ? 0 : thinWriteExposure(bytes, operations).data_bytes,
-    headroom = minimumHeadroom(current.profile, authority, {
-      ...held,
-      bytes: held.bytes + extra,
-    });
+  if (!existing && expires <= now) return undefined;
+  const exposures = new Map(held.exposures);
+  exposures.set(
+    allocationKey,
+    Math.max(exposures.get(allocationKey) ?? 0, allocation),
+  );
+  const headroom = minimumHeadroom(current.profile, authority, {
+    ...held,
+    exposures,
+  });
   if (
     !thinStorageWriteAllowed(
       current.profile,
@@ -399,7 +415,8 @@ export async function issuePostgresPoolCleanupAuthority(
       storage: scope.storage,
       device_major: io.device.device_major,
       device_minor: io.device.device_minor,
-      maximum_write_bytes: bytes,
+      allocation_reserve_bytes: allocation,
+      cleanup_mode: "drain_unmount",
       write_bytes_per_second: io.shared_pod_io.write_bytes_per_second,
       write_iops_per_second: io.shared_pod_io.write_iops_per_second,
       iat: now,
@@ -410,7 +427,7 @@ export async function issuePostgresPoolCleanupAuthority(
     snapshot = await installationHash(authority);
   if (!existing) {
     const result = await env.DB.prepare(
-      `INSERT INTO pool_cleanup_grants(binding_id,operation_id,authority_revision,claims_json,issued_at,expires_at,maximum_write_bytes,
+      `INSERT INTO pool_cleanup_grants(binding_id,operation_id,authority_revision,claims_json,issued_at,expires_at,allocation_reserve_bytes,
     headroom_authority_revision,headroom_snapshot_sha256,state,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,?,'reserved',?,? WHERE ${eligible.sql}
     AND NOT EXISTS(SELECT 1 FROM pool_cleanup_grants WHERE binding_id=? AND state<>'completed')`,
     )
@@ -421,7 +438,7 @@ export async function issuePostgresPoolCleanupAuthority(
         serialized,
         now,
         expires,
-        bytes,
+        allocation,
         authority.revision,
         snapshot,
         now,

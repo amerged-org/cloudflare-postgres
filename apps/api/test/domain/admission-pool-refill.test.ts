@@ -12,7 +12,7 @@ import {
   postgresPoolFixture,
 } from "./postgres-pool-fixture.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
-import { cleanupFixtures } from "./fixtures.ts";
+import { cleanupFixtures, request } from "./fixtures.ts";
 import { recordPostgresPoolPreparationContext } from "../../src/domain/postgres-pool-preparation.ts";
 import { recordPostgresPoolInventory } from "../../src/domain/postgres-pool-inventory.ts";
 
@@ -242,6 +242,48 @@ it("refuses a free refill when existing database CPU plus its declared idle requ
       .bind(f.node)
       .first("count(*)"),
   ).toBe(0);
+});
+
+it("does not spend a deleted database's unreleased holder charge on free refill", async () => {
+  const f = await servingPostgresPoolFixture({ thin: true }),
+    { context, inventory } = await refillInputs(f);
+  expect(
+    (
+      await request(
+        `/v1/databases/${f.id}`,
+        f.integrator,
+        "DELETE",
+        undefined,
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(202);
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='deleted',observed_generation=generation WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  await env.DB.prepare(
+    "UPDATE nodes SET allocatable_cpu_millicores=platform_reserved_cpu_millicores+? WHERE id=?",
+  )
+    .bind(2 * f.policy.idle_cpu_millicores - 1, f.node)
+    .run();
+  await recordPostgresPoolPreparationContext(env, f.node, context);
+  await expect(
+    recordPostgresPoolInventory(env, f.node, inventory),
+  ).rejects.toThrow();
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM pool_pods WHERE node_id=? AND state='ready'",
+    )
+      .bind(f.node)
+      .first("n"),
+  ).toBe(0);
+  expect(
+    await env.DB.prepare("SELECT state FROM pool_bindings WHERE id=?")
+      .bind(f.binding.scope.binding_id)
+      .first("state"),
+  ).toBe("detaching");
 });
 
 it("keeps concurrent complete refill observations within one free slot and the persisted idle budgets", async () => {

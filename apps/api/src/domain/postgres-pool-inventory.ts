@@ -5,7 +5,10 @@ import {
   PoolPodAttestation,
   POSTGRES_POOL,
 } from "@pgcf/contracts/postgres-pool";
-import { databaseCpuChargeSql } from "./startup-admission.ts";
+import {
+  databaseCpuChargeSql,
+  postgresPoolBoundCpuChargeSql,
+} from "./startup-admission.ts";
 import type { AdmissionSqlGuard } from "./admission-mutations.ts";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
@@ -239,8 +242,7 @@ export async function recordPostgresPoolInventory(
       pod.node_id !== nodeId ||
       pod.node_uid !== node.node_uid ||
       pod.boot_id !== node.boot_id ||
-      !fresh(pod.observed_at, now) ||
-      pod.observed_at > inventory.observed_at
+      !fresh(pod.observed_at, now)
     )
       throw conflict(
         "Pool Pod attestation differs from the current node observation",
@@ -337,7 +339,7 @@ export async function recordPostgresPoolInventory(
       AND (SELECT count(*) FROM pool_pods p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.state='ready')<=?
       AND COALESCE((SELECT sum(p.idle_cpu_millicores) FROM pool_pods p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.state='ready'),0)<=?
       AND COALESCE((SELECT sum(p.idle_memory_mib) FROM pool_pods p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.state='ready'),0)<=?
-      AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores>=COALESCE((SELECT sum(${databaseCpuChargeSql("d", "s")}) FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)+COALESCE((SELECT sum(p.idle_cpu_millicores) FROM pool_pods p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.state='ready'),0))`,
+      AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores>=COALESCE((SELECT sum(${databaseCpuChargeSql("d", "s")}) FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.node_id=n.id AND (d.observed_state<>'deleted' OR ${postgresPoolBoundCpuChargeSql("d")}>0)),0)+COALESCE((SELECT sum(p.idle_cpu_millicores) FROM pool_pods p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.state='ready'),0))`,
     bindings: [
       nodeId,
       node.node_uid,

@@ -20,6 +20,7 @@ import {
   poolBindingScopeHash,
 } from "@pgcf/contracts/postgres-pool";
 import { hasNonterminalPoolHolderSql } from "./postgres-pool.ts";
+import { postgresPoolCnpgSelectionStatements } from "./postgres-pool-cold-start.ts";
 import {
   databaseStartupHeadroomSql,
   startupReservationStatement,
@@ -390,6 +391,14 @@ export async function finalizeDeferredPoolRoleChange(
       env.DB.prepare(
         `UPDATE pool_role_mutations SET status='failed',error_code='superseded',error_message='Database or role changed before physical release',password_ciphertext=NULL,password_iv=NULL,password_kid=NULL,updated_at=?,completed_at=? WHERE id=? AND status='pending' AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.id=pool_role_mutations.database_id AND d.generation=pool_role_mutations.expected_generation AND d.deleted_at IS NULL AND d.desired_state='running' AND ((pool_role_mutations.kind='database.role.create' AND NOT EXISTS(SELECT 1 FROM roles r WHERE r.database_id=d.id AND r.name=pool_role_mutations.name)) OR (pool_role_mutations.kind='database.role.reset_password' AND EXISTS(SELECT 1 FROM roles r WHERE r.database_id=d.id AND r.name=pool_role_mutations.name AND r.password_revision=pool_role_mutations.expected_password_revision AND r.deleted_at IS NULL)))) AND ${guard.sql}`,
       ).bind(now, now, pending.id, ...guard.bindings),
+      ...postgresPoolCnpgSelectionStatements(env.DB, {
+        databaseId: id,
+        generation: pending.generation,
+        now: Date.parse(now),
+        guard,
+        roleOperationId: pending.id,
+        operationId: resume,
+      }),
     ]);
     return results[4]!.meta.changes === 1;
   });

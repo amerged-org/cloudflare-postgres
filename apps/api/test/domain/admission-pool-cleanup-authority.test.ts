@@ -2,7 +2,7 @@
 // Controlled D1/crypto metadata only; no live cleanup, mount or worker proof is claimed.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
-import { DatabaseWithOperation, thinWriteExposure } from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { PoolCleanupClaims } from "@pgcf/contracts/pool-cleanup-authority";
 import { servingPostgresPoolFixture } from "./postgres-pool-fixture.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
@@ -149,14 +149,14 @@ it("issues only one bounded cleanup grant after real writer expiry and fresh sto
     await env.DB.exec("DROP TRIGGER interrupted_cleanup_publication");
   }
   const reserved = await env.DB.prepare(
-    "SELECT state,claims_json,authority_token,maximum_write_bytes FROM pool_cleanup_grants WHERE binding_id=?",
+    "SELECT state,claims_json,authority_token,allocation_reserve_bytes FROM pool_cleanup_grants WHERE binding_id=?",
   )
     .bind(scope.binding_id)
     .first<{
       state: string;
       claims_json: string;
       authority_token: string | null;
-      maximum_write_bytes: number;
+      allocation_reserve_bytes: number;
     }>();
   expect(reserved?.state).toBe("reserved");
   expect(reserved?.authority_token).toBeNull();
@@ -177,10 +177,17 @@ it("issues only one bounded cleanup grant after real writer expiry and fresh sto
     database_generation: scope.generation,
     operation_id: operation.id,
     operation_target_generation: operation.generation,
+    cleanup_mode: "drain_unmount",
+    allocation_reserve_bytes: authority.physical_lvs.find(
+      (lv: { lv_uuid: string }) => lv.lv_uuid === scope.storage.lv_uuid,
+    )!.size_bytes,
   });
+  expect(claims).not.toHaveProperty("maximum_write_bytes");
   expect(claims!.authority_revision).toBeGreaterThan(io.authority_revision);
   expect(JSON.stringify(claims)).toBe(reserved!.claims_json);
-  expect(claims!.maximum_write_bytes).toBe(reserved!.maximum_write_bytes);
+  expect(claims!.allocation_reserve_bytes).toBe(
+    reserved!.allocation_reserve_bytes,
+  );
   expect((await read()).pool!.cleanup_authority === token).toBe(true);
   expect(
     await env.DB.prepare(
@@ -255,6 +262,12 @@ it("retains the cleanup allocation budget after expiry or an uncertain worker re
     ).operation,
     now = Date.now(),
     profile = scope.storage.profile;
+  const allocation = (await readCurrentNodeThinStorage(
+    env,
+    f.node,
+  ))!.authority!.physical_lvs.find(
+    (lv) => lv.lv_uuid === scope.storage.lv_uuid,
+  )!.size_bytes;
   const claims = PoolCleanupClaims.parse({
     v: 1,
     kid: "controlled",
@@ -273,7 +286,8 @@ it("retains the cleanup allocation budget after expiry or an uncertain worker re
     storage: scope.storage,
     device_major: 253,
     device_minor: 1,
-    maximum_write_bytes: profile.write_bytes_per_second,
+    allocation_reserve_bytes: allocation,
+    cleanup_mode: "drain_unmount",
     write_bytes_per_second: profile.write_bytes_per_second,
     write_iops_per_second: profile.write_iops_per_second,
     iat: now,
@@ -281,7 +295,7 @@ it("retains the cleanup allocation budget after expiry or an uncertain worker re
   });
   // This is an accepted local immutable CF reservation, without a signed token or executing worker.
   await env.DB.prepare(
-    `INSERT INTO pool_cleanup_grants(binding_id,operation_id,authority_revision,claims_json,issued_at,expires_at,maximum_write_bytes,headroom_authority_revision,headroom_snapshot_sha256,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'failed',?,?)`,
+    `INSERT INTO pool_cleanup_grants(binding_id,operation_id,authority_revision,claims_json,issued_at,expires_at,allocation_reserve_bytes,headroom_authority_revision,headroom_snapshot_sha256,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'failed',?,?)`,
   )
     .bind(
       scope.binding_id,
@@ -290,7 +304,7 @@ it("retains the cleanup allocation budget after expiry or an uncertain worker re
       JSON.stringify(claims),
       now,
       now + 1000,
-      claims.maximum_write_bytes,
+      claims.allocation_reserve_bytes,
       1,
       "a".repeat(64),
       now,
@@ -303,10 +317,7 @@ it("retains the cleanup allocation budget after expiry or an uncertain worker re
     .bind(f.id)
     .run();
   const authority = (await readCurrentNodeThinStorage(env, f.node))!.authority;
-  const budget = thinWriteExposure(
-    claims.maximum_write_bytes,
-    profile.write_iops_per_second,
-  ).data_bytes;
+  const budget = claims.allocation_reserve_bytes;
   const holds = await storageHolds(
     env,
     f.node,

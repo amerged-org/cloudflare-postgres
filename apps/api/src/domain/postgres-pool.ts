@@ -18,7 +18,6 @@ import {
   PoolBindingScope,
   PoolSleepRecord,
   PoolStorageObservation,
-  PoolPodInventory,
   PoolPodAttestation,
   PoolNodeReport,
   PoolSupervisorReport,
@@ -31,10 +30,10 @@ import {
   PoolCleanupIoAttestation,
   POSTGRES_POOL,
   poolBindingScopeHash,
+  poolCleanupIoAttestationHash,
   signPoolBindPermission,
   type DesiredPoolBinding,
 } from "@pgcf/contracts/postgres-pool";
-import { poolWorkloadProbeSafe } from "@pgcf/contracts";
 import { verifyStorageWriteAuthority } from "@pgcf/contracts/storage-write-authority";
 import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
 import { ApiError } from "../app.ts";
@@ -45,11 +44,15 @@ import {
   postgresPoolQualificationCapable,
 } from "./fleet-releases.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
-import { PoolCleanupClaims } from "@pgcf/contracts/pool-cleanup-authority";
+import {
+  PoolCleanupClaims,
+  verifyPoolCleanupAuthority,
+} from "@pgcf/contracts/pool-cleanup-authority";
 import { readPostgresPoolQualificationAuthority } from "./postgres-pool-qualification-authority.ts";
 import { readPostgresPoolFleetFence } from "./postgres-pool-fleet-fence.ts";
 import { currentStorageStopSql } from "./storage-capacity.ts";
 import { readPostgresPoolHostController } from "./postgres-pool-host.ts";
+import { postgresPoolCnpgSelectionStatements } from "./postgres-pool-cold-start.ts";
 export { readPostgresPoolQualificationAuthority } from "./postgres-pool-qualification-authority.ts";
 export { readPostgresPoolQualificationCleanupAuthority } from "./postgres-pool-qualification-cleanup.ts";
 import {
@@ -59,10 +62,6 @@ import {
 } from "./admission-mutations.ts";
 
 import { readPostgresPoolDatabaseContext as input } from "./postgres-pool-context.ts";
-import {
-  readPostgresPoolNodePolicy,
-  readPostgresPoolPreparationContexts,
-} from "./postgres-pool-preparation.ts";
 export { readPostgresPoolDatabaseContext } from "./postgres-pool-context.ts";
 
 const conflict = (message = "PostgreSQL pool authority changed") =>
@@ -73,22 +72,6 @@ const fresh = (at: number, now: number) =>
 const equal = (a: unknown, b: unknown) =>
   JSON.stringify(a) === JSON.stringify(b);
 const terminal = (state: string) => ["released", "refused"].includes(state);
-function poolPodIdentity(pod: PoolPodAttestation) {
-  return {
-    ...pod,
-    observed_at: 0,
-    container_ids: [...pod.container_ids].sort(),
-    workload_probes: pod.workload_probes
-      .map((p) => ({ ...p, probe: { ...p.probe, observed_at: 0 } }))
-      .sort((a, b) =>
-        a.container_id < b.container_id
-          ? -1
-          : a.container_id > b.container_id
-            ? 1
-            : 0,
-      ),
-  };
-}
 async function hintPostgresPoolProgress(env: Env, binding: PoolBinding) {
   const scope = binding.scope;
   const link = env.REGION_LINK.get(env.REGION_LINK.idFromName(scope.region_id));
@@ -782,210 +765,7 @@ export async function recordPostgresPoolSleep(
     if (result[0]!.meta.changes !== 1) throw conflict();
   });
 }
-export async function recordPostgresPoolInventory(
-  env: Env,
-  nodeId: string,
-  value: PoolPodInventory,
-) {
-  const inventory = PoolPodInventory.parse(value),
-    node = await currentNode(env, nodeId),
-    now = Date.now();
-  const selected = await readPostgresPoolNodePolicy(env, nodeId, now);
-  // Cleanup can retire only absent, never-claimed inventory from this exact run.
-  // It cannot publish a Pod, refresh a preparation, or create writer authority.
-  if (
-    !selected &&
-    inventory.pods.length === 0 &&
-    inventory.qualification_run_id &&
-    inventory.qualification_scope_sha256
-  ) {
-    if (
-      inventory.node_id !== nodeId ||
-      inventory.node_uid !== node.node_uid ||
-      inventory.boot_id !== node.boot_id ||
-      !fresh(inventory.observed_at, now)
-    )
-      throw conflict();
-    const result = await env.DB.prepare(
-      `UPDATE pool_pods SET state='retired' WHERE node_id=? AND node_uid=? AND boot_id=?
-      AND state='ready' AND binding_id IS NULL AND qualification_run_id=? AND qualification_scope_sha256=?
-      AND EXISTS(SELECT 1 FROM postgres_pool_qualification_runs q JOIN nodes n ON n.id=q.node_id
-      JOIN fleet_node_release_observations o ON o.node_id=n.id AND o.node_uid=n.node_uid
-      WHERE q.id=? AND q.scope_sha256=? AND q.status='cleanup' AND q.node_id=? AND q.node_uid=? AND q.boot_id=?
-      AND n.lost_at IS NULL AND n.node_uid=q.node_uid AND json_extract(o.facts_json,'$.boot_id')=q.boot_id)`,
-    )
-      .bind(
-        nodeId,
-        node.node_uid,
-        node.boot_id,
-        inventory.qualification_run_id,
-        inventory.qualification_scope_sha256,
-        inventory.qualification_run_id,
-        inventory.qualification_scope_sha256,
-        nodeId,
-        node.node_uid,
-        node.boot_id,
-      )
-      .run();
-    if (
-      result.meta.changes === 0 &&
-      !(await env.DB.prepare(
-        "SELECT 1 FROM postgres_pool_qualification_runs WHERE id=? AND scope_sha256=? AND status='cleanup' AND node_id=? AND node_uid=? AND boot_id=?",
-      )
-        .bind(
-          inventory.qualification_run_id,
-          inventory.qualification_scope_sha256,
-          nodeId,
-          node.node_uid,
-          node.boot_id,
-        )
-        .first())
-    )
-      throw conflict();
-    return;
-  }
-  const row = selected ? { revision: selected.revision } : undefined;
-  if (
-    !row ||
-    inventory.node_id !== nodeId ||
-    inventory.node_uid !== node.node_uid ||
-    inventory.boot_id !== node.boot_id ||
-    inventory.policy_revision !== row.revision ||
-    inventory.qualification_run_id !== selected?.qualification_run_id ||
-    inventory.qualification_scope_sha256 !==
-      selected?.qualification_scope_sha256 ||
-    !fresh(inventory.observed_at, now)
-  )
-    throw conflict();
-  const policy = selected!.policy;
-  const preparation = (
-    await readPostgresPoolPreparationContexts(env, nodeId, now)
-  )[0];
-  if (!preparation)
-    throw conflict("Authenticated preclaim Kubernetes context is missing");
-  if (
-    inventory.pods.length > policy.target_slots ||
-    inventory.idle_memory_current_bytes > policy.max_idle_memory_mib * 1024 ** 2
-  )
-    throw conflict("Actual pool inventory exceeds its hard idle bound");
-  for (const pod of inventory.pods) {
-    const prepared = preparation.pods.find(
-      (p) => p.pod_uid === pod.pool_pod_uid,
-    );
-    if (
-      !prepared ||
-      preparation.pool_namespace_uid !== pod.pool_namespace_uid ||
-      prepared.pod_name !== pod.pool_pod_name ||
-      prepared.pod_ip !== pod.pool_pod_ip ||
-      !equal([...prepared.container_ids].sort(), [...pod.container_ids].sort())
-    )
-      throw conflict(
-        "Pool Pod differs from the authenticated Kubernetes context",
-      );
-    const probeIds = new Set(
-      pod.workload_probes
-        .filter(
-          ({ probe }) =>
-            poolWorkloadProbeSafe(probe) && fresh(probe.observed_at, now),
-        )
-        .map(({ container_id }) => container_id),
-    );
-    if (pod.container_ids.some((cid) => !probeIds.has(cid)))
-      throw conflict(
-        "Actual OCI namespace/mount isolation was not proved for every writer",
-      );
-    if (
-      pod.node_id !== nodeId ||
-      pod.node_uid !== node.node_uid ||
-      pod.boot_id !== node.boot_id ||
-      !fresh(pod.observed_at, now) ||
-      !equal(pod.class, policy.class) ||
-      pod.supervisor_sha256 !== policy.supervisor_sha256
-    )
-      throw conflict("Pool Pod attestation differs from its immutable policy");
-    const previous = await env.DB.prepare(
-      "SELECT attestation_json,state FROM pool_pods WHERE pod_uid=?",
-    )
-      .bind(pod.pool_pod_uid)
-      .first<{ attestation_json: string; state: string }>();
-    if (previous) {
-      const old = PoolPodAttestation.parse(
-        JSON.parse(previous.attestation_json),
-      );
-      if (!equal(poolPodIdentity(old), poolPodIdentity(pod)))
-        throw conflict("Pool Pod runtime identity cannot be replaced");
-      if (previous.state !== "ready") {
-        if (previous.state === "claimed") {
-          const result = await env.DB.prepare(
-            `UPDATE pool_pods SET attestation_json=?,last_observed_at=? WHERE pod_uid=? AND state='claimed' AND attestation_json=? AND last_observed_at<=?
-            AND EXISTS(SELECT 1 FROM pool_bindings b JOIN database_runtime_holders h ON h.binding_id=b.id AND h.revision=b.holder_revision
-            WHERE b.id=pool_pods.binding_id AND b.pool_pod_uid=pool_pods.pod_uid AND b.node_uid=? AND b.boot_id=? AND h.kind='pool' AND h.state=b.state AND b.state NOT IN('released','refused'))
-            AND ${selected!.guard.sql}`,
-          )
-            .bind(
-              JSON.stringify(pod),
-              pod.observed_at,
-              pod.pool_pod_uid,
-              previous.attestation_json,
-              pod.observed_at,
-              node.node_uid,
-              node.boot_id,
-              ...selected!.guard.bindings,
-            )
-            .run();
-          if (result.meta.changes !== 1)
-            throw conflict(
-              "Bound Pod identity changed before observation commit",
-            );
-        }
-        continue;
-      }
-    }
-    await env.DB.prepare(
-      `INSERT INTO pool_pods(pod_uid,node_id,node_uid,boot_id,policy_revision,attestation_json,state,first_observed_at,last_observed_at,qualification_run_id,qualification_scope_sha256,idle_cpu_millicores,idle_memory_mib)
-      SELECT ?,?,?,?,?,?,'ready',?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN fleet_node_release_observations o ON o.node_id=n.id AND o.node_uid=n.node_uid
-        WHERE n.id=? AND n.node_uid=? AND n.lost_at IS NULL AND json_extract(o.facts_json,'$.boot_id')=?) AND ${selected!.guard.sql}
-      ON CONFLICT(pod_uid) DO UPDATE SET attestation_json=excluded.attestation_json,last_observed_at=excluded.last_observed_at WHERE pool_pods.state='ready' AND pool_pods.last_observed_at<=excluded.last_observed_at`,
-    )
-      .bind(
-        pod.pool_pod_uid,
-        nodeId,
-        node.node_uid,
-        node.boot_id,
-        row.revision,
-        JSON.stringify(pod),
-        pod.observed_at,
-        pod.observed_at,
-        inventory.qualification_run_id ?? null,
-        inventory.qualification_scope_sha256 ?? null,
-        policy.idle_cpu_millicores,
-        policy.idle_memory_mib,
-        nodeId,
-        node.node_uid,
-        node.boot_id,
-        ...selected!.guard.bindings,
-      )
-      .run();
-  }
-  const missing = await env.DB.prepare(
-    "SELECT pod_uid FROM pool_pods WHERE node_id=? AND node_uid=? AND boot_id=? AND state='ready' AND binding_id IS NULL AND qualification_run_id IS ?",
-  )
-    .bind(
-      nodeId,
-      node.node_uid,
-      node.boot_id,
-      inventory.qualification_run_id ?? null,
-    )
-    .all<{ pod_uid: string }>();
-  const present = new Set(inventory.pods.map((p) => p.pool_pod_uid));
-  for (const pod of missing.results)
-    if (!present.has(pod.pod_uid))
-      await env.DB.prepare(
-        `UPDATE pool_pods SET state='retired' WHERE pod_uid=? AND state='ready' AND binding_id IS NULL AND ${selected!.guard.sql}`,
-      )
-        .bind(pod.pod_uid, ...selected!.guard.bindings)
-        .run();
-}
+export { recordPostgresPoolInventory } from "./postgres-pool-inventory.ts";
 export async function readPostgresPoolAdmissionBinding(
   env: Env,
   id: string,
@@ -1063,6 +843,90 @@ export async function readPostgresPoolAdmissionBinding(
   return binding;
 }
 
+async function referenceDestructionFence(
+  env: Env,
+  binding: PoolBinding,
+  report: PoolNodeReport,
+): Promise<AdmissionSqlGuard & { completed: AdmissionSqlGuard }> {
+  const witness = report.reference_destruction!,
+    scope = binding.scope;
+  const grant = await readPostgresPoolCleanupGrant(
+    env,
+    scope.binding_id,
+    witness.operation_id,
+  );
+  const raw = await env.DB.prepare(
+    "SELECT attestation_json FROM pool_cleanup_io_attestations WHERE binding_id=? AND operation_id=?",
+  )
+    .bind(scope.binding_id, witness.operation_id)
+    .first<string>("attestation_json");
+  const parsed = PoolCleanupIoAttestation.safeParse(
+    raw ? JSON.parse(raw) : null,
+  );
+  if (
+    !grant ||
+    !grant.authority_token ||
+    !["issued", "failed"].includes(grant.state) ||
+    !parsed.success
+  )
+    throw conflict("Retained cleanup dispatch is unavailable");
+  const io = parsed.data,
+    claims = grant.claims;
+  const verified = await verifyPoolCleanupAuthority(
+    grant.authority_token,
+    await importBootstrapVerificationKeys(
+      JSON.parse(env.BOOTSTRAP_VERIFIER_KEYS),
+    ),
+    claims.iat,
+  );
+  // Verify the retained historical dispatch signature; this read-only release grants no new IO.
+  const stopped = (rows: typeof io.stopped_writers) =>
+    [...rows].sort((a, b) => a.container_id.localeCompare(b.container_id));
+  if (
+    !verified ||
+    !equal(verified, claims) ||
+    report.boot_id !== scope.boot_id ||
+    claims.boot_id !== scope.boot_id ||
+    io.boot_id !== scope.boot_id ||
+    io.binding_id !== scope.binding_id ||
+    io.scope_sha256 !== binding.scope_sha256 ||
+    io.holder_revision !== binding.holder_revision ||
+    claims.authority_revision !== witness.authority_revision ||
+    claims.cleanup_mode !== "drain_unmount" ||
+    witness.cleanup_io_sha256 !== claims.cleanup_io_sha256 ||
+    (await poolCleanupIoAttestationHash(io)) !== claims.cleanup_io_sha256 ||
+    !equal(witness.worker, io.worker) ||
+    !equal(stopped(witness.stopped_writers), stopped(io.stopped_writers)) ||
+    io.worker.executable_sha256 !== scope.host_controller_sha256 ||
+    report.kernel_proof.device_major !== claims.device_major ||
+    report.kernel_proof.device_minor !== claims.device_minor
+  )
+    throw conflict(
+      "Reference destruction differs from its exact retained cleanup dispatch",
+    );
+  return {
+    sql: "EXISTS(SELECT 1 FROM pool_cleanup_grants g JOIN pool_cleanup_io_attestations i ON i.binding_id=g.binding_id AND i.operation_id=g.operation_id WHERE g.binding_id=? AND g.operation_id=? AND g.state=? AND g.claims_json=? AND g.authority_token=? AND i.attestation_json=?)",
+    bindings: [
+      scope.binding_id,
+      witness.operation_id,
+      grant.state,
+      JSON.stringify(claims),
+      grant.authority_token,
+      raw,
+    ],
+    completed: {
+      sql: "EXISTS(SELECT 1 FROM pool_cleanup_grants g JOIN pool_cleanup_io_attestations i ON i.binding_id=g.binding_id AND i.operation_id=g.operation_id WHERE g.binding_id=? AND g.operation_id=? AND g.state='completed' AND g.claims_json=? AND g.authority_token=? AND i.attestation_json=?)",
+      bindings: [
+        scope.binding_id,
+        witness.operation_id,
+        JSON.stringify(claims),
+        grant.authority_token,
+        raw,
+      ],
+    },
+  };
+}
+
 export async function recordPostgresPoolNodeReport(
   env: Env,
   bindingId: string,
@@ -1097,7 +961,7 @@ export async function recordPostgresPoolNodeReport(
   )
     throw conflict("Post-boot absence differs from the immutable lost holder");
   let lossFence: AdmissionSqlGuard | undefined;
-  if (report.boot_loss) {
+  if (report.boot_loss || report.reference_destruction) {
     lossFence =
       (await readPostgresPoolFleetFence(env.DB, scope.region_id)) ??
       (await readPostgresPoolFleetFence(env.DB, scope.region_id, true));
@@ -1190,17 +1054,26 @@ export async function recordPostgresPoolNodeReport(
       return;
     throw conflict("Pool cleanup outcome is immutable");
   }
+  const destruction = report.reference_destruction
+    ? await referenceDestructionFence(env, binding, report)
+    : undefined;
   const target = report.state;
-  const recoveryOperation = report.boot_loss ? newOperationId() : undefined;
+  const recoveryOperation =
+    report.boot_loss || report.reference_destruction
+      ? newOperationId()
+      : undefined;
   const recoveryNow = new Date(now).toISOString();
   await withAdmissionMutation(env, [scope.database_id], async (mutation) => {
     const originalGuard = mutation.guard(scope.database_id);
-    const guard: AdmissionSqlGuard = lossFence
-      ? {
-          sql: `(${originalGuard.sql}) AND (${lossFence.sql})`,
-          bindings: [...originalGuard.bindings, ...lossFence.bindings],
-        }
-      : originalGuard;
+    const guards = [
+      originalGuard,
+      ...(lossFence ? [lossFence] : []),
+      ...(destruction ? [destruction] : []),
+    ];
+    const guard: AdmissionSqlGuard = {
+      sql: guards.map((g) => `(${g.sql})`).join(" AND "),
+      bindings: guards.flatMap((g) => g.bindings),
+    };
     const results = await mutation.batch([
       env.DB.prepare(
         `UPDATE pool_bindings SET state=?,node_report_json=?,updated_at=? WHERE id=? AND scope_sha256=? AND state NOT IN('released','refused')
@@ -1279,7 +1152,7 @@ export async function recordPostgresPoolNodeReport(
               ...guard.bindings,
             ),
             env.DB.prepare(
-              `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded after verified boot loss',updated_at=?,completed_at=?
+              `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded after verified unclean pool release',updated_at=?,completed_at=?
           WHERE database_id=? AND generation<? AND kind IN('database.suspend','database.resume','database.hibernate','database.wake') AND status IN('pending','running')
           AND EXISTS(SELECT 1 FROM databases WHERE id=? AND power_operation=? AND generation=?) AND ${guard.sql}`,
             ).bind(
@@ -1306,6 +1179,25 @@ export async function recordPostgresPoolNodeReport(
         JSON.stringify(report),
         ...guard.bindings,
       ),
+      env.DB.prepare(
+        `SELECT json(CASE WHEN EXISTS(SELECT 1 FROM pool_bindings b JOIN database_runtime_holders h ON h.binding_id=b.id AND h.database_id=b.database_id
+         WHERE b.id=? AND b.scope_sha256=? AND b.state=? AND b.node_report_json=? AND h.state=b.state AND h.revision=? ) AND (${destruction?.completed.sql ?? "1"}) THEN 'true' ELSE '' END)`,
+      ).bind(
+        bindingId,
+        binding.scope_sha256,
+        target,
+        JSON.stringify(report),
+        binding.holder_revision,
+        ...(destruction?.completed.bindings ?? []),
+      ),
+      ...(terminal(target)
+        ? postgresPoolCnpgSelectionStatements(env.DB, {
+            databaseId: scope.database_id,
+            generation: scope.generation,
+            now,
+            guard: originalGuard,
+          })
+        : []),
     ]);
     if (results[0]!.meta.changes !== 1 || results[1]!.meta.changes !== 1)
       throw conflict();
@@ -1408,21 +1300,16 @@ export async function recordPostgresPoolServing(
   if (results.some((result) => result.meta.changes !== 1)) throw conflict();
   await hintPostgresPoolProgress(env, binding);
 }
-export function postgresPoolIdleChargeSql(
-  nodeAlias: string,
-  resource: "cpu_millicores" | "memory_mib",
-) {
-  if (!/^[a-z][a-z0-9_]*$/.test(nodeAlias))
-    throw new Error("invalid_node_sql_alias");
-  return `COALESCE((SELECT SUM(pi.${resource === "cpu_millicores" ? "idle_cpu_millicores" : "idle_memory_mib"}) FROM pool_pods pi WHERE pi.node_id=${nodeAlias}.id AND pi.node_uid=${nodeAlias}.node_uid AND pi.state='ready'),0)`;
-}
+export { postgresPoolIdleChargeSql } from "./startup-admission.ts";
 
 /** Cross-record comparison is separate from structural Zod proof validation. */
 function creatorProofMatches(report: PoolNodeReport, binding: PoolBinding) {
   const fence = report.kernel_proof.creator_fence,
     storage = binding.scope.storage;
   return (
-    (report.state !== "mounted" && report.boot_loss === undefined) ||
+    (report.state !== "mounted" &&
+      report.boot_loss === undefined &&
+      report.reference_destruction === undefined) ||
     (fence !== null &&
       fence.scope_sha256 === binding.scope_sha256 &&
       fence.storage_uid === storage.storage_uid &&
@@ -2230,8 +2117,12 @@ export async function recordPostgresPoolCleanupIoAttestation(
     AND EXISTS(SELECT 1 FROM pool_io_attestations i WHERE i.binding_id=? AND i.attestation_json=?)
     AND EXISTS(SELECT 1 FROM node_compute_pool_policies p JOIN node_host_configurations h ON h.node_id=p.node_id AND h.node_uid=p.node_uid
       WHERE p.node_id=? AND p.node_uid=? AND p.policy_json=? AND h.profile_sha256=? AND h.sha256=?)
+    AND (NOT EXISTS(SELECT 1 FROM pool_cleanup_grants g WHERE g.binding_id=? AND g.operation_id=?)
+      OR EXISTS(SELECT 1 FROM pool_cleanup_io_attestations retained WHERE retained.binding_id=? AND retained.operation_id=? AND retained.attestation_json=?))
     ON CONFLICT(binding_id,operation_id) DO UPDATE SET attestation_json=excluded.attestation_json,observed_at=excluded.observed_at
-    WHERE pool_cleanup_io_attestations.observed_at<=excluded.observed_at`,
+    WHERE pool_cleanup_io_attestations.observed_at<=excluded.observed_at
+      AND (NOT EXISTS(SELECT 1 FROM pool_cleanup_grants g WHERE g.binding_id=pool_cleanup_io_attestations.binding_id AND g.operation_id=pool_cleanup_io_attestations.operation_id)
+        OR pool_cleanup_io_attestations.attestation_json=excluded.attestation_json)`,
   )
     .bind(
       bindingId,
@@ -2254,6 +2145,11 @@ export async function recordPostgresPoolCleanupIoAttestation(
       context.host.policy_json,
       context.host.profile_sha256,
       context.host.host_sha256,
+      bindingId,
+      report.operation_id,
+      bindingId,
+      report.operation_id,
+      JSON.stringify(report),
     )
     .run();
   if (result.meta.changes !== 1)
