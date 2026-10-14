@@ -16,6 +16,7 @@ use pgcf_native_protocol::{
 };
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -40,6 +41,76 @@ use tokio_tungstenite::{
 };
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type WebSocket = WebSocketStream<BudgetedStream>;
+#[cfg(test)]
+mod admission_revision_tests {
+    use super::*;
+    use crate::kubernetes::{Fence, Intent};
+    #[test]
+    fn v4_requires_a_persisted_independent_route_revision_at_the_existing_generation() {
+        let database = "a".repeat(20);
+        let pod = "01234567-89ab-4def-8123-0123456789ab";
+        let claims:RouteClaims=serde_json::from_value(serde_json::json!({"v":4,"db":database,"user":"app","cid":pod,"rg":"eu-test","kid":"test","iat":1,"exp":31,"rev":7,"pod":pod,"route_revision":19})).unwrap();
+        let mut state = FenceState::default();
+        state.records.insert(
+            database.clone(),
+            Fence {
+                uid: pod.into(),
+                intent: Intent {
+                    database: database.clone(),
+                    operation: format!("op_{}", "a".repeat(20)),
+                    revision: 7,
+                    mode: "running".into(),
+                },
+                retired_at: None,
+                deleting: false,
+                admission_target: None,
+            },
+        );
+        assert!(!route_revision_current(&state, &claims));
+        let target = serde_json::json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")});
+        state.records.get_mut(&database).unwrap().admission_target =
+            Some(serde_json::from_value(target).unwrap());
+        assert!(route_revision_current(&state, &claims));
+        state
+            .records
+            .get_mut(&database)
+            .unwrap()
+            .admission_target
+            .as_mut()
+            .unwrap()
+            .route_revision = 20;
+        assert!(!route_revision_current(&state, &claims));
+        state
+            .records
+            .get_mut(&database)
+            .unwrap()
+            .admission_target
+            .as_mut()
+            .unwrap()
+            .route_revision = 19;
+        let mut actual = TargetIdentity {
+            address: "10.0.0.7".parse().unwrap(),
+            pod_uid: pod.into(),
+            node: "customer-us1".into(),
+            storage: None,
+            container_id: None,
+            ca: None,
+        };
+        assert!(!admitted_runtime_current(&state, &claims, &actual));
+        actual.container_id = Some("a".repeat(64));
+        actual.ca = Some(crate::targets::CaIdentity {
+            ca_secret_uid: pod.into(),
+            ca_secret_resource_version: "81".into(),
+            ca_sha256: "b".repeat(64),
+        });
+        assert!(admitted_runtime_current(&state, &claims, &actual));
+        actual.ca.as_mut().unwrap().ca_secret_resource_version = "82".into();
+        assert!(!admitted_runtime_current(&state, &claims, &actual));
+        actual.ca.as_mut().unwrap().ca_secret_resource_version = "81".into();
+        actual.container_id = Some("c".repeat(64));
+        assert!(!admitted_runtime_current(&state, &claims, &actual));
+    }
+}
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
 pub struct Config {
     pub region: String,
@@ -67,6 +138,7 @@ pub struct DatabaseTarget {
     pub port: u16,
     pub address: std::net::IpAddr,
     pub pod_uid: String,
+    pub ca_sha256: Option<String>,
 }
 pub trait PostgresDial: Send + Sync {
     fn dial<'a>(
@@ -83,6 +155,18 @@ impl PostgresDial for ClusterPostgresDial {
         Box::pin(async move {
             for attempt in 0..2 {
                 let ca = self.0.database_ca(&target.database, attempt == 1).await?;
+                if target.ca_sha256.as_ref().is_some_and(|expected| {
+                    Sha256::digest(&ca)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                        != *expected
+                }) {
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err("admitted TLS authority changed".into());
+                }
                 match dial_postgres(target.address, &target.host, target.port, &ca).await {
                     Ok(postgres) => return Ok(postgres),
                     Err(error) => {
@@ -351,7 +435,10 @@ pub async fn serve_socket(
             .await;
         }
     };
-    if !revision_current || !route_target_current(&claims, &target) {
+    if !revision_current
+        || !route_target_current(&claims, &target)
+        || !admitted_runtime_current(&*gateway.fences.read().await, &claims, &target)
+    {
         stages.outcome = "route_stale";
         return control::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"})).await;
     }
@@ -626,6 +713,17 @@ async fn startup(
                         stages.outcome = "fenced";
                         return Err("fence changed during startup".into());
                     }
+                    if !admitted_runtime_current(&state, claims, bound) {
+                        return Err("admitted runtime changed before dial".into());
+                    }
+                    let admitted = if claims.v == 4 {
+                        state
+                            .records
+                            .get(&database)
+                            .and_then(|fence| fence.admission_target.clone())
+                    } else {
+                        None
+                    };
                     drop(state);
                     // The route was checked against this writer; a replacement is never dialled.
                     if !gateway
@@ -643,7 +741,11 @@ async fn startup(
                         .unwrap()
                         .update(id, false, true, true);
                     let target = DatabaseTarget {
-                        host: format!("database-rw.pgcf-db-{database}.svc"),
+                        host: admitted
+                            .as_ref()
+                            .map(|target| target.tls_server_name.clone())
+                            .unwrap_or_else(|| format!("database-rw.pgcf-db-{database}.svc")),
+                        ca_sha256: admitted.map(|target| target.ca_sha256),
                         database: database.clone(),
                         port: 5432,
                         address: bound.address,
@@ -791,12 +893,51 @@ async fn relay(
 /// A v3 route names the revision Cloudflare admitted; the running fence must still be it.
 /// Temporary rollout compatibility: a v2 route names no revision and keeps the fence checks.
 fn route_revision_current(state: &FenceState, claims: &RouteClaims) -> bool {
+    if claims.v == 4 {
+        return claims
+            .rev
+            .zip(claims.route_revision)
+            .is_some_and(|(generation, revision)| {
+                state.records.get(&claims.db).is_some_and(|fence| {
+                    fence.intent.mode == "running"
+                        && fence.intent.revision == generation
+                        && fence.admission_target.as_ref().is_some_and(|target| {
+                            target.generation == generation
+                                && target.route_revision == revision
+                                && claims.pod.as_ref() == Some(&target.pod_uid)
+                        })
+                })
+            });
+    }
     claims.rev.is_none_or(|revision| {
         state.records.get(&claims.db).is_some_and(|fence| {
             fence.intent.mode == "running" && fence.intent.revision == revision
         })
     })
 }
+fn admitted_runtime_current(
+    state: &FenceState,
+    claims: &RouteClaims,
+    target: &TargetIdentity,
+) -> bool {
+    if claims.v != 4 {
+        return true;
+    }
+    route_revision_current(state, claims)
+        && state
+            .records
+            .get(&claims.db)
+            .and_then(|fence| fence.admission_target.as_ref())
+            .is_some_and(|admitted| {
+                target.container_id.as_ref() == Some(&admitted.container_id)
+                    && target.ca.as_ref().is_some_and(|ca| {
+                        ca.ca_secret_uid == admitted.ca_secret_uid
+                            && ca.ca_secret_resource_version == admitted.ca_secret_resource_version
+                            && ca.ca_sha256 == admitted.ca_sha256
+                    })
+            })
+}
+
 /// A v3 route names the verified primary Pod; the cached writer and any storage binding must
 /// be that Pod at that revision. The dial still uses the writer's address and service TLS name.
 fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {

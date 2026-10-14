@@ -103,6 +103,7 @@ fn activity_token(nonce: usize, revision: u64) -> String {
 }
 fn fence(mode: &str, revision: u64) -> Fence {
     Fence {
+        admission_target: None,
         uid: cid(100),
         intent: Intent {
             database: DATABASE.into(),

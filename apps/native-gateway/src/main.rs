@@ -71,6 +71,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "endpointslices",
         receiver.clone(),
     ));
+    let pods = tokio::spawn(targets::synchronize(
+        api.clone(),
+        gateway.targets.clone(),
+        trust.clone(),
+        "pods",
+        receiver.clone(),
+    ));
     let storage = tokio::spawn(targets::synchronize(
         api.clone(),
         gateway.targets.clone(),
@@ -111,6 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = synchronize.await;
     let _ = endpoints.await;
     let _ = storage.await;
+    let _ = pods.await;
     Ok(())
 }
 async fn shutdown_signal() {

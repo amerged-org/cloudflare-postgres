@@ -22,12 +22,27 @@ pub struct Intent {
     pub revision: u64,
     pub mode: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionTarget {
+    pub v: u8,
+    pub generation: u64,
+    pub route_revision: u64,
+    pub admission_epoch: u64,
+    pub pod_uid: String,
+    pub container_id: String,
+    pub ca_secret_uid: String,
+    pub ca_secret_resource_version: String,
+    pub ca_sha256: String,
+    pub tls_server_name: String,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fence {
     pub uid: String,
     pub intent: Intent,
     pub retired_at: Option<u64>,
     pub deleting: bool,
+    pub admission_target: Option<AdmissionTarget>,
 }
 #[derive(Default)]
 pub struct FenceState {
@@ -74,7 +89,13 @@ impl FenceState {
                 self.ready = false;
                 return Err("fence disappeared");
             };
-            if new.uid != old.uid
+            if old.admission_target.as_ref().is_some_and(|prior| {
+                new.admission_target.as_ref().is_none_or(|next| {
+                    next.route_revision < prior.route_revision
+                        || next.admission_epoch < prior.admission_epoch
+                        || next.generation < prior.generation
+                })
+            }) || new.uid != old.uid
                 || new.intent.revision < old.intent.revision
                 || (new.intent.revision == old.intent.revision && new.intent != old.intent)
                 || (old.intent.mode == "retired" && new.intent != old.intent)
@@ -396,6 +417,7 @@ impl Kubernetes {
 fn discovery_path(path: &str, selector: &str) -> Result<(), &'static str> {
     if (path == "/apis/discovery.k8s.io/v1/endpointslices"
         && selector == "kubernetes.io/service-name=database-rw")
+        || (path == "/api/v1/pods" && selector == "cnpg.io/cluster=database")
         || (path == format!("/api/v1/namespaces/{}/configmaps", wire("fenceNamespace"))
             && selector == "pgcf.io/database-id")
     {
@@ -480,6 +502,29 @@ pub fn parse_snapshot(value: &Value) -> Result<HashMap<String, Fence>, &'static 
         } else {
             None
         };
+        let admission_target = item["data"]
+            .get("admission_target")
+            .map(|raw| {
+                let raw = raw
+                    .as_str()
+                    .filter(|raw| raw.len() <= 4096)
+                    .ok_or("invalid admitted target")?;
+                let value: Value =
+                    serde_json::from_str(raw).map_err(|_| "invalid admitted target")?;
+                if !valid_schema("gatewayAdmissionTarget", &value) {
+                    return Err("invalid admitted target");
+                }
+                let target: AdmissionTarget =
+                    serde_json::from_value(value).map_err(|_| "invalid admitted target")?;
+                if target.generation > intent.revision
+                    || target.tls_server_name
+                        != format!("database-rw.pgcf-db-{}.svc", intent.database)
+                {
+                    return Err("invalid admitted target binding");
+                }
+                Ok(target)
+            })
+            .transpose()?;
         if records
             .insert(
                 intent.database.clone(),
@@ -488,6 +533,7 @@ pub fn parse_snapshot(value: &Value) -> Result<HashMap<String, Fence>, &'static 
                     intent,
                     retired_at,
                     deleting: metadata.get("deletionTimestamp").is_some(),
+                    admission_target,
                 },
             )
             .is_some()
