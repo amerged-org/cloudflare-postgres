@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tonic::Status;
+mod qualified;
 
 pub const ROOT: &str = "/var/lib/kubelet/pgcf-pool-gates";
 const MAX_RECORD: u64 = 4096;
@@ -221,7 +222,7 @@ impl LockedVolume<'_> {
     pub fn record_path(&self) -> PathBuf {
         self.root.path.join(format!("{}.deny", self.key))
     }
-    fn existing(&self) -> Result<Option<Vec<u8>>, Status> {
+    fn existing_record(&self) -> Result<Option<(Vec<u8>, fs::Metadata)>, Status> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -248,7 +249,10 @@ impl LockedVolume<'_> {
         if bytes.len() as u64 > MAX_RECORD {
             return Err(refused());
         }
-        Ok(Some(bytes))
+        Ok(Some((bytes, meta)))
+    }
+    fn existing(&self) -> Result<Option<Vec<u8>>, Status> {
+        Ok(self.existing_record()?.map(|(bytes, _)| bytes))
     }
     /// CSI checks only durable absence, after acquiring the lock. Invalid records are denial.
     pub fn publish_allowed(&self) -> Result<bool, Status> {
@@ -270,6 +274,39 @@ impl LockedVolume<'_> {
                 Err(refused())
             };
         }
+        self.write_record(&bytes)
+    }
+    /// Only a fresh authenticated CF qualification GET can provide accepted evidence. The
+    /// caller first verifies current local driver, zero-device and absent dispatch journal.
+    /// This changes deny ownership, never grants a mount/start or clears CSI denial.
+    pub fn claim_qualified(
+        &mut self,
+        record: &Record,
+        desired: &serde_json::Value,
+        input: &serde_json::Value,
+        preparation: &serde_json::Value,
+        keys: &std::collections::HashMap<String, Vec<u8>>,
+        now: u64,
+    ) -> Result<(), Status> {
+        let evidence = qualified::accepted(record, desired, input, preparation, keys, now)?;
+        let (existing, meta) = self.existing_record()?.ok_or_else(refused)?;
+        let lock = self._lock.metadata().map_err(|_| refused())?;
+        let root = self.root.directory.metadata().map_err(|_| refused())?;
+        let current_lock = fs::symlink_metadata(self.root.path.join(format!("{}.lock", self.key)))
+            .map_err(|_| refused())?;
+        let current_root = fs::symlink_metadata(&self.root.path).map_err(|_| refused())?;
+        if record.volume_handle != self.handle
+            || existing != evidence.previous.bytes()?
+            || meta.ino() != evidence.inode
+            || digest(&existing) != evidence.record_sha256
+            || (lock.dev(), lock.ino()) != (current_lock.dev(), current_lock.ino())
+            || (root.dev(), root.ino()) != (current_root.dev(), current_root.ino())
+        {
+            return Err(refused());
+        }
+        self.write_record(&record.bytes()?)
+    }
+    fn write_record(&self, bytes: &[u8]) -> Result<(), Status> {
         let temporary = self
             .root
             .path
@@ -282,7 +319,7 @@ impl LockedVolume<'_> {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&temporary)
                 .map_err(|_| refused())?;
-            file.write_all(&bytes).map_err(|_| refused())?;
+            file.write_all(bytes).map_err(|_| refused())?;
             file.sync_all().map_err(|_| refused())?;
             fs::rename(&temporary, self.record_path()).map_err(|_| refused())?;
             self.root.directory.sync_all().map_err(|_| refused())?;
