@@ -5,6 +5,7 @@ use pgcf_native_protocol::{pool, qualification};
 use serde_json::{Value, json};
 use std::path::Path;
 use tonic::Status;
+const HOST_PRODUCER: &str = "node_agent";
 fn refused() -> Status {
     Status::failed_precondition("pool_qualification_execution_unconfirmed")
 }
@@ -29,6 +30,13 @@ fn storage(scope: &Value) -> Value {
     s["profile"] = scope["storage"].clone();
     s
 }
+fn claims_match(input: &Value, claims: &Value) -> bool {
+    claims["scope"] == input["scope"]
+        && claims["scope_sha256"] == input["scope_sha256"]
+        && claims["challenge"] == input["challenge"]
+        && qualification::progress_hash(&input["pending_progress"])
+            .is_some_and(|hash| claims["progress_sha256"] == hash)
+}
 pub fn claims(input: &Value, client: &Client) -> Result<Value, Status> {
     if !qualification::validate("PostgresPoolQualificationInput", input) {
         return Err(refused());
@@ -42,9 +50,7 @@ pub fn claims(input: &Value, client: &Client) -> Result<Value, Status> {
     let claims =
         qualification::verify_qualification_permission(text(input, "permission")?, &keys, now())
             .ok_or_else(refused)?;
-    if claims["scope"] != input["scope"]
-        || claims["scope_sha256"] != input["scope_sha256"]
-        || claims["challenge"] != input["challenge"]
+    if !claims_match(input, &claims)
         || claims["scope"]["node_id"] != client.local().node_id
         || claims["scope"]["node_uid"] != client.local().node_uid
         || claims["scope"]["region_id"] != client.local().region_id
@@ -59,6 +65,7 @@ pub fn claims(input: &Value, client: &Client) -> Result<Value, Status> {
     }
     Ok(claims)
 }
+
 async fn read_once(
     settings: &Settings,
     request: &Value,
@@ -93,7 +100,7 @@ pub async fn host_context(
     let scope = &grant["scope"];
     let challenge = &grant["challenge"];
     if challenge["gate"] != "host_mount_context"
-        || challenge["producer"] != "node"
+        || challenge["producer"] != HOST_PRODUCER
         || grant["preparation_sha256"].is_null()
         || !crate::pool_inventory::context_valid(preparation, client.local())
         || pool::preparation_hash(preparation).as_deref() != grant["preparation_sha256"].as_str()
@@ -181,6 +188,39 @@ pub async fn host_context(
     }
     claims(input, client)?;
     Ok(
-        json!({"run_id":scope["run_id"],"scope_sha256":grant["scope_sha256"],"sequence":challenge["sequence"],"nonce":challenge["nonce"],"producer":"node","node_uid":grant["execution"]["node_uid"],"boot_id":grant["execution"]["boot_id"],"candidate_spec_sha256":grant["execution"]["candidate_spec_sha256"],"started_at":issued,"observed_at":now(),"measurement":measurement}),
+        json!({"run_id":scope["run_id"],"scope_sha256":grant["scope_sha256"],"sequence":challenge["sequence"],"nonce":challenge["nonce"],"producer":HOST_PRODUCER,"node_uid":grant["execution"]["node_uid"],"boot_id":grant["execution"]["boot_id"],"candidate_spec_sha256":grant["execution"]["candidate_spec_sha256"],"started_at":issued,"observed_at":now(),"measurement":measurement}),
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn canonical_node_challenge_and_report_use_the_same_producer() {
+        let challenge = &qualification::CONTRACT["fixture"]["claims"]["challenge"];
+        assert_eq!(challenge["gate"], "host_mount_context");
+        assert_eq!(challenge["producer"], HOST_PRODUCER);
+        let schema = &qualification::CONTRACT["schemas"]["PostgresPoolQualificationReport"]["properties"]
+            ["producer"];
+        assert!(
+            jsonschema::validator_for(schema)
+                .unwrap()
+                .is_valid(&json!(HOST_PRODUCER))
+        );
+    }
+    #[test]
+    fn signed_progress_is_bound_before_any_node_action() {
+        let pending = qualification::CONTRACT["fixture"]["progress"].clone();
+        let hash = qualification::progress_hash(&pending).unwrap();
+        let mut claims = qualification::CONTRACT["fixture"]["claims"].clone();
+        claims["progress_sha256"] = hash.into();
+        let mut input = json!({"scope":claims["scope"],"scope_sha256":claims["scope_sha256"],"challenge":claims["challenge"],"pending_progress":pending});
+        assert!(claims_match(&input, &claims));
+        input["pending_progress"][0]["received_at"] = input["pending_progress"][0]["received_at"]
+            .as_u64()
+            .unwrap()
+            .saturating_add(1)
+            .into();
+        assert!(!claims_match(&input, &claims));
+    }
 }

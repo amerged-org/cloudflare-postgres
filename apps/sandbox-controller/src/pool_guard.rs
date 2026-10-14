@@ -6,7 +6,7 @@ use crate::{
 };
 use pgcf_native_protocol::{
     pool,
-    storage::{StorageTrust, VerifiedStorageAuthority},
+    storage::{StorageTrust, StorageWriteClaims, VerifiedStorageAuthority},
 };
 use serde_json::Value;
 use std::{
@@ -25,6 +25,22 @@ fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, Status> {
 }
 fn number(v: &Value, key: &str) -> Result<u64, Status> {
     v[key].as_u64().ok_or_else(refused)
+}
+fn replace_grant(old: &StorageWriteClaims, next: &StorageWriteClaims) -> Result<bool, Status> {
+    if next.authority_revision < old.authority_revision {
+        return Err(refused());
+    }
+    if next.authority_revision > old.authority_revision {
+        return Ok(true);
+    }
+    let mut same_revision = next.clone();
+    same_revision.exp = old.exp;
+    if same_revision != *old {
+        return Err(refused());
+    }
+    // A drain can shorten the CF deadline without changing its headroom revision.
+    // A later IO observation cannot extend this local clock at the same revision.
+    Ok(next.exp <= old.exp)
 }
 pub struct Armed {
     scope: Value,
@@ -131,12 +147,10 @@ impl Armed {
             .ok_or_else(refused)?;
         let old = self.authority.claims();
         let new = next.claims();
-        if self.expiry_latched
-            || new.authority_revision < old.authority_revision
-            || (new.authority_revision == old.authority_revision && new != old)
-        {
+        if self.expiry_latched {
             return Err(refused());
         }
+        let replace = replace_grant(old, new)?;
         let mut remaining = Duration::from_millis(new.exp.saturating_sub(current));
         if new.authority_revision == old.authority_revision {
             remaining = remaining.min(self.remaining.saturating_sub(self.received.elapsed()))
@@ -161,6 +175,9 @@ impl Armed {
         if !self.permits() || received.elapsed() >= remaining || now() >= new.exp {
             self.expiry_latched = true;
             return Err(refused());
+        }
+        if !replace {
+            return Ok(());
         }
         self.authority = next;
         self.token = token.to_owned();
@@ -226,6 +243,9 @@ impl Armed {
             process.recheck()?;if !process.io_matches(self.device,bps,iops)?{return Err(refused())}
             Ok(serde_json::json!({"container_id":process.container_id,"cgroup_inode":process.cgroup_inode,"pid":host_pids.get(&process.pid).ok_or_else(refused)?,"start_ticks":process.start_ticks,"pid_namespace":process.pid_namespace.inode,"device_major":libc::major(self.device),"device_minor":libc::minor(self.device),"write_bytes_per_second":bps,"write_iops_per_second":iops,"io_max_verified":true}))
         }).collect::<Result<Vec<_>,Status>>()?;
+        if !self.permits() {
+            return Err(refused());
+        }
         Ok(
             serde_json::json!({"authority_token":self.token,"authority_revision":self.authority_revision(),"expires_at":self.expires_at(),"protect_on_expiry_armed":true,"shared_pod_io":{"pod_cgroup_inode":self.shared.pod_cgroup_inode,"device_major":libc::major(self.device),"device_minor":libc::minor(self.device),"write_bytes_per_second":bps,"write_iops_per_second":iops,"io_max_verified":true,"all_writer_cgroups_descendants":true},"cgroups":cgroups}),
         )
@@ -303,5 +323,69 @@ impl Drop for Active {
     fn drop(&mut self) {
         let _ = self.revoke();
         self.clock.abort();
+    }
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::*;
+    #[test]
+    fn signed_same_revision_deadline_can_shrink_but_never_extend() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use ring::{
+            rand::SystemRandom,
+            signature::{Ed25519KeyPair, KeyPair},
+        };
+        let pair = Ed25519KeyPair::from_pkcs8(
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let keys = serde_json::json!({"cf":URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())})
+            .to_string();
+        let trusted =
+            StorageTrust::parse(&keys, &crate::pool_gate::digest(keys.as_bytes())).unwrap();
+        let scope = &pool::CONTRACT["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "thin-scope")
+            .unwrap()["value"];
+        let storage = &scope["storage"];
+        let profile = &storage["profile"];
+        let now = now();
+        let old: StorageWriteClaims = serde_json::from_value(serde_json::json!({
+            "v":1,"kid":"cf","database_id":scope["database_id"],"generation":scope["generation"],
+            "authority_revision":1,"storage_uid":storage["storage_uid"],"node_uid":scope["node_uid"],
+            "volume_group_uuid":storage["volume_group_uuid"],"pool_uuid":profile["pool_uuid"],
+            "profile_sha256":profile["profile_sha256"],"volume_handle":storage["volume_handle"],
+            "lv_uuid":storage["lv_uuid"],"pvc_uid":storage["pvc_uid"],"pv_uid":storage["pv_uid"],
+            "pod_uid":scope["pool_pod_uid"],"observed_at":now,"iat":now,"exp":now+1000,
+            "guard_seconds":profile["guard_seconds"],"drain_seconds":profile["drain_seconds"],"write_allowed":true
+        })).unwrap();
+        let verify = |claims: &StorageWriteClaims| {
+            let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+            let signature = pair.sign(
+                format!(
+                    "{}{}",
+                    pgcf_native_protocol::wire("storageAuthorityDomain"),
+                    body
+                )
+                .as_bytes(),
+            );
+            let token = format!("sa1.{body}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()));
+            pool::verify_pool_storage_authority(&trusted, &token, scope, now).unwrap()
+        };
+        let old = verify(&old);
+        let old = old.claims();
+        let mut next = old.clone();
+        next.exp -= 1;
+        assert!(replace_grant(old, verify(&next).claims()).unwrap());
+        next.exp = old.exp + 1;
+        assert!(!replace_grant(old, verify(&next).claims()).unwrap());
+        next.exp = old.exp;
+        next.observed_at -= 1;
+        assert!(replace_grant(old, verify(&next).claims()).is_err());
     }
 }

@@ -229,6 +229,21 @@ fn main() {
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A captured directory FD does not substitute for a still-existing original leaf.
+        // Exercise actual cgroup removal while both Process and CapturedGroup retain their FDs.
+        let original = processes[0].group_record();
+        fs::remove_dir(&leaves[0]).unwrap();
+        assert!(captured.recheck().is_err());
+        assert!(pgcf_sandbox_controller::pool_io::CapturedGroup::restore(&original).is_err());
+        fs::create_dir(&leaves[0]).unwrap();
+        assert_ne!(
+            fs::metadata(&leaves[0]).unwrap().ino(),
+            original.cgroup_inode
+        );
+        assert!(pgcf_sandbox_controller::pool_io::CapturedGroup::restore(&original).is_err());
+        println!(
+            "actual_empty_leaf_deleted_with_captured_fds=true recreated_leaf_inode_changed=true original_inode_reuse_refused=true"
+        );
         println!(
             "actual_original_cgroup_descendants_stopped_after_parent_exit=true actual_durable_inode_group_restored=true wrong_inode_refused=true"
         );

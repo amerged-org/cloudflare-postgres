@@ -102,7 +102,8 @@ pub struct Process {
     pidfd: OwnedFd,
     pod_uid: String,
 }
-/// One effective per-Pod/device ceiling for every writer, including the host worker in a leaf.
+/// Shared io.max configuration and measured IO for the exact Pod/device, including its host worker.
+/// These limits do not bound metadata/swap BIOs or replace Cloudflare's allocation reservation.
 pub struct SharedBudget {
     pub pod_cgroup_inode: u64,
     directory: File,

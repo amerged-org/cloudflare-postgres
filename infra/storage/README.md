@@ -15,10 +15,13 @@ NodeExpandVolume and the node volume/snapshot reconcilers now acquire the same
 per-volume lock as the agent and refuse any durable denial record. The root-owned
 `/var/lib/kubelet/pgcf-pool-gates` directory contains SHA-256 volume-handle keys.
 Locks are never unlinked; process death releases a lock but preserves denial.
-Expiry, malformed records and agent restart cannot authorize publishing. Only
-the agent removes its exact record after normal unmount, closure of creation
-descriptors and fresh UUID-scoped global device open-count zero. A guarded driver
-cannot be replaced or rolled back while a pool holder remains active.
+Expiry, malformed records and agent restart cannot authorize publishing. Normal
+detach requires nonlazy unmount, closure of creation descriptors and fresh
+UUID-scoped global device open-count zero. After a different boot, fresh physical
+absence is reported as an unclean boot loss without claiming an unmount. In both
+cases the agent retains its exact denial until Cloudflare's retained terminal
+binding contains one of its actual durable reports. A guarded driver cannot be
+replaced or rolled back while a pool holder remains active.
 
 
 The rebuilt executable has different machine bytes and a separately pinned hash.

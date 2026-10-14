@@ -272,8 +272,9 @@ fn mounted_report(
     }
     let s = &scope["storage"];
     let proof = json!({"device_major":libc::major(d.device()),"device_minor":libc::minor(d.device()),"mount_id":identity.mount_id,"dm_open_count":d.open_count().map_err(|_|refused())?,"foreign_mounts":unknown,"complete_namespace_scan":false,"named_namespace_scan_complete":observed.named_namespace_scan_complete,"zero_before_bind":true,"exclusive_superblock_creation":true,"nonlazy_unmount_verified":false,"never_attached_verified":false,"creator_fence":{"v":1,"scope_sha256":record.scope_sha256,"storage_uid":s["storage_uid"],"volume_handle":s["volume_handle"],"volume_group_uuid":s["volume_group_uuid"],"lv_uuid":s["lv_uuid"],"driver_gate_protocol":1,"driver_image":scope["driver_image"],"driver_sha256":driver.executable_sha256,"deny_record_durable":true,"csi_node_publish_serialized":true,"csi_node_expand_serialized":true,"creation_fds_closed":true},"mountpoint":{"pool_pod_uid":scope["pool_pod_uid"],"root_uid":0,"mode":493,"tmpfs":true,"opened_beneath":true,"symlink_free":true}});
-    let value = json!({"v":1,"binding_id":scope["binding_id"],"scope_sha256":record.scope_sha256,"node_uid":scope["node_uid"],"boot_id":crate::storage::current_boot_id()?,"pool_pod_uid":scope["pool_pod_uid"],"state":"mounted","observed_at":now(),"storage_backend":"lvm-thin-v1","thin_guard":active.proof()?,"kernel_proof":proof,"clean_stop":null,"error":null});
-    if !pool::validate("PoolNodeReport", &value) {
+    let thin_guard = active.proof()?;
+    let value = json!({"v":1,"binding_id":scope["binding_id"],"scope_sha256":record.scope_sha256,"node_uid":scope["node_uid"],"boot_id":crate::storage::current_boot_id()?,"pool_pod_uid":scope["pool_pod_uid"],"state":"mounted","observed_at":now(),"storage_backend":"lvm-thin-v1","thin_guard":thin_guard,"kernel_proof":proof,"clean_stop":null,"error":null});
+    if !active.current() || !pool::validate("PoolNodeReport", &value) {
         return Err(refused());
     }
     Ok(value)
@@ -452,6 +453,51 @@ async fn begin(
         report,
     })
 }
+fn holder_observations(scope: &Value, report: Value) -> Result<Vec<(&'static str, Value)>, Status> {
+    if pool::scope_hash(scope).as_deref() != report["scope_sha256"].as_str()
+        || report["binding_id"] != scope["binding_id"]
+        || report["node_uid"] != scope["node_uid"]
+        || report["boot_id"] != scope["boot_id"]
+        || report["pool_pod_uid"] != scope["pool_pod_uid"]
+    {
+        return Err(refused());
+    }
+    let storage = &scope["storage"];
+    let proof = &report["kernel_proof"];
+    // Both values come from the current kernel/armed-holder measurement above. The initial
+    // pregrant receipt is never restamped to keep a later SA1 eligible.
+    let io = json!({"v":1,"binding_id":scope["binding_id"],"scope_sha256":report["scope_sha256"],
+        "node_uid":scope["node_uid"],"boot_id":scope["boot_id"],"pool_namespace_uid":scope["pool_namespace_uid"],
+        "pool_pod_uid":scope["pool_pod_uid"],"observed_at":report["observed_at"],
+        "device":{"volume_group_uuid":storage["volume_group_uuid"],"lv_uuid":storage["lv_uuid"],"thin_id":storage["thin_id"],
+            "device_major":proof["device_major"],"device_minor":proof["device_minor"]},
+        "shared_pod_io":report["thin_guard"]["shared_pod_io"],"cgroups":report["thin_guard"]["cgroups"]});
+    if !pool::validate("PoolIoAttestation", &io) {
+        return Err(refused());
+    }
+    Ok(vec![("PoolIoAttestation", io), ("PoolNodeReport", report)])
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingHolderAction {
+    ObserveMounted,
+    Drain,
+    Protect,
+}
+fn existing_holder_action(scope: &Value, desired: &Value) -> ExistingHolderAction {
+    if *scope != desired["binding"]["scope"] {
+        return ExistingHolderAction::Protect;
+    }
+    match (
+        desired["authority"].as_str(),
+        desired["binding"]["state"].as_str(),
+    ) {
+        (Some("current"), Some("mounted" | "serving")) => ExistingHolderAction::ObserveMounted,
+        (Some("revoked"), Some("detaching")) => ExistingHolderAction::Drain,
+        _ => ExistingHolderAction::Protect,
+    }
+}
+
 /// Omitted/revoked holders protect immediately; network failures leave the finite local clock intact.
 pub async fn run(
     settings: Settings,
@@ -496,13 +542,8 @@ pub async fn run(
                     let id = text(scope, "binding_id")?.to_owned();
                     seen.insert(id.clone());
                     if let Some(holder) = holders.get_mut(&id) {
-                        if entry["authority"] != "current"
-                            || holder.scope != *scope
-                            || !matches!(
-                                entry["binding"]["state"].as_str(),
-                                Some("mounted" | "serving")
-                            )
-                        {
+                        let action = existing_holder_action(&holder.scope, entry);
+                        if action == ExistingHolderAction::Protect {
                             let _ = holder.active.revoke();
                             continue;
                         }
@@ -529,7 +570,13 @@ pub async fn run(
                             &driver,
                             &containers,
                         )?;
-                        client.report_pool("PoolNodeReport", &holder.report).await?;
+                        for (schema, observation) in
+                            holder_observations(scope, holder.report.clone())?
+                        {
+                            if action != ExistingHolderAction::Drain || schema != "PoolNodeReport" {
+                                client.report_pool(schema, &observation).await?;
+                            }
+                        }
                     }
                 }
                 for (id, holder) in &holders {
@@ -786,10 +833,54 @@ mod recovery_tests {
         }
     }
     #[test]
+    fn existing_holder_observation_refreshes_io_before_node_report() {
+        let scope = state().scope.unwrap();
+        let measured = pool::CONTRACT["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "measured-thin-device")
+            .unwrap()["value"]
+            .clone();
+        let observed_at = measured["observed_at"].as_u64().unwrap() + 1;
+        let report = json!({"v":1,"binding_id":scope["binding_id"],"scope_sha256":pool::scope_hash(&scope).unwrap(),
+            "node_uid":scope["node_uid"],"boot_id":scope["boot_id"],"pool_pod_uid":scope["pool_pod_uid"],"observed_at":observed_at,
+            "kernel_proof":{"device_major":measured["device"]["device_major"],"device_minor":measured["device"]["device_minor"]},
+            "thin_guard":{"shared_pod_io":measured["shared_pod_io"],"cgroups":measured["cgroups"]}});
+        let reports = holder_observations(&scope, report).unwrap();
+        assert_eq!(reports[0].0, "PoolIoAttestation");
+        assert_eq!(reports[0].1["observed_at"], observed_at);
+        assert_eq!(reports[0].1["cgroups"], measured["cgroups"]);
+        assert_eq!(reports[1].0, "PoolNodeReport");
+    }
+    #[test]
+    fn exact_existing_detaching_holder_can_use_separate_drain_authority() {
+        let scope = state().scope.unwrap();
+        let mut desired =
+            json!({"authority":"current","binding":{"scope":scope,"state":"serving"}});
+        assert_eq!(
+            existing_holder_action(&scope, &desired),
+            ExistingHolderAction::ObserveMounted
+        );
+        desired["authority"] = "revoked".into();
+        desired["binding"]["state"] = "detaching".into();
+        // This only classifies the already armed holder. A separate valid SA1 remains mandatory.
+        assert_eq!(
+            existing_holder_action(&scope, &desired),
+            ExistingHolderAction::Drain
+        );
+        desired["binding"]["scope"]["generation"] = 999.into();
+        assert_eq!(
+            existing_holder_action(&scope, &desired),
+            ExistingHolderAction::Protect
+        );
+    }
+    #[test]
     fn reboot_reuses_physical_uuid_and_thin_id_without_reusing_old_device_number() {
         let state = state();
         let mut actual = crate::pool_device::ThinMetadata {
             device: libc::makedev(253, 9),
+            logical_size_bytes: 32 * 1024 * 1024,
             thin_id: state.scope.as_ref().unwrap()["storage"]["thin_id"]
                 .as_u64()
                 .unwrap() as u32,

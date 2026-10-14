@@ -13,6 +13,18 @@ mod pool_namespaces;
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.len() == 4 && args[1] == "--detach-crash" {
+        let identity = pool_mount::MountIdentity {
+            device: args[2].parse().unwrap(),
+            mount_id: args[3].parse().unwrap(),
+        };
+        pool_mount::MountedAnchor::open(std::path::Path::new("/tmp/pgcf-a8/anchor"))
+            .unwrap()
+            .detach_in_one_shot(identity)
+            .unwrap();
+        // Deliberately die after the real syscall and before any durable completion write.
+        unsafe { libc::_exit(73) }
+    }
     if args.len() == 6 && args[1] == "--zero-suspended" {
         let before = pool_device::thin_metadata(&args[2], &args[3], "volume", &args[4]).unwrap();
         let zero = pool_device::zero_thin(
@@ -25,10 +37,12 @@ fn main() {
         .unwrap();
         assert!(before.suspended);
         assert_eq!(before.open_count, 0);
+        assert_eq!(before.logical_size_bytes, 32 * 1024 * 1024);
         assert!(zero.still_zero().unwrap());
         let after = pool_device::thin_metadata(&args[2], &args[3], "volume", &args[4]).unwrap();
         assert!(after.suspended);
         assert_eq!(after.device, before.device);
+        assert_eq!(after.logical_size_bytes, before.logical_size_bytes);
         assert_eq!(after.open_count, 0);
         println!("actual_suspended_readonly_metadata_dm0=true device_remained_suspended=true");
         return;
@@ -305,10 +319,28 @@ fn main() {
         std::fs::read("/tmp/pgcf-a8/anchor/data/owned-marker").unwrap(),
         b"actual ext4 content"
     );
-    again.detach_in_one_shot(same).unwrap();
-    let zero = device_proof.zero().unwrap();
     journal_state = journal_state.dispatch_detach().unwrap();
     journal.store(&journal_state).unwrap();
+    let crashed = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--detach-crash",
+            &same.device.to_string(),
+            &same.mount_id.to_string(),
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(crashed.code(), Some(73));
+    let durable = journal.read().unwrap().unwrap();
+    assert_eq!(durable.phase, pool_journal::Phase::DetachDispatched);
+    assert!(durable.terminal_report.is_none());
+    assert!(!durable.terminal_acknowledged);
+    assert!(durable.dispatch_mount().is_err());
+    assert!(!locked.publish_allowed().unwrap());
+    let zero = device_proof.zero().unwrap();
+    assert!(zero.still_zero().unwrap());
+    println!(
+        "actual_crash_after_nonlazy_unmount_before_journal=true original_dispatch_and_deny_retained=true actual_worker_reaped=true actual_global_dm0=true"
+    );
     journal_state = journal_state.detached(&zero).unwrap();
     journal.store(&journal_state).unwrap();
     assert!(

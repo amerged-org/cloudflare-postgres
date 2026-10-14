@@ -100,6 +100,7 @@ fn observed_status(uuid: &str) -> io::Result<Header> {
 pub struct ThinMetadata {
     pub device: u64,
     pub thin_id: u32,
+    pub logical_size_bytes: u64,
     pub open_count: u32,
     pub suspended: bool,
     pub read_only: bool,
@@ -126,7 +127,8 @@ pub fn thin_metadata(
     if !text(&before.name)?.ends_with(&format!("-{}", handle.replace('-', "--"))) {
         return Err(refused());
     }
-    let rows = targets(&uuid)?;
+    let table = target_table(&uuid)?;
+    let rows = &table.rows;
     if rows.len() != 1 || rows[0].0 != "thin" {
         return Err(refused());
     }
@@ -144,18 +146,27 @@ pub fn thin_metadata(
         },
     )?;
     let after = observed_status(&uuid)?;
-    if before.dev != after.dev || before.flags != after.flags || targets(&uuid)? != rows {
+    if before.dev != after.dev || before.flags != after.flags || target_table(&uuid)? != table {
         return Err(refused());
     }
     Ok(ThinMetadata {
         device: after.dev,
         thin_id,
+        logical_size_bytes: table.sectors.checked_mul(512).ok_or_else(refused)?,
         open_count: after.open_count.try_into().map_err(|_| refused())?,
         suspended: after.flags & (1 << 1) != 0,
         read_only: after.flags & 1 != 0,
     })
 }
+#[derive(PartialEq, Eq)]
+struct TargetTable {
+    rows: Vec<(String, String)>,
+    sectors: u64,
+}
 fn targets(uuid: &str) -> io::Result<Vec<(String, String)>> {
+    Ok(target_table(uuid)?.rows)
+}
+fn target_table(uuid: &str) -> io::Result<TargetTable> {
     #[repr(C, align(8))]
     struct Buffer([u8; 65536]);
     let mut b = Buffer([0; 65536]);
@@ -213,7 +224,10 @@ fn targets(uuid: &str) -> io::Result<Vec<(String, String)>> {
         ));
         offset = end;
     }
-    Ok(output)
+    Ok(TargetTable {
+        rows: output,
+        sectors: end_sector,
+    })
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "backend", deny_unknown_fields)]
