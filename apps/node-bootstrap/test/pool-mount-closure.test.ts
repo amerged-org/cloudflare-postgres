@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   copyFile,
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -25,6 +26,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
   await mkdir(output, { mode: 0o700 });
   const container = `pgcf-pool-kernel-${randomUUID()}`;
   const fixture = "apps/sandbox-controller/tests/fixtures/pool-kernel";
+  const sourceHash = createHash("sha256").update(repo);
   const selected = [
     "apps/sandbox-controller/src/pool_mount.rs",
     "apps/sandbox-controller/src/pool_gate.rs",
@@ -52,6 +54,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
       const target = join(source, name);
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
       await copyFile(join(repo, name), target);
+      sourceHash.update(name).update(await readFile(target));
       await chmod(target, 0o600);
     }
     await copyFile(
@@ -75,6 +78,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
       "unsupported fixture architecture",
     );
     const platform = native === "aarch64" ? "linux/arm64" : "linux/amd64";
+    const cargoTarget = `/target/${sourceHash.digest("hex").slice(0, 24)}`;
     const built = await invoke(
       [
         "run",
@@ -94,7 +98,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
         "--env",
         "RUSTUP_TOOLCHAIN=1.99.0",
         "--env",
-        "CARGO_TARGET_DIR=/target",
+        `CARGO_TARGET_DIR=${cargoTarget}`,
         "--env",
         "CARGO_PROFILE_DEV_DEBUG=0",
         "--env",
@@ -104,7 +108,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
         versions.nativeRuntime.testBuilderImage,
         "sh",
         "-ec",
-        "exec 2>&1; cargo build --locked; cp /target/debug/pgcf-pool-kernel-fixture /out/pgcf-pool-kernel-fixture; chmod 0700 /out/pgcf-pool-kernel-fixture",
+        `exec 2>&1; apk add --no-cache musl-dev; cargo build --locked; cp ${cargoTarget}/debug/pgcf-pool-kernel-fixture /out/pgcf-pool-kernel-fixture; chmod 0700 /out/pgcf-pool-kernel-fixture`,
       ],
       180000,
     );
@@ -190,8 +194,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
         "completed fixture container cleanup failed",
       );
     }
-    if (passed)
-      await rm(privateRoot, { recursive: true, force: true });
+    if (passed) await rm(privateRoot, { recursive: true, force: true });
     // An uncertain mount/cleanup retains its exact owned container and private fixture for diagnosis.
   }
 });
@@ -205,10 +208,12 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
   const output = join(privateRoot, "output");
   await mkdir(output, { mode: 0o700 });
   const container = `pgcf-pool-io-${randomUUID()}`;
+  const sourceHash = createHash("sha256").update(repo);
   const copy = async (name: string) => {
     const target = join(source, name);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
     await copyFile(join(repo, name), target);
+    sourceHash.update(name).update(await readFile(target));
     await chmod(target, 0o600);
   };
   const tree = async (directory: string, suffix: string) => {
@@ -245,6 +250,7 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
       "apps/native-gateway",
       "apps/native-reclaimer",
       "apps/native-bootstrap-relay",
+      "apps/pool-supervisor",
     ]) {
       await copy(`${member}/Cargo.toml`);
       await tree(`${member}/src`, ".rs");
@@ -280,6 +286,7 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
     const protoc = versions.nativeRuntime.protoc.archives.find(
       (pin) => pin.os === "linux" && pin.architecture === "amd64",
     )!;
+    const cargoTarget = `/target/${sourceHash.digest("hex").slice(0, 24)}`;
     const built = await invoke(
       [
         "run",
@@ -299,7 +306,7 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
         "--env",
         "RUSTUP_TOOLCHAIN=1.99.0",
         "--env",
-        "CARGO_TARGET_DIR=/target",
+        `CARGO_TARGET_DIR=${cargoTarget}`,
         "--env",
         "CARGO_PROFILE_DEV_DEBUG=0",
         "--env",
@@ -309,7 +316,7 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
         versions.nativeRuntime.testBuilderImage,
         "sh",
         "-ec",
-        `exec 2>&1; apk add --no-cache curl unzip; mkdir /tmp/protoc; curl --fail --silent --show-error --location '${protoc.url}' --output /tmp/protoc.zip; printf '%s  %s\\n' '${protoc.sha256}' /tmp/protoc.zip | sha256sum -c -; unzip -q /tmp/protoc.zip -d /tmp/protoc; printf '%s  %s\\n' '${protoc.binarySha256}' /tmp/protoc/bin/protoc | sha256sum -c -; export PROTOC=/tmp/protoc/bin/protoc; cargo build --locked -p pgcf-sandbox-controller --example pool_io_fixture; cp /target/debug/examples/pool_io_fixture /out/pool-io; chmod 0700 /out/pool-io`,
+        `exec 2>&1; apk add --no-cache curl unzip musl-dev; mkdir /tmp/protoc; curl --fail --silent --show-error --location '${protoc.url}' --output /tmp/protoc.zip; printf '%s  %s\\n' '${protoc.sha256}' /tmp/protoc.zip | sha256sum -c -; unzip -q /tmp/protoc.zip -d /tmp/protoc; printf '%s  %s\\n' '${protoc.binarySha256}' /tmp/protoc/bin/protoc | sha256sum -c -; export PROTOC=/tmp/protoc/bin/protoc; cargo build --locked -p pgcf-sandbox-controller --example pool_io_fixture; cp ${cargoTarget}/debug/examples/pool_io_fixture /out/pool-io; chmod 0700 /out/pool-io`,
       ],
       300000,
     );
@@ -320,31 +327,36 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
       "pinned source IO fixture compilation failed; output withheld",
     );
     started = true;
-    const actual = await invoke([
-      "run",
-      "--name",
-      container,
-      "--platform",
-      "linux/amd64",
-      "--network",
-      "none",
-      "--env",
-      process.env.PGCF_POOL_IO_OBSERVATION === "1" ? "PGCF_POOL_IO_OBSERVATION=1" : "PGCF_POOL_IO_OBSERVATION=0",
-      "--privileged",
-      "--cgroupns",
-      "host",
-      "--mount",
-      `type=bind,source=${output},target=/fixture,readonly`,
-      "--mount",
-      "type=bind,source=/lib/modules,target=/lib/modules,readonly",
-      "--mount",
-      "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup",
-      "--entrypoint",
-      "/bin/sh",
-      "ghcr.io/amerged-org/pgcf-regional:lvm-thin-sha-be30d08d420b@sha256:10d5aee4fba5416ee68e2a49ab0d560df495c3b62a58118019aad5685d4f0c87",
-      "/fixture/fixture.sh",
-      "/fixture/pool-io",
-    ], process.env.PGCF_POOL_IO_OBSERVATION === "1" ? 120000 : 60000);
+    const actual = await invoke(
+      [
+        "run",
+        "--name",
+        container,
+        "--platform",
+        "linux/amd64",
+        "--network",
+        "none",
+        "--env",
+        process.env.PGCF_POOL_IO_OBSERVATION === "1"
+          ? "PGCF_POOL_IO_OBSERVATION=1"
+          : "PGCF_POOL_IO_OBSERVATION=0",
+        "--privileged",
+        "--cgroupns",
+        "host",
+        "--mount",
+        `type=bind,source=${output},target=/fixture,readonly`,
+        "--mount",
+        "type=bind,source=/lib/modules,target=/lib/modules,readonly",
+        "--mount",
+        "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup",
+        "--entrypoint",
+        "/bin/sh",
+        "ghcr.io/amerged-org/pgcf-regional:lvm-thin-sha-be30d08d420b@sha256:10d5aee4fba5416ee68e2a49ab0d560df495c3b62a58118019aad5685d4f0c87",
+        "/fixture/fixture.sh",
+        "/fixture/pool-io",
+      ],
+      process.env.PGCF_POOL_IO_OBSERVATION === "1" ? 120000 : 60000,
+    );
     await writeFile(join(output, "diagnostic.log"), actual.stdout, {
       mode: 0o600,
     });
@@ -380,7 +392,6 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
         "completed IO fixture container cleanup failed",
       );
     }
-    if (passed)
-      await rm(privateRoot, { recursive: true, force: true });
+    if (passed) await rm(privateRoot, { recursive: true, force: true });
   }
 });
