@@ -47,9 +47,9 @@ async function sync(
   cacheCapable?: boolean,
 ): Promise<boolean> {
   DatabaseId.parse(id);
-  const snapshot = await readDatabasePresence(env.DB, id);
-  if (!snapshot) return false;
   if (cacheCapable === false) {
+    const snapshot = await readDatabasePresence(env.DB, id);
+    if (!snapshot) return false;
     // Legacy cron convergence remains presence-only; it explicitly clears any prior v4 cache.
     // Capable regions always take the complete publisher below.
     const closed = await env.DATABASE_ACTOR.get(
@@ -60,14 +60,13 @@ async function sync(
       // never removes an orphan barrier itself.
       const { publishDatabaseAdmission } =
         await import("./database-admission-snapshot.ts");
-      await publishDatabaseAdmission(env, id, undefined, snapshot);
+      await publishDatabaseAdmission(env, id);
     }
     return true;
   }
   const { publishDatabaseAdmission } =
     await import("./database-admission-snapshot.ts");
-  await publishDatabaseAdmission(env, id, undefined, snapshot);
-  return true;
+  return publishDatabaseAdmission(env, id);
 }
 
 /** One bounded keyset page; the cron and trusted callers decide when to read the next. */

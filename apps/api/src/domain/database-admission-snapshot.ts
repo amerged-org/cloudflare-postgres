@@ -13,8 +13,7 @@ import {
 import type { Env } from "../env.ts";
 import { DatabaseAdmissionSnapshot } from "./admission-state.ts";
 import { admissionSnapshotSql } from "./fleet-releases.ts";
-import { readDatabasePresence } from "./database-actor-sync.ts";
-import type { DatabasePresence } from "../database-actor.ts";
+import { DatabasePresence } from "../database-actor.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { notifyAdmissionRevisions } from "./admission-mutations.ts";
 import {
@@ -23,6 +22,8 @@ import {
 } from "./postgres-pool.ts";
 
 interface SnapshotRow extends DatabaseRow {
+  epoch_database_id: string | null;
+  presence_updated_at: string;
   project_deleted_at: string | null;
   node_uid: string | null;
   node_ready: number | null;
@@ -53,13 +54,10 @@ export async function readDatabaseAdmissionSnapshot(
   now = Date.now(),
 ) {
   DatabaseId.parse(id);
-  await env.DB.prepare(
-    "INSERT INTO database_admission_epochs(database_id) SELECT id FROM databases WHERE id=? ON CONFLICT(database_id) DO NOTHING",
-  )
-    .bind(id)
-    .run();
-  const row = await env.DB.prepare(
-    `SELECT d.*,p.deleted_at project_deleted_at,n.node_uid,n.ready node_ready,n.lost_at,r.gateway_url,r.gateway_binding,
+  const readRow = () =>
+    env.DB.prepare(
+      `SELECT d.*,p.deleted_at project_deleted_at,n.node_uid,n.ready node_ready,n.lost_at,r.gateway_url,r.gateway_binding,
+    ae.database_id epoch_database_id,CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END presence_updated_at,
     ae.admission_revision,ae.route_revision,ae.mutation_id,ae.completed_mutation_id,
     CASE WHEN ${admissionSnapshotSql("r")} THEN 1 ELSE 0 END cache_capable,
     CASE WHEN ${hasNonterminalPoolHolderSql("d")} THEN 1 ELSE 0 END pool_holder,
@@ -68,11 +66,22 @@ export async function readDatabaseAdmissionSnapshot(
     (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json,
     m.password_revision maintenance_revision
     FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions r ON r.id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
-    JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
+    LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
     LEFT JOIN node_region_policies policy ON policy.region_id=d.region_id LEFT JOIN maintenance_credentials m ON m.database_id=d.id WHERE d.id=?`,
-  )
-    .bind(id)
-    .first<SnapshotRow>();
+    )
+      .bind(id)
+      .first<SnapshotRow>();
+  let row = await readRow();
+  if (row && row.epoch_database_id === null) {
+    await env.DB.prepare(
+      "INSERT INTO database_admission_epochs(database_id) SELECT id FROM databases WHERE id=? ON CONFLICT(database_id) DO NOTHING",
+    )
+      .bind(id)
+      .run();
+    // One positive current readback, including a concurrent first publisher; never synthesize an epoch.
+    row = await readRow();
+    if (row?.epoch_database_id == null) return null;
+  }
   if (!row) return null;
   const roleOrder = (a: { name: string }, b: { name: string }) =>
     a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
@@ -204,6 +213,13 @@ export async function readDatabaseAdmissionSnapshot(
     (row.pool_holder === 0 || (pool && runtime !== null)) &&
     (row.cache_capable === 0 || runtime !== null);
   return {
+    presence: DatabasePresence.parse({
+      database_id: id,
+      revision: row.generation,
+      updated_at: row.presence_updated_at,
+      deleted,
+      roles: deleted ? [] : roles.map((role) => role.name),
+    }),
     snapshot: DatabaseAdmissionSnapshot.parse({
       v: 1,
       database_id: id,
@@ -232,16 +248,13 @@ export async function publishDatabaseAdmission(
   env: Env,
   id: string,
   completedMutation?: string,
-  knownPresence?: DatabasePresence,
 ) {
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
-  const presence = knownPresence ?? (await readDatabasePresence(env.DB, id));
-  if (!presence) return false;
-  await actor.seed(presence);
   if (await actor.repairAdmissionMutation())
     await notifyAdmissionRevisions(env, [id]);
   const state = await readDatabaseAdmissionSnapshot(env, id);
   if (!state) return false;
+  await actor.seed(state.presence);
   return actor.publishAdmissionSnapshot(
     state.snapshot,
     completedMutation ?? state.completed_mutation_id,
