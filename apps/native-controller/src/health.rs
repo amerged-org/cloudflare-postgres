@@ -582,6 +582,13 @@ async fn collect_backup(
             return Err("backup owner changed during read".into());
         }
     }
+    if crate::initial_backup::retry(kube, db, &namespace, &cluster, &backups)
+        .await
+        .is_err()
+    {
+        // Retry delivery cannot erase an already verified backup health observation.
+        eprintln!("{{\"event\":\"initial_backup_retry_failed\"}}");
+    }
     Ok((namespace, cluster, result))
 }
 #[cfg(test)]

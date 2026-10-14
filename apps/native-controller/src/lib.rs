@@ -3,6 +3,7 @@ pub mod api;
 pub mod contracts;
 pub mod fleet;
 pub mod health;
+pub mod initial_backup;
 pub mod inventory;
 pub mod kubernetes;
 pub mod manifests;
