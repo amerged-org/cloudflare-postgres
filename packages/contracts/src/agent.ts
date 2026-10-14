@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { DatabaseRuntimeAttestation } from "./reclaim.ts";
+import { DatabaseAdmissionIntent } from "./database-admission.ts";
+import {
+  DesiredPoolBinding,
+  PostgresPoolPolicyState,
+} from "./postgres-pool.ts";
 import { ComputePoolPolicy } from "./compute-pool.ts";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
@@ -209,6 +214,7 @@ export const DesiredDatabase = z
   .strictObject({
     id: DatabaseId,
     generation: z.number().int().min(1),
+    admission: DatabaseAdmissionIntent.optional(),
     storage_generation: z.number().int().positive().optional(),
     recovery: DesiredRecovery.optional(),
     desired_state: z.enum(["running", "suspended", "deleted"]),
@@ -227,6 +233,21 @@ export const DesiredDatabase = z
     /** CF-only signed, short-lived write gate; never part of power/configuration fingerprints. */
     storage_authority: z.string().max(STORAGE_AUTHORITY_MAX_LENGTH).optional(),
     storage_startup: DesiredStorageStartup.optional(),
+    pool_binding: DesiredPoolBinding.optional(),
+    pending_pool_role: z
+      .strictObject({
+        operation_id: OperationId,
+        binding_id: z.uuid(),
+        generation: z.number().int().positive(),
+        kind: z.enum(["create", "reset"]),
+        name: RoleName,
+        drain_deadline: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(Number.MAX_SAFE_INTEGER),
+      })
+      .optional(),
     size: DesiredSize,
     roles: z.array(DesiredRole).max(100).default([]),
     maintenance: MaintenanceCredential.optional(),
@@ -346,6 +367,7 @@ export const DesiredRegion = z.strictObject({
   id: RegionId,
   /** Current authoritative region pool template, including assigned per-Pod overhead. */
   compute_pool: ComputePoolPolicy.nullable().optional(),
+  postgres_pools: z.array(PostgresPoolPolicyState).max(1000).optional(),
   /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
   storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
   /** Nodes whose controller posts headroom samples, each once; omitted while none is selected. */

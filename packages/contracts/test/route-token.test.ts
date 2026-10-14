@@ -62,6 +62,97 @@ function signPayload(
 }
 
 describe("route token", () => {
+  it("v4 accepts the bounded maximum wire identities", async () => {
+    const keyring = {
+      active: "k".repeat(32),
+      keys: new Map([["k".repeat(32), keyBytes(1)]]),
+    };
+    const wideRegion = "r".repeat(32);
+    const token = await signRouteToken({
+      keyring,
+      region: wideRegion,
+      db,
+      user: "u".repeat(63),
+      cid,
+      now,
+      target: {
+        ...target,
+        revision: Number.MAX_SAFE_INTEGER,
+        route_revision: Number.MAX_SAFE_INTEGER,
+      },
+    });
+    expect(
+      await verifyRouteToken(token, {
+        keys: (await deriveRegionKeyring(keyring, wideRegion)).keys,
+        region: wideRegion,
+        now,
+      }),
+    ).toMatchObject({ ok: true });
+  });
+  it("v4 signs a separate route revision without changing the existing generation", async () => {
+    const token = await signRouteToken({
+      keyring: master,
+      region,
+      db,
+      user,
+      cid,
+      now,
+      target: { ...target, route_revision: 19 },
+    });
+    expect(token.startsWith("v4.")).toBe(true);
+    expect(
+      await verifyRouteToken(token, { keys: await regionKeys(), region, now }),
+    ).toEqual({
+      ok: true,
+      claims: {
+        v: 4,
+        db,
+        user,
+        cid,
+        rg: region,
+        kid: "k2",
+        iat: nowSec,
+        exp: nowSec + 30,
+        ...route,
+        route_revision: 19,
+      },
+    });
+    const [, payload, signature] = token.split(".");
+    expect(signature).toBe(
+      createHmac("sha256", (await regionKeys()).get("k2")!)
+        .update("pgcf-route/v4\n" + payload)
+        .digest("base64url"),
+    );
+  });
+  it("v4 refuses a missing revision and cannot be verified under the v3 signature domain", async () => {
+    const key = (await regionKeys()).get("k2")!;
+    const claims = {
+      v: 4,
+      db,
+      user,
+      cid,
+      rg: region,
+      kid: "k2",
+      iat: nowSec,
+      exp: nowSec + 30,
+      ...route,
+    };
+    expect(
+      await verifyRouteToken(signPayload(JSON.stringify(claims), key, "v4"), {
+        keys: await regionKeys(),
+        region,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+    const complete = { ...claims, route_revision: 19 };
+    expect(
+      await verifyRouteToken(signPayload(JSON.stringify(complete), key, "v3"), {
+        keys: await regionKeys(),
+        region,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+  });
   it("names the header", () => {
     expect(ROUTE_TOKEN_HEADER).toBe("X-PGCF-Route");
   });
@@ -591,7 +682,7 @@ describe("route token", () => {
       [null, "missing"],
       ["", "missing"],
       ["v3." + "A".repeat(600) + "." + sig, "too_long"],
-      [valid.replace(/^v3/, "v4"), "malformed"],
+      [valid.replace(/^v3/, "v4"), "bad_signature"],
       [`v3.${payload}`, "malformed"],
       [`v3.${payload}.${sig}.x`, "malformed"],
       [`v3.${payload}=.${sig}`, "malformed"],

@@ -32,7 +32,9 @@
     "./fleet-updates": "./src/fleet-updates.ts",
     "./region-material-rotation": "./src/region-material-rotation.ts",
     "./infrastructure-backups": "./src/infrastructure-backups.ts",
-    "./fleet-rollouts": "./src/fleet-rollouts.ts"
+    "./fleet-rollouts": "./src/fleet-rollouts.ts",
+    "./postgres-pool": "./src/postgres-pool.ts",
+    "./pool-cleanup-authority": "./src/pool-cleanup-authority.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

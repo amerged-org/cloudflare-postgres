@@ -3,6 +3,7 @@
 pub mod activity;
 #[path = "constants.generated.rs"]
 pub mod generated;
+pub mod pool;
 pub mod route;
 pub mod scoped_tokens;
 pub mod startup;
@@ -46,6 +47,9 @@ static CLAIM_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
     let mut result = HashMap::new();
     for name in [
         "routeClaims",
+        "admissionRouteClaims",
+        "poolAdmissionRouteClaims",
+        "gatewayAdmissionTarget",
         "legacyRouteClaims",
         "controlClaims",
         "activityClaims",
@@ -122,6 +126,15 @@ pub fn valid_schema(name: &str, value: &Value) -> bool {
                 };
                 if let Some(pattern) = CLAIM_PATTERNS.get(&format!("{name}/{key}"))
                     && !pattern.is_match(text)
+                {
+                    return false;
+                }
+                if field["minLength"]
+                    .as_u64()
+                    .is_some_and(|n| text.encode_utf16().count() < n as usize)
+                    || field["maxLength"]
+                        .as_u64()
+                        .is_some_and(|n| text.encode_utf16().count() > n as usize)
                 {
                     return false;
                 }

@@ -48,6 +48,25 @@
         "ttlSeconds": 30,
         "target": {
           "revision": 7,
+          "pod_uid": "01234567-89ab-4def-8123-0123456789ad",
+          "route_revision": 19
+        },
+        "active": "fixture",
+        "key": [
+          7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+          7, 7, 7, 7, 7, 7, 7, 7, 7
+        ],
+        "expected": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiIsInJnIjoiZXUtdGVzdCIsImtpZCI6ImZpeHR1cmUiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWQiLCJyb3V0ZV9yZXZpc2lvbiI6MTl9.-pMfaUKUM1ZvgKwAA1vDITDkbhpTLKPrp1xubvcSMtw"
+      },
+      {
+        "region": "eu-test",
+        "db": "aaaaaaaaaaaaaaaaaaaa",
+        "user": "app",
+        "cid": "01234567-89ab-4def-8123-0123456789ab",
+        "now": 1000000,
+        "ttlSeconds": 30,
+        "target": {
+          "revision": 7,
           "pod_uid": "01234567-89ab-4def-8123-0123456789ad"
         },
         "active": "fixture",
@@ -91,6 +110,16 @@
       }
     ],
     "salts": [
+      {
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "user": "app",
+        "active": "fixture",
+        "key": [
+          7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+          7, 7, 7, 7, 7, 7, 7, 7, 7
+        ],
+        "expected": "QMvQfKzdD5+UoMVqsFGqPg=="
+      },
       {
         "database": "aaaaaaaaaaaaaaaaaaaa",
         "user": "app",
@@ -150,6 +179,42 @@
       }
     },
     {
+      "name": "v4-independent-route-revision",
+      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTl9.S5QGgrEsk8YvCcF6ESPc3MR6hLYdtrsnt3QAG5p43z4",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": {
+        "ok": true,
+        "claims": {
+          "v": 4,
+          "db": "aaaaaaaaaaaaaaaaaaaa",
+          "user": "app",
+          "cid": "00000000-0000-0000-0000-000000000001",
+          "rg": "eu-test",
+          "kid": "test",
+          "iat": 1000,
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab",
+          "route_revision": 19
+        }
+      }
+    },
+    {
+      "name": "v4-missing-route-revision",
+      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.HPUALZCOD-dTAENH8teLXOJUVx87hoAVJ-nqWXF-bA0",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "v4-claims-under-v3",
+      "token": "v3.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTl9.oRSoT2zF2TruFutVQ0zDBt6Ys2SQHNddDAoUSUQOT78",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
       "name": "equivalent-json-numbers",
       "token": "v3.eyJ2IjozLjAsImRiIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJ1c2VyIjoiYXBwIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MWUzLCJleHAiOjEwMzAsInJldiI6N2UwLCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.fLaooJKuMbZyX60HTIYxY5nMozHsZT6SX9YgiS_8yaU",
       "now": 1000000,
@@ -190,6 +255,48 @@
           "pod": "01234567-89ab-4def-8123-0123456789ab"
         }
       }
+    },
+    {
+      "name": "pool-v4-exact-scope",
+      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTksImtpbmQiOiJwb29sIiwiYmluZGluZ19pZCI6IjEyMzQ1Njc4LTEyMzQtNDIzNC04MjM0LTEyMzQ1Njc4OTAxMiIsIm5vZGVfdWlkIjoiMjM0NTY3ODktMjM0NS00MzQ1LTgzNDUtMjM0NTY3ODkwMTIzIiwicG9kX2lwIjoiMTAuMS4yLjMiLCJzdG9yYWdlX2dlbmVyYXRpb24iOjIsInNjb3BlX3NoYTI1NiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifQ.Y-GX81d8IMM3oqR38xIDa5-U8yPMzKbi-VdOVVhEzqw",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": {
+        "ok": true,
+        "claims": {
+          "v": 4,
+          "db": "aaaaaaaaaaaaaaaaaaaa",
+          "user": "app",
+          "cid": "00000000-0000-0000-0000-000000000001",
+          "rg": "eu-test",
+          "kid": "test",
+          "iat": 1000,
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab",
+          "route_revision": 19,
+          "kind": "pool",
+          "binding_id": "12345678-1234-4234-8234-123456789012",
+          "node_uid": "23456789-2345-4345-8345-234567890123",
+          "pod_ip": "10.1.2.3",
+          "storage_generation": 2,
+          "scope_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "pool-v4-missing-binding",
+      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTksImtpbmQiOiJwb29sIiwibm9kZV91aWQiOiIyMzQ1Njc4OS0yMzQ1LTQzNDUtODM0NS0yMzQ1Njc4OTAxMjMiLCJwb2RfaXAiOiIxMC4xLjIuMyIsInN0b3JhZ2VfZ2VuZXJhdGlvbiI6Miwic2NvcGVfc2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9.3kj3D7xavi5YnrKc3i-dbbd7ZapjHRZUA-YW4SyGiVk",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "pool-v4-invalid-ip",
+      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTksImtpbmQiOiJwb29sIiwiYmluZGluZ19pZCI6IjEyMzQ1Njc4LTEyMzQtNDIzNC04MjM0LTEyMzQ1Njc4OTAxMiIsIm5vZGVfdWlkIjoiMjM0NTY3ODktMjM0NS00MzQ1LTgzNDUtMjM0NTY3ODkwMTIzIiwicG9kX2lwIjoiMTAuMS4yLjk5OSIsInN0b3JhZ2VfZ2VuZXJhdGlvbiI6Miwic2NvcGVfc2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9._Ui897RpAab6CB3viWBnGqvYh62COnbDBeySAwt5QqI",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
     },
     {
       "name": "missing",

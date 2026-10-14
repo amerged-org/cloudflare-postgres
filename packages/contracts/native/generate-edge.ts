@@ -88,6 +88,19 @@ export async function edgeVectors() {
       cid: "01234567-89ab-4def-8123-0123456789ab",
       now: 1000000,
       ttlSeconds: 30,
+      target: {
+        revision: 7,
+        pod_uid: "01234567-89ab-4def-8123-0123456789ad",
+        route_revision: 19,
+      },
+    },
+    {
+      region: "eu-test",
+      db: "a".repeat(20),
+      user: "app",
+      cid: "01234567-89ab-4def-8123-0123456789ab",
+      now: 1000000,
+      ttlSeconds: 30,
       target: { revision: 7, pod_uid: "01234567-89ab-4def-8123-0123456789ad" },
     },
     {

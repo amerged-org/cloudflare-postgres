@@ -5,6 +5,7 @@ import { z } from "zod";
 import { format } from "prettier";
 import {
   DatabaseRuntimeAttestation,
+  DATABASE_RUNTIME_PROOF_MAX_AGE_MS,
   reclaimConfigurationInput,
   reclaimConfigurationFingerprint,
 } from "../src/reclaim.ts";
@@ -569,6 +570,7 @@ const files = {
     version: 1,
     schemas,
     constants: {
+      DATABASE_RUNTIME_PROOF_MAX_AGE_MS,
       ARCHIVE_IDENTITY_QUERY,
       ARCHIVE_QUERY,
       ARCHIVE_FAILURE_MS,

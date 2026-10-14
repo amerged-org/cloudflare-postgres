@@ -5,8 +5,8 @@
 // Signature:  HMAC-SHA256(K, "pgcf-route/v3\n" + payloadB64u)
 // Region key: K = HMAC-SHA256(master[kid], "pgcf-route-key/v1\n" + regionId)
 //
-// A v3 token names the route revision and the verified primary Pod that Cloudflare
-// admitted; a gateway dials only while its fence and writer are exactly that route.
+// A v3 token names the database generation and verified primary Pod that Cloudflare
+// admitted; v4 adds an independent route revision under a separate signature domain.
 // The edge holds the master keyring and signs; a gateway holds only the keyring
 // derived for its own region, so a compromised gateway cannot mint tokens for
 // any other region.
@@ -18,12 +18,17 @@
 // still accept them. Remove v2 signing and verification and make the admission target
 // required once every region's release declares v3; a missing target is then refused.
 import { z } from "zod";
-import { DatabaseTarget } from "./database-admission.ts";
+import {
+  DatabaseTarget,
+  CnpgDatabaseTarget,
+  PoolDatabaseTarget,
+} from "./database-admission.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import { DATABASE_ID_PATTERN, REGION_ID_PATTERN, RoleName } from "./ids.ts";
 
 export const ROUTE_TOKEN_HEADER = "X-PGCF-Route";
 export const ROUTE_TOKEN_MAX_LENGTH = 512;
+export const ROUTE_TOKEN_ADMISSION_MAX_LENGTH = 1280;
 export const ROUTE_TOKEN_SIGN_TTL_SECONDS = 30;
 export const ROUTE_TOKEN_MAX_LIFETIME_SECONDS = 30;
 export const ROUTE_TOKEN_SKEW_SECONDS = 5;
@@ -31,6 +36,8 @@ export const ROUTE_KEY_MIN_BYTES = 32;
 
 const TOKEN_PREFIX = "v3";
 const SIGNATURE_DOMAIN = "pgcf-route/v3\n";
+const ADMISSION_TOKEN_PREFIX = "v4";
+const ADMISSION_SIGNATURE_DOMAIN = "pgcf-route/v4\n";
 const LEGACY_TOKEN_PREFIX = "v2";
 const LEGACY_SIGNATURE_DOMAIN = "pgcf-route/v2\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
@@ -38,6 +45,9 @@ const SIGNATURE_BYTES = 32;
 /** Authoritative wire constants for generated native consumers. */
 export const ROUTE_TOKEN_PREFIX = TOKEN_PREFIX;
 export const ROUTE_TOKEN_SIGNATURE_DOMAIN = SIGNATURE_DOMAIN;
+export const ROUTE_TOKEN_ADMISSION_PREFIX = ADMISSION_TOKEN_PREFIX;
+export const ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN =
+  ADMISSION_SIGNATURE_DOMAIN;
 /** Temporary rollout compatibility; the module comment names the removal condition. */
 export const ROUTE_TOKEN_LEGACY_PREFIX = LEGACY_TOKEN_PREFIX;
 export const ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN = LEGACY_SIGNATURE_DOMAIN;
@@ -60,12 +70,39 @@ const connectionClaims = {
 export const routeTokenClaimsSchema = z.strictObject({
   v: z.literal(3),
   ...connectionClaims,
-  /** Route revision: the committed revision whose verified target Cloudflare admitted. */
-  rev: DatabaseTarget.shape.revision,
+  /** Existing database generation, unchanged for v3 and v4. */
+  rev: CnpgDatabaseTarget.shape.revision,
   /** The verified primary Pod of that revision. */
-  pod: DatabaseTarget.shape.pod_uid,
+  pod: CnpgDatabaseTarget.shape.pod_uid,
 });
 export type RouteTokenClaims = z.infer<typeof routeTokenClaimsSchema>;
+export const cnpgAdmissionRouteTokenClaimsSchema =
+  routeTokenClaimsSchema.extend({
+    v: z.literal(4),
+    route_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  });
+export const poolAdmissionRouteTokenClaimsSchema =
+  cnpgAdmissionRouteTokenClaimsSchema
+    .extend({
+      kind: z.literal("pool"),
+      binding_id: PoolDatabaseTarget.shape.binding_id,
+      node_uid: PoolDatabaseTarget.shape.node_uid,
+      pod_ip: z.string().min(2).max(45),
+      storage_generation: PoolDatabaseTarget.shape.storage_generation,
+      scope_sha256: PoolDatabaseTarget.shape.scope_sha256,
+    })
+    .refine(
+      (value) =>
+        PoolDatabaseTarget.shape.pod_ip.safeParse(value.pod_ip).success,
+      { message: "Invalid pool Pod IP" },
+    );
+export const admissionRouteTokenClaimsSchema = z.union([
+  cnpgAdmissionRouteTokenClaimsSchema,
+  poolAdmissionRouteTokenClaimsSchema,
+]);
+export type AdmissionRouteTokenClaims = z.infer<
+  typeof admissionRouteTokenClaimsSchema
+>;
 /** Temporary rollout compatibility: no route revision or target. */
 export const legacyRouteTokenClaimsSchema = z.strictObject({
   v: z.literal(2),
@@ -160,6 +197,39 @@ export interface SignRouteTokenInput {
 export async function signRouteToken(
   input: SignRouteTokenInput,
 ): Promise<string> {
+  const poolTarget =
+    input.target &&
+    ("kind" in input.target ||
+      "binding_id" in input.target ||
+      "scope_sha256" in input.target)
+      ? PoolDatabaseTarget.safeParse(input.target)
+      : undefined;
+  if (poolTarget && !poolTarget.success)
+    throw new RangeError("invalid pool route target");
+  const pool = poolTarget?.success ? poolTarget.data : undefined;
+  if (input.target?.route_revision !== undefined)
+    return seal(
+      input,
+      admissionRouteTokenClaimsSchema.safeParse({
+        v: 4,
+        ...connection(input),
+        rev: input.target.revision,
+        pod: input.target.pod_uid,
+        route_revision: input.target.route_revision,
+        ...(pool
+          ? {
+              kind: pool.kind,
+              binding_id: pool.binding_id,
+              node_uid: pool.node_uid,
+              pod_ip: pool.pod_ip,
+              storage_generation: pool.storage_generation,
+              scope_sha256: pool.scope_sha256,
+            }
+          : {}),
+      }),
+      ADMISSION_TOKEN_PREFIX,
+      ADMISSION_SIGNATURE_DOMAIN,
+    );
   return seal(
     input,
     routeTokenClaimsSchema.safeParse({
@@ -203,7 +273,9 @@ function connection(input: Omit<SignRouteTokenInput, "target">) {
 
 async function seal(
   input: Omit<SignRouteTokenInput, "target">,
-  claims: z.ZodSafeParseResult<RouteTokenClaims | LegacyRouteTokenClaims>,
+  claims: z.ZodSafeParseResult<
+    RouteTokenClaims | AdmissionRouteTokenClaims | LegacyRouteTokenClaims
+  >,
   prefix: string,
   domain: string,
 ): Promise<string> {
@@ -232,7 +304,8 @@ export type RouteTokenFailure =
 export type RouteTokenResult =
   | {
       readonly ok: true;
-      readonly claims: RouteTokenClaims | LegacyRouteTokenClaims;
+      readonly claims:
+        RouteTokenClaims | AdmissionRouteTokenClaims | LegacyRouteTokenClaims;
     }
   | { readonly ok: false; readonly reason: RouteTokenFailure };
 
@@ -253,11 +326,21 @@ export async function verifyRouteToken(
   const time = input.now ?? Date.now();
   if (!Number.isFinite(time)) return fail("invalid_time");
   if (typeof token !== "string" || token.length === 0) return fail("missing");
-  if (token.length > ROUTE_TOKEN_MAX_LENGTH) return fail("too_long");
+  if (
+    token.length >
+    (token.startsWith(`${ADMISSION_TOKEN_PREFIX}.`)
+      ? ROUTE_TOKEN_ADMISSION_MAX_LENGTH
+      : ROUTE_TOKEN_MAX_LENGTH)
+  )
+    return fail("too_long");
   const parts = token.split(".");
   // Temporary rollout compatibility: v2 keeps its own prefix, domain and claims.
   const legacy = parts[0] === LEGACY_TOKEN_PREFIX;
-  if (parts.length !== 3 || (parts[0] !== TOKEN_PREFIX && !legacy))
+  const admission = parts[0] === ADMISSION_TOKEN_PREFIX;
+  if (
+    parts.length !== 3 ||
+    (parts[0] !== TOKEN_PREFIX && !legacy && !admission)
+  )
     return fail("malformed");
   const payload = parts[1] as string;
   const payloadBytes = base64urlToBytes(payload);
@@ -284,12 +367,20 @@ export async function verifyRouteToken(
     return fail("unknown_kid");
   const expected = await hmac(
     key,
-    (legacy ? LEGACY_SIGNATURE_DOMAIN : SIGNATURE_DOMAIN) + payload,
+    (legacy
+      ? LEGACY_SIGNATURE_DOMAIN
+      : admission
+        ? ADMISSION_SIGNATURE_DOMAIN
+        : SIGNATURE_DOMAIN) + payload,
   );
   if (!constantTimeEqual(expected, signature)) return fail("bad_signature");
 
   const claims = (
-    legacy ? legacyRouteTokenClaimsSchema : routeTokenClaimsSchema
+    legacy
+      ? legacyRouteTokenClaimsSchema
+      : admission
+        ? admissionRouteTokenClaimsSchema
+        : routeTokenClaimsSchema
   ).safeParse(decoded);
   if (!claims.success) return fail("invalid_claims");
   const { rg, iat, exp } = claims.data;

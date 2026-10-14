@@ -117,6 +117,8 @@ async fn admit(
             &route::RouteTarget {
                 revision: target.revision,
                 pod_uid: &target.pod_uid,
+                route_revision: target.route_revision,
+                pool: target.pool(),
             },
         ),
         None => route::sign_legacy(&ring, &connection),

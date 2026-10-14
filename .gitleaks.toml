@@ -34,3 +34,16 @@ regexes = [
   '''^c291cmNlLXNlY3JldA==$''',
   '''^dW5pdC1zZWNyZXQ=$''',
 ]
+
+# SHA256 of the deterministic public Ed25519 fixture keyset; not an API credential.
+# The keyset is generated from the explicitly public test seed in generate-postgres-pool.ts.
+[[rules.allowlists]]
+description = "Public PostgreSQL pool fixture verification keyset digest"
+condition = "AND"
+regexTarget = "secret"
+paths = [
+  '''^packages/contracts/native/postgres\-pool\.generated\.json$''',
+]
+regexes = [
+  '''^69b3b946b0651ae0ae68ac2a8b9486d417b0e05de79401956bc8c621c8782c3c$''',
+]

@@ -7,6 +7,14 @@ import {
   ComputePoolLease,
   ComputePoolObservation,
 } from "@pgcf/contracts/compute-pool";
+import {
+  PostgresPoolPolicyState,
+  PostgresPoolPolicyUpdate,
+} from "@pgcf/contracts/postgres-pool";
+import {
+  getPostgresPoolPolicy,
+  setPostgresPoolPolicy,
+} from "../domain/postgres-pool.ts";
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import {
@@ -77,21 +85,38 @@ export function registerComputePool(app: ApiApp) {
     app,
     "get",
     "/v1/nodes/{id}/compute-pool",
-    ComputePoolPolicyState,
-    (c) => getComputePoolPolicy(c, NodeId.parse(c.req.param("id"))),
+    z.union([ComputePoolPolicyState, PostgresPoolPolicyState]),
+    async (c) => {
+      const id = NodeId.parse(c.req.param("id"));
+      return (await c.env.DB.prepare(
+        "SELECT 1 FROM node_postgres_pool_policies WHERE node_id=?",
+      )
+        .bind(id)
+        .first())
+        ? getPostgresPoolPolicy(c, id)
+        : getComputePoolPolicy(c, id);
+    },
   );
   route(
     app,
     "put",
     "/v1/nodes/{id}/compute-pool",
-    ComputePoolPolicyState,
-    async (c) =>
-      setComputePoolPolicy(
+    z.union([ComputePoolPolicyState, PostgresPoolPolicyState]),
+    async (c) => {
+      const raw = await c.req.json();
+      if (raw.policy?.kind === "postgres_pods")
+        return setPostgresPoolPolicy(
+          c,
+          NodeId.parse(c.req.param("id")),
+          PostgresPoolPolicyUpdate.parse(raw),
+        );
+      return setComputePoolPolicy(
         c,
         NodeId.parse(c.req.param("id")),
-        ComputePoolPolicyUpdate.parse(await c.req.json()),
-      ),
-    ComputePoolPolicyUpdate,
+        ComputePoolPolicyUpdate.parse(raw),
+      );
+    },
+    z.union([ComputePoolPolicyUpdate, PostgresPoolPolicyUpdate]),
   );
   route(
     app,

@@ -2,7 +2,11 @@
 // Zod and existing protocol implementations are authoritative. Check generated files in CI.
 import { edgeContract, edgeVectors } from "./generate-edge.ts";
 import { ReclaimClaims } from "../src/reclaim.ts";
-import { HostStorageLease } from "../src/node-thin-storage.ts";
+import { GatewayAdmissionTarget } from "../src/database-admission.ts";
+import {
+  HostStorageLease,
+  NodeThinStorageLease,
+} from "../src/node-thin-storage.ts";
 import { StorageLvmUuid } from "../src/database-storage.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
@@ -29,7 +33,12 @@ import {
 import {
   legacyRouteTokenClaimsSchema,
   routeTokenClaimsSchema,
+  cnpgAdmissionRouteTokenClaimsSchema,
+  poolAdmissionRouteTokenClaimsSchema,
+  ROUTE_TOKEN_ADMISSION_PREFIX,
+  ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
   ROUTE_TOKEN_MAX_LENGTH,
+  ROUTE_TOKEN_ADMISSION_MAX_LENGTH,
   ROUTE_TOKEN_MAX_LIFETIME_SECONDS,
   ROUTE_TOKEN_SKEW_SECONDS,
   ROUTE_KEY_MIN_BYTES,
@@ -128,6 +137,8 @@ function schema(source: z.ZodType) {
       "enum",
       "format",
       "exclusiveMinimum",
+      "minLength",
+      "maxLength",
     ]);
     for (const key of Object.keys(field as object))
       if (!allowed.has(key))
@@ -142,6 +153,7 @@ const contract = {
   constants: {
     ...edge.constants,
     ROUTE_TOKEN_MAX_LENGTH,
+    ROUTE_TOKEN_ADMISSION_MAX_LENGTH,
     ROUTE_TOKEN_MAX_LIFETIME_SECONDS,
     ROUTE_TOKEN_SKEW_SECONDS,
     ROUTE_KEY_MIN_BYTES,
@@ -176,6 +188,8 @@ const contract = {
     ...edge.wire,
     routeTokenPrefix: ROUTE_TOKEN_PREFIX,
     routeSignatureDomain: ROUTE_TOKEN_SIGNATURE_DOMAIN,
+    admissionRouteTokenPrefix: ROUTE_TOKEN_ADMISSION_PREFIX,
+    admissionRouteSignatureDomain: ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
     legacyRouteTokenPrefix: ROUTE_TOKEN_LEGACY_PREFIX,
     legacyRouteSignatureDomain: ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
     controlSigningPurpose: GATEWAY_CONTROL_SIGNING_PURPOSE,
@@ -209,6 +223,9 @@ const contract = {
   gatewayRegion: edge.gatewayRegion,
   databaseAdmission: edge.databaseAdmission,
   routeClaims,
+  admissionRouteClaims: schema(cnpgAdmissionRouteTokenClaimsSchema),
+  poolAdmissionRouteClaims: schema(poolAdmissionRouteTokenClaimsSchema),
+  gatewayAdmissionTarget: schema(GatewayAdmissionTarget),
   legacyRouteClaims: schema(legacyRouteTokenClaimsSchema),
   controlClaims: schema(gatewayControlClaimsSchema),
   activityClaims: schema(gatewayActivityClaimsSchema),
@@ -217,6 +234,7 @@ const contract = {
   reclaimClaims: schema(ReclaimClaims),
   legacyStorageBinding: z.toJSONSchema(LegacyStorageBinding),
   storageHostLease: z.toJSONSchema(HostStorageLease),
+  nodeThinStorageLease: z.toJSONSchema(NodeThinStorageLease),
 };
 const key = new Uint8Array(32).fill(7),
   database = "a".repeat(20),
@@ -287,6 +305,17 @@ async function legacyToken(value: unknown): Promise<string> {
     ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
   );
 }
+const poolClaims = {
+  ...claims,
+  v: 4,
+  route_revision: 19,
+  kind: "pool",
+  binding_id: "12345678-1234-4234-8234-123456789012",
+  node_uid: "23456789-2345-4345-8345-234567890123",
+  pod_ip: "10.1.2.3",
+  storage_generation: 2,
+  scope_sha256: "a".repeat(64),
+};
 const routeInputs: {
   name: string;
   claims?: unknown;
@@ -295,6 +324,26 @@ const routeInputs: {
   region?: string;
 }[] = [
   { name: "valid", claims },
+  {
+    name: "v4-independent-route-revision",
+    token: await rawToken(
+      JSON.stringify({ ...claims, v: 4, route_revision: 19 }),
+      ROUTE_TOKEN_ADMISSION_PREFIX,
+      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
+    ),
+  },
+  {
+    name: "v4-missing-route-revision",
+    token: await rawToken(
+      JSON.stringify({ ...claims, v: 4 }),
+      ROUTE_TOKEN_ADMISSION_PREFIX,
+      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
+    ),
+  },
+  {
+    name: "v4-claims-under-v3",
+    claims: { ...claims, v: 4, route_revision: 19 },
+  },
   {
     name: "equivalent-json-numbers",
     token: await rawToken(
@@ -307,6 +356,30 @@ const routeInputs: {
   {
     name: "leading-json-bom",
     token: await rawToken("\uFEFF" + JSON.stringify(claims)),
+  },
+  {
+    name: "pool-v4-exact-scope",
+    token: await rawToken(
+      JSON.stringify(poolClaims),
+      ROUTE_TOKEN_ADMISSION_PREFIX,
+      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
+    ),
+  },
+  {
+    name: "pool-v4-missing-binding",
+    token: await rawToken(
+      JSON.stringify({ ...poolClaims, binding_id: undefined }),
+      ROUTE_TOKEN_ADMISSION_PREFIX,
+      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
+    ),
+  },
+  {
+    name: "pool-v4-invalid-ip",
+    token: await rawToken(
+      JSON.stringify({ ...poolClaims, pod_ip: "10.1.2.999" }),
+      ROUTE_TOKEN_ADMISSION_PREFIX,
+      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
+    ),
   },
   { name: "missing", token: null },
   { name: "malformed", token: "v1.a.b" },

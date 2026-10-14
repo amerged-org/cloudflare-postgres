@@ -55,6 +55,18 @@ fn authoritative_typescript_ip_and_signing_vectors() {
                 &route::RouteTarget {
                     revision: target["revision"].as_u64().unwrap(),
                     pod_uid: target["pod_uid"].as_str().unwrap(),
+                    route_revision: target["route_revision"].as_u64(),
+                    pool: if target["kind"] == "pool" {
+                        Some(route::PoolRouteTarget {
+                            binding_id: target["binding_id"].as_str().unwrap(),
+                            node_uid: target["node_uid"].as_str().unwrap(),
+                            pod_ip: target["pod_ip"].as_str().unwrap(),
+                            storage_generation: target["storage_generation"].as_u64().unwrap(),
+                            scope_sha256: target["scope_sha256"].as_str().unwrap(),
+                        })
+                    } else {
+                        None
+                    },
                 },
             ),
             None => route::sign_legacy(&ring, &connection),
@@ -112,6 +124,13 @@ fn an_admission_validates_its_known_fields_and_ignores_additive_ones() {
     let verified = Some(AdmittedTarget {
         revision: 7,
         pod_uid: pod.into(),
+        route_revision: None,
+        kind: None,
+        binding_id: None,
+        node_uid: None,
+        pod_ip: None,
+        storage_generation: None,
+        scope_sha256: None,
     });
     let (route, target) =
         admission(&json!({"ok":true,"region":region,"target":{"revision":7,"pod_uid":pod}}))
@@ -140,6 +159,8 @@ fn an_admission_validates_its_known_fields_and_ignores_additive_ones() {
         json!({"revision":9_007_199_254_740_992_u64,"pod_uid":pod}),
         json!({"revision":7,"pod_uid":"not-a-pod"}),
         json!({"revision":7}),
+        json!({"revision":7,"pod_uid":pod,"route_revision":null}),
+        json!({"revision":7,"pod_uid":pod,"route_revision":0}),
         json!(null),
     ] {
         assert_eq!(

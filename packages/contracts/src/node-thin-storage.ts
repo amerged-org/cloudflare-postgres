@@ -12,6 +12,7 @@ import {
 } from "./database-storage.ts";
 import { NodePhysicalStorage } from "./node-physical-storage.ts";
 import { STORAGE_AUTHORITY_MAX_LENGTH } from "./storage-write-authority.ts";
+import { PoolHostCustody, PoolPodPreparationContext } from "./postgres-pool.ts";
 
 const Bytes = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const NodeName = z
@@ -132,6 +133,7 @@ export const NodeThinStorageLease = z.strictObject({
         storage: DesiredDatabaseStorage.nullable(),
         volume: DatabaseStorageVolumeReceipt.nullable(),
         startup: DesiredStorageStartup.nullable(),
+        pool: PoolHostCustody.optional(),
       }),
     )
     .max(4096),
@@ -327,6 +329,7 @@ export const HostStorageLease = z
         }),
       )
       .max(2000),
+    preparations: z.array(PoolPodPreparationContext).max(1).optional(),
     databases: z
       .array(
         z.strictObject({
@@ -345,6 +348,7 @@ export const HostStorageLease = z
           startup_operation_id: OperationId.nullable(),
           volume: DatabaseStorageVolumeReceipt.nullable(),
           runtime_authority: z.string().max(4096).nullable(),
+          pool: PoolHostCustody.optional(),
           drain: HostStorageDrain.nullable().optional(),
         }),
       )
@@ -365,6 +369,19 @@ export const HostStorageLease = z
       value.databases.some(
         (entry) =>
           entry.node_uid !== value.node_uid ||
+          (entry.pool !== undefined &&
+            (entry.volume === null ||
+              entry.pool.holder_generation > entry.generation ||
+              (entry.pool.device === null &&
+                (entry.runtime_authority !== null ||
+                  entry.startup_expires_at !== null)) ||
+              (entry.pool.device !== null &&
+                (entry.pool.device.volume_group_uuid !==
+                  entry.volume.volume_group_uuid ||
+                  entry.pool.device.lv_uuid !== entry.volume.lv_uuid)) ||
+              (entry.pool.holder_boot_id !== value.boot_id &&
+                (entry.runtime_authority !== null ||
+                  entry.startup_expires_at !== null)))) ||
           (entry.drain != null &&
             (entry.desired_state === "running" ||
               entry.volume === null ||

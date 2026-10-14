@@ -13,6 +13,10 @@ import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { agentRegion } from "./agent-auth.ts";
 import { hashApiKey } from "@pgcf/contracts";
+import {
+  withAdmissionMutation,
+  type AdmissionSqlGuard,
+} from "./admission-mutations.ts";
 
 interface PoolRow {
   node_id: string;
@@ -76,17 +80,52 @@ export async function setComputePoolPolicy(
       "conflict",
       "Compute runtime differs from the approved fleet component",
     );
+  if (
+    await c.env.DB.prepare(
+      "SELECT 1 FROM node_postgres_pool_policies WHERE node_id=? AND json_extract(policy_json,'$.target_slots')>0",
+    )
+      .bind(id)
+      .first()
+  )
+    throw new ApiError(
+      "conflict",
+      "A PostgreSQL Pod pool already owns this node's idle budget",
+    );
   return withIdempotency(c, {
     replay: () => getComputePoolPolicy(c, id),
     execute: async (lease) => {
+      const previous = await c.env.DB.prepare(
+        "SELECT * FROM node_compute_pool_policies WHERE node_id=?",
+      )
+        .bind(id)
+        .first<PoolRow>();
+      if (
+        (previous?.revision ?? 0) !== body.expected_revision ||
+        (previous && previous.node_uid !== body.node_uid)
+      )
+        throw new ApiError(
+          "conflict",
+          "Compute pool revision or current physical node changed",
+        );
+      const effective = (value: ComputePoolPolicy) =>
+        JSON.stringify([
+          value.profile,
+          value.per_slot_cpu_millicores,
+          value.per_slot_memory_mib,
+        ]);
+      const changed =
+        !previous ||
+        effective(ComputePoolPolicy.parse(JSON.parse(previous.policy_json))) !==
+          effective(policy);
       const now = new Date().toISOString(),
         serialized = JSON.stringify(policy),
         next = body.expected_revision + 1;
-      const results = await c.env.DB.batch([
+      const statements = (guard?: AdmissionSqlGuard) => [
         c.env.DB.prepare(
           `INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at)
           SELECT id,node_uid,?,?,?,? FROM nodes WHERE id=? AND node_uid=? AND ready=1 AND lost_at IS NULL
           AND julianday(last_observed_at)>=julianday('now','-180 seconds') AND julianday(last_observed_at)<=julianday('now','+5 seconds') AND ?=0
+          AND NOT EXISTS(SELECT 1 FROM node_postgres_pool_policies x WHERE x.node_id=nodes.id AND json_extract(x.policy_json,'$.target_slots')>0) AND NOT EXISTS(SELECT 1 FROM node_compute_pool_policies p WHERE p.node_id=nodes.id) AND (${guard?.sql ?? "1=1"})
           ON CONFLICT(node_id) DO NOTHING`,
         ).bind(
           next,
@@ -96,10 +135,11 @@ export async function setComputePoolPolicy(
           id,
           body.node_uid,
           body.expected_revision,
+          ...(guard?.bindings ?? []),
         ),
         c.env.DB.prepare(
-          `UPDATE node_compute_pool_policies SET revision=?,release_id=?,policy_json=?,updated_at=? WHERE node_id=? AND node_uid=? AND revision=? AND ?>0
-          AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_id AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))`,
+          `UPDATE node_compute_pool_policies SET revision=?,release_id=?,policy_json=?,updated_at=? WHERE node_id=? AND node_uid=? AND revision=? AND ?>0 AND policy_json IS ?
+          AND NOT EXISTS(SELECT 1 FROM node_postgres_pool_policies x WHERE x.node_id=node_compute_pool_policies.node_id AND json_extract(x.policy_json,'$.target_slots')>0) AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_id AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')) AND (${guard?.sql ?? "1=1"})`,
         ).bind(
           next,
           policy.profile.release_id,
@@ -109,18 +149,51 @@ export async function setComputePoolPolicy(
           body.node_uid,
           body.expected_revision,
           body.expected_revision,
+          previous?.policy_json ?? null,
           body.node_uid,
+          ...(guard?.bindings ?? []),
         ),
         lease.completeStatement(id, 200, {
-          sql: "EXISTS(SELECT 1 FROM node_compute_pool_policies WHERE node_id=? AND node_uid=? AND revision=? AND policy_json=?)",
-          bindings: [id, body.node_uid, next, serialized],
+          sql: `EXISTS(SELECT 1 FROM node_compute_pool_policies WHERE node_id=? AND node_uid=? AND revision=? AND policy_json=?) AND (${guard?.sql ?? "1=1"})`,
+          bindings: [
+            id,
+            body.node_uid,
+            next,
+            serialized,
+            ...(guard?.bindings ?? []),
+          ],
         }),
-      ]);
-      if (results[0]!.meta.changes + results[1]!.meta.changes !== 1)
-        throw new ApiError(
-          "conflict",
-          "Compute pool revision or current physical node changed",
+      ];
+      const check = (results: D1Result[]) => {
+        if (results[0]!.meta.changes + results[1]!.meta.changes !== 1)
+          throw new ApiError(
+            "conflict",
+            "Compute pool revision or current physical node changed",
+          );
+      };
+      if (changed) {
+        let affected: string[] = [];
+        await withAdmissionMutation(
+          c.env,
+          [],
+          async (mutation) => {
+            check(await mutation.batch(statements(mutation.scopeGuard())));
+            affected = mutation.intents.map((intent) => intent.database_id);
+          },
+          { kind: "node", id },
         );
+        const node = await c.env.DB.prepare(
+          "SELECT region_id FROM nodes WHERE id=?",
+        )
+          .bind(id)
+          .first<{ region_id: string }>();
+        if (node && affected.length)
+          c.executionCtx.waitUntil(
+            c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(node.region_id))
+              .notify(affected)
+              .catch(() => undefined),
+          );
+      } else check(await c.env.DB.batch(statements()));
       return getComputePoolPolicy(c, id);
     },
   });

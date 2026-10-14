@@ -57,6 +57,70 @@ function spec() {
     roles: { control_relay: role, customer: structuredClone(role) },
   };
 }
+it("permits an isolated pool qualification candidate without a normal receipt while requiring the complete native wire", () => {
+  const base = spec(),
+    pins = [
+      "native-controller",
+      "native-gateway",
+      "pool-supervisor",
+      "pgcf-sandbox-controller",
+    ];
+  const role = (value: typeof base.roles.customer) => ({
+    ...value,
+    components: [
+      ...value.components,
+      ...pins.filter((n) => n !== "pgcf-sandbox-controller"),
+    ],
+    talos_extensions: [...value.talos_extensions, "pgcf-sandbox-controller"],
+  });
+  const candidate = {
+    ...base,
+    route_token_version: 4,
+    runtime_attestation_version: 2,
+    admission_snapshot_version: 1,
+    postgres_pool_qualification_version: 1,
+    postgres_pool_candidate: {
+      driver_sha256: "a".repeat(64),
+      supervisor_sha256: "b".repeat(64),
+      host_controller_sha256: "a".repeat(64),
+    },
+    components: [
+      ...base.components,
+      ...pins.map((name) => ({
+        name,
+        kind: "image",
+        version: "1.0.0",
+        reference: "registry.example/" + name + "@sha256:" + "e".repeat(64),
+        sha256: "e".repeat(64),
+      })),
+    ],
+    roles: {
+      customer: role(base.roles.customer),
+      control_relay: role(base.roles.control_relay),
+    },
+  };
+  const parsed = FleetReleaseSpec.parse(candidate);
+  expect(parsed.postgres_pool_version).toBeUndefined();
+  expect(parsed.postgres_pool_qualification).toBeUndefined();
+  expect(
+    FleetReleaseSpec.safeParse({
+      ...candidate,
+      postgres_pool_candidate: undefined,
+    }).success,
+  ).toBe(false);
+  expect(
+    FleetReleaseSpec.safeParse({ ...candidate, route_token_version: 3 })
+      .success,
+  ).toBe(false);
+  expect(
+    FleetReleaseSpec.safeParse({
+      ...candidate,
+      components: candidate.components.filter(
+        (c) => c.name !== "pool-supervisor",
+      ),
+    }).success,
+  ).toBe(false);
+});
 function hostActivation() {
   const now = new Date().toISOString(),
     node_uid = crypto.randomUUID(),
@@ -504,6 +568,39 @@ it("declares thin sampling only with a native controller on every role", () => {
     FleetReleaseSpec.safeParse({ ...native, thin_storage_sampling_version: 1 })
       .success,
   ).toBe(false);
+});
+it("declares admission snapshots only with v4 routing and v2 proofs on every native role", () => {
+  const native = spec();
+  for (const name of ["native-gateway", "native-controller"]) {
+    native.components.push({
+      name,
+      kind: "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    });
+    for (const role of Object.values(native.roles)) role.components.push(name);
+  }
+  const capable = {
+    ...native,
+    route_token_version: 4,
+    runtime_attestation_version: 2,
+    admission_snapshot_version: 1,
+  };
+  expect(FleetReleaseSpec.safeParse(capable).success).toBe(true);
+  expect(
+    FleetReleaseSpec.safeParse({ ...capable, route_token_version: 3 }).success,
+  ).toBe(false);
+  expect(
+    FleetReleaseSpec.safeParse({
+      ...capable,
+      runtime_attestation_version: undefined,
+    }).success,
+  ).toBe(false);
+  native.roles.customer.components = native.roles.customer.components.filter(
+    (name) => name !== "native-controller",
+  );
+  expect(FleetReleaseSpec.safeParse(capable).success).toBe(false);
 });
 it("does not treat a release-id claim or partial duplicate inventory as component observations", () => {
   expect(

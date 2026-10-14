@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { DatabaseId, OperationId } from "./ids.ts";
+import { DatabaseId, OperationId, RegionId, RoleName } from "./ids.ts";
 import { bytesToBase64url, base64urlToBytes } from "./encoding.ts";
 export const RECLAIM_PREFIX = "rc1";
 export const RECLAIM_DOMAIN = "pgcf-reclaim-authority/v1\n";
@@ -178,7 +178,7 @@ export const WarmReclaimPolicy = z
     message: "Reclaim step exceeds its episode budget",
   });
 export type WarmReclaimPolicy = z.infer<typeof WarmReclaimPolicy>;
-export const DatabaseRuntimeAttestation = z
+export const DatabaseRuntimeAttestationV1 = z
   .strictObject({
     v: z.literal(1),
     database_id: DatabaseId,
@@ -203,9 +203,144 @@ export const DatabaseRuntimeAttestation = z
   .refine((v) => v.memory_request_bytes <= v.memory_limit_bytes, {
     message: "Runtime request exceeds hard limit",
   });
+const ResourceVersion = z.string().min(1).max(128);
+export const DATABASE_RUNTIME_PROOF_MAX_AGE_MS = 60_000;
+export const DatabaseRuntimeObservationContinuity = z.strictObject({
+  v: z.literal(1),
+  controller_epoch: Hash,
+  watch_epoch: Safe.positive(),
+  coverage: z.literal("complete"),
+  verified_at: Safe,
+  expires_at: Safe,
+  resource_versions: z.strictObject({
+    namespace: ResourceVersion,
+    cluster: ResourceVersion,
+    pod: ResourceVersion,
+    ca_secret: ResourceVersion,
+    storage: ResourceVersion,
+    pvc: ResourceVersion,
+    pv: ResourceVersion,
+    node: ResourceVersion,
+  }),
+});
+export const DatabaseRuntimeAttestationV2 = z
+  .strictObject({
+    ...DatabaseRuntimeAttestationV1.shape,
+    v: z.literal(2),
+    region_id: RegionId,
+    route_revision: Safe.positive(),
+    admission_epoch: Safe.positive(),
+    applied_role_revisions: z
+      .array(z.strictObject({ name: RoleName, revision: Safe.positive() }))
+      .max(100),
+    tls_server_name: z
+      .string()
+      .min(1)
+      .max(253)
+      .regex(/^[a-z0-9.-]+$/),
+    ca_secret_uid: z.uuid(),
+    ca_secret_resource_version: ResourceVersion,
+    ca_sha256: Hash,
+    pod_ip: z.union([z.ipv4(), z.ipv6()]),
+    postgres_port: z.literal(5432),
+    observation: DatabaseRuntimeObservationContinuity,
+  })
+  .superRefine((proof, context) => {
+    if (proof.memory_request_bytes > proof.memory_limit_bytes)
+      context.addIssue({
+        code: "custom",
+        message: "Runtime request exceeds hard limit",
+      });
+    if (
+      new Set(proof.applied_role_revisions.map((role) => role.name)).size !==
+      proof.applied_role_revisions.length
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["applied_role_revisions"],
+        message: "Duplicate applied role revision",
+      });
+    if (
+      proof.observation.verified_at !== proof.observed_at ||
+      proof.observation.expires_at !==
+        proof.observed_at + DATABASE_RUNTIME_PROOF_MAX_AGE_MS ||
+      proof.observation.resource_versions.ca_secret !==
+        proof.ca_secret_resource_version
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["observation"],
+        message:
+          "Observation must bind the same verified runtime and CA revision",
+      });
+  });
+export type DatabaseRuntimeAttestationV2 = z.infer<
+  typeof DatabaseRuntimeAttestationV2
+>;
+export const DatabasePoolRuntimeAttestationV2 =
+  DatabaseRuntimeAttestationV2.safeExtend({
+    kind: z.literal("pool"),
+    binding_id: z.uuid(),
+    scope_sha256: Hash,
+    holder_revision: Safe.positive(),
+    pool_namespace_uid: z.uuid(),
+    pool_namespace_resource_version: z.string().min(1).max(256),
+  });
+export type DatabasePoolRuntimeAttestationV2 = z.infer<
+  typeof DatabasePoolRuntimeAttestationV2
+>;
+export const DatabaseRuntimeAttestation = z.union([
+  DatabaseRuntimeAttestationV1,
+  DatabaseRuntimeAttestationV2,
+  DatabasePoolRuntimeAttestationV2,
+]);
 export type DatabaseRuntimeAttestation = z.infer<
   typeof DatabaseRuntimeAttestation
 >;
+export type ReclaimRuntimeScope = Pick<
+  ReclaimClaims,
+  | "v"
+  | "database_id"
+  | "generation"
+  | "storage_generation"
+  | "node_uid"
+  | "boot_id"
+  | "cluster_uid"
+  | "namespace_uid"
+  | "cnpg_cluster_uid"
+  | "storage_uid"
+  | "pvc_uid"
+  | "pv_uid"
+  | "pod_uid"
+  | "container_id"
+  | "postgres_image_sha256"
+  | "memory_request_bytes"
+  | "memory_limit_bytes"
+>;
+/** Reclaim authority keeps its strict v1 wire shape independently of runtime proof versions. */
+export function reclaimScopeFromRuntime(
+  runtime: DatabaseRuntimeAttestation,
+): ReclaimRuntimeScope {
+  return {
+    v: 1,
+    database_id: runtime.database_id,
+    generation: runtime.generation,
+    storage_generation: runtime.storage_generation,
+    node_uid: runtime.node_uid,
+    boot_id: runtime.boot_id,
+    cluster_uid: runtime.cluster_uid,
+    namespace_uid: runtime.namespace_uid,
+    cnpg_cluster_uid: runtime.cnpg_cluster_uid,
+    storage_uid: runtime.storage_uid,
+    pvc_uid: runtime.pvc_uid,
+    pv_uid: runtime.pv_uid,
+    pod_uid: runtime.pod_uid,
+    container_id: runtime.container_id,
+    postgres_image_sha256: runtime.postgres_image_sha256,
+    memory_request_bytes: runtime.memory_request_bytes,
+    memory_limit_bytes: runtime.memory_limit_bytes,
+  };
+}
 export const NodeWarmReclaimQualification = z.strictObject({
   v: z.literal(1),
   revision: Safe.positive(),

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Edge-to-gateway route tokens. A v3 route names the route revision and verified primary Pod
+//! Edge-to-gateway route tokens. A v3 route names the database generation and verified primary Pod
 //! that Cloudflare admitted. Temporary rollout compatibility: v2 routes name neither; the
 //! authoritative TypeScript contract (route-token.ts) states when v2 is removed.
 use crate::{constant, valid_claims, valid_legacy_claims, wire};
@@ -20,12 +20,27 @@ pub struct RouteClaims {
     pub kid: String,
     pub iat: u64,
     pub exp: u64,
-    /// Route revision of the admitted verified target; absent only in a v2 route.
+    /// Existing database generation; absent only in a v2 route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<u64>,
     /// Verified primary Pod UID of that revision; absent only in a v2 route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod: Option<String>,
+    /// Independent route revision, required by v4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_sha256: Option<String>,
 }
 /// One admitted connection: the exact Edge wire inputs of a route token.
 pub struct Connection<'a> {
@@ -40,6 +55,15 @@ pub struct Connection<'a> {
 pub struct RouteTarget<'a> {
     pub revision: u64,
     pub pod_uid: &'a str,
+    pub route_revision: Option<u64>,
+    pub pool: Option<PoolRouteTarget<'a>>,
+}
+pub struct PoolRouteTarget<'a> {
+    pub binding_id: &'a str,
+    pub node_uid: &'a str,
+    pub pod_ip: &'a str,
+    pub storage_generation: u64,
+    pub scope_sha256: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -87,18 +111,49 @@ pub fn sign(
     connection: &Connection,
     target: &RouteTarget,
 ) -> Result<String, &'static str> {
-    let mut claims = claims(master, connection, "routeClaims")?;
+    let schema = if target.pool.is_some() {
+        "poolAdmissionRouteClaims"
+    } else if target.route_revision.is_some() {
+        "admissionRouteClaims"
+    } else {
+        "routeClaims"
+    };
+    let mut claims = claims(master, connection, schema)?;
     claims.rev = Some(target.revision);
     claims.pod = Some(target.pod_uid.into());
-    if !valid_claims(&serde_json::to_value(&claims).map_err(|_| "invalid claims")?) {
+    claims.route_revision = target.route_revision;
+    if let Some(pool) = &target.pool {
+        if target.route_revision.is_none() || pool.pod_ip.parse::<std::net::IpAddr>().is_err() {
+            return Err("invalid claims");
+        }
+        claims.kind = Some("pool".into());
+        claims.binding_id = Some(pool.binding_id.into());
+        claims.node_uid = Some(pool.node_uid.into());
+        claims.pod_ip = Some(pool.pod_ip.into());
+        claims.storage_generation = Some(pool.storage_generation);
+        claims.scope_sha256 = Some(pool.scope_sha256.into());
+    }
+    if !crate::valid_schema(
+        schema,
+        &serde_json::to_value(&claims).map_err(|_| "invalid claims")?,
+    ) || !crate::valid_role(&claims.user)
+    {
         return Err("invalid claims");
     }
     seal(
         master,
         connection.region,
         &claims,
-        wire("routeTokenPrefix"),
-        wire("routeSignatureDomain"),
+        wire(if target.route_revision.is_some() {
+            "admissionRouteTokenPrefix"
+        } else {
+            "routeTokenPrefix"
+        }),
+        wire(if target.route_revision.is_some() {
+            "admissionRouteSignatureDomain"
+        } else {
+            "routeSignatureDomain"
+        }),
     )
 }
 /// Temporary rollout compatibility: a v2 route for an admission without a verified target.
@@ -141,6 +196,13 @@ fn claims(
             .ok_or("invalid claims")?,
         rev: None,
         pod: None,
+        route_revision: None,
+        kind: None,
+        binding_id: None,
+        node_uid: None,
+        pod_ip: None,
+        storage_generation: None,
+        scope_sha256: None,
     })
 }
 fn seal(
@@ -190,13 +252,19 @@ pub fn verify(
         return Err("invalid_time");
     }
     let token = token.filter(|v| !v.is_empty()).ok_or("missing")?;
-    if token.len() > constant("ROUTE_TOKEN_MAX_LENGTH") as usize {
+    let limit = if token.starts_with(&format!("{}.", wire("admissionRouteTokenPrefix"))) {
+        constant("ROUTE_TOKEN_ADMISSION_MAX_LENGTH")
+    } else {
+        constant("ROUTE_TOKEN_MAX_LENGTH")
+    };
+    if token.len() > limit as usize {
         return Err("too_long");
     }
     let parts: Vec<_> = token.split('.').collect();
     // Temporary rollout compatibility: v2 keeps its own prefix, domain and claims.
     let legacy = parts[0] == wire("legacyRouteTokenPrefix");
-    if parts.len() != 3 || (parts[0] != wire("routeTokenPrefix") && !legacy) {
+    let admission = parts[0] == wire("admissionRouteTokenPrefix");
+    if parts.len() != 3 || (parts[0] != wire("routeTokenPrefix") && !legacy && !admission) {
         return Err("malformed");
     }
     let payload = decode(parts[1]).ok_or("malformed")?;
@@ -220,6 +288,8 @@ pub fn verify(
     mac.update(
         wire(if legacy {
             "legacyRouteSignatureDomain"
+        } else if admission {
+            "admissionRouteSignatureDomain"
         } else {
             "routeSignatureDomain"
         })
@@ -242,6 +312,19 @@ pub fn verify(
     }
     if !(if legacy {
         valid_legacy_claims(&value)
+    } else if admission {
+        crate::valid_schema(
+            if value.get("kind").is_some() {
+                "poolAdmissionRouteClaims"
+            } else {
+                "admissionRouteClaims"
+            },
+            &value,
+        ) && (value.get("kind").is_none()
+            || value["pod_ip"]
+                .as_str()
+                .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok()))
+            && value["user"].as_str().is_some_and(crate::valid_role)
     } else {
         valid_claims(&value)
     }) {
