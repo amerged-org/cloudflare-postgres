@@ -853,7 +853,9 @@ fn admitted_runtime_current(
     target: &TargetIdentity,
 ) -> bool {
     if claims.v != 4 {
-        return true;
+        // A legacy route names no admitted runtime, so it cannot vouch for a writer that only the
+        // controller's attestation, not the kubelet, has shown to be running.
+        return !target.unready;
     }
     route_revision_current(state, claims)
         && state
@@ -1102,6 +1104,7 @@ mod admission_revision_tests {
             container_id: None,
             ca: None,
             pool: None,
+            unready: false,
         };
         assert!(!admitted_runtime_current(&state, &claims, &actual));
         actual.container_id = Some("a".repeat(64));
@@ -1143,6 +1146,7 @@ mod admission_revision_tests {
                 admission_epoch: 11,
                 route_revision: 19,
             }),
+            unready: false,
         };
         let mut state = FenceState::default();
         let admitted=serde_json::from_value(serde_json::json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")})).unwrap();

@@ -438,6 +438,33 @@ pub(crate) fn typed(value: &Value, api_version: &str, kind: &str) -> bool {
     (value["apiVersion"].is_null() || value["apiVersion"] == api_version)
         && (value["kind"].is_null() || value["kind"] == kind)
 }
+/// The target the controller published in a fence's data, bound to that fence's own database
+/// and revision. The fence watch and the writer cache both read it through this function.
+pub(crate) fn admission_target(
+    data: &Value,
+    intent: &Intent,
+) -> Result<Option<AdmissionTarget>, &'static str> {
+    data.get("admission_target")
+        .map(|raw| {
+            let raw = raw
+                .as_str()
+                .filter(|raw| raw.len() <= 4096)
+                .ok_or("invalid admitted target")?;
+            let value: Value = serde_json::from_str(raw).map_err(|_| "invalid admitted target")?;
+            if !valid_schema("gatewayAdmissionTarget", &value) {
+                return Err("invalid admitted target");
+            }
+            let target: AdmissionTarget =
+                serde_json::from_value(value).map_err(|_| "invalid admitted target")?;
+            if target.generation > intent.revision
+                || target.tls_server_name != format!("database-rw.pgcf-db-{}.svc", intent.database)
+            {
+                return Err("invalid admitted target binding");
+            }
+            Ok(target)
+        })
+        .transpose()
+}
 pub fn parse_snapshot(value: &Value) -> Result<HashMap<String, Fence>, &'static str> {
     if value["kind"] != "ConfigMapList"
         || value["apiVersion"] != "v1"
@@ -502,29 +529,7 @@ pub fn parse_snapshot(value: &Value) -> Result<HashMap<String, Fence>, &'static 
         } else {
             None
         };
-        let admission_target = item["data"]
-            .get("admission_target")
-            .map(|raw| {
-                let raw = raw
-                    .as_str()
-                    .filter(|raw| raw.len() <= 4096)
-                    .ok_or("invalid admitted target")?;
-                let value: Value =
-                    serde_json::from_str(raw).map_err(|_| "invalid admitted target")?;
-                if !valid_schema("gatewayAdmissionTarget", &value) {
-                    return Err("invalid admitted target");
-                }
-                let target: AdmissionTarget =
-                    serde_json::from_value(value).map_err(|_| "invalid admitted target")?;
-                if target.generation > intent.revision
-                    || target.tls_server_name
-                        != format!("database-rw.pgcf-db-{}.svc", intent.database)
-                {
-                    return Err("invalid admitted target binding");
-                }
-                Ok(target)
-            })
-            .transpose()?;
+        let admission_target = admission_target(&item["data"], &intent)?;
         if records
             .insert(
                 intent.database.clone(),

@@ -57,6 +57,17 @@ frontend write rechecks the cached identities and lease; uncertain SQL is never
 replayed. Quiet sessions also check expiry. Healthy signed renewal preserves the
 connection and ordinary power-fence history.
 
+The kubelet reports a resumed Pod Ready up to a probe period after PostgreSQL accepts
+connections. While no endpoint is Ready, the one Pod that the controller attested in the
+fence's `admission_target` is the writer instead, and only on all of: the fence is running at
+the revision of that target and is not retiring or deleting; the endpoint's Pod UID is the
+attested one, it is not terminating, it is the only candidate, and it has one private address;
+the watched Pod is on that node and address with its `postgres` container running under the
+attested container ID; the watched CA is the attested one. A Ready endpoint always takes
+precedence, a pool binding never falls through to it, and the route ends with the Pod watch.
+Only a v4 route, which names the admitted runtime, may use such a writer; route token,
+storage binding and signed authority are checked exactly as for a Ready writer.
+
 The gateway accepts thin write authority only from the public-key map pinned by
 `PGCF_STORAGE_AUTHORITY_KEYS` and its canonical SHA-256 in
 `PGCF_STORAGE_AUTHORITY_KEYS_SHA256`; the private signer remains in Cloudflare.
