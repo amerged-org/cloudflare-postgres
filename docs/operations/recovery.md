@@ -306,7 +306,9 @@ volume, and carries no startup grant and no drain. The controller stops PostgreS
 it reports the sleep the entry becomes `suspended` (a parked Pod keeps its token) and the guard may
 freeze the volume the stopped Pod left. Without that evidence or a current write-allowed reading,
 or after the stop timed out, the guard freezes the volume and stops the Pod. Only a deletion still
-drains.
+drains. A wake reuses a parked Pod only when the controller's last report claimed the fast wake and
+the wake is the generation right after the reported sleep; any other wake retires the parked Pod
+and the controller starts a new one.
 
 A release that carries the receipt requires current thin write authority from every member that
 takes databases and from every member that already has a selection. Until then that member stays

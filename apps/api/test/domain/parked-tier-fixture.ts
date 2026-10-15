@@ -236,10 +236,13 @@ export const parkedPod = (w: AwakeWriter) => ({
  * node's identity proof has read the volume again at the sleep's generation by then, and the
  * parked Pod's io.max is still there: the proof counts every instance Pod as a writer.
  */
-export async function parkedWriter(w: AwakeWriter) {
+export async function parkedWriter(w: AwakeWriter, wake?: "fast") {
   const intent = await idleIntent(w);
   await w.evidence({ generation: intent.generation });
-  const response = await hibernated(w, intent, parkedPod(w));
+  const response = await hibernated(w, intent, {
+    ...parkedPod(w),
+    ...(wake === undefined ? {} : { wake }),
+  });
   expect(await response.json()).toEqual({ accepted: 1 });
   return intent;
 }

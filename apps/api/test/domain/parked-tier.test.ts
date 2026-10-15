@@ -391,7 +391,8 @@ it("a_parked_database_gets_a_running_lease_entry_with_a_token_for_the_parked_pod
 
 it("the_first_lease_after_a_wake_claim_carries_a_token_for_the_new_generation_and_the_same_pod", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases));
-  const parked = await parkedWriter(w);
+  // The controller claims the fast wake: the Pod and everything it runs are unchanged.
+  const parked = await parkedWriter(w, "fast");
   const resumed = await request(
     `/v1/databases/${w.id}/resume`,
     w.f.integrator,
@@ -435,6 +436,69 @@ it("the_first_lease_after_a_wake_claim_carries_a_token_for_the_new_generation_an
     generation: wake.database.generation,
     pod_uid: w.pod,
   });
+});
+
+it("a_wake_without_the_fast_claim_or_after_a_generation_jump_carries_no_token_for_the_parked_pod", async () => {
+  const resume = async (w: AwakeWriter) => {
+    const response = await request(
+      `/v1/databases/${w.id}/resume`,
+      w.f.integrator,
+      "POST",
+      undefined,
+      crypto.randomUUID(),
+    );
+    expect(response.status).toBe(202);
+    return DatabaseWithOperation.parse(await response.json());
+  };
+  // Parked without the claim: an ordinary wake. The startup entry carries no token, so the guard
+  // retires the parked Pod and lets the controller's replacement start.
+  const plain = await awakeWriter(await thinExecutionFixture(releases));
+  await parkedWriter(plain);
+  const ordinary = await resume(plain);
+  expect(await leaseEntry(plain.f, plain.id)).toMatchObject({
+    generation: ordinary.database.generation,
+    desired_state: "running",
+    startup_operation_id: ordinary.operation.id,
+    startup_expires_at: expect.any(Number),
+    runtime_authority: null,
+  });
+  // Claimed, but the generation moved after the reported sleep (a resize while parked).
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  const parked = await parkedWriter(w, "fast");
+  const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
+  await env.DB.prepare(
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    SELECT ?,1024,750,storage_gib,80,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
+  )
+    .bind(target, w.f.size)
+    .run();
+  try {
+    const resized = await request(
+      `/v1/databases/${w.id}`,
+      w.f.integrator,
+      "PATCH",
+      { size_class_id: target },
+      crypto.randomUUID(),
+    );
+    expect(resized.status).toBe(202);
+    // The node's next reading sees the volume at the resized generation, which a wake needs.
+    await w.evidence({ generation: parked.generation + 1 });
+    const wake = await resume(w);
+    expect(wake.database.generation).toBe(parked.generation + 2);
+    expect(await leaseEntry(w.f, w.id)).toMatchObject({
+      generation: wake.database.generation,
+      desired_state: "running",
+      startup_operation_id: wake.operation.id,
+      runtime_authority: null,
+    });
+  } finally {
+    await env.DB.prepare("UPDATE databases SET size_class_id=? WHERE id=?")
+      .bind(w.f.size, w.id)
+      .run();
+    await env.DB.prepare("DELETE FROM size_classes WHERE id=?")
+      .bind(target)
+      .run();
+  }
 });
 
 it("parked_token_requires_io_evidence_for_the_attested_pod_and_a_fresh_controller_observation", async () => {

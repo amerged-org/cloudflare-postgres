@@ -422,8 +422,8 @@ function evidencedWriter(
  * agree: the controller's fresh report names it and the node evidences exactly that one Pod. No
  * other source names a Pod for a parked database, so no token can exist for a Pod that was not both
  * attested and evidenced.
- * It serves two moments: while the database sleeps parked, and while its wake of exactly the
- * current generation reuses the Pod.
+ * It serves two moments: while the database sleeps parked, and while a fast wake of the very next
+ * generation reuses the Pod.
  */
 async function parkedHolder(
   env: Pick<Env, "DB">,
@@ -445,12 +445,14 @@ async function parkedHolder(
     // Parked steady state: only an idle sleep is parked; an explicit suspension is a real stop.
     if (database.suspension_reason !== "idle") return undefined;
   } else if (database.desired_state === "running") {
-    // Waking from parked: the wake of exactly this generation. The guard retires the previous
-    // holder of a volume whose new generation starts without a token, so the token has to be in
-    // the first lease of the wake. Once the guard accepted it, it holds this Pod as the writer of
-    // the generation: a replacement Pod for the same generation is refused until a newer one, so
-    // a wake that must take the slow path after this lease cannot create its Pod.
+    // Waking from parked. Once the guard accepted a token for this Pod at the wake's generation it
+    // holds the Pod as that generation's writer and refuses a replacement Pod until a newer one.
+    // So the token only goes with the controller's claim that every predicate of the fast wake
+    // holds, for the wake that directly follows the reported sleep. Any other wake is ordinary: no
+    // token for the parked Pod, the guard retires it with the startup and the controller demotes.
     if (
+      parked.wake !== "fast" ||
+      database.generation !== parked.generation + 1 ||
       !(await env.DB.prepare(
         "SELECT 1 FROM operations o WHERE o.id=? AND o.database_id=? AND o.project_id=? AND o.generation=? AND o.kind IN('database.wake','database.resume') AND o.status IN('pending','running')",
       )
