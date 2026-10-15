@@ -3469,8 +3469,8 @@ mod runtime_tests {
                         .to_string()
                         .into();
             });
-        f.server.put(json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"retained-pv","uid":uid(12)},"spec":{"claimRef":{"name":"database-1","namespace":f.ns,"uid":uid(11)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":"pvc-retained"},"storageClassName":"pgcf-lvm"},"status":{"phase":"Bound"}}));
-        f.server.put(json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"database-1","namespace":f.ns,"uid":uid(11)},"spec":{"volumeName":"retained-pv","storageClassName":"pgcf-lvm"},"status":{"phase":"Bound"}}));
+        f.server.put(json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"pvc-retained","uid":uid(12)},"spec":{"claimRef":{"name":"database-1","namespace":f.ns,"uid":uid(11)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":"pvc-retained"},"storageClassName":"pgcf-lvm"},"status":{"phase":"Bound"}}));
+        f.server.put(json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"database-1","namespace":f.ns,"uid":uid(11)},"spec":{"volumeName":"pvc-retained","storageClassName":"pgcf-lvm"},"status":{"phase":"Bound"}}));
         f.server.put(json!({"apiVersion":"local.openebs.io/v1alpha1","kind":"LVMVolume","metadata":{"name":"pvc-retained","namespace":"openebs","uid":uid(13)}}));
         assert_eq!(observed(&f).await, "provisioning");
         let writes = f.server.state.lock().unwrap().writes.clone();

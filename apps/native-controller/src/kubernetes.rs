@@ -301,7 +301,8 @@ impl Drop for WatchGuard {
         self.state.lock().unwrap().gap(&self.kind);
     }
 }
-fn identifier(value: &str) -> bool {
+/// Whether `value` is a Kubernetes object name this client will put in a path.
+pub(crate) fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
         && value.split('.').all(|part| {

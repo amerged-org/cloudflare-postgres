@@ -687,3 +687,83 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     assert_eq!(again["state"], "ready", "{again}");
     assert_eq!(requests_since(&w, at), (86, 0), "the pass after it");
 }
+
+#[tokio::test]
+async fn the_volume_is_read_by_the_handle_its_receipt_recorded_and_never_listed() {
+    // Every pass proves the storage anchor, which used to list every PersistentVolume and every
+    // LVMVolume of the cluster to find its own two.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let at = w.server.state.lock().unwrap().requests.len();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let requests = w.server.state.lock().unwrap().requests.clone();
+    let paths: Vec<&str> = requests[at..]
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect();
+    for collection in [
+        "/api/v1/persistentvolumes",
+        "/apis/local.openebs.io/v1alpha1/lvmvolumes",
+    ] {
+        assert!(!paths.contains(&collection), "{collection} was listed");
+    }
+    let volume = format!("/api/v1/persistentvolumes/{HANDLE}");
+    let lvm = format!("/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmvolumes/{HANDLE}");
+    assert!(paths.contains(&volume.as_str()), "{paths:?}");
+    assert!(paths.contains(&lvm.as_str()), "{paths:?}");
+}
+
+#[tokio::test]
+async fn a_volume_that_is_not_the_recorded_one_still_ends_the_pass_in_recovery() {
+    type Break = fn(&World);
+    let cases: [(&str, &str, Break); 4] = [
+        (
+            "the PersistentVolume was replaced by another object of its name",
+            "persistent_volume_missing_or_replaced",
+            |w| {
+                w.server.edit("PersistentVolume", None, HANDLE, |pv| {
+                    pv["metadata"]["uid"] = crate::test_server::uid(900).into();
+                });
+            },
+        ),
+        (
+            "the PersistentVolume is gone",
+            "persistent_volume_missing_or_replaced",
+            |w| {
+                let key = path("PersistentVolume", None, HANDLE);
+                w.server.state.lock().unwrap().objects.remove(&key);
+            },
+        ),
+        (
+            "the LVMVolume is gone",
+            "lvm_volume_missing_or_replaced",
+            |w| {
+                let key = path("LVMVolume", Some("openebs"), HANDLE);
+                w.server.state.lock().unwrap().objects.remove(&key);
+            },
+        ),
+        (
+            "the LVMVolume is being deleted",
+            "lvm_volume_missing_or_replaced",
+            |w| {
+                w.server.edit("LVMVolume", Some("openebs"), HANDLE, |lvm| {
+                    lvm["metadata"]["deletionTimestamp"] = "2026-10-15T00:00:00Z".into();
+                });
+            },
+        ),
+    ];
+    for (what, code, break_it) in cases {
+        let w = World::awake().await;
+        break_it(&w);
+        let observed = reconcile(&w).await;
+        assert_eq!(observed["state"], "error", "{what}: {observed}");
+        assert_eq!(
+            observed["message"],
+            format!("{code}; recovery required"),
+            "{what}"
+        );
+    }
+}

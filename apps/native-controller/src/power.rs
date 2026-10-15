@@ -3,7 +3,7 @@
 use crate::{
     Error,
     contracts::{constant, database_valid, generation, namespace, number, text},
-    kubernetes::{Kubernetes, terminal_pod},
+    kubernetes::{Kubernetes, identifier, terminal_pod},
     postgres, timing,
 };
 use base64::{
@@ -23,6 +23,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 const SYSTEM: &str = "pgcf-system";
+/// The namespace OpenEBS keeps its LVMVolumes in.
+const OPENEBS: &str = "openebs";
 const DATABASE_LABEL: &str = "pgcf.io/database-id";
 const GENERATION: &str = "pgcf.io/generation";
 const POWER_REVISION: &str = "pgcf.io/power-revision";
@@ -751,12 +753,10 @@ impl PowerCoordinator {
         let id = text(db, "id");
         let ns = namespace(db);
         let storage_name = format!("storage-{id}");
-        let (ns_value, cluster_value, storage_value, volumes, lvms) = tokio::try_join!(
+        let (ns_value, cluster_value, storage_value) = tokio::try_join!(
             self.k8s.read("Namespace", None, &ns),
             self.k8s.read("Cluster", Some(&ns), "database"),
             self.k8s.read("ConfigMap", Some(SYSTEM), &storage_name),
-            self.k8s.list("PersistentVolume", None, None),
-            self.k8s.list("LVMVolume", None, None)
         )?;
         let ns_value = owned(ns_value, &ns, id, None, false)?;
         let cluster = owned(cluster_value, "database", id, Some(&ns), false)?;
@@ -783,12 +783,40 @@ impl PowerCoordinator {
             return Err(Fault::Recovery("storage_profile_identity_changed"));
         }
         let storage_class = storage_class(db)?;
+        // The volume and its LVMVolume are read by the handle the receipt recorded: OpenEBS names
+        // the PersistentVolume and the LVMVolume after the volume ID. They are read together with
+        // the Node, and judged below in the order the checks always had.
+        let recorded = serde_json::from_str::<Value>(text(
+            &storage["metadata"]["annotations"],
+            VOLUME_IDENTITY,
+        ))
+        .ok()
+        .and_then(|identity| {
+            let handle = text(&identity, "handle");
+            identifier(handle).then(|| handle.to_string())
+        });
+        let (node, volume, lvm) = tokio::try_join!(
+            async {
+                match &storage_profile {
+                    Some(_) => self.k8s.read("Node", None, text(db, "node")).await,
+                    None => Ok(None),
+                }
+            },
+            async {
+                match &recorded {
+                    Some(handle) => self.k8s.read("PersistentVolume", None, handle).await,
+                    None => Ok(None),
+                }
+            },
+            async {
+                match &recorded {
+                    Some(handle) => self.k8s.read("LVMVolume", Some(OPENEBS), handle).await,
+                    None => Ok(None),
+                }
+            },
+        )?;
         if let Some(profile) = &storage_profile {
-            let node = self
-                .k8s
-                .read("Node", None, text(db, "node"))
-                .await?
-                .ok_or(Fault::Recovery("storage_node_identity_changed"))?;
+            let node = node.ok_or(Fault::Recovery("storage_node_identity_changed"))?;
             if node["metadata"]["uid"] != profile["node_uid"] {
                 return Err(Fault::Recovery("storage_node_identity_changed"));
             }
@@ -808,14 +836,13 @@ impl PowerCoordinator {
         )?;
         let identity: Value = serde_json::from_str(volume_text)
             .map_err(|_| Fault::Recovery("persistent_volume_identity_changed"))?;
-        let matches: Vec<_> = volumes
-            .iter()
-            .filter(|v| v["metadata"]["uid"] == identity["volumeUid"])
-            .collect();
-        if matches.len() != 1 {
-            return Err(Fault::Recovery("persistent_volume_missing_or_replaced"));
+        if recorded.is_none() {
+            return Err(Fault::Recovery("persistent_volume_identity_changed"));
         }
-        let volume = matches[0];
+        let Some(volume) = volume.filter(|v| v["metadata"]["uid"] == identity["volumeUid"]) else {
+            return Err(Fault::Recovery("persistent_volume_missing_or_replaced"));
+        };
+        let volume = &volume;
         let spec = &volume["spec"];
         let reference = &spec["claimRef"];
         let handle = required(text(&spec["csi"], "volumeHandle"), 253)?;
@@ -843,14 +870,10 @@ impl PowerCoordinator {
         {
             return Err(Fault::Recovery("persistent_claim_missing_or_replaced"));
         }
-        let matches: Vec<_> = lvms
-            .iter()
-            .filter(|v| v["metadata"]["name"] == handle)
-            .collect();
-        if matches.len() != 1 || !matches[0]["metadata"]["deletionTimestamp"].is_null() {
+        let Some(lvm) = lvm.filter(|v| v["metadata"]["deletionTimestamp"].is_null()) else {
             return Err(Fault::Recovery("lvm_volume_missing_or_replaced"));
-        }
-        let lvm = matches[0];
+        };
+        let lvm = &lvm;
         let revision = cluster["metadata"]["annotations"][POWER_REVISION]
             .as_str()
             .map(|v| v.parse::<u64>())
@@ -4381,13 +4404,11 @@ mod tls_tests {
         storage["metadata"]["annotations"][VOLUME_IDENTITY]=json!({"claimUid":id(5),"volumeUid":id(6),"handle":handle,"lvUuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef"}).to_string().into();
         storage["data"][protection_key()]=json!({"v":1,"database_id":db["id"],"generation":1,"operation_id":db["creation"]["operation_id"],"storage_uid":id(3),"namespace_uid":id(1),"cluster_uid":id(2),"node_uid":db["storage"]["node_uid"],"profile_sha256":db["storage"]["profile_sha256"],"requested_at":90_000}).to_string().into();
         resources.insert(format!("/api/v1/nodes/{}",text(db,"node")),json!({"apiVersion":"v1","kind":"Node","metadata":{"name":db["node"],"uid":id(4),"resourceVersion":"1"}}));
-        let pv = json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"retained-pv","uid":id(6),"resourceVersion":"1"},"spec":{"claimRef":{"name":claim,"namespace":ns,"uid":id(5)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":handle},"storageClassName":db["storage"]["storage_class"],"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":[db["node"]]}]}]}}},"status":{"phase":"Bound"}});
-        resources.insert(
-            "/api/v1/persistentvolumes".into(),
-            json!({"metadata":{"resourceVersion":"1"},"items":[pv]}),
-        );
-        resources.insert(format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}"),json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":claim,"namespace":ns,"uid":id(5),"resourceVersion":"1"},"spec":{"volumeName":"retained-pv","storageClassName":db["storage"]["storage_class"]},"status":{"phase":"Bound"}}));
-        resources.insert("/apis/local.openebs.io/v1alpha1/lvmvolumes".into(),json!({"metadata":{"resourceVersion":"1"},"items":[{"kind":"LVMVolume","metadata":{"name":handle,"namespace":SYSTEM,"uid":id(7),"resourceVersion":"1"}}]}));
+        // OpenEBS names the PersistentVolume and the LVMVolume after the volume ID.
+        let pv = json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":handle,"uid":id(6),"resourceVersion":"1"},"spec":{"claimRef":{"name":claim,"namespace":ns,"uid":id(5)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":handle},"storageClassName":db["storage"]["storage_class"],"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":[db["node"]]}]}]}}},"status":{"phase":"Bound"}});
+        resources.insert(format!("/api/v1/persistentvolumes/{handle}"), pv);
+        resources.insert(format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}"),json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":claim,"namespace":ns,"uid":id(5),"resourceVersion":"1"},"spec":{"volumeName":handle,"storageClassName":db["storage"]["storage_class"]},"status":{"phase":"Bound"}}));
+        resources.insert(format!("/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmvolumes/{handle}"),json!({"apiVersion":"local.openebs.io/v1alpha1","kind":"LVMVolume","metadata":{"name":handle,"namespace":"openebs","uid":id(7),"resourceVersion":"1"}}));
         resources.insert(
             format!("/api/v1/namespaces/{ns}/pods"),
             json!({"metadata":{"resourceVersion":"1"},"items":[]}),
