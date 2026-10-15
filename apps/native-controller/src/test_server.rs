@@ -36,6 +36,9 @@ pub struct State {
     pub refuse: Option<RefuseWrite>,
     /// A read for which this returns a status fails with it.
     pub refuse_read: Option<RefuseRead>,
+    /// The kubelet leaves an accepted Pod resize pending with this reason (`Deferred` or
+    /// `Infeasible`) instead of actuating it.
+    pub resize_pending: Option<String>,
     /// Every committed write as one line, appended to a log other doubles also write to, so a
     /// test can assert the order of effects across the cluster, the gateway and PostgreSQL.
     pub log: Option<Arc<Mutex<Vec<String>>>>,
@@ -214,6 +217,23 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
                 return reply(409, &json!({"reason":"Conflict"}));
             }
             strategic_merge(&mut current, &patch);
+            let mut conditions: Vec<Value> = current["status"]["conditions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c["type"] != "PodResizePending")
+                .collect();
+            if let Some(reason) = state.resize_pending.clone() {
+                // The kubelet cannot allocate the new requests: the spec changed, the statuses
+                // report what is still actuated, and the Pod says why.
+                conditions.push(json!({"type":"PodResizePending","status":"True","reason":reason}));
+                current["status"]["conditions"] = conditions.into();
+                advance(&mut current);
+                state.objects.insert(target.into(), current.clone());
+                return committed(state, method, path, patch, &current);
+            }
+            current["status"]["conditions"] = conditions.into();
             // The kubelet actuates an accepted resize at once: what the containers' statuses
             // report follows the new requests.
             for (spec, status) in [

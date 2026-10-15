@@ -477,6 +477,24 @@ async fn the_node_cap_is_a_precondition_of_parking() {
     w.snapshot.region["parking"]["max_per_node"] = 2.into();
     assert!(sleep_pass(&w).await.is_none());
     assert_eq!(progress(&w)["phase"], "parking");
+    // A database whose demotion has not removed its Pod yet still holds its slot; an ordinary
+    // hibernation in progress holds none.
+    for (park, parks) in [(true, false), (false, true)] {
+        let mut w = World::awake().await;
+        quick(&mut w);
+        let mut record = json!({"phase":"hibernating","anchor":{"node":NODE}});
+        if park {
+            record["park"] = json!({"parkedAt":now() - 1000});
+        }
+        seed_record(&w, "aaaaaaaaaaaaaaaaaaaa", record);
+        w.snapshot.region["parking"]["max_per_node"] = 1.into();
+        assert!(sleep_pass(&w).await.is_none());
+        assert_eq!(
+            progress(&w)["phase"] == "parking",
+            parks,
+            "a demoting record holds a slot: {park}"
+        );
+    }
     // With a second one the node is full and the sleep is a real hibernation.
     let mut w = World::awake().await;
     quick(&mut w);
@@ -494,8 +512,15 @@ async fn the_node_cap_is_a_precondition_of_parking() {
 
 /// The fence ConfigMap of another database whose progress is in `phase` on `node`.
 fn seed_other(w: &World, id: &str, phase: &str, parked_at: u64, node: &str) {
-    let progress = json!({"phase":phase,"anchor":{"node":node},"park":{"parkedAt":parked_at}});
-    w.server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("gateway-fence-{id}"),"namespace":SYSTEM,"uid":uid(500),"labels":{"pgcf.io/database-id":id,wire("fenceLabel"):"true"}},"data":{"power.json":progress.to_string()}}));
+    seed_record(
+        w,
+        id,
+        json!({"phase":phase,"anchor":{"node":node},"park":{"parkedAt":parked_at}}),
+    );
+}
+/// The fence ConfigMap of another database with the progress `record`.
+fn seed_record(w: &World, id: &str, record: Value) {
+    w.server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("gateway-fence-{id}"),"namespace":SYSTEM,"uid":uid(500),"labels":{"pgcf.io/database-id":id,wire("fenceLabel"):"true"}},"data":{"power.json":record.to_string()}}));
 }
 
 #[tokio::test]
@@ -848,60 +873,151 @@ async fn a_wake_that_cannot_build_the_manifests_takes_the_slow_path() {
 }
 
 #[tokio::test]
-async fn a_changed_pod_uid_container_id_boot_id_or_release_forces_demotion() {
-    async fn broken(name: &str, change: impl Fn(&mut World)) {
+async fn a_wake_of_a_pod_cnpg_replaced_continues_on_the_replacement_without_a_demotion() {
+    // Only the Pod is another one (or the same one with new containers, or one on a rebooted
+    // node), and nothing the wake applies changed: the instance CNPG keeps resumes through the
+    // ordinary wake, whatever its phase, instead of being hibernated and created once more.
+    type Change = Box<dyn Fn(&mut World)>;
+    let changes: Vec<(&str, bool, Change)> = vec![
+        (
+            "pod uid",
+            false,
+            Box::new(|w| {
+                w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+                    pod["metadata"]["uid"] = uid(77).into();
+                });
+            }),
+        ),
+        (
+            "postgres container",
+            true,
+            Box::new(|w| {
+                w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+                    pod["status"]["containerStatuses"][0]["containerID"] =
+                        "containerd://other".into();
+                });
+            }),
+        ),
+        (
+            "sidecar container",
+            true,
+            Box::new(|w| {
+                w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+                    pod["status"]["initContainerStatuses"][0]["containerID"] =
+                        "containerd://other".into();
+                });
+            }),
+        ),
+        (
+            "boot id",
+            true,
+            Box::new(|w| {
+                w.node["status"]["nodeInfo"]["bootID"] =
+                    "01234567-89ab-4def-8123-0000000000b2".into();
+            }),
+        ),
+    ];
+    for phase_stuck in [false, true] {
+        for (name, same_pod, change) in &changes {
+            let mut w = parked().await;
+            w.wake(3);
+            change(&mut w);
+            if phase_stuck {
+                stuck(&w);
+            }
+            let inputs = Inputs::of(&w).await;
+            assert!(
+                matches!(wake_pass(&w, &inputs).await, PrepareRunning::Proceed),
+                "{name}: the ordinary wake continues"
+            );
+            assert!(annotations(&w)[FENCE].is_null(), "{name}");
+            assert_eq!(annotations(&w)[HIBERNATION], "off", "{name}");
+            assert_eq!(progress(&w)["phase"], "wake", "{name}");
+            assert!(
+                patches(&w, &cluster_path(&w))
+                    .iter()
+                    .all(|b| b["metadata"]["annotations"][HIBERNATION] != "on"),
+                "{name}: no demotion"
+            );
+            // The Pod that is still the parked object gets its requests back; a replacement was
+            // created with them.
+            let up = usize::from(*same_pod);
+            assert_eq!(
+                patches(&w, &resize_path(&w)).len(),
+                1 + up,
+                "{name}: resize up only for the same Pod"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_changed_release_or_runtime_takes_the_slow_path() {
+    // An operator or runtime upgrade would roll the Pod right after the unfence: it is hibernated
+    // first and created once more by the ordinary wake.
+    type Change = Box<dyn Fn(&mut World)>;
+    let changes: Vec<(&str, Change)> = vec![
+        (
+            "release id",
+            Box::new(|w| w.snapshot.fleet_release["release"]["id"] = "r2".into()),
+        ),
+        (
+            "release spec",
+            Box::new(|w| {
+                w.snapshot.fleet_release["release"]["spec_sha256"] = "c".repeat(64).into()
+            }),
+        ),
+        (
+            "node assignment",
+            Box::new(|w| w.snapshot.fleet_release["nodes"][0]["revision"] = 4.into()),
+        ),
+        (
+            "runtime class",
+            Box::new(|w| {
+                w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+                    pod["spec"]["runtimeClassName"] = "pgcf-prestarted".into();
+                });
+            }),
+        ),
+    ];
+    for (name, change) in changes {
         let mut w = parked().await;
         w.wake(3);
         change(&mut w);
         let inputs = Inputs::of(&w).await;
-        let outcome = wake_pass(&w, &inputs).await;
         assert!(
-            matches!(outcome, PrepareRunning::Pending),
-            "{name}: identity must match the park record"
+            matches!(wake_pass(&w, &inputs).await, PrepareRunning::Pending),
+            "{name}: demoted first"
         );
         assert_eq!(fence_value(&w), "[\"*\"]", "{name}: no unfence");
         assert_eq!(annotations(&w)[HIBERNATION], "on", "{name}");
     }
-    broken("pod uid", |w| {
-        w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
-            pod["metadata"]["uid"] = uid(77).into();
-        });
-    })
-    .await;
-    broken("postgres container", |w| {
-        w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
-            pod["status"]["containerStatuses"][0]["containerID"] = "containerd://other".into();
-        });
-    })
-    .await;
-    broken("sidecar container", |w| {
-        w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
-            pod["status"]["initContainerStatuses"][0]["containerID"] = "containerd://other".into();
-        });
-    })
-    .await;
-    broken("boot id", |w| {
-        w.node["status"]["nodeInfo"]["bootID"] = "01234567-89ab-4def-8123-0000000000b2".into();
-    })
-    .await;
-    broken("release id", |w| {
-        w.snapshot.fleet_release["release"]["id"] = "r2".into();
-    })
-    .await;
-    broken("release spec", |w| {
-        w.snapshot.fleet_release["release"]["spec_sha256"] = "c".repeat(64).into();
-    })
-    .await;
-    broken("node assignment", |w| {
-        w.snapshot.fleet_release["nodes"][0]["revision"] = 4.into();
-    })
-    .await;
-    broken("runtime class", |w| {
-        w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
-            pod["spec"]["runtimeClassName"] = "pgcf-prestarted".into();
-        });
-    })
-    .await;
+}
+
+#[tokio::test]
+async fn a_drifted_wake_with_a_stuck_phase_lifts_the_fence_together_with_hibernation() {
+    // A slow path that meets a phase below healthy cannot hibernate a fenced instance: one patch
+    // lifts the fence and sets hibernation on, and CNPG hibernates once the instance is healthy.
+    let mut w = parked().await;
+    w.wake(3);
+    w.db["roles"][0]["password"] = "z".repeat(43).into();
+    stuck(&w);
+    let inputs = Inputs::of(&w).await;
+    assert!(matches!(
+        wake_pass(&w, &inputs).await,
+        PrepareRunning::Pending
+    ));
+    assert_eq!(fence_lifted_with_hibernation(&w), 1);
+    assert!(annotations(&w)[FENCE].is_null());
+    assert_eq!(annotations(&w)[HIBERNATION], "on");
+    assert_eq!(intent(&w)["mode"], "quiesce", "the gateway stays closed");
+    // Once CNPG has hibernated it, the ordinary wake releases hibernation.
+    hibernated(&w);
+    assert!(matches!(
+        wake_pass(&w, &inputs).await,
+        PrepareRunning::Proceed
+    ));
+    assert_eq!(annotations(&w)[HIBERNATION], "off");
 }
 
 /// Simulates CNPG finishing a hibernation: the condition is reached and the Pod is terminal.
@@ -966,79 +1082,125 @@ async fn ttl_demotes_a_parked_database_without_starting_postgres_when_phase_is_h
     assert!(progress(&w)["park"].is_null());
 }
 
-#[tokio::test]
-async fn a_stuck_phase_unfences_before_hibernation() {
-    let mut w = parked().await;
-    quick(&mut w);
-    // CNPG recreated the fenced Pod: its phase stays below Healthy and hibernation would wait.
+/// CNPG's phase while an instance it recreated stays fenced: never healthy again by itself.
+fn stuck(w: &World) {
     w.server
         .edit("Cluster", Some(&w.ns), "database", |cluster| {
             cluster["status"]["phase"] = "Waiting for the instances to become active".into();
         });
-    w.wake(3);
-    // A replaced Pod is not the recorded one, so the wake demotes: unfence first.
-    w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
-        pod["metadata"]["uid"] = uid(77).into();
-    });
-    let inputs = Inputs::of(&w).await;
-    assert!(matches!(
-        wake_pass(&w, &inputs).await,
-        PrepareRunning::Pending
-    ));
-    assert!(
-        annotations(&w)[FENCE].is_null(),
-        "algorithm B lifts the fence"
-    );
-    assert!(annotations(&w)[HIBERNATION].is_null() || annotations(&w)[HIBERNATION] == "off");
-    // Once the phase is healthy again, hibernation follows.
-    w.server
-        .edit("Cluster", Some(&w.ns), "database", |cluster| {
-            cluster["status"]["phase"] = "Cluster in healthy state".into();
-        });
-    assert!(matches!(
-        wake_pass(&w, &inputs).await,
-        PrepareRunning::Pending
-    ));
+}
+/// Cluster patches that lift the fence and set hibernation on in the same write.
+fn fence_lifted_with_hibernation(w: &World) -> usize {
+    patches(w, &cluster_path(w))
+        .iter()
+        .filter(|b| {
+            b["metadata"]["annotations"].get(FENCE) == Some(&Value::Null)
+                && b["metadata"]["annotations"][HIBERNATION] == "on"
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_parked_pod_that_cnpg_recreated_is_demoted_while_asleep() {
+    // A node reboot, an eviction or a deleted Pod: CNPG recreates the instance still fenced, so
+    // its phase never becomes healthy again and a hibernation alone would wait for ever. The same
+    // holds for any demotion that meets such a phase, here one the TTL starts.
+    for recreated in [true, false] {
+        let mut w = parked().await;
+        quick(&mut w);
+        if recreated {
+            w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+                pod["metadata"]["uid"] = uid(77).into();
+            });
+        } else {
+            expire(&w);
+        }
+        stuck(&w);
+        // One patch lifts the fence and sets hibernation on: the instance starts PostgreSQL
+        // behind the closed gateway, CNPG reaches a healthy phase and then hibernates it.
+        let first = sleep_pass(&w).await;
+        if recreated {
+            assert!(
+                first.is_none(),
+                "the recorded Pod is gone: nothing is parked"
+            );
+        } else {
+            withdrawn(first);
+        }
+        assert_eq!(progress(&w)["phase"], "hibernating");
+        assert_eq!(fence_lifted_with_hibernation(&w), 1);
+        assert!(annotations(&w)[FENCE].is_null());
+        assert_eq!(annotations(&w)[HIBERNATION], "on");
+        assert_eq!(intent(&w)["mode"], "quiesce", "the gateway stays closed");
+        assert!(sleep_pass(&w).await.is_none(), "still waiting for CNPG");
+        // CNPG hibernates the instance; the demotion ends as the plain hibernated observation.
+        hibernated(&w);
+        let done = sleep_pass(&w).await.expect("hibernated");
+        assert_eq!(done["state"], "hibernated");
+        assert!(done["power"]["parked"].is_null());
+        assert_eq!(progress(&w)["phase"], "hibernated");
+        assert!(progress(&w)["park"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn a_cluster_below_its_healthy_phase_is_never_parked() {
+    // Only a healthy Cluster can hibernate the Pod a demotion would give up, so only a healthy
+    // one parks; any other sleep is the ordinary hibernation.
+    let mut w = World::awake().await;
+    quick(&mut w);
+    stuck(&w);
+    assert!(sleep_pass(&w).await.is_none());
+    assert_eq!(progress(&w)["phase"], "hibernating");
+    assert!(progress(&w)["park"].is_null());
+    assert!(annotations(&w)[FENCE].is_null());
     assert_eq!(annotations(&w)[HIBERNATION], "on");
 }
 
 #[tokio::test]
-async fn an_idle_pass_never_starts_postgres_for_a_stuck_phase() {
-    let mut w = parked().await;
+async fn a_stop_that_is_never_confirmed_falls_back_to_hibernation() {
+    let mut w = World::awake().await;
     quick(&mut w);
-    w.server
-        .edit("Cluster", Some(&w.ns), "database", |cluster| {
-            cluster["status"]["phase"] = "Waiting for the instances to become active".into();
-        });
-    expire(&w);
-    // A suspended record carries no Cloudflare startup hold, so the unfence cannot be admitted.
-    let observed = sleep_pass(&w).await;
-    assert!(observed.is_none_or(|v| v["state"] == "hibernated"));
-    assert_eq!(fence_value(&w), "[\"*\"]");
-    assert!(annotations(&w)[HIBERNATION].is_null());
+    assert!(sleep_pass(&w).await.is_none());
+    assert_eq!(progress(&w)["phase"], "parking");
+    // PostgreSQL never stops behind the fence: within the sleep's budget the pass keeps waiting.
+    assert!(sleep_pass(&w).await.is_none());
+    assert_eq!(progress(&w)["phase"], "parking");
+    // Past it, the sleep becomes the ordinary hibernation. Nothing was parked, so nothing is
+    // observed as parked.
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+        |map| {
+            let mut record: Value = serde_json::from_str(text(&map["data"], "power.json")).unwrap();
+            record["startedAt"] = (now() - 601_000).into();
+            map["data"]["power.json"] = record.to_string().into();
+        },
+    );
+    assert!(sleep_pass(&w).await.is_none());
+    assert_eq!(progress(&w)["phase"], "hibernating");
+    assert_eq!(annotations(&w)[HIBERNATION], "on");
+    hibernated(&w);
+    let done = sleep_pass(&w).await.expect("hibernated");
+    assert_eq!(done["state"], "hibernated");
+    assert!(done["power"]["parked"].is_null());
 }
 
 #[tokio::test]
 async fn the_oldest_parked_databases_demote_themselves_when_the_cap_is_exceeded() {
     let mut w = parked().await;
     quick(&mut w);
-    // Two younger parked databases on this node; the policy now allows two of three.
+    // Two younger parked databases on this node; the policy now allows two of three. A
+    // database on another node does not count.
     seed_other(&w, "aaaaaaaaaaaaaaaaaaaa", "parked", now() - 10_000, NODE);
     seed_other(&w, "bbbbbbbbbbbbbbbbbbbb", "parked", now() - 20_000, NODE);
-    // A database on another node and one already demoting do not count.
     seed_other(
         &w,
         "cccccccccccccccccccc",
         "parked",
         now() - 90_000,
         "another-node",
-    );
-    seed_other(
-        &w,
-        "dddddddddddddddddddd",
-        "hibernating",
-        now() - 90_000,
-        NODE,
     );
     w.snapshot.region["parking"]["max_per_node"] = 2.into();
     w.server.edit(
@@ -1063,6 +1225,22 @@ async fn the_oldest_parked_databases_demote_themselves_when_the_cap_is_exceeded(
     seed_other(&w, "aaaaaaaaaaaaaaaaaaaa", "parked", now() - 10_000, NODE);
     w.snapshot.region["parking"]["max_per_node"] = 2.into();
     assert!(sleep_pass(&w).await.is_some());
+    assert_eq!(progress(&w)["phase"], "parked");
+    // A database already demoting still holds its slot and leaves first: its Pod is going, so the
+    // excess it causes demotes nobody else, however young it is.
+    let mut w = parked().await;
+    quick(&mut w);
+    seed_other(&w, "aaaaaaaaaaaaaaaaaaaa", "parked", now() - 10_000, NODE);
+    seed_other(
+        &w,
+        "dddddddddddddddddddd",
+        "hibernating",
+        now() - 1_000,
+        NODE,
+    );
+    w.snapshot.region["parking"]["max_per_node"] = 2.into();
+    let again = sleep_pass(&w).await.expect("still parked");
+    assert_eq!(again["power"]["parked"]["wake"], "fast");
     assert_eq!(progress(&w)["phase"], "parked");
 }
 
@@ -1202,6 +1380,22 @@ fn parked_progress_roundtrips_and_an_unknown_phase_is_a_recovery_error() {
     let parsed = progress_from(&map, 100_000).unwrap().unwrap();
     assert_eq!(parsed.phase, Phase::Parked);
     assert_eq!(serde_json::to_value(&parsed).unwrap(), record);
+    // A park recorded a moment ahead of this clock is a clock difference, not a forgery; one far
+    // ahead is refused.
+    let mut ahead = record.clone();
+    ahead["park"]["parkedAt"] = 104_000.into();
+    assert_eq!(
+        progress_from(&json!({"data":{"power.json":ahead.to_string()}}), 100_000)
+            .unwrap()
+            .unwrap()
+            .phase,
+        Phase::Parked
+    );
+    ahead["park"]["parkedAt"] = 106_000.into();
+    assert!(matches!(
+        progress_from(&json!({"data":{"power.json":ahead.to_string()}}), 100_000),
+        Err(Fault::Recovery("power_park_invalid"))
+    ));
     // `Parking` is the same record with the stop still unconfirmed.
     record["phase"] = "parking".into();
     let map = json!({"data":{"power.json":record.to_string()}});

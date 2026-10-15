@@ -59,8 +59,10 @@ pub fn pod_uid() -> String {
 pub fn gateway_uid() -> String {
     uid(20)
 }
-pub const POSTGRES_CONTAINER: &str = "containerd://postgres-container-0001";
-pub const SIDECAR_CONTAINER: &str = "containerd://sidecar-container-0001";
+pub const POSTGRES_CONTAINER: &str =
+    "containerd://1111111111111111111111111111111111111111111111111111111111111111";
+pub const SIDECAR_CONTAINER: &str =
+    "containerd://2222222222222222222222222222222222222222222222222222222222222222";
 pub const BOOT_ID: &str = "01234567-89ab-4def-8123-0000000000b1";
 pub const HANDLE: &str = "pvc-01234567-89ab-4def-8123-000000000006";
 
@@ -320,6 +322,14 @@ fn answers(
     })
 }
 
+/// A running emulation of the kubelet's readiness probe; it stops with the test.
+pub struct KubeletProbe(tokio::task::JoinHandle<()>);
+impl Drop for KubeletProbe {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct World {
     /// Every committed write of the cluster, every gateway control and every statement of
     /// PostgreSQL, in the order they happened.
@@ -542,6 +552,53 @@ impl World {
             )
             .await
             .unwrap()
+    }
+    /// The kubelet's readiness probe after a wake: once the fence is gone, the Pod and its
+    /// `postgres` container are reported ready, and the log records when.
+    pub fn kubelet_ready_after_unfence(&self) -> KubeletProbe {
+        let state = self.server.state.clone();
+        let log = self.log.clone();
+        let cluster = crate::test_server::path("Cluster", Some(&self.ns), "database");
+        let pod = crate::test_server::path("Pod", Some(&self.ns), "database-1");
+        KubeletProbe(tokio::spawn(async move {
+            loop {
+                let unfenced = state
+                    .lock()
+                    .unwrap()
+                    .objects
+                    .get(&cluster)
+                    .is_some_and(|c| {
+                        c["metadata"]["annotations"]
+                            .get("cnpg.io/fencedInstances")
+                            .is_none()
+                    });
+                if unfenced {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // A probe period, shortened.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let mut state = state.lock().unwrap();
+            if let Some(pod) = state.objects.get_mut(&pod) {
+                let mut conditions: Vec<Value> = pod["status"]["conditions"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| c["type"] != "Ready")
+                    .collect();
+                conditions.push(json!({"type":"Ready","status":"True"}));
+                pod["status"]["conditions"] = conditions.into();
+                pod["status"]["containerStatuses"][0]["ready"] = true.into();
+                let version: u64 = pod["metadata"]["resourceVersion"]
+                    .as_str()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                pod["metadata"]["resourceVersion"] = (version + 1).to_string().into();
+            }
+            log.lock().unwrap().push("KUBELET ready".into());
+        }))
     }
     /// A rolling update replaced the gateway Pod: same name, new identity.
     pub fn replace_gateway(&self) {

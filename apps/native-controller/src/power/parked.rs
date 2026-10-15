@@ -27,6 +27,9 @@ const SELECTOR: &str = "cnpg.io/cluster=database";
 const HEALTHY: &str = "Cluster in healthy state";
 /// How long a resize is awaited before the Pod is parked at the requests it still has.
 const RESIZE_BUDGET: Duration = Duration::from_secs(2);
+/// How long a wake waits for the kubelet to give a resumed Pod its requests back before the Pod
+/// is given up for one created with them (milliseconds from the start of the wake).
+const RESIZE_UP_BUDGET: u64 = 10_000;
 
 /// What the region's `parking` policy asks of a parked sleep.
 pub(super) struct Policy {
@@ -216,6 +219,34 @@ enum Demotion {
     Pending,
     Done,
 }
+/// Where a resumed Pod's requests stand on their way back.
+enum Restore {
+    /// The kubelet runs the Pod with them.
+    Done,
+    /// The Pod is not the parked object any more: its replacement was created with them.
+    Replaced,
+    /// Asked for and not actuated yet (`in_progress`, `deferred`).
+    Pending(&'static str),
+    /// Refused by the API server, or infeasible on this node.
+    Rejected(&'static str),
+}
+/// The fast wake's predicates that do not depend on the fence: what the desired state and the
+/// fleet would apply (`fits`), and whether the Pod is the one that was parked (`pod`).
+struct Inspection {
+    fits: Option<&'static str>,
+    pod: Option<&'static str>,
+}
+/// A Pod that changed only its identity: replaced, restarted or on a rebooted node.
+fn identity_only(reason: &str) -> bool {
+    matches!(reason, "boot_changed" | "pod_changed" | "pod_missing")
+}
+/// A database of a node whose instance Pod holds one of the node's parked slots: parked or being
+/// parked, or `leaving` (demoting a Pod it still holds).
+struct Slot {
+    id: String,
+    parked_at: u64,
+    leaving: bool,
+}
 /// What a sleeping pass knows of the fast wake of the Pod it retains.
 enum Standing {
     /// Every predicate holds right now.
@@ -227,7 +258,7 @@ enum Standing {
 }
 /// How a wake met a retained Pod.
 pub(super) enum Resumed {
-    Fast(ParkedWake),
+    Fast(Box<ParkedWake>),
     /// The retained Pod is being hibernated; the wake waits for it.
     Waiting,
     /// No retained Pod stands in the way: the ordinary CNPG wake applies.
@@ -259,9 +290,15 @@ impl PowerCoordinator {
             .collect();
         Ok(if live.len() == 1 { live.pop() } else { None })
     }
-    /// The databases of `node` whose Pod is parked or being parked, as (id, parked_at). Read
+    /// The parked slots of `node`: databases whose Pod is parked or being parked, and those
+    /// still demoting a parked Pod, which holds node memory until CNPG has deleted it. Read
     /// loosely: one unreadable record must never block another database's decision.
-    async fn parked_on_node(&self, node: &str) -> Result<Vec<(String, u64)>> {
+    ///
+    /// Two limits of a count read this way: passes for databases of one node run concurrently,
+    /// so each can find the last slot free and park, exceeding the cap until the oldest demote
+    /// themselves (`over_cap`); and a record that is deleted or unreadable holds no slot,
+    /// although its Pod may still run.
+    async fn slots_on_node(&self, node: &str) -> Result<Vec<Slot>> {
         let selector = format!("{}=true", wire("fenceLabel"));
         let maps = self
             .k8s
@@ -273,14 +310,16 @@ impl PowerCoordinator {
                 let id = map["metadata"]["labels"][DATABASE_LABEL].as_str()?;
                 let record: Value =
                     serde_json::from_str(map["data"]["power.json"].as_str()?).ok()?;
-                (matches!(record["phase"].as_str(), Some("parking" | "parked"))
-                    && record["anchor"]["node"] == node)
-                    .then(|| {
-                        (
-                            id.to_string(),
-                            record["park"]["parkedAt"].as_u64().unwrap_or(0),
-                        )
-                    })
+                let leaving = match record["phase"].as_str()? {
+                    "parking" | "parked" => false,
+                    "hibernating" if record["park"].is_object() => true,
+                    _ => return None,
+                };
+                (record["anchor"]["node"] == node).then(|| Slot {
+                    id: id.to_string(),
+                    parked_at: record["park"]["parkedAt"].as_u64().unwrap_or(0),
+                    leaving,
+                })
             })
             .collect())
     }
@@ -303,6 +342,7 @@ impl PowerCoordinator {
             || cluster["spec"]["instances"] != 1
             || hibernation_on(cluster)
             || fenced(cluster)
+            || !healthy(cluster)
             || boot_id(sleep.basis.node).is_empty()
         {
             return Ok(None);
@@ -335,8 +375,12 @@ impl PowerCoordinator {
         {
             return Ok(None);
         }
-        let peers = self.parked_on_node(text(db, "node")).await?;
-        if peers.iter().filter(|(id, _)| id != text(db, "id")).count() as u64 >= policy.max_per_node
+        let slots = self.slots_on_node(text(db, "node")).await?;
+        if slots
+            .iter()
+            .filter(|slot| slot.id != text(db, "id"))
+            .count() as u64
+            >= policy.max_per_node
         {
             return Ok(None);
         }
@@ -533,6 +577,14 @@ impl PowerCoordinator {
             .park
             .clone()
             .ok_or(Fault::Recovery("power_park_missing"))?;
+        // A stop that is never confirmed within the sleep's budget becomes the hibernation the
+        // sleep would otherwise have been.
+        if self.now().saturating_sub(p.started_at) >= MAX_WAIT {
+            self.demotion_event(db, intent, "stop_unconfirmed", None);
+            return Ok(Retained::Observed(
+                self.demote_pass(db, intent, map, p, cluster).await?,
+            ));
+        }
         let deadline = Instant::now() + self.stop_budget;
         let mut pause = Duration::from_millis(100);
         let pod = loop {
@@ -656,7 +708,10 @@ impl PowerCoordinator {
         eprintln!("{event}");
     }
     /// A periodic pass over a Parked database: the demotion triggers, in order, then a fresh
-    /// observation of the Pod it still holds.
+    /// observation of the Pod it still holds. Passes run only while the controller's desired
+    /// state is fresh (`main.rs` schedules no job without a full pull in the last 90 s), so a
+    /// parked Pod outlives its TTL, the cap and any drift while Cloudflare cannot be reached, at
+    /// its parked requests, until the next pass after the link returns.
     async fn parked_pass(
         &self,
         db: &Value,
@@ -731,22 +786,28 @@ impl PowerCoordinator {
             matches!(standing, Standing::Holds),
         ))))
     }
-    /// Whether this database is among the oldest ones above the node's cap, which demote
-    /// themselves: ordered by (parked_at, id), the first `count - max` leave.
+    /// Whether this database is among those above the node's cap, which demote themselves:
+    /// the first `count - max` leave, those already leaving first, then by (parked_at, id).
     async fn over_cap(&self, db: &Value, park: &Park, policy: Option<&Policy>) -> Result<bool> {
         let Some(policy) = policy else {
             return Ok(false);
         };
-        let mut peers = self.parked_on_node(text(db, "node")).await?;
-        if !peers.iter().any(|(id, _)| id == text(db, "id")) {
-            peers.push((text(db, "id").into(), park.parked_at));
+        let mut slots = self.slots_on_node(text(db, "node")).await?;
+        if !slots.iter().any(|slot| slot.id == text(db, "id")) {
+            slots.push(Slot {
+                id: text(db, "id").into(),
+                parked_at: park.parked_at,
+                leaving: false,
+            });
         }
-        peers.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
-        let excess = (peers.len() as u64).saturating_sub(policy.max_per_node) as usize;
-        Ok(peers
+        slots.sort_by(|a, b| {
+            (!a.leaving, a.parked_at, &a.id).cmp(&(!b.leaving, b.parked_at, &b.id))
+        });
+        let excess = (slots.len() as u64).saturating_sub(policy.max_per_node) as usize;
+        Ok(slots
             .iter()
             .take(excess)
-            .any(|(id, _)| id == text(db, "id")))
+            .any(|slot| slot.id == text(db, "id")))
     }
     /// A sleep pass over a database that holds a retained instance Pod.
     #[allow(clippy::too_many_arguments)]
@@ -803,7 +864,8 @@ impl PowerCoordinator {
         cluster: Value,
     ) -> Result<Option<Value>> {
         let first = p.phase != Phase::Hibernating && p.target == *intent;
-        let park = p.park.clone();
+        // Only a Pod seen stopped was ever observed as parked.
+        let park = p.park.clone().filter(|park| park.stopped);
         match self.demote(db, intent, map, p, &cluster, true).await?.0 {
             Demotion::Done => Ok(Some(observation(db, intent, "hibernated", None))),
             Demotion::Pending => match park.filter(|_| first) {
@@ -840,9 +902,12 @@ impl PowerCoordinator {
         )))
     }
     /// Algorithm A while the Cluster phase is healthy: hibernation on with the fence left in
-    /// place, so PostgreSQL never starts. Algorithm B otherwise: lift the fence and let CNPG
-    /// reach a healthy phase first. Lifting the fence starts PostgreSQL, which only a wake
-    /// asks for: a sleeping database (`sleep`) never does.
+    /// place, so PostgreSQL never starts. Algorithm B otherwise (an instance CNPG recreated, or
+    /// any phase below healthy): one patch lifts the fence and sets hibernation on. CNPG defers
+    /// hibernation until the phase is healthy, which a fenced instance never reaches; unfenced,
+    /// it starts PostgreSQL behind the gateway's closed fence, nothing can connect, and CNPG then
+    /// hibernates it. `sleep` is the database's desired state, which only decides what the
+    /// gateway's fence and the completion check stamp and read.
     async fn demote(
         &self,
         db: &Value,
@@ -905,19 +970,36 @@ impl PowerCoordinator {
             }
             // CNPG defers hibernation while its phase is not healthy; only an unfenced instance
             // can become healthy again.
-            if fenced(&cluster) && !healthy(&cluster) && !sleep {
+            if fenced(&cluster) && !healthy(&cluster) {
                 cluster = self.lift_fence(&cluster).await?;
             }
             phase.pending();
             return Ok((Demotion::Pending, map, p, cluster));
         }
-        if healthy(&cluster) {
-            self.cluster_intent(intent, &cluster, "on").await?;
-        } else if fenced(&cluster) && !sleep {
-            cluster = self.lift_fence(&cluster).await?;
-        }
+        let unfence = fenced(&cluster) && !healthy(&cluster);
+        self.cluster_power(intent, &cluster, "on", unfence).await?;
         phase.pending();
         Ok((Demotion::Pending, map, p, cluster))
+    }
+    /// The progress of a wake in flight on a retained Pod: `Wake` for `intent`, keeping the record
+    /// so a crash after the unfence still finds the Pod it must resume, and the wake's start.
+    fn wake_progress(&self, prior: &Progress, intent: &PowerIntent) -> Progress {
+        let mut progress = Progress::new(
+            intent.clone(),
+            Phase::Wake,
+            prior.anchor.clone(),
+            self.now(),
+        );
+        progress.park = prior.park.clone();
+        progress.proof_intent = prior.proof_intent.clone();
+        progress.segment = prior.segment.clone();
+        progress.gateways = prior.gateways.clone();
+        progress.key_uid = prior.key_uid.clone();
+        progress.key_version = prior.key_version.clone();
+        if prior.target.revision == intent.revision {
+            progress.started_at = prior.started_at;
+        }
+        progress
     }
     /// Resumes or demotes a retained Pod for a wake, before CNPG's hibernation is released.
     pub(super) async fn resume_retained(
@@ -935,65 +1017,52 @@ impl PowerCoordinator {
             .ok_or(Fault::Recovery("power_park_missing"))?;
         let lifted = !fenced(&cluster);
         if lifted && matches!(prior.phase, Phase::Parking | Phase::Parked | Phase::Wake) {
-            // The fence is already gone: PostgreSQL starts on the retained Pod without a demotion.
-            // Its requests return to what they were, then the ordinary chain verifies the
-            // running instance with the same predicates as any other wake.
-            if let Some(pod) = self
-                .k8s
-                .read("Pod", Some(&namespace(db)), &park.pod_name)
-                .await?
-                && pod["metadata"]["uid"] == park.pod_uid.as_str()
-                && pod["metadata"]["deletionTimestamp"].is_null()
-                && !terminal_pod(&pod)
-                && !Self::requested(&pod, &park.requests_before)
-            {
-                self.resize(&pod, &park.requests_before).await?;
-            }
-            return Ok((Resumed::Ordinary, map, prior, cluster));
+            return self
+                .resume_unfenced(db, intent, map, prior, cluster, &park)
+                .await;
         }
         let resumable = matches!(prior.phase, Phase::Parking | Phase::Parked | Phase::Wake)
             && !hibernation_on(&cluster);
         let mut decision = timing::Phase::begin(db, "park_eligibility");
-        let verdict = if resumable {
-            self.eligible(db, &park, &cluster, basis).await?
+        let inspection = if resumable {
+            self.inspect(db, &park, &cluster, basis).await?
         } else {
-            Some("demotion_in_progress")
+            Inspection {
+                fits: Some("demotion_in_progress"),
+                pod: None,
+            }
         };
-        if let Some(reason) = verdict {
-            decision.note("reason", reason);
-            decision.pending();
-            // The slow path: demote first, then the ordinary CNPG wake.
-            let (outcome, map, progress, cluster) =
-                self.demote(db, intent, map, prior, &cluster, false).await?;
-            return Ok(match outcome {
-                Demotion::Done => (Resumed::Ordinary, map, progress, cluster),
-                Demotion::Pending => (Resumed::Waiting, map, progress, cluster),
-            });
+        match (inspection.fits, inspection.pod) {
+            (None, None) => {}
+            (None, Some(reason)) if identity_only(reason) => {
+                // Only the Pod is another one, or the same one restarted or on a rebooted node,
+                // and nothing the wake applies changed: CNPG's instance resumes through the
+                // ordinary wake, which lifts the fence, instead of being hibernated and created
+                // once more. The parked object, if it is still the Pod, gets its requests back.
+                decision.note("reason", reason);
+                decision.note("path", "replaced");
+                decision.pending();
+                if let Restore::Rejected(why) = self.restore_requests(db, &park).await? {
+                    self.resize_event(db, "failed", why);
+                }
+                return Ok((Resumed::Ordinary, map, prior, cluster));
+            }
+            (Some(reason), _) | (None, Some(reason)) => {
+                decision.note("reason", reason);
+                decision.pending();
+                // The slow path: demote first, then the ordinary CNPG wake.
+                return self.demoted(db, intent, map, prior, &cluster).await;
+            }
         }
         decision.note("reason", Value::Null);
         decision.completed();
-        // The fast path. Progress `Wake` is persisted first and keeps the record, so a crash
-        // after the unfence still finds the Pod it must resume; then one patch lifts the fence
-        // and releases hibernation while the Pod's requests return.
+        // The fast path. Progress `Wake` is persisted first; then one patch lifts the fence and
+        // releases hibernation while the Pod's requests return.
         let started = Instant::now();
-        let mut progress = Progress::new(
-            intent.clone(),
-            Phase::Wake,
-            prior.anchor.clone(),
-            self.now(),
-        );
-        progress.park = Some(park.clone());
-        progress.proof_intent = prior.proof_intent.clone();
-        progress.segment = prior.segment.clone();
-        progress.gateways = prior.gateways.clone();
-        progress.key_uid = prior.key_uid.clone();
-        progress.key_version = prior.key_version.clone();
-        if prior.target.revision == intent.revision {
-            progress.started_at = prior.started_at;
-        }
+        let progress = self.wake_progress(&prior, intent);
         let map = self.write(db, Some(&map), None, &progress).await?;
         let lift = timing::Phase::begin(db, "unfence_patch");
-        let resize = timing::Phase::begin(db, "resize_up");
+        let mut resize = timing::Phase::begin(db, "resize_up");
         let pod = self
             .k8s
             .read("Pod", Some(&namespace(db)), &park.pod_name)
@@ -1011,26 +1080,229 @@ impl PowerCoordinator {
             Ok(()) => lift.completed(),
             Err(_) => lift.failed(),
         }
+        // A resize that did not land is retried by the next pass of the wake, which keeps the
+        // record; the unfence either landed, and is read back, or was not written.
         match &resized {
             Ok(()) => resize.completed(),
-            Err(_) => resize.failed(),
+            Err(_) => {
+                resize.note("reason", "refused");
+                resize.failed();
+            }
         }
-        // A resize that did not land is retried by the next pass (the record is retained); the
-        // unfence either landed, and is read back, or was not written.
         unfenced?;
-        let _ = resized;
         Ok((
-            Resumed::Fast(ParkedWake {
+            Resumed::Fast(Box::new(ParkedWake {
                 pod_name: park.pod_name,
                 pod_uid: park.pod_uid,
                 postgres_container_id: park.postgres_container_id,
                 sidecar_container_id: park.sidecar_container_id,
+                requests_before: park.requests_before,
                 started,
-            }),
+            })),
             map,
             progress,
             cluster,
         ))
+    }
+    /// The slow path of a wake: the retained Pod is demoted, then the ordinary CNPG wake runs.
+    async fn demoted(
+        &self,
+        db: &Value,
+        intent: &PowerIntent,
+        map: Value,
+        prior: Progress,
+        cluster: &Value,
+    ) -> Result<(Resumed, Value, Progress, Value)> {
+        let (outcome, map, progress, cluster) =
+            self.demote(db, intent, map, prior, cluster, false).await?;
+        Ok(match outcome {
+            Demotion::Done => (Resumed::Ordinary, map, progress, cluster),
+            Demotion::Pending => (Resumed::Waiting, map, progress, cluster),
+        })
+    }
+    /// A wake that finds the fence gone: PostgreSQL starts, or started, on the retained Pod. Its
+    /// requests must come back before the ordinary chain verifies the running instance with the
+    /// same predicates as any other wake. The kubelet may defer them, or find them infeasible on
+    /// this node, or the API server may refuse them: the wake waits within its budget, and gives
+    /// the Pod up for one created with them once the budget is spent or the kubelet says never.
+    async fn resume_unfenced(
+        &self,
+        db: &Value,
+        intent: &PowerIntent,
+        map: Value,
+        prior: Progress,
+        cluster: Value,
+        park: &Park,
+    ) -> Result<(Resumed, Value, Progress, Value)> {
+        // The budget counts from the start of this wake, which a lifted fence without a `Wake`
+        // record of this intent has not recorded yet.
+        let (map, prior) = if prior.phase == Phase::Wake && prior.target.revision == intent.revision
+        {
+            (map, prior)
+        } else {
+            let progress = self.wake_progress(&prior, intent);
+            (self.write(db, Some(&map), None, &progress).await?, progress)
+        };
+        let overdue = self.now().saturating_sub(prior.started_at) >= RESIZE_UP_BUDGET;
+        match self.restore_requests(db, park).await? {
+            Restore::Done | Restore::Replaced => Ok((Resumed::Ordinary, map, prior, cluster)),
+            Restore::Rejected(why) if why == "infeasible" || overdue => {
+                self.resize_event(db, "failed", why);
+                self.demotion_event(db, intent, "resize_rejected", Some(why));
+                self.demoted(db, intent, map, prior, &cluster).await
+            }
+            Restore::Pending(why) if overdue => {
+                self.resize_event(db, "failed", why);
+                self.demotion_event(db, intent, "resize_rejected", Some(why));
+                self.demoted(db, intent, map, prior, &cluster).await
+            }
+            Restore::Rejected(why) | Restore::Pending(why) => {
+                self.resize_event(db, "pending", why);
+                Ok((Resumed::Waiting, map, prior, cluster))
+            }
+        }
+    }
+    /// A `resize_up` timing event of a later pass of the wake, with what holds the requests back.
+    fn resize_event(&self, db: &Value, outcome: &str, reason: &str) {
+        let mut phase = timing::Phase::begin(db, "resize_up");
+        phase.note("reason", reason);
+        match outcome {
+            "pending" => phase.pending(),
+            _ => phase.failed(),
+        }
+    }
+    /// Gives the retained Pod, if it is still the parked object, its requests back, and reads
+    /// where they stand.
+    async fn restore_requests(&self, db: &Value, park: &Park) -> Result<Restore> {
+        let Some(mut pod) = self
+            .k8s
+            .read("Pod", Some(&namespace(db)), &park.pod_name)
+            .await?
+            .filter(|pod| {
+                pod["metadata"]["uid"] == park.pod_uid.as_str()
+                    && pod["metadata"]["deletionTimestamp"].is_null()
+                    && !terminal_pod(pod)
+            })
+        else {
+            return Ok(Restore::Replaced);
+        };
+        if !Self::requested(&pod, &park.requests_before) {
+            match self.resize(&pod, &park.requests_before).await {
+                Ok(actual) => pod = actual,
+                Err(_) => return Ok(Restore::Rejected("refused")),
+            }
+        }
+        Ok(Self::restored(&pod, &park.requests_before))
+    }
+    /// Where `requests`, already asked for, stand: the kubelet's `PodResizePending` reason says
+    /// why it cannot actuate them; otherwise they are actuated or on their way.
+    fn restored(pod: &Value, requests: &Requests) -> Restore {
+        let pending = pod["status"]["conditions"].as_array().and_then(|all| {
+            all.iter()
+                .find(|c| c["type"] == "PodResizePending" && c["status"] == "True")
+        });
+        match pending.map(|c| text(c, "reason")) {
+            Some("Infeasible") => Restore::Rejected("infeasible"),
+            Some(_) => Restore::Pending("deferred"),
+            None if Self::actuated(pod, requests) => Restore::Done,
+            None => Restore::Pending("in_progress"),
+        }
+    }
+    /// After PostgreSQL accepts on the resumed Pod, the kubelet must report the Pod Ready and its
+    /// `postgres` container ready, because the gateway routes only to such an endpoint, and must
+    /// have actuated the requests the Pod was resized back to. Polls within the pass, then reads
+    /// the Pod and the Cluster once more: the attestation is read back against those. `None`
+    /// means not within `budget`; the next pass of the wake continues on the same Pod.
+    pub(crate) async fn resumed_settled(
+        &self,
+        db: &Value,
+        wake: &ParkedWake,
+        cluster: &Value,
+        budget: Duration,
+    ) -> std::result::Result<Option<(Value, Value)>, Error> {
+        let ns = namespace(db);
+        let mut ready = Some(timing::Phase::begin(db, "pod_ready"));
+        let mut actuated = Some(timing::Phase::begin(db, "resize_actuated"));
+        let deadline = Instant::now() + budget;
+        let mut polls = 0_u64;
+        loop {
+            polls += 1;
+            let Some(pod) = self
+                .k8s
+                .read("Pod", Some(&ns), &wake.pod_name)
+                .await?
+                .filter(|pod| {
+                    pod["metadata"]["uid"] == wake.pod_uid.as_str()
+                        && container_ids(pod).is_some_and(|(postgres, sidecar)| {
+                            postgres == wake.postgres_container_id
+                                && sidecar == wake.sidecar_container_id
+                        })
+                })
+            else {
+                return Ok(None);
+            };
+            let postgres_ready = named(&pod["status"]["containerStatuses"], POSTGRES)
+                .is_some_and(|c| c["ready"] == true);
+            let pod_ready = pod["status"]["conditions"].as_array().is_some_and(|all| {
+                all.iter()
+                    .any(|c| c["type"] == "Ready" && c["status"] == "True")
+            });
+            if pod_ready
+                && postgres_ready
+                && let Some(mut phase) = ready.take()
+            {
+                phase.note("polls", polls);
+                phase.completed();
+            }
+            let restore = if Self::requested(&pod, &wake.requests_before) {
+                Self::restored(&pod, &wake.requests_before)
+            } else {
+                Restore::Rejected("refused")
+            };
+            match restore {
+                Restore::Done | Restore::Replaced => {
+                    if let Some(mut phase) = actuated.take() {
+                        phase.note("polls", polls);
+                        phase.completed();
+                    }
+                }
+                Restore::Rejected(why) => {
+                    // The next pass of the wake asks again, or gives the Pod up.
+                    if let Some(mut phase) = actuated.take() {
+                        phase.note("reason", why);
+                        phase.pending();
+                    }
+                    if let Some(phase) = ready.take() {
+                        phase.pending();
+                    }
+                    return Ok(None);
+                }
+                Restore::Pending(why) => {
+                    if let Some(phase) = actuated.as_mut() {
+                        phase.note("reason", why);
+                    }
+                }
+            }
+            if ready.is_none() && actuated.is_none() {
+                let current = self
+                    .k8s
+                    .read("Cluster", Some(&ns), "database")
+                    .await?
+                    .filter(|current| current["metadata"]["uid"] == cluster["metadata"]["uid"])
+                    .ok_or("Cluster identity changed during the wake")?;
+                return Ok(Some((pod, current)));
+            }
+            if Instant::now() >= deadline {
+                if let Some(phase) = ready.take() {
+                    phase.pending();
+                }
+                if let Some(phase) = actuated.take() {
+                    phase.pending();
+                }
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
     /// One CAS patch lifting the fence and setting hibernation off, retried across the Cluster
     /// status writes CNPG makes between the read and the write.
@@ -1100,11 +1372,8 @@ impl PowerCoordinator {
         }
         self.intact(db, park, cluster, basis).await
     }
-    /// Whether nothing the Pod was parked under has changed: the fleet release and the node's
-    /// boot, the Pod and its containers, its image and runtime, and the desired manifests, which
-    /// must change no spec and no data when applied (they cover the size class, the image, the
-    /// parameters, the plugin and every credential, so none can roll the Pod after a wake or
-    /// leave a credential unacknowledged). Every predicate is read, none is guessed.
+    /// Whether nothing the Pod was parked under has changed. `Some(reason)` names the first
+    /// predicate that does not hold.
     async fn intact(
         &self,
         db: &Value,
@@ -1112,21 +1381,35 @@ impl PowerCoordinator {
         cluster: &Value,
         basis: &Basis<'_>,
     ) -> Result<Option<&'static str>> {
+        let inspection = self.inspect(db, park, cluster, basis).await?;
+        Ok(inspection.fits.or(inspection.pod))
+    }
+    /// The predicates of the fast wake apart from the fence. What the wake applies (`fits`): the
+    /// fleet release and the desired manifests, which must change no spec and no data when
+    /// applied (they cover the size class, the image, the parameters, the plugin and every
+    /// credential, so none can roll the Pod after a wake or leave a credential unacknowledged).
+    /// The Pod (`pod`): the node's boot, the Pod and its containers, then its runtime and image.
+    /// Every predicate is read, none is guessed.
+    async fn inspect(
+        &self,
+        db: &Value,
+        park: &Park,
+        cluster: &Value,
+        basis: &Basis<'_>,
+    ) -> Result<Inspection> {
         let release = &basis.release["release"];
-        if release["id"] != park.release_id.as_str()
+        let release_changed = release["id"] != park.release_id.as_str()
             || release["spec_sha256"] != park.spec_sha256.as_str()
-            || assignment(basis.release, text(db, "node")) != Some(park.assignment_revision)
-        {
-            return Ok(Some("release_changed"));
-        }
-        if boot_id(basis.node).is_empty() || boot_id(basis.node) != park.node_boot_id {
-            return Ok(Some("boot_changed"));
-        }
-        if cluster["status"]["currentPrimary"] != park.pod_name.as_str() {
-            return Ok(Some("pod_changed"));
-        }
+            || assignment(basis.release, text(db, "node")) != Some(park.assignment_revision);
         let Some(manifests) = basis.manifests else {
-            return Ok(Some("manifests_unavailable"));
+            return Ok(Inspection {
+                fits: Some(if release_changed {
+                    "release_changed"
+                } else {
+                    "manifests_unavailable"
+                }),
+                pod: None,
+            });
         };
         let ns = namespace(db);
         let (pod, current) = tokio::try_join!(
@@ -1142,27 +1425,17 @@ impl PowerCoordinator {
                     ))
             )
         )?;
-        let Some(pod) = pod else {
-            return Ok(Some("pod_missing"));
-        };
-        if !bound(&pod, park) || !instance_live(&pod, cluster, db) {
-            return Ok(Some("pod_changed"));
-        }
-        if text(&pod["spec"], "runtimeClassName") != basis.runtime_class {
-            return Ok(Some("runtime_changed"));
-        }
-        // The Pod runs what the Cluster is asked to run: CNPG would otherwise roll it.
-        let wanted = manifests.iter().find(|m| text(m, "kind") == "Cluster");
-        let image = named(&pod["spec"]["containers"], POSTGRES).map(|c| text(c, "image"));
-        if wanted.map(|m| text(&m["spec"], "imageName")) != image {
-            return Ok(Some("image_changed"));
-        }
+        let mut fits = release_changed.then_some("release_changed");
         // Applying the desired manifests must change no spec and no data: the `apply` predicate,
         // ignoring only the generation annotation a wake always advances.
         let wanted = manifests.iter().filter(|m| text(m, "kind") != "Namespace");
         for (manifest, actual) in wanted.zip(current) {
+            if fits.is_some() {
+                break;
+            }
             let Some(actual) = actual else {
-                return Ok(Some("manifest_missing"));
+                fits = Some("manifest_missing");
+                break;
             };
             let content = if matches!(text(manifest, "kind"), "Secret" | "ConfigMap") {
                 "data"
@@ -1176,9 +1449,37 @@ impl PowerCoordinator {
                     "",
                 )
             {
-                return Ok(Some("manifest_changed"));
+                fits = Some("manifest_changed");
             }
         }
-        Ok(None)
+        // The Pod runs what the Cluster is asked to run: CNPG would otherwise roll it.
+        let image = manifests
+            .iter()
+            .find(|m| text(m, "kind") == "Cluster")
+            .map(|m| text(&m["spec"], "imageName"));
+        let pod = if boot_id(basis.node).is_empty() || boot_id(basis.node) != park.node_boot_id {
+            Some("boot_changed")
+        } else if cluster["status"]["currentPrimary"] != park.pod_name.as_str() {
+            Some("pod_changed")
+        } else {
+            match &pod {
+                None => Some("pod_missing"),
+                Some(pod) if !bound(pod, park) || !instance_live(pod, cluster, db) => {
+                    Some("pod_changed")
+                }
+                Some(pod) if text(&pod["spec"], "runtimeClassName") != basis.runtime_class => {
+                    Some("runtime_changed")
+                }
+                Some(pod)
+                    if image
+                        != named(&pod["spec"]["containers"], POSTGRES)
+                            .map(|c| text(c, "image")) =>
+                {
+                    Some("image_changed")
+                }
+                Some(_) => None,
+            }
+        };
+        Ok(Inspection { fits, pod })
     }
 }

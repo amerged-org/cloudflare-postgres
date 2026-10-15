@@ -57,14 +57,20 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     w.wake(3);
     w.start_postgres().await;
     w.log.lock().unwrap().clear();
+    let _kubelet = w.kubelet_ready_after_unfence();
     let observed = reconcile(&w).await;
-    // The kubelet never reported the Pod ready (the double has none), yet the wake is verified:
-    // the retained Pod's identity and PostgreSQL's own answer stand in for it.
+    // One pass: the retained Pod's identity and PostgreSQL's own answer prove the wake, and the
+    // kubelet's Ready is awaited inside it because the gateway routes only to a Ready endpoint.
     assert_eq!(observed["state"], "ready", "{observed}");
     assert_eq!(observed["power"]["state"], "awake");
+    assert_eq!(
+        observed["runtime_attestation"]["pod_uid"],
+        pod_uid(),
+        "{observed}"
+    );
     // Order: progress `Wake`, one patch lifting the fence and releasing hibernation, the Pod's
-    // requests returning, PostgreSQL's fresh postmaster, every role and the archive through the
-    // Pod, and only then the gateway release that admits clients.
+    // requests returning, PostgreSQL's fresh postmaster, the kubelet's Ready, every role and the
+    // archive through the Pod, and only then the gateway release that admits clients.
     let wake = at(&w, &["PATCH", "gateway-fence-", r#"\"phase\":\"wake\""#]);
     let unfence = at(
         &w,
@@ -80,11 +86,13 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     let roles = at(&w, &["SQL app role login"]);
     let archive = at(&w, &["SQL pgcf_maintenance archive"]);
     let release = at(&w, &["GATEWAY release"]);
+    let ready = at(&w, &["KUBELET ready"]);
     assert!(
         wake < unfence,
         "intent is persisted before the Cluster write"
     );
     assert!(unfence < accepting && resize < release);
+    assert!(ready < roles && ready < release, "{:#?}", log(&w));
     assert!(
         accepting < roles && roles < archive && archive < release,
         "{:#?}",
@@ -102,6 +110,77 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     );
     assert!(annotations(&w)[FENCE].is_null());
     assert_eq!(annotations(&w)[HIBERNATION], "off");
+}
+
+#[tokio::test]
+async fn a_resumed_pod_is_published_only_once_the_kubelet_reports_it_ready() {
+    // Until the gateway can route to an attested Pod before its Ready condition, an attested
+    // `ready` before the kubelet's Ready would send the waking connection to no endpoint.
+    let mut w = World::parked().await;
+    w.quick();
+    w.wake(3);
+    w.start_postgres().await;
+    let first = reconcile(&w).await;
+    assert_eq!(first["state"], "provisioning", "{first}");
+    assert_eq!(intent_mode(&w), "quiesce");
+    assert!(log(&w).iter().all(|line| !line.contains("GATEWAY release")));
+    assert!(
+        annotations(&w)[FENCE].is_null(),
+        "the unfence is not undone"
+    );
+    // The kubelet reports the Pod ready: the next pass publishes it.
+    w.pod(true);
+    let ready = reconcile(&w).await;
+    assert_eq!(ready["state"], "ready", "{ready}");
+    assert_eq!(intent_mode(&w), "running");
+}
+
+/// Moves the start of the wake in flight back by `ms`.
+fn wake_started_before(w: &World, ms: u64) {
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+        |map| {
+            let mut record: Value = serde_json::from_str(text(&map["data"], "power.json")).unwrap();
+            assert_eq!(record["phase"], "wake");
+            let at = record["startedAt"].as_u64().unwrap();
+            record["startedAt"] = at.saturating_sub(ms).into();
+            map["data"]["power.json"] = record.to_string().into();
+        },
+    );
+}
+
+#[tokio::test]
+async fn a_resize_up_the_kubelet_cannot_allocate_holds_the_wake_and_then_demotes() {
+    for reason in ["Deferred", "Infeasible"] {
+        let mut w = World::parked().await;
+        w.quick();
+        w.wake(3);
+        w.start_postgres().await;
+        let _kubelet = w.kubelet_ready_after_unfence();
+        w.server.state.lock().unwrap().resize_pending = Some(reason.into());
+        // The Pod runs PostgreSQL under the requests it was parked with: it is not published.
+        let first = reconcile(&w).await;
+        assert_eq!(first["state"], "provisioning", "{reason}: {first}");
+        assert!(
+            log(&w).iter().all(|line| !line.contains("GATEWAY release")),
+            "{reason}"
+        );
+        if reason == "Deferred" {
+            // The kubelet may still find the room: the wake waits for it within its budget.
+            let waiting = reconcile(&w).await;
+            assert_eq!(waiting["state"], "provisioning", "{waiting}");
+            assert_ne!(annotations(&w)[HIBERNATION], "on");
+            wake_started_before(&w, 11_000);
+        }
+        // An infeasible resize, or one deferred past the budget, gives the Pod up: it is
+        // hibernated and the ordinary wake creates it with the requests it needs.
+        let demoted = reconcile(&w).await;
+        assert_eq!(demoted["state"], "provisioning", "{reason}: {demoted}");
+        assert_eq!(annotations(&w)[HIBERNATION], "on", "{reason}");
+        assert_eq!(intent_mode(&w), "quiesce", "{reason}");
+    }
 }
 
 fn intent_mode(w: &World) -> String {
@@ -181,6 +260,16 @@ fn a_resumed_pod_is_current_only_while_it_is_the_same_running_pod() {
         pod_uid: crate::test_server::uid(9),
         postgres_container_id: "containerd://a".into(),
         sidecar_container_id: "containerd://b".into(),
+        requests_before: crate::power::Requests {
+            postgres: crate::power::ContainerRequests {
+                cpu: "25m".into(),
+                memory: "128Mi".into(),
+            },
+            sidecar: crate::power::ContainerRequests {
+                cpu: "100m".into(),
+                memory: "128Mi".into(),
+            },
+        },
         started: std::time::Instant::now(),
     };
     let pod = json!({"metadata":{"uid":crate::test_server::uid(9),"ownerReferences":[{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":crate::test_server::uid(3)}]},

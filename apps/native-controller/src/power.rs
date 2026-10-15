@@ -33,6 +33,9 @@ const FENCE: &str = "cnpg.io/fencedInstances";
 const FENCE_BINDING: &str = "pgcf.io/gateway-fence-uid";
 const VOLUME_IDENTITY: &str = "pgcf.io/volume-identity";
 const MAX_WAIT: u64 = 600_000;
+/// How far ahead of this controller's clock a time it recorded may be: a clock step after the
+/// write, not a forged record.
+const CLOCK_SKEW: u64 = 5_000;
 /// How long one sleep pass waits for the fenced PostgreSQL to be seen stopped.
 const STOP_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
@@ -202,16 +205,16 @@ impl Progress {
 /// One container's resource requests as Kubernetes quantity strings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ContainerRequests {
-    cpu: String,
-    memory: String,
+pub(crate) struct ContainerRequests {
+    pub(crate) cpu: String,
+    pub(crate) memory: String,
 }
 /// The requests of the two containers the parked tier resizes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Requests {
-    postgres: ContainerRequests,
-    sidecar: ContainerRequests,
+pub(crate) struct Requests {
+    pub(crate) postgres: ContainerRequests,
+    pub(crate) sidecar: ContainerRequests,
 }
 /// The instance Pod a parked database keeps: the identity a wake or a demotion must find again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +359,8 @@ pub struct ParkedWake {
     pub pod_uid: String,
     pub postgres_container_id: String,
     pub sidecar_container_id: String,
+    /// The requests the Pod is resized back to; the wake is verified only once they are actuated.
+    pub(crate) requests_before: Requests,
     /// Taken before the unfence was sent: a postmaster older than this did not start for it.
     pub started: std::time::Instant,
 }
@@ -628,7 +633,7 @@ fn progress_from(map: &Value, now: u64) -> Result<Option<Progress>> {
                 required(text, 4096)?;
             }
             if !valid_pattern("uuid", &park.pod_uid)
-                || park.parked_at > now
+                || park.parked_at > now.saturating_add(CLOCK_SKEW)
                 || park.parked_at > MAX_SAFE
                 || park.assignment_revision > MAX_SAFE
             {
@@ -1204,6 +1209,20 @@ impl PowerCoordinator {
         cluster: &Value,
         hibernation: &str,
     ) -> Result<()> {
+        // A wake always lifts the instance fence a retained Pod may still carry, together with
+        // hibernation, so CNPG can never create a fenced replacement Pod.
+        self.cluster_power(intent, cluster, hibernation, hibernation == "off")
+            .await
+    }
+    /// The power annotations and hibernation in one CAS patch, read back; `unfence` removes the
+    /// instance fence in the same write.
+    async fn cluster_power(
+        &self,
+        intent: &PowerIntent,
+        cluster: &Value,
+        hibernation: &str,
+        unfence: bool,
+    ) -> Result<()> {
         let revision = cluster["metadata"]["annotations"][POWER_REVISION]
             .as_str()
             .map(|v| v.parse::<u64>())
@@ -1218,9 +1237,6 @@ impl PowerCoordinator {
         {
             return Err(Fault::Stale);
         }
-        // A wake always lifts the instance fence a retained Pod may still carry, together with
-        // hibernation, so CNPG can never create a fenced replacement Pod.
-        let unfence = hibernation == "off";
         if revision == intent.revision
             && cluster["metadata"]["annotations"][POWER_OPERATION] == intent.operation
             && cluster["metadata"]["annotations"][HIBERNATION] == hibernation
@@ -2316,7 +2332,9 @@ impl PowerCoordinator {
                     )
                     .await
                 {
-                    Ok((Resumed::Fast(resumed), ..)) => return Ok(PrepareRunning::Parked(resumed)),
+                    Ok((Resumed::Fast(resumed), ..)) => {
+                        return Ok(PrepareRunning::Parked(*resumed));
+                    }
                     Ok((Resumed::Waiting, ..)) => return Ok(PrepareRunning::Pending),
                     Ok((Resumed::Ordinary, next_map, next_progress, next_cluster)) => {
                         map = Some(next_map);
@@ -2334,6 +2352,9 @@ impl PowerCoordinator {
             {
                 progress.started_at = prior.started_at;
             }
+            // A wake that continues on a retained Pod keeps its record until the wake ends, so
+            // every pass of it can still give the Pod its requests back.
+            progress.park = previous.as_ref().and_then(|prior| prior.park.clone());
             if let Some(map) = &map {
                 self.write(db, Some(map), None, &progress).await?;
             }
