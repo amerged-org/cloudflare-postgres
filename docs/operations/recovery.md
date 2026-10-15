@@ -232,15 +232,16 @@ that region is Ready; its credentials must not alter the source archive. A later
 authorized incident or loss drill must preserve or recover this same customer EU1.
 A complete regional control-plane loss drill remains outside this customer-free completion gate.
 
-## Later adopter migration
+## Integrator migration
 
-Operator acceptance and customer migration are separate. Keep existing Neon databases in service
-until a reviewed per-database cutover is accepted. Inventory roles, extensions, data/sequences,
-clients/pooling and capacity in the adopter repository, then stop source writes for the actual
-transfer. Verify target contents, nonsuperuser roles and TLS through Cloudflare, plus a completed
-target base backup and archived WAL, before changing application connections. Retain the Neon
-source through acceptance; after target writes, a rollback must reconcile them rather than point
-clients at stale data. Keep adapter changes and customer prices outside this generic service.
+Operator acceptance and customer migration are separate; moving existing databases from another
+provider is the integrator's task. Keep the source databases in service until a reviewed
+per-database cutover is accepted. Inventory roles, extensions, data/sequences, clients/pooling and
+capacity in the integrator's repository, then stop source writes for the actual transfer. Verify
+target contents, nonsuperuser roles and TLS through Cloudflare, plus a completed target base backup
+and archived WAL, before changing application connections. Retain the source through acceptance;
+after target writes, a rollback must reconcile them rather than point clients at stale data. Keep
+adapter changes and customer prices outside this generic service.
 
 ## Thin storage admission and protective recovery
 

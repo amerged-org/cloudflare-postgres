@@ -627,8 +627,8 @@ separately reviewed scope that preserves or recovers the same customer EU1. Keep
 proofs and record new measured results in `PLAN.md`. The historical approximately nine-second wake is the fallback baseline. The current ULTRA
 scope additionally requires a genuine shared-pool first SQL below one second; its acceptance
 remains open in the canonical plan.
-Do not migrate Neon or call the product finished until the open ULTRA steps, including recovery,
-have passed.
+Do not move production databases onto PGCF or call the product finished until the open ULTRA
+steps, including recovery, have passed.
 Record measured installation/rollout time and actual Contabo calls by lifecycle phase, including
 zero calls throughout repeated transport grants, Kubernetes/Talos reads and proof cleanup after
 source selection. Local tests, a configured image or provider Running do not establish this live
@@ -644,7 +644,7 @@ returned HTTP 409 before pause, and its session renewed without admission. The n
 separately authorized node addition must prove that path; the operator result does not
 substitute for automatic acceptance.
 
-EU1 and US1 passed real SQL through `db.ohmyho.st`, TLS1.3 and nonsuperuser application roles.
+EU1 and US1 passed real SQL through the database hostname, TLS1.3 and nonsuperuser application roles.
 EU trial SQL took2187ms. A separate EU restore took108618ms; a healthy-source EU-to-US restore
 preserved two committed markers in87988ms, including observation pacing. A third marker committed
 on US. All four databases passed R2 base-backup and exact committed-WAL checks, then each released
@@ -719,12 +719,13 @@ unknown. Keep lifecycle counts separate and do not sum overlapping capture windo
 
 ## Customer migration handover
 
-Neon migration remains a separate reviewed cutover. The earlier EU/US SQL, backup/WAL, restore,
-physical-reclamation and RAM-threshold checks are partial baseline evidence. The approved
-corrective plan now requires supported in-place fleet convergence, programmed patching and
-shared-pool fast-start acceptance before customer migration. Preserve EU1 and all three existing
-databases; the earlier EU-upgrade deferral does not override this approved corrective scope.
-Neither alignment nor template selection authorizes an EU reinstall or a customer cutover.
+Moving an integrator's existing databases into PGCF is the integrator's task and a separate
+reviewed cutover. The earlier EU/US SQL, backup/WAL, restore, physical-reclamation and
+RAM-threshold checks are partial baseline evidence. The approved corrective plan now requires
+supported in-place fleet convergence, programmed patching and shared-pool fast-start acceptance
+before customer migration. Preserve EU1 and all three existing databases; the earlier EU-upgrade
+deferral does not override this approved corrective scope. Neither alignment nor template
+selection authorizes an EU reinstall or a customer cutover.
 
 Prepared EU revision-2 authority is activated in the existing supported patch window,
 after the accepted etcd snapshot. The scoped route signer was separately replaced on October10:
@@ -740,8 +741,8 @@ backup-peak admission. Customer placement excludes the control/relay host.
 
 The October8 static-reservation snapshot allowed four minimum-class databases on US1 and seven
 on EU1, and allocated5 GiB physical volumes upfront. Those were ceilings of the old configuration,
-not measured customer density or limits of an8 GiB server. They do not establish whether an
-adopter's projects fit the replacement resource model. Refresh physical inventory and measure the new
+not measured customer density or limits of an8 GiB server. They do not establish how many
+databases fit the replacement resource model. Refresh physical inventory and measure the new
 model before customer cutover; record the result in the canonical plan.
 
 Ten real consecutive US minute samples from18:43:01 to18:52:04 UTC averaged **79.9062%** under
@@ -758,17 +759,15 @@ independent second trial. Never synthesize samples or weaken consecutive-minute 
 Both disposable loads used4096MiB limits and720-second automatic deadlines. Final second-load cleanup removed the exact Namespace/Pod and recovered4,177,731,584 bytes;
 fresh available RAM returned within the recorded baseline tolerance. Actual customer workload density remains unaccepted; RAM overbooking
 does not remove CPU, storage or startup checks. Approve sufficient regional capacity before
-committing an adopter cohort to a region.
+committing an integrator's databases to a region.
 
 ### Connection and cold starts
 
-The inspected adopter uses `pg` with Neon TCP origins. PGCF’s public transport is verified WSS;
-a TCP DSN hostname swap is insufficient. Use the established Neon serverless `Pool`/`Client`
-WebSocket mode with `pipelineConnect=false` and a `wsProxy` URL containing
-`/v2?database=<URL-encoded-PGCF-ID>&user=<URL-encoded-role>`; see
+PGCF’s public transport is verified WSS; a TCP DSN hostname swap is insufficient. Use the
+established Neon serverless `Pool`/`Client` WebSocket mode with `pipelineConnect=false` and a
+`wsProxy` URL containing `/v2?database=<URL-encoded-PGCF-ID>&user=<URL-encoded-role>`; see
 [the connection contract](../../README.md). Keep PostgreSQL authentication and TLS. Hints scope
-admission; they are not credentials. Neon supports multiple transports; this recommendation
-follows the inspected adopter and PGCF contracts.
+admission; they are not credentials.
 
 For psql and logical export/import tools, use the existing CLI:
 
@@ -780,9 +779,9 @@ Use the printed loopback port, target PGCF ID and role. `sslmode=disable` applie
 loopback; public WSS and gateway-to-PostgreSQL TLS remain verified. Keep passwords private;
 never expose a VPS database port.
 
-Dev cold connections measured p95 **9.160 s**, maximum **9.708 s**. The adopter’s **5 s**
-connect timeout can fail before wake. Its **10 s** query/statement defaults are separate from
-the end-to-end request deadline; budget wake plus work explicitly.
+Dev cold connections measured p95 **9.160 s**, maximum **9.708 s**. A client connect timeout
+shorter than the wake can fail before the database is awake. Query and statement timeouts are
+separate from the end-to-end request deadline; budget wake plus work explicitly.
 The approved shared-pool runtime must pass its separate below-one-second first-read gate before
 customer readiness. Pool misses still need an explicit timeout policy. Before cutover, verify
 one fallback policy: an approved always-warm size class
@@ -805,22 +804,22 @@ existing API contracts:
 - PGCF archive restore: `POST /v1/databases/{source-id}/restore` with
   `{"mode":"full","name":"recovered","region_id":"<region>"}` or PITR with `target_time`.
   It returns a **new database ID** and separate storage. Reuse the same key after an uncertain
-  submission; follow [recovery](recovery.md). This API restores PGCF archives, not a Neon dump.
+  submission; follow [recovery](recovery.md). This API restores PGCF archives, not a dump from
+  another provider.
 
-A separately approved Neon import freezes writes and uses a consistent logical export/import
-through the normal CLI, with reviewed owners, grants, extensions and sequences. For either
-import or restore, rebind the adopter’s provider/database mapping to the new target ID/region,
-update protected role credentials/password revision and versioned registration, drain old
-connections and create a fresh authorized pool. PGCF requires current database/role registration;
-stale or unregistered hints must fail. The adopter’s URL validator accepts Neon pooler hosts only,
-and its durable registration includes Neon-specific target fields. PGCF adapter/registration
-acceptance is therefore a cutover prerequisite: use supported scoped operations; do not bypass
-checks or edit tables to make a DSN swap work.
+An import from another provider is the integrator's task: it freezes writes and uses a consistent
+logical export/import through the normal CLI, with reviewed owners, grants, extensions and
+sequences. For either import or restore, the integrator rebinds its own provider/database mapping
+to the new target ID/region, updates protected role credentials/password revision and its
+versioned registration, drains old connections and creates a fresh authorized pool. PGCF requires
+current database/role registration; stale or unregistered hints must fail. Acceptance of the
+integrator's own adapter and registration is therefore a cutover prerequisite: use supported
+scoped operations; do not bypass checks or edit tables to make a DSN swap work.
 
 Compare data/checksums, roles/grants, sequences and committed markers. Verify actual Cloudflare
 TLS/region, target backup/WAL, application transactions and selected timeout/pool behavior.
 Rehearse restore into another new ID and repeat rebinding. Once target writes begin, returning
-to stale Neon requires reconciliation. Delete trials through `DELETE /v1/databases/{id}` and
+to the stale source requires reconciliation. Delete trials through `DELETE /v1/databases/{id}` and
 confirm operation completion plus physical reclamation; R2 archive retention is separate.
 
 

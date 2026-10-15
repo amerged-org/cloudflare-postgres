@@ -1,7 +1,7 @@
 # Integrator handover
 
-For the engineers of an integrator (the first one is ohmyho.st, "OMH") who create their databases
-on PGCF through its API and operate them without reading PGCF code. You know PostgreSQL and Neon.
+For the engineers of an integrator who create their databases on PGCF through its API and operate
+them without reading PGCF code. You know PostgreSQL and Neon.
 This runbook states what is different, which limits you must enforce yourselves and what is not
 available yet.
 
@@ -33,8 +33,9 @@ authority on what still blocks go-live; operator procedures are in the other run
 
 ### 1.1 One endpoint, two identifiers
 
-All databases share one hostname, for this installation `db.ohmyho.st`; it is the `host` of every
-connection URI. There is no TCP listener. The transport is a WebSocket that carries the
+All databases share one hostname, the `host` of every connection URI. The operator gives you the
+real hostname of the installation; the examples in this runbook use `db.example.com`. There is no
+TCP listener. The transport is a WebSocket that carries the
 PostgreSQL wire protocol, as in Neon's serverless driver:
 `wss://<host>/v2?database=<id>&user=<role>`. A `postgres://` TCP connection to the hostname, the
 HTTP query endpoint of the Neon driver (`/sql`) and any path other than `/v2` do not work.
@@ -249,8 +250,8 @@ unplaced) and `health.archiving` (`ok`, `failing`, `unknown`, with `since`).
 pgcf -X POST "$PGCF_API/v1/databases/<database-id>/roles" -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $KEY" -d '{"name":"web"}'
 pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
-# {"database_id":"...","role":"web","host":"db.ohmyho.st","database":"<database-id>",
-#  "uri":"postgres://web:<password>@db.ohmyho.st/<database-id>","includes_password":true}
+# {"database_id":"...","role":"web","host":"db.example.com","database":"<database-id>",
+#  "uri":"postgres://web:<password>@db.example.com/<database-id>","includes_password":true}
 ```
 
 - `app` is the database owner and not a superuser (the acceptance probe asserts
@@ -418,7 +419,7 @@ PostgreSQL. A TCP DSN with only the hostname replaced is not enough, and HTTP qu
 (`neon()`, `poolQueryViaFetch`) is not supported.
 
 For `psql` and migration tools build the CLI (`pnpm --filter @pgcf/cli build`) and run
-`node packages/cli/dist/main.js connect --endpoint wss://db.ohmyho.st --database <id> --user <role>`;
+`node packages/cli/dist/main.js connect --endpoint wss://db.example.com --database <id> --user <role>`;
 use the printed loopback port with `host=127.0.0.1` and `sslmode=disable`. The CLI never retries
 SQL and allows 16 local connections.
 
@@ -807,7 +808,7 @@ the operator supplies it at handover.** Send:
 - Cancel requests, replication connections, HTTP query mode, TCP access.
 - Budgets, quotas per tenant, compute and storage autoscaling, branching.
 - Maintenance-window notifications.
-- Neon migration tooling (a separate task after the canary).
+- Importing existing databases from another provider; moving them is your task.
 
 ## 9. Items for written confirmation
 

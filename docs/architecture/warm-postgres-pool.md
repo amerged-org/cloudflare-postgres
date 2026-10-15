@@ -455,7 +455,7 @@ Cloudflare's current thin authority, its measured I/O limits and fail-closed pro
 
 **Live acceptance on EU1 through Cloudflare**, after R2b is accepted:
 1. *Hit or miss.* A sleeping database (Cluster hibernated, no CNPG Pod) with X ready pool Pods on
-   its node; a normal client connection through `db.ohmyho.st`; `connect_ms` and `first_read_ms`
+   its node; a normal client connection through the database hostname; `connect_ms` and `first_read_ms`
    from one instant, broken down into claim, permission and hint delivery, device checks, mount,
    Lease, bundle, PostgreSQL ready, fresh checks, both proofs, admission, token, gateway dial, TLS,
    AuthenticationOk and first row. Every run is labelled `hit` or `miss` with the miss reason.
@@ -515,7 +515,7 @@ whole in-Pod chain on every wake (plan:118). The pool-hit gate is then recorded 
 (rt:122-127) and only rejected alternative 8 remains.
 
 **Decision 2 (only if Gate 0's stop rule fires).** Either build the runner anyway for the stages it
-removes and keep the pool-hit gate open, which keeps migration blocked (plan:22-25), or approve
+removes and keep the pool-hit gate open, which keeps go-live blocked (plan:22-25), or approve
 taking Pod creation off the hit path: PostgreSQL in pre-created pool Pods supervised by PGCF, with a
 late-bound volume (rejected alternative 8). That changes the CNPG-ownership constraint (rt:122) and
 needs its own design for archiving, backups and volume authority.

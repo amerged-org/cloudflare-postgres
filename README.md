@@ -16,8 +16,9 @@ protected; server loss is recovered from R2.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
 - Capacity and Contabo provisioning are implemented; complete autonomous admission and standing-policy activation remain under acceptance.
 
-[ohmyho.st](https://ohmyho.st) is the first adopter. Its Neon migration follows operator acceptance;
-existing customer databases remain on Neon until their separate migration is accepted.
+Integrators keep their adapters and any tooling that moves their existing databases in their own
+repositories; the [integrator handover](docs/operations/integrator-handover.md) describes the API,
+connections and limits they build on.
 
 ## Status
 
@@ -27,7 +28,8 @@ and the approved fast-start architecture are incomplete. See the
 [unified corrective plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md).
 The earlier broad completion statement is withdrawn. The following are partial Dev results. Both EU nodes and
 all five Flux releases are Ready, with 95 GiB measured storage per node. The complete Dev path through
-`db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
+the Dev installation's database hostname reaches real PostgreSQL with verified TLS, continuous WAL
+archiving and R2 backups.
 
 Real E0–E6 passed, including complete TCP port scans of the observed node IPv4 from both sources.
 Five create/delete runs survived ten agent restarts with complete storage cleanup. Empty, failed,
@@ -90,9 +92,10 @@ original purchase and installation. EU1 and US1 passed real Cloudflare SQL/TLS, 
 R2 base backup/WAL, restore and deletion with physical reclamation. The US region is now
 cancelled: US1 serves only as the R1.1 canary until 2026-11-05 and is then marked lost. Automatic
 postjoin admission remains open for the next genuine authorized node addition. Preserve both EU
-nodes and their existing data. Neon migration remains separate and requires the
-[customer handover gates](docs/operations/operator-installation.md#customer-migration-handover),
-including credential rotation, adopter transport/rebinding and sufficient regional capacity.
+nodes and their existing data. Moving an integrator's existing databases is the integrator's task
+and needs the [customer handover gates](docs/operations/operator-installation.md#customer-migration-handover),
+including credential rotation, the integrator's transport and rebinding, and sufficient regional
+capacity.
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
 through the authenticated Cloudflare management API. Expansion requires ten fresh aligned
@@ -137,7 +140,7 @@ flowchart LR
   subgraph Clients
     App["Apps and Workers<br/>PostgreSQL over WebSocket<br/>database and user hints"]
     Tools["psql and migrations<br/>via pgcf connect"]
-    Integrator["Integrator backend<br/>e.g. ohmyho.st"]
+    Integrator["Integrator backend"]
   end
 
   subgraph CF["Your Cloudflare account: control plane"]
