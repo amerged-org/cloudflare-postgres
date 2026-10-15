@@ -178,6 +178,18 @@ checkpoint reply is resolved by exact status readback in the same execution. If 
 proves the command was never attempted, it may record that finite outcome; a resumed uncertain
 write cannot infer it from an unchanged boot/version or missing response.
 
+Every stage that writes or verifies requires the node, every member and every database to be
+healthy. A database counts only while it can still become Ready: a CNPG Cluster that is being
+deleted, or whose `pgcf.io/database-id` namespace carries a `deletionTimestamp`, never holds a
+release, so a deleted database whose Pod is stuck cannot stall a fleet patch. A failed turn
+records its code as the operation's `error_code`; the latest failed turn replaces an earlier
+code until a checkpoint clears it, and only a halted operation keeps its own. A health gate the
+executor itself refuses names the failing fact, in the order it cascades (`node_ready`,
+`cluster_nodes_ready`, `databases_ready`): `patch_preflight_unhealthy_<fact>` at preflight and
+`patch_checkpoint_invalid_<fact>` for a checkpoint, for example
+`patch_checkpoint_invalid_databases_ready`. Any other checkpoint refusal stays
+`patch_checkpoint_invalid`.
+
 Before a rollout, run the same read-only parsers against the actual retained fleet and collect all
 deviations together. Record actual elapsed time, provider calls, versions and release digests in
 the ULTRA plan. SQL/TLS/roles, R2 base/WAL backup, restore and physical deletion acceptance
