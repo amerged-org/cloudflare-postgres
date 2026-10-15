@@ -62,6 +62,8 @@ type PersistedAdmissionMutationIntent = z.infer<
 const WAKE_FALLBACK_READ_MS = 1000;
 /** A concurrency block held this long is logged with its callback's name. */
 const GATE_LOG_MS = 1000;
+/** A wake claim whose commit lost its row to a concurrent write is read and tried again this often. */
+const WAKE_CLAIM_RETRIES = 2;
 /**
  * A role the actor may admit: live in D1, with the time its credential stops being accepted.
  * A bare name (the form older persisted presence and seeds use) is a role without expiry.
@@ -1083,110 +1085,139 @@ export class DatabaseActor extends DurableObject<Env> {
     id: string,
     user: string,
     requested: number,
+    deadline: number,
   ): Promise<
     { operation: string; revision: number } | { failure: "08006" } | undefined
   > {
     return this.gate("claimWake", async () => {
       const started = Date.now();
       try {
-        // Every read here holds every other event of this database: independent reads go together.
-        const [authorized, row] = await Promise.all([
-          this.known(id, user, true),
-          this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
-            .bind(id)
-            .first<DatabaseRow>(),
-        ]);
-        if ("ok" in authorized) return undefined;
-        if (!row) return undefined;
-        if (
-          row.desired_state === "suspended" &&
-          row.suspension_reason === "idle" &&
-          row.power_operation
-        ) {
-          const sleepingIntent = await this.env.DB.prepare(
-            "SELECT id FROM operations WHERE id=? AND database_id=? AND project_id=? AND generation<=? AND kind='database.hibernate'",
+        // The row a lost commit was made from: a read that finds it unchanged says the commit was
+        // refused for another reason, and the same commit would be refused again.
+        let lost: string | undefined;
+        for (let attempt = 0; ; attempt++) {
+          // Every read here holds every other event of this database: independent reads go together.
+          const [authorized, row] = await Promise.all([
+            this.known(id, user, true),
+            this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
+              .bind(id)
+              .first<DatabaseRow>(),
+          ]);
+          if ("ok" in authorized) return undefined;
+          if (!row) return undefined;
+          if (lost !== undefined && JSON.stringify(row) === lost)
+            return undefined;
+          if (
+            row.desired_state === "suspended" &&
+            row.suspension_reason === "idle" &&
+            row.power_operation
+          ) {
+            const sleepingIntent = await this.env.DB.prepare(
+              "SELECT id FROM operations WHERE id=? AND database_id=? AND project_id=? AND generation<=? AND kind='database.hibernate'",
+            )
+              .bind(row.power_operation, id, row.project_id, row.generation)
+              .first();
+            if (!sleepingIntent) return undefined;
+            const operation = newOperationId(),
+              now = new Date().toISOString(),
+              previous = row,
+              revision = previous.generation + 1;
+            let hinted: boolean | undefined;
+            const result = await withAdmissionMutation(
+              this.env,
+              [id],
+              async (mutation) => {
+                const plan = await preparePostgresPoolClaim(
+                  this.env,
+                  id,
+                  revision,
+                  mutation,
+                  previous.region_id,
+                );
+                if (
+                  plan &&
+                  plan.statements.length === 0 &&
+                  (await plan.finish()).kind === "blocked"
+                )
+                  throw new Error("pool_holder_unresolved");
+                const statements = powerTransitionStatements(
+                  this.env.DB,
+                  previous,
+                  "wake",
+                  operation,
+                  now,
+                  user,
+                  mutation.guard(id),
+                );
+                const committed = await mutation.batch([
+                  ...(plan?.statements ?? []),
+                  ...statements,
+                ]);
+                if (plan && (await plan.finish()).kind === "blocked")
+                  throw new Error("pool_claim_commit_unconfirmed");
+                const transition = committed.slice(
+                  plan?.statements.length ?? 0,
+                );
+                // The transition is committed with its operation, at the next generation: the region
+                // may pull it now, ahead of the snapshot publish that closes this mutation.
+                if (transition[0]!.meta.changes === 1)
+                  hinted = await this.hintWake(
+                    id,
+                    previous.region_id,
+                    operation,
+                    revision,
+                    started,
+                    requested,
+                  );
+                return transition;
+              },
+              undefined,
+              this.localAdmissionActor(id),
+            );
+            if (result[0]!.meta.changes !== 1) {
+              // The commit is compare-and-set on the version of the row read above, and the
+              // controller's periodic report of a sleeper rewrites that version: one that landed
+              // since lost this claim, so the row is read and claimed again, within the caller's time.
+              const retrying =
+                attempt < WAKE_CLAIM_RETRIES && Date.now() < deadline;
+              console.log(
+                JSON.stringify({
+                  event: "actor_claim_lost",
+                  database_id: id,
+                  revision,
+                  attempt,
+                  retrying,
+                  at_ms: Date.now(),
+                }),
+              );
+              if (!retrying) return undefined;
+              lost = JSON.stringify(previous);
+              continue;
+            }
+            this.ctx.waitUntil(thinStorageTurnsFor(this.env, [id]));
+            return hinted ? { operation, revision } : undefined;
+          }
+          if (row.desired_state !== "running" || !row.power_operation)
+            return undefined;
+          const operation = await this.env.DB.prepare(
+            "SELECT id FROM operations WHERE id=? AND database_id=? AND project_id=? AND generation=? AND kind IN('database.wake','database.resume') AND status IN('pending','running','succeeded')",
           )
             .bind(row.power_operation, id, row.project_id, row.generation)
-            .first();
-          if (!sleepingIntent) return undefined;
-          const operation = newOperationId(),
-            now = new Date().toISOString(),
-            previous = row,
-            revision = previous.generation + 1;
-          let hinted: boolean | undefined;
-          const result = await withAdmissionMutation(
-            this.env,
-            [id],
-            async (mutation) => {
-              const plan = await preparePostgresPoolClaim(
-                this.env,
-                id,
-                revision,
-                mutation,
-                previous.region_id,
-              );
-              if (
-                plan &&
-                plan.statements.length === 0 &&
-                (await plan.finish()).kind === "blocked"
-              )
-                throw new Error("pool_holder_unresolved");
-              const statements = powerTransitionStatements(
-                this.env.DB,
-                previous,
-                "wake",
-                operation,
-                now,
-                user,
-                mutation.guard(id),
-              );
-              const committed = await mutation.batch([
-                ...(plan?.statements ?? []),
-                ...statements,
-              ]);
-              if (plan && (await plan.finish()).kind === "blocked")
-                throw new Error("pool_claim_commit_unconfirmed");
-              const transition = committed.slice(plan?.statements.length ?? 0);
-              // The transition is committed with its operation, at the next generation: the region
-              // may pull it now, ahead of the snapshot publish that closes this mutation.
-              if (transition[0]!.meta.changes === 1)
-                hinted = await this.hintWake(
-                  id,
-                  previous.region_id,
-                  operation,
-                  revision,
-                  started,
-                  requested,
-                );
-              return transition;
-            },
-            undefined,
-            this.localAdmissionActor(id),
-          );
-          if (result[0]!.meta.changes !== 1) return undefined;
-          this.ctx.waitUntil(thinStorageTurnsFor(this.env, [id]));
-          return hinted ? { operation, revision } : undefined;
+            .first<{ id: string }>();
+          if (!operation) return undefined;
+          if (
+            !(await this.hintWake(
+              id,
+              row.region_id,
+              operation.id,
+              row.generation,
+              started,
+              requested,
+            ))
+          )
+            return undefined;
+          return { operation: operation.id, revision: row.generation };
         }
-        if (row.desired_state !== "running" || !row.power_operation)
-          return undefined;
-        const operation = await this.env.DB.prepare(
-          "SELECT id FROM operations WHERE id=? AND database_id=? AND project_id=? AND generation=? AND kind IN('database.wake','database.resume') AND status IN('pending','running','succeeded')",
-        )
-          .bind(row.power_operation, id, row.project_id, row.generation)
-          .first<{ id: string }>();
-        if (!operation) return undefined;
-        if (
-          !(await this.hintWake(
-            id,
-            row.region_id,
-            operation.id,
-            row.generation,
-            started,
-            requested,
-          ))
-        )
-          return undefined;
-        return { operation: operation.id, revision: row.generation };
       } catch {
         return { failure: "08006" as const };
       }
@@ -1291,7 +1322,12 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "57P03" };
       if (current.observed_state === "error")
         return { ok: false, sqlstate: "57P03" };
-      const wake = await this.claimWake(id.data, role.data, Date.now());
+      const wake = await this.claimWake(
+        id.data,
+        role.data,
+        Date.now(),
+        deadline,
+      );
       if (wake && "failure" in wake)
         return { ok: false, sqlstate: wake.failure };
       if (!wake && deadline > Date.now()) return this.admit(id.data, role.data);

@@ -185,6 +185,36 @@ function awake(f: Awaited<ReturnType<typeof ready>>, operation: string) {
   );
 }
 
+/**
+ * The controller's periodic report of a sleeper rewrites the row's `updated_at` and nothing a claim
+ * reads. One lands before each of the Actor's next `times` batches: after every read of the claim
+ * and ahead of its commit, which is compare-and-set on the version it read.
+ */
+async function observationsBeforeCommit(id: string, times: number) {
+  const seen = { batches: 0, writes: 0 };
+  await runInDurableObject(actor(id), (instance) => {
+    const db = (instance as unknown as { env: { DB: D1Database } }).env.DB;
+    const original = db.batch.bind(db);
+    vi.spyOn(db, "batch").mockImplementation(async (statements) => {
+      seen.batches++;
+      if (seen.writes < times) {
+        seen.writes++;
+        await env.DB.prepare("UPDATE databases SET updated_at=? WHERE id=?")
+          .bind(new Date(Date.now() + 5).toISOString(), id)
+          .run();
+      }
+      return original(statements);
+    });
+  });
+  return seen;
+}
+const wakeOperations = (id: string) =>
+  env.DB.prepare(
+    "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.wake'",
+  )
+    .bind(id)
+    .first("n");
+
 it("a committed ready observation releases a waiting wake at once, without its fallback read", async () => {
   const f = await ready();
   await idle(f);
@@ -826,6 +856,64 @@ it("a current password revision on an idle sleeper advances configuration withou
     ]),
   );
   expect((await pending).ok).toBe(true);
+});
+
+it("a wake claim that lost its row to an observation write reads it again and claims", async () => {
+  const f = await ready();
+  await idle(f);
+  const seen = await observationsBeforeCommit(f.id, 1);
+  const pending = actor(f.id).ensureAwake(f.id, "app", {
+    deadline: Date.now() + 3000,
+  });
+  const row = await untilWake(f.id);
+  await awake(f, row.power_operation);
+  expect(await pending).toMatchObject({ ok: true });
+  expect(seen.writes).toBe(1);
+  // The lost commit made no operation: the one wake is the second attempt's.
+  expect(await wakeOperations(f.id)).toBe(1);
+});
+
+it("a wake claim whose row keeps moving is tried three times, then refused", async () => {
+  const f = await ready();
+  await idle(f);
+  const seen = await observationsBeforeCommit(f.id, Infinity);
+  expect(
+    await actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 5000 }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  expect(seen.batches).toBe(3);
+  expect(await wakeOperations(f.id)).toBe(0);
+});
+
+it("a wake claim the commit refuses with its row unmoved is not tried again", async () => {
+  const f = await ready();
+  await idle(f);
+  // No startup headroom: the commit refuses whatever version the row has.
+  await env.DB.prepare("UPDATE nodes SET schedulable=0 WHERE id=?")
+    .bind(f.node)
+    .run();
+  const seen = await observationsBeforeCommit(f.id, 0);
+  expect(
+    await actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 5000 }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  expect(seen.batches).toBe(1);
+  expect(await wakeOperations(f.id)).toBe(0);
+});
+
+it("a wake claim that lost its row after the caller's deadline is not tried again", async () => {
+  const f = await ready();
+  await idle(f);
+  const seen = await observationsBeforeCommit(f.id, 1);
+  // The deadline has passed by the time the commit is lost: the claim was made once, never again.
+  const claim = await runInDurableObject(actor(f.id), (instance) =>
+    (
+      Reflect.get(instance, "claimWake") as (
+        ...args: unknown[]
+      ) => Promise<unknown>
+    ).call(instance, f.id, "app", Date.now(), Date.now() - 1),
+  );
+  expect(claim).toBeUndefined();
+  expect(seen.batches).toBe(1);
+  expect(await wakeOperations(f.id)).toBe(0);
 });
 
 it("wake_timing_events_name_the_database_and_the_wake_operation", async () => {
