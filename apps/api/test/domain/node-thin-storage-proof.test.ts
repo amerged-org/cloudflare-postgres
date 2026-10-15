@@ -8,7 +8,10 @@ import {
   newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
+import {
+  HostStorageLease,
+  NodeStorageHeadroomResponse,
+} from "@pgcf/contracts/node-thin-storage";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
@@ -1001,6 +1004,63 @@ it("keeps an identity-only turn available after the last deleted volume removes 
   expect(
     await desiredRegionStorageNodes(env, f.region, afterWriteExpiry),
   ).toEqual([]);
+});
+
+it("the host lease retires a deleted volume from the absence read even after its pool and write authority are gone", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const { created, receipt } = await boundDatabase(f);
+  const deletion = await request(
+    `/v1/databases/${created.database.id}`,
+    f.admin,
+    "DELETE",
+    undefined,
+    crypto.randomUUID(),
+  );
+  expect(deletion.status).toBe(202);
+  const deletedAt = iso(Date.now() - 60_000);
+  await env.DB.prepare(
+    "UPDATE databases SET deleted_at=?,updated_at=?,observed_state='deleted',observed_generation=generation WHERE id=?",
+  )
+    .bind(deletedAt, deletedAt, created.database.id)
+    .run();
+  // CSI removed the last LV and with it the pool. The identity read after the deletion proves the
+  // volume absent; its short write authority has lapsed, as it does once no pool can be sampled.
+  const read = Date.now() - 15_000;
+  await identityProof(f, {
+    revision: 3,
+    pool_uuid: null,
+    write_allowed: false,
+    physical: {
+      ...f.authority.physical,
+      free_bytes: 100 * gib,
+      thin_pool: null,
+    },
+    physical_lvs: [],
+    active_lv_uuids: [],
+    volumes: [],
+    observed_at: iso(read),
+    captured_at: iso(read),
+    expires_at: iso(read + 10_000),
+    inventory_observed_at: iso(read),
+    inventory_expires_at: iso(read + 300_000),
+    inventory_revision: 3,
+  });
+  expect((await readCurrentNodeThinStorage(env, f.node))?.authority).toBeNull();
+  const response = await request(
+    `/agent/v1/nodes/${f.node}/storage-guard`,
+    f.agent,
+  );
+  expect(response.status).toBe(200);
+  const entry = HostStorageLease.parse(await response.json()).databases.find(
+    (value) => value.database_id === created.database.id,
+  );
+  // The tombstone carries no volume and no write block, so the guard can retire the scope.
+  expect(entry).toMatchObject({
+    desired_state: "deleted",
+    volume: null,
+    write_blocked: false,
+  });
+  void receipt;
 });
 
 it("still blocks a missing pool while a non-deleted thin database references it", async () => {

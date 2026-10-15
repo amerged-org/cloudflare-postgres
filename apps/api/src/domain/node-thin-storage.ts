@@ -1095,6 +1095,8 @@ export async function hostStorageLease(
       : null;
     // Tombstones are explicit: only completed deletion and a later complete Native absence
     // read can declare no volume. Missing/paginated rows never authorize protective-scope GC.
+    // The absence read stays usable while its inventory is fresh, also once its short write
+    // authority lapsed: after the last thin LV CSI removes the pool, and nothing samples it.
     const reclaimed = Boolean(
       row.deleted_at &&
       row.desired_state === "deleted" &&
@@ -1103,7 +1105,7 @@ export async function hostStorageLease(
       receipt &&
       thinStorageVolumeReclaimed(
         storage,
-        authority,
+        authority ?? current?.reclamation,
         receipt.lv_uuid,
         Date.parse(row.deleted_at),
         now,
