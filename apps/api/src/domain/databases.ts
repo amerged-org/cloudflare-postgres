@@ -780,12 +780,21 @@ export async function deleteDatabase(
         return databaseOperationResponse(c, existing.id);
       }
       const op = newOperationId(),
-        now = new Date().toISOString(),
-        generation = row.generation + 1;
+        now = new Date().toISOString();
+      let generation = row.generation + 1;
       const result = await withAdmissionMutation(
         c.env,
         [id],
         async (mutation) => {
+          // Every writer of the generation holds this fence, so the generation read here is the
+          // one the batch finds; a change that committed after the request's first read is not a
+          // conflict.
+          const current = await c.env.DB.prepare(
+            "SELECT generation FROM databases WHERE id=? AND project_id=?",
+          )
+            .bind(id, row.project_id)
+            .first<{ generation: number }>();
+          generation = (current?.generation ?? row.generation) + 1;
           const guard = mutation.guard(id);
           return mutation.batch([
             c.env.DB.prepare(
@@ -796,7 +805,7 @@ export async function deleteDatabase(
               now,
               id,
               row.project_id,
-              row.generation,
+              generation - 1,
               ...guard.bindings,
             ),
             c.env.DB.prepare(

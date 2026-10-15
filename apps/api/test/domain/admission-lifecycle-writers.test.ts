@@ -17,7 +17,7 @@ import { createApp } from "../../src/app.ts";
 const classes: string[] = [];
 afterEach(async () => {
   await env.DB.exec(
-    "DROP TRIGGER IF EXISTS admission_writer_fence; DROP TRIGGER IF EXISTS admission_writer_abort",
+    "DROP TRIGGER IF EXISTS admission_writer_fence; DROP TRIGGER IF EXISTS admission_writer_abort; DROP TRIGGER IF EXISTS admission_writer_race",
   );
   await cleanupFixtures();
   for (const id of classes.splice(0))
@@ -140,6 +140,32 @@ it("deletion reserves the admission fence before marking the database deleted", 
       .first(),
   ).toEqual({ desired_state: "deleted", generation: 2 });
   expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(false);
+});
+
+it("a deletion reads the generation under its own fence, so a change committed just before it does not fail it", async () => {
+  const f = await ready();
+  // A power change commits after the request has read the database and before the deletion takes
+  // its fence: here, while the idempotency reservation is written.
+  await env.DB.exec(
+    `CREATE TRIGGER admission_writer_race AFTER INSERT ON idempotency_keys BEGIN UPDATE databases SET generation=generation+1 WHERE id='${f.id}'; END`,
+  );
+  const response = await request(
+    `/v1/databases/${f.id}`,
+    f.integrator,
+    "DELETE",
+    undefined,
+    crypto.randomUUID(),
+  );
+  expect(response.status).toBe(202);
+  const deleted = DatabaseWithOperation.parse(await response.json());
+  expect(deleted.database).toMatchObject({
+    desired_state: "deleted",
+    generation: 3,
+  });
+  expect(deleted.operation).toMatchObject({
+    kind: "database.delete",
+    generation: 3,
+  });
 });
 
 it("an unplaced deletion keeps its secondary deleted-state write inside the same fence", async () => {

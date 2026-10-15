@@ -314,6 +314,13 @@ reclaim in 93.3 s). The name is free at once. The backup archive is **retained**
 deleted only after all its databases have finished deleting. Retained archives are removed by a
 cron after expiry.
 
+A `409 conflict` from `DELETE` deletes nothing. "Database admission mutation is in progress" means
+another change to the same database holds it at that moment: a wake, an idle sleep or its
+compensation, a protective storage stop or its recovery, or a regional maintenance step. Retry with
+backoff and jitter (for example 1 s, 2 s, 4 s, up to about two minutes) under the same
+`Idempotency-Key`. "Database changed; retry the request" means another request deleted the database
+first; the retry returns that deletion's operation.
+
 ### 2.7 Backups, restorable window and restore
 
 **What exists.** Each database archives WAL continuously to R2 (gzip) through the Barman Cloud
@@ -840,6 +847,7 @@ Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
 | 403 | `forbidden` | integrator key on an admin route | no |
 | 404 | `not_found` | unknown ID, an ID of another project, unknown route, a role route of a deleted database | no |
 | 409 | `conflict` | name in use, "Database is deleted", "Database configuration is not ready", "Database changed; retry the request" (also a resume without headroom), role exists or 100 roles, a role change already waiting, restore refusals ([2.7](#27-backups-restorable-window-and-restore)), project still holds databases | after reading state |
+| 409 | `conflict` | "Database admission mutation is in progress": another change to the same database holds it for the moment | yes, with backoff for up to about two minutes |
 | 409 | `idempotency_conflict` | same key, different request; replay of a credential-creating call | no |
 | 409 | `idempotency_in_progress` | same key still executing | yes, shortly |
 | 503 | `capacity_exhausted` | resize or profile assignment: the node lacks memory, CPU or storage now | later |
