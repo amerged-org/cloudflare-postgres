@@ -18,11 +18,7 @@ Talos 1.14.2 and Kubernetes 1.36.5. Its installer and raw image are privately di
 fully verified. Further Golden changes require an observed boot or data blocker; other work
 belongs to R2. Runtime/platform references are immutable release inputs from the verified lock.
 
-**Runtime.** Databases run on CloudNativePG today. EU's region switch (`compute_pool`) is on and
-EU1 keeps one prestarted sandbox slot under R2.11. The shared warm PostgreSQL pool on thin storage
-(alternative 8), the native controller and gateway (done) and the Rust/Wasm Edge (delivered with the
-go-live release) and a measured first SQL below one second are required **before go-live**; the
-native bootstrap relay follows after go-live. Pool tests must not block standard-runtime acceptance.
+**Runtime.** Databases run on CloudNativePG. The native controller and gateway are deployed; EU's region switch (`compute_pool`) is on and EU1 keeps one prestarted sandbox slot. A measured first query below one second after idle through Cloudflare, delivered by the [parked sleep tier](parked-instances.md), is required **before go-live**. The shared warm PostgreSQL pool (alternative 8) is deleted once that is measured (owner decision 2026-10-15); the Rust/Wasm Edge and the native bootstrap relay follow after go-live.
 
 **New nodes require thin storage**; there is no thick fallback for them. Retained thick volumes
 keep their backend and data. Thin activation needs a release-bound receipt from the
@@ -36,6 +32,8 @@ maintenance window, because a reboot of EU1 or control stops every awake databas
 no region-wide maintenance lock; later acceptance uses dedicated test projects with stated limits.
 
 **Owner priority (2026-10-14):** deliver a sleeping Thin database's first SQL below one second through Cloudflare on a real shared-pool hit. Finish the required execution and data-preservation guards, deploy, and measure this path before broad acceptance repeats, density work or independent administrative features. Reuse valid completed checks; repeat tests only for relevant changes, concrete failures or required CI. A thick-only hit or an already-awake connection does not complete the goal. The full customer-ready scope remains required afterwards.
+
+**Owner priority update (2026-10-15):** the first query after idle must answer in 1–2 s, measured live and tested; this is the most important goal for going live. The parked sleep tier is the vehicle (a sleeping database keeps its Pod warm), the shared pool code is deleted if it does not serve that goal, and the parked capacity per server is measured and reported.
 
 ## Delivery architecture
 
