@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-#[path = "../../../../src/pool_device.rs"]
-mod pool_device;
-#[path = "../../../../src/pool_gate.rs"]
-mod pool_gate;
-#[path = "../../../../src/pool_journal.rs"]
-mod pool_journal;
-#[path = "../../../../src/pool_mount.rs"]
-mod pool_mount;
-#[allow(dead_code)]
-#[path = "../../../../src/pool_namespaces.rs"]
-mod pool_namespaces;
+// Ordinary module lookup below the controller source directory keeps each product module's own
+// child-module tree (such as pool_gate/qualified.rs) at its real path.
+#[path = "../../../../src"]
+mod controller {
+    pub mod pool_device;
+    pub mod pool_gate;
+    pub mod pool_journal;
+    pub mod pool_mount;
+    #[allow(dead_code)]
+    pub mod pool_namespaces;
+}
+use controller::{pool_device, pool_gate, pool_journal, pool_mount, pool_namespaces};
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();

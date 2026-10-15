@@ -6,6 +6,7 @@ edition="2024"
 license="Apache-2.0"
 publish=false
 [dependencies]
+pgcf-native-protocol={path="../../../../../packages/native-protocol"}
 libc="=0.2.190"
 sha2="=0.11.0"
 serde={version="=1.0.229",features=["derive"]}

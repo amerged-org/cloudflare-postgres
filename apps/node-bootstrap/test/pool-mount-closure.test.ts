@@ -16,6 +16,33 @@ import { dirname, join, resolve } from "node:path";
 import { runCommand } from "../src/bootstrap.ts";
 import versions from "../../../infra/platform/versions.lock.json" with { type: "json" };
 
+/** Copies only named public inputs; every copied path and byte keys the fixture's target dir. */
+function publicSources(repo: string, source: string) {
+  const sourceHash = createHash("sha256").update(repo);
+  const copy = async (name: string) => {
+    const target = join(source, name);
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await copyFile(join(repo, name), target);
+    sourceHash.update(name).update(await readFile(target));
+    await chmod(target, 0o600);
+  };
+  const tree = async (directory: string, suffix: string) => {
+    for (const entry of await readdir(join(repo, directory), {
+      withFileTypes: true,
+    })) {
+      if (entry.name.startsWith(".")) continue;
+      const name = join(directory, entry.name);
+      if (entry.isDirectory()) await tree(name, suffix);
+      else if (entry.isFile() && entry.name.endsWith(suffix)) await copy(name);
+    }
+  };
+  return {
+    copy,
+    tree,
+    targetDir: () => `/target/${sourceHash.digest("hex").slice(0, 24)}`,
+  };
+}
+
 test("real pool device custody, descriptor mount, busy refusal and crash-durable gate", async () => {
   const repo = resolve(import.meta.dirname, "../../..");
   await mkdir(join(repo, ".local"), { recursive: true, mode: 0o700 });
@@ -26,13 +53,15 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
   await mkdir(output, { mode: 0o700 });
   const container = `pgcf-pool-kernel-${randomUUID()}`;
   const fixture = "apps/sandbox-controller/tests/fixtures/pool-kernel";
-  const sourceHash = createHash("sha256").update(repo);
+  const { copy, tree, targetDir } = publicSources(repo, source);
   const selected = [
     "apps/sandbox-controller/src/pool_mount.rs",
     "apps/sandbox-controller/src/pool_gate.rs",
+    "apps/sandbox-controller/src/pool_gate/qualified.rs",
     "apps/sandbox-controller/src/pool_device.rs",
     "apps/sandbox-controller/src/pool_namespaces.rs",
     "apps/sandbox-controller/src/pool_journal.rs",
+    "packages/native-protocol/Cargo.toml",
     `${fixture}/Cargo.toml`,
     `${fixture}/Cargo.lock`,
     `${fixture}/src/main.rs`,
@@ -49,14 +78,11 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
   let cleanup = false;
   let passed = false;
   try {
-    // Copy only these public source files; no workspace credentials enter a compiler context.
-    for (const name of selected) {
-      const target = join(source, name);
-      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-      await copyFile(join(repo, name), target);
-      sourceHash.update(name).update(await readFile(target));
-      await chmod(target, 0o600);
-    }
+    // Copy only these public sources and the protocol crate the pool gate's qualified claim
+    // compiles against; no workspace credentials enter a compiler context.
+    for (const name of selected) await copy(name);
+    await tree("packages/native-protocol/src", ".rs");
+    await tree("packages/contracts/native", ".json");
     await copyFile(
       join(repo, fixture, "fixture.sh"),
       join(output, "fixture.sh"),
@@ -78,7 +104,7 @@ test("real pool device custody, descriptor mount, busy refusal and crash-durable
       "unsupported fixture architecture",
     );
     const platform = native === "aarch64" ? "linux/arm64" : "linux/amd64";
-    const cargoTarget = `/target/${sourceHash.digest("hex").slice(0, 24)}`;
+    const cargoTarget = targetDir();
     const built = await invoke(
       [
         "run",
@@ -208,24 +234,7 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
   const output = join(privateRoot, "output");
   await mkdir(output, { mode: 0o700 });
   const container = `pgcf-pool-io-${randomUUID()}`;
-  const sourceHash = createHash("sha256").update(repo);
-  const copy = async (name: string) => {
-    const target = join(source, name);
-    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    await copyFile(join(repo, name), target);
-    sourceHash.update(name).update(await readFile(target));
-    await chmod(target, 0o600);
-  };
-  const tree = async (directory: string, suffix: string) => {
-    for (const entry of await readdir(join(repo, directory), {
-      withFileTypes: true,
-    })) {
-      if (entry.name.startsWith(".")) continue;
-      const name = join(directory, entry.name);
-      if (entry.isDirectory()) await tree(name, suffix);
-      else if (entry.isFile() && entry.name.endsWith(suffix)) await copy(name);
-    }
-  };
+  const { copy, tree, targetDir } = publicSources(repo, source);
   const invoke = (args: string[], timeout = 60000) =>
     runCommand({
       executable: "docker",
@@ -288,7 +297,7 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
     const protoc = versions.nativeRuntime.protoc.archives.find(
       (pin) => pin.os === "linux" && pin.architecture === "amd64",
     )!;
-    const cargoTarget = `/target/${sourceHash.digest("hex").slice(0, 24)}`;
+    const cargoTarget = targetDir();
     const built = await invoke(
       [
         "run",
