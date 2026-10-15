@@ -101,11 +101,11 @@ export interface SizeRow extends Omit<SizeClass, "enabled"> {
 
 /**
  * `now` is read once by a list so that every row is judged at the same instant. Backup and disk
- * health come from the producers of the operator listing; a row read without the newest agent
- * sample reports the disk unknown.
+ * health and the storage figures come from the producers of the operator listing; a row read
+ * without the newest agent sample reports them unknown.
  */
 export function databaseView(row: DatabaseRow, now = Date.now()): Database {
-  const { backup, disk } = databaseHealthOf(row, now);
+  const { backup, disk, sample } = databaseHealthOf(row, now);
   return Database.parse({
     id: row.id,
     project_id: row.project_id,
@@ -135,6 +135,14 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
       },
       disk: { status: disk.status, used_ratio: disk.used_fraction },
     },
+    storage:
+      sample === null
+        ? null
+        : {
+            used_bytes: sample.storage_used_bytes,
+            allocated_bytes: sample.storage_allocated_bytes,
+            observed_at: sample.observed_at,
+          },
     created_at: row.created_at,
     updated_at: row.updated_at,
   });

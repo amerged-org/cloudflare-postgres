@@ -99,6 +99,11 @@ const exampleDatabase = {
     backup: { status: "ok", last_base_backup_at: "2030-01-01T03:00:00.000Z" },
     disk: { status: "ok", used_ratio: 0.12 },
   },
+  storage: {
+    used_bytes: 644245094,
+    allocated_bytes: 5368709120,
+    observed_at: "2030-01-01T09:29:30.000Z",
+  },
   created_at: "2030-01-01T08:00:00.000Z",
   updated_at: "2030-01-01T09:30:00.000Z",
 };

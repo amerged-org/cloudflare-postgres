@@ -418,6 +418,28 @@ export const DatabaseHealth = z
   .meta({ id: "DatabaseHealth" });
 export type DatabaseHealth = z.infer<typeof DatabaseHealth>;
 
+/** The newest volume figures the region's agent reported for a database. */
+export const DatabaseStorage = z.strictObject({
+  used_bytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .describe(
+      "Bytes used on the volume; null when the sample did not measure it.",
+    ),
+  allocated_bytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .describe("Bytes of the volume's capacity; null when unknown."),
+  observed_at: Timestamp.describe(
+    "When the agent took the sample; judge its age yourself.",
+  ),
+});
+export type DatabaseStorage = z.infer<typeof DatabaseStorage>;
+
 export const Database = z
   .strictObject({
     id: DatabaseId,
@@ -434,6 +456,9 @@ export const Database = z
     observed_generation: z.number().int().min(0),
     status_message: z.string().max(TEXT_MAX_LENGTH).nullable(),
     health: DatabaseHealth,
+    storage: DatabaseStorage.nullable().describe(
+      "The newest volume figures from the region's agent; null before its first sample.",
+    ),
     created_at: Timestamp,
     updated_at: Timestamp,
   })

@@ -69,7 +69,7 @@ const operatorRow = async (admin: string, id: string) => {
   return page.data.find((row) => row.id === id)!;
 };
 
-it("reports unknown health before the first sample", async () => {
+it("reports unknown health and no storage before the first sample", async () => {
   const f = await created();
   const database = await read(f);
   expect(database.health).toEqual({
@@ -78,6 +78,7 @@ it("reports unknown health before the first sample", async () => {
     backup: { status: "unknown", last_base_backup_at: null },
     disk: { status: "unknown", used_ratio: null },
   });
+  expect(database.storage).toBeNull();
 });
 
 it("takes backup and disk health from the producers of the operator listing", async () => {
@@ -95,6 +96,11 @@ it("takes backup and disk health from the producers of the operator listing", as
     last_base_backup_at: now,
   });
   expect(database.health.disk).toEqual({ status: "warning", used_ratio: 0.95 });
+  expect(database.storage).toEqual({
+    used_bytes: 95,
+    allocated_bytes: 100,
+    observed_at: now,
+  });
   // The operator sees the same verdicts: one source, not a second copy of it.
   const row = await operatorRow(f.admin, f.id);
   expect(row.backup).toMatchObject({
@@ -124,12 +130,22 @@ it("keeps what is unknown unknown: an old sample, a failing backup, a missing fi
     status: "failing",
     last_base_backup_at: completed,
   });
-  // A sample older than the freshness window says nothing about the disk now.
+  // A sample older than the freshness window says nothing about the disk now, but is shown with its age.
   expect(database.health.disk.status).toBe("unknown");
-  // A newer sample that measured nothing keeps the ratio unknown.
+  expect(database.storage).toEqual({
+    used_bytes: 10,
+    allocated_bytes: 100,
+    observed_at: old,
+  });
+  // A newer sample that measured nothing keeps the ratio unknown and the object present.
   await sample(f.id, now, null, 100, 2);
   database = await read(f);
   expect(database.health.disk).toEqual({ status: "unknown", used_ratio: null });
+  expect(database.storage).toEqual({
+    used_bytes: null,
+    allocated_bytes: 100,
+    observed_at: now,
+  });
 });
 
 it("carries the same fields in lists and in operation answers", async () => {
@@ -143,10 +159,11 @@ it("carries the same fields in lists and in operation answers", async () => {
     status: "ok",
     used_ratio: 0.25,
   });
+  expect(listed.data[0]!.storage).toMatchObject({ used_bytes: 1 });
   const deleted = DatabaseWithOperation.parse(
     await (
       await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")
     ).json(),
   );
-  expect(deleted.database.health.disk.used_ratio).toBe(0.25);
+  expect(deleted.database.storage).toMatchObject({ allocated_bytes: 4 });
 });

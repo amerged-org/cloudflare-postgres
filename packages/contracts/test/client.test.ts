@@ -89,6 +89,7 @@ function fixtures() {
       backup: { status: "unknown" as const, last_base_backup_at: null },
       disk: { status: "unknown" as const, used_ratio: null },
     },
+    storage: null,
     created_at: now,
     updated_at: now,
   };
