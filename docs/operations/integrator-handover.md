@@ -21,10 +21,10 @@ authority on what still blocks go-live; operator procedures are in the other run
 
 | Topic | State on 2026-10-15 |
 | --- | --- |
-| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met**: no shared-pool hit has been measured yet (Go-live path: *Sub-second wake*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
+| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met**: the parked sleep tier that targets it is implemented and its wake has not been measured (Go-live path: *Sub-second wake*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
 | Redundancy | One customer node (EU1), one PostgreSQL instance per database, no replica, no second node. Losing EU1 stops every database until it is restored from R2 onto new capacity ([7](#7-failure-and-recovery)). |
 | Capacity numbers | The density test that measures how many databases may be awake has not run (Go-live path: *Density on EU1*). The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the arithmetic the admission code applies, not measured capacity. |
-| New databases | EU1 reports Thin storage `blocked` and placement closed since 2026-10-14; the fix is in code and ships with the go-live release (Go-live path: *Green main*, *Go-live release*). While that holds, `POST /v1/databases` and restores are accepted but the database waits unplaced ([2.1](#21-create)). |
+| New databases | Thin storage is live on EU1 and new databases are placed on Thin volumes; open defects of Thin starts and idle sleeps are listed in the ULTRA plan (go-live path and after go-live). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced ([2.1](#21-create)). |
 | Alerts | Recorded, not delivered: no email recipient or sender is configured (Go-live path: *Alerts*). You receive no alerts from PGCF ([6](#6-alerts-and-operations)). |
 | Your key | Project-scoped key isolation and rotation have not been exercised live (Go-live path: *Integrator access and catalog*). |
 | Maintenance | Fleet patches reboot the single customer node and visibly interrupt databases. From the canary on the EU stack is production (`pgcf-api-dev` and `eu-dev` are only names): such reboots then need the owner's go and an announced window, but no announcement channel is defined ([7.1](#71-what-happens-in-each-situation)). |
@@ -211,8 +211,10 @@ counts from readiness.
 - Ready means the operation is `succeeded`, the database `observed_state` is `ready` and
   `observed_generation` equals `generation`. Poll `GET /v1/operations/{id}`; the database stays
   `pending` or `provisioning` until then. Connecting earlier returns `57P03` immediately.
-- Measured on EU1 with the standard runtime (the plan's "EU acceptance" row): ready in 30.7 s,
-  first SQL through Cloudflare 0.57 s, base backup and WAL in R2 after 20.7 s.
+- Measured on EU1 (the plan's "EU acceptance" row, thick storage, standard runtime): ready in
+  30.7 s, first SQL through Cloudflare 0.57 s, base backup and WAL in R2 after 20.7 s. On Thin
+  storage (Go-live path: *Thin acceptance*, 2026-10-15) a create took 260.4 s to ready, first SQL
+  through Cloudflare 0.93 s and base backup and WAL in R2 84.5 s.
 - **No capacity.** If no node qualifies, the call still returns `202`: `node_id` is `null`,
   `observed_state` is `pending` and `status_message` is `Waiting for verified regional capacity`.
   A minute cron places it when capacity appears (for example when another database hibernates).
@@ -265,8 +267,9 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   the change reaches PostgreSQL with the database's next configuration pass. Wait until
   `observed_generation == generation` before connecting as the new role (earlier: `57P03`). A
   hibernated database applies it at its next wake.
-- A role change on a database that is currently bound to a shared pool Pod (not deployed yet) is
-  deferred and answered with `202` and an operation; poll it like any operation.
+- A role change on a database that is bound to a shared pool Pod is deferred and answered with
+  `202` and an operation; poll it like any operation. No database is bound to a pool Pod: the
+  shared pool is deferred and not deployed.
 - The URI has no port and no `sslmode`; see [3.1](#31-driver-configuration) for how to use it.
 
 ### 2.4 Suspend and resume
@@ -290,8 +293,8 @@ the capacity case. Retry later or free capacity.
 
 `PATCH /v1/databases/{id}` with `{"size_class_id": "<class>"}`.
 
-- A running database moves to the new limits by replacing its Pod, so its sessions end. The README
-  records one measured resize to 512 MiB and 250 m taking 28 s with data and volume unchanged. A
+- A running database moves to the new limits by replacing its Pod, so its sessions end. One
+  earlier Dev resize to 512 MiB and 250 m took 28 s with data and volume unchanged. A
   hibernated database changes immediately and starts on the new class at its next wake.
 - The target class must be enabled, within the region's memory maximum and, for a running
   database, fit the node now: `503 capacity_exhausted` ("Current node has insufficient memory, CPU
@@ -440,12 +443,12 @@ SQL and allows 16 local connections.
   `statement_timeout` and `pg_cancel_backend()` from another session.
 - `replication` connections and logical replication are refused. Frames are binary; text
   WebSocket frames are refused.
-- Text-format results are what the acceptance suite verifies. The README records decoded
-  binary-result assertions as failed on WebSocket and on direct TCP with node-postgres 8.22; do
+- Text-format results are what the acceptance suite verifies. Decoded binary-result assertions
+  failed in the earlier Dev acceptance on WebSocket and on direct TCP with node-postgres 8.22; do
   not rely on binary result formats until that is closed.
 - One WebSocket message may be up to 32 MiB; the gateway sends frames of at most 64 KiB. `COPY`
-  works over the same connection (the README records a 105 MB binary `COPY` integrity pass
-  through the CLI).
+  works over the same connection (an earlier Dev acceptance passed a 105 MB binary `COPY`
+  integrity check through the CLI).
 - The gateway pings every 30 s and drops a connection that misses a pong; ordinary WebSocket
   stacks answer automatically.
 - The StartupMessage must arrive within 10 s of the upgrade and is at most 10,000 bytes.
@@ -462,23 +465,24 @@ client and PostgreSQL; PGCF's Edge and gateway only relay it.
 
 ### 3.4 Timeouts and retries for a sleeping database
 
-Measured wake times through Cloudflare (standard runtime, no shared pool):
+Measured wake times through Cloudflare (standard runtime, CNPG hibernation):
 
 | Series | First row after connect |
 | --- | --- |
 | Gate 0, 3 cold wakes, 2026-10-12, retained 1 GiB database | **8.1–9.4 s** |
 | The same wake before the wake orchestration (R1.2 baseline) | 9.6–11.2 s |
-| Earlier 20-wake series (README; p50 / p95 / max) | 8.4 / 9.2 / 9.7 s |
+| Earlier 20-wake series (p50 / p95 / max) | 8.4 / 9.2 / 9.7 s |
 | Already awake database, first row | 0.47–0.96 s (0.54–0.61 s in the warm rounds) |
 
-**The sub-second goal is not met.** It needs a prestarted pool slot that a sleeping database is
-bound to on connect; the pool code is on main but neither built nor deployed (Go-live path: *Pool
-host producer*, *Pool enablement acceptance*, *Sub-second wake*), and no end-to-end wake below 8 s
-has been measured. The first expectation recorded for a pool hit is 1 to
-2 s; below 1 s is not excluded. PGCF publishes the result only in the ULTRA plan's Done table, as
-the first row after three consecutive real pool hits, with `connect_ms` and `first_read_ms` from
-one start and every run labelled `hit` or `miss`; update this section from that row when
-*Sub-second wake* closes.
+**The sub-second goal is not met.** The path to it is the parked sleep tier: after an idle sleep
+the database's instance Pod stays and only PostgreSQL stops, so the next connection unfences the
+Pod instead of creating a new one ([design](../architecture/parked-instances.md)). It is
+implemented and not measured (Go-live path: *Sub-second wake*); the design budgets 1.3 to 2.2 s
+for the first implementation and about 1.1 to 1.2 s with direct SQL readiness, so below 1 s needs
+further removals. A demoted (fully hibernated) database takes the 8.1–9.4 s wake. The shared
+prestarted pool is deferred. PGCF publishes the result only in the ULTRA plan's Done table, as the
+first row measured stage by stage from one start, with every run labelled hit or miss (demoted,
+hibernated); update this section from that row when *Sub-second wake* closes.
 
 What the Edge does: it waits at most **30 s** for a wake (`ADMISSION_DEADLINE_MS`), coalesces all
 connections of one database into one wake and admits at most 32 waiters per database. Giving up
@@ -554,7 +558,7 @@ quotas per tenant, compute autoscaling or branching in v1. The limits below are 
 | Placement mode | `actual_ram`: starts are admitted against fresh measured RAM, not reservations |
 | Per-database memory maximum | 4,096 MiB, steps of 256 |
 | Node (EU1) | 6 vCPU, 12 GB; the plan records 5,000 m CPU and 10,819 MiB allocatable |
-| Prestarted compute pool | one slot, 100 m and 64 MiB per slot; this overhead is charged to every database |
+| Prestarted sandbox slots (region `compute_pool`, not the shared PostgreSQL pool) | one slot, 100 m and 64 MiB per slot; this overhead is charged to every database |
 
 ### 4.2 Awake databases: CPU and RAM admission
 
@@ -564,7 +568,8 @@ A database that is not confirmed hibernated is charged
 
 against `allocatable CPU - platform requests P - the charges of all awake databases - idle pool
 Pods`. A start is admitted only if its own charge still fits. A confirmed hibernated database
-carries no charge.
+carries no charge; a parked database (region policy `parked_tier`) holds the parked requests of
+its Pod instead.
 
 Starts also need a memory sample of the node that is at most 90 s old and shows no
 `MemoryPressure`, with available RAM of `memory_mib + 512 MiB` (sidecar limit) plus the pool slot
@@ -644,7 +649,7 @@ pgcf -G "$PGCF_API/v1/usage" \
 | --- | --- |
 | `provisioned_seconds`, `awake_seconds` | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension |
 | `memory_mib_seconds`, `cpu_millicore_seconds` | the class's memory and CPU **limits** times awake seconds; not measured consumption |
-| `reserved_cpu_millicore_seconds` | request plus sidecar (plus pool overhead) times awake seconds; zero while confirmed hibernated |
+| `reserved_cpu_millicore_seconds` | request plus sidecar (plus pool overhead) times awake seconds; zero while confirmed hibernated, and the parked Pod's requests while the database is parked (region policy `parked_tier`) |
 | `reserved_memory_mib_seconds` | class memory plus the 128 MiB sidecar request times **provisioned** seconds: sleeping time is included, because the hibernation snapshot does not reduce it |
 | `reserved_storage_byte_seconds` | quota times provisioned seconds; **null for Thin volumes** (their snapshot carries no physical allocation), with the gap named |
 | `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the agent's filesystem samples in the period (bytes used; PVC capacity) |
@@ -730,7 +735,7 @@ for it during incidents.
 
 | Situation | Effect on your database | Data | You do |
 | --- | --- | --- | --- |
-| Idle sleep | Pod removed after quiesce; the next connection wakes it | WAL archived first, volume kept | reconnect |
+| Idle sleep | PostgreSQL stops after quiesce and the Pod is removed, or kept parked when the region policy `parked_tier` is enabled; the next connection wakes it | WAL archived first, volume kept | reconnect |
 | Manual suspend | refused with `57P03` until resume | as above | `POST /resume` |
 | Planned maintenance: fleet patch or rollout | new placement is closed during it, so creates wait; the single customer node reboots and its databases "may experience visible maintenance downtime"; the control node is patched after the customer node. A release that changes kernel, Thin driver or host extension is announced as an outage of all Thin databases. From the canary on, reboots of EU1 or control need the owner's go and an announced window (the plan: a reboot of EU1 or control stops every awake database and there is no region-wide maintenance lock). The announcement channel is not defined in the repository | kept | plan around the window; ask the operator for it |
 | Node reboot (crash, or a patch) | every database Pod on the node stops; PostgreSQL crash-recovers from the local volume when the node and the regional controller are back; Thin databases additionally wait until write authority is re-established on the new boot (fresh boot confirmation and an identity proof); hibernated databases are not touched. No duration is measured for databases | kept (local volume) | retry with backoff; check `observed_state` |
@@ -801,7 +806,8 @@ the operator supplies it at handover.** Send:
 
 ## 8. Not available yet
 
-- Sub-second first SQL after sleep, and the shared prestarted pool behind it.
+- Sub-second first SQL after sleep (the parked sleep tier is implemented and not measured); the
+  shared prestarted pool is deferred.
 - A second customer node, redundancy and a measured recovery time; node drain and moving
   databases with their IDs kept (a restore always creates a new ID).
 - Alert delivery to a recipient; alert history, acknowledgement and test send.
@@ -826,10 +832,10 @@ confirmation. The state column says what is measured and what is derived or open
 | --- | --- | --- |
 | RPO per class | [7.2](#72-recovery-point) | derived: `archive_timeout_seconds` plus upload time; one measured sample (66.7 s with a 60 s timeout); no per-class measurement |
 | PITR window per class | [2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point) | derived from `backup_retention_days`; not listable through the API; no measured full-window restore |
-| Thin hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | **not measured**: no pool hit exists; the standard-runtime wake is 8.1–9.4 s |
+| Parked hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | **not measured**: the parked tier is implemented; the hibernated wake is 8.1–9.4 s |
 | `57P03` meanings and retry rule | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee |
 | Connection limits | [3.6](#36-connection-limits) | stated; the deployed per-role and per-network values are not recorded in the repository |
-| Role-change deferral on pool-bound databases | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code; the pool is not deployed |
+| Role-change deferral on pool-bound databases | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code; the pool is deferred and not deployed |
 | Outage classes and maintenance windows | [7.1](#71-what-happens-in-each-situation) | classes stated; no window schedule and no announcement channel is defined |
 | New IDs after restore or node loss | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) | stated |
 | Capacity caps | [4](#4-capacity-and-limits-you-must-enforce) | arithmetic only; measured caps follow *Density on EU1* |
@@ -903,10 +909,10 @@ outcome and are not replayed.
 | Admission, wake, idle, `57P03` | `apps/api/src/database-actor.ts`, `apps/api/src/domain/{startup-admission,placement,storage-capacity,agent-metrics,observations}.ts` |
 | Edge, hints, SQLSTATE, deadline, decoy | `apps/edge/src/*.ts` (the Rust/Wasm port in `apps/edge-rust` applies the same policy) |
 | Gateway limits, TLS, cancel, startup, idle close | `apps/native-gateway/src/transport.rs`, `packages/native-protocol/src/activity.rs`, `packages/contracts/src/pg-wire.ts`, `packages/contracts/native/protocol.generated.json` |
-| Sleep sequence and refusals | `apps/regional/src/agent/sleep.ts`, `apps/native-controller/src/power.rs` |
+| Sleep sequence and refusals | `apps/native-controller/src/power.rs` |
 | PostgreSQL cluster, backup schedule, retention, `pg_hba` | `apps/native-controller/src/manifests.rs`, `infra/postgres/README.md`, `infra/platform/versions.lock.json` |
-| Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, `README.md` |
-| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/native-controller/src/measurements.rs`, conformant to `apps/regional/src/agent/measurements.ts` |
+| Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, [README](../../README.md) |
+| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/native-controller/src/measurements.rs` |
 | Alerts, health | `apps/api/src/domain/{operational-health,infrastructure-alerts}.ts`, `docs/operations/infrastructure-backups.md` |
 | Recovery, maintenance | `docs/operations/recovery.md`, `docs/operations/fleet-patches.md` |
 | Measured numbers and open steps | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) |

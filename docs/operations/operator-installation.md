@@ -1,23 +1,20 @@
 # Existing-account installation
 
-Current scope (2026-10-11): follow the canonical [ULTRA delivery plan](../architecture/cloudflare-convergence-and-serverless-plan.md)
+Follow the canonical [ULTRA delivery plan](../architecture/cloudflare-convergence-and-serverless-plan.md)
 and record measured completion there. Keep the existing EU control/relay and customer EU1
-servers. The US region is cancelled; US1 serves only as the R1.1 canary until it is marked lost.
-The three EU databases are owner-declared disposable test data and may be deleted and
-recreated if they obstruct; this does not authorize resetting EU hosts or repurposing control.
+servers; do not reset, re-adopt or reinstall either of them to resume a stalled operation. The US
+region is cancelled and US1 is marked lost.
 
-EU1 uses V159 / Cloud VPS Plus 4, 4 vCPU, 8 GiB RAM and 150 GiB NVMe. Talos 1.14.2/Kubernetes
-1.36.5 is the release baseline. Golden R1 includes the sandbox extension and common release pins;
-`dm_thin_pool` is loaded through Talos machine configuration, not the image recipe. Activate
-prepared EU replacement credentials in its patch window. Rust and shared-pool work proceeds
-in parallel and ships as R2 through the same automatic target-release workflow.
+EU1 is a Contabo Cloud VPS with 6 vCPU and 12 GB RAM. Talos 1.14.2/Kubernetes 1.36.5 is the
+release baseline. Golden R1 includes the sandbox extension and common release pins;
+`dm_thin_pool` is loaded through Talos machine configuration, not the image recipe.
 
 New nodes use the golden raw image through AddNode; existing nodes use supported Talos/Kubernetes
-upgrades followed by Flux platform/PGCF convergence. One target-release API call must drive the
-whole selected fleet serially without laptop helpers or operator steps. Current per-node APIs
-are building blocks, not proof that fleet automation exists. Use the six functional checks in the
-ULTRA plan. Use Contabo only at provider lifecycle boundaries. A future real expansion uses the
-configured threshold/purchase policy and the same golden release; a new region starts with its
+upgrades followed by Flux platform/PGCF convergence. One `POST /v1/fleet/rollouts` request drives
+the whole selected fleet serially without laptop helpers or operator steps
+([fleet patches](fleet-patches.md)). Use the six functional checks in the ULTRA plan. Use Contabo
+only at provider lifecycle boundaries. A future real expansion uses the configured
+threshold/purchase policy and the same golden release; a new region starts with its
 [control server](#control-server-of-a-new-region).
 
 ## Reviewed deployment inputs
@@ -50,57 +47,33 @@ creating its bucket; the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS
 exact region ID to its actual Worker binding and bucket. A mismatching or missing binding fails
 closed.
 
-Deploy the management API before a fleet release whose native controller labels observations
-with `coverage`. An earlier API refuses the label as `invalid_request`; the controller then resends
-the same report once in the legacy shape. Route tokens are versioned: v3 binds the route revision
-and the verified primary Pod, and the native gateway refuses a stale revision or another Pod
-before dialling. A region gets v3 only when its assigned release declares
-`"route_token_version": 3` and every current assigned member confirmed that release's patch at the
-current region revision. Otherwise the Actor admission names no target and the Edge signs v2,
-which every gateway accepts; the TypeScript gateway accepts only v2. In a v3 region an admission
-without the verified target of the observed revision is refused as not ready (57P03), never
-signed v2.
+Route tokens are versioned. The Edge signs a token that the regional gateway verifies before it
+dials PostgreSQL. A v3 token binds the database generation and the verified primary Pod. A v4
+token adds the independent admission route revision from the Actor's admission snapshot and
+needs the release markers `route_token_version: 4`, `runtime_attestation_version: 2` and
+`admission_snapshot_version: 1`. The native gateway refuses a stale revision or another Pod
+before dialling. A region gets a token with a target only when its assigned release declares
+the version and every current assigned member confirmed that release's patch at the current
+region revision; an admission without the verified target of the observed revision is refused as
+not ready (57P03).
 
 Approval checks only that a declaring release runs the native gateway and controller on every
-role; the API holds no image provenance. Before declaring v3, read the source commit that CI
-built and labelled each pinned image from, and check it against the cutoff:
+role; the API holds no image provenance. Declare a route token version only in a release whose
+pinned `native-gateway` and `native-controller` images CI built from the source that implements
+it.
 
-```sh
-docker pull "$REFERENCE"
-commit=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REFERENCE")
-git merge-base --is-ancestor 509d148 "$commit"
-```
+## Edge Worker
 
-The `native-gateway` commit must contain 509d148, which verifies v3. The `native-controller`
-commit must contain "fix: publish a restored database's running fence under its restore";
-earlier controllers leave a restored database without the running fence its v3 routes need.
+The deployed Edge Worker is the TypeScript `apps/edge`; the management API and DatabaseActor stay
+in TypeScript. Start the private deployment configuration from `apps/edge/wrangler.example.jsonc`
+and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit namespaces,
+regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret.
 
-Roll back in reverse order: Edge, fleet, API.
-
-- Edge: an older Edge signs only v2, which every gateway accepts. This stops new v3 routes at
-  once without a fleet change.
-- Fleet, or ending v3 in a region: send `POST /v1/fleet/rollouts` with a release that does not
-  declare the version. The rollout reassigns the region and every member in one step, which ends
-  v3 before a patch can start an older gateway; issued v3 tokens expire within 30 seconds. Never
-  use `PUT /v1/regions/{id}/release` alone for a region with assigned members: until each
-  member's assignment follows, the native controller cannot verify its databases and
-  protectively stops thin ones.
-- API: an API older than 7d92e6a cannot parse a release that declares `route_token_version`.
-  First complete such a rollout in every region that declared it. Then point the fleet update
-  policy's `promoted_release_id` at a release without the declaration, or disable the policy,
-  with `PUT /v1/fleet/update-policy`. Otherwise the older API fails those regions' desired-state
-  reads, and every cron run fails at the promoted release, skipping later rollout, backup and
-  alert steps.
-
-Remove v2 once every region's release declares v3.
-
-## Rust/Wasm Edge artifact
-
-The complete replacement entry lives in `apps/edge-rust`; the management API and
-DatabaseActor stay in TypeScript. Build the selected source once using the Rust toolchain
-and `rustEdge` tools from `infra/platform/versions.lock.json`. Verify the pinned tool
-archives and exact members before using `WASM_BINDGEN_BIN`, `WASM_OPT_BIN` and
-`ESBUILD_BIN`. The common CI workflow performs this preparation.
+The Rust/Wasm replacement lives in `apps/edge-rust`. The common CI workflow builds it; it is not
+deployed. Build the selected source once using the Rust toolchain and `rustEdge` tools from
+`infra/platform/versions.lock.json`. Verify the pinned tool archives and exact members before
+using `WASM_BINDGEN_BIN`, `WASM_OPT_BIN` and `ESBUILD_BIN`. The common CI workflow performs this
+preparation.
 
 `pnpm --filter @pgcf/edge-rust build` creates `build/index.js`, `build/index_bg.wasm`
 and the compatibility entry `build/worker/shim.mjs`. Preserve their checksums and upstream
@@ -109,23 +82,16 @@ built bytes in real local workerd instances with the actual DatabaseActor, D1, r
 and Fetcher bindings; it does not rebuild the Worker. Local fixtures prove binding and
 protocol behavior. They do not replace Dev PostgreSQL/TLS and VPC transport acceptance.
 
-Start the private deployment configuration from `apps/edge-rust/wrangler.example.jsonc`
-and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit
-namespaces, regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret. The example
-intentionally has no custom build command: delivery uses the qualified artifact instead
-of compiling again. Do not activate the replacement until the selected bytes pass Dev
-database acceptance. Record the actual Worker version and result in the ULTRA plan.
-Activate only a Wasm Edge whose source commit contains fdbfcbe
-(`git merge-base --is-ancestor fdbfcbe <commit>`). Earlier builds parse the admission by exact
-keys: those before 509d148 refuse the `target` the current API adds and fail every connection,
-and later ones would refuse the next additive field. Builds from fdbfcbe validate the fields they
-use and ignore additive ones, like the TypeScript Edge that serves live traffic.
+Start the replacement's private configuration from `apps/edge-rust/wrangler.example.jsonc`;
+it has the same bindings and secret as the TypeScript example. The example intentionally has no
+custom build command: delivery uses the qualified artifact instead of compiling again. Do not
+activate the replacement until the selected bytes pass Dev database acceptance. Record the
+actual Worker version and result in the ULTRA plan.
 
-Successful upgrades return the unopened upstream WebSocket directly to Cloudflare.
-PostgreSQL bytes are not relayed through a TypeScript or Wasm application loop. Only
-bounded local refusal sockets parse their own startup/SCRAM exchange. Request aborts and
-the absolute admission deadline cancel the exact Actor waiter; a cancellation never
-retries the gateway connection or application SQL.
+Both editions return the unopened upstream WebSocket directly to Cloudflare. PostgreSQL bytes
+are not relayed through a TypeScript or Wasm application loop. Only bounded local refusal sockets
+parse their own startup/SCRAM exchange. Request aborts and the absolute admission deadline cancel
+the exact Actor waiter; a cancellation never retries the gateway connection or application SQL.
 
 ## Private bootstrap transport
 
@@ -189,12 +155,6 @@ full port scan whenever the initial preparation proof expires. Native host/certi
 physical/cluster/node identity and acknowledged/pending-byte comparisons remain mandatory.
 This authorization ends with cancellation, revocation or admission and grants no permission
 to another job or to release quarantine without fresh postjoin proof.
-For a partially written job created before migration0022, the programmed Workflow establishes
-this record once at an explicit lifecycle boundary using a fresh preparation proof and fresh
-read-only provider facts. Its CAS preserves the complete input and current acknowledged/pending
-checkpoint. Routine reads/grants cannot establish the record or query Contabo. Apply0022 through
-the tracked D1 migration path only after checking the exact pending migration and the paused
-job; do not reset the disk or replay an uncertain write.
 
 The provider client retains credential-scoped OAuth reuse/coalescing, early-expiry refresh and
 401 invalidation. A credential change closes reuse of the old client; an uncertain mutation is
@@ -202,8 +162,8 @@ resolved through its existing claim and readback rather than replayed.
 
 ## Programmed installation path
 
-The headless producer is implemented and has passed the common software and image checks; delivery
-and fresh-node Dev acceptance are tracked in PLAN.md.
+The headless producer is implemented and has passed the common software and image checks; its
+fresh-node live acceptance is tracked in the ULTRA plan.
 Configure `PUT /v1/regions/{id}/installation-profile` once with administrator scope. The exact
 profile fields are `version:1`, `region_id`, `provider_product_id`, `relay_issuer_region_id`, `dns`,
 `storage:{ephemeral_gib,lvm_gib}` and `rescue_client_private_key`. Storage is the reviewed layout;
@@ -301,22 +261,20 @@ repeat purchase, profile import, adoption, registration or disk-write intent. EU
 admitted and needs no bootstrap or adoption. The sequence below is the procedure for future
 authorized additions, not an instruction to reinstall an existing node.
 
-The recorded EU Regional source is 6978033 (CI 37851000610) until the EU fleet patch. An owner
-change removed the live node ceilings (`max_nodes:null`) and the personal capacity-mail
-credentials/recipient. Per the owner's 2026-10-11 decision, automatic EU purchases stay enabled
-and US purchases are off; every addition still waits for a thin-qualified release (see the
-[new-region runbook](#control-server-of-a-new-region), step 4).
+The live node ceiling is removed (`max_nodes:null`) and no capacity-mail credentials or
+recipient are configured. Purchases and autoscale stay off through go-live; enabling them, or
+any new paid resource, needs the owner's explicit, costed go, and every addition waits for a
+thin-qualified release (see the [new-region runbook](#control-server-of-a-new-region), step 4).
 The missing EU installation profile is configuration work, not a missing owner permission.
-Historical warning/delivery tests remain in PLAN.md; they do not imply that mail is still enabled.
 
 ### Operator-configured capacity and optional notifications
 
-Deploy the matching API and additive 0038/0041 migrations before using these policy fields. Management
-is API-only and requires an administrator key; an integrator's project key does not control
-infrastructure purchases. Read `GET /v1/regions/{id}/capacity-policy`, then PUT the intended complete
-policy to the same route. Existing fields retain their documented full-replacement semantics;
-omitting newly added settings or `max_nodes` preserves stored values for existing callers.
-Explicit `null` removes an optional value. No large sentinel count represents an absent limit.
+Management is API-only and requires an administrator key; an integrator's project key does not
+control infrastructure purchases. Read `GET /v1/regions/{id}/capacity-policy`, then PUT the
+intended complete policy to the same route. Existing fields retain their documented
+full-replacement semantics; omitting newly added settings or `max_nodes` preserves stored values
+for existing callers. Explicit `null` removes an optional value. No large sentinel count
+represents an absent limit.
 
 | Setting | Meaning |
 | --- | --- |
@@ -329,6 +287,7 @@ Explicit `null` removes an optional value. No large sentinel count represents an
 | `node_cpu_warning_threshold_ppm` | Optional warning when any node's ten-minute average CPU usage reaches it against node CPU capacity; null disables it. Needs a reporter that sends the CPU sample fields: the native controller shipped with R2. Otherwise CPU stays unknown. |
 | `node_storage_warning_threshold_ppm` | Optional warning when any node's fresh LVM sample reaches it: thin-pool data or metadata fill, otherwise volume-group allocation; null disables it. |
 | `cap_warning_enabled` | Opt-in notice for an operator-selected finite cap; false by default. |
+| `parked_tier` | Optional [parked sleep tier](../architecture/parked-instances.md): `enabled`, `ttl_seconds` (how long a database stays parked), `max_per_node` (the oldest demote to full hibernation first) and the parked requests. Omitted keeps it, `null` removes it, `enabled:false` demotes every parked database. |
 
 The configured RAM threshold applies to automatic new paid orders in both placement modes.
 Retain ten fresh aligned consecutive minutes for every eligible customer node, each with stable
@@ -367,12 +326,9 @@ Missing delivery configuration sends nothing and does not block capacity decisio
 
 Warning events use stable IDs and stored payloads; receivers must retain event/payload dedupe
 beyond provider idempotency windows. Explicitly disabling a warning deactivates pending episodes
-even when RAM is unknown; delivery also checks current policy. Reconnecting a mail transport must
-not deliver an obsolete personal warning. Unknown measurements alone do not rearm an enabled
-warning. Operational health records callback acceptance; provider acceptance and actual delivery
-are separate evidence. The prior personal integration has been disabled by removing only its
-capacity-specific credentials/recipient. Shared Resend keys and unrelated adopter mail continue
-unchanged; the inactive PGCF service binding is removed in the next qualified API configuration.
+even when RAM is unknown; delivery also checks current policy. Unknown measurements alone do not
+rearm an enabled warning. Operational health records callback acceptance; provider acceptance
+and actual delivery are separate evidence.
 
 The retained control server's UID-guarded new-database placement flag is already disabled;
 preserve Kubernetes/platform operation and existing data. The flag excludes new placement;
@@ -380,8 +336,7 @@ existing databases must continue to serve, wake, resize and delete normally.
 
 ### API-only resource profiles and regional configuration
 
-The corrective implementation adds these management routes; deploy the matching API/Regional
-release and additive migrations before using them. No PGCF administration UI is part of the product.
+These management routes are API-only; no PGCF administration UI is part of the product.
 
 | Route | Purpose |
 | --- | --- |
@@ -402,25 +357,27 @@ The existing cron processes at most eight assignments per invocation and resumes
 configuration generations and database operations. Capacity conflicts leave the current desired
 state intact for retry; they are not successful application.
 
-PostgreSQL CPU request and hard CPU limit are separate fields. An omitted request preserves the
-legacy request-equals-limit behavior. Use qualified resource values; a smaller request does not
-prove workload density or remove PostgreSQL/Barman startup checks. Memory remains the PostgreSQL
-container limit, with backup/system overhead reported separately.
+PostgreSQL CPU request and hard CPU limit are separate fields. An omitted request equals the
+limit. Use qualified resource values; a smaller request does not prove workload density or
+remove PostgreSQL/Barman startup checks. Memory remains the PostgreSQL container limit, with
+backup/system overhead reported separately.
 
 A confirmed sleeping database accepts future compute configuration while remaining suspended.
-Its unchanged no-Pod fact retains zero active CPU charge. `deferred_until_wake` explicitly means
+Its unchanged no-Pod fact retains zero active CPU charge (a parked database keeps its instance
+Pod and holds the parked charge instead). `deferred_until_wake` explicitly means
 that no running PostgreSQL has yet proved the new settings. The next wake reacquires fresh hard
 CPU/RAM startup admission and must report current configuration readiness before `applied:true`.
 An uncertain stop or degraded observation is pending. A newer resource revision supersedes an
 unfinished older resize explicitly; stale observations cannot acknowledge the current revision.
 
-Physical storage reporting does not enable thin allocation. Current thick quotas still debit
-real extents. A missing/old/mismatched sample stays unknown, and `thin_pool:null` means no thin pool
-exists, not free thin capacity. Qualify pool sizing, growth, metadata exhaustion, final-volume
-reclaim and existing-volume migration before changing storage admission.
+Physical storage reporting does not enable thin allocation: Thin storage is selected per node
+and needs a release-bound qualification receipt
+([recovery](recovery.md#thin-storage-admission-and-protective-recovery)). Retained thick
+volumes keep their backend and quota debit. A missing/old/mismatched sample stays unknown, and
+`thin_pool:null` means no thin pool exists, not free thin capacity.
 
-Cloudflare implements the capacity-to-Ready sequence below from persisted state. The current
-installation used the owner-authorized operator postjoin/admission fallback; the complete
+Cloudflare implements the capacity-to-Ready sequence below from persisted state. Earlier
+installations used the owner-authorized operator postjoin/admission fallback; the complete
 automatic path remains to be proved by the next genuine authorized node purchase:
 
 1. Ten fresh consecutive minute samples from the same physical Node UID reach 76% average
@@ -449,17 +406,11 @@ automatic path remains to be proved by the next genuine authorized node purchase
    under hard RAM/CPU/storage and full PostgreSQL/Barman startup-peak admission. There is no 81%
    placement cutoff. Failed starts/timeouts do not silently release unknown peak reservations.
 
-The following is a historical failed selection, not the current V159 offer. Contabo lists V155
-as 300 GB SSD. On 2026-10-06, the owner-authorized API test submitted
-`productId: "V155"`, `region: "EU"`, `period: 1` and
-`addOns.extraStorage.nvme: [{ "sizeTB": 0.15, "quantity": 1 }]`. One POST returned201 and its
-original-request CREATED audit matched. Final allocation was **8 vCPU, 24,576 MiB RAM and
-614,400 MiB SSD (600 GiB)**, so this payload does **not** select the included 150 GB NVMe
-variant. No installer or disk write ran. Do not use it for standing regional expansion.
-The V155 free-NVMe selector remains unverified. The current owner-approved V159 offer supplies
-150 GiB NVMe without a storage add-on; its one purchase (US1) and actual allocation are verified.
-Use only that confirmed offer and its reviewed costs for the current installation profile and
-standing policy. Do not repeat the V155 test; EU additions follow the configured purchase policy.
+Use only the confirmed V159 offer (150 GiB NVMe, no storage add-on) and its reviewed costs for the
+installation profile and standing policy. Do not select a V155 NVMe add-on
+(`addOns.extraStorage.nvme`): the one test allocated an 8 vCPU, 24 GiB RAM, 600 GiB SSD server
+and not the NVMe variant. Do not repeat that test; EU additions follow the configured purchase
+policy.
 
 ## Control server of a new region
 
@@ -497,7 +448,7 @@ Every call needs an administrator key; send each mutation with its own persisten
    byte-identical to the release's qualified profile and purchases off unless the owner approved
    a costed order. A non-null `compute_pool` also switches the region's pool runtime on. AddNode
    refuses before any provider order until these match a release with a thin qualification
-   receipt, so no region can add a node before R2b.
+   receipt, so no region can add a node without a receipt-bearing release.
 5. **Control server.** `POST /v1/nodes/additions` with
    `{"region_id":"<region>","mode":"adopt","provider_instance_id":"<instance>"}` for an allocated
    VPS, or `mode:"order"` with the configured `order` and the owner's costed approval. The
@@ -526,12 +477,19 @@ Every call needs an administrator key; send each mutation with its own persisten
     workers through AddNode; they join with the region's custody and take customer placement
     after admission.
 
-## Legacy manual evidence and recovery path
+Region registration must use `http://pgcf-gateway.pgcf-system.svc.cluster.local:8080/pg` with the
+configured private VPC binding. Gateway WebSocket upgrade requires this path; a healthy Tunnel
+and correct service binding alone are insufficient. Correct a wrong URL once with exact
+configuration comparison before and after; no runtime or database reset is needed.
 
-The following procedure documents the earlier accepted EU2 path and explicit recovery inputs.
-That same node is now retained customer EU1. Do not rerun its adoption, rescue or installation.
-This historical procedure remains a reference for separately authorized recovery; it does not
-authorize a loss drill or removal of EU1 during the current completion.
+## Manual installation and recovery path
+
+The following procedure is the manual path with explicit recovery inputs that installed the node
+now retained as customer EU1 (then EU2). Its step 7 is also the manual network-proof path that an
+EU addition needs while EU is the only region, because the programmed outside proof scans from a
+Ready node of another Contabo region. Do not rerun EU1's adoption, rescue or installation. This
+procedure remains the reference for separately authorized recovery; it does not authorize a loss
+drill or removal of EU1.
 
 1. Configure `/v1/regions/{id}/capacity-policy` with the explicit node maximum. A region lists
    existing provider instances in `adopt_instance_ids` or orders only its configured approved
@@ -587,8 +545,7 @@ Preparation proofs have a short expiry. The first destructive checkpoint verifie
 facts and the accepted proof, then stores immutable installation continuation authority in
 Cloudflare. Later installation commands use that authority, current operation/binding/plan and
 short transport grants with fresh physical identities; they do not repeat provider inventory or
-full preparation scans whenever the original proof ages. A legacy job missing continuation
-authority needs one verified lifecycle-boundary backfill. Resume with the same sealed input,
+full preparation scans whenever the original proof ages. Resume with the same sealed input,
 credentials and native checkpoint, including saved write offsets. Neither a renewed proof nor
 continuation authority permits restarting a disk write or resetting an uncertain checkpoint.
 Quarantine release keeps separate fresh post-join network, Node identity and capacity proofs.
@@ -624,9 +581,9 @@ healthy. Compare SQL data and committed markers, verify target backup/WAL and re
 Node, volume, role and encrypted custody identities.
 Earlier loss, deletion and decommissioning kits are withheld; any later loss drill needs a
 separately reviewed scope that preserves or recovers the same customer EU1. Keep unchanged prior
-proofs and record new measured results in `PLAN.md`. The historical approximately nine-second wake is the fallback baseline. The current ULTRA
-scope additionally requires a genuine shared-pool first SQL below one second; its acceptance
-remains open in the canonical plan.
+proofs and record new measured results in the ULTRA plan. The ordinary wake of a fully hibernated
+database is the fallback baseline. The ULTRA scope additionally requires a measured first SQL
+below one second for a woken parked database; its acceptance remains open in the go-live path.
 Do not move production databases onto PGCF or call the product finished until the open ULTRA
 steps, including recovery, have passed.
 Record measured installation/rollout time and actual Contabo calls by lifecycle phase, including
@@ -635,131 +592,19 @@ source selection. Local tests, a configured image or provider Running do not est
 acceptance. Use the normal Cloudflare SQL endpoint to verify actual placement, roles/TLS, committed
 markers, R2 base backup/WAL and deletion through confirmed physical storage reclamation.
 
-## Accepted checks and observed software
-
-US1's installation used the owner-authorized operator postjoin/admission fallback, which completed
-at 16:50:20 UTC in 198.356 seconds; its programmed 1 GiB storage trial wrote, read and physically
-reclaimed its volume in 753.081 seconds. Automatic postjoin admission remains unproved: a report
-returned HTTP 409 before pause, and its session renewed without admission. The next genuine,
-separately authorized node addition must prove that path; the operator result does not
-substitute for automatic acceptance.
-
-EU1 and US1 passed real SQL through the database hostname, TLS1.3 and nonsuperuser application roles.
-EU trial SQL took2187ms. A separate EU restore took108618ms; a healthy-source EU-to-US restore
-preserved two committed markers in87988ms, including observation pacing. A third marker committed
-on US. All four databases passed R2 base-backup and exact committed-WAL checks, then each released
-its5GiB physical volume after deletion (20GiB total). The earlier empty timeout trial was deleted
-separately without an allocation. All three existing EU databases and encrypted custody remain.
-
-Region registration must use `http://pgcf-gateway.pgcf-system.svc.cluster.local:8080/pg` with the
-configured private VPC binding. Gateway WebSocket upgrade requires this path; a healthy Tunnel
-and correct service binding alone are insufficient. Correct a wrong URL once with exact
-configuration comparison before and after; no runtime or database reset is needed.
-
-The recorded EU inventory is from October 7/8, supplemented by the October 9 common Regional
-delivery and fresh read-only Talos/Kubernetes checks. The supported programmed patch path closes
-its remaining OS/cluster differences from the selected release.
-
-| Component | EU |
-| --- | --- |
-| Talos / kernel / containerd | 1.14.1 / 6.18.51-talos / 2.3.5 |
-| Kubernetes API and kubelet | 1.36.3 |
-| Flux source / kustomize / helm / notification | 1.9.5 / 1.9.5 / 1.6.4 / 1.9.4 |
-| Additional Flux controllers | Absent from inventory |
-| Cilium / CNPG operator / Barman plugin | 1.20.2 / 1.30.1 / 0.15.1 |
-| CNPG / Barman Helm charts | 0.29.1 / 0.8.1 |
-| cert-manager / OpenEBS / LVM driver | 1.21.2 / 4.6.1 / 1.10.1 |
-| cloudflared | 2026.10.0 |
-| PostgreSQL, actual SQL | 18.6 (Debian18.6-1.pgdg13+2), server180006 |
-| Regional runtime source | 6978033, CI37851000610 |
-
-The following are actual workload `imageID` digests, not Helm chart or release-content digests.
-Kubernetes component versions are 1.36.3; the repositories are `registry.k8s.io/<component>`.
-
-| Kubernetes component | EU actual imageID digest |
-| --- | --- |
-| kube-apiserver | `sha256:b4bc06c81fd76f81174e6c19ddacf477acdf1583e7a5846ebbd513493aef6e43` |
-| kube-controller-manager | `sha256:ed56454bf514916079a227f5765b64524fde52106dfcc52978b28634765b78b8` |
-| kube-scheduler | `sha256:128fc07d278d64c4f2cce416ed0a9f37b23a30cdde6f97873d18c9c78e259df4` |
-
-Flux repositories are `ghcr.io/fluxcd/<controller>`.
-
-| Flux controller | EU version and actual imageID digest |
-| --- | --- |
-| source-controller | 1.9.5 / `sha256:6f20d232d596a758c923d2861f23511718fc303b8a2e36a1434a7c736b9f4268` |
-| kustomize-controller | 1.9.5 / `sha256:a3a955eb2bc432c2eaa94d2d3714e3beae7fdf17586fd23aadf71ab597ac3339` |
-| helm-controller | 1.6.4 / `sha256:8ff15409e46d354338045f483d58ca9cb35dffa2f87e4addd1f5eba1e6a9175f` |
-| notification-controller | 1.9.4 / `sha256:840f318265ee26f0d2c48a158bf7896b22aa4e998e320a18646309f0e40b15da` |
-
-The installer configuration does not prove a shared immutable image. The retained EU control
-configuration names `v1.14.1` by tag without a digest. Customer EU1 records installer digest
-`sha256:d1d2fbf374cd886fdd3b2f19d3bc9e82dcefa9caeb73275810b0f71060cc986e`.
-These are configured installer identities, distinct from the running Talos version. No EU
-reinstallation, upgrade or template activation was performed to align them.
-
-At this audit the actual EU Regional digest was
-`sha256:ee08af77e5d3adf875bc9bb4ef7fbc2d54fe0434d2af185cc6508c61d48571da`.
-The common correction passed CI qualification of all10 layers and anonymous registry readback of89,798,172
-compressed bytes. The configured PostgreSQL image pin is
-`sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`; actual SQL confirms
-18.6.
-
-Actual EU controller imageIDs: CNPG `sha256:923c267ec29636db3bee20f993d0ec4973fa22998e1adad37da79e4d32b5bc07`,
-Barman `sha256:c75acad19a36e8176cfe2885761ff1b836c6ef977d7257e298c99a28b5c302ef`,
-Cilium `sha256:2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01`,
-cert-manager `sha256:70f532fd9cfde0b09d55687200942399d89838bc2d5d5b45152eb799a15912b8`,
-LVM `sha256:41f73aba7f31eee4a033053d9c2f203e007a838c14823f3fd472c50651a98999`, and
-cloudflared `sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07`.
-Chart digests and workload imageIDs identify different artifacts; do not compare them as strings.
-
-The initial admitted-node association capture counted1 OAuth and1 provider GET. Three nonempty
-30-minute routine captures counted zero provider attempts, including390 proof/transport frames
-and a report HTTP409 in the final pre-operator window. Historical lifetime provider totals are
-unknown. Keep lifecycle counts separate and do not sum overlapping capture windows.
-
 ## Customer migration handover
 
 Moving an integrator's existing databases into PGCF is the integrator's task and a separate
-reviewed cutover. The earlier EU/US SQL, backup/WAL, restore, physical-reclamation and
-RAM-threshold checks are partial baseline evidence. The approved corrective plan now requires
-supported in-place fleet convergence, programmed patching and shared-pool fast-start acceptance
-before customer migration. Preserve EU1 and all three existing databases; the earlier EU-upgrade
-deferral does not override this approved corrective scope. Neither alignment nor template
+reviewed cutover. Preserve EU1 and its existing data. Neither version alignment nor template
 selection authorizes an EU reinstall or a customer cutover.
-
-Prepared EU revision-2 authority is activated in the existing supported patch window,
-after the accepted etcd snapshot. The scoped route signer was separately replaced on October10:
-current Edge/API custody and all four gateway Pods reject its predecessor. Do not repeat key
-rotations or reinstall nodes. Retain historical archive-decryption material privately until
-retention permits its removal. Check the canonical plan for live fleet completion.
 
 Inventory source region, roles/grants/extensions, sequences, pools, timeouts and sizing. Resource
 classes are configured through the management API in 256 MiB PostgreSQL increments, with an
-operator maximum of4 GiB. A limit is not a permanent physical reservation. Actual-RAM placement,
+operator maximum of 4 GiB. A limit is not a permanent physical reservation. Actual-RAM placement,
 sleeping CPU release and thin physical storage must be measured together with hard startup and
-backup-peak admission. Customer placement excludes the control/relay host.
-
-The October8 static-reservation snapshot allowed four minimum-class databases on US1 and seven
-on EU1, and allocated5 GiB physical volumes upfront. Those were ceilings of the old configuration,
-not measured customer density or limits of an8 GiB server. They do not establish how many
-databases fit the replacement resource model. Refresh physical inventory and measure the new
-model before customer cutover; record the result in the canonical plan.
-
-Ten real consecutive US minute samples from18:43:01 to18:52:04 UTC averaged **79.9062%** under
-an operation-owned3968MiB allocation. Cloudflare persisted that average and its expansion trigger.
-Existing eligible placement and full CPU/storage/PostgreSQL plus512MiB Barman startup checks
-still passed. At that historical test the dry capacity decision was `disabled` and made no provider
-call. The current generic API exposes the operator-configured threshold and purchase switch; a fresh
-installation buys nothing until configured. There is no fixed three-node cap. The agreed model
-is V159 with a one-month term and no storage add-on. The installation/release acceptance gate
-still prevents automatic expansion until the target is qualified.
-The first trial correctly rejected a missing18:37 sample; actual kubelet timestamps crossed
-18:36:59 to18:38:00. Its load was removed and physical available RAM recovered before the
-independent second trial. Never synthesize samples or weaken consecutive-minute validation.
-Both disposable loads used4096MiB limits and720-second automatic deadlines. Final second-load cleanup removed the exact Namespace/Pod and recovered4,177,731,584 bytes;
-fresh available RAM returned within the recorded baseline tolerance. Actual customer workload density remains unaccepted; RAM overbooking
-does not remove CPU, storage or startup checks. Approve sufficient regional capacity before
-committing an integrator's databases to a region.
+backup-peak admission; the density test in the ULTRA plan records the result. Customer placement
+excludes the control/relay host. RAM overbooking does not remove CPU, storage or startup checks:
+approve sufficient regional capacity before committing an integrator's databases to a region.
 
 ### Connection and cold starts
 
@@ -772,19 +617,20 @@ admission; they are not credentials.
 For psql and logical export/import tools, use the existing CLI:
 
 ```sh
-node packages/cli/dist/main.js connect --endpoint wss://db.your-domain --database <pgcf-id> --user <role>
+node packages/cli/dist/main.js connect --endpoint wss://db.example.com --database <pgcf-id> --user <role>
 ```
 
 Use the printed loopback port, target PGCF ID and role. `sslmode=disable` applies only to
 loopback; public WSS and gateway-to-PostgreSQL TLS remain verified. Keep passwords private;
 never expose a VPS database port.
 
-Dev cold connections measured p95 **9.160 s**, maximum **9.708 s**. A client connect timeout
-shorter than the wake can fail before the database is awake. Query and statement timeouts are
-separate from the end-to-end request deadline; budget wake plus work explicitly.
-The approved shared-pool runtime must pass its separate below-one-second first-read gate before
-customer readiness. Pool misses still need an explicit timeout policy. Before cutover, verify
-one fallback policy: an approved always-warm size class
+A hibernated database wakes in 8.1–9.4 s through Cloudflare (the ULTRA plan's wake-path
+measurement, standard runtime). A client connect timeout shorter than the wake can fail before the
+database is awake. Query and statement timeouts are separate from the end-to-end request deadline;
+budget wake plus work explicitly. The parked sleep tier (region policy `parked_tier`) is the path to
+a first SQL below one second and must pass its own acceptance (go-live path: sub-second wake) before
+customer readiness; a database demoted to full hibernation always takes the ordinary wake. Before
+cutover, verify one fallback policy: an approved always-warm size class
 (`sleep_after_seconds:null`); prewake with `POST /v1/databases/{id}/resume`, operation/readiness
 polling and `SELECT 1` immediately before traffic; or bounded connection/request deadlines
 covering measured wake plus query/network margin. SQL statement timeouts are separate and do
@@ -825,10 +671,11 @@ confirm operation completion plus physical reclamation; R2 archive retention is 
 
 ## Synchronize version templates after an accepted Kubernetes upgrade
 
-The current corrective scope requires supported data-preserving fleet convergence and supersedes
-the earlier EU-upgrade deferral. Qualify the complete release and affected database checks before
-maintenance. The day-two programmed patch lifecycle remains open; this metadata synchronization
-endpoint does not implement an OS/Kubernetes upgrade or credential rotation.
+Fleet rollouts ([fleet patches](fleet-patches.md)) upgrade Talos and Kubernetes in place and
+synchronize this version metadata themselves once every member has converged. Use the endpoint
+below only after an upgrade performed outside a rollout. It does not implement an
+OS/Kubernetes upgrade or credential rotation. Qualify the complete release and affected
+database checks before maintenance.
 
 Use the supported Talos Kubernetes upgrade with a reviewed dry run; never reinstall the EU
 nodes to align patch versions. Verify the actual API-server and every kubelet version while
@@ -836,7 +683,7 @@ preserving Node/Cluster UID, storage, roles, Secrets and certificate/key identit
 actual post-upgrade configuration; never reapply old machine documents that would downgrade
 the components.
 
-After migration0023, administrators can read `GET /v1/regions/{id}/bootstrap-material` and use
+Administrators can read `GET /v1/regions/{id}/bootstrap-material` and use
 `POST /v1/regions/{id}/bootstrap-material` to synchronize version metadata. The write requires
 expected current revision and old/new plaintext hashes, an exact hash of verified readback,
 Cluster UID, complete physical Node UID/provider/name set and a fresh observation timestamp.

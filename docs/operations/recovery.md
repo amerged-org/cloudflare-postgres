@@ -26,10 +26,9 @@ reinstall, reset or restore etcd merely because a patch has stalled. The procedu
 does not attest that a retained node currently has a usable alternate boot slot; record actual
 slot observations separately. See the pinned [Talos upgrade and rollback procedure](https://docs.siderolabs.com/talos/v1.14/configure-your-talos-cluster/lifecycle-management/upgrading-talos).
 
-The operator topology is EU only: EU control/relay and customer EU1. The customer model is
-V159 / Cloud VPS Plus 4: 4 vCPU, 8 GB RAM, 150 GB NVMe, one-month term. The US region is
-cancelled; US1 serves only as the R1.1 canary until it is marked lost, as listed in the canonical
-ULTRA plan. Never order a replacement or reinstall an EU node to resume a stalled rollout.
+The operator topology is EU only: EU control/relay and customer EU1 (6 vCPU, 12 GB RAM). The US
+region is cancelled and US1 is marked lost, as recorded in the canonical ULTRA plan. Never order
+a replacement or reinstall an EU node to resume a stalled rollout.
 
 Recovery drills use separate targets while preserving the healthy source and its committed data.
 Do not reset, re-adopt, fence, delete or decommission EU1 for an acceptance drill. The incident
@@ -89,9 +88,8 @@ credential and needs no cross-region relationship.
 
 Use the relationship's expected revision and a stable idempotency key for source-key rotation.
 Unfinished referencing restores block rotation; successful restored targets receive a new
-desired generation through the existing reconcile path. An authoritative desired map never
-falls back to the old manual map when an entry is missing or drifted. The manual map remains
-compatible only while the API field is absent during a consumer-first rollout.
+desired generation through the existing reconcile path. A missing or drifted entry of the
+authoritative desired map fails closed for that source.
 
 Cross-region acceptance requires a real Dev run: verify the source commit markers over the normal
 Cloudflare SQL endpoint, promotion, nonsuperuser application access, removal of temporary
@@ -219,18 +217,17 @@ on verified replacement infrastructure; recover PostgreSQL through R2 into separ
 An etcd snapshot helps recover Kubernetes configuration, but it does not recreate lost local
 PostgreSQL volumes. Validate SQL and routing before opening traffic.
 
-The D1 export/local restore rehearsal and API full restore/PITR/deleted-source acceptance are
-recorded in `PLAN.md`. A healthy-source cross-region restore from EU into US1 passed earlier; with
-the US region cancelled, the current completion drill restores an EU1 test database from the EU
-R2 archive into a separate target, as node check 5 in the ULTRA plan.
-Verify SQL, recovered markers, recovery duration and the last recoverable transaction. Keep EU1
-healthy throughout the restore and retain its Node, namespace, Cluster, PVC/PV, role and encrypted
-custody identities. The topology is the EU control/relay server and existing customer EU1; it
-requires no EU1 removal. The earlier destructive loss and cleanup kits are withheld. A
-cross-region restore into a later region installs its scoped source-read credential map only after
-that region is Ready; its credentials must not alter the source archive. A later separately
-authorized incident or loss drill must preserve or recover this same customer EU1.
-A complete regional control-plane loss drill remains outside this customer-free completion gate.
+Restoring a daily D1 export into a scratch D1 database and an etcd snapshot status check are
+open in the ULTRA go-live path (backups); the daily artifacts have so far only been read back.
+Node check 5 of the ULTRA plan restores an EU1 test database from the EU R2 archive into a
+separate target. Verify SQL, recovered markers, recovery duration and the last recoverable
+transaction. Keep EU1 healthy throughout the restore and retain its Node, namespace, Cluster,
+PVC/PV, role and encrypted custody identities. The topology is the EU control/relay server and
+existing customer EU1; it requires no EU1 removal. The earlier destructive loss and cleanup kits
+are withheld. A cross-region restore into a later region installs its scoped source-read
+credential map only after that region is Ready; its credentials must not alter the source
+archive. A later separately authorized incident or loss drill must preserve or recover this same
+customer EU1. A regional control-plane loss has no procedure yet (go-live path: recovery).
 
 ## Integrator migration
 
@@ -459,12 +456,12 @@ identity and of an expired token, is verified after activation by the six live c
    not the class hash. Each new Talos kernel, driver or host extension needs a new run.
 
 **Requalification after R2b (open owner decision)**
-A new run needs a customer node without a thin selection. Once R2b selects EU1, EU has no such node:
+A new run needs a customer node without a thin selection. R2b selected EU1, so EU has no such node:
 the selection cannot be removed, the control node is excluded and AddNode selects thin storage on
 every new node. A later release that changes the Talos kernel, `openebs-lvm` or
 `pgcf-sandbox-controller` then cannot obtain a receipt, and its patch leaves EU1 waiting in the
 storage stage without thin write authority. Do not roll out such a release before the owner decides
-how to requalify, and decide before R2b selects EU1. A run also needs the node's release to equal the
+how to requalify. A run also needs the node's release to equal the
 region release, so a requalification first rolls out a receipt-less candidate release. Selected
 nodes have no thin write authority until the successor with the new receipt is rolled out; the
 decision must accept or avoid that outage. Options:
@@ -473,7 +470,30 @@ decision must accept or avoid that outage. Options:
 - Allow a run on a selected node that holds no thin volumes, using a distinct scratch pool name.
 
 
+## Parked sleep tier
+
+The parked tier is implemented ([design](../architecture/parked-instances.md)); its live
+acceptance is open in the ULTRA go-live path. With the region policy `parked_tier` enabled
+(`PUT /v1/regions/{id}/capacity-policy`), an idle sleep fences the database's single CNPG
+instance instead of hibernating the Cluster: only PostgreSQL stops, while the instance Pod, its
+volume, the Barman sidecar and the primary Lease stay and the Pod's requests shrink in place. The
+sleep proof (quiesce, archived WAL segment) is unchanged, so every acknowledged commit is in R2
+before the fence. The public state stays `hibernated`; the next connection unfences the Pod and
+resizes it back instead of creating a new one.
+
+The native controller demotes a parked database to full hibernation when `ttl_seconds` passes,
+when the node holds more than `max_per_node` parked databases (the oldest first), when the policy
+is switched off (`enabled:false`) or removed (`null`), and when anything changed since parking:
+the fleet release, the node boot, the Pod or container identity, or the desired spec (a resize, a
+role change or a password reset). A manual suspend demotes it; a delete follows the ordinary
+delete flow. A wake that is not eligible for the fast path demotes first and takes the ordinary
+CNPG wake. No writer exists while a Pod is fenced.
+
 ## Optional warm reclaim
+
+Warm reclaim is implemented in the API and the host publisher but inactive on the live fleet: no
+node is qualified and no database carries a policy, so every idle database takes the sleep path
+above. The node reclaimer binary is built by CI and not deployed.
 
 The default idle path remains Pod-cold hibernation. Administrators explicitly configure a database
 with `GET`/`PUT /v1/databases/{id}/warm-reclaim` (`expected_revision`, `expected_generation`, and a
@@ -490,8 +510,9 @@ isolated-worker and actual encrypted-swap acceptance remain required before any 
 The protected host publisher uses the existing regional identity to fetch
 `GET /agent/v1/nodes/{id}/reclaim` and post bounded observations to
 `POST /agent/v1/nodes/{id}/reclaim-observations`. It publishes a two-second envelope of CF-signed,
-five-second maximum rc1 scopes. The unprivileged reclaimer receives public verification keys and
-local identity snapshots; it receives no CF write credential, PostgreSQL credential or CRI socket.
+five-second maximum rc1 scopes. The unprivileged reclaimer (built, not deployed) receives public
+verification keys and local identity snapshots; it receives no CF write credential, PostgreSQL
+credential or CRI socket.
 
 The Actor persists one idle episode with its own revision. Renewal cannot replenish its budget
 or change its runtime scope. Before a connection uses the warm route, the Actor persists a higher
@@ -501,5 +522,5 @@ keeps this barrier closed. An already-running bounded kernel call may finish aft
 acknowledgement; no further step can be scheduled. Admission still reads current authoritative
 state and never treats a reclaim result as hibernation, CPU release or permission to replay SQL.
 
-See PLAN.md for actual deployment and kernel acceptance. The local authority tests do not establish
-swap safety, reclaimed-memory savings or first-read performance on the retained fleet.
+The local authority tests do not establish swap safety, reclaimed-memory savings or first-read
+performance on the retained fleet.

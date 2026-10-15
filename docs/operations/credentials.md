@@ -94,11 +94,9 @@ temporary restore-administration derivation. Check the target's observed configu
 real source read before retiring the old key. Keep every credential encryption key still needed
 to decrypt stored custody.
 
-For consumer-first deployment, install the D1 migration and compatible regional consumer before
-enabling the API producer. The earlier local `pgcf-system/pgcf-restore-source-s3` map is a legacy
-compatibility input only when desired state omits `recovery_sources`. An explicit API map,
-including an empty map, never falls back to that Secret or to the target's write key. Normal
-setup and rotation use the PGCF API; no direct Kubernetes Secret installation is required.
+An explicit API map, including an empty map, never falls back to a local Secret or to the
+target's write key. Setup and rotation use the PGCF API; no direct Kubernetes Secret installation
+is required.
 
 Keep a source-read credential while any non-deleted restored target references its source.
 Successful promoted targets retain recovery metadata and still verify the source ObjectStore.
@@ -124,15 +122,15 @@ US machine configuration as well; treat both prior authority sets as compromised
 fingerprint differences do not protect a later disclosure. Read the current accepted rotation
 results in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#done). Disposable laboratory keys must never become fleet custody.
 
-The latest October10 owner decision authorizes activation of the prepared EU replacement
-authority during the automatic EU patch window, combining required restarts with the upgrade.
-This supersedes the earlier rotation pause. Verify replacement access and rejection of retired
-authority through the existing procedure. The prior disclosure record remains. Planning this
-change does not mean it has been activated.
+EU's replacement authority (cluster material revision 3, Talos 1.14.2 and Kubernetes 1.36.5) is
+active and the retired authority is rejected, as the ULTRA plan records. The prior disclosure
+record remains. For any further rotation, verify replacement access and rejection of retired
+authority through the existing procedure.
 
 The cancelled US region receives no further rotation. Keep its encrypted custody and every
-`CREDENTIAL_KEYS` ID it references as a dormant record. Revoke its R2, Tunnel and source-read
-tokens in the Cloudflare US cleanup listed in the ULTRA plan, after US1 is marked lost.
+`CREDENTIAL_KEYS` ID it references as a dormant record. US1 is marked lost: revoke its R2, Tunnel
+and source-read tokens and the EU-archive read key issued for it in the credential hygiene step
+of the ULTRA go-live path, and confirm that EU archive reads and writes still work.
 
 The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.2/cmd/talosctl/cmd/talos/rotate-ca.go)
 supports separate Talos and Kubernetes API CA rotation. For Talos only, explicitly set

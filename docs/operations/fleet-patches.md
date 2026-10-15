@@ -1,19 +1,16 @@
 # Retained-node fleet patches
 
 These per-node endpoints are existing building blocks. The one-request fleet coordinator is
-implemented; its rollouts patched EU1 and control through R2.11 (both R2.11 patches completed on 2026-10-14). EU1 has reported `pending` since its Thin block (see go-live step 3 in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path)).
-Manual orchestration of these endpoints does not establish automatic fleet acceptance.
+implemented; its rollouts patched EU1 and control through the native runtime releases. The
+[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path) records
+the current release, rollout and `pending` status. Manual orchestration of these endpoints does
+not establish automatic fleet acceptance.
 
 The management API provides an assignment-bound `PatchNode` Workflow and a separate Native
 container identity. A terminal admitted AddNode job stays terminal. Patches use authenticated
 Talos/Kubernetes transport without Contabo, Rescue, disk reinstallation or SSH.
 
 ## Start, inspect and resume
-
-When migrating an older strict-contract controller, install its compatible qualified TypeScript
-bridge before selecting a fleet release or enabling pool/thin policy. Until then, leave those
-optional settings unset. Create the owned thick-volume canary before release activation so the
-gateway-first patch can bind its retained storage and prove real SQL before controller replacement.
 
 1. Qualify immutable artifacts through the single CI and approve their release through
    `PUT /v1/fleet/releases/{id}`. Select the release for the region and assign it to every current
@@ -110,9 +107,11 @@ versions allow the vendor's OCI build suffix, while current Helm history must ca
 selected OCI digest. Pod specs and running imageIDs prove selected architecture manifests.
 Declarative updates compare the bound UID and exact previous desired fields; unrelated controller
 status/resource-version changes do not invalidate a configuration CAS. The selected OpenEBS wrapper and cgroup mount override are applied through the existing platform
-Kustomization while preserving unrelated values. The reviewed source chooses
-separate `native-controller` and `native-gateway` images when present, with `regional` only as the
-legacy composition. Do not activate unqualified Rust binaries by changing an image label.
+Kustomization while preserving unrelated values. The reviewed source selects the
+`regional-native` composition when the release pins `native-controller` and `native-gateway`
+(a release that pins the controller without the gateway is refused). The `regional` pin is the
+TypeScript bootstrap relay's image on the `control_relay` role until a release pins
+`native-bootstrap-relay`. Do not activate unqualified Rust binaries by changing an image label.
 
 The approved release's `openebs-lvm` image selects the qualified wrapper independently of its
 build-source lock. Pin its tag and digest; if the role also lists `image/openebs/lvm-driver`,
@@ -179,19 +178,18 @@ checkpoint reply is resolved by exact status readback in the same execution. If 
 proves the command was never attempted, it may record that finite outcome; a resumed uncertain
 write cannot infer it from an unchanged boot/version or missing response.
 
-Before delivery, run the same read-only parsers against the actual retained fleet and collect all
-deviations together. Deliver the API/Native changes with `PATCH_NODE` configured, then prove the
-canary and interruption/recovery through this path. Record actual elapsed time, provider calls,
-versions and release digests in the ULTRA plan. SQL/TLS/roles, R2 base/WAL backup, restore and
-physical deletion acceptance remain live gates. A source/unit-test pass is not live acceptance.
+Before a rollout, run the same read-only parsers against the actual retained fleet and collect all
+deviations together. Record actual elapsed time, provider calls, versions and release digests in
+the ULTRA plan. SQL/TLS/roles, R2 base/WAL backup, restore and physical deletion acceptance
+remain live gates. A source/unit-test pass is not live acceptance.
 
 Cloudflare policy configuration, the administrator candidate catalog and bounded official-feed
 discovery are implemented in source. No configured policy means no work. Current candidates
 honestly remain `awaiting_ci` with `qualification_channel_unavailable`; discovery cannot execute
 patches or fabricate CI/canary receipts. The automatic discovery-to-CI qualification channel, security-alert integration and complete
 Dev fleet acceptance remain open. Use the canonical ULTRA acceptance scope; long soak series
-are not a prerequisite. Scoped route retirement is verified; prepared EU authority follows
-the selected supported patch window. These source APIs are not automatic patch completion. Advance regions only after the
+are not a prerequisite. Scoped route retirement is verified and EU's replacement authority is
+active. These source APIs are not automatic patch completion. Advance regions only after the
 canary's required gates pass, including an actual thin-database material-revision transition.
 
 ## One-request fleet convergence
@@ -238,8 +236,7 @@ prepared rotation at its snapshot gate when its region is reached. The old rollo
 `blocked` with `identity_or_assignment_changed` after its assignments change.
 
 An operation that can never converge at a declarative platform stage, such as a release whose
-pinned regional image never becomes Ready, is superseded explicitly. Apply migration
-`0044_fleet_patch_superseded.sql` with the matching API first. With an administrator key,
+pinned regional image never becomes Ready, is superseded explicitly. With an administrator key,
 `POST /v1/fleet/patches/{operation_id}/halt` accepts only `flux`, `platform` or `regional`,
 where Flux applies idempotent desired state after every OS, host and Kubernetes-version write;
 other stages return `409`. The halt sets `halted` with `operator_hold_superseded` through the
