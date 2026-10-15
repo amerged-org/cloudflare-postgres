@@ -684,8 +684,12 @@ impl World {
                 })
         });
         let sql = self.sql.clone();
-        let login: Login =
-            Arc::new(move |user: &str| sql.lock().unwrap().refused.get(user).copied());
+        let log = self.log.clone();
+        // Every login is a line of the log, in the order of the statements and the writes.
+        let login: Login = Arc::new(move |user: &str| {
+            log.lock().unwrap().push(format!("LOGIN {user}"));
+            sql.lock().unwrap().refused.get(user).copied()
+        });
         let postgres = Postgres::start_with(
             &self.authority,
             &format!("database-rw.{}.svc", self.ns),

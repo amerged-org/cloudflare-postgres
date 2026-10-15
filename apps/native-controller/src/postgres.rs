@@ -209,17 +209,19 @@ pub async fn roles(
     primary_address: &str,
     socket: Option<SocketAddr>,
 ) -> Result<bool, Error> {
-    roles_at(db, ca, primary_address, Route::Service(socket)).await
+    roles_at(db, ca, primary_address, Route::Service(socket), None).await
 }
 /// Every role logs in to the instance Pod itself, concurrently: the kubelet's readiness, and so
-/// the Service's endpoint, is not awaited.
+/// the Service's endpoint, is not awaited. `maintenance` is a session of the maintenance role the
+/// caller holds on that Pod, in which the attributes are read instead of in one of their own.
 pub async fn roles_pod(
     db: &Value,
     ca: &[u8],
     primary_address: &str,
     socket: SocketAddr,
+    maintenance: Option<&Session>,
 ) -> Result<bool, Error> {
-    roles_at(db, ca, primary_address, Route::Pod(socket)).await
+    roles_at(db, ca, primary_address, Route::Pod(socket), maintenance).await
 }
 pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
     roles_at(
@@ -229,6 +231,7 @@ pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Er
             .as_str()
             .ok_or("pool PostgreSQL address absent")?,
         Route::Pool(scope),
+        None,
     )
     .await
 }
@@ -503,6 +506,7 @@ async fn attributes_current(
     ca: &[u8],
     route: &Route<'_>,
     roles: &[&Value],
+    held: Option<&Session>,
 ) -> Result<bool, Error> {
     // The owner is the application's bootstrap role, not a role CNPG manages.
     let managed: Vec<&&Value> = roles.iter().filter(|role| role["owner"] != true).collect();
@@ -512,16 +516,23 @@ async fn attributes_current(
     if db["maintenance"].is_null() {
         return Ok(false);
     }
-    let session = open_on(
-        db,
-        ca,
-        route,
-        text(&db["maintenance"], "role"),
-        text(&db["maintenance"], "password"),
-    )
-    .await?;
+    let opened;
+    let session = match held {
+        Some(session) => session,
+        None => {
+            opened = open_on(
+                db,
+                ca,
+                route,
+                text(&db["maintenance"], "role"),
+                text(&db["maintenance"], "password"),
+            )
+            .await?;
+            &opened
+        }
+    };
     for role in managed {
-        if !catalog_holds(&session, role).await? {
+        if !catalog_holds(session, role).await? {
             return Ok(false);
         }
     }
@@ -532,6 +543,7 @@ async fn roles_at(
     ca: &[u8],
     primary_address: &str,
     route: Route<'_>,
+    maintenance: Option<&Session>,
 ) -> Result<bool, Error> {
     if text(db, "desired_state") != "running" {
         return Ok(false);
@@ -557,7 +569,7 @@ async fn roles_at(
                 }
             }
         }
-        attributes_current(db, ca, &route, &roles).await
+        attributes_current(db, ca, &route, &roles, maintenance).await
     })
     .await?
 }
@@ -768,9 +780,15 @@ mod tests {
             .await
             .unwrap();
         assert!(all, "every role of the Pod logs in");
-        let concurrently = roles_pod(&w.db, w.authority.pem.as_bytes(), POD_IP, socket.unwrap())
-            .await
-            .unwrap();
+        let concurrently = roles_pod(
+            &w.db,
+            w.authority.pem.as_bytes(),
+            POD_IP,
+            socket.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(concurrently);
         // Another Pod answering is not this one.
         assert!(
@@ -980,6 +998,57 @@ mod tests {
             .iter()
             .any(|line| line.contains(needle))
     }
+    /// The attributes of the roles are read in the maintenance session the caller already holds:
+    /// the roles log in on their own credentials and nothing logs in once more for the catalogs.
+    #[tokio::test]
+    async fn the_attributes_are_read_in_the_session_the_caller_holds() {
+        let w =
+            world_with_role(serde_json::json!({"connection_limit":5,"member_of":["reader_query"]}))
+                .await;
+        let socket = w.reconciler.power.postgres.unwrap();
+        let logins = |w: &crate::test_world::World, user: &str| {
+            w.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| *line == &format!("LOGIN {user}"))
+                .count()
+        };
+        let held = maintenance(&w.db, w.authority.pem.as_bytes(), Some(socket))
+            .await
+            .unwrap();
+        assert_eq!(logins(&w, "pgcf_maintenance"), 1);
+        assert!(
+            roles_pod(
+                &w.db,
+                w.authority.pem.as_bytes(),
+                crate::test_world::POD_IP,
+                socket,
+                Some(&held)
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            logins(&w, "pgcf_maintenance"),
+            1,
+            "the catalogs are read in the session held"
+        );
+        assert!(log_has(&w, "role attributes report_job"));
+        // Without one, the roles open their own.
+        assert!(
+            roles_pod(
+                &w.db,
+                w.authority.pem.as_bytes(),
+                crate::test_world::POD_IP,
+                socket,
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(logins(&w, "pgcf_maintenance"), 2);
+    }
     /// A role that bypasses row security is verified by its own view of its privileges: it must
     /// bypass exactly where the record says, and a plain role must not.
     #[tokio::test]
@@ -1183,7 +1252,8 @@ mod tests {
                 &w.db,
                 w.authority.pem.as_bytes(),
                 crate::test_world::POD_IP,
-                socket
+                socket,
+                None
             )
             .await
             .unwrap()

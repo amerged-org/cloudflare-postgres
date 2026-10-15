@@ -772,7 +772,9 @@ impl Reconciler {
     }
     /// `at_pod` dials the Pod's own address, as a resumed Pod's sessions do, instead of the
     /// Service, whose endpoints may lag the Pod's Ready, and does not require the kubelet's Ready
-    /// bit either: the caller judges that Pod by what it runs.
+    /// bit either: the caller judges that Pod by what it runs. `held` is a session of the
+    /// maintenance role on that Pod the caller already has: the probe asks its questions in it
+    /// instead of logging in once more.
     async fn archive(
         &self,
         db: &Value,
@@ -780,6 +782,7 @@ impl Reconciler {
         pod: &Value,
         ca: &[u8],
         at_pod: bool,
+        held: Option<&postgres::Session>,
     ) -> Result<Probed, Error> {
         let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
         let ns = namespace(db);
@@ -804,8 +807,15 @@ impl Reconciler {
         });
         let sample = if sql_eligible {
             let result=async {
-                let socket=if at_pod{Some(self.power.pod_socket(text(&pod["status"],"podIP"))?)}else{self.power.postgres};
-                let session=postgres::connect_via(db,ca,text(&db["maintenance"],"role"),text(&db["maintenance"],"password"),text(db,"id"),socket).await?;
+                let opened;
+                let session=match held{
+                    Some(session)=>session,
+                    None=>{
+                        let socket=if at_pod{Some(self.power.pod_socket(text(&pod["status"],"podIP"))?)}else{self.power.postgres};
+                        opened=postgres::connect_via(db,ca,text(&db["maintenance"],"role"),text(&db["maintenance"],"password"),text(db,"id"),socket).await?;
+                        &opened
+                    }
+                };
                 let identity=session.query(constant("ARCHIVE_IDENTITY_QUERY").as_str().ok_or("archive SQL not generated")?,&[&text(&db["maintenance"],"role")]).await?;
                 if identity.len()!=1{return Err::<ArchiveSample,Error>("archive SQL identity missing".into());}
                 let row=&identity[0];
@@ -885,14 +895,15 @@ impl Reconciler {
     /// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster: the
     /// maintenance role connects to the Pod's own address under the tenant's TLS name and finds
     /// the right database, a primary, TLS, this Pod, and a postmaster that started after the
-    /// unfence was sent. Polls inside the pass; false means not within the window.
+    /// unfence was sent. Polls inside the pass; `None` means not within the window, and the
+    /// answer is the session that proved it: the checks that follow ask their questions in it.
     async fn pg_accepting(
         &self,
         db: &Value,
         ca: &[u8],
         pod: &Value,
         wake: &ParkedWake,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<postgres::Session>, Error> {
         let mut phase = timing::Phase::begin(db, "pg_accepting");
         let ip = text(&pod["status"], "podIP");
         let socket = self.power.pod_socket(ip)?;
@@ -917,29 +928,30 @@ impl Reconciler {
                 .await?;
                 let rows = session.query(postgres::ACCEPTING_QUERY, &[]).await?;
                 let [row] = rows.as_slice() else {
-                    return Ok::<bool, Error>(false);
+                    return Ok::<Option<postgres::Session>, Error>(None);
                 };
                 // The server's own clock measures the postmaster's age; the controller's
                 // monotonic clock measures the time since the unfence was sent. A postmaster
                 // older than that did not start for this wake.
                 let age: i64 = row.try_get("postmaster_age_ms")?;
                 let since = i64::try_from(wake.started.elapsed().as_millis()).unwrap_or(i64::MAX);
-                Ok(row.try_get::<_, String>("database")? == text(db, "id")
+                let current = row.try_get::<_, String>("database")? == text(db, "id")
                     && !row.try_get::<_, bool>("recovery")?
                     && row.try_get::<_, bool>("tls")?
                     && row.try_get::<_, String>("server_address")? == ip
-                    && (0..=since.saturating_add(250)).contains(&age))
+                    && (0..=since.saturating_add(250)).contains(&age);
+                Ok(current.then_some(session))
             };
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if let Ok(Ok(true)) = tokio::time::timeout(remaining, attempt).await {
+            if let Ok(Ok(Some(session))) = tokio::time::timeout(remaining, attempt).await {
                 phase.note("polls", polls);
                 phase.completed();
-                return Ok(true);
+                return Ok(Some(session));
             }
             if std::time::Instant::now() >= deadline {
                 phase.note("polls", polls);
                 phase.pending();
-                return Ok(false);
+                return Ok(None);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1557,21 +1569,23 @@ impl Reconciler {
         // kubelet has actuated its requests, without waiting for the kubelet's Ready bit: the
         // gateway routes to the Pod by its attestation. The Pod and the Cluster read after that
         // are the ones the chain below starts from.
-        let (pod, cluster) = match &parked {
+        // The session that proved PostgreSQL accepts is the maintenance session the attribute
+        // check and the archive sample ask their questions in.
+        let (pod, cluster, held) = match &parked {
             Some(wake) => {
-                if !self.pg_accepting(db, &ca, &pod, wake).await? {
+                let Some(held) = self.pg_accepting(db, &ca, &pod, wake).await? else {
                     return Ok(Some(observation(db, "provisioning", None)));
-                }
+                };
                 match self
                     .power
                     .resumed_settled(db, wake, &cluster, self.accept_budget)
                     .await?
                 {
-                    Some(settled) => settled,
+                    Some((pod, cluster)) => (pod, cluster, Some(held)),
                     None => return Ok(Some(observation(db, "provisioning", None))),
                 }
             }
-            None => (pod, cluster),
+            None => (pod, cluster, None),
         };
         let expected_image = db["postgres"]["image"]
             .as_str()
@@ -1631,7 +1645,7 @@ impl Reconciler {
         let roles_ok = match &parked {
             Some(_) => {
                 let ip = text(&pod["status"], "podIP");
-                postgres::roles_pod(db, &ca, ip, self.power.pod_socket(ip)?).await?
+                postgres::roles_pod(db, &ca, ip, self.power.pod_socket(ip)?, held.as_ref()).await?
             }
             None => {
                 postgres::roles(db, &ca, text(&pod["status"], "podIP"), self.power.postgres).await?
@@ -1688,7 +1702,7 @@ impl Reconciler {
         unchanged.completed();
         let metrics = timing::Phase::begin(db, "archive_metrics");
         let probed = self
-            .archive(db, &cluster, &pod, &ca, parked.is_some())
+            .archive(db, &cluster, &pod, &ca, parked.is_some(), held.as_ref())
             .await?;
         metrics.completed();
         let Probed {

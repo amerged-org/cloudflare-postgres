@@ -922,3 +922,25 @@ async fn the_proof_reads_the_resources_it_names_back_together() {
         8
     );
 }
+
+#[tokio::test]
+async fn a_parked_wake_logs_the_maintenance_role_in_once() {
+    // The login that proves PostgreSQL accepts on the resumed Pod is the session the archive
+    // sample then asks its questions in; every role proves its own credential, together.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    w.log.lock().unwrap().clear();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let logins: Vec<String> = log(&w)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("LOGIN ").map(str::to_string))
+        .collect();
+    let count = |user: &str| logins.iter().filter(|login| *login == user).count();
+    assert_eq!(count("pgcf_maintenance"), 1, "{logins:?}");
+    assert_eq!(count("app"), 1, "{logins:?}");
+    assert_eq!(count("reader_query"), 1, "{logins:?}");
+    assert_eq!(logins.len(), 3, "{logins:?}");
+}
