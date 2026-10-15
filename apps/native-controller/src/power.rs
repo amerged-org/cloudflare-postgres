@@ -944,6 +944,11 @@ impl PowerCoordinator {
             {
                 return Err(Fault::Stale);
             }
+            // A write that would change nothing is not made: it would still make the cluster's
+            // watch deliver it.
+            if map["data"].as_object() == Some(&data) {
+                return Ok(map.clone());
+            }
             self.k8s.patch(map, &json!({"data":data})).await?;
         } else {
             if intent.is_none() {
@@ -2362,7 +2367,13 @@ impl PowerCoordinator {
             // A wake that continues on a retained Pod keeps its record until the wake ends, so
             // every pass of it can still give the Pod its requests back.
             progress.park = previous.as_ref().and_then(|prior| prior.park.clone());
-            if let Some(map) = &map {
+            // A wake that completed under this very intent is not begun again: the pass that
+            // looks at an awake database once more would turn its record back into `Wake`, write
+            // `Awake` at its end once more, and have the cluster's watch make it due again.
+            let completed = previous
+                .as_ref()
+                .is_some_and(|prior| prior.phase == Phase::Awake && prior.target == intent);
+            if !completed && let Some(map) = &map {
                 self.write(db, Some(map), None, &progress).await?;
             }
             self.cluster_intent(&intent, &cluster, "off").await?;
@@ -2461,7 +2472,10 @@ impl PowerCoordinator {
         let result=tokio::time::timeout(Duration::from_secs(10),async{
    let(physical,cluster)=self.anchor(db).await?;let mut map=self.fence(db).await?;let prior=map.as_ref().map(|m|progress_from(m,self.now())).transpose()?.flatten();if prior.as_ref().is_some_and(|p|!physical.matches(&p.anchor)){return Err(Fault::Recovery("power_storage_identity_changed"));}
    if cluster["metadata"]["annotations"][HIBERNATION]=="on"{return Ok(None);}
-   let progress=Progress::new(intent.clone(),Phase::Awake,physical,self.now());let current=self.write(db,map.as_ref(),Some(&intent),&progress).await?;map=Some(current.clone());self.bind_fence(db,&current).await?;let snapshot=self.snapshot().await?;self.controls(&intent,&snapshot,"release").await?;
+   let mut progress=Progress::new(intent.clone(),Phase::Awake,physical,self.now());
+   // An awake database's record says when its wake completed: another pass over it leaves it as it is.
+   if let Some(prior)=prior.as_ref().filter(|p|p.phase==Phase::Awake&&p.target==intent){progress.started_at=prior.started_at;}
+   let current=self.write(db,map.as_ref(),Some(&intent),&progress).await?;map=Some(current.clone());self.bind_fence(db,&current).await?;let snapshot=self.snapshot().await?;self.controls(&intent,&snapshot,"release").await?;
    if self.gateways().await?!=snapshot.pods{return Ok(None);}let current=self.fence(db).await?.ok_or(Fault::Stale)?;if uid(&current)?!=uid(map.as_ref().unwrap())?||intent_from(&current,text(db,"id"))?!=intent{return Ok(None);}
    let mut value=observation.clone();if !db["power"].is_null(){value["power"]=json!({"operation":intent.operation,"revision":intent.revision,"state":"awake"});}Ok(Some(value))
   }).await;

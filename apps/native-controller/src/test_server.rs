@@ -30,6 +30,13 @@ pub struct State {
     pub texts: BTreeMap<String, String>,
     /// Every accepted write as (method, path, request body).
     pub writes: Vec<(String, String, Value)>,
+    /// Every request the double received, writes and reads, in the order it was received, as
+    /// (method, path).
+    pub requests: Vec<(String, String)>,
+    /// The watch event of every committed write as the API server sends it to a metadata watch of
+    /// the object's kind, with that kind: what the controller's own writes make its watches
+    /// deliver.
+    pub events: Vec<(String, Value)>,
     /// The Content-Type of every PATCH, in the order of `writes`' PATCH entries: (path, type).
     pub patch_types: Vec<(String, String)>,
     /// A write for which this returns a status is refused with it and never committed.
@@ -214,6 +221,7 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
             value["metadata"]["uid"] = uid(1000 + state.serial).into();
             value["metadata"]["resourceVersion"] = "1".into();
             state.objects.insert(key.clone(), value.clone());
+            queue_event(state, "ADDED", &value);
             state.writes.push((method.into(), key, value.clone()));
             reply(201, &value)
         }
@@ -242,6 +250,7 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
                 current["status"]["conditions"] = conditions.into();
                 advance(&mut current);
                 state.objects.insert(target.into(), current.clone());
+                queue_event(state, "MODIFIED", &current);
                 return committed(state, method, path, patch, &current);
             }
             current["status"]["conditions"] = conditions.into();
@@ -264,6 +273,7 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
             }
             advance(&mut current);
             state.objects.insert(target.into(), current.clone());
+            queue_event(state, "MODIFIED", &current);
             committed(state, method, path, patch, &current)
         }
         "PATCH" => {
@@ -279,6 +289,7 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
             merge(&mut current, &patch);
             advance(&mut current);
             state.objects.insert(path.into(), current.clone());
+            queue_event(state, "MODIFIED", &current);
             committed(state, method, path, patch, &current)
         }
         "DELETE" => {
@@ -297,13 +308,22 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
                 current["metadata"]["deletionTimestamp"] = "2026-10-11T00:00:00Z".into();
                 advance(&mut current);
                 state.objects.insert(path.into(), current.clone());
+                queue_event(state, "MODIFIED", &current);
             } else {
                 state.objects.remove(path);
+                queue_event(state, "DELETED", &current);
             }
             committed(state, method, path, options, &current)
         }
         _ => reply(405, &json!({})),
     }
+}
+/// Queues the watch event of a committed write of `object`, which a metadata watch of its kind
+/// receives.
+fn queue_event(state: &mut State, kind: &str, object: &Value) {
+    let event = json!({"type":kind,"object":{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata","metadata":object["metadata"].clone()}});
+    let kind = object["kind"].as_str().unwrap_or_default().to_string();
+    state.events.push((kind, event));
 }
 fn advance(value: &mut Value) {
     let version: u64 = value["metadata"]["resourceVersion"]
@@ -411,6 +431,7 @@ impl Server {
                     tls.read_exact(&mut body).await.unwrap();
                     let response = {
                         let mut state = state.lock().unwrap();
+                        state.requests.push((method.clone(), path.clone()));
                         if method == "PATCH" {
                             state.patch_types.push((path.clone(), content_type));
                         }

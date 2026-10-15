@@ -90,12 +90,21 @@ pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
     "Secret",
     "ConfigMap",
 ];
+/// How long the version of this controller's own write is remembered for the event of the watch
+/// that is still to come; a watch that restarted past it never delivers it.
+const OWN_WRITE_MEMORY: Duration = Duration::from_secs(120);
+/// Versions remembered for one object: a pass writes one object a few times at most.
+const OWN_WRITES_PER_OBJECT: usize = 16;
 #[derive(Debug)]
 struct WatchContinuity {
     controller_epoch: String,
     epoch: u64,
     kinds: HashMap<String, (String, Instant, bool)>,
     objects: HashMap<(String, String, String), (String, String)>,
+    /// Versions of watched objects that this controller itself wrote and whose watch events have
+    /// not arrived yet, by (kind, namespace, name): the pass that wrote one holds the object as
+    /// written, so its event is not a change someone else made.
+    written: HashMap<(String, String, String), Vec<(String, Instant)>>,
 }
 impl Default for WatchContinuity {
     fn default() -> Self {
@@ -117,6 +126,7 @@ impl Default for WatchContinuity {
             epoch: 1,
             kinds: HashMap::new(),
             objects: HashMap::new(),
+            written: HashMap::new(),
         }
     }
 }
@@ -179,6 +189,107 @@ impl WatchContinuity {
                     .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
             })
             .then(|| (self.controller_epoch.clone(), self.epoch))
+    }
+    /// Remembers that this controller wrote `object`, as the write answered, over the version
+    /// `before`. A write that changed nothing answers the version it was made over and leaves no
+    /// event, so none is expected for it.
+    fn wrote(&mut self, kind: &str, object: &Value, before: &str) {
+        let meta = &object["metadata"];
+        let version = text(meta, "resourceVersion");
+        if !RUNTIME_WATCH_KINDS.contains(&kind)
+            || version.is_empty()
+            || version.len() > 128
+            || version == before
+        {
+            return;
+        }
+        let key = (
+            kind.to_string(),
+            text(meta, "namespace").to_string(),
+            text(meta, "name").to_string(),
+        );
+        let versions = self.written.entry(key).or_default();
+        versions.retain(|(_, at)| at.elapsed() < OWN_WRITE_MEMORY);
+        if versions.len() >= OWN_WRITES_PER_OBJECT {
+            versions.remove(0);
+        }
+        versions.push((version.to_string(), Instant::now()));
+        if self.written.len() > 4096 {
+            self.written.retain(|_, versions| {
+                versions.retain(|(_, at)| at.elapsed() < OWN_WRITE_MEMORY);
+                !versions.is_empty()
+            });
+        }
+    }
+    /// Whether `object` is a version this controller wrote itself; its event ends the memory of it.
+    fn own(&mut self, kind: &str, object: &Value) -> bool {
+        let meta = &object["metadata"];
+        let key = (
+            kind.to_string(),
+            text(meta, "namespace").to_string(),
+            text(meta, "name").to_string(),
+        );
+        let version = text(meta, "resourceVersion");
+        let Some(versions) = self.written.get_mut(&key) else {
+            return false;
+        };
+        let Some(at) = versions.iter().position(|(held, _)| held == version) else {
+            return false;
+        };
+        versions.remove(at);
+        if versions.is_empty() {
+            self.written.remove(&key);
+        }
+        true
+    }
+    /// One event of a metadata watch of `kind`: the revision the watch stands at afterwards and
+    /// what the event hints for reconciliation, a database ID or a pool scope. The event of a
+    /// version this controller wrote itself hints no database: the pass that wrote it holds the
+    /// object as written, and a change someone else makes has a version of its own.
+    fn event(&mut self, kind: &str, event: &Value) -> Result<(String, Option<String>), Error> {
+        let event_type = text(event, "type");
+        if event_type == "ERROR" {
+            return Err("Kubernetes watch history gap".into());
+        }
+        if !["ADDED", "MODIFIED", "DELETED", "BOOKMARK"].contains(&event_type) {
+            return Err("Kubernetes watch event invalid".into());
+        }
+        let object = &event["object"];
+        let version = text(&object["metadata"], "resourceVersion");
+        if version.is_empty() || version.len() > 128 {
+            return Err("Kubernetes watch revision missing".into());
+        }
+        self.connected(kind, version);
+        if event_type == "BOOKMARK" {
+            return Ok((version.to_string(), None));
+        }
+        if !self.observe(kind, object, event_type == "DELETED") {
+            return Err("watch object metadata invalid".into());
+        }
+        let meta = &object["metadata"];
+        let labelled = text(&meta["labels"], "pgcf.io/database-id");
+        let id = if labelled.is_empty() {
+            text(meta, "namespace")
+                .strip_prefix("pgcf-db-")
+                .unwrap_or("")
+        } else {
+            labelled
+        };
+        let hint = if pgcf_native_protocol::valid_pattern("database", id) {
+            (!self.own(kind, object)).then(|| id.to_string())
+        } else {
+            let prefix = match kind {
+                "Pod" if meta["namespace"] == "pgcf-pool" => Some("pool-pod:"),
+                "Namespace" if meta["name"] == "pgcf-pool" => Some("pool-namespace:"),
+                "Node" => Some("pool-node:"),
+                _ => None,
+            };
+            prefix.and_then(|prefix| {
+                let uid = text(meta, "uid");
+                pgcf_native_protocol::valid_pattern("uuid", uid).then(|| format!("{prefix}{uid}"))
+            })
+        };
+        Ok((version.to_string(), hint))
     }
 }
 struct WatchGuard {
@@ -310,6 +421,16 @@ pub async fn bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<
 impl Kubernetes {
     pub fn runtime_continuity(&self) -> Option<(String, u64)> {
         self.continuity.lock().unwrap().snapshot()
+    }
+    /// What one event of a metadata watch of `kind` makes of the watch: the revision it stands at
+    /// and the database or pool scope it hints. An event for a version this controller wrote
+    /// itself hints no database.
+    pub(crate) fn watch_event(
+        &self,
+        kind: &str,
+        event: &Value,
+    ) -> Result<(String, Option<String>), Error> {
+        self.continuity.lock().unwrap().event(kind, event)
     }
     pub fn runtime_resource_current(&self, resource: &Value) -> bool {
         self.continuity
@@ -598,63 +719,12 @@ impl Kubernetes {
                         continue;
                     }
                     let event: Value = serde_json::from_slice(&line)?;
-                    let event_type = text(&event, "type");
-                    if event_type == "ERROR" {
-                        return Err("Kubernetes watch history gap".into());
-                    }
-                    if !["ADDED", "MODIFIED", "DELETED", "BOOKMARK"].contains(&event_type) {
-                        return Err("Kubernetes watch event invalid".into());
-                    }
-                    let rv = text(&event["object"]["metadata"], "resourceVersion");
-                    if rv.is_empty() || rv.len() > 128 {
-                        return Err("Kubernetes watch revision missing".into());
-                    }
-                    version = rv.to_string();
-                    self.continuity.lock().unwrap().connected(kind, rv);
-                    if event_type != "BOOKMARK"
-                        && !self.continuity.lock().unwrap().observe(
-                            kind,
-                            &event["object"],
-                            event_type == "DELETED",
-                        )
-                    {
-                        return Err("watch object metadata invalid".into());
-                    }
-                    if event_type != "BOOKMARK" {
-                        let labelled = text(
-                            &event["object"]["metadata"]["labels"],
-                            "pgcf.io/database-id",
-                        );
-                        let id = if labelled.is_empty() {
-                            text(&event["object"]["metadata"], "namespace")
-                                .strip_prefix("pgcf-db-")
-                                .unwrap_or("")
-                        } else {
-                            labelled
-                        };
-                        if pgcf_native_protocol::valid_pattern("database", id) {
-                            events
-                                .try_send(id.to_string())
-                                .map_err(|_| "controller hint queue exhausted")?;
-                        } else {
-                            let meta = &event["object"]["metadata"];
-                            let prefix = match kind {
-                                "Pod" if meta["namespace"] == "pgcf-pool" => Some("pool-pod:"),
-                                "Namespace" if meta["name"] == "pgcf-pool" => {
-                                    Some("pool-namespace:")
-                                }
-                                "Node" => Some("pool-node:"),
-                                _ => None,
-                            };
-                            if let Some(prefix) = prefix {
-                                let uid = text(meta, "uid");
-                                if pgcf_native_protocol::valid_pattern("uuid", uid) {
-                                    events
-                                        .try_send(format!("{prefix}{uid}"))
-                                        .map_err(|_| "controller hint queue exhausted")?;
-                                }
-                            }
-                        }
+                    let (next, hint) = self.watch_event(kind, &event)?;
+                    version = next;
+                    if let Some(hint) = hint {
+                        events
+                            .try_send(hint)
+                            .map_err(|_| "controller hint queue exhausted")?;
                     }
                 }
             }
@@ -864,6 +934,7 @@ impl Kubernetes {
             .request(Method::POST, &collection(kind, ns)?, Some(manifest))
             .await?
             .ok_or("Kubernetes create result unknown")?;
+        self.continuity.lock().unwrap().wrote(kind, &response, "");
         let uid = text(&response["metadata"], "uid");
         let actual = self
             .read(kind, ns, name)
@@ -907,6 +978,10 @@ impl Kubernetes {
         if text(&result["metadata"], "uid") != uid {
             return Err("Kubernetes patched identity changed".into());
         }
+        self.continuity
+            .lock()
+            .unwrap()
+            .wrote(text(current, "kind"), &result, rv);
         let actual = self
             .read(
                 text(current, "kind"),
@@ -967,6 +1042,11 @@ impl Kubernetes {
         if text(&result["metadata"], "uid") != uid {
             return Err("Kubernetes resized identity changed".into());
         }
+        self.continuity.lock().unwrap().wrote(
+            "Pod",
+            &result,
+            text(&pod["metadata"], "resourceVersion"),
+        );
         let actual = self
             .read("Pod", ns, name)
             .await?
@@ -1229,6 +1309,73 @@ mod tests {
             !kube.observed(&newer, Duration::from_millis(20)).await,
             "the version the watch holds is not the newer write"
         );
+    }
+    #[tokio::test]
+    async fn the_event_of_a_version_the_controller_wrote_hints_nothing_and_any_other_does() {
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        let id = "dbbbbbbbbbbbbbbbbbbb";
+        let name = format!("gateway-fence-{id}");
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"pgcf-system","uid":uid(1),"labels":{"pgcf.io/database-id":id}},"data":{"power.json":"1"}}));
+        let current = server
+            .k8s
+            .read("ConfigMap", Some("pgcf-system"), &name)
+            .await
+            .unwrap()
+            .unwrap();
+        let written = server
+            .k8s
+            .patch(&current, &serde_json::json!({"data":{"power.json":"2"}}))
+            .await
+            .unwrap();
+        let events = std::mem::take(&mut server.state.lock().unwrap().events);
+        assert_eq!(events.len(), 1);
+        let (version, hint) = server.k8s.watch_event("ConfigMap", &events[0].1).unwrap();
+        assert_eq!(version, written["metadata"]["resourceVersion"]);
+        assert_eq!(hint, None, "the write of this controller is not news");
+        // Someone else writes the same object next: a version of its own, and a hint. The
+        // memory of the controller's write ended with its event.
+        let mut other = events[0].1.clone();
+        other["object"]["metadata"]["resourceVersion"] = "9".into();
+        assert_eq!(
+            server.k8s.watch_event("ConfigMap", &other).unwrap(),
+            ("9".to_string(), Some(id.to_string()))
+        );
+        assert_eq!(
+            server.k8s.watch_event("ConfigMap", &events[0].1).unwrap().1,
+            Some(id.to_string())
+        );
+        // A write that changed nothing answers the version it was made over, leaves no event
+        // and is not remembered.
+        let version = written["metadata"]["resourceVersion"].as_str().unwrap();
+        server
+            .k8s
+            .continuity
+            .lock()
+            .unwrap()
+            .wrote("ConfigMap", &written, version);
+        assert!(server.k8s.continuity.lock().unwrap().written.is_empty());
+    }
+    #[test]
+    fn a_remembered_write_is_bounded_and_only_watched_kinds_are_remembered() {
+        let mut state = WatchContinuity::default();
+        let object = |kind: &str, rv: &str| serde_json::json!({"kind":kind,"metadata":{"name":"x","namespace":"pgcf-system","uid":"u","resourceVersion":rv}});
+        // A kind no watch delivers is never waited for.
+        state.wrote("ResourceQuota", &object("ResourceQuota", "5"), "4");
+        assert!(state.written.is_empty());
+        for version in 10..40 {
+            state.wrote(
+                "ConfigMap",
+                &object("ConfigMap", &version.to_string()),
+                &(version - 1).to_string(),
+            );
+        }
+        let held = state.written.values().next().unwrap();
+        assert_eq!(held.len(), OWN_WRITES_PER_OBJECT);
+        // The oldest versions were forgotten, the newest are still the controller's.
+        assert!(!state.own("ConfigMap", &object("ConfigMap", "10")));
+        assert!(state.own("ConfigMap", &object("ConfigMap", "39")));
+        assert!(!state.own("ConfigMap", &object("ConfigMap", "39")));
     }
     #[test]
     fn watch_gap_changes_coverage_but_ordinary_events_and_own_publication_do_not() {

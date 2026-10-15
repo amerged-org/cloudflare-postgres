@@ -594,3 +594,66 @@ async fn a_new_generation_is_published_with_its_proof_in_one_pass() {
     assert_eq!(admission_target(&w)["pod_uid"], crate::test_server::uid(77));
     assert_eq!(admission_target(&w)["generation"], 3);
 }
+
+/// The writes the cluster has committed so far, as (method, object name, what was written).
+fn committed(w: &World) -> Vec<(String, String, Value)> {
+    w.server
+        .state
+        .lock()
+        .unwrap()
+        .writes
+        .iter()
+        .map(|(method, path, body)| {
+            (
+                method.clone(),
+                path.rsplit('/').next().unwrap().to_string(),
+                body.clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_completed_wake_leaves_the_cluster_quiet_until_something_else_changes() {
+    // After a wake the database stays awake and is looked at again every minute, and whenever
+    // something changes. Neither may change anything itself: a pass that writes makes the
+    // watch deliver its write, which makes the database due again, which writes.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    // The watch has delivered the writes of the sleep.
+    assert!(w.watch_delivers().is_empty());
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    // The watch delivers every write of the wake: not one is a change someone else made.
+    let hinted = w.watch_delivers();
+    assert!(
+        hinted.is_empty(),
+        "the controller's own writes mark the database due: {hinted:?}"
+    );
+    // The kubelet reports the Pod Ready some time later; the passes that follow are the ordinary
+    // chain over the same facts.
+    w.kubelet_ready_now()();
+    for operation_in_record in [true, false] {
+        if !operation_in_record {
+            // The operation is complete: the desired record no longer carries it.
+            w.db.as_object_mut().unwrap().remove("power");
+        }
+        for _ in 0..2 {
+            let before = committed(&w).len();
+            let again = reconcile(&w).await;
+            assert_eq!(again["state"], "ready", "{again}");
+            let wrote: Vec<_> = committed(&w).split_off(before);
+            assert!(
+                wrote.is_empty(),
+                "a pass over unchanged facts wrote (operation in the record: {operation_in_record}): {:?}",
+                wrote
+                    .iter()
+                    .map(|(method, name, _)| format!("{method} {name}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(w.watch_delivers().is_empty());
+    }
+}

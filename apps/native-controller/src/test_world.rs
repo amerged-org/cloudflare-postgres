@@ -880,6 +880,20 @@ impl World {
             log.lock().unwrap().push("KUBELET ready".into());
         })
     }
+    /// The watch events of every write the cluster committed since the last call, delivered to
+    /// the controller's watch as the API server sends them, and the databases they hint for
+    /// reconciliation. Afterwards the watch's picture of the objects is the current one again, as
+    /// a watch without lag has it.
+    pub fn watch_delivers(&self) -> Vec<String> {
+        let events = std::mem::take(&mut self.server.state.lock().unwrap().events);
+        let hints = events
+            .iter()
+            .filter(|(kind, _)| crate::kubernetes::RUNTIME_WATCH_KINDS.contains(&kind.as_str()))
+            .filter_map(|(kind, event)| self.reconciler.k8s.watch_event(kind, event).unwrap().1)
+            .collect();
+        self.server.state.lock().unwrap().sync();
+        hints
+    }
     /// Changes the instance Pod the way `change` says, as a new version of it.
     pub fn change_pod(
         &self,
