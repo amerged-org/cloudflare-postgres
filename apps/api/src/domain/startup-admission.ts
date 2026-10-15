@@ -39,14 +39,11 @@ export function postgresPoolBoundCpuChargeSql(databaseAlias = "d"): string {
     WHERE b.database_id=${database}.id AND b.node_id=${database}.node_id AND b.state NOT IN('released','refused')),0)`;
 }
 
-/** A configured scheduling share consumes CPU until the owned runtime is confirmed stopped. */
-export function databaseCpuChargeSql(
-  databaseAlias = "d",
-  sizeAlias = "s",
-  acceptingStopInCurrentBatch = false,
+/** A database whose owned runtime stop is confirmed: the one predicate behind every "cold" decision. */
+function stoppedSleeperSql(
+  database: string,
+  acceptingStopInCurrentBatch: boolean,
 ): string {
-  const database = identifier(databaseAlias),
-    size = identifier(sizeAlias);
   // The observation batch records its lifecycle fact before completing this exact owned stop.
   // Both commit together; ordinary admission always requires the completed operation.
   const completed =
@@ -54,7 +51,7 @@ export function databaseCpuChargeSql(
   const stopStatus = acceptingStopInCurrentBatch
     ? `(cold_operation.status IN('pending','running') OR (${completed}))`
     : `(${completed})`;
-  const sleeping = `${database}.desired_state='suspended'
+  return `${database}.desired_state='suspended'
     AND ${database}.observed_state='provisioning' AND ${database}.observed_power='hibernated'
     AND ${database}.observed_generation=${database}.generation AND ${database}.deleted_at IS NULL
     AND EXISTS(SELECT 1 FROM operations cold_operation WHERE cold_operation.id=${database}.power_operation
@@ -63,6 +60,17 @@ export function databaseCpuChargeSql(
       AND ((${database}.suspension_reason='manual' AND cold_operation.kind='database.suspend')
         OR (${database}.suspension_reason='idle' AND cold_operation.kind='database.hibernate')))
 `;
+}
+
+/** A configured scheduling share consumes CPU until the owned runtime is confirmed stopped. */
+export function databaseCpuChargeSql(
+  databaseAlias = "d",
+  sizeAlias = "s",
+  acceptingStopInCurrentBatch = false,
+): string {
+  const database = identifier(databaseAlias),
+    size = identifier(sizeAlias);
+  const sleeping = stoppedSleeperSql(database, acceptingStopInCurrentBatch);
   const protectedStop = `(${database}.desired_state='running' AND ${database}.deleted_at IS NULL
     AND ${database}.observed_power='hibernated' AND ${database}.observed_generation=${database}.generation)
     AND (${database}.storage_profile_json IS NOT NULL AND ${database}.storage_volume_json IS NOT NULL
@@ -76,6 +84,26 @@ export function databaseCpuChargeSql(
     ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END),${postgresPoolBoundCpuChargeSql(database)})`;
 }
 
+/**
+ * The scheduling request of the Pod a parked database still holds, on top of `databaseCpuChargeSql`
+ * (which stays 0 for it, so every "confirmed cold" predicate keeps its meaning). It applies only to
+ * a confirmed stopped sleeper with the controller's hint, and an unusable hint charges the full
+ * request: the node is never reported freer than it may be.
+ */
+export function databaseParkedCpuSql(
+  databaseAlias = "d",
+  sizeAlias = "s",
+  acceptingStopInCurrentBatch = false,
+): string {
+  const database = identifier(databaseAlias),
+    size = identifier(sizeAlias),
+    parked = `json_extract(${database}.parked_json,'$.cpu_millicores')`;
+  return `(CASE WHEN ${database}.parked_json IS NOT NULL AND (${stoppedSleeperSql(database, acceptingStopInCurrentBatch)})
+    THEN CASE WHEN json_extract(${database}.parked_json,'$.v')=1 AND typeof(${parked})='integer' AND ${parked}>=0 THEN ${parked}
+      ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END
+    ELSE 0 END)`;
+}
+
 /** Ready pool Pods reserve their real scheduling requests before they become database holders. */
 export function postgresPoolIdleChargeSql(
   nodeAlias: string,
@@ -85,6 +113,16 @@ export function postgresPoolIdleChargeSql(
   return `COALESCE((SELECT SUM(pi.${resource === "cpu_millicores" ? "idle_cpu_millicores" : "idle_memory_mib"}) FROM pool_pods pi WHERE pi.node_id=${node}.id AND pi.node_uid=${node}.node_uid AND pi.state='ready'),0)`;
 }
 
+/**
+ * The Pods that parked databases of this node still hold. A separate sibling term, never nested in
+ * the charge sum: D1 allows an expression tree of depth 100 and the resize statement that embeds
+ * the node headroom is exactly that deep, so the sum of charges must stay untouched.
+ */
+function parkedNodeCpuSql(node: string, excluded: string): string {
+  return `COALESCE((SELECT SUM(${databaseParkedCpuSql("parked_database", "parked_size")})
+        FROM databases parked_database JOIN size_classes parked_size ON parked_size.id=parked_database.size_class_id
+        WHERE parked_database.node_id=${node}.id AND parked_database.parked_json IS NOT NULL ${excluded.replaceAll("cpu_database", "parked_database")}),0)`;
+}
 /** Every start competes in the same atomic SQL budget, including waking an existing database. */
 export function nodeCpuHeadroomSql(
   nodeAlias = "n",
@@ -115,7 +153,7 @@ export function nodeCpuHeadroomSql(
         FROM databases cpu_database JOIN size_classes cpu_size ON cpu_size.id=cpu_database.size_class_id
         WHERE cpu_database.node_id=${node}.id AND (cpu_database.observed_state<>'deleted' OR ${postgresPoolBoundCpuChargeSql("cpu_database")}>0) ${excluded}),0)
       -${postgresPoolIdleChargeSql(node, "cpu_millicores")}
-      >=${effectiveTarget}
+      >=${effectiveTarget}+${parkedNodeCpuSql(node, excluded)}
     AND typeof(${computePoolOverheadSql(node, "cpu_millicores")})='integer'
     AND ${computePoolOverheadSql(node, "cpu_millicores")} BETWEEN 0 AND ${maximumInteger})`;
 }
