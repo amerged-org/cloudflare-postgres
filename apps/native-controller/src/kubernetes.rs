@@ -418,6 +418,12 @@ pub async fn bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<
     }
     Ok(bytes)
 }
+/// Whether `value` is the object of `kind`, `namespace` and `name` that was asked for.
+fn is_object(value: &Value, kind: &str, namespace: Option<&str>, name: &str) -> bool {
+    text(value, "kind") == kind
+        && text(&value["metadata"], "name") == name
+        && namespace.is_none_or(|ns| text(&value["metadata"], "namespace") == ns)
+}
 impl Kubernetes {
     pub fn runtime_continuity(&self) -> Option<(String, u64)> {
         self.continuity.lock().unwrap().snapshot()
@@ -844,11 +850,10 @@ impl Kubernetes {
         let value = self
             .request(Method::GET, &named(kind, namespace, name)?, None)
             .await?;
-        if value.as_ref().is_some_and(|v| {
-            text(v, "kind") != kind
-                || text(&v["metadata"], "name") != name
-                || namespace.is_some_and(|ns| text(&v["metadata"], "namespace") != ns)
-        }) {
+        if value
+            .as_ref()
+            .is_some_and(|v| !is_object(v, kind, namespace, name))
+        {
             return Err("Kubernetes read identity changed".into());
         }
         Ok(value)
@@ -948,7 +953,14 @@ impl Kubernetes {
         }
         Ok(actual)
     }
+    /// Merge-patches `current` under its UID and resourceVersion and returns the object as the
+    /// server answered the write: the answer is the object as it was written, so it is not read
+    /// again. A write whose answer did not arrive is an error, and whoever needs to know whether it
+    /// committed reads the object.
     pub async fn patch(&self, current: &Value, patch: &Value) -> Result<Value, Error> {
+        let kind = text(current, "kind");
+        let ns = current["metadata"]["namespace"].as_str();
+        let name = text(&current["metadata"], "name");
         let uid = text(&current["metadata"], "uid");
         let rv = text(&current["metadata"], "resourceVersion");
         if uid.is_empty() || rv.is_empty() || !current["metadata"]["deletionTimestamp"].is_null() {
@@ -964,38 +976,17 @@ impl Kubernetes {
         body["metadata"]["uid"] = uid.into();
         body["metadata"]["resourceVersion"] = rv.into();
         let result = self
-            .request(
-                Method::PATCH,
-                &named(
-                    text(current, "kind"),
-                    current["metadata"]["namespace"].as_str(),
-                    text(&current["metadata"], "name"),
-                )?,
-                Some(&body),
-            )
+            .request(Method::PATCH, &named(kind, ns, name)?, Some(&body))
             .await?
             .ok_or("Kubernetes patch target disappeared")?;
-        if text(&result["metadata"], "uid") != uid {
+        if text(&result["metadata"], "uid") != uid
+            || !is_object(&result, kind, ns, name)
+            || text(&result["metadata"], "resourceVersion").is_empty()
+        {
             return Err("Kubernetes patched identity changed".into());
         }
-        self.continuity
-            .lock()
-            .unwrap()
-            .wrote(text(current, "kind"), &result, rv);
-        let actual = self
-            .read(
-                text(current, "kind"),
-                current["metadata"]["namespace"].as_str(),
-                text(&current["metadata"], "name"),
-            )
-            .await?
-            .ok_or("Kubernetes patched resource disappeared")?;
-        if text(&actual["metadata"], "uid") != uid
-            || text(&actual["metadata"], "resourceVersion").is_empty()
-        {
-            return Err("Kubernetes patch readback identity changed".into());
-        }
-        Ok(actual)
+        self.continuity.lock().unwrap().wrote(kind, &result, rv);
+        Ok(result)
     }
     /// Resizes the requests of named containers of a running Pod in place, through the `resize`
     /// subresource. It is a strategic merge, because a JSON merge patch would replace the
@@ -1039,7 +1030,7 @@ impl Kubernetes {
             )
             .await?
             .ok_or("Kubernetes resize target disappeared")?;
-        if text(&result["metadata"], "uid") != uid {
+        if text(&result["metadata"], "uid") != uid || !is_object(&result, "Pod", ns, name) {
             return Err("Kubernetes resized identity changed".into());
         }
         self.continuity.lock().unwrap().wrote(
@@ -1047,14 +1038,7 @@ impl Kubernetes {
             &result,
             text(&pod["metadata"], "resourceVersion"),
         );
-        let actual = self
-            .read("Pod", ns, name)
-            .await?
-            .ok_or("Kubernetes resized Pod disappeared")?;
-        if text(&actual["metadata"], "uid") != uid {
-            return Err("Kubernetes resize readback identity changed".into());
-        }
-        Ok(actual)
+        Ok(result)
     }
     pub async fn delete(&self, current: &Value, propagation: &str) -> Result<(), Error> {
         let uid = text(&current["metadata"], "uid");
@@ -1308,6 +1292,74 @@ mod tests {
         assert!(
             !kube.observed(&newer, Duration::from_millis(20)).await,
             "the version the watch holds is not the newer write"
+        );
+    }
+    #[tokio::test]
+    async fn a_patch_and_a_resize_are_answered_by_the_server_and_not_read_again() {
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"owned","namespace":"pgcf-system","uid":uid(1)},"data":{"value":"old"}}));
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"database-1","namespace":"pgcf-db-a","uid":uid(2)},
+            "spec":{"containers":[{"name":"postgres","resources":{"requests":{"cpu":"25m","memory":"128Mi"}}}]},"status":{}}));
+        let map = server
+            .k8s
+            .read("ConfigMap", Some("pgcf-system"), "owned")
+            .await
+            .unwrap()
+            .unwrap();
+        let pod = server
+            .k8s
+            .read("Pod", Some("pgcf-db-a"), "database-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let reads = server.state.lock().unwrap().requests.len();
+        let patched = server
+            .k8s
+            .patch(&map, &serde_json::json!({"data":{"value":"new"}}))
+            .await
+            .unwrap();
+        assert_eq!(patched["data"]["value"], "new");
+        assert_eq!(patched["metadata"]["uid"], map["metadata"]["uid"]);
+        assert_ne!(
+            patched["metadata"]["resourceVersion"],
+            map["metadata"]["resourceVersion"]
+        );
+        let resized = server
+            .k8s
+            .resize_pod(
+                &pod,
+                &[("postgres", serde_json::json!({"cpu":"10m","memory":"96Mi"}))],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resized["spec"]["containers"][0]["resources"]["requests"],
+            serde_json::json!({"cpu":"10m","memory":"96Mi"})
+        );
+        // One request each: the answer of a write is the object as it was written.
+        assert_eq!(
+            server.state.lock().unwrap().requests[reads..],
+            [
+                (
+                    "PATCH".to_string(),
+                    "/api/v1/namespaces/pgcf-system/configmaps/owned".to_string()
+                ),
+                (
+                    "PATCH".to_string(),
+                    "/api/v1/namespaces/pgcf-db-a/pods/database-1/resize".to_string()
+                ),
+            ]
+        );
+        // An answer for another object is no answer.
+        let other = serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"other","namespace":"pgcf-system","uid":uid(1),"resourceVersion":"1"}});
+        assert!(
+            server
+                .k8s
+                .patch(&other, &serde_json::json!({"data":{"value":"x"}}))
+                .await
+                .is_err()
         );
     }
     #[tokio::test]

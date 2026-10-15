@@ -657,3 +657,33 @@ async fn a_completed_wake_leaves_the_cluster_quiet_until_something_else_changes(
         assert!(w.watch_delivers().is_empty());
     }
 }
+
+/// The requests the controller made since `from`, as (reads, writes).
+fn requests_since(w: &World, from: usize) -> (usize, usize) {
+    let state = w.server.state.lock().unwrap();
+    let all = &state.requests[from..];
+    let reads = all.iter().filter(|(method, _)| method == "GET").count();
+    (reads, all.len() - reads)
+}
+
+#[tokio::test]
+async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
+    // The requests of the wake that parked databases wait for, and of the pass that looks at the
+    // awake database again once the kubelet reports its Pod ready, as (reads, writes). Every
+    // request is a round trip of the wake or a charge on the API server of a database that only
+    // sits there: a change that adds one changes these numbers.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let at = w.server.state.lock().unwrap().requests.len();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(requests_since(&w, at), (103, 19), "the wake");
+    let _ = w.watch_delivers();
+    w.kubelet_ready_now()();
+    let at = w.server.state.lock().unwrap().requests.len();
+    let again = reconcile(&w).await;
+    assert_eq!(again["state"], "ready", "{again}");
+    assert_eq!(requests_since(&w, at), (86, 0), "the pass after it");
+}

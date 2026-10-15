@@ -902,12 +902,23 @@ impl PowerCoordinator {
         let Some(map) = map else {
             return Ok(None);
         };
-        let map = owned(Some(map), &name, id, Some(SYSTEM), false)?;
+        self.fence_checked(db, map).map(Some)
+    }
+    /// The gateway fence `map` as the database's own, at no revision beyond the desired one.
+    fn fence_checked(&self, db: &Value, map: Value) -> Result<Value> {
+        let id = text(db, "id");
+        let map = owned(
+            Some(map),
+            &format!("gateway-fence-{id}"),
+            id,
+            Some(SYSTEM),
+            false,
+        )?;
         let intent = intent_from(&map, id)?;
         if intent.revision > number(db, "generation") {
             return Err(Fault::Stale);
         }
-        Ok(Some(map))
+        Ok(map)
     }
     async fn write(
         &self,
@@ -934,7 +945,8 @@ impl PowerCoordinator {
             );
         }
         data.insert("power.json".into(), progress_text.clone().into());
-        if let Some(map) = map {
+        // What the write answers is the fence as it was written: it is not read again.
+        let written = if let Some(map) = map {
             let prior = intent_from(map, id)?;
             if intent.is_some_and(|next| {
                 next.revision < prior.revision
@@ -949,14 +961,14 @@ impl PowerCoordinator {
             if map["data"].as_object() == Some(&data) {
                 return Ok(map.clone());
             }
-            self.k8s.patch(map, &json!({"data":data})).await?;
+            self.k8s.patch(map, &json!({"data":data})).await?
         } else {
             if intent.is_none() {
                 return Err(Fault::Recovery("gateway_fence_missing"));
             }
-            self.k8s.create(&json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"labels":{DATABASE_LABEL:id,wire("fenceLabel"):"true"}},"data":data})).await?;
-        }
-        let next = self.fence(db).await?.ok_or(Fault::Stale)?;
+            self.k8s.create(&json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"labels":{DATABASE_LABEL:id,wire("fenceLabel"):"true"}},"data":data})).await?
+        };
+        let next = self.fence_checked(db, written)?;
         if map.is_some_and(|prior| prior["metadata"]["uid"] != next["metadata"]["uid"])
             || text(&next["data"], "power.json") != progress_text
         {
