@@ -22,6 +22,8 @@ export const ParkedRecord = z.strictObject({
   parked_at: z.iso.datetime(),
   /** API receive time of the latest report. */
   observed_at: z.iso.datetime(),
+  /** The latest report's claim that every predicate of the fast wake still holds. */
+  wake: z.literal("fast").optional(),
 });
 export type ParkedRecord = z.infer<typeof ParkedRecord>;
 
@@ -43,11 +45,13 @@ export function parkedRecordFresh(record: ParkedRecord, now: number): boolean {
   return observed <= now + 5000 && now - observed <= PARKED_FRESH_MS;
 }
 
-/** The record an accepted parked report writes; the first report of a Pod fixes `parked_at`. */
+/** The record an accepted parked report writes; the first report of a Pod fixes `parked_at`, and
+ * each report replaces the fast-wake claim, so a report without it withdraws it. */
 export function nextParkedRecord(input: {
   pod_uid: string;
   cpu_millicores: number;
   memory_mib: number;
+  wake?: "fast";
   generation: number;
   previous: ParkedRecord | undefined;
   now: string;
@@ -63,5 +67,6 @@ export function nextParkedRecord(input: {
         ? input.previous.parked_at
         : input.now,
     observed_at: input.now,
+    ...(input.wake === undefined ? {} : { wake: input.wake }),
   };
 }

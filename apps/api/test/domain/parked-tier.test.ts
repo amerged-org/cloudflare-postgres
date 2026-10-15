@@ -165,6 +165,29 @@ it("parked_observation_is_stored_only_for_idle_sleeps_and_cleared_by_ready_or_de
   ).toBe("awake");
 });
 
+it("a_parked_report_stores_the_fast_wake_claim_until_a_later_report_withdraws_it", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases)),
+    intent = await idleIntent(w);
+  await w.evidence({ generation: intent.generation });
+  const claimed = await hibernated(w, intent, {
+    ...parkedPod(w),
+    wake: "fast",
+  });
+  expect(await claimed.json()).toEqual({ accepted: 1 });
+  const stored = await parkedRecord(w.id);
+  expect(stored).toMatchObject({ pod_uid: w.pod, wake: "fast" });
+  // The record with the claim still names the guard's running writer.
+  expect((await leaseEntry(w.f, w.id)).desired_state).toBe("running");
+  // The next report without the claim withdraws it; the Pod stays parked since its first report.
+  await new Promise((done) => setTimeout(done, 5));
+  expect(await (await hibernated(w, intent, parkedPod(w))).json()).toEqual({
+    accepted: 1,
+  });
+  const withdrawn = await parkedRecord(w.id);
+  expect(withdrawn).not.toHaveProperty("wake");
+  expect(withdrawn.parked_at).toBe(stored.parked_at);
+});
+
 it("a_parked_observation_is_refused_for_a_manual_suspend", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases));
   const suspended = DatabaseWithOperation.parse(

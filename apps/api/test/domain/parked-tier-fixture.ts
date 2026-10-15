@@ -201,7 +201,12 @@ export async function idleIntent(w: AwakeWriter) {
 export function hibernated(
   w: AwakeWriter,
   intent: { operation: string; generation: number },
-  parked?: { pod_uid: string; cpu_millicores: number; memory_mib: number },
+  parked?: {
+    pod_uid: string;
+    cpu_millicores: number;
+    memory_mib: number;
+    wake?: "fast";
+  },
 ) {
   return request(
     "/agent/v1/observations",
