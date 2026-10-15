@@ -1439,14 +1439,22 @@ export class DatabaseActor extends DurableObject<Env> {
       activity.last_activity_at > activity.observed_at
     )
       return false;
+    // The report of every ready database comes through here every few seconds: its read of the row
+    // is not made inside the gate, where a slow one would hold every other event of the database.
+    // A report of a generation that has moved on is stored harmlessly: whoever uses it compares its
+    // revision with the row's.
+    try {
+      const current = await this.env.DB.prepare(
+        "SELECT generation FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=? AND d.deleted_at IS NULL AND p.deleted_at IS NULL",
+      )
+        .bind(databaseId)
+        .first<{ generation: number }>();
+      if (current?.generation !== activity.revision) return false;
+    } catch {
+      return false;
+    }
     return this.gate("recordActivity", async () => {
       try {
-        const current = await this.env.DB.prepare(
-          "SELECT generation FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=? AND d.deleted_at IS NULL AND p.deleted_at IS NULL",
-        )
-          .bind(databaseId)
-          .first<{ generation: number }>();
-        if (current?.generation !== activity.revision) return false;
         if (activity.active_connections > 0) await this.revokeReclaimLocked();
         return (
           this.ctx.storage.sql.exec(
@@ -1463,6 +1471,57 @@ export class DatabaseActor extends DurableObject<Env> {
     });
   }
 
+  /**
+   * A refusal that needs no gate: no current report, a row that moved on, or a database busy or
+   * idle for less than its sleep threshold. Undefined when the database may be idle or has a warm
+   * reclaim policy, which decides on its own thresholds.
+   */
+  private async idleRefusal(
+    databaseId: string,
+    revision: number,
+  ): Promise<
+    | { ok: false; reason: "activity_unavailable" | "not_idle" | "changed" }
+    | undefined
+  > {
+    const activity = this.ctx.storage.sql
+      .exec<{
+        revision: number;
+        observed_at: string;
+        last_activity_at: string;
+        active_connections: number;
+      }>("SELECT * FROM database_activity WHERE singleton=1")
+      .toArray()[0];
+    if (
+      !activity ||
+      activity.revision !== revision ||
+      Date.parse(activity.observed_at) < Date.now() - 30_000
+    )
+      return { ok: false, reason: "activity_unavailable" };
+    const row = await this.env.DB.prepare(
+      "SELECT d.*,s.sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.deleted_at IS NULL",
+    )
+      .bind(databaseId)
+      .first<DatabaseRow & { sleep_after_seconds: number | null }>();
+    if (
+      !row ||
+      row.generation !== revision ||
+      row.desired_state !== "running" ||
+      row.observed_state !== "ready" ||
+      row.observed_generation !== revision ||
+      row.observed_power !== "awake"
+    )
+      return { ok: false, reason: "changed" };
+    if (
+      row.warm_reclaim_policy_json === null &&
+      (activity.active_connections !== 0 ||
+        row.sleep_after_seconds === null ||
+        Date.now() - Date.parse(activity.last_activity_at) <
+          row.sleep_after_seconds * 1000)
+    )
+      return { ok: false, reason: "not_idle" };
+    return undefined;
+  }
+
   async requestIdle(
     databaseId: string,
     revision: number,
@@ -1473,6 +1532,11 @@ export class DatabaseActor extends DurableObject<Env> {
     this.identity(DatabaseId.parse(databaseId));
     if (!this.presence() || this.presence()!.deleted)
       return { ok: false, reason: "changed" };
+    // Most probes find nothing to do. Their answer is given before the gate, from the report in the
+    // Actor's own storage and one read of the row; a database that may be idle takes the gate,
+    // which decides on fresh reads as before.
+    const early = await this.idleRefusal(databaseId, revision);
+    if (early) return early;
     return this.gate("requestIdle", async () => {
       const activity = this.ctx.storage.sql
         .exec<{

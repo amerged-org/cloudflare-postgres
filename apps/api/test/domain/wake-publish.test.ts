@@ -307,21 +307,71 @@ it("a published snapshot of the wake's revision releases the waiting connection 
 
 it("a gate held for a second names its callback in the log", async () => {
   const f = await sleeping();
-  // The activity report's database read stands for any slow read inside the Actor's gate.
-  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
-  const original = prototype.prepare;
+  // The claim's read of its sleeping intent stands for any slow read inside the Actor's gate.
+  const read = holdRead(
+    "SELECT id FROM operations WHERE id=? AND database_id=? AND project_id=? AND generation<=? AND kind='database.hibernate'",
+  );
+  const warnings: string[] = [];
+  vi.spyOn(console, "warn").mockImplementation((...values: unknown[]) => {
+    warnings.push(values.map(String).join(" "));
+  });
+  const waiting = actor(f.id).ensureAwake(f.id, "app", {
+    deadline: Date.now() + 15_000,
+  });
+  for (let i = 0; i < 400 && read.held() === 0; i++) await sleep(5);
+  expect(read.held()).toBe(1);
+  // Another RPC that needs the gate waits behind the held callback.
+  const waitStarted = Date.now();
+  const victim = actor(f.id).repairAdmissionMutation();
+  await sleep(1200);
+  read.release();
+  await victim;
+  expect(Date.now() - waitStarted).toBeGreaterThanOrEqual(1000);
+  const row = await untilWake(f.id);
+  await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    readyBody(f, row.power_operation),
+  );
+  expect(await waiting).toMatchObject({ ok: true });
+  const events = warnings
+    .map((line) => {
+      try {
+        return JSON.parse(line) as {
+          event: string;
+          callback: string;
+          ms: number;
+        };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((value) => value?.event === "actor_gate_held");
+  expect(events).toEqual([
+    expect.objectContaining({
+      event: "actor_gate_held",
+      callback: "claimWake",
+    }),
+  ]);
+  expect(events[0]!.ms).toBeGreaterThanOrEqual(1000);
+}, 30_000);
+
+/** Holds every execution of one read until `release`, on every D1 binding of the isolate. */
+function holdRead(prefix: string) {
   let open!: () => void;
   const gate = new Promise<void>((resolve) => {
     open = resolve;
   });
   let held = 0;
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
+  const original = prototype.prepare;
   vi.spyOn(prototype, "prepare").mockImplementation(function (
     this: D1Database,
     sql: string,
   ) {
     const statement = original.call(this, sql);
-    if (!sql.startsWith("SELECT generation FROM databases d JOIN projects p"))
-      return statement;
+    if (!sql.startsWith(prefix)) return statement;
     const wrap = (target: D1PreparedStatement): D1PreparedStatement =>
       new Proxy(target, {
         get(inner, property) {
@@ -339,48 +389,70 @@ it("a gate held for a second names its callback in the log", async () => {
       });
     return wrap(statement);
   });
-  const warnings: string[] = [];
-  vi.spyOn(console, "warn").mockImplementation((...values: unknown[]) => {
-    warnings.push(values.map(String).join(" "));
-  });
+  return { held: () => held, release: () => open() };
+}
+/** An RPC that needs the Actor's gate and nothing else answers within a bound, or it is held. */
+async function gateIsOpen(id: string) {
+  return Promise.race([
+    actor(id)
+      .repairAdmissionMutation()
+      .then(() => true),
+    sleep(600).then(() => false),
+  ]);
+}
+
+it("recording an activity report does not hold the gate across its database read", async () => {
+  const f = await sleeping();
+  const read = holdRead("SELECT generation FROM databases d JOIN projects p");
   const row = (await env.DB.prepare(
     "SELECT generation FROM databases WHERE id=?",
   )
     .bind(f.id)
     .first<{ generation: number }>())!;
-  const activity = actor(f.id).recordActivity(f.id, {
+  const recording = actor(f.id).recordActivity(f.id, {
     revision: row.generation,
     observed_at: new Date().toISOString(),
     last_activity_at: new Date().toISOString(),
     active_connections: 0,
   });
-  for (let i = 0; i < 400 && held === 0; i++) await sleep(5);
-  expect(held).toBe(1);
-  // Another RPC that needs the gate waits behind the held callback.
-  const waitStarted = Date.now();
-  const victim = actor(f.id).repairAdmissionMutation();
-  await sleep(1200);
-  open();
-  await Promise.all([activity, victim]);
-  expect(Date.now() - waitStarted).toBeGreaterThanOrEqual(1000);
-  const events = warnings
-    .map((line) => {
-      try {
-        return JSON.parse(line) as {
-          event: string;
-          callback: string;
-          ms: number;
-        };
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((value) => value !== undefined);
-  expect(events).toEqual([
-    expect.objectContaining({
-      event: "actor_gate_held",
-      callback: "recordActivity",
+  for (let i = 0; i < 400 && read.held() === 0; i++) await sleep(5);
+  expect(read.held()).toBe(1);
+  expect(await gateIsOpen(f.id)).toBe(true);
+  read.release();
+  expect(await recording).toBe(true);
+}, 30_000);
+
+it("an idle probe that finds the database busy does not hold the gate across its database read", async () => {
+  const f = await sleeping();
+  // Wake it for real so that it is ready and awake at a known generation.
+  const waiting = actor(f.id).ensureAwake(f.id, "app", {
+    deadline: Date.now() + 15_000,
+  });
+  const woken = await untilWake(f.id);
+  expect(
+    (
+      await request(
+        "/agent/v1/observations",
+        f.agent,
+        "POST",
+        readyBody(f, woken.power_operation),
+      )
+    ).status,
+  ).toBe(200);
+  expect(await waiting).toMatchObject({ ok: true });
+  expect(
+    await actor(f.id).recordActivity(f.id, {
+      revision: woken.generation,
+      observed_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      active_connections: 1,
     }),
-  ]);
-  expect(events[0]!.ms).toBeGreaterThanOrEqual(1000);
+  ).toBe(true);
+  const read = holdRead("SELECT d.*,s.sleep_after_seconds FROM databases d");
+  const probing = actor(f.id).requestIdle(f.id, woken.generation);
+  for (let i = 0; i < 400 && read.held() === 0; i++) await sleep(5);
+  expect(read.held()).toBe(1);
+  expect(await gateIsOpen(f.id)).toBe(true);
+  read.release();
+  expect(await probing).toEqual({ ok: false, reason: "not_idle" });
 }, 30_000);
