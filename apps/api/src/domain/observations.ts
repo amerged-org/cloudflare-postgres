@@ -749,6 +749,7 @@ export async function observations(
         );
       return mutation ? mutation.batch(statements) : c.env.DB.batch(statements);
     };
+    const committing = Date.now();
     const result = await (invalidates
       ? observation.state === "ready"
         ? withPoolCertificateRefresh(
@@ -760,19 +761,37 @@ export async function observations(
           )
         : withAdmissionMutation(c.env, [row.id], execute)
       : execute());
+    const committed = Date.now();
     accepted += result[0]!.meta.changes;
     if (result[0]!.meta.changes === 1 && !invalidates)
       await publishDatabaseAdmission(c.env, row.id);
-    // Push the committed transition to ready; the Actor's bounded fallback read recovers a lost push.
-    if (
-      result[0]!.meta.changes === 1 &&
+    const published = Date.now();
+    // Where a wake's time goes after the controller's report: the commit, the snapshot publish
+    // and the push that releases the Actor's waiters. Only a transition is a measurement.
+    const report = (pushMilliseconds: number | null) =>
+      console.log(
+        JSON.stringify({
+          event: "observation_commit",
+          database_id: row.id,
+          operation: row.power_operation ?? null,
+          generation: observation.generation,
+          state: observation.state,
+          at_ms: Date.now(),
+          d1_ms: committed - committing,
+          publish_ms: published - committed,
+          push_ms: pushMilliseconds,
+        }),
+      );
+    const becameReady =
       observation.state === "ready" &&
       !(
         row.observed_state === "ready" &&
         row.observed_power === "awake" &&
         row.observed_generation === observation.generation
-      )
-    )
+      );
+    // Push the committed transition to ready; the Actor's bounded fallback read recovers a lost push.
+    if (result[0]!.meta.changes === 1 && becameReady) {
+      const pushed = Date.now();
       c.executionCtx.waitUntil(
         c.env.DATABASE_ACTOR.get(c.env.DATABASE_ACTOR.idFromName(row.id))
           .observedReady(
@@ -780,8 +799,15 @@ export async function observations(
             observation.generation,
             row.power_operation ?? null,
           )
-          .catch(() => false),
+          .catch(() => false)
+          .then(() => report(Date.now() - pushed)),
       );
+    } else if (
+      result[0]!.meta.changes === 1 &&
+      observation.state === "hibernated" &&
+      row.observed_power !== "hibernated"
+    )
+      report(null);
     // Only an identity proof reads a new thin volume's LV into its receipt; start one now.
     if (
       result[0]!.meta.changes === 1 &&

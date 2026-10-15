@@ -117,5 +117,6 @@ erDiagram
 - [apps/api/migrations/0048_postgres_pool.sql:1](../../../apps/api/migrations/0048_postgres_pool.sql#L1)
 - [apps/api/migrations/0049_postgres_pool_qualification.sql:1](../../../apps/api/migrations/0049_postgres_pool_qualification.sql#L1)
 - [apps/api/migrations/0050_pool_role_mutations.sql:1](../../../apps/api/migrations/0050_pool_role_mutations.sql#L1)
+- [apps/api/migrations/0051_parked_tier.sql:1](../../../apps/api/migrations/0051_parked_tier.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

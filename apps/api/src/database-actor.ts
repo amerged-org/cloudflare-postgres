@@ -154,6 +154,8 @@ export class DatabaseActor extends DurableObject<Env> {
   private polling = false;
   private pushed = false;
   private wake: { operation: string; revision: number } | undefined;
+  /** When the waiters of the current wake began to wait; only for the actor_release measurement. */
+  private waitStartedAt = 0;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private interruptPoll: (() => void) | undefined;
   private admissionState() {
@@ -930,6 +932,7 @@ export class DatabaseActor extends DurableObject<Env> {
     { operation: string; revision: number } | { failure: "08006" } | undefined
   > {
     return this.ctx.blockConcurrencyWhile(async () => {
+      const started = Date.now();
       try {
         const authorized = await this.known(id, user, true);
         if ("ok" in authorized) return undefined;
@@ -1028,11 +1031,24 @@ export class DatabaseActor extends DurableObject<Env> {
           this.ctx.storage.sql.exec(
             "UPDATE database_wake SET hint_claimed=1 WHERE singleton=1",
           );
+          const hinted = Date.now();
           await this.env.REGION_LINK.get(
             this.env.REGION_LINK.idFromName(row.region_id),
           )
             .notify([id])
             .catch(() => undefined);
+          // The wake split's first stage on this side: the claim itself and the region hint.
+          console.log(
+            JSON.stringify({
+              event: "actor_claim",
+              database_id: id,
+              operation: operation.id,
+              revision: row.generation,
+              at_ms: Date.now(),
+              claim_ms: hinted - started,
+              hint_ms: Date.now() - hinted,
+            }),
+          );
         }
         return { operation: operation.id, revision: row.generation };
       } catch {
@@ -1145,12 +1161,12 @@ export class DatabaseActor extends DurableObject<Env> {
       if (!wake && deadline > Date.now()) return this.admit(id.data, role.data);
       if (!wake || deadline <= Date.now() || this.waiters.size >= 32)
         return { ok: false, sqlstate: "57P03" };
-      if (
-        this.wake &&
+      const replaced =
+        this.wake !== undefined &&
         (this.wake.operation !== wake.operation ||
-          this.wake.revision !== wake.revision)
-      )
-        this.finishWaiters(false);
+          this.wake.revision !== wake.revision);
+      if (replaced) this.finishWaiters(false);
+      if (this.wake === undefined || replaced) this.waitStartedAt = Date.now();
       this.wake = wake;
       const waiter = parsed.data.waiterId ?? crypto.randomUUID();
       if (this.waiters.has(waiter)) return { ok: false, sqlstate: "57P03" };
@@ -1203,6 +1219,7 @@ export class DatabaseActor extends DurableObject<Env> {
             waiter.resolve(false);
           }
         if (!this.waiters.size) break;
+        const viaPush = this.pushed;
         this.pushed = false;
         const row = await this.env.DB.prepare(
           `SELECT d.generation,d.power_operation,d.desired_state,d.observed_state,d.observed_generation,d.observed_power,p.deleted_at project_deleted_at FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=?`,
@@ -1235,6 +1252,17 @@ export class DatabaseActor extends DurableObject<Env> {
                 snapshot.runtime &&
                 snapshot.runtime.observation.expires_at > Date.now()))
           ) {
+            console.log(
+              JSON.stringify({
+                event: "actor_release",
+                database_id: id,
+                operation: this.wake.operation,
+                revision: this.wake.revision,
+                at_ms: Date.now(),
+                waited_ms: Date.now() - this.waitStartedAt,
+                via: viaPush ? "push" : "poll",
+              }),
+            );
             this.finishWaiters(true);
             break;
           }

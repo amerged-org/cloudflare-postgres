@@ -70,6 +70,7 @@ export async function desired(
   c: ApiContext,
   query: DesiredQuery,
 ): Promise<Response> {
+  const started = Date.now();
   const region = await agentRegion(c);
   const admissionCapable = await admissionSnapshotCapable(c.env.DB, region.id);
   const poolCapable = await postgresPoolCapable(c.env.DB, region.id);
@@ -304,7 +305,7 @@ export async function desired(
   }
   const fleetRelease = await readDesiredFleetRelease(c.env.DB, region.id);
   const recoverySources = await desiredRegionArchiveSources(c.env, region.id);
-  return c.json(
+  const response = c.json(
     DesiredResponse.parse({
       ...(fleetRelease ? { fleet_release: fleetRelease } : {}),
       region: {
@@ -330,4 +331,16 @@ export async function desired(
       next: result.results.length > query.limit ? rows.at(-1)!.id : null,
     }),
   );
+  // One line per page, so a wake's pull is measured where the controller reads it.
+  console.log(
+    JSON.stringify({
+      event: "desired_page",
+      region_id: region.id,
+      ...(databases.length === 1 ? { database_id: databases[0]!.id } : {}),
+      databases: databases.length,
+      at_ms: Date.now(),
+      elapsedMs: Date.now() - started,
+    }),
+  );
+  return response;
 }

@@ -40,7 +40,7 @@ flowchart TD
 - [apps/api/src/domain/node-inspection.ts · ensureNodeInstallationInspection:574](../../../apps/api/src/domain/node-inspection.ts#L574)
 - [apps/api/src/domain/node-proof.ts · ensureNodePreparationProof:23](../../../apps/api/src/domain/node-proof.ts#L23)
 - [apps/api/src/domain/node-proof.ts · ensureNodeVerificationProof:75](../../../apps/api/src/domain/node-proof.ts#L75)
-- [apps/api/src/domain/node-state.ts · claimNodeDispatch:762](../../../apps/api/src/domain/node-state.ts#L762)
+- [apps/api/src/domain/node-state.ts · claimNodeDispatch:765](../../../apps/api/src/domain/node-state.ts#L765)
 - [apps/api/src/domain/node-thin-storage-bootstrap.ts · ensureBootstrapThinStorage:24](../../../apps/api/src/domain/node-thin-storage-bootstrap.ts#L24)
 - [apps/api/src/domain/prepare-node-installation.ts · prepareNodeInstallationInputs:17](../../../apps/api/src/domain/prepare-node-installation.ts#L17)
 - [apps/api/src/workflows/add-node.ts · dispatchNodeOrder:92](../../../apps/api/src/workflows/add-node.ts#L92)

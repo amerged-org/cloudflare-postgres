@@ -825,3 +825,66 @@ it("a current password revision on an idle sleeper advances configuration withou
   );
   expect((await pending).ok).toBe(true);
 });
+
+it("wake_timing_events_name_the_database_and_the_wake_operation", async () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const f = await ready();
+  await idle(f);
+  const waiterId = crypto.randomUUID();
+  const pending = actor(f.id).ensureAwake(f.id, "app", {
+    waiterId,
+    deadline: Date.now() + 3000,
+  });
+  const row = await untilWake(f.id);
+  await registered(f.id, waiterId);
+  await awake(f, row.power_operation);
+  expect(await pending).toMatchObject({ ok: true });
+  expect((await request("/agent/v1/desired", f.agent)).status).toBe(200);
+  const events = log.mock.calls.flatMap(([value]) => {
+    try {
+      return typeof value === "string"
+        ? [JSON.parse(value) as Record<string, unknown>]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const named = (event: string) => events.filter((e) => e.event === event);
+  const key = { database_id: f.id, operation: row.power_operation };
+  expect(named("actor_claim")).toEqual([
+    expect.objectContaining({
+      ...key,
+      revision: row.generation,
+      at_ms: expect.any(Number),
+      claim_ms: expect.any(Number),
+      hint_ms: expect.any(Number),
+    }),
+  ]);
+  expect(
+    named("observation_commit").find(
+      (e) => e.state === "ready" && e.operation === row.power_operation,
+    ),
+  ).toMatchObject({
+    ...key,
+    at_ms: expect.any(Number),
+    d1_ms: expect.any(Number),
+    publish_ms: expect.any(Number),
+    push_ms: expect.any(Number),
+  });
+  expect(named("actor_release")).toEqual([
+    expect.objectContaining({
+      ...key,
+      at_ms: expect.any(Number),
+      waited_ms: expect.any(Number),
+      via: expect.stringMatching(/^(push|poll)$/),
+    }),
+  ]);
+  expect(named("desired_page").at(-1)).toMatchObject({
+    at_ms: expect.any(Number),
+    elapsedMs: expect.any(Number),
+    databases: expect.any(Number),
+  });
+  // The events never carry credentials or tokens.
+  const serialized = JSON.stringify(events);
+  expect(serialized).not.toContain(f.agent);
+});
