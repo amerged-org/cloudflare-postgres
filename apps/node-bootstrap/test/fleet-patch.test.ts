@@ -491,7 +491,8 @@ test("fresh cluster/node identity changes and unhealthy databases prevent a writ
   await assert.rejects(r.turn(), /patch_cluster_membership_changed/);
   assert.equal(r.writes.length, 0);
   r.facts = { ...r.fixture.facts, databases_ready: false };
-  await assert.rejects(r.turn(), /patch_checkpoint_invalid/);
+  // The failure code names the health fact the checkpoint gate refused, not only the refusal.
+  await assert.rejects(r.turn(), /patch_checkpoint_invalid_databases_ready/);
   assert.equal(r.writes.length, 0);
 });
 /** Answers the executor's CNPG Cluster and database-namespace reads with exactly these objects. */
@@ -545,7 +546,10 @@ test("a Cluster whose database is being deleted never blocks a release but an Ac
     [cluster("live", true), cluster("gone", false)],
     [namespace("live"), namespace("gone")],
   );
-  await assert.rejects(blocked.turn(), /patch_preflight_unhealthy/);
+  await assert.rejects(
+    blocked.turn(),
+    /patch_preflight_unhealthy_databases_ready/,
+  );
   assert.equal(blocked.current.state, "pending");
   // A Cluster that is itself being deleted can never become Ready either.
   const removed = runtime();

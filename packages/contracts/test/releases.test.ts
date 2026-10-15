@@ -13,6 +13,7 @@ import {
   FleetPatchInput,
   type FleetPatchFacts,
   fleetPatchCheckpointAllowed,
+  fleetPatchCheckpointRefusalCode,
   fleetPatchTalosRebootObserved,
   fleetPatchWritePreflightAllowed,
 } from "../src/fleet-patches.ts";
@@ -376,6 +377,34 @@ it("host-only activation clears dispatch only for the existing proven-before-att
   ).toBe(false);
   input.host_configuration_only = false;
   expect(fleetPatchCheckpointAllowed(input, pending)).toBe(false);
+});
+it("a refused checkpoint names the health fact whose repair would let it pass and no other", () => {
+  const { input, facts, checkpoint } = hostActivation();
+  expect(fleetPatchCheckpointAllowed(input, checkpoint)).toBe(true);
+  const refused = (changed: Partial<FleetPatchFacts>) => {
+    const next = { ...checkpoint, facts: { ...facts, ...changed } };
+    expect(fleetPatchCheckpointAllowed(input, next)).toBe(false);
+    return fleetPatchCheckpointRefusalCode(input, next);
+  };
+  expect(refused({ databases_ready: false })).toBe(
+    "patch_checkpoint_invalid_databases_ready",
+  );
+  expect(
+    refused({
+      cluster_nodes: [{ ...facts.cluster_nodes[0]!, node_ready: false }],
+    }),
+  ).toBe("patch_checkpoint_invalid_cluster_nodes_ready");
+  // The node explains the databases on it, so the cascade names the node.
+  expect(refused({ node_ready: false, databases_ready: false })).toBe(
+    "patch_checkpoint_invalid_node_ready",
+  );
+  // A health fact that repairing would not lift is not the cause of the refusal.
+  expect(
+    refused({ databases_ready: false, host_configuration_sha256: undefined }),
+  ).toBe("patch_checkpoint_invalid");
+  expect(refused({ host_configuration_sha256: "0".repeat(64) })).toBe(
+    "patch_checkpoint_invalid",
+  );
 });
 it("the existing late identity check fences a host-only activation reboot and forbids OS stages", () => {
   const { input, facts, checkpoint } = hostActivation();

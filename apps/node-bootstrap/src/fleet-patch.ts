@@ -8,6 +8,8 @@ import {
   FleetPatchInput,
   FleetPatchStatus,
   fleetPatchCheckpointAllowed,
+  fleetPatchCheckpointRefusalCode,
+  fleetPatchUnhealthyFact,
   fleetPatchRuntimeMatches,
   fleetPatchKubernetesImagesMatch,
   fleetPatchHostServiceObserved,
@@ -955,7 +957,10 @@ export async function runFleetPatch(
         ),
       );
       if (!fleetPatchCheckpointAllowed({ ...input, status: current }, value))
-        throw new BootstrapError("patch_checkpoint_invalid");
+        // The code names the health fact whose repair would let the checkpoint pass.
+        throw new BootstrapError(
+          fleetPatchCheckpointRefusalCode({ ...input, status: current }, value),
+        );
       let raw: unknown;
       try {
         raw = await call({ kind: "checkpoint", ...value });
@@ -1046,8 +1051,9 @@ export async function runFleetPatch(
       return current;
     }
     if (current.stage === "preflight") {
-      if (!facts.node_ready || !facts.databases_ready)
-        throw new BootstrapError("patch_preflight_unhealthy");
+      const unhealthy = fleetPatchUnhealthyFact(facts);
+      if (unhealthy)
+        throw new BootstrapError(`patch_preflight_unhealthy_${unhealthy}`);
       await checkpoint("preflight", "confirmed", facts);
     } else if (current.stage === "host_config") {
       if (fleetStateReapplyDisposition(current) === "readback") {

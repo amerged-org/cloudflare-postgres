@@ -453,6 +453,20 @@ export function fleetPatchKubernetesImagesMatch(
     )
   );
 }
+/** The first failing health fact, in the order a failure cascades: a node that is not Ready explains the
+ *  members and databases on it. Null when the node, every member and every database is healthy, which
+ *  every stage that writes or verifies requires. */
+export function fleetPatchUnhealthyFact(
+  facts: Pick<
+    FleetPatchFacts,
+    "node_ready" | "databases_ready" | "cluster_nodes"
+  >,
+): "node_ready" | "cluster_nodes_ready" | "databases_ready" | null {
+  if (!facts.node_ready) return "node_ready";
+  if (!facts.cluster_nodes.every((v) => v.node_ready))
+    return "cluster_nodes_ready";
+  return facts.databases_ready ? null : "databases_ready";
+}
 export function fleetPatchCheckpointAllowed(
   input: FleetPatchInput,
   next: FleetPatchCheckpoint,
@@ -474,10 +488,7 @@ export function fleetPatchCheckpointAllowed(
     )
   )
     return false;
-  const healthy =
-    facts.node_ready &&
-    facts.cluster_nodes.every((v) => v.node_ready) &&
-    facts.databases_ready;
+  const healthy = fleetPatchUnhealthyFact(facts) === null;
   if (next.state === "halted")
     return next.stage === current.stage && current.state !== "dispatched";
   if (
@@ -759,6 +770,32 @@ export function fleetPatchCheckpointAllowed(
     matches.kubernetes &&
     healthy
   );
+}
+/** The failure code of a checkpoint the executor refuses before it posts it. When repairing the failing
+ *  health facts would let the checkpoint pass, they are its cause and the code names the first of them,
+ *  for example `patch_checkpoint_invalid_databases_ready`; any other refusal keeps the bare code. */
+export function fleetPatchCheckpointRefusalCode(
+  input: FleetPatchInput,
+  next: FleetPatchCheckpoint,
+): string {
+  const fact = fleetPatchUnhealthyFact(next.facts);
+  if (
+    fact &&
+    fleetPatchCheckpointAllowed(input, {
+      ...next,
+      facts: {
+        ...next.facts,
+        node_ready: true,
+        databases_ready: true,
+        cluster_nodes: next.facts.cluster_nodes.map((v) => ({
+          ...v,
+          node_ready: true,
+        })),
+      },
+    })
+  )
+    return `patch_checkpoint_invalid_${fact}`;
+  return "patch_checkpoint_invalid";
 }
 export function fleetPatchWritePreflightAllowed(
   input: FleetPatchInput,
