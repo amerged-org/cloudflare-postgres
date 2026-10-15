@@ -493,7 +493,7 @@ CNPG wake. No writer exists while a Pod is fenced.
 
 Warm reclaim is implemented in the API and the host publisher but inactive on the live fleet: no
 node is qualified and no database carries a policy, so every idle database takes the sleep path
-above. The node reclaimer binary is built by CI and not deployed.
+above. The node reclaimer binary was deleted (2026-10-15) and no node can execute reclaim.
 
 The default idle path remains Pod-cold hibernation. Administrators explicitly configure a database
 with `GET`/`PUT /v1/databases/{id}/warm-reclaim` (`expected_revision`, `expected_generation`, and a

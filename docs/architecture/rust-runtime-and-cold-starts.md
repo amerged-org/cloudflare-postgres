@@ -338,8 +338,8 @@ Successful proxy-side authentication cannot bypass PostgreSQL's authentication o
 
 ## 12. Additional warm reclaim
 
-**Status.** The API policy and the host publisher are implemented; the node reclaimer binary is built
-and not deployed, no node is qualified and no database carries a policy. This mode is additional to
+**Status.** The API policy and the host publisher are implemented; the node reclaimer binary was deleted
+(2026-10-15), no node is qualified and no database carries a policy. This mode is additional to
 the parked tier and the deferred shared compute pool. It may optimize an already assigned idle
 runtime; it is not pool implementation or evidence for pool-hit latency.
 
