@@ -303,9 +303,11 @@ export async function withAdmissionMutation<T>(
       .first<{ revision: number }>();
     if (!reserved) throw conflict();
     scopeRevision = reserved.revision;
-    // New create/placement commits reject this pending scope before membership is read.
+    // New create/placement commits reject this pending scope before membership is read. A database
+    // whose deletion is confirmed admits nothing, so it is no member: each member costs Actor and D1
+    // round trips while the fence holds every member.
     const rows = await env.DB.prepare(
-      `SELECT d.id FROM databases d WHERE d.${scopeColumn[scope.kind]}=? AND (${scope.databases?.sql ?? "1=1"}) ORDER BY d.id`,
+      `SELECT d.id FROM databases d WHERE d.${scopeColumn[scope.kind]}=? AND NOT (d.deleted_at IS NOT NULL AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation) AND (${scope.databases?.sql ?? "1=1"}) ORDER BY d.id`,
     )
       .bind(scope.id, ...(scope.databases?.bindings ?? []))
       .all<{ id: string }>();

@@ -364,6 +364,49 @@ it("a scoped epoch commit immediately hints the affected regional desired state"
   }
 });
 
+it("a scope fence leaves a database whose deletion is confirmed out of its membership", async () => {
+  const f = await ready();
+  const create = async (name: string) =>
+    DatabaseWithOperation.parse(await (await f.create(name)).json()).database
+      .id;
+  const gone = await create("gone"),
+    leaving = await create("leaving"),
+    now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE databases SET desired_state='deleted',deleted_at=?,observed_state='deleted',observed_generation=generation WHERE id=?",
+    ).bind(now, gone),
+    // A deletion the controller has not confirmed yet still belongs to the scope.
+    env.DB.prepare(
+      "UPDATE databases SET desired_state='deleted',deleted_at=? WHERE id=?",
+    ).bind(now, leaving),
+  ]);
+  const epoch = (id: string) =>
+    env.DB.prepare(
+      "SELECT admission_revision FROM database_admission_epochs WHERE database_id=?",
+    )
+      .bind(id)
+      .first<number>("admission_revision");
+  const before = await epoch(gone);
+  let members: string[] = [];
+  await withAdmissionMutation(
+    env,
+    [],
+    async (mutation) => {
+      members = mutation.intents.map((intent) => intent.database_id);
+      const guard = mutation.scopeGuard();
+      await mutation.batch([
+        env.DB.prepare(
+          `UPDATE regions SET updated_at=? WHERE id=? AND ${guard.sql}`,
+        ).bind(now, f.region, ...guard.bindings),
+      ]);
+    },
+    { kind: "region", id: f.region },
+  );
+  expect(members.sort()).toEqual([f.id, leaving].sort());
+  expect(await epoch(gone)).toBe(before);
+});
+
 it("a project scope fence rejects a new member before its existing Actor can be mutated", async () => {
   const f = await ready();
   await withAdmissionMutation(

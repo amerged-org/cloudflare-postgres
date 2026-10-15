@@ -444,36 +444,44 @@ it("a real project ABORT fences its delayed original SQL authority without repla
     .bind(new Date().toISOString(), f.id)
     .run();
   const before = (await epoch(f.id))!;
+  // The project fence's own reservation is the authority the aborted request held.
+  await env.DB.exec(
+    "CREATE TABLE IF NOT EXISTS held_project_authority(mutation_id TEXT,revision INTEGER)",
+  );
+  await trigger(
+    `CREATE TRIGGER hold_project_authority AFTER UPDATE OF mutation_status ON admission_scope_fences WHEN NEW.kind='project' AND NEW.scope_id='${f.project}' AND NEW.mutation_status='pending' BEGIN INSERT INTO held_project_authority VALUES(NEW.mutation_id,NEW.revision); END`,
+  );
   await trigger(
     `CREATE TRIGGER abort_project_policy BEFORE UPDATE OF deleted_at ON projects WHEN NEW.id='${f.project}' BEGIN SELECT RAISE(ABORT,'project commit interrupted'); END`,
   );
+  let held: { mutation_id: string; revision: number };
   try {
     expect(
       (await request(`/v1/projects/${f.project}`, f.admin, "DELETE")).status,
     ).toBe(500);
+    held = (await env.DB.prepare(
+      "SELECT mutation_id,revision FROM held_project_authority",
+    ).first<{ mutation_id: string; revision: number }>())!;
   } finally {
-    await env.DB.exec("DROP TRIGGER abort_project_policy");
+    await env.DB.exec(
+      "DROP TRIGGER abort_project_policy; DROP TRIGGER hold_project_authority; DROP TABLE held_project_authority",
+    );
   }
-  const after = (await epoch(f.id))!;
-  expect(after.mutation_outcome).toBe("fenced");
-  expect(after.admission_revision).toBe(before.admission_revision + 1);
-  const scoped = await env.DB.prepare(
-    "SELECT revision FROM admission_scope_fences WHERE kind='project' AND scope_id=?",
-  )
-    .bind(f.project)
-    .first<{ revision: number }>();
+  // The project's only database is a confirmed deletion: no member, so its epoch is untouched.
+  expect(await epoch(f.id)).toEqual(before);
+  expect(
+    await env.DB.prepare(
+      "SELECT revision,mutation_id FROM admission_scope_fences WHERE kind='project' AND scope_id=?",
+    )
+      .bind(f.project)
+      .first(),
+  ).toEqual({ revision: held.revision + 1, mutation_id: null });
   const old = new AdmissionMutation(
       env,
-      [
-        {
-          database_id: f.id,
-          admission_revision: before.admission_revision,
-          route_revision: before.route_revision,
-          mutation_id: after.completed_mutation_id!,
-        },
-      ],
+      [],
       { kind: "project", id: f.project },
-      scoped!.revision - 1,
+      held.revision,
+      held.mutation_id,
     ),
     guard = old.scopeGuard();
   expect(
