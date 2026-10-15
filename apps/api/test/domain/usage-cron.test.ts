@@ -436,6 +436,49 @@ describe("bounded usage cron", () => {
     await runUsageCron(env.DB, start + 9 * USAGE_HOUR_MS);
     expect(await rows(id)).toEqual(saved);
   });
+  it("stops a database whose deletion was recorded only after its hours had been rolled up past it", async () => {
+    // A never-placed database is deleted without a lifecycle event, so before its deletion time
+    // counted as the end of metering the cron treated it as live and advanced its pointer.
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = start + 40 * USAGE_HOUR_MS,
+      deletedAt = start + 2 * USAGE_HOUR_MS + 600_000;
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE databases SET desired_state='deleted',deleted_at=?,observed_state='deleted' WHERE id=?",
+      ).bind(iso(deletedAt), id),
+      env.DB.prepare(
+        "INSERT INTO usage_rollup_progress(database_id,next_hour) VALUES(?,?)",
+      ).bind(id, iso(start + 38 * USAGE_HOUR_MS)),
+      ...[1, 2, 30].map((hour) =>
+        env.DB.prepare(
+          `INSERT INTO usage_samples(database_id,source,producer_id,sequence,interval_start,interval_end,observed_at,payload)
+        VALUES(?,'backup','r2_a',?,?,?,?,?)`,
+        ).bind(
+          id,
+          hour,
+          iso(start + hour * USAGE_HOUR_MS),
+          iso(start + hour * USAGE_HOUR_MS),
+          iso(start + hour * USAGE_HOUR_MS),
+          JSON.stringify({
+            source: "backup",
+            database_id: id,
+            producer_id: "r2_a",
+            sequence: hour,
+            observed_at: iso(start + hour * USAGE_HOUR_MS),
+            backup_bytes: 1,
+          }),
+        ),
+      ),
+    ]);
+    const result = await runUsageCron(env.DB, now);
+    expect(result.failed).toBe(0);
+    expect(result.databases).toBe(1);
+    // The two samples older than the retention day go; the one inside it follows later.
+    expect(result.pruned).toBe(2);
+    expect(await rows(id)).toHaveLength(0);
+    expect(await progress(id)).toBe(iso(start + 38 * USAGE_HOUR_MS));
+  });
   it("fails closed on malformed persisted hour state", async () => {
     const f = await cohort(),
       id = f.ids[0]!;

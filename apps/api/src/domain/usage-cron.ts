@@ -228,11 +228,10 @@ export async function runUsageCron(
         .first<{ next_hour: string }>();
       if (!progress) throw new Error("usage_database_cursor_missing");
       let next = hour(progress.next_hour);
-      if (
-        next < created ||
-        next > current + USAGE_HOUR_MS ||
-        (terminal !== null && next > terminal + USAGE_HOUR_MS)
-      )
+      // A pointer beyond the window of a deleted database is a closed window, not corruption: a
+      // database deleted before it was placed has no deleted event, so the cron metered it as live
+      // until its deletion time began to end its window. Nothing more is rolled up for it.
+      if (next < created || next > current + USAGE_HOUR_MS)
         throw new Error("invalid_usage_database_cursor");
       result.pruned += await pruneUsageSamples(
         db,
