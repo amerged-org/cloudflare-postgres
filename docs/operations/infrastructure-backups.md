@@ -17,11 +17,6 @@ after the failed attempt ended, at most three attempts per UTC day, and never wh
 another run is pending or running. Fresh installations have backups disabled and
 no email addresses configured.
 
-To upgrade an installation that already applied `0039`, apply migration `0043` and
-deploy the matching Worker back to back: the previous Worker's Cron inserts runs with
-`ON CONFLICT(day)`, which fails against the rebuilt runs table. Never roll the Worker
-back below commit `efb9282` unless the `0039` tables are restored.
-
 Set the operator-configurable `containers[].max_instances` high enough for a backup
 to run alongside node patches and installations. The example uses eight because a
 fleet patch keeps its container for the inactivity window after it finishes. These
