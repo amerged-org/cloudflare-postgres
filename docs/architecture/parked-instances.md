@@ -1017,6 +1017,16 @@ next run, not of this list:
   became four requests in one. A parked wake with items 3 to 10: 126 reads and 19 writes became 101
   reads and 19 writes; the pass over the awake database after it, 92 reads and 2 writes, became 84
   reads and no write (with item 9).
+- Reads of the same kind around them, issued together as well (no write moved and none is dropped
+  half sent): the identity of the cluster with the fence, then the Node, the deletion marker, the
+  namespace, the receipt and the Cluster at the start of a pass (7 sequential reads became 2
+  rounds); in the release of the fence the anchor with the fence and the binding with the gateway
+  snapshot (2 rounds fewer); in the archive probe the credential, the Cluster, the Pod and the
+  receipt read again after its questions (3 rounds became 1); the claim with the receipt of the
+  volume's binding, the namespace label with the primary, the authority with its published copy,
+  and the resumed Pod with the record of the wake (1 round fewer each). Everything above together,
+  with every Kubernetes request of the in-process world answered after the same delay: a parked
+  wake of 145 requests in 115 sequential rounds became 120 requests in 50 rounds.
 - Item 9: the version of every object the controller writes is remembered, and the watch event of
   exactly that version hints no database; a pass over an unchanged awake database writes nothing.
   Live, an awake database was reconciled 1.5 times a second as long as it stayed awake (89 requests
