@@ -1,8 +1,9 @@
 # ULTRA — customer-ready PostgreSQL
 
-Canonical scope and status. The owner decision of **11 October 2026** makes the fleet EU-only and
-supersedes the earlier execution order, including the 03:30 Europe/Amsterdam coaching of the same
-day. Customer migration is not yet authorized.
+Canonical scope and status. The owner decision of **11 October 2026** makes the fleet EU-only. On
+**15 October 2026** the owner approved going live: OMH creates its new databases on PGCF once the
+[go-live path](#go-live-path) is complete; existing Neon databases move afterwards in a separate
+step.
 
 ## Fixed scope
 
@@ -10,22 +11,30 @@ Cloudflare is the global control plane: it owns configuration, placement, progre
 provider actions for every region. The fleet is **EU control** (relay host, no customer databases)
 and **customer EU1**. Preserve both servers, existing data and keys; no EU reinstall. The US region
 is cancelled at Contabo (contract ends 2026-11-04); US1 was marked lost on 2026-10-11 and is no longer patched.
-US and Oceania return later from the same region configuration. Purchases and autoscale remain off during the current EU1 acceptance; new paid resources require the owner's explicit, costed go.
+US and Oceania return later from the same region configuration. Purchases and autoscale stay off
+through go-live; enabling them, or any new paid resource, requires the owner's explicit, costed go.
 
 **R1-final is frozen:** the qualified Golden image containing the sandbox DNS/hostname fix,
 Talos 1.14.2 and Kubernetes 1.36.5. Its installer and raw image are privately distributed and
 fully verified. Further Golden changes require an observed boot or data blocker; other work
 belongs to R2. Runtime/platform references are immutable release inputs from the verified lock.
-R1.1 is the fleet release that carries these frozen bytes.
 
-**R1 uses standard PostgreSQL runtime.** A region API switch selects the pool runtime; it stays
-off for R1 acceptance and turns on for EU with R2. The shared prestarted pool, Rust runtime and
-measured first SQL below one second remain mandatory **before migration**. Pool tests must not
-block the standard-runtime fleet acceptance.
+**Runtime.** Databases run on CloudNativePG today. EU's region switch (`compute_pool`) is on and
+EU1 keeps one prestarted sandbox slot under R2.11. The shared warm PostgreSQL pool on thin storage
+(alternative 8), the native controller and gateway (done) and the Rust/Wasm Edge (delivered with the
+go-live release) and a measured first SQL below one second are required **before go-live**; the
+native bootstrap relay follows after go-live. Pool tests must not block standard-runtime acceptance.
 
 **New nodes require thin storage**; there is no thick fallback for them. Retained thick volumes
 keep their backend and data. Thin activation needs a release-bound receipt from the
-[qualification gates](#thin-storage-qualification-gates).
+[qualification gates](#thin-storage-qualification-gates); EU1's run 14 produced one on 2026-10-13,
+carried by R2.7 through R2.11.
+
+**From the canary on, the EU stack is production.** `pgcf-api-dev` and `eu-dev` are only names;
+there is no separate test environment. Fleet rollouts that reboot EU1, thin qualification runs,
+failure and density tests and material rotations then need the owner's go and an announced
+maintenance window, because a reboot of EU1 or control stops every awake database and the fleet has
+no region-wide maintenance lock; later acceptance uses dedicated test projects with stated limits.
 
 **Owner priority (2026-10-14):** deliver a sleeping Thin database's first SQL below one second through Cloudflare on a real shared-pool hit. Finish the required execution and data-preservation guards, deploy, and measure this path before broad acceptance repeats, density work or independent administrative features. Reuse valid completed checks; repeat tests only for relevant changes, concrete failures or required CI. A thick-only hit or an already-awake connection does not complete the goal. The full customer-ready scope remains required afterwards.
 
@@ -56,81 +65,82 @@ keep their backend and data. Thin activation needs a release-bound receipt from 
   with `first_region`, then `AddNode` for the control server (a region's first node becomes its
   control plane), placement off and role `control_relay`, then workers. The cancelled US records
   stay dormant and are not reused.
-- **Current constraints.** `AddNode` refuses before any provider order until the region selects a
-  thin-qualified release with matching `compute_pool` and `thin_storage` templates, so every new
-  node waits for R2b. Its outside network proof scans from a Ready, uncancelled node in another
-  Contabo region; while EU is the only region, an EU addition has no automatic scan source and
-  needs the manual network-proof path. EU also lacks its write-once installation profile, which an
-  EU addition needs before it can install. The purchase itself checks neither, so an automatic EU
-  order after R2b would buy a server that waits for both.
+- **Current constraints.** EU selects a receipt-bearing release (R2.11) with matching `compute_pool`
+  and `thin_storage` templates, so the R2b gate is met. `AddNode` still needs every live EU member
+  converged, and EU1 reports `pending` while Thin is blocked (go-live step 2). An EU addition also
+  lacks the write-once EU installation profile, and its outside network proof needs a Ready node in
+  another Contabo region; while EU is the only region it needs the manual network-proof path. The
+  purchase itself checks neither, so purchases stay off.
 
 ## Done
 
 | Completed step | Measurement / boundary |
 | --- | --- |
 | Generic API controls | RAM threshold and purchase switches accepted live; fresh installations buy/send nothing. |
-| Credential retirement | US authority and route signer checked; current US custody metadata retains the same keys. EU replacement is prepared. |
-| Daily infrastructure backup | D1 and both etcd artifacts fully verified in R2; successful run 232.7 s. Email remains operator-configured. |
-| EU read-only preparation | 279 role documents validated; isolated role boot passed in 125.7 s; direct rescue/config/snapshot custody ready. |
-| US technical release | Ready at 21:35 UTC via Cloudflare; later operator repairs are counted separately. US database acceptance is no longer pursued. |
-| Corrected sandbox runtime qualification | AMD64 proof passed: pool claims 10.4/11.5 ms. These are runtime timings, not first-SQL results. |
-| Frozen R1-final image | One installer/raw composition: 11.5/28.0 s. Five private immutable objects fully read back; public eligibility remains open. |
-| Observed-error class corrections | Generation, host-file activation, Kubelet pin, persistent taint and safe held-target replacement tested; qualified/current delivery varies below. |
-| Batch A deploy | API and NodeBootstrap from `1de03f2` deployed; successors drop lost members and `operator_hold_` holds. |
-| US1 retired | Marked lost at 12:01 UTC on 2026-10-11; one pending US test database record remains for the Cloudflare US cleanup. |
-| EU hold release | EU-only R1.2 successor `op_3ts0qw8s0tey6u7wvdkn` started the rotation; snapshot through discovery-secret confirmed, after list-kind and binding-order fixes found live. |
-| EU rotation | Material revision 2 active at 23:32 UTC on 2026-10-11, 21 s after a fresh verification; revision 3 records Talos 1.14.2 / Kubernetes 1.36.5. Both encryption rewrites (50 Secrets each) and the paged ciphertext proof passed; retired authority is rejected. |
-| EU1 | R1.2 converged (Talos 1.14.2, Kubernetes 1.36.5) without operator intervention; Flux turns take about 3 min after read batching instead of exceeding the 600 s turn. |
-| Control | R1.2 converged; the relay answered 5 min after the etcd-CA reboot and 4 min after each host-service reboot; the operator-published kubelet trust map was adopted through code. |
-| EU acceptance | New database ready in 30.7 s, SQL through Cloudflare 0.57 s (PostgreSQL 18.6), base backup and 3 WAL files in R2 after 20.7 s, delete and storage reclaim 93.3 s; existing databases answered in 0.69–0.93 s; RAM window valid on both nodes. |
-| Cold-start baseline | Standard runtime on EU1 (R1.2): first SQL after wake 9.6–11.2 s through Cloudflare; connect → database Pod Ready 4.9–6.6 s; Pod Ready → admission 4–5 s (agent cadence, role and archive probes, fence, observation, Actor D1 poll). |
-| Sandbox proof storage-expiry stop | The proof raised the material revision before the guard held the new lease, so the guard refused it and nothing stopped; it now waits for the guard (`5314d95`). The other failures of 2026-10-11 are a separate shim transport defect. |
-| Thin qualification | Run 14 passed all seven gates on EU1 and produced the receipt; normal cleanup restored exactly **97,706,311,680 free bytes**. `data_full` grew 16→24 GiB with the same pool UUID, preserved all 4,160 acknowledged commits and restarted PostgreSQL in 5,137 ms. With option 1 sampling every 2 s, `startup_bound` had 2 accepted samples, scrape p99 119 ms and maximum accepted gap 3,574 ms < 5,000 ms; `noflush_quiescence` had 8 samples, p99 134 ms and maximum gap 2,737 ms. Both windows had complete native coverage and zero unknown samples; the identity cycle took 32,092 ms < 60,000 ms. Noflush froze 567,283,712 dirty bytes with zero new sectors or blocks, drained in 4,700 ms and passed fsck with exit 0. |
-| Database placement and filters | the existing EU1 stack exposes nullable `node_id` and conjunctive project, region, node, desired-state and public observed-state filters. Live GETs returned the retained hibernated database for the full intersection and no records for the control node or conflicting states; two one-record pages follow the server cursor without duplication, and malformed cursors return 400. Project-scope and deleted-record exclusion regressions pass in real D1; project-scoped credential isolation was not exercised live. The strict SDK and API must use the matching contract revision. |
-| OpenAPI completeness | the delivered documents cover 112 public, 13 agent and 21 internal operations. Three authenticated live GETs verified all 146 unique operation IDs, summaries, scoped paths and resolved component references, with the actual deployed Worker UUID, source tag and timestamp. Source-backed header/error tests and the combined 1,075 API tests pass. |
+| Frozen R1-final image | One installer/raw composition: 11.5/28.0 s; five private immutable objects fully read back; public eligibility is listed under [after go-live](#after-go-live). |
+| EU-only fleet | US1 marked lost 2026-10-11; EU material revision 3 (Talos 1.14.2, Kubernetes 1.36.5) active with retired authority rejected; R1.2 converged on EU1 and control without operator intervention. |
+| EU acceptance (standard runtime) | New database ready in 30.7 s, SQL through Cloudflare 0.57 s, base backup and WAL in R2 after 20.7 s, delete and storage reclaim 93.3 s. |
+| Wake path | Cold wake to first row 8.1–9.4 s (Gate 0, 2026-10-12, no RuntimeClass); awake first row 0.47–0.96 s (0.54–0.61 s in the Gate 0 warm rounds); Pod Ready → Edge admission about 1.1–2.9 s after the wake orchestration (was 4–5 s; Pod Ready at one-second resolution). |
+| R2 native runtime | R2.11's native controller and gateway patches completed on EU1 (09:45Z) and control (09:51Z) on 2026-10-14; since the Thin block (go-live step 2) EU1 and the R2.11 rollout report `pending`. The usage outbox drains and a woken database sleeps after 60 s idle. |
+| EU1 upgrade | 6 vCPU and 12 GB (11,943 MiB visible); the reboot's configuration proof and kubelet pin were renewed through the fleet path; idle node CPU 3.23 %, RAM 8.72 %. |
+| Thin qualification | Run 14 passed all seven gates; `startup_bound` maximum sample gap 3,574 ms < 5,000 ms; cleanup restored the volume group byte-exactly. |
+| Thin authority renewal | Option 1 deployed: native sampling every 2 s, capability gating and composed authority; scrape p99 119–134 ms in the qualification windows. |
+| R2b activation | R2.11 carries the run-14 receipt; the EU `thin_storage` template and the EU1 Thin selection (revision 9, new databases allowed) are installed; pool 16 GiB data and 1 GiB metadata, growing to 64 GiB. |
+| Thin database, first pass | Under R2.9 a new Thin database committed 1,000 rows through Cloudflare (its first start went through a protective sleep after a withdrawn startup authority), a manually started base backup and WAL reached R2, a restore returned the same digest and delete reclaimed both volumes. |
+| Daily infrastructure backup | D1 and EU etcd verified in R2; complete on 2026-10-13 (148.3 s) and 2026-10-15 (331.8 s). |
+| API reads | Database placement and conjunctive filters, node and region reads, paginated release and patch history verified live; the three OpenAPI documents (public 112, agent 13, internal 21) cover all 146 operations of the deployed Worker (`22c0164`). |
+| Warm pool design | Owner approved [alternative 8](warm-postgres-pool.md) (PGCF-supervised PostgreSQL in pre-created pool Pods) on 2026-10-12. |
 
-## Open
+## Go-live path
 
-One row per step, in dependency order. A step moves to Done only with its measured result.
+Owner approval of 2026-10-15. One row per step in dependency order; a step moves to Done only with
+its measured result. Steps 8–13 run in parallel with 3–7; the canary starts when 1–13 are done.
 
-| Step | Status | Finished when |
-| --- | --- | --- |
-| Cloudflare US cleanup | Open | The pending US test database record is removed; US Tunnel, VPC binding, firewall/rescue entries and tokens removed; `ARCHIVE_US` kept until retained US archives expire. |
-| Terminal Pods after reboots | Fixed in code | R1.2 carries the fixed regional agent, and after its reboot EU1 databases wake, suspend and delete. Failed or Succeeded Pods left by a reboot made these power transitions fail. |
-| CNPG in-place restart | Fixed in code | The pool runtime switch yields a primary Pod with the selected RuntimeClass, and the EU rotation's consumer renewal yields new database Pods. CNPG's default restart method applies `kubectl.kubernetes.io/restartedAt` inside the running Pod, but both need a new Pod. NodeBootstrap carries the fix before the EU rotation; the native controller carries it with R2. |
-| Notifier | Open: the owner provides a Resend API key (Worker secret `RESEND_API_KEY`), a sender on a Resend-verified domain and a recipient. The OpenAPI document describes email, thresholds and alert status. Alerts evaluate at most four regions; a config PUT fails a running backup. | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. CPU values arrive only from R2's native controller. |
-| R2 | In progress: R2.1 (`65350a4`: CA roots, list TypeMeta), R2.2 (`dc635b2`: OpenEBS node affinity) and R2.3 (controller `d8aa83b`, gateway `fea5fc6`, route token v3) converged on EU1 and control; the Edge signs v3 since 2026-10-12 16:10Z. R2.4 (`r2.4-ultra-fb5b8ed`: controller and gateway `fb5b8ed`, no thin receipt) rolled out with `op_cbf4t1p9g1hnwftapbk2` (complete 21:24Z; checks 1–3 and 6 pass, the retained database keeps 8 base backups and 95 WAL files in R2, check 4 waits for the thin decision); once its controller ran on EU1 (20:45Z) the retained database's outbox drained and it slept again after 60 s idle (20:46Z). Found live on the way: the measurement checkpoint identity compared raw strings (fixed `ef83c96`), and late usage samples for finalized hours got 409 forever, wedging the outbox and retrying every 250 ms (fixed `eb4b98f`; the API acknowledges them as refused). | The controller from `eb4b98f` converges on EU1 and control, six checks pass, and a woken database sleeps after `sleep_after_seconds`. |
-| Pool cold-start test | Open | A sleeping database's pool-hit first SQL is measured from one start (<1 s target, unproven), data is preserved and refill is observed; a miss is labelled a miss. |
-| Thin authority renewal | In progress: owner-approved option 1. Capability gating, composed authority, retry cadence and the native fast loop are deployed. Fresh inventory now remains available as read-only reclamation proof after its short write lease expires. The failed first Thin database reached deleted generation 3 and released its startup reservation. The startup-renewal and pre-Ready custody repair passes 119 controller tests, actual Kubernetes CAS and PVC-replacement checks, and a GET-only probe on both live nodes. R2.10 is fully confirmed and converged on both nodes. The retained database is suspended/hibernated at generation 36; its successful Fleet resize preserved the PostgreSQL image, original 5 GiB linear volume and PVC. | R2b is active and all live acceptance checks in section 11 of the [proposal](thin-authority-renewal.md) pass. |
-| R2b | In progress: run 14 qualified Thin and both R2.10 nodes are converged. EU1 selection revision 9 is installed. New placement is paused after a restore exposed missing operation identity in pre-Ready storage protection; fresh startup authority alone cannot clear that protection. The latest source became ready in 42.1 s and committed 1,000 rows through Cloudflare in 0.936 s after readiness. Its automatic base backup and four WAL files reached R2; committed WAL was confirmed after 66.69 s. Restore did not finish. Normal cleanup reclaimed both test volumes in 231.56 s, returned the VG to 97,706,311,680 free bytes and preserved the original database. Both old startup reservations released. A previous separate restore returned all 1,000 rows with the same digest, but its overall acceptance retained a diagnostic gap. The deployed headroom repair reserves every retained Thin LV’s full measured logical size; sleeping overbooking remains open. The producer fix retains the restore operation and passes 25 API and 122 controller tests, plus actual Kubernetes marker/replay and same-generation refusal checks. Deploy it, then repeat automatic backup/restore, idle/wake and authority-renewal acceptance. | An R2 successor carries the receipt; the EU thin template and EU1 selection/placement are active; Thin create, automatic backup, restore and delete pass with sound all-write exposure accounting; all section 11 authority checks and density/sleeping-CPU measurements pass. |
-| Density load test (12 GB node) | Open: owner-confirmed EU1 RAM upgrade to 12 GB; the same 17-database workload runs after Thin qualification and R2b. Needs `ef83c96` delivered, retained databases suspended, `autoscale_enabled` false, no held node addition and purchases off; storm latency after Wake orchestration; repeated once after the warm pool ([definition](#density-load-test-12-gb-node)) | On EU1, 16 × 256 MiB and 1 × 1 GiB thin databases are created, sleep and wake through Cloudflare; the observed awake limit equals the CPU-admission arithmetic, excess starts get 57P03 or wait unplaced, and no database Pod stays Pending; sleeping CPU release, per-database and node RAM/CPU idle and under load, non-Pod memory and one 256 MiB OOM recovery are measured; no acknowledged commit is lost or replayed, no platform Pod is evicted, nothing is bought; storage is reclaimed and the kubelet reservation is confirmed or changed. |
-| Daily infrastructure backup | In progress: 2026-10-11 failed (US snapshot source, since fixed) and 2026-10-12 failed because two fleet-patch containers held both NodeBootstrap instances. `max_instances` is 8 and failed days now retry up to three times. 2026-10-13 completed on attempt 1 in 148.3 s (D1 413 MB, EU etcd 59 MB); a same-day retry after a failure is not yet shown. | The next run completes D1 and EU etcd, and a forced failure retries the same day. |
-| Lost-node patch closure | Open | Marking a node lost closes its unfinished patch operations, so they no longer block its region's patch, rollout and placement guards. |
-| Relay-host material reboots | Open | Version-metadata material synchronization does not reboot the relay host again when its host files are unchanged (revision 3 caused a second host-service reboot). |
-| Relay transport cost | In progress | Every relay connection needs its own 2–6.6 s single-use transport; transports are issued in batches so long stages stay inside the 600 s turn by design. |
-| NodeBootstrap turn delivery | Fixed in code (`525b316`): turns are registered with 202 and followed by the container's own record; run 11 ran 13 turns without a lease wait. A lost request has not recurred since. | A Durable Object's request to its NodeBootstrap container that is lost before the container accepts it no longer holds the turn until its timeout: thin qualification run 9 lost 11 minutes on a held lease and the R2.4 control patch 13 minutes in `runtime_admission` (2026-10-12). |
-| Region controller | Design ([proposal](region-controller.md)) | Customer worker patches run on the control server against local Talos and Kubernetes APIs with checkpoints in Cloudflare; the relay path stays for AddNode, the control server itself and material rotation. |
-| Fleet inventory API | In progress: node inventory is delivered and verified on the existing EU1 stack. Three nodes paginated as 2 + 1; EU node and region item reads expose current roles, observed runtime versions and current-UID latest patches. EU1 reports pending while Thin is blocked, control converged, and the retired node unobserved. Release-approval and patch-history lists are delivered: 39 read-only live requests paginated 14 releases and 34 patch operations across seven pages each, with stable cursor replay, no duplicates and conjunctive node/region/release filters. Durable rollout history remains open. | One call lists every node with region, role, Talos/Kubernetes versions, release state and latest patch; releases, rollouts and patch operations can be listed; `GET /v1/nodes/{id}` and `GET /v1/regions/{id}` exist; the agent version is stored and shown. |
-| Infrastructure metrics history | Open | Node RAM, CPU and disk time series are readable (node samples live 12 min and only current values are returned). Per-database usage already has hourly/daily history; measured CPU and RAM per database are added. |
-| Node lifecycle | Open | A node can be drained, its databases moved with their IDs kept, and decommissioned with the provider instance cancelled and its slot freed; today only placement close and mark-lost exist, and restore creates a new ID. |
-| Audit, events and operations | Open | Admin mutations record the acting key; long-running operations can be listed through one shape; state changes can be consumed without per-resource polling. |
-| Access security | Open | A read-only scope exists; keys expire, show last use and rotate, region agent keys included; admin key minting is bounded; the frontend runs behind Cloudflare Access with a proxy Worker that holds the key (the API has no CORS); the API has its own domain with rate limiting. |
-| Alert operations | Open | Alerts keep history and node details, can be acknowledged, cover database archiving and disk, show their delivery configuration and offer a test send; every region is evaluated (today the first four policy regions, which also limits capacity retries and autoscale). |
-| Infrastructure backup operations | Open | Run history is readable, a failed run can be retried the same day, and changing the alert email no longer fails a running backup. |
-| Control-plane self-health | Open | The minute cron stores and exposes each step's outcome; one failing region or step no longer stops the steps after it unnoticed. |
-| Restore UX | Open | Backups and the restorable time window are listable, deleted databases can be found and restore refusals are explicit. |
-| EU2+ prerequisites | Open | EU installation profile, a network-proof source while EU is the only Contabo region, and the thin receipt (R2b) exist; AddNode installs EU2 from the Golden image and patches it to EU1's level. |
-| Sub-second decision | Owner direction 2026-10-12: prestarted PostgreSQL in warm Pods, X per node, a database bound on connect and detached after `sleep_after_seconds` (60–900 s for 1–15 min). The [warm pool proposal](warm-postgres-pool.md) recommends PGCF-supervised PostgreSQL in pre-created pool Pods (alternative 8), the only design that removes Pod creation from a wake. Gate 0 assessment: a pool hit removes Pod creation through Pod Ready (about 6 s); the remaining orchestration after PostgreSQL is ready (1.2–2.2 s today), the pool Pod's PostgreSQL start and the 0.5–0.6 s awake path must together stay under 1 s, so 1–2 s is the realistic first result and under 1 s is not structurally excluded. | The design for archiving, backups, single writer, TLS custody and network identity is written and accepted. |
-| Shared PostgreSQL warm pool on thin storage | Implementation in progress. Local actual-kernel checks cover thin device identity, exclusive mounts, durable CSI exclusion, busy unmount refusal and content-preserving detach/rebind. Actual Kubernetes checks cover Lease identity/CAS and restricted Pod manifests. The supervisor serves stock PostgreSQL over verified TLS; the gateway preserves a busy transaction through idle drain. Pinned containerd/runc with a private PID namespace proved that a host cleanup worker keeps its exact original cgroup while container stop waits; after the worker exits and is reaped, stop and removal complete. This is local Linux 6.8 evidence, not Talos qualification. A paired ordinary direct-IO experiment wrote the same 8 MiB through two persistent workers in 56.36 ms without a dedicated cap and 8,525.41 ms at 1 MiB/s and 256 IOPS; worker and ancestor counters were measured and all test resources removed. This demonstrates workload throttling, not an all-write bound. Thin cleanup execution, integrated backup/restore and qualification on EU1 remain open. No shared-pool hit latency has been measured live. | All [alternative 8 acceptance](warm-postgres-pool.md#a87-component-changes-and-acceptance) checks pass on EU1; sleeping thin database to first SQL through Cloudflare is below 1 s on a real shared-pool hit, data and archive continuity hold, slots refill and density is measured again. |
-| Wake orchestration | Delivered 2026-10-12: Actor push and route token target (API `fea5fc6`, migration 0045), immediate controller publication (controller `d8aa83b`), v3 route verification and direct dial (gateway `fea5fc6`), v3 signing (Edge version `bfc0ab53`). Measured by Wake stage measurement. Measured 2026-10-12 (Gate 0, retained 1 GiB database, 3 wakes): Pod Ready → Edge admission complete 1.2–2.2 s, down from 4–5 s; connect → Pod created 0.08–0.83 s. | Pod Ready → admission falls well below the measured 4–5 s through immediate controller publication, Actor push instead of the 250 ms D1 poll and direct gateway routing. |
-| Wake stage measurement | Measured 2026-10-12 through Cloudflare from a laptop, v3 routes, gateway stage log (`fb5b8ed`). Cold wake of the retained database (Gate 0, 3 rounds, marker complete): first row 8.1–9.4 s (was 9.6–11.2 s); Pod created 0.08–0.83 s, PodReadyToStartContainers +1.0 s (sandbox, CNI, volume and fsGroup), init container 2.0–2.2 s, barman sidecar 2.8–3.2 s, postgres first log 4.0–5.2 s, PostgreSQL ready 4.7–6.0 s with pg_control `shut down`, Pod Ready 6.1–6.8 s, Edge admission complete 7.8–9.0 s, first server message +0.2–0.4 s, SCRAM and query +0.1 s. Awake path: first row 0.47–0.96 s (warm rounds 0.54–0.61 s); client → Edge 45–113 ms, Edge admission including the Actor and the Tunnel WebSocket 117–217 ms, gateway accept → StartupMessage 24–101 ms, PostgreSQL dial 3–12 ms, first backend byte 0–2 ms, round trip 23–43 ms. The rest of the 177–313 ms between admission and the first server message lies in Cloudflare between the Edge's 101 and the client's first bytes. | Every wake stage from connect to first row is measured in milliseconds on EU1, including the `fsGroup` change time, the pg_control state and the split of the 0.69–0.93 s awake path. |
-| Sandbox shim transport | Fixed in code | The CI proof passes on main without the early `shim_request_failed` of runs of `e7a4503`, `ac2cacc` and `fea5fc6` (attempt 1). A shim that received `Shutdown` removes its socket before it exits (2–1027 ms later here) and may exit before it replies; `Slot::destroy` reported that ENOENT, ECONNRESET or EOF as a failed release. The proof's refused claim sends one `Shutdown` and its CRI `Shutdown` a second; under build load a pool retirement's only `Shutdown` lost its reply. Destroy now waits up to 3 s for the exact shim exit through its pidfd and returns the request error only while the shim stays alive. Local arm64 proof: unchanged, 8 of 18 runs failed with the byte-identical CI log; fixed, 14 of 14 passed, 4 of them under build load. |
-| Flux object selection | Open | Fleet patches install only the selected Flux components, without image-automation or source-watcher objects whose controllers are not installed. |
-| Secret rewrite robustness | Open | A Secret created, changed or deleted during the encryption phases no longer stalls the rotation. |
-| EU control identity labels | Open | EU control's Node carries `pgcf.io/region` through its machine configuration, and the retained-node tolerance for the missing label is removed. |
-| Handover | Open | Client adapter, timeout policy, restore/new ID mapping, capacity and recovery are documented. Neon migration is a separate task. |
+| # | Step | Status | Finished when |
+| --- | --- | --- | --- |
+| 1 | Green main | CI red since `522934c` (2026-10-14 09:45Z); `d027043` fixes the three failures of `cfe3201` (two pool fixture builds, one storage-driver hash check) and the Thin host-file read; its run is in progress. Later CI steps (regional, infra and scripts tests, sandbox CRI proof, manifest render) have not run on the pool code. | One CI run on main passes every job and publishes all images. |
+| 2 | Pool host producer | Missing on main: nothing produces a fresh kernel observation of a sleeping Thin database before a qualification run exists, during gate 2 or at claim time, so the first live start returns 409. It lives in the host extension and must land before the installer is built. | The host extension reports a fresh observation (at most 60 s old) for every hibernated Thin database it may bind; its tests fail without the producer. |
+| 3 | Go-live release | R2.12 changes the native controller and gateway, the guarded storage driver, the host extension, the pool supervisor, the Talos installer for both roles and the Rust Edge; it needs API migrations 0047–0050 and a new NodeBootstrap first. EU1 is patched first, then control (one Talos install and reboot each). A receipt binds the driver, host extension, kernel and profile, so EU1 (already selected) cannot requalify: the documented default is a scratch qualification on the control node, then a receipt-bearing successor (R2.13) and a driver-only EU1 profile update. EU1 has no Thin write authority from its R2.12 patch until R2.13, which is acceptable only because it holds no customer data. | R2.13 carries a new receipt; both nodes are `converged`; EU1 Thin is `ready` on the new driver with placement open; every later release leaves kernel, driver and host extension unchanged or is announced as an outage of all Thin databases. |
+| 4 | Thin acceptance | The R2.10 pass (2026-10-14 07:25–07:35Z) committed 1,000 rows and archived base backup and WAL, but its restore could not restart after a startup-authority gap (fixed in R2.11); the only restore with a matching digest ran on R2.9 after a manual base backup. None of it applies to the go-live release. | On the go-live release: create, SQL through Cloudflare, automatic base backup and WAL, restore with the same digest, delete with reclaim, idle sleep and wake; a control reboot while a Thin database is awake under writes shows the protective stop, resume and no lost acknowledged commit; the checks of section 11 of the [renewal proposal](thin-authority-renewal.md) pass. |
+| 5 | Sub-second wake | No pool hit measured yet. Measured on EU1 (throwaway Pod, 2026-10-15): PostgreSQL 18.6 clean start reaches ready in 111–117 ms and answers SQL after 136–169 ms (8 rounds), against 0.7–0.8 s from first log to ready inside the CNPG wake; the awake path is 0.47–0.96 s. Gate 0 expects 1–2 s for a first hit, below 1 s is not excluded. | Three consecutive real pool hits deliver a sleeping Thin database's first SQL through Cloudflare below 1 s with every stage in milliseconds; data and archive continuity hold; the slot refills; misses are labelled. |
+| 6 | Pool enablement acceptance | The pool qualification has native producers only for its first two gates; mount propagation, thin write authority, I/O limits, base backup and expiry protection have none on main, and a normal-enabled pool needs the receipt of all gates. | [Alternative 8](warm-postgres-pool.md#a87-component-changes-and-acceptance) live acceptance items 2–5 pass on EU1: data and refill, detach after 60 s and 900 s, pool WAL and base backup restored through the API with the marker, a later CNPG wake archives on the same timeline, and supervisor kill, pool Pod deletion, node reboot with a bound slot and two wakes on one slot show no second writer and no lost commit. |
+| 7 | Density on EU1 | Defined [below](#density-load-test-12-gb-node); runs after steps 5–6 because the pool changes platform requests and idle RAM. | Awake limit K, sleep release and storm admission match the code for the class mix; maximum Thin databases per class and the memory-start bound are recorded; caps OMH must enforce are stated. |
+| 8 | Alerts | Waiting for the owner's Resend secret (`RESEND_API_KEY`) in Cloudflare, a sender on a Resend-verified domain and a recipient. Alert kinds cover infrastructure only: EU1 Thin has been `blocked` since 2026-10-14 16:01Z with no alarm, and the only EU database reports archive and disk `unknown`. The minute cron runs about 15 steps unisolated and ends with alerting and backup dispatch, so an earlier failure silently disables both. Changing the sender or recipient revokes an unfinished daily backup run. | One real alarm arrives at the named recipient; RAM, CPU, storage and infrastructure-backup alarms, per-database WAL-archive failure, base backup older than 36 h (hibernated skips excluded), Thin `blocked` and protective stop are delivered, each with a runbook action; a stopped or failing cron raises an alarm that does not depend on the cron; configuration is set outside the 00:00Z backup window. |
+| 9 | Backups | 2026-10-14 failed all three automatic same-day attempts with `infrastructure_backup_operator_portforward_timeout` while an R2.8 rollout was patching control (00:00–00:34Z); same-day retry works (2026-10-12 completed on attempt 3). Daily artifacts have only been read back, never restored; Cloudflare states that a running D1 export blocks other D1 requests while the 2 s write-authority samples need D1 within a 10 s guard. | The port-forward cause is fixed or rollouts avoid the window; one D1 artifact is decrypted with the offline key copy and imported into a scratch D1 with integrity checks, and the etcd artifact passes a snapshot status check; the export's request-block window is measured and a night with an awake Thin database under writes and one wake during the export shows no protective stop and no failed wake, otherwise method or schedule change. |
+| 10 | Control database growth | `usage_samples` has no retention: 636,689 rows for 66 databases since 2026-10-04, and the hibernated retained database alone wrote 17,456 rows (9 MB) in 24 h (gateway 11,340, agent 5,646, backup 470). At 100 databases D1's 10 GB limit is about two weeks away and the blocking export grows with it (413 MB on 2026-10-13, 468 MB on 2026-10-15). | Idle hibernated databases emit no samples; raw samples covered by finalized hourly rollups are pruned in bounded batches; D1 bytes per database per day and the headroom to 10 GB are recorded. |
+| 11 | Credential hygiene | The EU-archive read key issued for the US region and the US R2, Tunnel and source-read tokens are still valid (US1 is cancelled but running until 2026-11-04 and its configuration is treated as compromised); the Cloudflare account that holds PGCF's D1 and R2 is shared with unrelated projects whose account-wide tokens can read or change them (owner decision, see After go-live). | Each US credential is revoked and a read with it is refused while EU archive reads and writes still work; the pending US database record is removed; `ARCHIVE_US` is kept. |
+| 12 | Recovery | Per-database restore returns a new ID. Replacing a lost EU1 needs a purchase, `AddNode` recover, the EU installation profile and the manual network-proof path; control (relay, API server, sampling source) has no loss procedure; lost-node patch closure is open, so an unfinished patch on a lost EU1 blocks the region's rollout guard. | The EU installation profile exists; the owner has pre-approved a costed replacement order for an EU1 loss (or EU2 exists); lost-node patch closure is delivered; the runbooks for EU1 loss and control loss are written with their preconditions checked and state the measured control-reboot impact; no purchase is made. |
+| 13 | Integrator access and catalog | Project-scoped credential isolation has not been exercised live. Eight size classes are enabled, six of them test classes, and the 256 MiB class keeps backups for one day. | OMH has its own key whose scope and rotation are verified live; the owner approves the production class catalog (memory, CPU, storage, `max_connections`, `sleep_after_seconds`, `archive_timeout`, `backup_retention_days`) and test classes are disabled; the deployed handshake limit (120 new WebSocket connections per 60 s per database) is stated. |
+| 14 | Handover | Open | The [integrator handover](../operations/integrator-handover.md) states measured values: RPO and PITR window per class, Thin hit and miss latency, 57P03 meanings and retry rule, connection limits, role-change deferral on pool-bound databases, outage classes and maintenance windows, new IDs after restore or node loss, capacity caps; OMH confirms it in writing. |
+| 15 | OMH adapter | Not implemented (OMH decision D381); to be built in the OMH repository. | From OMH staging through `db.ohmyho.st` with the Neon serverless driver: create, role and connection URI, password reset, suspend and resume, resize, PITR restore rebound to the new ID, delete; 57P03 and capacity waits handled; hourly usage of a pool-served database matches its awake time. |
+| 16 | Canary | Open | At least five internal OMH databases run on the go-live release for at least 72 h including two nightly backup windows: each shows a completed base backup younger than 36 h and continuous WAL, no `53300` refusals, one PITR restore is rebound by OMH and no acknowledged commit is lost; then OMH creates all new databases on PGCF. |
+| 17 | Neon migration | After step 16; separate task. | Existing OMH databases move with a verified copy and a way back to Neon. |
 
-## Restart class — one pre-EU gate
+## After go-live
+
+Not gating go-live; ordered by expected need.
+
+- **Account separation (owner decision):** the Cloudflare account that holds PGCF's D1 and R2 is
+  shared with unrelated projects; moving PGCF to its own account, or at least listing and pruning
+  every token with D1, R2 or Workers write scope, removes that exposure.
+- **Capacity:** EU2 (owner's costed go) for redundancy and capacity; sleeping Thin overbooking,
+  which needs an all-write bound beyond `io.max`; node drain, move with kept IDs and decommission.
+- **Operations:** alert history, acknowledgement, test send and evaluation of every region;
+  backup run history; control-plane self-health; infrastructure metrics history; audit and events;
+  restore UX; durable rollout history.
+- **Access security:** read-only scope, key expiry, last use and rotation including region agent
+  keys, bounded admin minting, the frontend behind Cloudflare Access and an API domain with rate
+  limiting.
+- **Fleet:** relay-host material reboots, relay transport cost, the
+  [region controller](region-controller.md), Flux object selection, Secret rewrite robustness and
+  EU control identity labels.
+- **Public release:** public Golden image eligibility (anonymous manifest, config, layer and raw
+  readback) and installation polish for new operators.
+- **Cleanup and decisions:** Cloudflare US resources (keep `ARCHIVE_US` until the US archives
+  expire); the OpenEBS exporter patch upstream (owner go, outward-facing); the Thin `discard`
+  decision below.
+
+## Restart class
 
 | Changed fact | Required programmed behavior |
 | --- | --- |
@@ -152,10 +162,7 @@ Six checks per node:
 5. R2 base backup, archived WAL and real restore into a separate target.
 6. Existing databases and committed markers preserved.
 
-US intervention accounting retains three historical OS actions, one later operator configuration
-apply, public-pin/inventory repairs, one create retry and qualified consumer cycles. A programmed
-activation reboot is separate. Do not claim fully automatic US acceptance from those results.
-EU has no operator exception. No new server purchase is part of this corrective rollout.
+EU has no operator exception. No server purchase is part of the go-live path.
 
 The installation selects actual RAM at 76% over ten fresh consecutive minutes/stable physical
 Node UID; threshold and automatic purchasing are API configurable. Eligible nodes remain available
@@ -165,8 +172,8 @@ new workload density still requires measurement.
 
 ## Density load test (12 GB node)
 
-R2b's density and sleeping-CPU-release measurement: EU1 (6 vCPU, owner-upgraded 12 GB RAM;
-11,943 MiB visible after the upgrade) runs
+Go-live step 8's density and sleeping-CPU-release measurement: EU1 (6 vCPU, owner-upgraded 12 GB
+RAM; 11,943 MiB visible after the upgrade) runs
 16 × 256 MiB and 1 × 1 GiB thin databases (`sleep_after_seconds` 60) through Cloudflare.
 
 After the configuration-persistence repair, ten consecutive current-boot samples with the retained
@@ -213,12 +220,8 @@ platform Pod eviction, OOM or restart; MemoryPressure outside S6; EU1 NotReady; 
 samples; a node addition; a volume at 80 % or thin data at its reserve; a data-safety violation; a
 retained database changing state; overlap with thin qualification, a rollout or the 03:00 backups.
 
-**Prerequisites.** Thin qualification finished (it forbids creates in the region); R2b active,
-because the native gateway refuses databases without thin authority
-(`apps/native-gateway/src/targets.rs:336-340`); `ef83c96` delivered, else a woken retained database
-never sleeps; retained databases suspended; `autoscale_enabled` false, no held node addition,
-purchases off. Storm latency follows Wake orchestration; repeat once after the
-warm pool, which changes P and idle RAM.
+**Prerequisites.** Go-live steps 2–5; retained databases suspended; `autoscale_enabled` false, no
+held node addition, purchases off. The run follows the warm pool, which changes P and idle RAM.
 
 ## Thin storage qualification gates
 

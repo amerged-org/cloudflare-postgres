@@ -252,7 +252,7 @@ during upstream startup). The packaged CLI includes the first-party and bundled-
 The current target is the operator deployment on existing accounts: one EU control server and
 customer EU1. Each further region adds one control server and customer workers from the same
 [delivery architecture](docs/architecture/cloudflare-convergence-and-serverless-plan.md#delivery-architecture).
-Public-release installation polish follows separately; see [ULTRA execution plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#open).
+Public-release installation polish follows separately; see [after go-live](docs/architecture/cloudflare-convergence-and-serverless-plan.md#after-go-live) in the ULTRA plan.
 
 The management API reference is generated at `/v1/openapi.json` from the shared contracts,
 including the public raw fleet-image GET/HEAD service. Regional agent operations are published

@@ -184,7 +184,7 @@ warm retention. No pool state may be reported ready from these findings.
 
 ### Required pool acceptance
 
-Use the pool cold-start step after R2 in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#open).
+Use the sub-second wake step of the [ULTRA go-live path](cloudflare-convergence-and-serverless-plan.md#go-live-path).
 A real unassigned slot must exist before demand. Connect normally through Cloudflare to a sleeping
 database with no running tenant compute and measure connection through the first validated SQL
 result from the same start time. A pool hit must finish below one second, preserve committed data,
