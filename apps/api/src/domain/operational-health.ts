@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import {
+  BACKUP_HEALTH_STATUSES,
+  DISK_HEALTH_STATUSES,
   DatabaseId,
   NodeId,
   RegionId,
@@ -32,7 +34,7 @@ export const HeartbeatHealth = HealthClock.safeExtend({
 });
 export const BackupHealth = HealthClock.safeExtend({
   status: z
-    .enum(["ok", "stale", "failing", "unknown"])
+    .enum(BACKUP_HEALTH_STATUSES)
     .describe(
       "ok: last completed base backup at most 36 h old; stale: older; failing: the agent reports failing or the last failure is newer than the last completion; unknown: no agent report within 180 s, an unknown report, or no completed backup.",
     ),
@@ -41,7 +43,7 @@ export const BackupHealth = HealthClock.safeExtend({
 });
 export const DiskHealth = HealthClock.safeExtend({
   status: z
-    .enum(["ok", "warning", "unknown"])
+    .enum(DISK_HEALTH_STATUSES)
     .describe(
       "warning: at least 90 % of the allocated storage is used; unknown: no agent usage sample within 180 s.",
     ),
@@ -149,6 +151,55 @@ export function diskHealth(
     used_fraction: fraction,
   };
 }
+export type AgentUsageSample = Extract<
+  z.infer<typeof UsageSample>,
+  { source: "agent" }
+>;
+/** The payload of a database's newest agent sample: the one source of its disk health and storage. */
+export function latestAgentSampleSql(database = "databases"): string {
+  if (!/^[a-z][a-z0-9_]*$/.test(database))
+    throw new Error("invalid_database_alias");
+  return `(SELECT payload FROM usage_samples s WHERE s.database_id=${database}.id AND s.source='agent' ORDER BY s.observed_at DESC,s.producer_id DESC,s.sequence DESC LIMIT 1)`;
+}
+export function parseAgentSample(
+  payload: string | null | undefined,
+): AgentUsageSample | null {
+  if (payload == null) return null;
+  try {
+    const parsed = UsageSample.safeParse(JSON.parse(payload));
+    return parsed.success && parsed.data.source === "agent"
+      ? parsed.data
+      : null;
+  } catch {
+    return null; // A corrupt persisted sample remains unknown.
+  }
+}
+/** The database columns and sample the backup and disk producers read. */
+export interface DatabaseHealthSource {
+  backup_observed_at?: string | null;
+  backup_health?: BackupHealthSample["health"] | null;
+  backup_last_completed_at?: string | null;
+  backup_last_failed_at?: string | null;
+  agent_sample?: string | null;
+}
+/**
+ * The backup and disk verdicts of one database. The operator listing and the integrator's
+ * `Database` both read them here, so the two can never disagree.
+ */
+export function databaseHealthOf(row: DatabaseHealthSource, now = Date.now()) {
+  const sample = parseAgentSample(row.agent_sample);
+  const backup = BackupHealthSample.safeParse({
+    observed_at: row.backup_observed_at ?? null,
+    health: row.backup_health ?? "unknown",
+    last_completed_at: row.backup_last_completed_at ?? null,
+    last_failed_at: row.backup_last_failed_at ?? null,
+  });
+  return {
+    backup: backupHealth(backup.success ? backup.data : null, now),
+    disk: diskHealth(sample, now),
+    sample,
+  };
+}
 export const OperationalRegionHealth = z.strictObject({
   id: RegionId,
   infrastructure_alerts: z
@@ -238,50 +289,27 @@ export async function readOperationalHealth(
   const result = await db
     .prepare(
       `SELECT id,region_id,node_id,created_at,backup_observed_at,backup_health,backup_last_completed_at,backup_last_failed_at,
-    (SELECT payload FROM usage_samples s WHERE s.database_id=databases.id AND s.source='agent' ORDER BY s.observed_at DESC,s.producer_id DESC,s.sequence DESC LIMIT 1) disk_sample
+    ${latestAgentSampleSql()} agent_sample
     FROM databases WHERE deleted_at IS NULL AND ${cursor.sql} ORDER BY created_at DESC,id DESC LIMIT ?`,
     )
     .bind(...cursor.bindings, limit)
-    .all<{
-      id: string;
-      region_id: string;
-      node_id: string | null;
-      created_at: string;
-      backup_observed_at: string | null;
-      backup_health: BackupHealthSample["health"];
-      backup_last_completed_at: string | null;
-      backup_last_failed_at: string | null;
-      disk_sample: string | null;
-    }>();
-  return result.results.map(
-    ({
-      backup_observed_at,
-      backup_health,
-      backup_last_completed_at,
-      backup_last_failed_at,
-      disk_sample,
-      ...row
-    }) => {
-      const backup = BackupHealthSample.safeParse({
-        observed_at: backup_observed_at,
-        health: backup_health,
-        last_completed_at: backup_last_completed_at,
-        last_failed_at: backup_last_failed_at,
-      });
-      let disk: z.infer<typeof UsageSample> | null = null;
-      if (disk_sample !== null) {
-        try {
-          const parsed = UsageSample.safeParse(JSON.parse(disk_sample));
-          if (parsed.success) disk = parsed.data;
-        } catch {
-          /* Corrupt persisted samples remain unknown. */
-        }
-      }
-      return {
-        ...row,
-        backup: backupHealth(backup.success ? backup.data : null, now),
-        disk: diskHealth(disk, now),
-      };
-    },
-  );
+    .all<
+      {
+        id: string;
+        region_id: string;
+        node_id: string | null;
+        created_at: string;
+      } & DatabaseHealthSource
+    >();
+  return result.results.map((row) => {
+    const { backup, disk } = databaseHealthOf(row, now);
+    return {
+      id: row.id,
+      region_id: row.region_id,
+      node_id: row.node_id,
+      created_at: row.created_at,
+      backup,
+      disk,
+    };
+  });
 }

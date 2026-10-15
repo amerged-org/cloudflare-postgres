@@ -27,6 +27,7 @@ import {
   type IdempotencyLease,
 } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
+import { latestAgentSampleSql } from "./operational-health.ts";
 import { keyring } from "../crypto/keyring.ts";
 import {
   choosePlacement,
@@ -396,11 +397,14 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     bindings.push(query.observed_state);
   }
   const result = await c.env.DB.prepare(
-    `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
   )
     .bind(...bindings, ...cursor.bindings, pagination.limit + 1)
     .all<DatabaseRow>();
-  return c.json(pagination.envelope(result.results.map(databaseView)));
+  const now = Date.now();
+  return c.json(
+    pagination.envelope(result.results.map((row) => databaseView(row, now))),
+  );
 }
 
 export function databaseResizeStatement(

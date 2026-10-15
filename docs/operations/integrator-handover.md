@@ -254,7 +254,16 @@ The `Database` object: `desired_state` (`running`, `suspended`, `deleted`), `obs
 (`pending`, `provisioning`, `hibernated`, `ready`, `error`, `deleting`, `deleted`),
 `suspension_reason` (`manual`, `idle`, `null`), `generation` and `observed_generation` (a changed
 configuration is applied when they are equal), `status_message`, `node_id` (`null` while
-unplaced) and `health.archiving` (`ok`, `failing`, `unknown`, with `since`).
+unplaced) and `health`:
+
+| Field | Meaning |
+| --- | --- |
+| `health.archiving` | `ok`, `failing`, `unknown`, with `since` |
+| `health.backup` | `status` is `ok` while the last completed base backup is at most 36 h old, `stale` when older, `failing` when the region reports failing or its last failure is newer than its last completion, `unknown` without a report within 180 s or without a completed backup; `last_base_backup_at` is when that backup finished, `null` while unknown |
+| `health.disk` | `status` is `warning` from 90 % used and `unknown` without a usage sample within 180 s; `used_ratio` is used divided by allocated bytes of the newest sample, `null` when it measured nothing |
+
+`null` and `unknown` mean not known, never fine and never zero. These are the very figures the
+operator reads in `GET /v1/operational-health?scope=databases`: one source, two views.
 
 ### 2.3 Roles, connection URI and passwords
 
@@ -694,9 +703,10 @@ empty and falls as they fill (the plan lists sleeping overbooking as open work).
 `sum(storage_gib of all databases on the node) + data stored <= pool size - 2 GiB`, at most 64
 volumes, pool at most 64 GiB.
 
-Meter and alert on size yourselves (`pg_database_size()`, `storage_used_bytes_max` in usage): a
-full volume stops writes and nothing grows a quota for you. The operator-side disk warning appears
-at 90 % used.
+Watch size yourselves: `health.disk` of the database shows the share of the volume in use
+(`pg_database_size()` and `storage_used_bytes_max` in usage remain the other sources). A full
+volume stops writes and nothing grows a quota for you. `health.disk.status` becomes `warning` at
+90 % used, the same threshold of the operator's warning.
 
 ### 4.4 Your checklist
 
@@ -814,12 +824,10 @@ region in R2, read back in full ([infrastructure backups](infrastructure-backups
 them has not been exercised. The plan records completed runs on 2026-10-13 and 2026-10-15; 2026-10-14 failed all three attempts and is
 open (Go-live path: *Backups*). These backups are not your database backups.
 
-What you can watch yourselves: `health.archiving` and `observed_state: error` per database, the
-size of each database, connection errors by SQLSTATE, and `GET /healthz` of the API and of the
-database host (both only say that the Worker runs). The operator-only
-`GET /v1/operational-health?scope=databases` adds per-database `backup.status` (`ok` while the
-last completed base backup is at most 36 h old) and `disk.status` (`warning` from 90 % used); ask
-for it during incidents.
+What you can watch yourselves: per database `health.archiving`, `health.backup`, `health.disk` and
+`observed_state: error` ([2.2](#22-operations-and-readiness)), connection errors by SQLSTATE, and `GET /healthz` of the API and of the database host (both only say that the Worker
+runs). The operator-only `GET /v1/operational-health?scope=databases` lists the same backup and
+disk verdicts for every project at once.
 
 ## 7. Failure and recovery
 

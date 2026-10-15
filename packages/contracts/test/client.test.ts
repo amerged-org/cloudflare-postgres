@@ -83,7 +83,12 @@ function fixtures() {
     generation: 1,
     observed_generation: 1,
     status_message: null,
-    health: { archiving: "ok" as const, since: null },
+    health: {
+      archiving: "ok" as const,
+      since: null,
+      backup: { status: "unknown" as const, last_base_backup_at: null },
+      disk: { status: "unknown" as const, used_ratio: null },
+    },
     created_at: now,
     updated_at: now,
   };

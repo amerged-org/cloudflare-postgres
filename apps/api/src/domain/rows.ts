@@ -10,8 +10,13 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
+import {
+  databaseHealthOf,
+  latestAgentSampleSql,
+  type DatabaseHealthSource,
+} from "./operational-health.ts";
 
-export interface DatabaseRow {
+export interface DatabaseRow extends DatabaseHealthSource {
   id: string;
   project_id: string;
   region_id: string;
@@ -94,7 +99,13 @@ export interface SizeRow extends Omit<SizeClass, "enabled"> {
   enabled: number;
 }
 
-export function databaseView(row: DatabaseRow): Database {
+/**
+ * `now` is read once by a list so that every row is judged at the same instant. Backup and disk
+ * health come from the producers of the operator listing; a row read without the newest agent
+ * sample reports the disk unknown.
+ */
+export function databaseView(row: DatabaseRow, now = Date.now()): Database {
+  const { backup, disk } = databaseHealthOf(row, now);
   return Database.parse({
     id: row.id,
     project_id: row.project_id,
@@ -118,6 +129,11 @@ export function databaseView(row: DatabaseRow): Database {
     health: {
       archiving: row.archiving_health,
       since: row.archiving_health_since,
+      backup: {
+        status: backup.status,
+        last_base_backup_at: backup.last_completed_at,
+      },
+      disk: { status: disk.status, used_ratio: disk.used_fraction },
     },
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -161,7 +177,7 @@ export async function databaseForRequest(
 ): Promise<DatabaseRow> {
   await getAuth(c);
   const row = await c.env.DB.prepare(
-    `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
   )
     .bind(id)
     .first<DatabaseRow>();

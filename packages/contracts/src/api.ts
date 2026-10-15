@@ -374,10 +374,46 @@ export const ARCHIVING_HEALTH = ["ok", "failing", "unknown"] as const;
 export const ArchivingHealth = z.enum(ARCHIVING_HEALTH);
 export type ArchivingHealth = z.infer<typeof ArchivingHealth>;
 
+export const BACKUP_HEALTH_STATUSES = [
+  "ok",
+  "stale",
+  "failing",
+  "unknown",
+] as const;
+export const DISK_HEALTH_STATUSES = ["ok", "warning", "unknown"] as const;
+
+/**
+ * Measured health of one database. A missing measurement is `unknown` or null, never ok or zero.
+ * The operator listing of `GET /v1/operational-health?scope=databases` reads the same producers.
+ */
 export const DatabaseHealth = z
   .strictObject({
     archiving: ArchivingHealth,
     since: Timestamp.nullable(),
+    backup: z.strictObject({
+      status: z
+        .enum(BACKUP_HEALTH_STATUSES)
+        .describe(
+          "ok: the last completed base backup is at most 36 h old; stale: older; failing: the region reports failing, or the last failure is newer than the last completion; unknown: no report within 180 s, an unknown report, or no completed backup.",
+        ),
+      last_base_backup_at: Timestamp.nullable().describe(
+        "When the last completed base backup finished; null while none is known.",
+      ),
+    }),
+    disk: z.strictObject({
+      status: z
+        .enum(DISK_HEALTH_STATUSES)
+        .describe(
+          "warning: at least 90 % of the allocated storage is used; unknown: no usage sample within 180 s, or the sample measured nothing.",
+        ),
+      used_ratio: z
+        .number()
+        .nonnegative()
+        .nullable()
+        .describe(
+          "Used bytes divided by allocated bytes in the newest sample; null when it measured nothing.",
+        ),
+    }),
   })
   .meta({ id: "DatabaseHealth" });
 export type DatabaseHealth = z.infer<typeof DatabaseHealth>;

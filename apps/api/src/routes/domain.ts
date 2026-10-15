@@ -93,7 +93,12 @@ const exampleDatabase = {
   storage_generation: 1,
   observed_generation: 5,
   status_message: null,
-  health: { archiving: "ok", since: "2030-01-01T09:00:00.000Z" },
+  health: {
+    archiving: "ok",
+    since: "2030-01-01T09:00:00.000Z",
+    backup: { status: "ok", last_base_backup_at: "2030-01-01T03:00:00.000Z" },
+    disk: { status: "ok", used_ratio: 0.12 },
+  },
   created_at: "2030-01-01T08:00:00.000Z",
   updated_at: "2030-01-01T09:30:00.000Z",
 };
