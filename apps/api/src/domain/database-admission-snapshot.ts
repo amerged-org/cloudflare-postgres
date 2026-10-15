@@ -244,19 +244,39 @@ export async function readDatabaseAdmissionSnapshot(
     completed_mutation_id: row.completed_mutation_id,
   };
 }
+/** Milliseconds each step of one publish took, for the measurement of a wake. */
+export type PublishSteps = Partial<
+  Record<"repair_ms" | "snapshot_ms" | "seed_ms" | "store_ms", number>
+>;
 export async function publishDatabaseAdmission(
   env: Env,
   id: string,
   completedMutation?: string,
+  steps?: PublishSteps,
 ) {
+  const timed = async <T>(
+    step: keyof PublishSteps,
+    run: () => Promise<T>,
+  ): Promise<T> => {
+    const started = Date.now();
+    try {
+      return await run();
+    } finally {
+      if (steps) steps[step] = Date.now() - started;
+    }
+  };
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
-  if (await actor.repairAdmissionMutation())
+  if (await timed("repair_ms", () => actor.repairAdmissionMutation()))
     await notifyAdmissionRevisions(env, [id]);
-  const state = await readDatabaseAdmissionSnapshot(env, id);
+  const state = await timed("snapshot_ms", () =>
+    readDatabaseAdmissionSnapshot(env, id),
+  );
   if (!state) return false;
-  await actor.seed(state.presence);
-  return actor.publishAdmissionSnapshot(
-    state.snapshot,
-    completedMutation ?? state.completed_mutation_id,
+  await timed("seed_ms", () => actor.seed(state.presence));
+  return timed("store_ms", () =>
+    actor.publishAdmissionSnapshot(
+      state.snapshot,
+      completedMutation ?? state.completed_mutation_id,
+    ),
   );
 }

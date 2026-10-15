@@ -1223,50 +1223,65 @@ export class DatabaseActor extends DurableObject<Env> {
         if (!this.waiters.size) break;
         const viaPush = this.pushed;
         this.pushed = false;
-        const row = await this.env.DB.prepare(
-          `SELECT d.generation,d.power_operation,d.desired_state,d.observed_state,d.observed_generation,d.observed_power,p.deleted_at project_deleted_at FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=?`,
-        )
-          .bind(id)
-          .first<AdmissionRow>();
-        if (
-          !row ||
-          row.project_deleted_at !== null ||
-          row.generation !== this.wake.revision ||
-          row.power_operation !== this.wake.operation ||
-          row.desired_state !== "running" ||
-          ["error", "deleting", "deleted"].includes(row.observed_state)
-        ) {
-          this.finishWaiters(false);
-          break;
+        let row: AdmissionRow | null | undefined;
+        try {
+          row = await this.env.DB.prepare(
+            `SELECT d.generation,d.power_operation,d.desired_state,d.observed_state,d.observed_generation,d.observed_power,p.deleted_at project_deleted_at FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=?`,
+          )
+            .bind(id)
+            .first<AdmissionRow>();
+        } catch (error) {
+          // A failed read says nothing about the wake. Every waiter keeps its own deadline, and the
+          // next read comes with the next push or after the fallback interval.
+          console.warn(
+            JSON.stringify({
+              event: "actor_poll_read_failed",
+              database_id: id,
+              error: error instanceof Error ? error.name : "error",
+            }),
+          );
         }
-        if (
-          row.observed_state === "ready" &&
-          row.observed_generation === this.wake.revision &&
-          row.observed_power === "awake"
-        ) {
-          const state = this.admissionState(),
-            snapshot = state?.snapshot;
+        if (row !== undefined) {
           if (
-            !state?.barrier &&
-            (!snapshot?.cache_capable ||
-              (snapshot.admissible &&
-                snapshot.generation === this.wake.revision &&
-                snapshot.runtime &&
-                snapshot.runtime.observation.expires_at > Date.now()))
+            !row ||
+            row.project_deleted_at !== null ||
+            row.generation !== this.wake.revision ||
+            row.power_operation !== this.wake.operation ||
+            row.desired_state !== "running" ||
+            ["error", "deleting", "deleted"].includes(row.observed_state)
           ) {
-            console.log(
-              JSON.stringify({
-                event: "actor_release",
-                database_id: id,
-                operation: this.wake.operation,
-                revision: this.wake.revision,
-                at_ms: Date.now(),
-                waited_ms: Date.now() - this.waitStartedAt,
-                via: viaPush ? "push" : "poll",
-              }),
-            );
-            this.finishWaiters(true);
+            this.finishWaiters(false);
             break;
+          }
+          if (
+            row.observed_state === "ready" &&
+            row.observed_generation === this.wake.revision &&
+            row.observed_power === "awake"
+          ) {
+            const state = this.admissionState(),
+              snapshot = state?.snapshot;
+            if (
+              !state?.barrier &&
+              (!snapshot?.cache_capable ||
+                (snapshot.admissible &&
+                  snapshot.generation === this.wake.revision &&
+                  snapshot.runtime &&
+                  snapshot.runtime.observation.expires_at > Date.now()))
+            ) {
+              console.log(
+                JSON.stringify({
+                  event: "actor_release",
+                  database_id: id,
+                  operation: this.wake.operation,
+                  revision: this.wake.revision,
+                  at_ms: Date.now(),
+                  waited_ms: Date.now() - this.waitStartedAt,
+                  via: viaPush ? "push" : "poll",
+                }),
+              );
+              this.finishWaiters(true);
+              break;
+            }
           }
         }
         // A push that arrived during this read asks for another one at once.
@@ -1291,7 +1306,15 @@ export class DatabaseActor extends DurableObject<Env> {
           this.pollTimer = setTimeout(done, delay);
         });
       }
-    } catch {
+    } catch (error) {
+      // Not a read failure (those keep waiting above): the loop's own state is unusable.
+      console.error(
+        JSON.stringify({
+          event: "actor_poll_failed",
+          database_id: id,
+          error: error instanceof Error ? error.name : "error",
+        }),
+      );
       this.finishWaiters(false);
     }
   }

@@ -30,8 +30,14 @@ import {
   withPoolCertificateRefresh,
   type AdmissionMutation,
 } from "./admission-mutations.ts";
-import { publishDatabaseAdmission } from "./database-admission-snapshot.ts";
+import {
+  publishDatabaseAdmission,
+  type PublishSteps,
+} from "./database-admission-snapshot.ts";
 import { admissionSnapshotCapable } from "./fleet-releases.ts";
+
+/** How long a controller report waits for its admission publish (about 0.1 s) before it is answered. */
+const ADMISSION_PUBLISH_ANSWER_MS = 1000;
 
 /** Renewal timestamps/RVs outside the admitted identity do not create new configuration epochs. */
 function admissionRuntimeIdentity(raw: unknown) {
@@ -762,26 +768,8 @@ export async function observations(
         : withAdmissionMutation(c.env, [row.id], execute)
       : execute());
     const committed = Date.now();
+    const changed = result[0]!.meta.changes === 1;
     accepted += result[0]!.meta.changes;
-    if (result[0]!.meta.changes === 1 && !invalidates)
-      await publishDatabaseAdmission(c.env, row.id);
-    const published = Date.now();
-    // Where a wake's time goes after the controller's report: the commit, the snapshot publish
-    // and the push that releases the Actor's waiters. Only a transition is a measurement.
-    const report = (pushMilliseconds: number | null) =>
-      console.log(
-        JSON.stringify({
-          event: "observation_commit",
-          database_id: row.id,
-          operation: row.power_operation ?? null,
-          generation: observation.generation,
-          state: observation.state,
-          at_ms: Date.now(),
-          d1_ms: committed - committing,
-          publish_ms: published - committed,
-          push_ms: pushMilliseconds,
-        }),
-      );
     const becameReady =
       observation.state === "ready" &&
       !(
@@ -789,25 +777,88 @@ export async function observations(
         row.observed_power === "awake" &&
         row.observed_generation === observation.generation
       );
-    // Push the committed transition to ready; the Actor's bounded fallback read recovers a lost push.
-    if (result[0]!.meta.changes === 1 && becameReady) {
-      const pushed = Date.now();
-      c.executionCtx.waitUntil(
-        c.env.DATABASE_ACTOR.get(c.env.DATABASE_ACTOR.idFromName(row.id))
-          .observedReady(
-            row.id,
-            observation.generation,
-            row.power_operation ?? null,
+    // A waiting connection needs only the committed ready state: push it now, ahead of and
+    // independent of the publish, whatever that takes. The Actor's bounded fallback read recovers
+    // a lost push.
+    const pushStarted = Date.now();
+    let pushMilliseconds: number | null = null;
+    const pushing =
+      changed && becameReady
+        ? c.env.DATABASE_ACTOR.get(c.env.DATABASE_ACTOR.idFromName(row.id))
+            .observedReady(
+              row.id,
+              observation.generation,
+              row.power_operation ?? null,
+            )
+            .catch(() => false)
+            .then(() => {
+              pushMilliseconds = Date.now() - pushStarted;
+            })
+        : undefined;
+    const steps: PublishSteps = {};
+    let publishedAt: number | null = null;
+    const publishing =
+      changed && !invalidates
+        ? publishDatabaseAdmission(c.env, row.id, undefined, steps).then(
+            (value) => {
+              publishedAt = Date.now();
+              return value;
+            },
           )
-          .catch(() => false)
-          .then(() => report(Date.now() - pushed)),
-      );
-    } else if (
-      result[0]!.meta.changes === 1 &&
-      observation.state === "hibernated" &&
-      row.observed_power !== "hibernated"
+        : undefined;
+    if (publishing) {
+      // A publish is a few Actor RPCs and D1 reads. A failure within the bound still fails this
+      // report, so the controller sends it again; a publish still running after it finishes in
+      // the background and no longer holds the controller's report or its next pass.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        publishing.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), ADMISSION_PUBLISH_ANSWER_MS);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (!settled)
+        c.executionCtx.waitUntil(
+          publishing.then(
+            () => undefined,
+            (error) =>
+              console.error(
+                JSON.stringify({
+                  event: "admission_publish_failed",
+                  database_id: row.id,
+                  error: error instanceof Error ? error.name : "error",
+                }),
+              ),
+          ),
+        );
+    }
+    // Where a wake's time goes after the controller's report: the commit, the snapshot publish
+    // (with its steps) and the push that releases the Actor's waiters. Only a transition is a
+    // measurement; it is logged when both have finished.
+    if (
+      changed &&
+      (becameReady ||
+        (observation.state === "hibernated" &&
+          row.observed_power !== "hibernated"))
     )
-      report(null);
+      c.executionCtx.waitUntil(
+        Promise.all([pushing, publishing?.catch(() => undefined)]).then(() =>
+          console.log(
+            JSON.stringify({
+              event: "observation_commit",
+              database_id: row.id,
+              operation: row.power_operation ?? null,
+              generation: observation.generation,
+              state: observation.state,
+              at_ms: Date.now(),
+              d1_ms: committed - committing,
+              publish_ms: publishedAt === null ? null : publishedAt - committed,
+              push_ms: pushMilliseconds,
+              publish_steps: steps,
+            }),
+          ),
+        ),
+      );
     // Only an identity proof reads a new thin volume's LV into its receipt; start one now.
     if (
       result[0]!.meta.changes === 1 &&
