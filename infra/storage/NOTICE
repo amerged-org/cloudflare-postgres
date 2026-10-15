@@ -1,16 +1,13 @@
-PGCF OpenEBS LVM exporter metadata and pool custody patch
+PGCF OpenEBS LVM exporter metadata patch
 
 This image contains OpenEBS LVM LocalPV 1.10.1, source commit
 e8a234cbfeef5fa16fde1330c8de2d91e31831f1, licensed under Apache-2.0.
 Original copyright notices are retained in the corresponding source archive.
 
-PGCF contributors added exporter metadata readers/collectors and regression tests
-on 2026-10-13. CSI device-path validation and thin-pool capacity discovery retain
-the upstream implementation. The pool custody protocol adds a per-volume lock
-and durable denial before filesystem/raw-block NodePublish and NodeExpand,
-and before the node's volume/snapshot reconciliation writes. The denial persists
-across agent death; only the qualified agent clears it after verified cleanup.
-The upstream source archive and applied patch accompany this image under /usr/share/pgcf.
+PGCF contributors modified only the exporter collectors and added exporter-specific
+metadata readers and regression tests on 2026-10-13. CSI device-path validation
+and thin-pool capacity discovery retain the upstream implementation. The upstream
+source archive and applied patch accompany this image under /usr/share/pgcf.
 
 The rebuilt binary includes the Go runtime (BSD-3-Clause). Its license and
 the vendored dependency notices are retained alongside this notice.

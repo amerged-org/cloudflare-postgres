@@ -9,7 +9,7 @@ RUN --network=none set -eu; \
     printf '%s  %s\n' 723c061ea3e2c3e61b457f8f614f0b87724aeae37564ba4c1bdd41c722118187 /patch-tool.apk | sha256sum -c -; \
     test "$(stat -c %s /patch-tool.apk)" = 69750; \
     apk add --no-network --no-cache --repositories-file /dev/null /patch-tool.apk; \
-    printf '%s  %s\n' f571ef645592fe5f82936ddfb609d755d83fea2d5c57fb04f61a83b4f84ebff4 /upstream.tar.gz f88f388bba5b66a41ba5e51b8eea2ca35574a8f90db8802031c0279bd29cf82c /exporter-metadata.patch | sha256sum -c -; \
+    printf '%s  %s\n' f571ef645592fe5f82936ddfb609d755d83fea2d5c57fb04f61a83b4f84ebff4 /upstream.tar.gz e803cc8f736f05c372e3841d6e24efd080bb3b3d1b9bdb3685451f393dfd222e /exporter-metadata.patch | sha256sum -c -; \
     test "$(stat -c %s /upstream.tar.gz)" = 421865; \
     tar -xzf /upstream.tar.gz --strip-components=1 --exclude='*/result'; \
     patch -p1 < /exporter-metadata.patch
@@ -17,14 +17,12 @@ RUN --network=default --mount=type=cache,target=/go/pkg/mod \
     go mod download && go mod verify && go mod vendor
 RUN --network=none --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     set -eu; \
-    go test -mod=vendor -count=1 ./pkg/lvm ./pkg/collector ./pkg/volumegate; \
-    go test -mod=vendor -count=1 ./pkg/driver -run '^TestPoolDenialPrecedesEveryPublishAndExpansionPath$'; \
-    go test -mod=vendor -run '^$' ./pkg/mgmt/volume ./pkg/mgmt/snapshot; \
+    go test -mod=vendor -count=1 ./pkg/lvm ./pkg/collector; \
     mkdir -p /out/licenses; \
     go build -mod=vendor -trimpath -buildvcs=false -ldflags='-s -w -buildid= -X github.com/openebs/lvm-localpv/pkg/version.Version=1.10.1 -X github.com/openebs/lvm-localpv/pkg/version.GitCommit=e8a234cbfeef5fa16fde1330c8de2d91e31831f1' -o /out/lvm-driver ./cmd; \
     find vendor -type f \( -iname '*license*' -o -iname '*notice*' -o -iname '*copying*' -o -iname '*copyright*' \) -exec sh -c 'for file do relative="${file#vendor/}"; mkdir -p "/out/licenses/${relative%/*}"; cp "$file" "/out/licenses/$relative"; done' sh {} +
 
-# Preserve upstream LVM/runtime; install the rebuilt metadata/CSI gate driver and thin tools.
+# Preserve upstream LVM/runtime and CSI source; install the rebuilt exporter and thin tools.
 FROM docker.io/openebs/lvm-driver@sha256:41f73aba7f31eee4a033053d9c2f203e007a838c14823f3fd472c50651a98999
 
 ADD --checksum=sha256:88d98bb7034823d5184d873e8eef05ae6ec9a9880fdcd6c1bbc12e1484fdd829 https://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/thin-provisioning-tools-1.1.0-r0.apk /tmp/thin-provisioning-tools.apk
@@ -54,8 +52,8 @@ COPY --from=driver-build /usr/local/go/LICENSE /usr/share/licenses/pgcf-lvm-loca
 COPY --from=driver-build /out/licenses/ /usr/share/licenses/pgcf-lvm-localpv/dependencies/
 RUN --network=none set -eu; \
     chmod 0644 /usr/share/pgcf/lvm-localpv-e8a234cbfeef5fa16fde1330c8de2d91e31831f1.tar.gz; \
-    printf '%s  %s\n' a40d565e57266594e1602e1a9388327c170bd20979cdb3a78e979afd043594ba /usr/local/bin/lvm-driver f571ef645592fe5f82936ddfb609d755d83fea2d5c57fb04f61a83b4f84ebff4 /usr/share/pgcf/lvm-localpv-e8a234cbfeef5fa16fde1330c8de2d91e31831f1.tar.gz f88f388bba5b66a41ba5e51b8eea2ca35574a8f90db8802031c0279bd29cf82c /usr/share/pgcf/lvm-localpv-exporter.patch c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 /usr/share/licenses/pgcf-lvm-localpv/LICENSE adecbdfb771dd9de099f05da63db1558b93aa0f21451e4f6dfa6c3f6f7582fd9 /usr/share/licenses/pgcf-lvm-localpv/NOTICE 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad /usr/share/licenses/pgcf-lvm-localpv/Go-LICENSE | sha256sum -c -; \
-    test "$(stat -c %s /usr/local/bin/lvm-driver)" = 54956156; \
+    printf '%s  %s\n' 753e722293eec85a490212eb1b44ffd01611d04ba65866072de0f42295d72fba /usr/local/bin/lvm-driver f571ef645592fe5f82936ddfb609d755d83fea2d5c57fb04f61a83b4f84ebff4 /usr/share/pgcf/lvm-localpv-e8a234cbfeef5fa16fde1330c8de2d91e31831f1.tar.gz e803cc8f736f05c372e3841d6e24efd080bb3b3d1b9bdb3685451f393dfd222e /usr/share/pgcf/lvm-localpv-exporter.patch c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 /usr/share/licenses/pgcf-lvm-localpv/LICENSE 6b739ae5bdcf5f0f785d9be6743ac587c74c8602af059206be8fc708dd1d6ef9 /usr/share/licenses/pgcf-lvm-localpv/NOTICE 911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad /usr/share/licenses/pgcf-lvm-localpv/Go-LICENSE | sha256sum -c -; \
+    test "$(stat -c %s /usr/local/bin/lvm-driver)" = 54939772; \
     test "$(stat -c %s /usr/share/pgcf/lvm-localpv-e8a234cbfeef5fa16fde1330c8de2d91e31831f1.tar.gz)" = 421865; \
     find /usr/share/licenses/pgcf-lvm-localpv/dependencies -type f > /tmp/dependency-notices; \
     test "$(wc -l < /tmp/dependency-notices)" = 108; \

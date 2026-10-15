@@ -66,7 +66,7 @@ own extension upgrade after the image update; a new package alone does not chang
 
 **OpenEBS storage image:** `infra/storage/Dockerfile` inherits the pinned official
 OpenEBS LVM LocalPV 1.10.1 image and unchanged LVM/runtime packages. It rebuilds the
-upstream driver with metadata readers and a durable per-volume CSI pool gate; device-path validation
+upstream driver with an exporter-only metadata patch; CSI device-path validation
 and capacity-discovery source remain unchanged, while compiled machine bytes differ.
 The pinned upstream archive, applied patch, Apache-2.0 license and modification
 notice accompany the runtime image. The driver is compiled with Go 1.27.2 from the pinned official
