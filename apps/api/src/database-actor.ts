@@ -59,6 +59,8 @@ type PersistedAdmissionMutationIntent = z.infer<
 
 /** A committed ready observation's push starts the wake loop's D1 read at once; this bounded read only recovers a lost push. */
 const WAKE_FALLBACK_READ_MS = 1000;
+/** A concurrency block held this long is logged with its callback's name. */
+const GATE_LOG_MS = 1000;
 export const DatabasePresence = z
   .strictObject({
     database_id: DatabaseId,
@@ -188,11 +190,35 @@ export class DatabaseActor extends DurableObject<Env> {
       barrier ? JSON.stringify(barrier) : null,
     );
   }
+  /**
+   * The Actor's concurrency block, named. Every other event of the database waits while a callback
+   * runs, so one held for a second is logged with its name: a stalled RPC of a wake then names its
+   * holder. (The RPC that waited is measured by its caller, as the publish steps are.)
+   */
+  private gate<T>(name: string, callback: () => Promise<T>): Promise<T> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const started = Date.now();
+      try {
+        return await callback();
+      } finally {
+        const ms = Date.now() - started;
+        if (ms >= GATE_LOG_MS)
+          console.warn(
+            JSON.stringify({
+              event: "actor_gate_held",
+              callback: name,
+              ms,
+              at_ms: Date.now(),
+            }),
+          );
+      }
+    });
+  }
   /** Trusted mutation RPC. The closed barrier is durable before the caller can touch desired state. */
   async beginAdmissionMutation(value: unknown): Promise<boolean> {
     const intent = AdmissionMutationIntent.parse(value);
     this.identity(intent.database_id);
-    return this.ctx.blockConcurrencyWhile(() =>
+    return this.gate("beginAdmissionMutation", () =>
       this.beginAdmissionMutationLocked(intent),
     );
   }
@@ -221,7 +247,7 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Repairs interruption before a D1 reservation existed; a positive CAS fences late reservations too. */
   async repairAdmissionMutation(): Promise<boolean> {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.gate("repairAdmissionMutation", async () => {
       const barrier = this.admissionState()?.barrier;
       if (!barrier || barrier.started_at > Date.now() - 60000) return false;
       try {
@@ -251,7 +277,7 @@ export class DatabaseActor extends DurableObject<Env> {
   ): Promise<boolean> {
     const snapshot = DatabaseAdmissionSnapshot.parse(value);
     this.identity(snapshot.database_id);
-    return this.ctx.blockConcurrencyWhile(() =>
+    return this.gate("publishAdmissionSnapshot", () =>
       this.publishAdmissionSnapshotLocked(snapshot, completedMutation),
     );
   }
@@ -445,7 +471,7 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   async revokeWarmReclaim(databaseId: string): Promise<void> {
     this.identity(DatabaseId.parse(databaseId));
-    await this.ctx.blockConcurrencyWhile(() => this.revokeReclaimLocked());
+    await this.gate("revokeWarmReclaim", () => this.revokeReclaimLocked());
   }
   /** Mutations revoke reclaim under the same real acknowledgement/expiry rule, without activity. */
   async revokeBeforeChange(
@@ -465,7 +491,7 @@ export class DatabaseActor extends DurableObject<Env> {
     recordAdmission = true,
   ): Promise<boolean> {
     this.identity(databaseId);
-    await this.ctx.blockConcurrencyWhile(async () => {
+    await this.gate("revokeBeforeAdmission", async () => {
       const state = this.reclaimState();
       if (recordAdmission) {
         state.last_admitted_at = Date.now();
@@ -490,7 +516,7 @@ export class DatabaseActor extends DurableObject<Env> {
   /** Trusted node publisher RPC. The reclaimer receives only this short-lived signed scope. */
   async reclaimIntent(databaseId: string): Promise<string | null> {
     this.identity(DatabaseId.parse(databaseId));
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.gate("reclaimIntent", async () => {
       const state = this.reclaimState();
       if (!state.claims) return null;
       if (state.revoked)
@@ -580,7 +606,7 @@ export class DatabaseActor extends DurableObject<Env> {
     this.identity(DatabaseId.parse(databaseId));
     const parsed = ReclaimObservation.safeParse(raw);
     if (!parsed.success) return false;
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.gate("recordReclaimObservation", async () => {
       const state = this.reclaimState(),
         claims = state.claims,
         ack = parsed.data,
@@ -728,7 +754,7 @@ export class DatabaseActor extends DurableObject<Env> {
     const parsed = DatabasePresence.safeParse(value);
     if (!parsed.success) throw new Error("invalid_actor_snapshot");
     this.identity(parsed.data.database_id);
-    await this.ctx.blockConcurrencyWhile(async () => {
+    await this.gate("seedPresence", async () => {
       this.initializeSchema();
       if (clearAdmissionSnapshot) {
         const state = this.admissionState();
@@ -1010,7 +1036,7 @@ export class DatabaseActor extends DurableObject<Env> {
   ): Promise<
     { operation: string; revision: number } | { failure: "08006" } | undefined
   > {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.gate("claimWake", async () => {
       const started = Date.now();
       try {
         // Every read here holds every other event of this database: independent reads go together.
@@ -1408,7 +1434,7 @@ export class DatabaseActor extends DurableObject<Env> {
       activity.last_activity_at > activity.observed_at
     )
       return false;
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.gate("recordActivity", async () => {
       try {
         const current = await this.env.DB.prepare(
           "SELECT generation FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=? AND d.deleted_at IS NULL AND p.deleted_at IS NULL",
@@ -1442,7 +1468,7 @@ export class DatabaseActor extends DurableObject<Env> {
     this.identity(DatabaseId.parse(databaseId));
     if (!this.presence() || this.presence()!.deleted)
       return { ok: false, reason: "changed" };
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.gate("requestIdle", async () => {
       const activity = this.ctx.storage.sql
         .exec<{
           revision: number;

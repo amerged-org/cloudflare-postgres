@@ -304,3 +304,83 @@ it("a published snapshot of the wake's revision releases the waiting connection 
     target: { revision: row.generation, pod_uid: proof.pod_uid },
   });
 }, 30_000);
+
+it("a gate held for a second names its callback in the log", async () => {
+  const f = await sleeping();
+  // The activity report's database read stands for any slow read inside the Actor's gate.
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
+  const original = prototype.prepare;
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let held = 0;
+  vi.spyOn(prototype, "prepare").mockImplementation(function (
+    this: D1Database,
+    sql: string,
+  ) {
+    const statement = original.call(this, sql);
+    if (!sql.startsWith("SELECT generation FROM databases d JOIN projects p"))
+      return statement;
+    const wrap = (target: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(target, {
+        get(inner, property) {
+          if (property === "bind")
+            return (...values: unknown[]) => wrap(inner.bind(...values));
+          if (property === "first")
+            return async (...args: unknown[]) => {
+              held++;
+              await gate;
+              return Reflect.apply(inner.first, inner, args);
+            };
+          const value = Reflect.get(inner, property);
+          return typeof value === "function" ? value.bind(inner) : value;
+        },
+      });
+    return wrap(statement);
+  });
+  const warnings: string[] = [];
+  vi.spyOn(console, "warn").mockImplementation((...values: unknown[]) => {
+    warnings.push(values.map(String).join(" "));
+  });
+  const row = (await env.DB.prepare(
+    "SELECT generation FROM databases WHERE id=?",
+  )
+    .bind(f.id)
+    .first<{ generation: number }>())!;
+  const activity = actor(f.id).recordActivity(f.id, {
+    revision: row.generation,
+    observed_at: new Date().toISOString(),
+    last_activity_at: new Date().toISOString(),
+    active_connections: 0,
+  });
+  for (let i = 0; i < 400 && held === 0; i++) await sleep(5);
+  expect(held).toBe(1);
+  // Another RPC that needs the gate waits behind the held callback.
+  const waitStarted = Date.now();
+  const victim = actor(f.id).repairAdmissionMutation();
+  await sleep(1200);
+  open();
+  await Promise.all([activity, victim]);
+  expect(Date.now() - waitStarted).toBeGreaterThanOrEqual(1000);
+  const events = warnings
+    .map((line) => {
+      try {
+        return JSON.parse(line) as {
+          event: string;
+          callback: string;
+          ms: number;
+        };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((value) => value !== undefined);
+  expect(events).toEqual([
+    expect.objectContaining({
+      event: "actor_gate_held",
+      callback: "recordActivity",
+    }),
+  ]);
+  expect(events[0]!.ms).toBeGreaterThanOrEqual(1000);
+}, 30_000);
