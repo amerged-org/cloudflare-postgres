@@ -19,6 +19,8 @@ import {
   readFleetPatch,
   readFleetPatchStatus,
   recordFleetPatchCheckpoint,
+  recordFleetPatchFailure,
+  fleetPatchSuperseded,
   assertFleetPatchAuthority,
   fleetPatchAuthoritySql,
   refreshFleetPatchRegionStorage,
@@ -2386,6 +2388,48 @@ it("an operator halt supersedes only a Flux, platform or regional stage", async 
       .bind(f.region)
       .first("n"),
   ).toBe(1);
+});
+
+it("the latest failure code replaces an earlier one on a live operation while a halted hold keeps its own", async () => {
+  const f = await setup(),
+    code = async () => (await readFleetPatch(env, f.op)).error_code;
+  expect(await code()).toBeNull();
+  await recordFleetPatchFailure(
+    f.runtime,
+    f.op,
+    "patch_postgres_rollout_failed",
+  );
+  expect(await code()).toBe("patch_postgres_rollout_failed");
+  // The turn that fails now is the cause an operator must see, not the first failure the row ever had.
+  await recordFleetPatchFailure(
+    f.runtime,
+    f.op,
+    "patch_checkpoint_invalid_databases_ready",
+  );
+  expect(await code()).toBe("patch_checkpoint_invalid_databases_ready");
+  // A message that is no patch code is recorded as the generic failure and still replaces the last.
+  await recordFleetPatchFailure(f.runtime, f.op, "connect ECONNRESET");
+  expect(await code()).toBe("patch_execution_failed");
+  // An operator hold is not a failure: later turn failures neither replace nor clear its code.
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='regional',state='dispatched' WHERE operation_id=?",
+  )
+    .bind(f.op)
+    .run();
+  expect(
+    (await request(`/v1/fleet/patches/${f.op}/halt`, f.admin, "POST")).status,
+  ).toBe(200);
+  await recordFleetPatchFailure(
+    f.runtime,
+    f.op,
+    "patch_checkpoint_invalid_databases_ready",
+  );
+  const held = await readFleetPatchStatus(f.runtime, f.op);
+  expect(held).toMatchObject({
+    state: "halted",
+    error_code: "operator_hold_superseded",
+  });
+  expect(fleetPatchSuperseded(held)).toBe(true);
 });
 
 it("an executor checkpoint racing the operator halt fails closed and cannot clear the hold", async () => {

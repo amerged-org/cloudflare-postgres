@@ -1565,6 +1565,8 @@ export async function startFleetPatch(env: Env, id: string) {
     else if (state.status === "paused") await instance.resume();
   }
 }
+/** The code of the turn that failed last is the operator's current cause, so it replaces the code of an
+ *  earlier failed turn. Only a halted operation keeps its code: an operator hold is not a turn failure. */
 export async function recordFleetPatchFailure(
   env: Env,
   id: string,
@@ -1574,7 +1576,7 @@ export async function recordFleetPatchFailure(
     ? code
     : "patch_execution_failed";
   await env.DB.prepare(
-    `UPDATE fleet_patch_operations SET error_code=COALESCE(error_code,?),updated_at=? WHERE operation_id=? AND stage NOT IN('complete','host_ready') AND ${authoritySql}`,
+    `UPDATE fleet_patch_operations SET error_code=CASE WHEN state='halted' THEN error_code ELSE ? END,updated_at=? WHERE operation_id=? AND stage NOT IN('complete','host_ready') AND ${authoritySql}`,
   )
     .bind(safe, new Date().toISOString(), id)
     .run();
