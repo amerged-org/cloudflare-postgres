@@ -36,6 +36,8 @@ interface InputRow {
   storage_profile_json: string | null;
   storage_volume_json: string | null;
   runtime_attestation_json: string | null;
+  /** A parked Pod still holds the volume: no pool Pod may claim it. */
+  parked_json: string | null;
   archive_path: string;
   roles_json: string;
   maintenance_revision: number | null;
@@ -51,7 +53,7 @@ export async function readPostgresPoolDatabaseContext(env: Env, id: string) {
     d.desired_postgres_image image,d.desired_postgres_schema_revision schema_revision,d.pg_major,s.memory_mib,
     CASE WHEN rp.placement_mode='actual_ram' THEN rp.postgres_memory_request_mib ELSE NULL END memory_request_mib,
     s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
-    d.storage_profile_json,d.storage_volume_json,d.runtime_attestation_json,d.archive_path,ae.admission_revision,ae.route_revision,ae.mutation_id,
+    d.storage_profile_json,d.storage_volume_json,d.runtime_attestation_json,d.parked_json,d.archive_path,ae.admission_revision,ae.route_revision,ae.mutation_id,
     (SELECT json_group_array(json_object('name',r.name,'owner',r.owner,'revision',r.password_revision)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
     m.password_revision maintenance_revision FROM databases d JOIN projects p ON p.id=d.project_id JOIN size_classes s ON s.id=d.size_class_id
     JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id

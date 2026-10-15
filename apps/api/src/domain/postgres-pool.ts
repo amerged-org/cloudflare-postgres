@@ -379,6 +379,8 @@ export async function preparePostgresPoolClaim(
               : { kind: "blocked", reason: "claim_commit_unconfirmed" };
           },
         };
+  // A parked database's own Pod still holds the volume mounted, whatever an older clean sleep says.
+  if (row.parked_json) return miss("parked_pod_holds_volume");
   if (!holder?.sleep_json || holder.clean_stop !== 1)
     return miss("no_verified_clean_sleep");
   const sleep = PoolSleepRecord.safeParse(JSON.parse(holder.sleep_json));
@@ -728,6 +730,7 @@ export async function recordPostgresPoolSleep(
     state.row.observed_state !== "provisioning" ||
     state.row.observed_generation !== state.row.generation ||
     state.row.observed_power !== "hibernated" ||
+    state.row.parked_json ||
     sleep.configuration_fingerprint !== state.fingerprint ||
     !equal(sleep.class, state.class) ||
     !observation.success ||

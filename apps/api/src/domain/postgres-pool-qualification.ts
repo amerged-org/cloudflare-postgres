@@ -321,6 +321,7 @@ async function createRun(
     row.desired_state !== "suspended" ||
     row.observed_generation !== row.generation ||
     row.observed_power !== "hibernated" ||
+    row.parked_json ||
     row.deleted_at ||
     row.project_deleted_at ||
     !row.ever_ready ||
@@ -448,7 +449,7 @@ async function createRun(
       JOIN databases d ON d.node_id=q.node_id JOIN database_admission_epochs ae ON ae.database_id=d.id
       WHERE q.node_id=? AND q.node_uid=? AND q.boot_id=? AND q.release_id=? AND q.spec_sha256=?
       AND d.id=? AND d.generation=? AND d.desired_state='suspended' AND d.observed_power='hibernated' AND d.observed_generation=d.generation
-      AND d.storage_profile_json=? AND d.storage_volume_json=? AND ae.admission_revision=? AND ae.mutation_id IS NULL
+      AND d.parked_json IS NULL AND d.storage_profile_json=? AND d.storage_volume_json=? AND ae.admission_revision=? AND ae.mutation_id IS NULL
       AND t.authority_json=? AND t.compute_policy_json=? AND t.host_profile_sha256=?)
       AND NOT EXISTS(SELECT 1 FROM postgres_pool_qualification_runs existing
         WHERE (existing.node_id=? OR existing.database_id=?) AND existing.status IN('running','cleanup'))
