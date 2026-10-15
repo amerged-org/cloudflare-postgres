@@ -1011,21 +1011,26 @@ export class DatabaseActor extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         "UPDATE database_wake SET hint_claimed=1 WHERE singleton=1",
       );
+      // Already claimed, so nothing replays it: the claim does not wait for its delivery.
       const hinted = Date.now();
-      await this.env.REGION_LINK.get(this.env.REGION_LINK.idFromName(regionId))
-        .notify([id])
-        .catch(() => undefined);
-      // The wake split's first stage on this side: the claim itself and the region hint.
-      console.log(
-        JSON.stringify({
-          event: "actor_claim",
-          database_id: id,
-          operation,
-          revision,
-          at_ms: Date.now(),
-          claim_ms: hinted - started,
-          hint_ms: Date.now() - hinted,
-        }),
+      this.ctx.waitUntil(
+        this.env.REGION_LINK.get(this.env.REGION_LINK.idFromName(regionId))
+          .notify([id])
+          .catch(() => undefined)
+          .then(() =>
+            // The wake split's first stage on this side: the claim itself and the region hint.
+            console.log(
+              JSON.stringify({
+                event: "actor_claim",
+                database_id: id,
+                operation,
+                revision,
+                at_ms: Date.now(),
+                claim_ms: hinted - started,
+                hint_ms: Date.now() - hinted,
+              }),
+            ),
+          ),
       );
     }
     return true;

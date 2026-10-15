@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The claim of a wake runs inside the Actor's concurrency block: every D1 round trip in it holds
-// every other event of the database. These tests name the reads a claim needs and the order in
-// which its hint leaves; each safety check of the admission mutation stays, as the neighbouring
+// every other event of the database. These tests name the reads a claim needs and that its hint
+// holds nothing back; each safety check of the admission mutation stays, as the neighbouring
 // admission tests prove. Real D1 and Durable Object harness; no live evidence.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
@@ -214,22 +214,63 @@ it("the claim reads the pool capability together with the pool runs and needs no
   expect(await waiting).toMatchObject({ ok: true });
 }, 30_000);
 
-it("the hint leaves as soon as the transition commits, before the snapshot publish and any read back", async () => {
+it("the claim does not read back the row and the operation its own transition committed", async () => {
   const { events, finish } = await claim();
-  const hint = events.indexOf("HINT");
-  expect(hint).toBeGreaterThan(-1);
-  // The claim's own publish and the reads that confirm the committed row come after the hint.
-  const commit = indexOf(
-    events,
-    "UPDATE database_admission_epochs SET mutation_id=?",
-  );
-  expect(commit).toBeGreaterThan(-1);
-  expect(indexOf(events, PUBLISH_SNAPSHOT, commit)).toBeGreaterThan(hint);
-  expect(indexOf(events, PUBLISH_EPOCH, commit)).toBeGreaterThan(hint);
-  // The claim does not read back the row or the operation it has just committed.
+  // The one read of the row is the claim's first; the committed generation and operation are the
+  // transition's own, and the publish that closes the mutation still follows its commit.
   expect(starts(events, ROW)).toHaveLength(1);
   expect(
     starts(events, OPERATION).filter((e) => e.includes("kind IN")),
   ).toHaveLength(0);
+  const commit = indexOf(
+    events,
+    "UPDATE database_admission_epochs SET mutation_id=?",
+  );
+  expect(indexOf(events, PUBLISH_SNAPSHOT, commit)).toBeGreaterThan(commit);
+  expect(indexOf(events, PUBLISH_EPOCH, commit)).toBeGreaterThan(commit);
+  expect(events).toContain("HINT");
   await finish();
+}, 30_000);
+
+it("the claim does not wait for the hint's delivery", async () => {
+  const f = await sleeping();
+  let open!: () => void;
+  const delivered = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let notified = 0;
+  await runInDurableObject(
+    env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region)),
+    (instance) => {
+      const proto = Object.getPrototypeOf(instance) as {
+        notify: (ids?: string[]) => Promise<number>;
+      };
+      const notify = proto.notify;
+      vi.spyOn(proto, "notify").mockImplementation(async function (
+        this: unknown,
+        ids?: string[],
+      ) {
+        notified++;
+        await delivered;
+        return notify.call(this, ids);
+      });
+    },
+  );
+  const waiterId = crypto.randomUUID();
+  const waiting = actor(f.id).ensureAwake(f.id, "app", {
+    waiterId,
+    deadline: Date.now() + 20_000,
+  });
+  // The wake is claimed and its waiter registered while the region's hint is still on its way.
+  await registered(f.id, waiterId);
+  expect(notified).toBe(1);
+  open();
+  const row = await untilWake(f.id);
+  await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    readyBody(f, row.power_operation),
+  );
+  expect(await waiting).toMatchObject({ ok: true });
 }, 30_000);
