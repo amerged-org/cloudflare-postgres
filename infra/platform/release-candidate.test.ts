@@ -200,3 +200,14 @@ test("selected OpenEBS implementation is an image with a stable logical alias de
   assert.equal(candidate.spec?.components.find(v=>v.name==="openebs-lvm")?.reference,selected);
   assert.equal(candidate.spec?.components.find(v=>v.name==="image/openebs/lvm-driver")?.reference,selected);
 });
+
+test("the locked Cilium bootstrap values hash is the hash of the values file the image ships", async () => {
+  const lock = JSON.parse(bytes.toString()),
+    values = await readFile(
+      new URL(`../../${lock.bootstrapValues.cilium.path}`, import.meta.url),
+    );
+  assert.equal(
+    lock.bootstrapValues.cilium.sha256,
+    createHash("sha256").update(values).digest("hex"),
+  );
+});

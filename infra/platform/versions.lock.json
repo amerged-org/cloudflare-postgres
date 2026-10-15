@@ -206,7 +206,7 @@
   "bootstrapValues": {
     "cilium": {
       "path": "infra/platform/base/values/cilium.yaml",
-      "sha256": "ae15533e01a89cee28277be2d0ba3539823c8ed695d8a79ee23d27d559566922"
+      "sha256": "21e2e9ad68dc3ce662fcba85cffa14483c7d09dc05de99c2c8c27aa6fa47b995"
     }
   },
   "rustEdge": {
