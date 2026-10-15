@@ -2279,6 +2279,50 @@ it("a qualified release needs thin write authority only from database members an
   expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
 });
 
+it("restoring placements takes the region fence only when a closure is reopened", async () => {
+  const f = await fixture();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 2,
+    purchases_enabled: false,
+    order: null,
+  });
+  releases.push((await standingPostjoinFixture(f.region)).id);
+  const patch = (await env.DB.prepare(
+    "SELECT operation_id,created_at FROM fleet_patch_operations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first<{ operation_id: string; created_at: string }>())!;
+  const fence = () =>
+    env.DB.prepare(
+      "SELECT revision FROM admission_scope_fences WHERE kind='region' AND scope_id=?",
+    )
+      .bind(f.region)
+      .first<number>("revision");
+  // The rollout turn repeats this every minute: with nothing closed, no Actor of the region is closed.
+  const idle = await fence();
+  expect(await restoreFleetPatchPlacements(env, patch.operation_id)).toBe(true);
+  expect(await fence()).toBe(idle);
+  // A closure this patch owns is reopened under the region fence.
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_closed_at=? WHERE id=?",
+  )
+    .bind(patch.created_at, f.node)
+    .run();
+  expect(await restoreFleetPatchPlacements(env, patch.operation_id)).toBe(true);
+  expect(
+    await env.DB.prepare(
+      "SELECT database_placement_closed_at FROM nodes WHERE id=?",
+    )
+      .bind(f.node)
+      .first("database_placement_closed_at"),
+  ).toBeNull();
+  const reopened = await fence();
+  expect(reopened).not.toBe(idle);
+  expect(await restoreFleetPatchPlacements(env, patch.operation_id)).toBe(true);
+  expect(await fence()).toBe(reopened);
+});
+
 it("an operator halt supersedes only a Flux, platform or regional stage", async () => {
   const f = await setup(),
     halt = (key = f.admin) =>

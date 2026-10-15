@@ -1043,6 +1043,24 @@ export async function restoreFleetPatchPlacements(
       return false;
   }
   // A closure that a superseded predecessor owned is this release's when its operation recorded it unchanged.
+  const reopenable = `region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.region_id=nodes.region_id AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.bootstrap_operation_id IS NULL AND p.stage IN('host_ready','complete') AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND ((json_extract(j.value,'$.previous_placement_closed_at') IS NULL AND nodes.database_placement_closed_at=p.created_at)
+      OR EXISTS(SELECT 1 FROM fleet_patch_operations s,json_each(s.cluster_nodes_json) k WHERE s.region_id=p.region_id AND s.bootstrap_operation_id IS NULL AND ${fleetPatchSupersededSql("s")} AND json_extract(k.value,'$.node_id')=nodes.id AND json_extract(k.value,'$.node_uid')=nodes.node_uid AND json_extract(k.value,'$.previous_placement_closed_at') IS NULL AND s.created_at=json_extract(j.value,'$.previous_placement_closed_at') AND nodes.database_placement_closed_at=s.created_at)))
+    AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND NOT ${fleetPatchSupersededSql()})`,
+    reopenBindings = [
+      row.region_id,
+      row.release_id,
+      row.spec_sha256,
+      row.region_revision,
+      row.region_id,
+    ];
+  // A rollout turn repeats this every minute. With nothing to reopen it closes no Actor: a region
+  // fence holds every database of the region for its whole duration.
+  if (
+    !(await env.DB.prepare(`SELECT 1 FROM nodes WHERE ${reopenable} LIMIT 1`)
+      .bind(...reopenBindings)
+      .first())
+  )
+    return true;
   await withAdmissionMutation(
     env,
     [],
@@ -1050,18 +1068,8 @@ export async function restoreFleetPatchPlacements(
       const guard = mutation.scopeGuard();
       const result = await mutation.batch([
         env.DB.prepare(
-          `UPDATE nodes SET database_placement_closed_at=NULL,updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.region_id=nodes.region_id AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.bootstrap_operation_id IS NULL AND p.stage IN('host_ready','complete') AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND ((json_extract(j.value,'$.previous_placement_closed_at') IS NULL AND nodes.database_placement_closed_at=p.created_at)
-      OR EXISTS(SELECT 1 FROM fleet_patch_operations s,json_each(s.cluster_nodes_json) k WHERE s.region_id=p.region_id AND s.bootstrap_operation_id IS NULL AND ${fleetPatchSupersededSql("s")} AND json_extract(k.value,'$.node_id')=nodes.id AND json_extract(k.value,'$.node_uid')=nodes.node_uid AND json_extract(k.value,'$.previous_placement_closed_at') IS NULL AND s.created_at=json_extract(j.value,'$.previous_placement_closed_at') AND nodes.database_placement_closed_at=s.created_at)))
-    AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND NOT ${fleetPatchSupersededSql()}) AND (${guard.sql})`,
-        ).bind(
-          new Date().toISOString(),
-          row.region_id,
-          row.release_id,
-          row.spec_sha256,
-          row.region_revision,
-          row.region_id,
-          ...guard.bindings,
-        ),
+          `UPDATE nodes SET database_placement_closed_at=NULL,updated_at=? WHERE ${reopenable} AND (${guard.sql})`,
+        ).bind(new Date().toISOString(), ...reopenBindings, ...guard.bindings),
       ]);
       return result;
     },
