@@ -313,11 +313,14 @@ fn differences(
     };
     intervals.into_iter().map(|(start,end)|{let diff=|field:&str|if known&&same_hour{Value::from(number(current,field)-number(previous,field))}else{Value::Null};let sample=json!({"database_id":current["database"],"source":"gateway","producer_id":producer(current),"sequence":end,"observed_at":current["observedAt"],"interval_start":iso(start)?,"interval_end":iso(end)?,"expected_producers":expected,"ingress_bytes":diff("ingressBytes"),"egress_bytes":diff("egressBytes"),"connections":diff("totalConnections"),"connection_seconds":if known&&same_hour{json!((number(current,"connectionMilliseconds")-number(previous,"connectionMilliseconds"))as f64/1000.0)}else{Value::Null}});if !schema_valid("UsageSample",&sample){return Err("measurement delta invalid".into());}Ok(sample)}).collect()
 }
+/// The storage gauge most recently handed to the outbox, with the UTC hour it was taken in.
+type Gauge = (Option<u64>, Option<u64>, u64);
 #[derive(Default)]
 struct State {
     cursor: String,
     loaded: bool,
     sampling: HashMap<String, (u64, u64, bool)>,
+    gauges: HashMap<String, Gauge>,
 }
 struct Work {
     db: Value,
@@ -327,6 +330,8 @@ struct Work {
     checkpoint: Value,
     allocated: Option<u64>,
     volume_identity: Value,
+    /// The storage gauge last queued in the outbox; the process keeps it once that checkpoint is saved.
+    gauge: Option<Gauge>,
 }
 pub struct Measurements {
     k8s: Kubernetes,
@@ -509,6 +514,7 @@ impl Measurements {
             checkpoint,
             allocated,
             volume_identity,
+            gauge: None,
         })
     }
     async fn save(&self, work: &mut Work) -> Result<(), Error> {
@@ -860,6 +866,7 @@ impl Measurements {
         targets.sort_by_key(|db| text(db, "id"));
         if targets.is_empty() {
             state.sampling.clear();
+            state.gauges.clear();
             return Ok(());
         }
         state.sampling.retain(|id, (generation, _, _)| {
@@ -867,6 +874,9 @@ impl Measurements {
                 .iter()
                 .any(|db| text(db, "id") == id && number(db, "generation") == *generation)
         });
+        state
+            .gauges
+            .retain(|id, _| targets.iter().any(|db| text(db, "id") == id));
         let anchor = targets[0];
         if !state.loaded {
             state.cursor = self
@@ -928,7 +938,8 @@ impl Measurements {
             .collect::<Vec<_>>()
             .await;
         let mut works = Vec::new();
-        for work in owner_results.into_iter().flatten() {
+        for mut work in owner_results.into_iter().flatten() {
+            work.gauge = state.gauges.get(text(&work.db, "id")).copied();
             Self::remember(state, &work);
             works.push(work);
         }
@@ -1043,6 +1054,10 @@ impl Measurements {
             if saved {
                 if success {
                     persisted.insert(id.clone());
+                    match work.gauge {
+                        Some(gauge) => state.gauges.insert(id.clone(), gauge),
+                        None => state.gauges.remove(&id),
+                    };
                 } else {
                     collected.remove(&id);
                 }
@@ -1097,6 +1112,20 @@ impl Measurements {
         }
         Ok(())
     }
+}
+/// A known, measured interval in which nothing was counted.
+fn quiet(samples: &[Value]) -> bool {
+    !samples.is_empty()
+        && samples.iter().all(|sample| {
+            [
+                "ingress_bytes",
+                "egress_bytes",
+                "connections",
+                "connection_seconds",
+            ]
+            .iter()
+            .all(|field| sample[*field].as_f64() == Some(0.0))
+        })
 }
 fn advance(
     work: &mut Work,
@@ -1245,32 +1274,61 @@ fn advance(
         .as_array()
         .ok_or("measurement outbox missing")?
         .clone();
+    // A pod whose counters did not move keeps its last emitted observation as the baseline, so the
+    // next sample spans the quiet period instead of one sample per cycle recording nothing.
+    let mut held = HashSet::new();
     if let Some(previous) = previous {
         let mut expected = reports.iter().map(producer).collect::<Vec<_>>();
         expected.sort();
         for report in reports {
             if let Some(last) = previous.iter().find(|last| last["pod"] == report["pod"]) {
-                pending.extend(differences(
+                let samples = differences(
                     last,
                     report,
                     &json!(expected),
                     continuous && ((!had_gap && !gap_detected) || recovered),
-                )?);
+                )?;
+                if quiet(&samples) {
+                    held.insert(text(report, "pod").to_string());
+                } else {
+                    pending.extend(samples);
+                }
             }
         }
     }
-    let sample = json!({"database_id":db["id"],"source":"agent","producer_id":process,"sequence":clock,"observed_at":now,"storage_used_bytes":used,"storage_allocated_bytes":work.allocated});
-    if !schema_valid("UsageSample", &sample) {
-        return Err("measurement storage sample invalid".into());
+    // A storage gauge nobody can measure that did not change adds nothing within its UTC hour. A
+    // measured gauge is emitted every cycle: disk health reads the newest sample.
+    let gauge = (used, work.allocated, clock / limit("USAGE_HOUR_MS"));
+    let repeated = used.is_none() && work.gauge == Some(gauge);
+    if !repeated {
+        let sample = json!({"database_id":db["id"],"source":"agent","producer_id":process,"sequence":clock,"observed_at":now,"storage_used_bytes":used,"storage_allocated_bytes":work.allocated});
+        if !schema_valid("UsageSample", &sample) {
+            return Err("measurement storage sample invalid".into());
+        }
+        pending.push(sample);
     }
-    pending.push(sample);
     let mut candidate = checkpoint.clone();
     candidate["outbox"] = json!(pending);
     if pending.len() <= limit("MEASUREMENT_MAX_OUTBOX") as usize
         && serde_json::to_vec(&candidate)?.len() <= limit("MEASUREMENT_CHECKPOINT_BYTES") as usize
     {
+        let baseline = reports
+            .iter()
+            .map(|report| {
+                previous
+                    .and_then(|previous| {
+                        previous.iter().find(|last| {
+                            held.contains(text(report, "pod")) && last["pod"] == report["pod"]
+                        })
+                    })
+                    .unwrap_or(report)
+            })
+            .collect::<Vec<_>>();
         checkpoint["outbox"] = candidate["outbox"].clone();
-        checkpoint["baseline"] = json!({"sampledAt":now,"inventory":inventory,"keyUid":snapshot.key_uid,"keyVersion":snapshot.key_version,"reports":reports});
+        checkpoint["baseline"] = json!({"sampledAt":now,"inventory":inventory,"keyUid":snapshot.key_uid,"keyVersion":snapshot.key_version,"reports":baseline});
+        if !repeated {
+            work.gauge = Some(gauge);
+        }
     }
     Ok(activity)
 }
@@ -1353,6 +1411,7 @@ mod tests {
             checkpoint: std::mem::take(&mut checkpoint),
             allocated: None,
             volume_identity: Value::Null,
+            gauge: None,
         };
         assert!(
             advance(
@@ -1384,6 +1443,156 @@ mod tests {
         assert_eq!(activity["last_activity_at"], iso(130000).unwrap());
         assert_eq!(activity["idle_observed_since"], iso(130000).unwrap());
         assert_eq!(activity["connections"], 0);
+    }
+    /// A persisted one-pod checkpoint whose baseline report was observed at 115000 ms.
+    fn quiet_work() -> (Work, GatewaySnapshot) {
+        let checkpoint = vectors()["checkpoints"][1]["result"].clone();
+        let snapshot = snapshot(&checkpoint["baseline"]);
+        let work = Work {
+            db: json!({"id":checkpoint["baseline"]["reports"][0]["database"],"generation":1,"storage":{"backend":"lvm-thin-v1"}}),
+            resource: Value::Null,
+            namespace: Value::Null,
+            cluster: Value::Null,
+            checkpoint,
+            allocated: None,
+            volume_identity: Value::Null,
+            gauge: None,
+        };
+        (work, snapshot)
+    }
+    /// The baseline pod observed again at `at` with `ingress` more bytes since it was held.
+    fn observed(work: &Work, at: u64, ingress: u64) -> Value {
+        let mut report = work.checkpoint["baseline"]["reports"][0].clone();
+        report["observedAt"] = iso(at).unwrap().into();
+        report["ingressBytes"] = (number(&report, "ingressBytes") + ingress).into();
+        report
+    }
+    fn gateway_samples(work: &Work) -> Vec<Value> {
+        work.checkpoint["outbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|sample| sample["source"] == "gateway")
+            .cloned()
+            .collect()
+    }
+    #[test]
+    fn quiet_gateway_intervals_stay_open_until_traffic_is_counted() {
+        let (mut work, snapshot) = quiet_work();
+        let held = work.checkpoint["baseline"]["reports"].clone();
+        for at in [130000, 145000] {
+            let report = observed(&work, at, 0);
+            advance(&mut work, &[report], &snapshot, None, "agent_test", at).unwrap();
+            // Nothing was counted: no gateway sample, and the next interval still starts at 115000.
+            assert!(gateway_samples(&work).is_empty(), "{at}");
+            assert_eq!(work.checkpoint["baseline"]["reports"], held, "{at}");
+            assert_eq!(work.checkpoint["baseline"]["sampledAt"], iso(at).unwrap());
+            assert!(checkpoint(&json!({"data":{key("MEASUREMENT_CHECKPOINT_KEY"):work.checkpoint.to_string()}}), &work.checkpoint["identity"]).is_ok());
+        }
+        let report = observed(&work, 160000, 10);
+        advance(
+            &mut work,
+            std::slice::from_ref(&report),
+            &snapshot,
+            None,
+            "agent_test",
+            160000,
+        )
+        .unwrap();
+        let samples = gateway_samples(&work);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["interval_start"], iso(115000).unwrap());
+        assert_eq!(samples[0]["interval_end"], iso(160000).unwrap());
+        assert_eq!(samples[0]["sequence"], 160000);
+        assert_eq!(samples[0]["ingress_bytes"], 10);
+        assert_eq!(work.checkpoint["baseline"]["reports"], json!([report]));
+    }
+    #[test]
+    fn a_quiet_interval_across_the_hour_closes_as_unknown_fragments() {
+        let (mut work, snapshot) = quiet_work();
+        let report = observed(&work, 3_605_000, 0);
+        advance(
+            &mut work,
+            std::slice::from_ref(&report),
+            &snapshot,
+            None,
+            "agent_test",
+            3_605_000,
+        )
+        .unwrap();
+        let samples = gateway_samples(&work);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["interval_start"], iso(115000).unwrap());
+        assert_eq!(samples[0]["interval_end"], iso(3_600_000).unwrap());
+        assert_eq!(samples[1]["interval_start"], iso(3_600_000).unwrap());
+        assert_eq!(samples[1]["interval_end"], iso(3_605_000).unwrap());
+        assert!(samples.iter().all(|s| s["ingress_bytes"].is_null()));
+        assert_eq!(work.checkpoint["baseline"]["reports"], json!([report]));
+    }
+    #[test]
+    fn a_restart_during_a_held_interval_is_unknown_not_zero() {
+        let (mut work, snapshot) = quiet_work();
+        let held = observed(&work, 130000, 0);
+        advance(&mut work, &[held], &snapshot, None, "agent_test", 130000).unwrap();
+        let mut restarted = observed(&work, 145000, 0);
+        restarted["processEpoch"] = "01234567-89ab-4def-8123-000000000004".into();
+        restarted["epoch"] = "01234567-89ab-4def-8123-000000000005".into();
+        restarted["startedAt"] = iso(140000).unwrap().into();
+        restarted["counterStartedAt"] = iso(140000).unwrap().into();
+        restarted["countersSince"] = iso(140000).unwrap().into();
+        restarted["lastActivityAt"] = Value::Null;
+        restarted["history"] = "current_process_absence".into();
+        for field in [
+            "ingressBytes",
+            "egressBytes",
+            "totalConnections",
+            "connectionMilliseconds",
+        ] {
+            restarted[field] = 0.into();
+        }
+        advance(
+            &mut work,
+            &[restarted.clone()],
+            &snapshot,
+            None,
+            "agent_test",
+            145000,
+        )
+        .unwrap();
+        let samples = gateway_samples(&work);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["interval_start"], iso(115000).unwrap());
+        assert!(samples[0]["ingress_bytes"].is_null());
+        assert!(samples[0]["connection_seconds"].is_null());
+        assert_eq!(work.checkpoint["gapSince"], iso(145000).unwrap());
+        assert_eq!(work.checkpoint["baseline"]["reports"], json!([restarted]));
+    }
+    #[test]
+    fn an_unmeasurable_storage_gauge_is_repeated_once_per_hour_while_a_measured_one_stays_fresh() {
+        let (mut work, snapshot) = quiet_work();
+        let mut emitted = Vec::new();
+        for (at, used) in [
+            (130000, None),
+            (145000, None),
+            (160000, Some(5)),
+            (175000, Some(5)),
+            (190000, None),
+            (205000, None),
+            (3_700_000, None),
+        ] {
+            work.checkpoint["outbox"] = json!([]);
+            let report = observed(&work, at, 0);
+            advance(&mut work, &[report], &snapshot, used, "agent_test", at).unwrap();
+            emitted.push(
+                work.checkpoint["outbox"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|sample| sample["source"] == "agent")
+                    .count(),
+            );
+        }
+        assert_eq!(emitted, [1, 0, 1, 1, 1, 0, 1]);
     }
     #[test]
     fn unknown_counters_or_impossible_counts_never_authorize_idle() {
