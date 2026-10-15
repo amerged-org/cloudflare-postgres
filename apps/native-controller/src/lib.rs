@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod api;
 pub mod contracts;
+pub mod diagnostics;
 pub mod fleet;
 pub mod health;
 pub mod initial_backup;

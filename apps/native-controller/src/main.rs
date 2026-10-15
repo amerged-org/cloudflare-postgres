@@ -4,6 +4,7 @@ use pgcf_native_controller::{
     Error,
     api::{ControlApi, DesiredSnapshot},
     contracts::{constant, integer, number, schema_valid, text},
+    diagnostics::error_code,
     kubernetes::Kubernetes,
     measurements::Measurements,
     node_storage::{Renewal, Sampler, driver_image, sample_node},
@@ -594,6 +595,11 @@ fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
     cell.hints = cell.hints.wrapping_add(1);
     cell.reattest |= kind == "Pod" && cell.ready;
 }
+/// The log line of a failed reconcile: the database, its generation and the failure's class. The
+/// failure's text is never logged (see `error_code`).
+fn reconcile_failed(database_id: &str, generation: u64, error: &Error) -> Value {
+    json!({"event":"database_reconcile_failed","database_id":database_id,"generation":generation,"error":error_code(error)})
+}
 /// The backoff after the `attempt`-th consecutive failed reconcile or renewal.
 fn failure_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(8)).min(300))
@@ -1163,11 +1169,11 @@ async fn run() -> Result<(), Error> {
                                     pull_ids.insert(id.clone());
                                     stale_snapshot_retry(cell,Instant::now());
                                 }
-                                Err(_) => {
+                                Err(error) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
                                     cell.due = Instant::now() + failure_delay(cell.attempt);
-                                    eprintln!("{}", json!({"event":"database_reconcile_failed", "database_id":id, "generation":generation}));
+                                    eprintln!("{}", reconcile_failed(&id, generation, &error));
                                 }
                             }
                             if cell.hints != marker { cell.due = Instant::now(); }
@@ -1402,6 +1408,28 @@ mod tests {
         renewed = db.clone();
         renewed["storage_startup"] = Value::Null;
         assert_ne!(initial, fingerprint(&renewed, &state).unwrap());
+    }
+    #[test]
+    fn a_failed_reconcile_logs_the_failures_class_and_not_its_text() {
+        let error: Error = "connect to 10.0.0.7:5432 as app with hunter2Hunter2 failed".into();
+        let line = reconcile_failed("dbbbbbbbbbbbbbbbbbbb", 7, &error);
+        assert_eq!(
+            line,
+            json!({"event":"database_reconcile_failed","database_id":"dbbbbbbbbbbbbbbbbbbb","generation":7,"error":"other"})
+        );
+        let status: Error =
+            Box::new(pgcf_native_controller::kubernetes::KubernetesError { status: 409 });
+        assert_eq!(
+            reconcile_failed("dbbbbbbbbbbbbbbbbbbb", 7, &status)["error"],
+            "kubernetes_http_409"
+        );
+        let phrase: Error = "Cluster UID changed".into();
+        assert_eq!(
+            reconcile_failed("dbbbbbbbbbbbbbbbbbbb", 7, &phrase)["error"],
+            "cluster_uid_changed"
+        );
+        let text = line.to_string();
+        assert!(!text.contains("10.0.0.7") && !text.contains("hunter2"));
     }
     #[test]
     fn tokenless_startup_refreshes_before_expiry_and_shortened_grants_revoke() {
