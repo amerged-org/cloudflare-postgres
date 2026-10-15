@@ -62,10 +62,11 @@ A database lives on one node of one region, chosen at creation (`region_id`); th
 Edge finds the region from the database's record.
 
 The installation serves one region: EU. Its region ID is `eu-dev` (the Worker and region IDs carry
-the name `dev`); the operator confirms the value, because `GET /v1/regions` needs an admin key. A
-`us-dev` record still exists but the US region is cancelled and has no usable node: a database
-created there waits unplaced indefinitely. Customer databases run only on EU1; the EU control
-server takes none.
+the name `dev`). `GET /v1/regions` with your key lists `{id, provider_region}` of the regions that
+accept placement and nothing else about them: those with a node that is ready, schedulable, not
+lost and open for new databases. A `us-dev` record still exists but the US region is cancelled
+and has no usable node: it is not listed, and a database created there waits unplaced
+indefinitely. Customer databases run only on EU1; the EU control server takes none.
 
 ### 1.3 Size classes
 
@@ -104,8 +105,9 @@ There are two key scopes:
 | Databases, roles, operations, archive summary, usage | its own project; a resource of another project is reported as `404`, never `403` | all projects |
 | Connection URI | **includes the role password** | never includes a password (`includes_password: false`) |
 | Size classes | list | list and define |
+| Regions | list `{id, provider_region}` of those that accept placement | list the full records, create, read |
 | Projects | list and read its own; delete its own once it holds no live database (this also revokes the project's keys) | create, list, delete |
-| API keys, regions, nodes, capacity policy, costs, operational health, infrastructure backups, fleet | `403` | yes |
+| API keys, nodes, capacity policy, costs, operational health, infrastructure backups, fleet | `403` | yes |
 
 A key is `pgcf_sk_<12 characters>_<43 characters>`, sent as `Authorization: Bearer <key>`. PGCF
 stores only an HMAC of it; the full key appears once, in the creation response. A lost response
@@ -185,7 +187,7 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
 | Operation ID | Call | Notes |
 | --- | --- | --- |
 | `createDatabase` | `POST /v1/databases` | 202 |
-| `listDatabases` | `GET /v1/databases` | filters `project_id`, `region_id`, `node_id`, `desired_state`, `observed_state`; excludes deleted |
+| `listDatabases` | `GET /v1/databases` | filters `project_id`, `region_id`, `node_id`, `desired_state`, `observed_state` and `name` (exact, case-sensitive; unique among the live databases of a project, so one match inside your project); excludes deleted |
 | `getDatabase` | `GET /v1/databases/{id}` | also returns a deleted database (`desired_state: deleted`) |
 | `resizeDatabase` | `PATCH /v1/databases/{id}` | body `{size_class_id}` only; no rename |
 | `deleteDatabase` | `DELETE /v1/databases/{id}` | 202 |
@@ -195,7 +197,9 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
 | `resetDatabaseRolePassword` | `POST /v1/databases/{id}/roles/{name}/reset-password` | `Idempotency-Key` required |
 | `deleteDatabaseRole` | `DELETE /v1/databases/{id}/roles/{name}` | 202, operation `database.role.delete` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required |
 | `getDatabaseConnectionUri` | `GET /v1/databases/{id}/roles/{name}/connection-uri` | password included for integrator keys |
-| `getDatabaseOperation` | `GET /v1/operations/{id}` | by ID only; no list endpoint |
+| `getDatabaseOperation` | `GET /v1/operations/{id}` | |
+| `listDatabaseOperations` | `GET /v1/databases/{id}/operations` | newest first, the view of `getDatabaseOperation`; also the operations PGCF starts itself; a deleted database stays listable |
+| `listRegions` | `GET /v1/regions` | `{id, provider_region}` of the regions that accept placement ([1.2](#12-regions)) |
 | `getDatabaseArchive` | `GET /v1/databases/{id}/archive` | counts only |
 | `getUsage` | `GET /v1/usage` | [5](#5-metering) |
 | `listSizeClasses` | `GET /v1/size-classes` | |
@@ -248,7 +252,7 @@ Poll with a short interval at first and a longer one afterwards; there is no eve
 webhook (open work). Kinds you start: `database.create`, `database.restore` (it belongs to the new
 database), `database.delete`, `database.resize`, `database.suspend`, `database.resume`,
 `database.role.delete`. PGCF starts `database.hibernate` (idle sleep) and `database.wake` (a
-connection) itself; you cannot list them.
+connection) itself; they appear in `GET /v1/databases/{id}/operations` like any other.
 
 The `Database` object: `desired_state` (`running`, `suspended`, `deleted`), `observed_state`
 (`pending`, `provisioning`, `hibernated`, `ready`, `error`, `deleting`, `deleted`),
@@ -915,12 +919,12 @@ the operator supplies it at handover.** Send:
 - Alert delivery to a recipient; alert history, acknowledgement and test send.
 - Listing backups and the restorable window; finding deleted databases; explicit restore
   refusals.
-- Listing operations, an event stream or webhooks, an audit log.
+- An event stream or webhooks, an audit log.
 - Key expiry, last-use display, key rotation as a feature, a read-only scope; an API domain with
   rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
-  per-role settings, renaming a database, a region list for integrators.
+  per-role settings, renaming a database.
 - Cancel requests, replication connections, HTTP query mode, TCP access.
 - Budgets, quotas per tenant, compute and storage autoscaling, branching.
 - Maintenance-window notifications.

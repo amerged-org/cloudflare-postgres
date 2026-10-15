@@ -29,6 +29,17 @@ export function nodePlacementBindings(now = Date.now()): [string, string] {
     new Date(now + 5000).toISOString(),
   ];
 }
+/**
+ * A region accepts placement while one of its nodes is ready, schedulable, not lost and open for
+ * new databases. A moment without fresh observations or free capacity does not change that: the
+ * create is accepted and waits for it.
+ */
+export function regionAcceptsPlacementSql(region = "regions"): string {
+  if (!/^[a-z][a-z0-9_]*$/.test(region))
+    throw new Error("invalid_region_placement_alias");
+  return `EXISTS(SELECT 1 FROM nodes accepting WHERE accepting.region_id=${region}.id AND accepting.ready=1 AND accepting.schedulable=1
+    AND accepting.lost_at IS NULL AND accepting.database_placement_enabled=1 AND accepting.database_placement_closed_at IS NULL)`;
+}
 export function nodeDatabasePlacementGuard(alias = "n"): string {
   return `${alias}.database_placement_enabled=1 AND ${alias}.database_placement_closed_at IS NULL
     AND ${nodeDatabaseCapacityGuard(alias)}`;

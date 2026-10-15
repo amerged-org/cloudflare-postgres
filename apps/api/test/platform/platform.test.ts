@@ -253,7 +253,6 @@ describe("API platform on real Workers D1", () => {
       ["/v1/api-keys", "POST", { name: "forbidden", scope: "admin" }, 403],
       [`/v1/api-keys/${admin.api_key.id}`, "DELETE", undefined, 403],
       ["/v1/size-classes/small", "PUT", size, 403],
-      ["/v1/regions", "GET", undefined, 403],
       ["/v1/regions", "POST", regionBody(), 403],
       ["/v1/nodes", "GET", undefined, 403],
     ];
@@ -264,6 +263,16 @@ describe("API platform on real Workers D1", () => {
       );
       expect(response.status, `${method} ${path}`).toBe(expected);
     }
+    // An integrator reads the regions it can place a database in, and only that of each.
+    const regions = await app().fetch(
+      request("/v1/regions", integrator.key),
+      env,
+    );
+    expect(regions.status).toBe(200);
+    for (const region of (
+      await regions.json<{ data: Record<string, unknown>[] }>()
+    ).data)
+      expect(Object.keys(region).sort()).toEqual(["id", "provider_region"]);
     const listing = await app().fetch(
       request("/v1/projects", integrator.key),
       env,

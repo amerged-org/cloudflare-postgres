@@ -14,6 +14,7 @@ import {
   DesiredResponse,
   ErrorBody,
   IdempotencyKey,
+  ListQuery,
   ObservationReport,
   Operation,
   OperationId,
@@ -31,6 +32,7 @@ import { archiveSummary } from "../domain/archive.ts";
 import {
   createDatabase,
   deleteDatabase,
+  listDatabaseOperations,
   listDatabases,
   resizeDatabase,
 } from "../domain/databases.ts";
@@ -436,6 +438,20 @@ export function registerDomain(app: ApiApp): void {
         ),
       );
     },
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/databases/{id}/operations",
+      security,
+      tags: ["Operations"],
+      description:
+        "Lists every operation of the database, newest first, in the view of `GET /v1/operations/{id}`: the ones you started and the ones PGCF starts itself (idle sleep, wake). A deleted database keeps its operations readable. `limit` is 1 to 100 and `cursor` is the `next_cursor` of the previous page.",
+      request: { params, query: ListQuery },
+      responses: responses(listEnvelope(Operation)),
+    },
+    async (c) => listDatabaseOperations(c, DatabaseId.parse(c.req.param("id"))),
   );
   register(
     app,

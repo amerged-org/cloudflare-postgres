@@ -2,6 +2,7 @@
 import {
   hashApiKey,
   newAgentKey,
+  PlacementRegion,
   type RegionCreate,
   type RegionRouteKeyring,
   type RegionBootstrapMaterialUpdate,
@@ -22,7 +23,8 @@ import {
   bootstrapCredentialInsert,
 } from "../crypto/bootstrap-credentials.ts";
 import type { ApiContext } from "../env.ts";
-import { requireScope } from "../middleware/auth.ts";
+import { getAuth, requireScope } from "../middleware/auth.ts";
+import { regionAcceptsPlacementSql } from "../domain/placement.ts";
 import {
   refuseCredentialReplay,
   withIdempotency,
@@ -116,10 +118,34 @@ export async function createRegion(
     },
   });
 }
+/**
+ * An administrator reads the full records. An integrator key chooses where to create a database
+ * and sees only the regions that accept placement, as `{id, provider_region}`.
+ */
 export async function listRegions(c: ApiContext): Promise<Response> {
-  await requireScope(c, "admin");
+  const auth = await getAuth(c);
   const pagination = page(c);
   const cursor = pagination.where();
+  if (auth.scope !== "admin") {
+    const placed = await c.env.DB.prepare(
+      `SELECT id,provider_region,created_at FROM regions WHERE ${regionAcceptsPlacementSql()} AND ${cursor.sql} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    )
+      .bind(...cursor.bindings, pagination.limit + 1)
+      .all<{ id: string; provider_region: string; created_at: string }>();
+    const { data, next_cursor } = pagination.envelope(placed.results);
+    return c.json(
+      {
+        data: data.map((region) =>
+          PlacementRegion.parse({
+            id: region.id,
+            provider_region: region.provider_region,
+          }),
+        ),
+        next_cursor,
+      },
+      200,
+    );
+  }
   const rows = await c.env.DB.prepare(
     `SELECT * FROM regions WHERE ${cursor.sql} ORDER BY created_at DESC, id DESC LIMIT ?`,
   )

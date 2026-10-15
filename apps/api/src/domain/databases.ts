@@ -57,6 +57,7 @@ import {
   databaseView,
   isConstraintError,
   operationForRequest,
+  operationsForDatabase,
   operationView,
   type DatabaseRow,
   type RegionRow,
@@ -366,6 +367,16 @@ export async function createDatabase(
     },
   });
 }
+/** The operations of one database, newest first: the very rows `GET /v1/operations/{id}` reads. */
+export async function listDatabaseOperations(
+  c: ApiContext,
+  id: string,
+): Promise<Response> {
+  const pagination = page(c);
+  const rows = await operationsForDatabase(c, id, pagination);
+  const { data, next_cursor } = pagination.envelope(rows);
+  return c.json({ data: data.map(operationView), next_cursor });
+}
 export async function listDatabases(c: ApiContext): Promise<Response> {
   const auth = await getAuth(c),
     query = DatabaseListQuery.parse(c.req.query()),
@@ -384,6 +395,7 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     ["d.region_id", query.region_id],
     ["d.node_id", query.node_id],
     ["d.desired_state", query.desired_state],
+    ["d.name", query.name],
   ] as const)
     if (value !== undefined && value !== null) {
       filters.push(`${column}=?`);

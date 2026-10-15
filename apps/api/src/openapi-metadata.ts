@@ -152,7 +152,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "admin",
   ),
   "POST /v1/regions": route("createRegion", "Create a region", "admin"),
-  "GET /v1/regions": route("listRegions", "List regions", "admin"),
+  "GET /v1/regions": route(
+    "listRegions",
+    "List regions, or for an integrator the regions that accept placement",
+    "api",
+  ),
   "GET /v1/regions/{id}": route(
     "getRegion",
     "Read regional inventory",
@@ -250,6 +254,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/operations/{id}": route(
     "getDatabaseOperation",
     "Read a database operation",
+    "project",
+  ),
+  "GET /v1/databases/{id}/operations": route(
+    "listDatabaseOperations",
+    "List the operations of a database, newest first",
     "project",
   ),
   "GET /v1/databases/{id}/archive": route(

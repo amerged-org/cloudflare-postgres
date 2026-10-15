@@ -9,6 +9,7 @@ import {
   ListQuery,
   NodeId,
   NodeInventory,
+  PlacementRegion,
   Project,
   ProjectCreate,
   ProjectId,
@@ -238,8 +239,13 @@ export function registerPlatform(app: ApiApp): void {
       path: "/v1/regions",
       security,
       tags: ["Regions"],
+      description:
+        "An administrator key reads the full region records. An integrator key reads `{id, provider_region}` of the regions that accept placement: at least one node that is ready, schedulable, not lost and open for new databases, and nothing else about nodes, capacity or cost. Choose `region_id` of a new database from this list.",
       request: { query: ListQuery },
-      responses: response(listEnvelope(Region), 200),
+      responses: response(
+        z.union([listEnvelope(Region), listEnvelope(PlacementRegion)]),
+        200,
+      ),
     },
     listRegions,
   );

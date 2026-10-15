@@ -289,6 +289,18 @@ export const RegionCreate = z
   .meta({ id: "RegionCreate" });
 export type RegionCreate = z.infer<typeof RegionCreate>;
 
+/**
+ * What an integrator key sees of a region: one a database can be placed in. Nothing of its nodes,
+ * capacity or cost.
+ */
+export const PlacementRegion = z
+  .strictObject({
+    id: RegionId,
+    provider_region: RegionFields.provider_region,
+  })
+  .meta({ id: "PlacementRegion" });
+export type PlacementRegion = z.infer<typeof PlacementRegion>;
+
 /** The agent key and derived routing keyring are returned exactly once, at creation. */
 export const RegionCreated = z
   .strictObject({
@@ -471,6 +483,9 @@ export const DatabaseListQuery = ListQuery.extend({
   node_id: NodeId.optional(),
   desired_state: DesiredState.optional(),
   observed_state: ObservedState.optional(),
+  name: DatabaseName.optional().describe(
+    "Exact, case-sensitive name; names are unique among the live databases of a project.",
+  ),
 }).meta({ id: "DatabaseListQuery" });
 export type DatabaseListQuery = z.infer<typeof DatabaseListQuery>;
 
