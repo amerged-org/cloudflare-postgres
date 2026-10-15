@@ -304,8 +304,30 @@ export class DatabaseActor extends DurableObject<Env> {
       snapshot.admissible &&
       this.wake?.revision === snapshot.generation
     ) {
-      this.pushed = true;
-      this.interruptPoll?.();
+      // The snapshot was read from the committed state after readiness and no barrier stands now:
+      // it is the condition the readiness loop applies, so it releases the waiters itself without
+      // another read. A cached runtime proof must still be current.
+      if (
+        !snapshot.cache_capable ||
+        (snapshot.runtime &&
+          snapshot.runtime.observation.expires_at > Date.now())
+      ) {
+        console.log(
+          JSON.stringify({
+            event: "actor_release",
+            database_id: snapshot.database_id,
+            operation: this.wake.operation,
+            revision: this.wake.revision,
+            at_ms: Date.now(),
+            waited_ms: Date.now() - this.waitStartedAt,
+            via: "publish",
+          }),
+        );
+        this.finishWaiters(true);
+      } else {
+        this.pushed = true;
+        this.interruptPoll?.();
+      }
     }
     return true;
   }

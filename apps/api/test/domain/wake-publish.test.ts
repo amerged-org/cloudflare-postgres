@@ -6,8 +6,14 @@ import {
   createExecutionContext,
   waitOnExecutionContext,
 } from "cloudflare:test";
+import { newOperationId } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { createApp } from "../../src/app.ts";
+import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
+import {
+  admissionFixtureReleases,
+  admissionSnapshotFixture,
+} from "./admission-snapshot-fixture.ts";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import {
   actor,
@@ -22,6 +28,10 @@ import {
 afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
+  for (const id of admissionFixtureReleases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
 });
 /**
  * Holds every execution of the admission snapshot read (the publish's first D1 read) until
@@ -200,4 +210,102 @@ it("a ready observation is answered while its admission publish is still running
   await waitOnExecutionContext(context);
   expect(answered).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
+}, 30_000);
+
+it("a published snapshot of the wake's revision releases the waiting connection without another read", async () => {
+  const f = await admissionSnapshotFixture();
+  const sleepOperation = newOperationId(),
+    sleepGeneration = f.proof.generation + 1,
+    at = new Date().toISOString();
+  // Controlled committed regional sleep metadata, followed by the real Actor wake writer.
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,?,?,?,?)",
+    ).bind(sleepOperation, f.project, f.id, sleepGeneration, at, at, at),
+    env.DB.prepare(
+      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_attestation_json=NULL WHERE id=?",
+    ).bind(sleepGeneration, sleepGeneration, sleepOperation, f.id),
+    env.DB.prepare(
+      "UPDATE database_admission_epochs SET admission_revision=admission_revision+1,route_revision=route_revision+1 WHERE database_id=?",
+    ).bind(f.id),
+  ]);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  const waiterId = crypto.randomUUID();
+  const waiting = actor(f.id).ensureAwake(f.id, "reader", {
+    waiterId,
+    deadline: Date.now() + 15_000,
+  });
+  for (let i = 0; i < 400; i++) {
+    const row = await env.DB.prepare(
+      "SELECT d.desired_state,e.mutation_id FROM databases d JOIN database_admission_epochs e ON e.database_id=d.id WHERE d.id=?",
+    )
+      .bind(f.id)
+      .first<{ desired_state: string; mutation_id: string | null }>();
+    if (row?.desired_state === "running" && row.mutation_id === null) break;
+    await sleep(5);
+  }
+  await registered(f.id, waiterId);
+  await parkPolling(f.id);
+  // The loop's next readiness read never returns: only the publish itself can release the waiter.
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
+  const original = prototype.prepare;
+  vi.spyOn(prototype, "prepare").mockImplementation(function (
+    this: D1Database,
+    sql: string,
+  ) {
+    const statement = original.call(this, sql);
+    if (!sql.startsWith("SELECT d.generation,d.power_operation"))
+      return statement;
+    const wrap = (target: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(target, {
+        get(inner, property) {
+          if (property === "bind")
+            return (...values: unknown[]) => wrap(inner.bind(...values));
+          if (property === "first") return () => new Promise(() => undefined);
+          const value = Reflect.get(inner, property);
+          return typeof value === "function" ? value.bind(inner) : value;
+        },
+      });
+    return wrap(statement);
+  });
+  const row = (await env.DB.prepare(
+    "SELECT generation,power_operation FROM databases WHERE id=?",
+  )
+    .bind(f.id)
+    .first<{ generation: number; power_operation: string }>())!;
+  const epoch = (await env.DB.prepare(
+    "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
+  )
+    .bind(f.id)
+    .first<{ admission_revision: number; route_revision: number }>())!;
+  const observedAt = Date.now();
+  const proof = {
+    ...f.proof,
+    generation: row.generation,
+    admission_epoch: epoch.admission_revision,
+    route_revision: epoch.route_revision,
+    pod_uid: crypto.randomUUID(),
+    container_id: "b".repeat(64),
+    observed_at: observedAt,
+    observation: {
+      ...f.proof.observation,
+      verified_at: observedAt,
+      expires_at: observedAt + 60000,
+      watch_epoch: f.proof.observation.watch_epoch + 1,
+    },
+  };
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_attestation_json=? WHERE id=?",
+  )
+    .bind(JSON.stringify(proof), f.id)
+    .run();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  const released = await Promise.race([
+    waiting,
+    sleep(2500).then(() => "held"),
+  ]);
+  expect(released).toMatchObject({
+    ok: true,
+    target: { revision: row.generation, pod_uid: proof.pod_uid },
+  });
 }, 30_000);
