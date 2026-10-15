@@ -105,6 +105,30 @@ describe("failed request diagnostics in the Workers runtime", () => {
     expect(ErrorBody.parse(await response.json()).error.code).toBe("internal");
   });
 
+  it("names a platform failure's class on the one failure line and nothing else of the exception", async () => {
+    const log = logger();
+    const canary = crypto.randomUUID();
+    const app = createApp();
+    app.get("/test/stalled", () => {
+      throw new Error(
+        `D1_ERROR: D1 DB is overloaded. Requests queued for too long. ${canary}`,
+      );
+    });
+    const response = await app.fetch(request("/test/stalled"), env);
+    expect(response.status).toBe(500);
+    expect(log).toHaveBeenCalledTimes(1);
+    const logged = JSON.parse(log.mock.calls[0]![0] as string) as Record<
+      string,
+      unknown
+    >;
+    expect(logged.event).toBe("api_request_failed");
+    expect(logged.cause).toBe(
+      "D1 DB is overloaded. Requests queued for too long.",
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain(canary);
+    expect(ErrorBody.parse(await response.json()).error.code).toBe("internal");
+  });
+
   it("keeps intentional error details in the response while excluding them and body data from diagnostics", async () => {
     const log = logger();
     const canary = crypto.randomUUID();

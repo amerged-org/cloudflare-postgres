@@ -37,6 +37,8 @@ export type AuthPrincipal = Pick<ApiKey, "id" | "scope" | "project_id">;
 
 export interface ApiVariables {
   requestId: string;
+  /** The class of an unexpected failure, set by the error handler for the request's one failure line. */
+  failureCause?: string;
   auth?: AuthPrincipal;
 }
 

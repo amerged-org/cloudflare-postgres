@@ -261,6 +261,24 @@ function httpError(error: HTTPException): { code: ErrorCode; message: string } {
   }
 }
 
+/** The platform's own words for the conditions that make a request fail without a defect of ours. Only these
+ * exact phrases are ever named; any other exception text may carry request data and stays out of the logs. */
+const PLATFORM_FAILURES = [
+  "D1 DB is overloaded. Requests queued for too long.",
+  "D1 DB storage operation exceeded timeout which caused object to be reset.",
+  "Network connection lost.",
+  "Durable Object reset because its code was updated.",
+  "Durable Object storage operation exceeded timeout which caused object to be reset.",
+  "Cannot resolve Durable Object due to transient issue on remote node.",
+  "Worker exceeded CPU time limit.",
+  "Worker exceeded memory limit.",
+] as const;
+
+export function failureCause(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  return PLATFORM_FAILURES.find((phrase) => error.message.includes(phrase));
+}
+
 export function createApp(): ApiApp {
   const app = new OpenAPIHono<ApiEnv>({
     defaultHook(result, c) {
@@ -285,6 +303,7 @@ export function createApp(): ApiApp {
     c.header(DIAGNOSTIC_ID_HEADER, diagnosticId);
     if (c.res.status >= 400) {
       const matched = routePath(c, -1);
+      const cause = c.get("failureCause");
       console.error(
         JSON.stringify({
           event: "api_request_failed",
@@ -293,6 +312,7 @@ export function createApp(): ApiApp {
           route: DIAGNOSTIC_ROUTES.has(matched) ? matched : "unmatched",
           status: c.res.status,
           elapsed_ms: Math.round(performance.now() - started),
+          ...(cause ? { cause } : {}),
         }),
       );
     }
@@ -320,6 +340,8 @@ export function createApp(): ApiApp {
       const mapped = httpError(error);
       return apiError(c, mapped.code, mapped.message);
     }
+    const cause = failureCause(error);
+    if (cause) c.set("failureCause", cause);
     return apiError(c, "internal", "Internal server error");
   });
 
