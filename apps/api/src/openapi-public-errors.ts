@@ -249,10 +249,6 @@ export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
 export const locationResponses: Readonly<
   Record<string, Readonly<Record<string, string>>>
 > = {
-  "POST /v1/api-keys": {
-    "201":
-      "API-key resource path for authenticated admin creation; the first bootstrap-key response omits this header.",
-  },
   "POST /v1/projects": {
     "201":
       "Created project resource path, also returned on a completed idempotency replay.",

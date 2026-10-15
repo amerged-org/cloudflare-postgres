@@ -20,11 +20,29 @@ import {
   SizeClassId,
 } from "./ids.ts";
 
+/**
+ * The version of the API contract that the served OpenAPI documents carry as `info.version`: the
+ * shapes, limits and documented behaviour of the requests and responses. It changes with the
+ * contract and only with it, never with a Worker release (that version is `x-worker-version`).
+ * Raise the major for a change a client written against the previous version can break on, the
+ * minor for an addition, and the patch for a correction of the documentation alone.
+ */
+export const API_CONTRACT_VERSION = "1.0.0";
+
 /** ISO-8601 UTC timestamp exactly as Date#toISOString renders it. */
 export const Timestamp = z.iso
   .datetime({ precision: 3 })
   .meta({ id: "Timestamp" });
 export type Timestamp = z.infer<typeof Timestamp>;
+/** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
+export const TIMESTAMP_PATTERN: string = (() => {
+  const { pattern } = z.toJSONSchema(z.iso.datetime({ precision: 3 }));
+  if (typeof pattern !== "string") throw new Error("timestamp_pattern_missing");
+  return pattern;
+})();
+/** A timestamp with its own description. The generator inlines it, so the pattern is restated. */
+const describedTimestamp = (description: string) =>
+  Timestamp.meta({ description, pattern: TIMESTAMP_PATTERN });
 
 export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/;
@@ -233,14 +251,20 @@ export const SizeClass = z
       message: "PostgreSQL CPU request cannot exceed its class limit",
     },
   )
-  .meta({ id: "SizeClass" });
+  .meta({
+    id: "SizeClass",
+    description:
+      "cpu_request_millicores, when present, is at most cpu_millicores. memory_mib is a multiple of 256 in a class an operator defines.",
+  });
 export type SizeClass = z.infer<typeof SizeClass>;
 
 /** Body of PUT /v1/size-classes/{id}. */
 export const SizeClassUpsert = z
   .strictObject({
     ...SizeClassFields,
-    memory_mib: SizeClassFields.memory_mib.multipleOf(256),
+    memory_mib: SizeClassFields.memory_mib
+      .multipleOf(256)
+      .meta({ multipleOf: 256 }),
   })
   .refine(
     (size) =>
@@ -251,7 +275,11 @@ export const SizeClassUpsert = z
       message: "PostgreSQL CPU request cannot exceed its class limit",
     },
   )
-  .meta({ id: "SizeClassUpsert" });
+  .meta({
+    id: "SizeClassUpsert",
+    description:
+      "memory_mib is a multiple of 256, and cpu_request_millicores, when present, is at most cpu_millicores; a violation is a 400.",
+  });
 export type SizeClassUpsert = z.infer<typeof SizeClassUpsert>;
 
 // ---------- Regions ----------
@@ -298,7 +326,10 @@ export const PlacementRegion = z
     id: RegionId,
     provider_region: RegionFields.provider_region,
   })
-  .meta({ id: "PlacementRegion" });
+  .meta({
+    id: "PlacementRegion",
+    examples: [{ id: "eu-1", provider_region: "EU" }],
+  });
 export type PlacementRegion = z.infer<typeof PlacementRegion>;
 
 /** The agent key and derived routing keyring are returned exactly once, at creation. */
@@ -408,9 +439,9 @@ export const DatabaseHealth = z
         .describe(
           "ok: the last completed base backup is at most 36 h old; stale: older; failing: the region reports failing, or the last failure is newer than the last completion; unknown: no report within 180 s, an unknown report, or no completed backup.",
         ),
-      last_base_backup_at: Timestamp.nullable().describe(
+      last_base_backup_at: describedTimestamp(
         "When the last completed base backup finished; null while none is known.",
-      ),
+      ).nullable(),
     }),
     disk: z.strictObject({
       status: z
@@ -446,7 +477,7 @@ export const DatabaseStorage = z.strictObject({
     .nonnegative()
     .nullable()
     .describe("Bytes of the volume's capacity; null when unknown."),
-  observed_at: Timestamp.describe(
+  observed_at: describedTimestamp(
     "When the agent took the sample; judge its age yourself.",
   ),
 });
@@ -566,9 +597,9 @@ export const Role = z
     password_revision: z.number().int().min(1),
     created_at: Timestamp,
     updated_at: Timestamp,
-    valid_until: Timestamp.nullable().describe(
+    valid_until: describedTimestamp(
       "PostgreSQL VALID UNTIL: from this time, truncated to the whole second, the role cannot log in; null means never. An open session is not ended by it.",
-    ),
+    ).nullable(),
     connection_limit: RoleConnectionLimit.nullable().describe(
       "PostgreSQL CONNECTION LIMIT: concurrent sessions of the role; null means unlimited.",
     ),
@@ -606,7 +637,7 @@ export type Role = z.infer<typeof Role>;
 export const RoleCreate = z
   .strictObject({
     name: RoleName,
-    valid_until: Timestamp.describe(
+    valid_until: describedTimestamp(
       "Must lie in the future when the request executes, truncated to the whole second PostgreSQL applies it at. PostgreSQL enforces it as VALID UNTIL; the edge refuses an expired role before it would wake a hibernated database. No maximum.",
     ).optional(),
     connection_limit: RoleConnectionLimit.describe(
@@ -664,7 +695,10 @@ export const ConnectionUri = z
     role: RoleName,
     host: z.string().min(1).max(253),
     database: DatabaseId,
-    uri: z.string().startsWith("postgres://").max(2048),
+    uri: z
+      .string()
+      .regex(/^postgres:\/\//)
+      .max(2048),
     includes_password: z.boolean(),
   })
   .meta({ id: "ConnectionUri" });
@@ -740,7 +774,8 @@ export const ApiKey = z
   .strictObject({
     id: ApiKeyId,
     scope: ApiKeyScope,
-    project_id: ProjectId.nullable(),
+    // A union, so that the component ProjectId is not made nullable for every other use.
+    project_id: z.union([ProjectId, z.null()]),
     name: DisplayName,
     lookup_id: z.string().regex(/^[a-z0-9]{12}$/),
     created_at: Timestamp,
@@ -763,7 +798,11 @@ export const ApiKeyCreate = z
       path: ["project_id"],
     },
   )
-  .meta({ id: "ApiKeyCreate" });
+  .meta({
+    id: "ApiKeyCreate",
+    description:
+      "An integrator key requires project_id and is bound to that project; an admin key must omit it. Anything else is a 400.",
+  });
 export type ApiKeyCreate = z.infer<typeof ApiKeyCreate>;
 
 /** The full key appears only in this creation response. */
@@ -792,12 +831,12 @@ export type BaseBackup = z.infer<typeof BaseBackup>;
 export const BackupCatalog = z
   .strictObject({
     database_id: DatabaseId,
-    earliest_restorable_time: Timestamp.nullable().describe(
+    earliest_restorable_time: describedTimestamp(
       "When the oldest restorable base backup finished: no `pitr` target before it can be restored.",
-    ),
-    latest_restorable_time: Timestamp.nullable().describe(
+    ).nullable(),
+    latest_restorable_time: describedTimestamp(
       "When the newest archived WAL segment was uploaded: an upper bound of the window. A `pitr` target after the last commit in the archive fails recovery; `full` restores everything archived.",
-    ),
+    ).nullable(),
     base_backups: z
       .array(BaseBackup)
       .max(64)
@@ -805,7 +844,28 @@ export const BackupCatalog = z
         "The restorable base backups, newest first; at most 64, the bound of the v1 recovery catalog.",
       ),
   })
-  .meta({ id: "BackupCatalog" });
+  .meta({
+    id: "BackupCatalog",
+    examples: [
+      {
+        database_id: "ab12cd34ef56gh78ij90",
+        earliest_restorable_time: "2030-01-01T03:00:38.000Z",
+        latest_restorable_time: "2030-01-02T09:41:07.000Z",
+        base_backups: [
+          {
+            id: "20300102T030000",
+            started_at: "2030-01-02T03:00:00.000Z",
+            completed_at: "2030-01-02T03:00:41.000Z",
+          },
+          {
+            id: "20300101T030000",
+            started_at: "2030-01-01T03:00:00.000Z",
+            completed_at: "2030-01-01T03:00:38.000Z",
+          },
+        ],
+      },
+    ],
+  });
 export type BackupCatalog = z.infer<typeof BackupCatalog>;
 
 export const DatabaseRestored = z

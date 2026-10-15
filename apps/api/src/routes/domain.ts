@@ -220,6 +220,8 @@ export function registerDomain(app: ApiApp): void {
       path: "/v1/databases/{id}",
       security,
       tags: ["Databases"],
+      description:
+        "Reads one database, a deleted one too: it is answered with 200 and `desired_state: deleted` (`observed_state` is `deleting` until the region has confirmed the removal, then `deleted`). 404 means an unknown ID or a database of another project.",
       request: { params },
       responses: responses(Database),
     },

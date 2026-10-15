@@ -6,10 +6,10 @@ This runbook states what is different, which limits you must enforce yourselves 
 available yet.
 
 Every statement is derived from the code and contracts of this repository; Appendix B lists where,
-and Appendix C lists where the served OpenAPI document differs from the code. Behaviour without a
-live acceptance is marked **not yet verified**. Values that are installation configuration rather
-than code (region policy, alert thresholds) were read from the live installation on 2026-10-15 and
-are labelled as such. Measured numbers carry their source in the
+and Appendix C lists what the served OpenAPI document states in words rather than in schema.
+Behaviour without a live acceptance is marked **not yet verified**. Values that are installation
+configuration rather than code (region policy, alert thresholds) were read from the live
+installation on 2026-10-15 and are labelled as such. Measured numbers carry their source in the
 [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#done), which is also
 where PGCF publishes new ones. The plan's
 [Go-live path](../architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path) is the
@@ -137,9 +137,11 @@ open work.
 
 ## 2. Lifecycle API
 
-The machine-readable reference is `GET /v1/openapi.json` (no key needed; `info.version` is the
-version of the running Worker); [Appendix C](#appendix-c-where-the-served-openapi-document-differs-from-the-code)
-lists where it differs from the code. Its operation IDs are listed below. Examples assume:
+The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
+the version of the API contract (`1.0.0` for this document): it changes when the contract changes
+and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
+state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
+Its operation IDs are listed below. Examples assume:
 
 ```sh
 export PGCF_API='https://<management-api-origin>'   # the operator tells you; it is not the database host
@@ -154,8 +156,8 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
   and PGCF's own TypeScript client validates them strictly, so it must match the deployed Worker.
   Ignore unknown response fields in your client.
 - **Timestamps** have exactly one form: UTC with three fractional digits and a literal `Z`
-  (`2026-10-15T09:30:00.000Z`). `…:00Z`, `…:00.0Z` and `+00:00` offsets are `400`, although the
-  served OpenAPI only says `format: date-time` ([Appendix C](#appendix-c-where-the-served-openapi-document-differs-from-the-code)).
+  (`2026-10-15T09:30:00.000Z`). `…:00Z`, `…:00.0Z` and `+00:00` offsets are `400`; the served
+  OpenAPI gives the pattern.
 - **Lists** take `limit` (1 to 100, default 50) and an opaque `cursor`, return
   `{ "data": [...], "next_cursor": string | null }` and are ordered newest first. The role list is
   not paginated (at most 100 roles, ordered by name).
@@ -1006,8 +1008,9 @@ different resource first.
 | `role_has_members` | terminal | other live roles are `member_of` this role; delete the members first | |
 | `archive_expired`, `archive_unusable`, `no_recovery_point`, `source_unavailable`, `region_unavailable` | terminal | restore refusals ([2.7](#27-backups-restorable-window-and-restore)) | |
 
-A `409 conflict` of an operator route (regions, nodes, fleet, profiles, capacity) carries the
-message only.
+A `409 conflict` of an operator route (regions, nodes, fleet, profiles, capacity) carries a reason
+only where it is one of these, for example `mutation_in_progress`; otherwise the message is all
+there is.
 
 `GET /v1/databases/{id}` answers `200` for a deleted database; role routes answer `404`.
 
@@ -1068,26 +1071,22 @@ outcome and are not replayed.
 | Measured numbers and open steps | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) |
 | Region policy, Thin profile, alert thresholds (installation values) | `GET /v1/regions/{id}/capacity-policy` and `GET /v1/nodes/{id}/storage-profile` of the live installation, not the repository |
 
-## Appendix C. Where the served OpenAPI document differs from the code
+## Appendix C. What the served OpenAPI document states in words
 
-Found by diffing `GET /v1/openapi.json` of the Worker built from this commit against the
-contracts' own JSON Schema and the handlers. If you generate a client from the document, apply
-these corrections; the code is authoritative.
+`GET /v1/openapi.json` is generated from the contracts and checked against their own JSON Schema:
+property names, requirements, patterns, bounds, `multipleOf`, nullability and enumerations agree,
+and `info.version` is the contract version. A JSON Schema cannot state the rules below, which
+involve several fields, the stored state or the time of the request. The document says each in the
+description of the schema or the operation; the code is authoritative.
 
-| Served document | Code | Consequence |
+| Rule | Where the document says it | Refusal |
 | --- | --- | --- |
-| `Timestamp` is `format: date-time` | exactly `YYYY-MM-DDTHH:MM:SS.mmmZ` (three fractional digits, literal `Z`) | `target_time`, usage `from` and `to` and cost-fact times in any other form are `400` |
-| `ProjectId` is `string` or `null` everywhere (`DatabaseCreate.project_id`, `Database.project_id`, `Operation.project_id`, `UsageRow.project_id`, `Project.id`, the `{id}` of `/v1/projects/{id}`, the `project_id` query parameters) | only `ApiKey.project_id` is nullable (admin keys) | a generated client types project IDs as nullable; the API never returns `null` there and rejects it in requests |
-| `SizeClassUpsert.memory_mib`: 256 to 1,048,576 | additionally a multiple of 256 (admin only) | other values are `400` |
-| `ApiKeyCreate.project_id` optional | an `integrator` key requires it and an `admin` key must omit it | `400` |
-| `RoleName` is the pattern `^[a-z][a-z0-9_]{0,62}$` | also not `postgres`, `streaming_replica`, `pg_*`, `cnpg_*`; `RoleCreate` also refuses `pgcf_maintenance` | `400` |
-| `UsageQuery`: `project_id` and `database_id` both optional; `from` and `to` timestamps | exactly one scope; both boundaries aligned to the granularity (UTC hour or day); at most 31 days | `400` |
-| `SizeClass`/`SizeClassUpsert` fields independent | `cpu_request_millicores` must not exceed `cpu_millicores` | `400` |
-| `RoleCreate.valid_until` is a `Timestamp`; `member_of` an array of at most 8 distinct `RoleName` | `valid_until` must be in the future when the request executes (not on a replay); every `member_of` entry must be a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `400` |
-| `POST /v1/api-keys` `201` `Location: /v1/api-keys/{id}` | no `GET` exists for that path (only `DELETE`) | do not follow it |
-| Idempotency described without retention | keys are kept 24 hours | retries after a day execute again |
-| Request bodies without a size limit | 64 KiB, and `Content-Type: application/json` whenever there is a body | `400` |
-| `GET /v1/databases/{id}` documents `404` "Resource not found or inaccessible" and says nothing of deletion | a deleted database is returned with `200` and `desired_state: deleted` | check `desired_state` |
-
-Smaller differences: the served document drops the safe-integer maxima of counters and the
-`postgres://` prefix pattern of `ConnectionUri.uri`.
+| An `integrator` key requires `project_id` and an `admin` key must omit it | `ApiKeyCreate` | `400` |
+| `memory_mib` of a size class is a multiple of 256 and `cpu_request_millicores` does not exceed `cpu_millicores` | `SizeClass`, `SizeClassUpsert` | `400` |
+| `postgres`, `streaming_replica`, `pg_*` and `cnpg_*` are not role names, and `pgcf_maintenance` cannot be created | `RoleName`, `RoleCreate` | `400` |
+| `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `RoleCreate` | `400` |
+| A usage request names exactly one scope; both boundaries are aligned to the granularity and at most 31 days apart | `getUsage` | `400` |
+| A request body is JSON of at most 64 KiB with `Content-Type: application/json` whenever there is a body | `info.description` | `400` |
+| Idempotency keys are kept 24 hours per API key; a request that failed is not retained | `Idempotency-Key` of each mutation | |
+| A deleted database is read with `200` and `desired_state: deleted` | `getDatabase` | |
+| An operator route's `409` carries a `details.reason` only where it is one of the listed reasons | [A.1](#a1-http) | |

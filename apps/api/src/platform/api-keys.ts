@@ -99,7 +99,6 @@ export async function createApiKey(
       ]);
       if (result[0]!.meta.changes === 0)
         throw new ApiError("not_found", "Project not found");
-      c.header("Location", `/v1/api-keys/${id}`);
       return c.json(
         {
           api_key: {

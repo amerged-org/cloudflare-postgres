@@ -52,6 +52,7 @@ export const NodeInventory = Node.extend({
     observed_facts: true,
   }),
   observation: NodeFleetObservation,
-  latest_patch: NodeLatestPatch.nullable(),
+  // A union, so that the component NodeLatestPatch is not made nullable for every other use.
+  latest_patch: z.union([NodeLatestPatch, z.null()]),
 }).meta({ id: "NodeInventory" });
 export type NodeInventory = z.infer<typeof NodeInventory>;

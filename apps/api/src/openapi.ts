@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { RETRYABLE_ERROR_REASONS } from "@pgcf/contracts";
+import {
+  API_CONTRACT_VERSION,
+  RETRYABLE_ERROR_REASONS,
+  TIMESTAMP_PATTERN,
+} from "@pgcf/contracts";
 import { NODE_OPERATOR_KUBERNETES_HEADERS } from "@pgcf/contracts/node-operator";
 import { ApiError, type ApiApp } from "./app.ts";
 import type { Env } from "./env.ts";
@@ -22,9 +26,26 @@ type Operation = NonNullable<PathItem["get"]>;
 type Scope = "public" | "agent" | "internal";
 const methods = ["get", "head", "post", "put", "patch", "delete"] as const;
 const scopes = [
-  ["public", "/v1/openapi.json", "PGCF management API"],
-  ["agent", "/agent/v1/openapi.json", "PGCF regional agent API"],
-  ["internal", "/internal/v1/openapi.json", "PGCF operation callback API"],
+  [
+    "public",
+    "/v1/openapi.json",
+    "PGCF management API",
+    [
+      "Request bodies are JSON of at most 64 KiB and carry `Content-Type: application/json` whenever there is a body; unknown fields are refused with `400`.",
+      "Timestamps are UTC with exactly three fractional digits and a literal `Z`, as `Date#toISOString` renders them.",
+      "Lists are ordered newest first and take `limit` (1 to 100) and the opaque `cursor` of the previous page's `next_cursor`.",
+      "An error is `{error: {code, message, request_id, details?}}`. `details.reason` is the stable cause where a code stands for several, and a `Retry-After` header advises the delay of a transient refusal.",
+      "A mutation that names `Idempotency-Key` is repeated safely under the same key for 24 hours, per API key.",
+      "A resource of another project is reported as `404`, never `403`.",
+    ].join("\n\n"),
+  ],
+  ["agent", "/agent/v1/openapi.json", "PGCF regional agent API", undefined],
+  [
+    "internal",
+    "/internal/v1/openapi.json",
+    "PGCF operation callback API",
+    undefined,
+  ],
 ] as const;
 const errors: Record<number, string> = {
   400: "Invalid request",
@@ -66,6 +87,64 @@ const retryAfterHeader = {
   description: `Seconds to wait before repeating the request. Sent when the refusal is transient: error.details.reason is one of ${Object.keys(RETRYABLE_ERROR_REASONS).join(", ")}, or the code is capacity_exhausted or idempotency_in_progress. A hint, not a promise.`,
   schema: { type: "integer" as const, minimum: 1 },
 };
+
+/** The generator drops the calendar pattern of a datetime; the contract's own JSON Schema has it. */
+const componentDocumentation: Readonly<
+  Record<string, Record<string, unknown>>
+> = {
+  Timestamp: {
+    pattern: TIMESTAMP_PATTERN,
+    description:
+      "UTC time with exactly three fractional digits and a literal Z, as Date#toISOString renders it; other precisions and offsets are refused with 400.",
+    examples: ["2026-10-15T09:30:00.000Z"],
+  },
+  RoleName: {
+    description:
+      "A lower-case identifier of 1 to 63 characters. postgres, streaming_replica and names that start with pg_ or cnpg_ are reserved; creating a role also refuses pgcf_maintenance, and `app` is the owner.",
+  },
+};
+const SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+/**
+ * Brings the generator's output to what the contracts enforce: a nullable reference is the
+ * reference or null (the generator emits allOf with a nullable type, which would refuse the null),
+ * and an integer is a safe integer unless it says otherwise.
+ */
+function conformToContracts(value: unknown): void {
+  if (value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) conformToContracts(item);
+    return;
+  }
+  const node = value as Record<string, unknown>;
+  const parts = node.allOf;
+  if (Array.isArray(parts) && parts.length === 2) {
+    const reference = parts.find(
+      (part) => part !== null && typeof part === "object" && "$ref" in part,
+    ) as Record<string, unknown> | undefined;
+    const rest = parts.find((part) => part !== reference) as
+      Record<string, unknown> | undefined;
+    if (
+      reference !== undefined &&
+      rest !== undefined &&
+      Array.isArray(rest.type) &&
+      rest.type.includes("null")
+    ) {
+      const { type: _type, ...annotations } = rest;
+      void _type;
+      delete node.allOf;
+      node.anyOf = [reference, { type: "null" }];
+      Object.assign(node, annotations);
+    }
+  }
+  const type = node.type;
+  if (type === "integer" || (Array.isArray(type) && type.includes("integer"))) {
+    if (node.maximum === undefined && node.exclusiveMaximum === undefined)
+      node.maximum = SAFE_INTEGER;
+    if (node.minimum === undefined && node.exclusiveMinimum === undefined)
+      node.minimum = -SAFE_INTEGER;
+  }
+  for (const child of Object.values(node)) conformToContracts(child);
+}
 
 function inScope(scope: Scope, path: string): boolean {
   return scope === "public"
@@ -157,12 +236,12 @@ function describeOperation(key: string, operation: Operation): void {
       required: requiredIdempotentPublicRoutes.has(key),
       description:
         key === "POST /v1/api-keys"
-          ? "Optional for authenticated API-key creation. One-time credentials cannot be replayed: reuse of the same key returns 409. Bootstrap creation ignores this header."
+          ? "Optional for authenticated API-key creation. One-time credentials cannot be replayed: reuse of the same key returns 409. Bootstrap creation ignores this header. Keys are kept for 24 hours."
           : key === "POST /v1/regions"
-            ? "Optional for region creation. One-time regional agent credentials cannot be replayed: reuse of the same key returns 409."
+            ? "Optional for region creation. One-time regional agent credentials cannot be replayed: reuse of the same key returns 409. Keys are kept for 24 hours."
             : requiredIdempotentPublicRoutes.has(key)
-              ? "Required; a request without it is refused. Reusing a key with the same request returns the retained result; a different request conflicts."
-              : "Reusing a key with the same request returns the retained result; a different request conflicts. Omit only where optional.",
+              ? "Required; a request without it is refused with 400. Reusing a key with the same request returns the retained result; a different request conflicts. Keys are kept for 24 hours per API key; a request that failed is not retained."
+              : "Reusing a key with the same request returns the retained result; a different request conflicts. Keys are kept for 24 hours per API key; a request that failed is not retained. Omit only where optional.",
       schema: { type: "string", pattern: "^[A-Za-z0-9._~-]{1,128}$" },
     });
   operation.parameters.push({
@@ -290,7 +369,7 @@ export function registerApiDocuments(app: ApiApp): void {
   });
   registerCallbackDocumentation(app);
   registerFleetImageDocumentation(app);
-  for (const [scope, path, title] of scopes) {
+  for (const [scope, path, title, description] of scopes) {
     app.openAPIRegistry.registerPath({
       method: "get",
       path,
@@ -306,7 +385,12 @@ export function registerApiDocuments(app: ApiApp): void {
       const document = structuredClone(
         app.getOpenAPI31Document({
           openapi: "3.1.0",
-          info: { title, version: metadata.id, "x-worker-version": metadata },
+          info: {
+            title,
+            version: API_CONTRACT_VERSION,
+            ...(description === undefined ? {} : { description }),
+            "x-worker-version": metadata,
+          },
         }),
       );
       document.paths = Object.fromEntries(
@@ -324,6 +408,14 @@ export function registerApiDocuments(app: ApiApp): void {
             );
         }
       scopedComponents(document);
+      conformToContracts(document);
+      for (const [name, documentation] of Object.entries(
+        componentDocumentation,
+      )) {
+        const schemas = document.components?.schemas as
+          Record<string, Record<string, unknown>> | undefined;
+        if (schemas?.[name]) Object.assign(schemas[name], documentation);
+      }
       return c.json(document);
     });
   }

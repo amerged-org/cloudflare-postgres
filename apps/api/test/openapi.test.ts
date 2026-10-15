@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import {
+  API_CONTRACT_VERSION,
+  BackupCatalog,
   DatabaseWithOperation,
   ErrorBody,
+  PlacementRegion,
   Role,
   RoleCreate,
 } from "@pgcf/contracts";
@@ -117,22 +120,24 @@ describe("actual generated API references in the Workers runtime", () => {
     );
   });
 
-  it("binds the document version to actual Miniflare runtime metadata", async () => {
+  it("versions the document by its contract and names the deployed Worker beside it", async () => {
     const metadata = Reflect.get(
       env,
       "CF_VERSION_METADATA",
     ) as WorkerVersionMetadata;
     expect(metadata?.id).toBeTruthy();
-    // Read the built-in binding, never supply a manufactured Worker identity.
-    console.info("actual Miniflare version metadata", {
-      id: metadata.id,
-      tag: metadata.tag,
-      timestamp: metadata.timestamp,
-    });
-    const doc = await document("/v1/openapi.json");
-    expect(doc.info.version).toBe(metadata.id);
-    expect(doc.info.version).not.toBe("0.0.0");
-    expect(doc.info["x-worker-version"]).toEqual(metadata);
+    for (const path of [
+      "/v1/openapi.json",
+      "/agent/v1/openapi.json",
+      "/internal/v1/openapi.json",
+    ]) {
+      const doc = await document(path);
+      // A Worker release changes the Worker version; only the contract changes this one.
+      expect(doc.info.version, path).toBe(API_CONTRACT_VERSION);
+      expect(doc.info.version).toMatch(/^\d+\.\d+\.\d+$/);
+      expect(doc.info.version).not.toBe(metadata.id);
+      expect(doc.info["x-worker-version"]).toEqual(metadata);
+    }
   });
 
   it("fails only documentation explicitly when the runtime binding is missing", async () => {
@@ -502,6 +507,147 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(
       operation(doc, "/v1/databases", "get").responses["400"]!.headers,
     ).not.toHaveProperty("Retry-After");
+  });
+
+  it("keeps nullability at the use site and states what the contracts enforce", async () => {
+    type Schema = Record<string, unknown> & {
+      type?: string | string[];
+      allOf?: Schema[];
+      anyOf?: Schema[];
+      properties?: Record<string, Schema>;
+    };
+    const nullable = (schema: Schema | undefined) =>
+      Array.isArray(schema?.type) && schema!.type.includes("null");
+    for (const path of [
+      "/v1/openapi.json",
+      "/agent/v1/openapi.json",
+      "/internal/v1/openapi.json",
+    ]) {
+      const doc = await document(path);
+      const schemas = (doc.components?.schemas ?? {}) as Record<string, Schema>;
+      // A component that is nullable makes every use of it nullable; nullability belongs to the use.
+      expect(
+        Object.entries(schemas)
+          .filter(([, schema]) => nullable(schema))
+          .map(([name]) => name),
+        path,
+      ).toEqual([]);
+      // allOf with a reference and a nullable type would reject the null it is meant to allow.
+      const offenders: string[] = [];
+      const visit = (value: unknown, at: string): void => {
+        if (value === null || typeof value !== "object") return;
+        const node = value as Schema;
+        if (
+          Array.isArray(node.allOf) &&
+          node.allOf.some((part) => "$ref" in part) &&
+          node.allOf.some((part) => nullable(part))
+        )
+          offenders.push(at);
+        for (const [key, child] of Object.entries(node))
+          visit(child, `${at}/${key}`);
+      };
+      visit(doc, "");
+      expect(offenders, path).toEqual([]);
+    }
+    const doc = await document("/v1/openapi.json");
+    const schemas = doc.components!.schemas as Record<string, Schema>;
+    expect(schemas.ProjectId).toMatchObject({
+      type: "string",
+      pattern: "^prj_[a-z0-9]{20}$",
+    });
+    expect(schemas.Database!.properties!.node_id).toEqual({
+      anyOf: [{ $ref: "#/components/schemas/NodeId" }, { type: "null" }],
+    });
+    expect(schemas.Operation!.properties!.completed_at).toEqual({
+      anyOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }],
+    });
+    expect(schemas.ApiKey!.properties!.project_id).toEqual({
+      anyOf: [{ $ref: "#/components/schemas/ProjectId" }, { type: "null" }],
+    });
+    // The one timestamp form of the API, as the validators enforce it.
+    const timestamp = schemas.Timestamp as { pattern?: string };
+    expect(
+      new RegExp(timestamp.pattern!).test("2026-10-15T09:30:00.000Z"),
+    ).toBe(true);
+    for (const refused of [
+      "2026-10-15T09:30:00Z",
+      "2026-10-15T09:30:00.0Z",
+      "2026-10-15T09:30:00.000+00:00",
+    ])
+      expect(new RegExp(timestamp.pattern!).test(refused), refused).toBe(false);
+    // A timestamp that carries its own description is inline: it states the pattern itself.
+    const inline = (schema: Schema | undefined) =>
+      (schema as { pattern?: string }).pattern;
+    for (const field of [
+      schemas.Role!.properties!.valid_until,
+      schemas.RoleCreate!.properties!.valid_until,
+      schemas.BackupCatalog!.properties!.earliest_restorable_time,
+      schemas.BackupCatalog!.properties!.latest_restorable_time,
+      schemas.Database!.properties!.storage!.properties!.observed_at,
+      schemas.DatabaseHealth!.properties!.backup!.properties!
+        .last_base_backup_at,
+    ])
+      expect(inline(field)).toBe(timestamp.pattern);
+    expect(
+      (schemas.ConnectionUri!.properties!.uri as { pattern?: string }).pattern,
+    ).toBe("^postgres:\\/\\/");
+    expect(schemas.SizeClassUpsert!.properties!.memory_mib).toMatchObject({
+      multipleOf: 256,
+      minimum: 256,
+    });
+    // Counters are safe integers, as the contracts bound them.
+    expect(schemas.Database!.properties!.generation).toMatchObject({
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+    });
+  });
+
+  it("documents the rules the validators apply beyond the field types", async () => {
+    const doc = await document("/v1/openapi.json");
+    const schemas = doc.components!.schemas as Record<
+      string,
+      { description?: string }
+    >;
+    expect(schemas.ApiKeyCreate!.description).toMatch(
+      /integrator.*project_id/s,
+    );
+    expect(schemas.RoleName!.description).toMatch(/pgcf_maintenance/);
+    expect(schemas.SizeClass!.description).toMatch(/cpu_request_millicores/);
+    expect(schemas.SizeClassUpsert!.description).toMatch(
+      /cpu_request_millicores/,
+    );
+    const usage = operation(doc, "/v1/usage", "get");
+    expect(usage.description).toMatch(/exactly one/);
+    expect(usage.description).toMatch(/31 days/);
+    const read = operation(doc, "/v1/databases/{id}", "get");
+    expect(read.description).toMatch(/desired_state/);
+    expect(read.description).toMatch(/deleted/);
+    expect(
+      operation(doc, "/v1/databases/{id}/archive", "get").summary,
+    ).not.toMatch(/status/);
+    // There is no resource behind an API key's path to follow.
+    expect(
+      operation(doc, "/v1/api-keys", "post").responses["201"]!.headers,
+    ).not.toHaveProperty("Location");
+    // Every keyed mutation says how long its key is kept and what a body may be.
+    // The examples are copied by integrators, so each must be valid under its own contract.
+    const exampled = doc.components!.schemas as Record<
+      string,
+      { examples?: unknown[] }
+    >;
+    expect(
+      BackupCatalog.parse(exampled.BackupCatalog!.examples![0]),
+    ).toMatchObject({ database_id: "ab12cd34ef56gh78ij90" });
+    expect(
+      PlacementRegion.parse(exampled.PlacementRegion!.examples![0]),
+    ).toMatchObject({ provider_region: "EU" });
+    const keyed = operation(doc, "/v1/databases", "post").parameters!.find(
+      (parameter) => parameter.name === "Idempotency-Key",
+    )!;
+    expect(keyed.description).toMatch(/24 hours/);
+    const info = (doc as unknown as { info: { description?: string } }).info;
+    expect(info.description).toMatch(/64 KiB/);
+    expect(info.description).toMatch(/Content-Type: application\/json/);
   });
 
   it("limits callback replies to the outcomes produced by their current actions", async () => {
