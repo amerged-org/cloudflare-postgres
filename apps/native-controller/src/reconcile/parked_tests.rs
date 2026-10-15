@@ -679,13 +679,13 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     let at = w.server.state.lock().unwrap().requests.len();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
-    assert_eq!(requests_since(&w, at), (103, 19), "the wake");
+    assert_eq!(requests_since(&w, at), (102, 19), "the wake");
     let _ = w.watch_delivers();
     w.kubelet_ready_now()();
     let at = w.server.state.lock().unwrap().requests.len();
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
-    assert_eq!(requests_since(&w, at), (86, 0), "the pass after it");
+    assert_eq!(requests_since(&w, at), (85, 0), "the pass after it");
 }
 
 #[tokio::test]
@@ -766,4 +766,33 @@ async fn a_volume_that_is_not_the_recorded_one_still_ends_the_pass_in_recovery()
             "{what}"
         );
     }
+}
+
+/// How often the controller read `path` since `from`.
+fn reads_of(w: &World, from: usize, path: &str) -> usize {
+    w.server.state.lock().unwrap().requests[from..]
+        .iter()
+        .filter(|(method, at)| method == "GET" && at == path)
+        .count()
+}
+
+#[tokio::test]
+async fn the_cluster_is_asserted_once_per_pass() {
+    // The identity of the cluster, the UID of kube-system, is read once by a pass, whatever the
+    // pass goes on to do.
+    let cluster = path("Namespace", None, "kube-system");
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let at = w.server.state.lock().unwrap().requests.len();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(reads_of(&w, at, &cluster), 1, "the wake");
+    let _ = w.watch_delivers();
+    w.kubelet_ready_now()();
+    let at = w.server.state.lock().unwrap().requests.len();
+    let again = reconcile(&w).await;
+    assert_eq!(again["state"], "ready", "{again}");
+    assert_eq!(reads_of(&w, at, &cluster), 1, "the pass after it");
 }

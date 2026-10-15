@@ -1189,6 +1189,8 @@ impl Reconciler {
         // Absence of the desired pool branch means CF selected ordinary CNPG. Retained
         // local records must still be verified/handed back before the normal wake path.
         let state_name = text(db, "desired_state");
+        // The identity of the cluster is read once by a pass: everything the pass goes on to
+        // read, it reads from this cluster.
         self.k8s.assert_cluster(&self.cluster_uid).await?;
         if !self.ensure_pool_handoff(db).await? {
             return Ok(None);
@@ -2508,13 +2510,14 @@ impl Reconciler {
         }
         Ok(())
     }
+    /// The Node and the host authority the database stands on. The pass has asserted the identity
+    /// of the cluster before it asks.
     async fn guard(
         &self,
         db: &Value,
         snapshot: &DesiredSnapshot,
         require_write: bool,
     ) -> Result<(Value, Value), Error> {
-        self.k8s.assert_cluster(&self.cluster_uid).await?;
         let assigned = snapshot.fleet_release["nodes"]
             .as_array()
             .and_then(|nodes| {
