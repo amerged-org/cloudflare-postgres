@@ -1420,8 +1420,44 @@ impl Reconciler {
         fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
         let mut applied = vec![];
         let apply_phase = timing::Phase::begin(db, "desired_apply");
-        for manifest in &manifests {
-            let actual = self.apply(db, manifest).await?;
+        // The objects the pass is about to bring to the desired state are read together before the
+        // first of them is written, and written in the order of the manifests (the policies and
+        // quotas before the Cluster whose Pod they bind). The Cluster is read when its turn comes:
+        // CNPG writes its status continually, and a patch over a version read ahead of the writes
+        // before it would conflict.
+        let identity = |manifest: &Value| {
+            (
+                text(manifest, "kind").to_string(),
+                manifest["metadata"]["namespace"]
+                    .as_str()
+                    .map(str::to_string),
+                text(&manifest["metadata"], "name").to_string(),
+            )
+        };
+        let ahead: Vec<usize> = (0..manifests.len())
+            .filter(|index| text(&manifests[*index], "kind") != "Cluster")
+            .collect();
+        let named: Vec<_> = ahead
+            .iter()
+            .map(|index| identity(&manifests[*index]))
+            .collect();
+        let refs: Vec<_> = named
+            .iter()
+            .map(|(kind, namespace, name)| (kind.as_str(), namespace.as_deref(), name.as_str()))
+            .collect();
+        let mut current: std::collections::HashMap<usize, Option<Value>> = ahead
+            .into_iter()
+            .zip(self.k8s.read_all(&refs).await?)
+            .collect();
+        for (index, manifest) in manifests.iter().enumerate() {
+            let read = match current.remove(&index) {
+                Some(read) => read,
+                None => {
+                    let (kind, namespace, name) = identity(manifest);
+                    self.k8s.read(&kind, namespace.as_deref(), &name).await?
+                }
+            };
+            let actual = self.apply_to(db, manifest, read).await?;
             if text(manifest, "kind") == "Cluster" {
                 if !stored["clusterUid"].is_null()
                     && actual["metadata"]["uid"] != stored["clusterUid"]
@@ -1607,16 +1643,26 @@ impl Reconciler {
         }
         roles.completed();
         let unchanged = timing::Phase::begin(db, "runtime_unchanged");
-        for actual in &applied {
-            let Some(fresh) = self
-                .k8s
-                .read(
+        // Every applied object and the TLS authority are read together, and judged in order.
+        let mut asked: Vec<_> = applied
+            .iter()
+            .map(|actual| {
+                (
                     text(actual, "kind"),
                     actual["metadata"]["namespace"].as_str(),
                     text(&actual["metadata"], "name"),
                 )
-                .await?
-            else {
+            })
+            .collect();
+        asked.push((
+            "Secret",
+            Some(ns.as_str()),
+            text(&ca_secret["metadata"], "name"),
+        ));
+        let mut fresh_all = self.k8s.read_all(&asked).await?;
+        let current_ca = fresh_all.pop().flatten();
+        for (actual, fresh) in applied.iter().zip(fresh_all) {
+            let Some(fresh) = fresh else {
                 unchanged.pending();
                 return Ok(Some(observation(db, "provisioning", None)));
             };
@@ -1631,11 +1677,7 @@ impl Reconciler {
                 return Ok(Some(observation(db, "provisioning", None)));
             }
         }
-        let current_ca = self
-            .k8s
-            .read("Secret", Some(&ns), text(&ca_secret["metadata"], "name"))
-            .await?
-            .ok_or("TLS authority disappeared")?;
+        let current_ca = current_ca.ok_or("TLS authority disappeared")?;
         if current_ca["metadata"]["uid"] != ca_secret["metadata"]["uid"]
             || current_ca["metadata"]["resourceVersion"] != ca_secret["metadata"]["resourceVersion"]
             || !cluster_owned(&current_ca, &cluster)
@@ -2304,6 +2346,16 @@ impl Reconciler {
         self.persist_admission_target(db, &result).await?;
         Ok(Some(result))
     }
+    /// The object `resource` names, read again.
+    async fn reread(&self, resource: &Value) -> Result<Option<Value>, Error> {
+        self.k8s
+            .read(
+                text(resource, "kind"),
+                resource["metadata"]["namespace"].as_str(),
+                text(&resource["metadata"], "name"),
+            )
+            .await
+    }
     async fn runtime_readback(
         &self,
         db: &Value,
@@ -2319,61 +2371,55 @@ impl Reconciler {
             resources.node,
         );
         let ns = crate::contracts::namespace(db);
-        let claim = self
-            .k8s
-            .read(
-                "PersistentVolumeClaim",
-                Some(&ns),
-                text(&pod["metadata"], "name"),
-            )
-            .await?
-            .ok_or("runtime PVC missing")?;
-        let pv = self
-            .k8s
-            .read("PersistentVolume", None, text(&claim["spec"], "volumeName"))
-            .await?
-            .ok_or("runtime PV missing")?;
-        let storage = self
-            .k8s
-            .read(
-                "ConfigMap",
-                Some(SYSTEM),
-                &format!("storage-{}", text(db, "id")),
-            )
-            .await?
-            .ok_or("runtime storage receipt missing")?;
+        let claim_name = text(&pod["metadata"], "name");
+        let storage_name = format!("storage-{}", text(db, "id"));
+        // The claim and the receipt are read, and the resources the proof was built from are read
+        // again, together; then the volume the claim names, with the claim and the receipt read
+        // once more; then that volume again. Each is read again after it was first read.
+        let (claim, storage, namespace_now, cluster_now, pod_now, ca_now, node_now) = tokio::try_join!(
+            self.k8s
+                .read("PersistentVolumeClaim", Some(&ns), claim_name),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &storage_name),
+            self.reread(namespace),
+            self.reread(cluster),
+            self.reread(pod),
+            self.reread(ca),
+            self.reread(node),
+        )?;
+        let claim = claim.ok_or("runtime PVC missing")?;
+        let storage = storage.ok_or("runtime storage receipt missing")?;
+        let volume_name = text(&claim["spec"], "volumeName");
+        let (pv, claim_now, storage_now) = tokio::try_join!(
+            self.k8s.read("PersistentVolume", None, volume_name),
+            self.reread(&claim),
+            self.reread(&storage),
+        )?;
+        let pv = pv.ok_or("runtime PV missing")?;
         if claim["metadata"]["uid"] != volume["claimUid"]
             || pv["metadata"]["uid"] != volume["volumeUid"]
         {
             return Ok(None);
         }
+        let pv_now = self.reread(&pv).await?;
         let mut versions = json!({});
         let resources = [
-            ("namespace", namespace),
-            ("cluster", cluster),
-            ("pod", pod),
-            ("ca_secret", ca),
-            ("node", node),
-            ("pvc", &claim),
-            ("pv", &pv),
-            ("storage", &storage),
+            ("namespace", namespace, namespace_now),
+            ("cluster", cluster, cluster_now),
+            ("pod", pod, pod_now),
+            ("ca_secret", ca, ca_now),
+            ("node", node, node_now),
+            ("pvc", &claim, claim_now),
+            ("pv", &pv, pv_now),
+            ("storage", &storage, storage_now),
         ];
-        for (key, resource) in resources {
-            let Some(fresh) = self
-                .k8s
-                .read(
-                    text(resource, "kind"),
-                    resource["metadata"]["namespace"].as_str(),
-                    text(&resource["metadata"], "name"),
-                )
-                .await?
-            else {
+        for (key, resource, fresh) in &resources {
+            let Some(fresh) = fresh else {
                 return Ok(None);
             };
             if fresh["metadata"]["uid"] != resource["metadata"]["uid"]
                 || fresh["metadata"]["resourceVersion"] != resource["metadata"]["resourceVersion"]
                 || !fresh["metadata"]["deletionTimestamp"].is_null()
-                || !self.k8s.runtime_resource_current(&fresh)
+                || !self.k8s.runtime_resource_current(fresh)
             {
                 return Ok(None);
             }
@@ -2382,7 +2428,7 @@ impl Reconciler {
         if self.k8s.runtime_continuity().as_ref() != Some(start)
             || resources
                 .iter()
-                .any(|(_, resource)| !self.k8s.runtime_resource_current(resource))
+                .any(|(_, resource, _)| !self.k8s.runtime_resource_current(resource))
         {
             return Ok(None);
         }
@@ -2584,6 +2630,18 @@ impl Reconciler {
         let ns = manifest["metadata"]["namespace"].as_str();
         let name = text(&manifest["metadata"], "name");
         let current = self.k8s.read(kind, ns, name).await?;
+        self.apply_to(db, manifest, current).await
+    }
+    /// Brings the object `manifest` names, as it was read, to the manifest.
+    async fn apply_to(
+        &self,
+        db: &Value,
+        manifest: &Value,
+        current: Option<Value>,
+    ) -> Result<Value, Error> {
+        let kind = text(manifest, "kind");
+        let ns = manifest["metadata"]["namespace"].as_str();
+        let name = text(&manifest["metadata"], "name");
         if let Some(current) = &current {
             owned(current, db, name, ns)?;
             if generation(current) > number(db, "generation") {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{Error, contracts::text};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::{Client, Method, StatusCode, Url};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde_json::{Value, json};
@@ -93,6 +93,9 @@ pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
 /// How long the version of this controller's own write is remembered for the event of the watch
 /// that is still to come; a watch that restarted past it never delivers it.
 const OWN_WRITE_MEMORY: Duration = Duration::from_secs(120);
+/// How many reads of one group are in flight at once: the group of a pass is a dozen objects and
+/// the API server answers each in a few milliseconds.
+const READ_FANOUT: usize = 8;
 /// Versions remembered for one object: a pass writes one object a few times at most.
 const OWN_WRITES_PER_OBJECT: usize = 16;
 #[derive(Debug)]
@@ -858,6 +861,23 @@ impl Kubernetes {
             return Err("Kubernetes read identity changed".into());
         }
         Ok(value)
+    }
+    /// Reads `objects` (kind, namespace, name) a few at a time and answers them in the order they
+    /// were asked in. They are independent reads: the answers are as of the same moment only to
+    /// the extent that any run of reads is. A slow read holds back no other.
+    pub async fn read_all(
+        &self,
+        objects: &[(&str, Option<&str>, &str)],
+    ) -> Result<Vec<Option<Value>>, Error> {
+        let mut answered: Vec<(usize, Option<Value>)> = stream::iter(objects.iter().enumerate())
+            .map(|(index, (kind, namespace, name))| async move {
+                Ok::<_, Error>((index, self.read(kind, *namespace, name).await?))
+            })
+            .buffer_unordered(READ_FANOUT)
+            .try_collect()
+            .await?;
+        answered.sort_by_key(|(index, _)| *index);
+        Ok(answered.into_iter().map(|(_, object)| object).collect())
     }
     pub async fn list(
         &self,

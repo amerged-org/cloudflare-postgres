@@ -2,7 +2,10 @@
 //! The reconciliation of a database that holds a retained instance Pod, against the in-process
 //! doubles.
 use super::{SYSTEM, *};
-use crate::{test_server::path, test_world::*};
+use crate::{
+    test_server::{Gate, path},
+    test_world::*,
+};
 
 const FENCE: &str = "cnpg.io/fencedInstances";
 const HIBERNATION: &str = "cnpg.io/hibernation";
@@ -795,4 +798,127 @@ async fn the_cluster_is_asserted_once_per_pass() {
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
     assert_eq!(reads_of(&w, at, &cluster), 1, "the pass after it");
+}
+
+/// Every request the controller made since `from`, as "METHOD path".
+fn made_since(w: &World, from: usize) -> Vec<String> {
+    w.server.state.lock().unwrap().requests[from..]
+        .iter()
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_generation_is_applied_by_reading_its_objects_together_and_writing_them_in_order() {
+    // A pass that brings a new generation to the cluster reads the objects it is about to write
+    // before it writes the first, a few at a time, and writes them in the order of the manifests:
+    // the policies and quotas before the Cluster that creates the Pod they bind. The Cluster is
+    // read when its turn comes, because CNPG writes its status continually and a patch over a
+    // version read ahead of the others' writes would conflict.
+    let w = World::running().await;
+    let names = [
+        ("ResourceQuota", "database-resources"),
+        ("LimitRange", "container-defaults"),
+        ("NetworkPolicy", "default-deny"),
+        ("NetworkPolicy", "gateway-ingress"),
+        ("NetworkPolicy", "agent-management-ingress"),
+        ("CiliumNetworkPolicy", "database-boundaries"),
+        ("ObjectStore", "archive"),
+        ("ScheduledBackup", "daily-backup"),
+    ];
+    let objects: Vec<String> = names
+        .iter()
+        .map(|(kind, name)| path(kind, Some(&w.ns), name))
+        .collect();
+    // Only the apply pass and the check that the applied objects stayed as applied read these:
+    // each is a group of eight read together, which two groups of four fill, and the pass
+    // that read them one after another would fill none.
+    let matching = objects.clone();
+    w.server.state.lock().unwrap().gate = Some(Gate::new(4, move |at| {
+        matching.iter().any(|object| object == at)
+    }));
+    let at = w.server.state.lock().unwrap().requests.len();
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let gate = w.server.state.lock().unwrap().gate.take().unwrap();
+    assert_eq!(
+        (gate.rounds, gate.gave_up),
+        (4, 0),
+        "the objects were not read together, by the apply pass and by the check after it"
+    );
+    let made = made_since(&w, at);
+    let patched: Vec<&str> = made
+        .iter()
+        .filter(|request| request.starts_with("PATCH "))
+        .map(|request| request.trim_start_matches("PATCH "))
+        .filter(|at| {
+            objects.iter().any(|object| object == at)
+                || *at == path("Cluster", Some(&w.ns), "database")
+        })
+        .collect();
+    let mut wanted: Vec<String> = objects.clone();
+    wanted.insert(7, path("Cluster", Some(&w.ns), "database"));
+    assert_eq!(
+        patched, wanted,
+        "the writes are in the order of the manifests"
+    );
+    // The Cluster is read right before it is written, after the object written before it.
+    let cluster = format!("PATCH {}", path("Cluster", Some(&w.ns), "database"));
+    let position = made.iter().position(|request| *request == cluster).unwrap();
+    assert_eq!(
+        made[position - 1],
+        format!("GET {}", path("Cluster", Some(&w.ns), "database"))
+    );
+    assert_eq!(
+        made[position - 2],
+        format!("PATCH {}", path("ObjectStore", Some(&w.ns), "archive"))
+    );
+}
+
+#[tokio::test]
+async fn the_proof_reads_the_resources_it_names_back_together() {
+    let mut w = World::running().await;
+    w.admitted();
+    let start = w.reconciler.k8s.runtime_continuity().expect("a watch");
+    let get = |kind: &str, namespace: Option<&str>, name: &str| {
+        w.server.get(kind, namespace, name).expect(name)
+    };
+    let namespace = get("Namespace", None, &w.ns);
+    let cluster = get("Cluster", Some(&w.ns), "database");
+    let pod = get("Pod", Some(&w.ns), "database-1");
+    let ca = get("Secret", Some(&w.ns), "database-ca");
+    let node = get("Node", None, NODE);
+    let volume = json!({"claimUid":claim_uid(),"volumeUid":volume_uid(),"handle":HANDLE});
+    // Eleven reads: the claim, the volume and the receipt, and each of the eight resources of
+    // the proof again. Read one after another, no group of three is ever together.
+    w.server.state.lock().unwrap().gate = Some(Gate::new(3, |_| true));
+    let continuity = w
+        .reconciler
+        .runtime_readback(
+            &w.db,
+            &start,
+            &RuntimeResources {
+                namespace: &namespace,
+                cluster: &cluster,
+                pod: &pod,
+                ca: &ca,
+                node: &node,
+            },
+            &volume,
+        )
+        .await
+        .unwrap()
+        .expect("the resources are as they were read");
+    let gate = w.server.state.lock().unwrap().gate.take().unwrap();
+    assert!(
+        gate.rounds >= 3,
+        "{} groups together, {} reads alone",
+        gate.rounds,
+        gate.gave_up
+    );
+    assert_eq!(continuity["coverage"], "complete");
+    assert_eq!(
+        continuity["resource_versions"].as_object().unwrap().len(),
+        8
+    );
 }
