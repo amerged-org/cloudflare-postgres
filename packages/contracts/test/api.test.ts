@@ -283,11 +283,15 @@ describe("request bodies", () => {
   it("binds integrator keys to a project and admin keys to none", () => {
     const project_id = newProjectId();
     expect(
-      ApiKeyCreate.safeParse({ scope: "integrator", project_id, name: "omh" })
-        .success,
+      ApiKeyCreate.safeParse({
+        scope: "integrator",
+        project_id,
+        name: "integrator",
+      }).success,
     ).toBe(true);
     expect(
-      ApiKeyCreate.safeParse({ scope: "integrator", name: "omh" }).success,
+      ApiKeyCreate.safeParse({ scope: "integrator", name: "integrator" })
+        .success,
     ).toBe(false);
     expect(
       ApiKeyCreate.safeParse({ scope: "admin", project_id, name: "ops" })
