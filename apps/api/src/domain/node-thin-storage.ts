@@ -218,6 +218,12 @@ async function heldWriterPod(
   receipt: DatabaseStorageVolumeReceipt,
   authority: NodeThinStorageAuthority,
   qualification: string | null,
+  reading = authority.volumes.find(
+    (value) =>
+      value.database_id === database.id &&
+      value.generation === database.generation &&
+      value.storage_generation === receipt.storage_generation,
+  ),
 ): Promise<string | undefined> {
   const lv = authority.physical_lvs.find(
       (value) => value.lv_uuid === receipt.lv_uuid && value.segtype === "thin",
@@ -247,12 +253,7 @@ async function heldWriterPod(
     runtime.pv_uid !== receipt.pv_uid
   )
     return undefined;
-  const volume = authority.volumes.find(
-    (value) =>
-      value.database_id === database.id &&
-      value.generation === database.generation &&
-      value.storage_generation === receipt.storage_generation,
-  );
+  const volume = reading;
   const hold = await env.DB.prepare(
     "SELECT h.ready_at,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at FROM database_start_admissions h JOIN operations o ON o.id=h.operation_id WHERE h.database_id=? AND h.generation=? AND h.node_id=? AND h.node_uid=? AND h.budget_bytes>0 AND h.storage_budget_bytes>=?",
   )
@@ -539,6 +540,59 @@ export async function storageWriteAuthorityForDatabase(
 }
 
 /**
+ * The writer a sleep's window continues: the running authority's own sources at the generation the
+ * Pod was started for (the sleep bumped the row's generation from it). The node's single measured
+ * Pod, or while no reading has measured one yet, the held writer: the startup hold plus the
+ * controller's attestation of that start. Both have to name the same Pod, and a frozen volume or a
+ * second measured Pod names none.
+ */
+async function stoppingWriter(
+  env: Pick<Env, "DB">,
+  database: DatabaseRow,
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+  authority: NodeThinStorageAuthority,
+  qualification: string | null,
+): Promise<string | undefined> {
+  const volumes = authority.volumes.filter(
+    (volume) =>
+      volume.database_id === database.id &&
+      volume.storage_generation === receipt.storage_generation &&
+      volume.generation <= database.generation,
+  );
+  if (volumes.length > 1) return undefined;
+  const volume = volumes[0];
+  if (
+    volume &&
+    (volume.quiesced ||
+      !volumeMatchesReceipt(volume, storage, receipt) ||
+      volume.io.length > 1)
+  )
+    return undefined;
+  const io = volume?.io[0];
+  if (
+    io &&
+    (io.write_bytes_per_second > storage.write_bytes_per_second ||
+      io.write_iops_per_second > storage.write_iops_per_second)
+  )
+    return undefined;
+  const held =
+    database.observed_generation === database.generation - 1
+      ? await heldWriterPod(
+          env,
+          { ...database, generation: database.observed_generation },
+          storage,
+          receipt,
+          authority,
+          qualification,
+          volume,
+        )
+      : undefined;
+  if (io && held && io.pod_uid !== held) return undefined;
+  return io?.pod_uid ?? held;
+}
+
+/**
  * For the host lease only: the writer token of a database whose sleep is being carried out. The
  * desired state is already "suspended" while the controller still has to stop PostgreSQL
  * gracefully in the instance Pod (its sleep proof, then the stop). The guard freezes the volume and
@@ -556,8 +610,15 @@ async function stoppingStorageWriteAuthority(
   if (database.desired_state !== "suspended") return undefined;
   const context = await currentWriterContext(env, database, now, snapshot);
   if (!context) return undefined;
-  const { storage, receipt, authority } = context;
-  const pod = evidencedWriter(database, storage, receipt, authority);
+  const { storage, receipt, authority, current } = context;
+  const pod = await stoppingWriter(
+    env,
+    database,
+    storage,
+    receipt,
+    authority,
+    current!.row.qualification_json,
+  );
   if (!pod) return undefined;
   return signStorageWriter(
     env,

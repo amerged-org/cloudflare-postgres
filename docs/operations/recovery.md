@@ -301,14 +301,23 @@ inventory proof.
 
 While a thin database's sleep (idle or manual) is under way, the host lease keeps its instance Pod
 the running writer: until the sleep's stop operation of that generation leaves pending or running,
-the entry is `running` with a write token for the one Pod the latest identity proof evidences on the
-volume, and carries no startup grant and no drain. The controller stops PostgreSQL in that Pod; once
-it reports the sleep the entry becomes `suspended` (a parked Pod keeps its token) and the guard may
-freeze the volume the stopped Pod left. Without that evidence or a current write-allowed reading,
-or after the stop timed out, the guard freezes the volume and stops the Pod. Only a deletion still
-drains. A wake reuses a parked Pod only when the controller's last report claimed the fast wake and
-the wake is the generation right after the reported sleep; any other wake retires the parked Pod
-and the controller starts a new one.
+the entry is `running` with a write token for that one Pod, and carries no startup grant and no
+drain. The Pod is named by the same evidence the running token trusts: the Pod the latest identity
+proof measured on the volume or, before a reading has measured it, the held writer (the start's
+storage hold plus the controller's attestation); both must agree. The controller stops PostgreSQL
+in that Pod; once it reports the sleep the entry becomes `suspended` (a parked Pod keeps its token)
+and the guard may freeze the volume the stopped Pod left. Without that evidence or a current
+write-allowed reading, or after the stop timed out, the guard freezes the volume and stops the Pod.
+Only a deletion still drains. A wake reuses a parked Pod only when the controller's last report
+claimed the fast wake and the wake is the generation right after the reported sleep; any other wake
+retires the parked Pod and the controller starts a new one.
+
+The first lease of a sleep window or of a fast wake can arrive while the node's authority revision
+has not moved since the previous token; the guard then refuses that whole node lease once and keeps
+its previous state until the next accepted headroom sample moves the revision. The fast-wake claim
+is the controller's last parked report: if the Pod drifts after it and the wake has to start a new
+Pod after all, the guard refuses that Pod for the wake's generation until the wake times out and the
+next wake bumps the generation.
 
 A release that carries the receipt requires current thin write authority from every member that
 takes databases and from every member that already has a selection. Until then that member stays

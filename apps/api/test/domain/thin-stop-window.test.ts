@@ -11,7 +11,15 @@ import {
 } from "@pgcf/contracts/node-thin-storage";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { mib, nonce, post, sample } from "./thin-renewal-fixture.ts";
+import {
+  gib,
+  identityProof,
+  lvs,
+  mib,
+  nonce,
+  post,
+  sample,
+} from "./thin-renewal-fixture.ts";
 import {
   type AwakeWriter,
   awakeWriter,
@@ -140,7 +148,13 @@ it("the window needs one evidenced Pod, a current reading and a stop still under
   const w = await awakeWriter(await thinExecutionFixture(releases)),
     entry = () => leaseEntry(w.f, w.id);
   const intent = await idleIntent(w);
-  // No Pod measured on the volume names no writer.
+  // Well after the start, a reading that measured no Pod names no writer: as for a running
+  // database, the held writer ends with the first post-ready reading.
+  await env.DB.prepare(
+    "UPDATE databases SET runtime_attestation_json=json_set(runtime_attestation_json,'$.observed_at',?) WHERE id=?",
+  )
+    .bind(Date.now() - 10_000, w.id)
+    .run();
   await w.evidence({ io: [] });
   expect(await entry()).toMatchObject(suspendedEntry);
   // Neither do two.
@@ -172,6 +186,58 @@ it("the window needs one evidenced Pod, a current reading and a stop still under
     .bind(new Date().toISOString(), intent.operation)
     .run();
   expect(await entry()).toMatchObject(suspendedEntry);
+});
+
+/** A reading of the node that has the volume but has not measured any Pod's io.max on it yet. */
+const unmeasured = (w: AwakeWriter) =>
+  identityProof(w.f, {
+    physical: w.physical,
+    physical_lvs: [
+      lvs.pool,
+      lvs.data,
+      lvs.meta,
+      {
+        name: w.receipt.volume_handle,
+        lv_uuid: w.receipt.lv_uuid,
+        size_bytes: 5 * gib,
+        segtype: "thin",
+      },
+    ],
+    active_lv_uuids: [w.receipt.lv_uuid],
+    volumes: [],
+  });
+
+it("a database idled before any reading measured its Pod gets the window from its held writer", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  // Ready moments ago: the controller attested the Pod under its startup hold, and the node's
+  // reading has not measured it yet. The running token already trusts exactly that.
+  await unmeasured(w);
+  const intent = await idleIntent(w);
+  expectWindow(await leaseEntry(w.f, w.id), w, intent.generation);
+});
+
+it("a sleep with neither a measured nor a held writer gets no window", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  await unmeasured(w);
+  await env.DB.prepare(
+    "UPDATE databases SET runtime_attestation_json=NULL WHERE id=?",
+  )
+    .bind(w.id)
+    .run();
+  await idleIntent(w);
+  expect(await leaseEntry(w.f, w.id)).toMatchObject(suspendedEntry);
+});
+
+it("an attested Pod that differs from the measured writer gets no window", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  // The node measured the Pod's io.max while the controller's attestation names another Pod.
+  await env.DB.prepare(
+    "UPDATE databases SET runtime_attestation_json=json_set(runtime_attestation_json,'$.pod_uid',?) WHERE id=?",
+  )
+    .bind(crypto.randomUUID(), w.id)
+    .run();
+  await idleIntent(w);
+  expect(await leaseEntry(w.f, w.id)).toMatchObject(suspendedEntry);
 });
 
 it("a deletion during the window drains as before", async () => {
