@@ -1,6 +1,9 @@
 # Parked instances: a sleep tier that keeps the Pod and stops PostgreSQL
 
-Status: **implementation in progress** (controller and API tiers on branches; nothing deployed).
+Status: **implemented on branches, not deployed.** There is no release marker; the region policy
+`parked_tier` is the only switch (no backwards compatibility in Dev). Live findings of 2026-10-15
+changed section 3.3: the API keeps a stopping Pod's token until the controller's stop observation
+commits, and the wake token for a parked Pod needs its fast-wake claim.
 Design date: 2026-10-15. Repository snapshot: origin/main `95e64ab`; every
 `path:line` below refers to that snapshot. CNPG citations (`cnpg:path:line`) refer to a clone of
 the v1.30.1 tag (commit `2a35abb`, the version the repository pins); `cnpg-plugin:path:line` refers
@@ -108,7 +111,7 @@ qualified warm-reclaim policy never reaches either (section 2.4).
 | --- | --- | --- | --- |
 | Public `desired_state` / `observed_state` | `running` / `ready` | `suspended` / `hibernated` (unchanged, `rows.ts:95-101`) | same |
 | D1 `observed_power` | `awake` | `hibernated` (CHECK allows only `awake`,`hibernated`, `apps/api/migrations/0008_database_lifecycle.sql:37`; no new value) | `hibernated` |
-| D1 `parked_json` (new, nullable) | NULL | `{v:1, pod_uid, generation, cpu_millicores, memory_mib, parked_at, observed_at}` | NULL |
+| D1 `parked_json` (new, nullable) | NULL | `{v:1, pod_uid, generation, cpu_millicores, memory_mib, wake?, parked_at, observed_at}` | NULL |
 | Cluster annotations | no fence; `cnpg.io/hibernation` off/absent | `cnpg.io/fencedInstances='["*"]'`; hibernation off/absent; `pgcf.io/power-revision`,`power-operation` | `cnpg.io/hibernation=on`; no fence |
 | CNPG Cluster status | Healthy, Ready | phase unchanged (Healthy); `readyInstances=0`; Lease held by the instance | `cnpg.io/hibernation` condition reason `Hibernated` (`cnpg:pkg/reconciler/hibernation/status.go:53`) |
 | Kubernetes Pod | Running, Ready | Running, not Ready; PostgreSQL absent; instance manager + sidecar up; volume mounted; requests shrunk | none |
@@ -234,7 +237,10 @@ Controller (`power.rs` `suspend_step`, 1275-1494). Steps S1-S5 are the existing 
       poll continues; this is a negative probe and never proof by itself, only together with c);
    e) gateway `status` controls and `anchor` unchanged (as 1357-1383).
 9. S9 resize down (section 2.1.2); S10 `Phase::Parked` written; observation `hibernated` with
-   `power.parked = {pod_uid, cpu_millicores, memory_mib}` (power.rs:526-534 gains the field).
+   `power.parked = {pod_uid, cpu_millicores, memory_mib, wake?: "fast"}` (power.rs:526-534 gains the
+   field). `wake: "fast"` is claimed only while every fast-path predicate holds (release, node boot,
+   Pod and container identity, runtime, image, manifest containment); on drift the controller
+   demotes before any wake.
 
 **What "stopped cleanly" can and cannot mean.** The controller has no exec or log access to the
 Pod (rbac comment: no `pods/exec`, no cluster-wide `pods/log`), so it cannot read `pg_control`.
@@ -359,8 +365,9 @@ Decider: the controller, in the periodic reconcile of each parked database (cade
 Why the controller and not an API-side decider: the inputs are node-local and already in the
 controller's hands (Pod identity, `Node.status.nodeInfo.bootID`, the node's fence ConfigMaps, which
 carry a common label so one list suffices, `power.rs:4367`), the action is a Kubernetes write it
-performs for hibernation anyway, and it must keep working when Cloudflare or the region link is
-unreachable, because a parked Pod holds node RAM. The policy values stay Cloudflare-owned desired
+performs for hibernation anyway. The implementation runs no job without a full desired pull in
+the last 90 s, so while Cloudflare is unreachable no TTL, cap or drift demotion happens and parked
+Pods keep their parked requests until the link returns. The policy values stay Cloudflare-owned desired
 state (`region.parking`, section 5.2), so the controller executes desired state and reports an
 observation, as AGENTS.md requires. An API-side decider would need a new desired field with its own
 revision protocol and a pull round trip per demotion, and would still depend on the controller to
@@ -420,7 +427,7 @@ Resume of a demoted database is the unmodified CNPG wake (`cluster_intent off`, 
 | **Controller restart or rollout** | Progress is in the fence ConfigMap; `Parking` resumes at S8, `Parked` is re-verified each 60 s, `Wake` resumes (power.rs:2069-2077). **Downgrading to a controller without this phase makes `power.json` unparseable (`power_progress_invalid`)**: demote all parked databases (policy off) before such a rollback. |
 | **CNPG operator upgrade/restart** | A fenced primary is never rolled out (`cluster_upgrade.go:112`) and no switchover happens (`cluster_controller.go:735-739`); the running instance manager keeps its old binary. At wake the release predicate (2.2) is false, so the first wake after an operator or fleet release change demotes and recreates the Pod instead of waking into a rollout. |
 | **Gateway restart** | Fence ConfigMap is persistent; no sessions exist. |
-| **Cloudflare/D1 outage** | Controller keeps TTL, can still demote. The guard lease lapses like for any database; a parked Pod is then frozen/killed by the guard (harmless, no writer), and the first wake after recovery resumes it through the existing startup-resume path (`storage.rs:461-499,824-849`); wake is slower, never unsafe. |
+| **Cloudflare/D1 outage** | No demotion until the next full desired pull (see 2.3). The guard lease lapses like for any database; a parked Pod is then frozen/killed by the guard (harmless, no writer), and the first wake after recovery resumes it through the existing startup-resume path (`storage.rs:461-499,824-849`); wake is slower, never unsafe. |
 | **Warm reclaim (`node-reclaimer`)** | Disjoint. A database that is a warm-reclaim candidate never takes the idle-hibernate path: `requestIdle` returns `not_idle` for it (`database-actor.ts:1365-1381`) and a reclaim lease is revoked before a real idle sleep (`:1389`). Parking therefore applies only to databases without a qualified warm policy; nothing in `warm-reclaim.ts` changes. |
 | **Usage and cost metrics** | `awake_seconds`, `memory_mib_seconds` and `cpu_millicore_seconds` stop at the `hibernated` event (`usage-rollup.ts:91-92,148-152`). The snapshot of that event keeps `reserved_memory_mib` at class memory plus the sidecar request (`observations.ts:530-545`), which already exceeds a parked Pod's footprint, but sets `reserved_cpu_millicores` to 0 (charge 0, `startup-admission.ts:57-77`). Section 4.3 adds the parked CPU to that snapshot so that `reserved_cpu_millicore_seconds` equals what the node accounts. No new metric name (open question Q11). |
 | **Pool runtime** | A parked database is excluded from pool claims (D1 `parked_json IS NULL`, section 1.2); the pool's own eligibility already requires a hibernated Cluster with no Pod and an empty Lease (`pool:83-88`). Both routes can be enabled in one region: a parked database wakes through the parked path, a demoted one is an ordinary hibernated database and a pool claim may serve its next wake. |
@@ -473,6 +480,22 @@ PGDATA of one database is written by at most one process at any time:
 - Data written by crash recovery after an immediate fallback is covered by PostgreSQL's WAL.
 
 ### 3.3 Thin write authority, host guard, I/O limits, reserved capacity
+
+**Live findings (EU1, 2026-10-15) and their fixes.** V-5 below is confirmed: a thin idle sleep had its
+Pod's tasks stopped by the guard 7 s after the sleep intent (restartCount 1); PostgreSQL restarted
+while D1 stayed `suspended` and the controller's reconcile failed in a loop. Fix (API only): while a
+stop operation (`database.suspend` or `database.hibernate`) of the current generation is pending or
+running and the node proof evidences the Pod, the lease presents `running` with a token for that Pod;
+the window ends with the controller's stop observation or the operation's timeout. A replay of the
+lease through `storage.rs` also showed that a wake from parked that later takes the slow path at the
+same generation leaves the replacement Pod unpermitted. Fix: the wake token for the parked Pod is
+issued only when the parked record claims `wake: "fast"` and the database generation is exactly the
+parked generation plus one; every other wake retires the parked Pod and starts a new one. The stop
+window accepts the same evidence as the running token: the Pod a node reading measured, or before
+any reading the held writer (startup hold plus the controller's attestation). Two limits remain on
+thin volumes: a database that parks before the first reading after its start gets no parked token
+and is demoted instead; and a parked Pod that CNPG recreates after a node reboot cannot start
+without a startup grant, so it stays down until the next wake, which starts it normally.
 
 What the guard does with a Pod it knows (`storage.rs:536-595,764-877`): a Pod in a `pgcf-db-<id>`
 namespace is permitted only while its lease entry is `running`, not `write_blocked`, with a valid
@@ -575,13 +598,24 @@ and R1 removes the exposure afterwards.
 
 | | awake (existing) | parked |
 | --- | --- | --- |
-| `postgres` container requests | CPU `cpu_request_millicores ?? cpu_millicores`; memory `memory_request_mib` under `actual_ram`, else `memory_mib` (`manifests.rs:148,341`, `desired.ts:256-258`) | CPU 10m, memory 96Mi (lab shrank 100m/256Mi to 20m/96Mi; manager RSS ~62 MB) |
+| `postgres` container requests | CPU `cpu_request_millicores ?? cpu_millicores`; memory `memory_request_mib` under `actual_ram`, else `memory_mib` (`manifests.rs:148,341`, `desired.ts:256-258`) | CPU 10m, memory 96Mi on the container (lab shrank 100m/256Mi to 20m/96Mi; manager RSS ~62 MB); the Pod's effective requests stay at the class requests (below) |
 | `plugin-barman-cloud` requests | 100m / 128Mi (`contracts/src/sizing.ts:5-10`) | CPU 5m, memory 64Mi (to be set from V-7) |
 | limits | CPU `cpu_millicores`, memory `memory_mib`; sidecar 500m / 512Mi | unchanged (resize touches requests only) |
 | RuntimeClass `spec.overhead` (pool runtime) | per-slot (immutable) | same (immutable); included in the charge |
 
 The parked values are policy (`parked_tier`), tuned after V-7. Example (256 MiB class, plan:189):
-awake requests 450m / 320Mi; parked about 15m plus overhead / 160Mi.
+awake requests 450m / 320Mi; parked requests stay at the class requests.
+
+**Request floor.** A parked Pod's effective requests cannot fall below the class requests. CNPG's
+regular init container `bootstrap-controller` carries `cluster.Spec.Resources`
+(`cnpg:pkg/specs/containers.go:45`), and the Pod's effective request is `max(sum of containers and
+sidecars, each regular init container)` for CPU and memory alike. The observation reports the
+effective figures, so the API's charge is correct. Parking frees the sidecar's request delta and
+the RAM the stopped PostgreSQL used (which `actual_ram` placement sees), not scheduling requests.
+Classes that sleep should set small requests (`cpu_request_millicores`, and `memory_request_mib`
+under `actual_ram`). Kubernetes 1.36 can shrink the completed init container in place
+(`InPlacePodVerticalScalingInitContainers`, beta and on by default, with `NodeDeclaredFeatures`);
+that would lower the floor but is not implemented, and EU1's feature declaration is unconfirmed.
 
 **In-place resize versus lower fixed requests.** Fixed low requests would make every awake Pod
 scheduling-light, break the API's CPU arithmetic (it charges `cpu_request_millicores`,
@@ -658,13 +692,17 @@ slack_mem = A_mem - P_mem - N - B - K * m_awake
 max_parked = floor(0.8 * min(slack_cpu / p_cpu, slack_mem / p_mem))
 ```
 
+The cap is checked and then acted on per pass, so concurrent passes on one node can exceed it until
+the oldest databases demote; a deleted or unreadable fence ConfigMap holds no slot.
+
 EU1 worked example (inputs from plan:187-198, estimates marked): `A_cpu=5000m`, `P_cpu=650m`,
-`K=9` at 450m: `slack_cpu = 300m`; with `p_cpu = 15m` → 20; `A_mem = 10,819 MiB`, `P_mem` and `N` taken
+`K=9` at 450m: `slack_cpu = 300m`; with `p_cpu` at the class request (request floor, 4.1) → 0, so the
+cap needs a smaller class CPU request or a smaller `K`; `A_mem = 10,819 MiB`, `P_mem` and `N` taken
 as 1,500 MiB (estimate), `B = 200 MiB` (estimate), `m_awake = 256+512 = 768`:
 `slack_mem = 10,819 - 1,500 - 200 - 6,912 = 2,207` → 19 at 115 MiB. `max_parked = floor(0.8 * 19) = 15`.
-Recommended initial value 8 until V-6 and V-7 are measured. CPU and memory slack are close
-(20 versus 19): parking leaves `K` unchanged only while `max_parked * p_cpu <= slack_cpu` and
-`max_parked * p_mem <= slack_mem`.
+Recommended initial value 8 until V-6 and V-7 are measured. Parking leaves `K` unchanged only
+while `max_parked * p_cpu <= slack_cpu` and `max_parked * p_mem <= slack_mem`; with the CPU floor
+the request floor makes the CPU term bind first.
 
 CNPG load: a fenced Cluster is reconciled by the operator **every second**
 (`cnpg:internal/controller/cluster_controller.go:1150-1153` returns `RequeueAfter: 1s, ErrNextLoop`
@@ -703,12 +741,11 @@ and unmeasured (V-6); it is the main density cost besides RAM.
 | --- | --- |
 | `migrations/0051_parked_tier.sql` | expand-only: `ALTER TABLE databases ADD COLUMN parked_json TEXT CHECK(parked_json IS NULL OR json_valid(parked_json));` and `ALTER TABLE node_region_policies ADD COLUMN parked_tier_json TEXT CHECK(parked_tier_json IS NULL OR json_valid(parked_tier_json));` Both nullable, no backfill; absent = disabled. Ship before code (same pattern as `0036_warm_reclaim.sql`). |
 | `src/domain/rows.ts` | `parked_json?: string \| null` |
-| `src/domain/observations.ts` | accept `power.parked` only for `state='hibernated'`, `desired_state='suspended'`, `suspension_reason='idle'`, capability true; write `parked_json = {v:1,pod_uid,generation,cpu_millicores,memory_mib,parked_at,observed_at}` in the same UPDATE as `observed_power` (470-526); set NULL for `ready`/`deleted`/`hibernated` without `parked`; leave unchanged for `provisioning`/`error` |
+| `src/domain/observations.ts` | accept `power.parked` only for `state='hibernated'`, `desired_state='suspended'`, `suspension_reason='idle'`; write `parked_json = {v:1,pod_uid,generation,cpu_millicores,memory_mib,wake?,parked_at,observed_at}` in the same UPDATE as `observed_power` (470-526); set NULL for `ready`/`deleted`/`hibernated` without `parked`; leave unchanged for `provisioning`/`error` |
 | `src/domain/startup-admission.ts` | `databaseParkedCpuSql`; add to `nodeCpuHeadroomSql` (113-116) |
 | `src/domain/placement.ts` (260), `postgres-pool-inventory.ts` (342) | add the term |
 | `src/domain/node-thin-storage.ts` | `parkedHolder`; R2 branch in `storageWriteAuthorityForDatabase` (305-376); R1 presentation and freshness bound in `hostStorageLease` (870-961) |
-| `src/domain/fleet-releases.ts` | `parkedTierSql(region)` and `parkedTierCapable()` modeled on `thinStorageSamplingSql` (894-905) |
-| `src/domain/desired.ts` | `region.parking` only when capable (pattern at 269-277) |
+| `src/domain/desired.ts` | `region.parking` whenever the region policy is set |
 | `src/domain/node-state.ts`, `src/routes/nodes.ts` | persist/serve `parked_tier` in the capacity policy (upsert pattern 193-223; `KEEP` semantics, `contracts/src/nodes.ts:~143-200`) |
 | `src/domain/postgres-pool.ts`, `postgres-pool-cold-start.ts` | `AND d.parked_json IS NULL` in claim eligibility |
 | `src/database-actor.ts`, `observations.ts`, `desired.ts` | timing events (section 6.3); optional trims (6.4) |
@@ -718,14 +755,13 @@ and unmeasured (V-6); it is the main density cost besides RAM.
 
 | File | Change |
 | --- | --- |
-| `src/agent.ts` | `DatabaseObservation.power.parked: strictObject{pod_uid:uuid, cpu_millicores:Count, memory_mib:Count}.optional()`; superRefine: only with `state==="hibernated"` and no `refusal` (extends 599-620); `DesiredResponse.region.parking: ParkedTierPolicy.optional()`; `cpu_millicores` and `memory_mib` are the Pod's effective scheduling request after the resize (container requests plus `Pod.spec.overhead`), the quantity Kubernetes sums per node |
+| `src/agent.ts` | `DatabaseObservation.power.parked: strictObject{pod_uid:uuid, cpu_millicores:Count, memory_mib:Count, wake:literal("fast").optional()}.optional()`; superRefine: only with `state==="hibernated"` and no `refusal` (extends 599-620); `DesiredResponse.region.parking: ParkedTierPolicy.optional()`; `cpu_millicores` and `memory_mib` are the Pod's effective scheduling request after the resize (container requests plus `Pod.spec.overhead`), the quantity Kubernetes sums per node |
 | `src/nodes.ts` | `NodeRegionPolicy.parked_tier: ParkedTierPolicy.nullable().optional()`: `{enabled, ttl_seconds 60..3300, max_per_node 0..64, postgres_cpu_millicores, postgres_memory_mib, sidecar_cpu_millicores, sidecar_memory_mib}` |
-| `src/releases.ts` | `FleetReleaseSpec.parked_tier_version: z.literal(1).optional()`, valid only with `runtime_attestation_version === 2` (native controller present) |
 | `native/*.generated.json` | regenerate (`generate.ts`); wire constants are Kubernetes keys held as Rust consts like `HIBERNATION` (power.rs:30) |
 
-All new wire fields are emitted only for a region whose every non-lost node is patched to a release
-with `parked_tier_version: 1` (strict schemas, `desired.ts:196,269-277` precedent). Order:
-migration, API, release containing the controller, policy PUT.
+There is no release marker. Order: migration, API, release containing the controller, policy PUT;
+an older controller rejects `region.parking` on its strict parse, so the policy is set only after the
+new controller runs.
 
 ### 5.4 Edge and gateway
 
@@ -754,8 +790,8 @@ migration, API, release containing the controller, policy PUT.
   A ValidatingAdmissionPolicy limiting `pods/resize` by this principal to `pgcf-db-*`
   namespaces is an optional hardening (open question Q6).
 - NetworkPolicy/CiliumNetworkPolicy: none (agent to 5432 and 9187 is allowed, `manifests.rs:218-227`).
-- Fleet release: new native-controller image digest in `infra/platform/versions.lock.json`,
-  `parked_tier_version: 1`, receipt carried unchanged (host extension, driver and kernel identical).
+- Fleet release: new native-controller image digest in `infra/platform/versions.lock.json`; host
+  extension, driver and kernel identical.
 
 ### 5.6 Documentation
 
@@ -763,8 +799,8 @@ migration, API, release containing the controller, policy PUT.
 PostgreSQL warm pool) and Done measurements; `pool:913-918,771-773` (alternative 7 and the
 fencing remark: D-1); `rt` section 4/5/15 state table and acceptance (D-2, D-3); `README.md`
 states and the wake diagram (diagrams are checked by the repository's mermaider tooling before
-push); `docs/operations/recovery.md` (demote-all before a controller downgrade; parked-tier
-runbook); `apps/api` OpenAPI text for the capacity policy.
+push); `docs/operations/recovery.md` (parked-tier runbook: policy off demotes every parked
+database); `apps/api` OpenAPI text for the capacity policy.
 
 ### 5.7 Items that force thin requalification
 
