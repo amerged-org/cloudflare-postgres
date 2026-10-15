@@ -926,6 +926,62 @@ export class DatabaseActor extends DurableObject<Env> {
       .toArray();
     return allowed.length === 1 ? undefined : { ok: false, sqlstate: "53300" };
   }
+  /**
+   * The durable claim of one wake and its single hint to the region. Claim before notifying: a lost
+   * response never replays a hint; periodic desired pulls recover its loss. False when a newer wake
+   * is already stored.
+   */
+  private async hintWake(
+    id: string,
+    regionId: string,
+    operation: string,
+    revision: number,
+    started: number,
+  ): Promise<boolean> {
+    const stored = this.ctx.storage.sql
+      .exec<{ operation: string; revision: number; hint_claimed: number }>(
+        "SELECT operation,revision,hint_claimed FROM database_wake WHERE singleton=1",
+      )
+      .toArray()[0];
+    if (stored && stored.revision > revision) return false;
+    if (
+      !stored ||
+      stored.operation !== operation ||
+      stored.revision !== revision
+    )
+      this.ctx.storage.sql.exec(
+        "INSERT INTO database_wake(singleton,operation,revision,hint_claimed) VALUES(1,?,?,0) ON CONFLICT(singleton) DO UPDATE SET operation=excluded.operation,revision=excluded.revision,hint_claimed=0",
+        operation,
+        revision,
+      );
+    const current = this.ctx.storage.sql
+      .exec<{ hint_claimed: number }>(
+        "SELECT hint_claimed FROM database_wake WHERE singleton=1",
+      )
+      .toArray()[0]!;
+    if (!current.hint_claimed) {
+      this.ctx.storage.sql.exec(
+        "UPDATE database_wake SET hint_claimed=1 WHERE singleton=1",
+      );
+      const hinted = Date.now();
+      await this.env.REGION_LINK.get(this.env.REGION_LINK.idFromName(regionId))
+        .notify([id])
+        .catch(() => undefined);
+      // The wake split's first stage on this side: the claim itself and the region hint.
+      console.log(
+        JSON.stringify({
+          event: "actor_claim",
+          database_id: id,
+          operation,
+          revision,
+          at_ms: Date.now(),
+          claim_ms: hinted - started,
+          hint_ms: Date.now() - hinted,
+        }),
+      );
+    }
+    return true;
+  }
   private async claimWake(
     id: string,
     user: string,
@@ -935,13 +991,14 @@ export class DatabaseActor extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       const started = Date.now();
       try {
-        const authorized = await this.known(id, user, true);
+        // Every read here holds every other event of this database: independent reads go together.
+        const [authorized, row] = await Promise.all([
+          this.known(id, user, true),
+          this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
+            .bind(id)
+            .first<DatabaseRow>(),
+        ]);
         if ("ok" in authorized) return undefined;
-        let row = await this.env.DB.prepare(
-          "SELECT * FROM databases WHERE id=?",
-        )
-          .bind(id)
-          .first<DatabaseRow>();
         if (!row) return undefined;
         if (
           row.desired_state === "suspended" &&
@@ -956,7 +1013,9 @@ export class DatabaseActor extends DurableObject<Env> {
           if (!sleepingIntent) return undefined;
           const operation = newOperationId(),
             now = new Date().toISOString(),
-            previous = row;
+            previous = row,
+            revision = previous.generation + 1;
+          let hinted: boolean | undefined;
           const result = await withAdmissionMutation(
             this.env,
             [id],
@@ -964,8 +1023,9 @@ export class DatabaseActor extends DurableObject<Env> {
               const plan = await preparePostgresPoolClaim(
                 this.env,
                 id,
-                previous.generation + 1,
+                revision,
                 mutation,
+                previous.region_id,
               );
               if (
                 plan &&
@@ -988,18 +1048,27 @@ export class DatabaseActor extends DurableObject<Env> {
               ]);
               if (plan && (await plan.finish()).kind === "blocked")
                 throw new Error("pool_claim_commit_unconfirmed");
-              return committed.slice(plan?.statements.length ?? 0);
+              const transition = committed.slice(plan?.statements.length ?? 0);
+              // The transition is committed with its operation, at the next generation: the region
+              // may pull it now, ahead of the snapshot publish that closes this mutation.
+              if (transition[0]!.meta.changes === 1)
+                hinted = await this.hintWake(
+                  id,
+                  previous.region_id,
+                  operation,
+                  revision,
+                  started,
+                );
+              return transition;
             },
             undefined,
             this.localAdmissionActor(id),
           );
           if (result[0]!.meta.changes !== 1) return undefined;
           this.ctx.waitUntil(thinStorageTurnsFor(this.env, [id]));
-          row = await this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
-            .bind(id)
-            .first<DatabaseRow>();
+          return hinted ? { operation, revision } : undefined;
         }
-        if (!row || row.desired_state !== "running" || !row.power_operation)
+        if (row.desired_state !== "running" || !row.power_operation)
           return undefined;
         const operation = await this.env.DB.prepare(
           "SELECT id FROM operations WHERE id=? AND database_id=? AND project_id=? AND generation=? AND kind IN('database.wake','database.resume') AND status IN('pending','running','succeeded')",
@@ -1007,51 +1076,16 @@ export class DatabaseActor extends DurableObject<Env> {
           .bind(row.power_operation, id, row.project_id, row.generation)
           .first<{ id: string }>();
         if (!operation) return undefined;
-        const stored = this.ctx.storage.sql
-          .exec<{ operation: string; revision: number; hint_claimed: number }>(
-            "SELECT operation,revision,hint_claimed FROM database_wake WHERE singleton=1",
-          )
-          .toArray()[0];
-        if (stored && stored.revision > row.generation) return undefined;
         if (
-          !stored ||
-          stored.operation !== operation.id ||
-          stored.revision !== row.generation
-        )
-          this.ctx.storage.sql.exec(
-            "INSERT INTO database_wake(singleton,operation,revision,hint_claimed) VALUES(1,?,?,0) ON CONFLICT(singleton) DO UPDATE SET operation=excluded.operation,revision=excluded.revision,hint_claimed=0",
+          !(await this.hintWake(
+            id,
+            row.region_id,
             operation.id,
             row.generation,
-          );
-        // Claim before notifying: a lost response never replays a hint; periodic desired pulls recover its loss.
-        const current = this.ctx.storage.sql
-          .exec<{ hint_claimed: number }>(
-            "SELECT hint_claimed FROM database_wake WHERE singleton=1",
-          )
-          .toArray()[0]!;
-        if (!current.hint_claimed) {
-          this.ctx.storage.sql.exec(
-            "UPDATE database_wake SET hint_claimed=1 WHERE singleton=1",
-          );
-          const hinted = Date.now();
-          await this.env.REGION_LINK.get(
-            this.env.REGION_LINK.idFromName(row.region_id),
-          )
-            .notify([id])
-            .catch(() => undefined);
-          // The wake split's first stage on this side: the claim itself and the region hint.
-          console.log(
-            JSON.stringify({
-              event: "actor_claim",
-              database_id: id,
-              operation: operation.id,
-              revision: row.generation,
-              at_ms: Date.now(),
-              claim_ms: hinted - started,
-              hint_ms: Date.now() - hinted,
-            }),
-          );
-        }
+            started,
+          ))
+        )
+          return undefined;
         return { operation: operation.id, revision: row.generation };
       } catch {
         return { failure: "08006" as const };

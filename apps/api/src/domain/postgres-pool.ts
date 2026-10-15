@@ -288,19 +288,23 @@ export async function preparePostgresPoolClaim(
   id: string,
   wakeGeneration: number,
   mutation: AdmissionMutation,
+  /** The database's region, when the caller has just read its row. */
+  regionId?: string,
 ): Promise<PreparedPostgresPoolClaim> {
-  const region = await env.DB.prepare(
-    "SELECT region_id FROM databases WHERE id=?",
-  )
-    .bind(id)
-    .first<string>("region_id");
+  const region =
+    regionId ??
+    (await env.DB.prepare("SELECT region_id FROM databases WHERE id=?")
+      .bind(id)
+      .first<string>("region_id"));
   if (!region) throw new ApiError("not_found", "Database not found");
-  const capable = await postgresPoolCapable(env.DB, region);
-  const pendingRun = await env.DB.prepare(
-    "SELECT id FROM postgres_pool_qualification_runs WHERE database_id=? AND status IN('running','cleanup')",
-  )
-    .bind(id)
-    .first();
+  const [capable, pendingRun] = await Promise.all([
+    postgresPoolCapable(env.DB, region),
+    env.DB.prepare(
+      "SELECT id FROM postgres_pool_qualification_runs WHERE database_id=? AND status IN('running','cleanup')",
+    )
+      .bind(id)
+      .first(),
+  ]);
   if (!capable && !pendingRun)
     return { statements: [], finish: async () => ({ kind: "disabled" }) };
   const state = await input(env, id),

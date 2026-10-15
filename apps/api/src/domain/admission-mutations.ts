@@ -315,19 +315,29 @@ export async function withAdmissionMutation<T>(
   }
   try {
     for (const id of ids) {
-      await env.DB.prepare(
-        "INSERT INTO database_admission_epochs(database_id) SELECT id FROM databases WHERE id=? ON CONFLICT(database_id) DO NOTHING",
-      )
-        .bind(id)
-        .run();
-      const epoch = await env.DB.prepare(
-        "SELECT database_id,admission_revision,route_revision,mutation_id FROM database_admission_epochs WHERE database_id=?",
-      )
-        .bind(id)
-        .first<EpochRow>();
+      const readEpoch = () =>
+        env.DB.prepare(
+          "SELECT database_id,admission_revision,route_revision,mutation_id FROM database_admission_epochs WHERE database_id=?",
+        )
+          .bind(id)
+          .first<EpochRow>();
+      let epoch = await readEpoch();
+      if (!epoch) {
+        // Only a database that never had an epoch needs its first one inserted.
+        await env.DB.prepare(
+          "INSERT INTO database_admission_epochs(database_id) SELECT id FROM databases WHERE id=? ON CONFLICT(database_id) DO NOTHING",
+        )
+          .bind(id)
+          .run();
+        epoch = await readEpoch();
+      }
       if (!epoch || epoch.mutation_id !== null) throw conflict();
-      const presence = await readDatabasePresence(env.DB, id);
-      if (!presence) throw conflict();
+      // Only a remote Actor is seeded with the presence; the local one is the caller itself.
+      const presence =
+        local?.database_id === id
+          ? undefined
+          : await readDatabasePresence(env.DB, id);
+      if (local?.database_id !== id && !presence) throw conflict();
       const intent = {
         database_id: id,
         mutation_id: mutationId,
@@ -338,7 +348,7 @@ export async function withAdmissionMutation<T>(
         if (!(await local.begin(intent))) throw conflict();
       } else {
         const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
-        await actor.seed(presence);
+        await actor.seed(presence!);
         if (!(await actor.beginAdmissionMutation(intent))) throw conflict();
       }
       intents.push(intent);
@@ -373,9 +383,10 @@ export async function withAdmissionMutation<T>(
       mutationId,
     );
     const result = await execute(mutation);
-    // Callers must use batch: otherwise their write has no positive epoch receipt.
+    // Callers must use batch: otherwise their write has no positive epoch receipt. A batch that
+    // returned has committed every epoch receipt it carried (a missing one throws), so the fence
+    // that closes a failed mutation's delayed statements has nothing left to close here.
     mutation.assertSubmitted();
-    await fenceAdmissionMutation(env, mutationId, scope);
     await publishMutation(env, intents, local);
     if (!local)
       await notifyAdmissionRevisions(
