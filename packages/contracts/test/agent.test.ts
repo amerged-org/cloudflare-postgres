@@ -952,6 +952,67 @@ it("carries an exact power intent while legacy desired pages stay awake", () => 
   ).toBe(false);
 });
 
+it("a parked Pod is reported only inside a hibernated observation without refusal", () => {
+  const value = observation();
+  const databases = value.databases as Record<string, unknown>[];
+  const parked = { pod_uid: randomUUID(), cpu_millicores: 15, memory_mib: 160 };
+  const hibernated = {
+    ...databases[0],
+    state: "hibernated",
+    power: {
+      operation: newOperationId(),
+      revision: 1,
+      state: "hibernated",
+      parked,
+    },
+  };
+  expect(
+    ObservationRequest.safeParse({ ...value, databases: [hibernated] }).success,
+  ).toBe(true);
+  const power = hibernated.power as Record<string, unknown>;
+  // An awake or errored observation can never carry a parked Pod.
+  expect(
+    ObservationRequest.safeParse({
+      ...value,
+      databases: [
+        { ...hibernated, state: "ready", power: { ...power, state: "awake" } },
+      ],
+    }).success,
+  ).toBe(false);
+  expect(
+    ObservationRequest.safeParse({
+      ...value,
+      databases: [
+        {
+          ...hibernated,
+          state: "error",
+          power: { ...power, state: "awake", refusal: "busy" },
+        },
+      ],
+    }).success,
+  ).toBe(false);
+  // The Pod identity and its request are strict.
+  expect(
+    ObservationRequest.safeParse({
+      ...value,
+      databases: [
+        {
+          ...hibernated,
+          power: { ...power, parked: { ...parked, pod_uid: "x" } },
+        },
+      ],
+    }).success,
+  ).toBe(false);
+  expect(
+    ObservationRequest.safeParse({
+      ...value,
+      databases: [
+        { ...hibernated, power: { ...power, parked: { ...parked, extra: 1 } } },
+      ],
+    }).success,
+  ).toBe(false);
+});
+
 it("hibernation observations require an exact power identity and cannot claim ready", () => {
   const value = observation();
   const databases = value.databases as Record<string, unknown>[];

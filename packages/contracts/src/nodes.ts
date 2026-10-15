@@ -8,6 +8,7 @@ import {
   InfrastructureCurrency,
 } from "./costs.ts";
 import { ComputePoolPolicy } from "./compute-pool.ts";
+import { ParkedTierPolicy } from "./parked-tier.ts";
 
 export const ProviderInstanceId = z
   .string()
@@ -244,6 +245,11 @@ export const NodeRegionPolicy = z
       .optional()
       .describe(
         "Optional thin-provisioned LVM storage profile for the region's nodes. Returned only when set; omitted on PUT keeps it, null removes it.",
+      ),
+    parked_tier: ParkedTierPolicy.nullable()
+      .optional()
+      .describe(
+        "Optional parked sleep tier: after an idle sleep the database's instance Pod stays and only PostgreSQL stops, so the next connection wakes in a fraction of a Pod start. ttl_seconds bounds how long a database stays parked, max_per_node how many databases a node parks (the oldest demote to full hibernation first). Needs a release with parked_tier_version. Returned only when set; omitted on PUT keeps it, null removes it.",
       ),
   })
   .superRefine((policy, context) => {

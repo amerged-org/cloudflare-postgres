@@ -16,6 +16,7 @@ export * from "./nodes.ts";
 export * from "./node-inventory.ts";
 export * from "./node-operator.ts";
 export * from "./compute-pool.ts";
+export * from "./parked-tier.ts";
 export * from "./region-configuration.ts";
 export * from "./releases.ts";
 export * from "./resource-profiles.ts";

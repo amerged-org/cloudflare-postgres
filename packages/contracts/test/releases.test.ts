@@ -569,6 +569,35 @@ it("declares thin sampling only with a native controller on every role", () => {
       .success,
   ).toBe(false);
 });
+it("declares the parked tier only with runtime attestation v2", () => {
+  const native = spec();
+  native.components.push({
+    name: "native-controller",
+    kind: "image",
+    version: "1.0.0",
+    reference: `registry.example/native-controller@sha256:${"d".repeat(64)}`,
+    sha256: "d".repeat(64),
+  });
+  for (const role of Object.values(native.roles))
+    role.components.push("native-controller");
+  expect(
+    FleetReleaseSpec.parse({
+      ...native,
+      runtime_attestation_version: 2,
+      parked_tier_version: 1,
+    }).parked_tier_version,
+  ).toBe(1);
+  expect(
+    FleetReleaseSpec.safeParse({ ...native, parked_tier_version: 1 }).success,
+  ).toBe(false);
+  expect(
+    FleetReleaseSpec.safeParse({
+      ...native,
+      runtime_attestation_version: 2,
+      parked_tier_version: 2,
+    }).success,
+  ).toBe(false);
+});
 it("declares admission snapshots only with v4 routing and v2 proofs on every native role", () => {
   const native = spec();
   for (const name of ["native-gateway", "native-controller"]) {
