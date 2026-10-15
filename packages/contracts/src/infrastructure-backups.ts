@@ -228,7 +228,7 @@ export const InfrastructureBackupRunStatus = z.strictObject({
     .int()
     .positive()
     .describe(
-      "Attempt within the UTC day, from 1. A failed attempt is retried at least 10 minutes after it ended, at most 3 attempts per day.",
+      "Attempt within the UTC day, from 1. A failed attempt is retried at least 90 minutes after it ended, at most 3 attempts per day. A due attempt held back by a fleet patch or a starting thin database takes no number: see deferral in GET /v1/infrastructure-backups.",
     ),
   status: z
     .enum(["pending", "running", "complete", "failed"])
@@ -244,6 +244,23 @@ export const InfrastructureBackupRunStatus = z.strictObject({
     .describe(
       "d1-control plus one etcd-<region> per captured regional cluster.",
     ),
+});
+export const InfrastructureBackupDeferral = z.strictObject({
+  day: z.iso.date().describe("UTC day of the held-back attempt."),
+  reason: z
+    .enum(["deferred_by_patch", "deferred_by_thin_start"])
+    .describe(
+      "deferred_by_patch: a fleet patch operation is unfinished (not complete or host_ready, not halted, before its deadline, on a node that is not lost) or changed in the last 15 minutes. deferred_by_thin_start: a thin database start granted in the last 15 minutes is not yet ready.",
+    ),
+  first_at: Timestamp.describe("First Cron check that held an attempt back."),
+  last_at: Timestamp.describe(
+    "Latest Cron check that held an attempt back; the Cron checks every minute, so a value older than a few minutes means the wait ended.",
+  ),
+  checks: z
+    .number()
+    .int()
+    .positive()
+    .describe("Number of Cron checks that held an attempt back on this day."),
 });
 export const InfrastructureBackupHealth = z.strictObject({
   kind: InfrastructureBackupKind,

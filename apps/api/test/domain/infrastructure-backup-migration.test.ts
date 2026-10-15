@@ -78,6 +78,11 @@ it("numbers existing daily runs attempt 1 and keeps every artifact, its cascade 
       tbl_name: "infrastructure_backup_artifacts",
     },
     {
+      type: "table",
+      name: "infrastructure_backup_deferrals",
+      tbl_name: "infrastructure_backup_deferrals",
+    },
+    {
       type: "index",
       name: "infrastructure_backup_health_idx",
       tbl_name: "infrastructure_backup_artifacts",

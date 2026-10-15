@@ -4,6 +4,7 @@ import { ErrorBody, InfraAlertKind } from "@pgcf/contracts";
 import {
   InfrastructureBackupConfig,
   InfrastructureBackupConfigInput,
+  InfrastructureBackupDeferral,
   InfrastructureBackupHealth,
   InfrastructureBackupRunStatus,
 } from "@pgcf/contracts/infrastructure-backups";
@@ -12,6 +13,7 @@ import { requireScope } from "../middleware/auth.ts";
 import {
   authorizeBackupOperator,
   configureInfrastructureBackups,
+  infrastructureBackupDeferral,
   infrastructureBackupHealth,
   infrastructureBackupStatus,
   readInfrastructureBackupConfig,
@@ -104,7 +106,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
       security: [{ bearerAuth: [] }],
       summary: "Read the latest infrastructure backup run and backup freshness",
       description:
-        "Returns the latest attempt of the latest UTC day with per-artifact receipts and the freshness of every expected backup: the D1 export in d1_region_id and one etcd snapshot per region with a current cluster and a node that is not lost. Earlier attempts of that day stay in D1 only and are not returned. While enabled, the minute cron starts one run per UTC day and retries a failed run on the same day: the next attempt starts at least 10 minutes after the failed attempt ended, at most 3 attempts per day, and never while another run of any day is pending or running. A run fails after two hours. Health status failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for that region; a later complete attempt clears failing. No credentials, signed URLs or keys are returned.",
+        "Returns the latest attempt of the latest UTC day with per-artifact receipts and the freshness of every expected backup: the D1 export in d1_region_id and one etcd snapshot per region with a current cluster and a node that is not lost. Earlier attempts of that day stay in D1 only and are not returned. While enabled, the minute cron starts one run per UTC day and retries a failed run on the same day: the next attempt starts at least 90 minutes after the failed attempt ended, at most 3 attempts per day, and never while another run of any day is pending or running. A due attempt waits, without taking an attempt number, while a fleet patch operation is unfinished or changed in the last 15 minutes and while a thin database start granted in the last 15 minutes is not ready; deferral shows the latest such wait. A run fails after two hours. Health status failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for that region; a later complete attempt clears failing. No credentials, signed URLs or keys are returned.",
       responses: {
         200: {
           description: "Latest safe backup receipts and current freshness",
@@ -117,6 +119,9 @@ export function registerInfrastructureBackups(app: ApiApp) {
                 health: z
                   .array(InfrastructureBackupHealth)
                   .describe("Freshness of every expected backup."),
+                deferral: InfrastructureBackupDeferral.nullable().describe(
+                  "The latest time a due attempt was held back, with its reason; null when none ever was. It is current only while last_at is recent: the cron checks every minute.",
+                ),
               }),
             },
           },
@@ -130,6 +135,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
         {
           latest: await infrastructureBackupStatus(c.env.DB),
           health: await infrastructureBackupHealth(c.env),
+          deferral: await infrastructureBackupDeferral(c.env.DB),
         },
         200,
       );

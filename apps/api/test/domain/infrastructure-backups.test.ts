@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { Env } from "../../src/env.ts";
 import {
   authorizeBackupOperator,
@@ -26,9 +26,12 @@ import {
   storeRegionJoinBundle,
   joinBundleReference,
 } from "../../src/crypto/bootstrap-credentials.ts";
-import { newNodeId } from "@pgcf/contracts";
+import { newDatabaseId, newNodeId, newOperationId } from "@pgcf/contracts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 afterEach(async () => {
+  await env.DB.prepare(
+    "DELETE FROM fleet_patch_operations WHERE release_id LIKE 'daily-backup-test-%'",
+  ).run();
   await env.DB.prepare("DELETE FROM infrastructure_backup_runs").run();
   await env.DB.prepare(
     "UPDATE infrastructure_backup_config SET enabled=0,d1_account_id=NULL,d1_database_id=NULL,d1_region_id=NULL,notification_recipient=NULL,notification_sender=NULL,enabled_at=NULL,updated_at=NULL,revision=0 WHERE singleton=1",
@@ -136,13 +139,14 @@ it("uses actual local Workflow missing-instance semantics and one persisted dail
     status: "pending",
   });
 });
-it("retries a failed UTC day ten minutes after the failed attempt ended, at most three attempts", async () => {
+it("retries a failed UTC day ninety minutes after the failed attempt ended, at most three attempts", async () => {
   const f = await fixture(),
     created: string[] = [],
     binding = recordingWorkflow(created),
     start = Date.parse("2026-10-12T00:01:00.000Z"),
     minute = 60000,
-    hour = 60 * minute;
+    hour = 60 * minute,
+    delay = 90 * minute;
   await configureInfrastructureBackups(binding, config(f.region), start);
   const attempts = async () =>
     (
@@ -151,23 +155,25 @@ it("retries a failed UTC day ten minutes after the failed attempt ended, at most
       ).all<{ id: string; attempt: number; status: string }>()
     ).results;
   await runInfrastructureBackupCron(binding, start);
-  // The two-hour deadline fails attempt 1 at 02:01; its retry waits ten minutes.
+  // The two-hour deadline fails attempt 1 at 02:01; its retry waits ninety minutes, not ten.
   await runInfrastructureBackupCron(binding, start + 2 * hour);
-  await runInfrastructureBackupCron(
-    binding,
-    start + 2 * hour + 10 * minute - 1,
-  );
+  await runInfrastructureBackupCron(binding, start + 2 * hour + 10 * minute);
+  await runInfrastructureBackupCron(binding, start + 2 * hour + delay - 1);
   expect(await attempts()).toEqual([
     { id: created[0], attempt: 1, status: "failed" },
   ]);
-  await runInfrastructureBackupCron(binding, start + 2 * hour + 10 * minute);
+  await runInfrastructureBackupCron(binding, start + 2 * hour + delay);
   expect(await attempts()).toEqual([
     { id: created[0], attempt: 1, status: "failed" },
     { id: created[1], attempt: 2, status: "pending" },
   ]);
-  await runInfrastructureBackupCron(binding, start + 4 * hour + 10 * minute);
-  await runInfrastructureBackupCron(binding, start + 4 * hour + 20 * minute);
-  await runInfrastructureBackupCron(binding, start + 6 * hour + 20 * minute);
+  // Attempt 2's deadline is 05:31; its retry is the third and last attempt of the day.
+  await runInfrastructureBackupCron(binding, start + 4 * hour + delay);
+  await runInfrastructureBackupCron(binding, start + 4 * hour + 2 * delay - 1);
+  expect(created).toHaveLength(2);
+  await runInfrastructureBackupCron(binding, start + 4 * hour + 2 * delay);
+  expect(created).toHaveLength(3);
+  await runInfrastructureBackupCron(binding, start + 6 * hour + 2 * delay);
   // The third failure ends the day's retries.
   await runInfrastructureBackupCron(binding, start + 23 * hour);
   expect((await attempts()).map((run) => [run.attempt, run.status])).toEqual([
@@ -183,7 +189,7 @@ it("retries a failed UTC day ten minutes after the failed attempt ended, at most
       kind: "d1",
       region_id: f.region,
       status: "failing",
-      last_failed_at: "2026-10-12T06:21:00.000Z",
+      last_failed_at: "2026-10-12T09:01:00.000Z",
       error_code: "infrastructure_backup_deadline",
     }),
   );
@@ -197,6 +203,394 @@ it("retries a failed UTC day ten minutes after the failed attempt ended, at most
     day: "2026-10-13",
     attempt: 1,
     status: "pending",
+  });
+});
+const minute = 60000;
+async function patchOperation(
+  f: { node: string; region: string },
+  values: { stage: string; state: string; updated: number; deadline: number },
+) {
+  const release = `daily-backup-test-${crypto.randomUUID()}`,
+    operation = newOperationId(),
+    stamp = (ms: number) => new Date(ms).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,'{}',?,?)",
+  )
+    .bind(release, "d".repeat(64), stamp(values.updated))
+    .run();
+  await env.DB.prepare(
+    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
+    SELECT ?,n.id,n.region_id,n.node_uid,?,?,?,1,1,1,'192.0.2.9','[]',1,?,?,?,?,? FROM nodes n WHERE n.id=?`,
+  )
+    .bind(
+      operation,
+      crypto.randomUUID(),
+      release,
+      "d".repeat(64),
+      values.stage,
+      values.state,
+      stamp(values.updated - 10 * minute),
+      stamp(values.updated),
+      stamp(values.deadline),
+      f.node,
+    )
+    .run();
+  return operation;
+}
+/** A thin start that holds its volume's reserve: granted at the time and not yet ready. */
+async function thinStartAdmission(
+  f: { project: string; region: string; node: string; size: string },
+  grantedAt: number,
+) {
+  const database = newDatabaseId(),
+    operation = newOperationId(),
+    at = new Date(grantedAt).toISOString(),
+    uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+      .bind(f.node)
+      .first<string>("node_uid"))!;
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,archive_path,storage_profile_json,created_at,updated_at) VALUES(?,?,?,?,?,?,'running',?,?,?,?)",
+    ).bind(
+      database,
+      f.project,
+      f.region,
+      f.node,
+      `thin-start-${database}`,
+      f.size,
+      `s3://thin-start/${database}/g1`,
+      JSON.stringify({ node_uid: uid, startup_reserve_bytes: 2 ** 30 }),
+      at,
+      at,
+    ),
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) VALUES(?,'database.wake','running',?,?,1,?,?)",
+    ).bind(operation, f.project, database, at, at),
+    // The class stores 5 GiB, which exceeds the 1 GiB startup reserve.
+    env.DB.prepare(
+      "INSERT INTO database_start_admissions(operation_id,database_id,generation,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes) VALUES(?,?,1,?,?,?,?,?,?)",
+    ).bind(operation, database, f.node, uid, 2 ** 30, at, at, 5 * 2 ** 30),
+  ]);
+  return operation;
+}
+const makeReady = (operation: string, at: number) =>
+  env.DB.prepare(
+    "UPDATE database_start_admissions SET ready_at=?,ready_sample_observed_at=? WHERE operation_id=?",
+  )
+    .bind(new Date(at).toISOString(), new Date(at).toISOString(), operation)
+    .run();
+const deferrals = async () =>
+  (
+    await env.DB.prepare(
+      "SELECT day,reason,first_at,last_at,checks FROM infrastructure_backup_deferrals ORDER BY day,reason",
+    ).all()
+  ).results;
+describe("a due attempt held back by a fleet patch or a starting thin database", () => {
+  afterEach(async () => {
+    await env.DB.prepare("DELETE FROM infrastructure_backup_deferrals").run();
+  });
+  it("starts the first attempt of the day as attempt 1 once no patch ran for fifteen minutes", async () => {
+    const f = await fixture(),
+      created: string[] = [],
+      binding = recordingWorkflow(created),
+      start = Date.parse("2026-10-14T00:00:30.000Z");
+    await configureInfrastructureBackups(
+      binding,
+      config(f.region),
+      start - 60 * minute,
+    );
+    const operation = await patchOperation(f, {
+      stage: "platform",
+      state: "dispatched",
+      updated: start - 30000,
+      deadline: start + 40 * minute,
+    });
+    await runInfrastructureBackupCron(binding, start);
+    await runInfrastructureBackupCron(binding, start + minute);
+    // The patch holds the attempt back: no run exists, so no attempt number is taken.
+    expect(created).toEqual([]);
+    expect(await infrastructureBackupStatus(env.DB)).toBeNull();
+    expect(await deferrals()).toEqual([
+      {
+        day: "2026-10-14",
+        reason: "deferred_by_patch",
+        first_at: "2026-10-14T00:00:30.000Z",
+        last_at: "2026-10-14T00:01:30.000Z",
+        checks: 2,
+      },
+    ]);
+    expect(
+      await (await request("/v1/infrastructure-backups", f.admin)).json(),
+    ).toMatchObject({
+      latest: null,
+      deferral: {
+        day: "2026-10-14",
+        reason: "deferred_by_patch",
+        first_at: "2026-10-14T00:00:30.000Z",
+        last_at: "2026-10-14T00:01:30.000Z",
+        checks: 2,
+      },
+    });
+    // The patch completes at 00:10:30. A patch that changed in the last fifteen minutes still holds.
+    const done = start + 10 * minute;
+    await env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='complete',state='confirmed',updated_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(done).toISOString(), operation)
+      .run();
+    await runInfrastructureBackupCron(binding, done + 15 * minute - 1);
+    expect(created).toEqual([]);
+    await runInfrastructureBackupCron(binding, done + 15 * minute);
+    expect(created).toHaveLength(1);
+    expect(await infrastructureBackupStatus(env.DB)).toMatchObject({
+      id: created[0],
+      day: "2026-10-14",
+      attempt: 1,
+      status: "pending",
+    });
+  });
+  it("holds a due retry back behind a patch without using one of the day's three attempts", async () => {
+    const f = await fixture(),
+      created: string[] = [],
+      binding = recordingWorkflow(created),
+      start = Date.parse("2026-10-14T00:01:00.000Z"),
+      fail = (id: string, at: number) =>
+        env.DB.prepare(
+          "UPDATE infrastructure_backup_runs SET status='failed',completed_at=?,error_code='infrastructure_backup_operator_portforward_timeout' WHERE id=?",
+        )
+          .bind(new Date(at).toISOString(), id)
+          .run();
+    await configureInfrastructureBackups(
+      binding,
+      config(f.region),
+      start - 60 * minute,
+    );
+    await runInfrastructureBackupCron(binding, start);
+    expect(created).toHaveLength(1);
+    await fail(created[0]!, start + 5 * minute);
+    // The retry falls due at 01:36 while a patch is running.
+    const patch = await patchOperation(f, {
+      stage: "regional",
+      state: "dispatched",
+      updated: start + 90 * minute,
+      deadline: start + 150 * minute,
+    });
+    await runInfrastructureBackupCron(binding, start + 95 * minute);
+    expect(created).toHaveLength(1);
+    expect((await deferrals()).map((row) => [row.reason, row.checks])).toEqual([
+      ["deferred_by_patch", 1],
+    ]);
+    await env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='complete',state='confirmed',updated_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(start + 100 * minute).toISOString(), patch)
+      .run();
+    await runInfrastructureBackupCron(binding, start + 115 * minute);
+    expect(created).toHaveLength(2);
+    // The wait took no attempt: attempts 2 and 3 are both still available.
+    await fail(created[1]!, start + 120 * minute);
+    await runInfrastructureBackupCron(binding, start + 210 * minute);
+    expect(created).toHaveLength(3);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT attempt,status FROM infrastructure_backup_runs ORDER BY attempt",
+        ).all()
+      ).results,
+    ).toEqual([
+      { attempt: 1, status: "failed" },
+      { attempt: 2, status: "failed" },
+      { attempt: 3, status: "pending" },
+    ]);
+  });
+  it("is not held back by a halted patch, a patch past its deadline or a patch of a lost node that stopped changing", async () => {
+    const f = await fixture(),
+      created: string[] = [],
+      binding = recordingWorkflow(created),
+      start = Date.parse("2026-10-14T00:00:30.000Z"),
+      quiet = start - 180 * minute;
+    await configureInfrastructureBackups(
+      binding,
+      config(f.region),
+      start - 60 * minute,
+    );
+    const next = async (expected: number) => {
+      await runInfrastructureBackupCron(binding, start);
+      expect(created).toHaveLength(expected);
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM infrastructure_backup_runs"),
+        env.DB.prepare("DELETE FROM fleet_patch_operations"),
+      ]);
+    };
+    // No operation changed inside the settle window in any of these cases.
+    await patchOperation(f, {
+      stage: "platform",
+      state: "halted",
+      updated: quiet,
+      deadline: start + 30 * minute,
+    });
+    await next(1);
+    await patchOperation(f, {
+      stage: "flux",
+      state: "dispatched",
+      updated: quiet,
+      deadline: start - minute,
+    });
+    await next(2);
+    await patchOperation(f, {
+      stage: "flux",
+      state: "dispatched",
+      updated: quiet,
+      deadline: start + 30 * minute,
+    });
+    await env.DB.prepare(
+      "UPDATE nodes SET lost_at=?,lost_reason='test loss',ready=0,schedulable=0 WHERE id=?",
+    )
+      .bind(new Date(start).toISOString(), f.node)
+      .run();
+    await next(3);
+    expect(await deferrals()).toEqual([]);
+  });
+  it("holds an attempt back while a thin start granted in the last fifteen minutes is not ready", async () => {
+    const f = await fixture(),
+      created: string[] = [],
+      binding = recordingWorkflow(created),
+      start = Date.parse("2026-10-14T00:00:30.000Z");
+    await configureInfrastructureBackups(
+      binding,
+      config(f.region),
+      start - 60 * minute,
+    );
+    const admission = await thinStartAdmission(f, start - 2 * minute);
+    await runInfrastructureBackupCron(binding, start);
+    expect(created).toEqual([]);
+    expect(await deferrals()).toEqual([
+      {
+        day: "2026-10-14",
+        reason: "deferred_by_thin_start",
+        first_at: "2026-10-14T00:00:30.000Z",
+        last_at: "2026-10-14T00:00:30.000Z",
+        checks: 1,
+      },
+    ]);
+    // Once the start is ready the attempt follows.
+    await makeReady(admission, start + minute);
+    await runInfrastructureBackupCron(binding, start + minute);
+    expect(created).toHaveLength(1);
+    // A start granted sixteen minutes ago that never became ready no longer counts as in flight.
+    await env.DB.prepare("DELETE FROM infrastructure_backup_runs").run();
+    await thinStartAdmission(f, start - 14 * minute);
+    await runInfrastructureBackupCron(binding, start + 2 * minute);
+    expect(created).toHaveLength(2);
+  });
+  it("asks the provider to export only after a thin start in flight is ready, and not forever", async () => {
+    const f = await fixture(),
+      at = Date.now(),
+      run = crypto.randomUUID(),
+      binding = enabled(),
+      c = await configureInfrastructureBackups(binding, config(f.region), at);
+    await env.DB.prepare(
+      "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,?,1,?,'running',?,?)",
+    )
+      .bind(
+        run,
+        new Date(at).toISOString().slice(0, 10),
+        c.revision,
+        new Date(at).toISOString(),
+        new Date(at + 3600000).toISOString(),
+      )
+      .run();
+    const url = "https://export.example.com/control.sql",
+      order: string[] = [],
+      requested = async () => {
+        order.push("export");
+        return Response.json({
+          success: true,
+          result: { status: "complete", result: { signed_url: url } },
+        });
+      },
+      admission = await thinStartAdmission(f, at - minute);
+    setTimeout(() => {
+      order.push("ready");
+      void makeReady(admission, Date.now());
+    }, 60);
+    expect(
+      await exportControlD1(binding, run, requested, {
+        pollMs: 10,
+        limitMs: 5000,
+      }),
+    ).toBe(url);
+    expect(order).toEqual(["ready", "export"]);
+    // A start that stays unready does not hold the export beyond the limit.
+    await thinStartAdmission(f, at - minute);
+    order.length = 0;
+    expect(
+      await exportControlD1(binding, run, requested, {
+        pollMs: 10,
+        limitMs: 50,
+      }),
+    ).toBe(url);
+    expect(order).toEqual(["export"]);
+    // A check that cannot read the admissions never fails the capture.
+    order.length = 0;
+    const unreadable = {
+      ...binding,
+      DB: new Proxy(binding.DB, {
+        get(target, key) {
+          if (key === "prepare")
+            return (query: string) => {
+              if (query.includes("database_start_admissions"))
+                throw new Error("admissions_unreadable");
+              return target.prepare(query);
+            };
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+    };
+    expect(
+      await exportControlD1(unreadable, run, requested, {
+        pollMs: 10,
+        limitMs: 5000,
+      }),
+    ).toBe(url);
+    expect(order).toEqual(["export"]);
+  });
+  it("holds an attempt back and keeps the Cron running when the wait cannot be recorded", async () => {
+    const f = await fixture(),
+      created: string[] = [],
+      binding = recordingWorkflow(created),
+      start = Date.parse("2026-10-14T00:00:30.000Z");
+    await configureInfrastructureBackups(
+      binding,
+      config(f.region),
+      start - 60 * minute,
+    );
+    await patchOperation(f, {
+      stage: "flux",
+      state: "dispatched",
+      updated: start - 30000,
+      deadline: start + 40 * minute,
+    });
+    const unrecorded = {
+      ...binding,
+      DB: new Proxy(binding.DB, {
+        get(target, key) {
+          if (key === "prepare")
+            return (query: string) => {
+              if (query.includes("infrastructure_backup_deferrals"))
+                throw new Error("deferral_unrecorded");
+              return target.prepare(query);
+            };
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+    };
+    await runInfrastructureBackupCron(unrecorded, start);
+    expect(created).toEqual([]);
+    expect(await infrastructureBackupStatus(env.DB)).toBeNull();
+    expect(await deferrals()).toEqual([]);
   });
 });
 it("dispatches a previous day's pending attempt and starts no other while a run of any day is pending or running", async () => {
@@ -259,8 +653,9 @@ it("clears a failed day's health and alert once a retry completes and reports th
     c = await configureInfrastructureBackups(
       binding,
       config(f.region),
-      at - 3600000,
+      at - 3 * 3600000,
     );
+  // The failed attempt ended 100 minutes ago, so its retry is due.
   await env.DB.prepare(
     "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,completed_at,expires_at,error_code) VALUES(?,?,1,?,'failed',?,?,?,'infrastructure_backup_execution_failed')",
   )
@@ -268,8 +663,8 @@ it("clears a failed day's health and alert once a retry completes and reports th
       crypto.randomUUID(),
       day,
       c.revision,
-      new Date(at - 1800000).toISOString(),
-      new Date(at - 1200000).toISOString(),
+      new Date(at - 7200000).toISOString(),
+      new Date(at - 6000000).toISOString(),
       new Date(at + 5400000).toISOString(),
     )
     .run();
@@ -323,6 +718,8 @@ it("clears a failed day's health and alert once a retry completes and reports th
         status: "ok",
       }),
     ]),
+    // No attempt was ever held back.
+    deferral: null,
   });
 });
 it("keeps each region's failed episode while a retry completes part of the backup and clears it once an attempt completes", async () => {

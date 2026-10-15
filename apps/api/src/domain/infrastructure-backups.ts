@@ -10,6 +10,7 @@ import {
   InfrastructureBackupConfigInput,
   InfrastructureBackupArtifactIdentity,
   InfrastructureBackupArtifactStatus,
+  InfrastructureBackupDeferral,
   InfrastructureBackupPreparedArtifact,
   InfrastructureBackupRunStatus,
   InfrastructureBackupHealth,
@@ -28,8 +29,17 @@ import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-
 
 export const INFRASTRUCTURE_BACKUP_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_RUN_MS = 2 * 60 * 60 * 1000;
-const RETRY_DELAY_MS = 10 * 60 * 1000;
+// The attempts of a day are spread over several hours: one disturbance of half an hour, such as
+// a fleet rollout, must not use all three.
+const RETRY_DELAY_MS = 90 * 60 * 1000;
 const MAX_DAILY_ATTEMPTS = 3;
+/** A fleet patch operation that changed this recently still holds a due attempt back. */
+const PATCH_SETTLE_MS = 15 * 60 * 1000;
+/** A thin start granted this recently and not yet ready is in flight; an older one is stuck. */
+const THIN_START_WINDOW_MS = 15 * 60 * 1000;
+/** The export request waits at most this long, polling this often, for such a start to be ready. */
+const START_WAIT_MS = 5 * 60 * 1000;
+const START_POLL_MS = 5000;
 type ConfigRow = {
   enabled: number;
   d1_account_id: string | null;
@@ -199,6 +209,60 @@ export async function infrastructureBackupStatus(db: D1Database, id?: string) {
     ),
   });
 }
+/** The latest time a due attempt was held back; last_at older than a few minutes means it no longer is. */
+export async function infrastructureBackupDeferral(db: D1Database) {
+  const row = await db
+    .prepare(
+      "SELECT day,reason,first_at,last_at,checks FROM infrastructure_backup_deferrals ORDER BY last_at DESC LIMIT 1",
+    )
+    .first();
+  return row ? InfrastructureBackupDeferral.parse(row) : null;
+}
+/**
+ * A thin database start in flight: its admission holds thin storage (storage_budget_bytes, the
+ * test every reader of the admissions uses), has no ready_at, and its database carries no
+ * protection marker of this generation. One granted longer ago than THIN_START_WINDOW_MS is
+ * stuck, not in flight. Thick and standard-runtime starts do not renew against the write guard.
+ */
+async function thinStartInFlight(db: D1Database, now: number) {
+  return !!(await db
+    .prepare(
+      `SELECT 1 held FROM database_start_admissions a
+      JOIN databases d ON d.id=a.database_id AND d.generation=a.generation
+      WHERE a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND a.granted_at>?
+        AND d.deleted_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation)
+      LIMIT 1`,
+    )
+    .bind(new Date(now - THIN_START_WINDOW_MS).toISOString())
+    .first());
+}
+/**
+ * Why a due attempt must wait, or null. The capture uses the relay and the control database that
+ * a running fleet patch is using too, and the D1 export makes that database unavailable for the
+ * whole of its job, which a thin start in flight must not meet. A wait takes no attempt number.
+ * A patch counts while it is unfinished (not complete or host_ready, not halted, before its
+ * deadline, on a node that is not lost) and for PATCH_SETTLE_MS after its last change, which also
+ * bridges the gap between the operations of one rollout. Not detectable here: a start that
+ * begins after this check (the export request checks again) and awake thin databases under writes.
+ */
+async function backupHeldBack(db: D1Database, now: number) {
+  const patch = await db
+    .prepare(
+      `SELECT 1 held FROM fleet_patch_operations p
+      WHERE (p.stage NOT IN('complete','host_ready') AND p.state<>'halted' AND p.deadline_at>?
+        AND p.node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))
+        OR p.updated_at>? LIMIT 1`,
+    )
+    .bind(
+      new Date(now).toISOString(),
+      new Date(now - PATCH_SETTLE_MS).toISOString(),
+    )
+    .first();
+  if (patch) return "deferred_by_patch" as const;
+  return (await thinStartInFlight(db, now))
+    ? ("deferred_by_thin_start" as const)
+    : null;
+}
 export async function assertBackupRun(env: Env, id: string, now = Date.now()) {
   // A notification PUT carries both revisions atomically. Read them in the same transaction
   // so an intervening carry cannot make a valid capture look revoked.
@@ -254,8 +318,21 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
           now - Date.parse(previous.completed_at!) >= RETRY_DELAY_MS
         ? previous.attempt + 1
         : 0;
-  // One attempt at a time across days, so a retry never competes with another capture.
-  if (attempt)
+  // A held-back attempt is not inserted: it takes no attempt number and uses none of the day's.
+  const held = attempt ? await backupHeldBack(env.DB, now) : null;
+  if (held) {
+    try {
+      await env.DB.prepare(
+        `INSERT INTO infrastructure_backup_deferrals(day,reason,first_at,last_at,checks) VALUES(?,?,?,?,1)
+        ON CONFLICT(day,reason) DO UPDATE SET last_at=excluded.last_at,checks=checks+1`,
+      )
+        .bind(day, held, at, at)
+        .run();
+    } catch {
+      /* The record is for operators: a failed write never stops the Cron that alerting follows. */
+    }
+  } else if (attempt) {
+    // One attempt at a time across days, so a retry never competes with another capture.
     await env.DB.prepare(
       "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) SELECT ?,?,?,?,'pending',?,? WHERE NOT EXISTS(SELECT 1 FROM infrastructure_backup_runs WHERE status IN('pending','running')) ON CONFLICT(day,attempt) DO NOTHING",
     )
@@ -268,6 +345,7 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
         new Date(now + MAX_RUN_MS).toISOString(),
       )
       .run();
+  }
   // An inserted attempt is the only pending run; otherwise dispatch one of any day whose Workflow creation was uncertain.
   const run = await env.DB.prepare(
     "SELECT * FROM infrastructure_backup_runs WHERE status='pending' ORDER BY day DESC,attempt DESC LIMIT 1",
@@ -560,11 +638,23 @@ export async function exportControlD1(
   env: Env,
   id: string,
   fetcher: typeof fetch = fetch,
+  start = { pollMs: START_POLL_MS, limitMs: START_WAIT_MS },
 ) {
   const { config, row } = await assertBackupRun(env, id);
   if (!env.INFRASTRUCTURE_BACKUP_CF_TOKEN)
     throw new Error("infrastructure_backup_export_secret_missing");
   const url = `https://api.cloudflare.com/client/v4/accounts/${config.d1_account_id}/d1/database/${config.d1_database_id}/export`;
+  // The Cron checked a minute or more ago. The export blocks the database the start's write
+  // authority renews against, so wait here, before the request, for a start now in flight. A
+  // start that never becomes ready, or a check that fails, must not stop the backup: after the
+  // limit, or at once, the export goes on.
+  for (
+    let waited = 0;
+    waited < start.limitMs &&
+    (await thinStartInFlight(env.DB, Date.now()).catch(() => false));
+    waited += start.pollMs
+  )
+    await new Promise((resolve) => setTimeout(resolve, start.pollMs));
   let bookmark: string | undefined;
   for (let poll = 0; poll < 120; poll++) {
     // D1 itself may reject queries while its export is running. Poll the same provider job
