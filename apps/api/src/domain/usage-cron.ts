@@ -134,7 +134,11 @@ async function pruneUsageSamples(
   } catch (error) {
     if (error instanceof StatementBudgetExceeded) throw error;
     console.warn(
-      JSON.stringify({ event: "usage_prune_failed", database_id: databaseId }),
+      JSON.stringify({
+        event: "usage_prune_failed",
+        database_id: databaseId,
+        error: String(error).slice(0, 200),
+      }),
     );
     return 0;
   }

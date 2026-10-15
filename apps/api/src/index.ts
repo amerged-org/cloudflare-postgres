@@ -15,6 +15,12 @@ const app = createApp();
 export default {
   fetch: app.fetch,
   scheduled(_controller, env, context) {
-    context.waitUntil(runCron(env));
+    // One line per invocation makes bounded background work, such as the usage sample pruning,
+    // observable while it drains.
+    context.waitUntil(
+      runCron(env).then((result) =>
+        console.log(JSON.stringify({ event: "cron_completed", ...result })),
+      ),
+    );
   },
 } satisfies ExportedHandler<Env>;

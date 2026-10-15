@@ -5,9 +5,15 @@ import {
   archiveDestinationPath,
   newOperationId,
 } from "@pgcf/contracts";
+import {
+  createExecutionContext,
+  createScheduledController,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { USAGE_HOUR_MS } from "@pgcf/contracts/usage";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCron } from "../../src/cron.ts";
+import worker from "../../src/index.ts";
 import {
   runUsageCron,
   USAGE_CRON_PAGE_LIMIT,
@@ -31,6 +37,7 @@ const resources = {
   storage_allocated_bytes: 5 * 1024 ** 3,
 };
 afterEach(async () => {
+  vi.restoreAllMocks();
   await env.DB.batch([
     env.DB.prepare("DELETE FROM usage_cron_cursor"),
     env.DB.prepare("DELETE FROM region_hint_cursor"),
@@ -92,6 +99,16 @@ async function progress(id: string) {
       .bind(id)
       .first<{ next_hour: string }>()
   )?.next_hour;
+}
+/** The structured events a spied console method received; other lines are not events. */
+function logged(spy: { mock: { calls: unknown[][] } }) {
+  return spy.mock.calls.flatMap(([line]) => {
+    try {
+      return [JSON.parse(String(line)) as Record<string, unknown>];
+    } catch {
+      return [];
+    }
+  });
 }
 function loseWrite(
   db: D1Database,
@@ -851,11 +868,58 @@ describe("raw usage sample retention", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await runUsageCron(failing, now);
     const result = await runUsageCron(failing, now);
     expect(result.failed).toBe(0);
     expect(result.pruned).toBe(0);
     expect((await rows(id)).filter((row) => row.final === 1)).toHaveLength(4);
     expect(await perHour(id)).toEqual({ 0: 3 });
+    // The log names the failure itself, never a sample payload.
+    const events = logged(warn).filter(
+      (event) => event.event === "usage_prune_failed",
+    );
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[0]).toEqual({
+      event: "usage_prune_failed",
+      database_id: id,
+      error: "Error: test_prune_failure",
+    });
+  });
+  it("reports the usage cron result of every scheduled invocation so draining is observable", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!;
+    await env.DB.batch([f.event(id, "created"), f.event(id, "ready")]);
+    for (const hour of [0, 1]) await record(f, id, hour);
+    // The pointer already covers the first ten hours, so one invocation removes both finalized hours.
+    await env.DB.prepare(
+      "INSERT INTO usage_rollup_progress(database_id,next_hour) VALUES(?,?)",
+    )
+      .bind(id, iso(start + 10 * USAGE_HOUR_MS))
+      .run();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const context = createExecutionContext();
+    await worker.scheduled(
+      createScheduledController({
+        scheduledTime: Date.now(),
+        cron: "* * * * *",
+      }),
+      env,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    const summaries = logged(log).filter(
+      (event) => event.event === "cron_completed",
+    );
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.usage).toMatchObject({
+      databases: 1,
+      failed: 0,
+      pruned: 6,
+    });
+    // Only the invocation's own backup measurement of the current hour remains.
+    const remaining = await perHour(id);
+    expect(remaining[0]).toBeUndefined();
+    expect(remaining[1]).toBeUndefined();
   });
 });
