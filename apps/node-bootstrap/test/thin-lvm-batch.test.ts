@@ -13,10 +13,14 @@ import sources from "../../../infra/storage/sources.lock.json" with { type: "jso
 
 test("reads actual LVM and kernel DM inventory in one bounded remote command", async () => {
   const container = `pgcf-thin-read-${randomUUID()}`;
-  // Existing Q14-qualified public bytes provide the exact locked LVM and thin tools. No driver
-  // daemon is started, and the fixture owns only its filtered temporary loop/PV/VG.
-  const image =
-    "ghcr.io/amerged-org/pgcf-regional:lvm-thin-sha-be30d08d420b@sha256:10d5aee4fba5416ee68e2a49ab0d560df495c3b62a58118019aad5685d4f0c87";
+  // The image built from this revision's infra/storage/Dockerfile provides the exact locked
+  // driver, LVM and thin tools; a changed driver is published only after this test passes. No
+  // driver daemon is started, and the fixture owns only its filtered temporary loop/PV/VG.
+  const image = process.env.PGCF_TEST_STORAGE_IMAGE;
+  assert.ok(
+    image,
+    "PGCF_TEST_STORAGE_IMAGE must name the image built from infra/storage/Dockerfile",
+  );
   const invoke = async (args: string[], timeout = 30000) =>
     await runCommand({
       executable: "docker",

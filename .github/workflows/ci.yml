@@ -194,6 +194,12 @@ jobs:
           cargo clippy -p pgcf-edge-rust --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Build the Worker once for actual Workerd tests
         run: pnpm -r --if-present build
+      - name: Build the pinned storage image for actual LVM tests
+        run: |
+          PGCF_TEST_STORAGE_IMAGE="pgcf-storage-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx build --platform linux/amd64 --load --provenance=false --sbom=false \
+            --file infra/storage/Dockerfile --tag "$PGCF_TEST_STORAGE_IMAGE" infra/storage
+          printf 'PGCF_TEST_STORAGE_IMAGE=%s\n' "$PGCF_TEST_STORAGE_IMAGE" >> "$GITHUB_ENV"
       - name: Test
         run: |
           pnpm test

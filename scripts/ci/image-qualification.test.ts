@@ -1237,7 +1237,9 @@ test("storage CI leaves network selection to its checked Dockerfile module-fetch
       .replace(storage, "")
       .matchAll(/docker buildx build(?:[^\n]*\\\n)*[^\n]*/g),
   ];
-  assert.equal(otherBuilds.length, 4);
+  // The check job's storage test image, then the regional, bootstrap, PostgreSQL and native builds.
+  assert.equal(otherBuilds.length, 5);
+  assert.match(otherBuilds[0]![0], /--file infra\/storage\/Dockerfile/);
   for (const command of otherBuilds)
     assert.doesNotMatch(
       command[0],

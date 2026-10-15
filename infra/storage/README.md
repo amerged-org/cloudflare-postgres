@@ -42,7 +42,12 @@ GPL-3.0-only corresponding source/COPYING. First-party assembly remains Apache-2
 docker buildx build --platform linux/amd64 --load --provenance=false \
   --tag pgcf-storage:local infra/storage
 PGCF_TEST_STORAGE_IMAGE=pgcf-storage:local node --test infra/storage/image.test.mjs
+PGCF_TEST_STORAGE_IMAGE=pgcf-storage:local node --test apps/node-bootstrap/test/thin-lvm-batch.test.ts
 ```
+
+The NodeBootstrap LVM read test compares the driver, LVM and thin-tools hashes it reads
+from this image with `sources.lock.json`. A changed driver is published only after the
+CI check job passes, so that job builds this Dockerfile and tests the resulting image.
 
 Among RUN instructions, only the builder's checksum-verified Go module download/vendor step uses network.
 Remote ADD fetches remain HTTPS downloads bound by their recorded SHA-256.
