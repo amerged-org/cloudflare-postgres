@@ -7,7 +7,11 @@ import {
   DatabaseResize,
   OperationKind,
   ERROR_CODES,
+  ERROR_REASONS,
   ErrorBody,
+  RETRYABLE_ERROR_REASONS,
+  TERMINAL_ERROR_REASONS,
+  retryAfterSeconds,
   IDEMPOTENCY_KEY_PATTERN,
   ListQuery,
   Node,
@@ -306,6 +310,53 @@ describe("errors", () => {
         error: { code: "teapot", message: "", request_id: "r" },
       }).success,
     ).toBe(false);
+  });
+
+  it("takes the stable reason of the details from the closed set", () => {
+    for (const reason of ERROR_REASONS)
+      expect(
+        ErrorBody.parse(errorBody("conflict", "x", "r", { reason })).error
+          .details,
+      ).toEqual({ reason });
+    const parse = (details: unknown) =>
+      ErrorBody.safeParse({
+        error: { code: "conflict", message: "x", request_id: "r", details },
+      }).success;
+    expect(parse({ reason: "because" })).toBe(false);
+    // Route-specific context travels beside it.
+    expect(parse({ reason: "name_in_use", run_id: "op_1" })).toBe(true);
+    expect(parse({ run_id: "op_1" })).toBe(true);
+  });
+
+  it("classifies every reason exactly once and advises a delay only for the retryable ones", () => {
+    const retryable = Object.keys(RETRYABLE_ERROR_REASONS);
+    expect(new Set([...retryable, ...TERMINAL_ERROR_REASONS]).size).toBe(
+      retryable.length + TERMINAL_ERROR_REASONS.length,
+    );
+    expect([...ERROR_REASONS].sort()).toEqual(
+      [...retryable, ...TERMINAL_ERROR_REASONS].sort(),
+    );
+    for (const reason of TERMINAL_ERROR_REASONS)
+      expect(retryAfterSeconds("conflict", reason), reason).toBeUndefined();
+    for (const reason of retryable)
+      expect(
+        retryAfterSeconds(
+          "conflict",
+          reason as keyof typeof RETRYABLE_ERROR_REASONS,
+        ),
+        reason,
+      ).toBeGreaterThan(0);
+    // A refusal without a reason is not advised: the message is all there is.
+    expect(retryAfterSeconds("conflict")).toBeUndefined();
+    // These codes are transient by their meaning alone.
+    expect(retryAfterSeconds("capacity_exhausted")).toBeGreaterThan(0);
+    expect(retryAfterSeconds("idempotency_in_progress")).toBeGreaterThan(0);
+    for (const code of [
+      "invalid_request",
+      "idempotency_conflict",
+      "internal",
+    ] as const)
+      expect(retryAfterSeconds(code), code).toBeUndefined();
   });
 });
 

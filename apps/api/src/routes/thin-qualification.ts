@@ -54,7 +54,7 @@ export function registerThinQualification(app: ApiApp) {
       "Starts one fenced scratch qualification of a complete thin profile on a current customer or control-relay node whose database placement is disabled. It creates and removes its own pool, LVs and namespace and never selects thin storage.",
     request: {
       params: z.object({ id: NodeId }),
-      headers: z.object({ "Idempotency-Key": IdempotencyKey }),
+      headers: z.object({ "Idempotency-Key": IdempotencyKey.optional() }),
       body: {
         required: true,
         content: {

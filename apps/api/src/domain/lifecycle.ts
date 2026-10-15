@@ -131,6 +131,19 @@ export function powerTransitionStatements(
   return statements;
 }
 
+async function hasStartupHeadroom(
+  db: D1Database,
+  id: string,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT ${databaseStartupHeadroomSql("d")} headroom FROM databases d WHERE d.id=?`,
+    )
+    .bind(id)
+    .first<{ headroom: number }>();
+  return row?.headroom === 1;
+}
+
 export async function changePower(
   c: ApiContext,
   id: string,
@@ -142,7 +155,9 @@ export async function changePower(
     execute: async (lease) => {
       const row = await databaseForRequest(c, id, true);
       if (row.desired_state === "deleted" || row.deleted_at !== null)
-        throw new ApiError("conflict", "Database is deleted");
+        throw new ApiError("conflict", "Database is deleted", {
+          reason: "database_deleted",
+        });
       const sleeping = action === "suspend";
       const same = sleeping
         ? row.desired_state === "suspended" &&
@@ -188,7 +203,11 @@ export async function changePower(
           )?.id;
         }
         if (!op)
-          throw new ApiError("conflict", "Database configuration is not ready");
+          throw new ApiError(
+            "conflict",
+            "Database configuration is not ready",
+            { reason: "not_ready" },
+          );
         await lease
           .completeStatement(op, 202, {
             sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
@@ -211,7 +230,9 @@ export async function changePower(
           row.observed_generation !== row.generation ||
           row.observed_power !== "awake")
       )
-        throw new ApiError("conflict", "Database configuration is not ready");
+        throw new ApiError("conflict", "Database configuration is not ready", {
+          reason: "not_ready",
+        });
       const op = newOperationId(),
         now = new Date().toISOString();
       const result = await withAdmissionMutation(
@@ -236,8 +257,18 @@ export async function changePower(
           ]);
         },
       );
-      if (result[0]!.meta.changes !== 1)
-        throw new ApiError("conflict", "Database changed; retry the request");
+      if (result[0]!.meta.changes !== 1) {
+        // A start that the node cannot hold is told apart from a change that raced the request.
+        if (!sleeping && !(await hasStartupHeadroom(c.env.DB, id)))
+          throw new ApiError(
+            "conflict",
+            "Current node has insufficient memory, CPU or storage",
+            { reason: "node_capacity" },
+          );
+        throw new ApiError("conflict", "Database changed; retry the request", {
+          reason: "generation_changed",
+        });
+      }
       hint(c, row.region_id, [id]);
       if (!sleeping) c.executionCtx.waitUntil(thinStorageTurnsFor(c.env, [id]));
       return databaseOperationResponse(c, op);

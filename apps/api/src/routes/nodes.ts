@@ -74,7 +74,10 @@ const responses = (
   [status]: { description, content: json(schema) },
 });
 const headers = z.object({
-  "Idempotency-Key": z.string().regex(/^[A-Za-z0-9._~-]{1,128}$/),
+  "Idempotency-Key": z
+    .string()
+    .regex(/^[A-Za-z0-9._~-]{1,128}$/)
+    .optional(),
 });
 const params = z.object({ id: OperationId }),
   regionParams = z.object({ id: RegionId });

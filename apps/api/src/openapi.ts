@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { RETRYABLE_ERROR_REASONS } from "@pgcf/contracts";
 import { NODE_OPERATOR_KUBERNETES_HEADERS } from "@pgcf/contracts/node-operator";
 import { ApiError, type ApiApp } from "./app.ts";
 import type { Env } from "./env.ts";
@@ -58,6 +59,12 @@ const responseHeaders = {
   "X-Content-Type-Options": {
     schema: { type: "string" as const, const: "nosniff" },
   },
+};
+
+/** Present on a 409 or 503 whose cause is transient; the same rule decides it in apiError. */
+const retryAfterHeader = {
+  description: `Seconds to wait before repeating the request. Sent when the refusal is transient: error.details.reason is one of ${Object.keys(RETRYABLE_ERROR_REASONS).join(", ")}, or the code is capacity_exhausted or idempotency_in_progress. A hint, not a promise.`,
+  schema: { type: "integer" as const, minimum: 1 },
 };
 
 function inScope(scope: Scope, path: string): boolean {
@@ -169,6 +176,8 @@ function describeOperation(key: string, operation: Operation): void {
   for (const [status, response] of Object.entries(operation.responses ?? {})) {
     if ("$ref" in response) continue;
     response.headers = { ...responseHeaders, ...response.headers };
+    if (status === "409" || status === "503")
+      response.headers["Retry-After"] = retryAfterHeader;
     if (operation.responses?.default) {
       response.headers["Cache-Control"] = {
         description:

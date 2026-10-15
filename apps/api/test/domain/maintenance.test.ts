@@ -283,7 +283,12 @@ describe("encrypted internal maintenance credentials", () => {
       const response = await createApp().fetch(
         new Request(`https://${["api", "invalid"].join(".")}${path}`, {
           method,
-          headers: { Authorization: `Bearer ${key}` },
+          headers: {
+            Authorization: `Bearer ${key}`,
+            ...(method === "GET"
+              ? {}
+              : { "Idempotency-Key": crypto.randomUUID() }),
+          },
         }),
         { ...env, CREDENTIAL_KEYS: replacementKeys },
         context,

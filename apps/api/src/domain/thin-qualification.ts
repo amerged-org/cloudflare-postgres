@@ -177,11 +177,6 @@ export async function startThinQualification(
   await requireScope(c, "admin");
   NodeId.parse(nodeId);
   const body = ThinQualificationRequest.parse(raw);
-  if (!c.req.header("Idempotency-Key"))
-    throw new ApiError(
-      "invalid_request",
-      "Thin qualification requires an Idempotency-Key",
-    );
   // The Workflow follows the persisted run, so a replay also drives a run whose start was lost.
   const output = async (id: string) => {
     const run = await readThinQualification(c.env, id);

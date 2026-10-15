@@ -652,11 +652,6 @@ export async function createFleetRollout(
   input: FleetRolloutRequest,
 ) {
   await requireScope(c, "admin");
-  if (!c.req.header("Idempotency-Key"))
-    throw new ApiError(
-      "invalid_request",
-      "Idempotency-Key is required for fleet rollouts",
-    );
   const output = async (id: string) => {
     // Failure to start leaves committed desired intent intact. Cron resumes this exact intent.
     try {

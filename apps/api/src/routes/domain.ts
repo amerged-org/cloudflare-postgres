@@ -57,9 +57,16 @@ const errors = {
   401: { description: "Invalid credentials", content: json(ErrorBody) },
   403: { description: "Insufficient scope", content: json(ErrorBody) },
   404: { description: "Resource not found", content: json(ErrorBody) },
-  409: { description: "Conflict", content: json(ErrorBody) },
+  409: {
+    description:
+      "Conflict: error.details.reason names the cause; a Retry-After header marks a refusal that clears by itself",
+    content: json(ErrorBody),
+  },
   500: { description: "Internal server error", content: json(ErrorBody) },
-  503: { description: "Capacity unavailable", content: json(ErrorBody) },
+  503: {
+    description: "Capacity unavailable now; retry after the Retry-After delay",
+    content: json(ErrorBody),
+  },
 };
 const responses = (schema: z.ZodType, status = 200) => ({
   ...errors,
@@ -132,9 +139,8 @@ const exampleRole = {
   bypass_rls: false,
 };
 const security = [{ bearerAuth: [] }];
+/** Whether a route requires the key is decided by requiredIdempotentPublicRoutes alone. */
 const headers = z.object({ "Idempotency-Key": IdempotencyKey.optional() });
-/** Role mutations change credentials of a running database; their retries must be safe. */
-const requiredKey = z.object({ "Idempotency-Key": IdempotencyKey });
 const params = z.object({ id: DatabaseId });
 const roleParams = z.object({ id: DatabaseId, name: RoleName });
 const body = (schema: z.ZodType) => ({ required: true, content: json(schema) });
@@ -298,7 +304,7 @@ export function registerDomain(app: ApiApp): void {
       description:
         "Creates a login role and answers 201 with it. The service generates its password; an integrator key reads it with the connection URI. Optional attributes: `valid_until` (a time in the future, applied at whole seconds, truncated; PostgreSQL's VALID UNTIL: from then on the role cannot log in, and an expired credential does not wake a hibernated database), `connection_limit` (1 to 10000, PostgreSQL's CONNECTION LIMIT), `member_of` (up to 8 other live roles of this database, never `app`, `pgcf_maintenance`, `pg_*` or `cnpg_*`; the role inherits their privileges) and `bypass_rls` (PostgreSQL's BYPASSRLS). A database holds at most 100 roles; a deleted role counts until PostgreSQL has confirmed its removal. The role is registered at once and can connect when the database's `observed_generation` has reached its `generation`. An Idempotency-Key is required; a replay returns the retained result, also after `valid_until` has passed.",
       request: {
-        headers: requiredKey,
+        headers,
         params,
         body: {
           required: true,
@@ -336,7 +342,7 @@ export function registerDomain(app: ApiApp): void {
       path: "/v1/databases/{id}/roles/{name}/reset-password",
       security,
       tags: ["Roles"],
-      request: { headers: requiredKey, params: roleParams },
+      request: { headers, params: roleParams },
       responses: {
         ...responses(Role),
         202: {
@@ -361,7 +367,7 @@ export function registerDomain(app: ApiApp): void {
       tags: ["Roles"],
       description:
         "Deletes a role. From the moment the request is accepted the role cannot connect: the edge refuses it and it is no longer listed. The answer is 202 with an operation of kind `database.role.delete`. The region sets the role to NOLOGIN, ends its sessions and drops it; the operation succeeds when PostgreSQL has confirmed that. A role that owns objects or holds privileges cannot be dropped: the operation then fails with `role_not_droppable` while the role stays unable to log in; remove those objects, then delete the role again, which starts a new operation. A hibernated database applies the removal at its next wake; the operation succeeds at once, because the role is already unroutable, and deleting the role again once the database runs starts an operation that reports what PostgreSQL did. The owner `app` and the maintenance role cannot be deleted, and neither can a role that other roles are `member_of` until they are deleted. The name can be created again once the removal is confirmed. An Idempotency-Key is required; another request for a role whose removal is in progress returns the same operation.",
-      request: { headers: requiredKey, params: roleParams },
+      request: { headers, params: roleParams },
       responses: {
         ...responses(DatabaseWithOperation, 202),
         202: {

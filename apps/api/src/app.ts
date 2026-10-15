@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
-import { ERROR_HTTP_STATUS, errorBody, type ErrorCode } from "@pgcf/contracts";
+import {
+  ERROR_HTTP_STATUS,
+  errorBody,
+  retryAfterSeconds,
+  type ErrorCode,
+  type ErrorDetails,
+} from "@pgcf/contracts";
 import { HTTPException } from "hono/http-exception";
 import { routePath } from "hono/route";
 import { registerApiDocuments } from "./openapi.ts";
@@ -155,13 +161,9 @@ const DIAGNOSTIC_ROUTES = new Set([
 
 export class ApiError extends Error {
   readonly code: ErrorCode;
-  readonly details?: Record<string, unknown>;
+  readonly details?: ErrorDetails;
 
-  constructor(
-    code: ErrorCode,
-    message: string,
-    details?: Record<string, unknown>,
-  ) {
+  constructor(code: ErrorCode, message: string, details?: ErrorDetails) {
     super(message);
     this.name = "ApiError";
     this.code = code;
@@ -173,11 +175,13 @@ export function apiError(
   c: ApiContext,
   code: ErrorCode,
   message: string,
-  details?: Record<string, unknown>,
+  details?: ErrorDetails,
 ): Response {
+  const retry = retryAfterSeconds(code, details?.reason);
   return c.json(
     errorBody(code, message, c.get("requestId"), details),
     ERROR_HTTP_STATUS[code],
+    retry === undefined ? undefined : { "Retry-After": String(retry) },
   );
 }
 

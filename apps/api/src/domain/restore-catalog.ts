@@ -99,14 +99,18 @@ export async function restoreBackup(
       ...(cursor ? { cursor } : {}),
     });
     if (result.delimitedPrefixes.length || result.objects.length > 1000)
-      throw new ApiError("conflict", "Archive listing is incomplete");
+      throw new ApiError("conflict", "Archive listing is incomplete", {
+        reason: "archive_unusable",
+      });
     for (const o of result.objects) {
       if (
         !o.key.startsWith(prefix) ||
         objects.has(o.key) ||
         objects.size >= CATALOG_OBJECT_LIMIT
       )
-        throw new ApiError("conflict", "Archive listing is invalid");
+        throw new ApiError("conflict", "Archive listing is invalid", {
+          reason: "archive_unusable",
+        });
       objects.set(o.key, o);
     }
     if (!result.truncated) {
@@ -114,7 +118,9 @@ export async function restoreBackup(
       break;
     }
     if (!result.cursor || cursors.has(result.cursor))
-      throw new ApiError("conflict", "Archive listing is incomplete");
+      throw new ApiError("conflict", "Archive listing is incomplete", {
+        reason: "archive_unusable",
+      });
     cursors.add(result.cursor);
     cursor = result.cursor;
   }
@@ -122,6 +128,7 @@ export async function restoreBackup(
     throw new ApiError(
       "conflict",
       "Archive listing exceeds the bounded recovery catalog",
+      { reason: "archive_unusable" },
     );
   const walNames = new Set<string>();
   for (const key of objects.keys()) {
@@ -134,6 +141,7 @@ export async function restoreBackup(
         throw new ApiError(
           "conflict",
           "Archive contains duplicate WAL segment identities",
+          { reason: "archive_unusable" },
         );
       walNames.add(name);
     }
@@ -149,6 +157,7 @@ export async function restoreBackup(
       throw new ApiError(
         "conflict",
         "Archive recovery catalog exceeds the backup limit",
+        { reason: "archive_unusable" },
       );
     const value = await bucket.get(key);
     if (!value || value.size > 65536) continue;
@@ -175,6 +184,7 @@ export async function restoreBackup(
     throw new ApiError(
       "conflict",
       "No complete base backup and required WAL are available for the requested recovery",
+      { reason: "no_recovery_point" },
     );
   return selected;
 }

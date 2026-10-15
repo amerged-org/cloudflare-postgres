@@ -163,13 +163,21 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
 - **Asynchronous writes** return `202` with `{database, operation}` (restore: `{target_database,
   operation}`) and `Location: /v1/operations/{id}`.
 - **Idempotency.** Send `Idempotency-Key` (`^[A-Za-z0-9._~-]{1,128}$`) on every mutation, generate
-  it once per logical operation and persist it with your intent before sending. The same key with
-  the same method, path and JSON body returns the retained result (for database operations the
-  original operation, read fresh); the same key with another request is `409
-  idempotency_conflict`; while the first call still runs it is `409 idempotency_in_progress`. A
-  request that fails is not cached: a retry with the same key executes again. Keys are kept for 24
-  hours per API key. `GET` needs none. Never retry a mutation under a new key after an uncertain
-  response.
+  it once per logical operation and persist it with your intent before sending. It is
+  **required** (`400` without it) on creating, resizing, deleting, suspending, resuming and
+  restoring a database, on assigning a resource profile and on creating, resetting and deleting a
+  role; the served document marks it required on exactly these routes. The same key with the same
+  method, path and JSON body returns the retained result (for database operations the original
+  operation, read fresh); the same key with another request is `409 idempotency_conflict`; while
+  the first call still runs it is `409 idempotency_in_progress`. A request that fails is not
+  cached: a retry with the same key executes again. Keys are kept for 24 hours per API key. `GET`
+  needs none. Never retry a mutation under a new key after an uncertain response.
+- **Refusals and retries.** Every error body is `{error: {code, message, request_id, details?}}`.
+  Where one code stands for several causes, `error.details.reason` names the cause from a closed
+  set; switch on it and never on the message, which may change. A refusal that can clear by
+  itself carries a `Retry-After` header in seconds (a hint, not a promise): the retryable reasons
+  and `capacity_exhausted` and `idempotency_in_progress`. The reasons are listed in
+  [A.1](#a1-http).
 - **Client library.** `PgcfClient` in `packages/contracts/src/client.ts` is workspace-only (the
   package is private and not published) and strict about response shapes; call the HTTP API
   directly or vendor it. It uses a 30 s timeout by default and never retries a write.
@@ -222,7 +230,7 @@ counts from readiness.
   This wait has no timeout of its own (every other operation fails with `operation_timeout` after
   20 minutes without progress); set your own deadline and delete the database to cancel.
 - Errors: `400` for an unknown or disabled class or region, `404` for an unknown project, `409`
-  for a name that a live database of the project already uses.
+  with reason `name_in_use` for a name that a live database of the project already uses.
 - Engine: PostgreSQL 18 (18.6 at the time of writing, unmodified engine, `pgvector` 0.8.7). Which
   other extensions the owner role may create is **not yet verified**.
 
@@ -325,9 +333,9 @@ pgcf -i -X DELETE "$PGCF_API/v1/databases/<database-id>/roles/report_a1b2c3" \
   deleting it. Afterwards `DELETE` the role again under a new `Idempotency-Key` (the old key
   replays the failed operation): a failed removal starts a new operation, and the region drops the
   role as soon as nothing depends on it. The old operation stays `failed`.
-- **The name** is free again only when the removal is confirmed; creating it earlier is `409`
-  ("A role of this name is being deleted"). A role awaiting its removal counts toward the 100
-  roles.
+- **The name** is free again only when the removal is confirmed; creating it earlier is `409` with
+  reason `role_being_deleted`. A role awaiting its removal counts toward the 100 roles
+  (`role_limit`).
 - **Hibernated database.** A suspended or idle-hibernated database has no PostgreSQL running, so the
   region applies the removal at its next wake. The operation reports `succeeded` at once because
   the role is already unroutable, **before** PostgreSQL has dropped it (a removal still waiting
@@ -340,9 +348,9 @@ pgcf -i -X DELETE "$PGCF_API/v1/databases/<database-id>/roles/report_a1b2c3" \
   completed for a database that still is not running, returns the same operation, without a new
   generation. After a removal was confirmed the role is `404`.
 - **Refusals.** `400` for the owner `app` and `pgcf_maintenance`; `404` for an unknown role;
-  `409` for a role that other live roles are `member_of` (delete the members first), for a database
-  bound to a shared pool, and while another role change waits. Deleting a database ends a pending
-  removal with `superseded`.
+  `409` for a role that other live roles are `member_of` (`role_has_members`: delete the members
+  first), for a database bound to a shared pool and while another role change waits
+  (`pool_bound`, retryable). Deleting a database ends a pending removal with `superseded`.
 
 ### 2.4 Suspend and resume
 
@@ -358,8 +366,9 @@ existing operation.
 `resume` also works as a **pre-wake** of an idle-hibernated database: it is the supported way to
 wake before traffic (poll the operation, then run `SELECT 1`). When the node cannot take the
 start (no fresh memory sample within 90 s, `MemoryPressure`, or no CPU, RAM or storage headroom),
-`resume` answers `409 conflict` ("Database changed; retry the request"); that message also covers
-the capacity case. Retry later or free capacity.
+`resume` answers `409 conflict` with reason `node_capacity` and `Retry-After: 30`: retry later or
+free capacity. A `409` with reason `generation_changed` is a change that raced the request and is
+retried at once.
 
 ### 2.5 Resize
 
@@ -389,12 +398,12 @@ reclaim in 93.3 s). The name is free at once. The backup archive is **retained**
 awaiting its removal is not. A project can be deleted only after all its databases have finished
 deleting. Retained archives are removed by a cron after expiry.
 
-A `409 conflict` from `DELETE` deletes nothing. "Database admission mutation is in progress" means
-another change to the same database holds it at that moment: a wake, an idle sleep or its
-compensation, a protective storage stop or its recovery, or a regional maintenance step. Retry with
-backoff and jitter (for example 1 s, 2 s, 4 s, up to about two minutes) under the same
-`Idempotency-Key`. "Database changed; retry the request" means another request deleted the database
-first; the retry returns that deletion's operation.
+A `409 conflict` from `DELETE` deletes nothing. Reason `mutation_in_progress` means another change
+to the same database holds it at that moment: a wake, an idle sleep or its compensation, a
+protective storage stop or its recovery, or a regional maintenance step. Retry with backoff and
+jitter (for example 1 s, 2 s, 4 s, up to about two minutes) under the same `Idempotency-Key`;
+`Retry-After` gives the first delay. Reason `generation_changed` means another request changed the
+database first (for example deleted it); the retry returns that deletion's operation.
 
 ### 2.7 Backups, restorable window and restore
 
@@ -447,13 +456,15 @@ the source without reconciling them. A stale ID fails with `28P01` ([A.4](#a4-sq
 The restore is ready when its operation is `succeeded`: recovery has promoted, roles and settings
 match and the temporary restore administrator is gone. Compare your markers before cutover.
 
-| Refusal | Meaning |
+| `409` reason | Meaning |
 | --- | --- |
-| `409` "The deleted source archive is outside recovery retention" | deleted source past `deleted_at + backup_retention_days`, or its cleanup has begun |
-| `409` "No complete base backup and required WAL are available for the requested recovery" | no complete base backup ends at or before `target_time`, or its WAL chain has a gap |
-| `409` "Archive listing exceeds the bounded recovery catalog" and similar | the v1 catalog reads at most 16,000 objects and 64 base backups per database |
-| `409` "A database with this target name already exists" | choose another `name` |
-| `409` "Source region or size is unavailable" | the source's class is disabled or its region record is gone |
+| `archive_expired` | deleted source past `deleted_at + backup_retention_days`, or its cleanup has begun |
+| `no_recovery_point` | no complete base backup ends at or before `target_time`, or its WAL chain has a gap |
+| `archive_unusable` | the v1 catalog reads at most 16,000 objects and 64 base backups per database, and the listing was incomplete, invalid or beyond that bound |
+| `name_in_use` | a live database of the project already has the target `name`; choose another |
+| `source_unavailable` | the source's class is disabled, its region record is gone or its credentials are unavailable |
+| `region_unavailable` | the `region_id` of the request names no region |
+| `generation_changed` | the source, its retained archive or the placement changed under the request; retry |
 
 A restore needs capacity like a create; without it the target waits unplaced and the operation
 stays `pending`. Restore duration is **not measured**: the plan records no recovery time.
@@ -931,17 +942,40 @@ Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
 
 | Status | `error.code` | When | Retry |
 | --- | --- | --- | --- |
-| 400 | `invalid_request` | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink or change on thick, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a `member_of` entry that is not a live role of the database (or is `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*`), deleting `app` or `pgcf_maintenance` | no |
+| 400 | `invalid_request` | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a database or role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink or change on thick, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a `member_of` entry that is not a live role of the database (or is `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*`), deleting `app` or `pgcf_maintenance` | no |
 | 401 | `unauthorized` | key missing, malformed, unknown, revoked, or its project deleted | no |
 | 403 | `forbidden` | integrator key on an admin route | no |
 | 404 | `not_found` | unknown ID, an ID of another project, unknown route, a role route of a deleted database | no |
-| 409 | `conflict` | name in use, "Database is deleted", "Database configuration is not ready", "Database changed; retry the request" (also a resume without headroom), role exists or 100 roles, a role of that name "is being deleted", a role that other roles are `member_of` ("delete the members first"), a role deletion on a database bound to a shared pool, a role change already waiting, restore refusals ([2.7](#27-backups-restorable-window-and-restore)), project still holds databases | after reading state |
-| 409 | `conflict` | "Database admission mutation is in progress": another change to the same database holds it for the moment | yes, with backoff for up to about two minutes |
+| 409 | `conflict` | the request is refused for the cause in `error.details.reason` (table below) | by reason |
 | 409 | `idempotency_conflict` | same key, different request; replay of a credential-creating call | no |
-| 409 | `idempotency_in_progress` | same key still executing | yes, shortly |
-| 503 | `capacity_exhausted` | resize or profile assignment: the node lacks memory, CPU or storage now | later |
+| 409 | `idempotency_in_progress` | same key still executing | yes, shortly (`Retry-After`) |
+| 503 | `capacity_exhausted` | resize or profile assignment: the node lacks memory, CPU or storage now | later (`Retry-After`) |
 | 500 | `internal` | unexpected failure | yes, with the same key |
 | 429 | `rate_limited` | defined by the contract; the API emits none today | |
+
+The stable reasons of a `409 conflict` (and of `node_capacity`) come in two kinds. A **retryable**
+reason clears without a change to the request and the answer carries `Retry-After`; repeat the
+request under the same `Idempotency-Key`. A **terminal** reason needs a different request or a
+different resource first.
+
+| `details.reason` | Kind | Cause | `Retry-After` |
+| --- | --- | --- | --- |
+| `mutation_in_progress` | retryable | another change to the same database holds it for the moment (a wake, an idle sleep or its compensation, a protective stop, a maintenance step) | 1 s |
+| `generation_changed` | retryable | the database, or what a create or restore was based on, changed between the read and the write ("Database changed; retry the request") | 1 s |
+| `not_ready` | retryable | the database has not applied its latest generation or is not running yet ("Database configuration is not ready") | 5 s |
+| `pool_bound` | retryable | the database is bound to a shared pool Pod, or a role change already waits for its release | 5 s |
+| `node_capacity` | retryable | the node lacks memory, CPU or storage for a resize, or for a resume ([2.4](#24-suspend-and-resume)) | 30 s |
+| `name_in_use` | terminal | a live database of the project already has this name (create, restore) | |
+| `database_deleted` | terminal | the database is deleted | |
+| `project_not_empty` | terminal | the project still holds databases that are not yet confirmed deleted | |
+| `role_exists` | terminal | the role name exists | |
+| `role_limit` | terminal | the database holds 100 roles; a role awaiting its removal counts | |
+| `role_being_deleted` | terminal | a role of that name is awaiting its removal; create it again once PostgreSQL has dropped it | |
+| `role_has_members` | terminal | other live roles are `member_of` this role; delete the members first | |
+| `archive_expired`, `archive_unusable`, `no_recovery_point`, `source_unavailable`, `region_unavailable` | terminal | restore refusals ([2.7](#27-backups-restorable-window-and-restore)) | |
+
+A `409 conflict` of an operator route (regions, nodes, fleet, profiles, capacity) carries the
+message only.
 
 `GET /v1/databases/{id}` answers `200` for a deleted database; role routes answer `404`.
 
@@ -1020,7 +1054,6 @@ these corrections; the code is authoritative.
 | `getDatabaseArchive`: "Read database backup and WAL archive status" | returns only `{database_id, base_backup_count, wal_count, bytes}` | there is no status or window; use `health.archiving` |
 | `RoleCreate.valid_until` is a `Timestamp`; `member_of` an array of at most 8 distinct `RoleName` | `valid_until` must be in the future when the request executes (not on a replay); every `member_of` entry must be a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `400` |
 | `POST /v1/api-keys` `201` `Location: /v1/api-keys/{id}` | no `GET` exists for that path (only `DELETE`) | do not follow it |
-| `resumeDatabase`: `409` only | a resume without CPU, RAM or storage headroom is also `409` ("Database changed; retry the request"); `503 capacity_exhausted` exists only for resize and profile assignment | treat a `409` on resume as possible capacity |
 | Idempotency described without retention | keys are kept 24 hours | retries after a day execute again |
 | Request bodies without a size limit | 64 KiB, and `Content-Type: application/json` whenever there is a body | `400` |
 | `GET /v1/databases/{id}` documents `404` "Resource not found or inaccessible" and says nothing of deletion | a deleted database is returned with `200` and `desired_state: deleted` | check `desired_state` |

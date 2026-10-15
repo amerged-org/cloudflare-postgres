@@ -123,6 +123,7 @@ export async function restoreDatabase(
         throw new ApiError(
           "conflict",
           "The deleted source archive is outside recovery retention",
+          { reason: "archive_expired" },
         );
       const targetRegionId = body.region_id ?? source.region_id;
       const [sourceRegion, region, size] = await Promise.all([
@@ -141,9 +142,13 @@ export async function restoreDatabase(
           .first<SizeRow>(),
       ]);
       if (!sourceRegion || !size)
-        throw new ApiError("conflict", "Source region or size is unavailable");
+        throw new ApiError("conflict", "Source region or size is unavailable", {
+          reason: "source_unavailable",
+        });
       if (!region)
-        throw new ApiError("conflict", "Restore target region is unavailable");
+        throw new ApiError("conflict", "Restore target region is unavailable", {
+          reason: "region_unavailable",
+        });
       if (
         !(await databaseMemoryPolicyAllows(
           c.env.DB,
@@ -178,7 +183,9 @@ export async function restoreDatabase(
           ).results;
       const issuer = (await getAuth(c)).id;
       if (stored.filter((r) => r.owner === 1).length !== 1)
-        throw new ApiError("conflict", "Source credentials are unavailable");
+        throw new ApiError("conflict", "Source credentials are unavailable", {
+          reason: "source_unavailable",
+        });
       const targetId = newDatabaseId(),
         op = newOperationId(),
         storageGeneration = (source.storage_generation ?? 1) + 1,
@@ -334,6 +341,7 @@ export async function restoreDatabase(
           throw new ApiError(
             "conflict",
             "A database with this target name already exists",
+            { reason: "name_in_use" },
           );
         throw error;
       }
@@ -341,6 +349,7 @@ export async function restoreDatabase(
         throw new ApiError(
           "conflict",
           "Source credentials, retention or placement changed; retry the request",
+          { reason: "generation_changed" },
         );
       if (node) hint(c, targetRegionId, [targetId]);
       return response(c, op);

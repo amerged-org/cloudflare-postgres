@@ -4,6 +4,7 @@ import { afterEach, expect, it } from "vitest";
 import {
   fixture,
   cleanupFixtures,
+  refusal,
   request,
   observedBody,
   observation,
@@ -98,7 +99,12 @@ it("keeps a fresh restore target denied and refuses restore creation while its p
         "POST",
         { name: "scope-fenced-target", mode: "full" },
       );
-      expect(refused.status).toBe(409);
+      // The target's own insert finds the project fenced: it changed under the request.
+      expect(await refusal(refused)).toMatchObject({
+        status: 409,
+        reason: "generation_changed",
+        retryAfter: "1",
+      });
       expect(
         await env.DB.prepare(
           "SELECT count(*) n FROM databases WHERE project_id=? AND name='scope-fenced-target'",
@@ -475,14 +481,14 @@ it("retains deleted-source restore authority and rejects another tenant, missing
     ).status,
   ).toBe(404);
   expect(
-    (
+    await refusal(
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
         mode: "full",
         name: "wrong-region",
         region_id: "missing-test",
-      })
-    ).status,
-  ).toBe(409);
+      }),
+    ),
+  ).toMatchObject({ status: 409, reason: "region_unavailable" });
   expect(
     (
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
@@ -502,34 +508,39 @@ it("retains deleted-source restore authority and rejects another tenant, missing
     )
     .run();
   expect(
-    (
+    await refusal(
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
         mode: "full",
         name: "expired",
-      })
-    ).status,
-  ).toBe(409);
+      }),
+    ),
+  ).toEqual({
+    status: 409,
+    code: "conflict",
+    reason: "archive_expired",
+    retryAfter: null,
+  });
 });
 it("refuses missing WAL and a target before a completed base backup without reserving target storage", async () => {
   const f = await archived();
   expect(
-    (
+    await refusal(
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
         mode: "pitr",
         name: "too-early",
         target_time: f.before,
-      })
-    ).status,
-  ).toBe(409);
+      }),
+    ),
+  ).toMatchObject({ status: 409, reason: "no_recovery_point" });
   await env.ARCHIVE.delete(keys.filter((k) => k.includes("/wals/")));
   expect(
-    (
+    await refusal(
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
         mode: "full",
         name: "missing-wal",
-      })
-    ).status,
-  ).toBe(409);
+      }),
+    ),
+  ).toMatchObject({ status: 409, reason: "no_recovery_point" });
   expect(
     await env.DB.prepare("SELECT COUNT(*) count FROM database_restores").first<{
       count: number;

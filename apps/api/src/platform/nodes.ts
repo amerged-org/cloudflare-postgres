@@ -162,17 +162,12 @@ export async function requestNodeAddition(
 ): Promise<Response> {
   await requireScope(c, "admin");
   const body = NodeAdditionRequest.parse(raw);
-  const key = c.req.header("Idempotency-Key");
-  if (!key)
-    throw new ApiError(
-      "invalid_request",
-      "Node additions require an Idempotency-Key",
-    );
   return withIdempotency(c, {
     replay: async (id) => nodeAdditionResponse(c, id),
     execute: async (lease) => {
       let addition = await reserveNodeAddition(c.env.DB, {
-        request_key: key,
+        // withIdempotency has refused a request without the key: the route is required.
+        request_key: c.req.header("Idempotency-Key")!,
         request: body,
       });
       addition = await approveStandingNodePurchase(

@@ -37,7 +37,9 @@ const scopeColumn = {
   node: "node_id",
 };
 const conflict = () =>
-  new ApiError("conflict", "Database admission mutation is in progress");
+  new ApiError("conflict", "Database admission mutation is in progress", {
+    reason: "mutation_in_progress",
+  });
 
 export class AdmissionMutation {
   private submitted = false;

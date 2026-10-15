@@ -219,14 +219,22 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/regions/{target}/archive-sources/{source}",
 ]);
 
-/** These handlers reject an omitted key before submitting durable work: the long-running
- * platform operations and the role mutations, which change credentials of a running database.
+/** withIdempotency refuses an omitted key on these routes (400) before submitting durable work, and
+ * the served document marks the header required from the same set: the long-running platform
+ * operations and every mutation of a database an integrator calls, whose retries must be safe.
  */
 export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/nodes/additions",
   "POST /v1/nodes/{id}/patches",
   "POST /v1/fleet/rollouts",
   "POST /v1/nodes/{id}/thin-qualifications",
+  "POST /v1/databases",
+  "PATCH /v1/databases/{id}",
+  "DELETE /v1/databases/{id}",
+  "POST /v1/databases/{id}/restore",
+  "POST /v1/databases/{id}/suspend",
+  "POST /v1/databases/{id}/resume",
+  "PUT /v1/databases/{id}/resource-profile",
   "POST /v1/databases/{id}/roles",
   "POST /v1/databases/{id}/roles/{name}/reset-password",
   "DELETE /v1/databases/{id}/roles/{name}",

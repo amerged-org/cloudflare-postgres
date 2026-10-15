@@ -129,6 +129,7 @@ export async function deleteProject(
             throw new ApiError(
               "conflict",
               "Project still has databases awaiting deletion",
+              { reason: "project_not_empty" },
             );
         },
         { kind: "project", id },

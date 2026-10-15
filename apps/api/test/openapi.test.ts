@@ -248,8 +248,15 @@ describe("actual generated API references in the Workers runtime", () => {
     const management = await document("/v1/openapi.json");
     const agent = await document("/agent/v1/openapi.json");
     const internal = await document("/internal/v1/openapi.json");
+    // Creating a database is idempotent by contract and refuses a request without its key.
     const create = operation(management, "/v1/databases", "post");
     expect(create.parameters).toContainEqual(
+      expect.objectContaining({ name: "Idempotency-Key", required: true }),
+    );
+    // An optional key stays optional where the handler accepts a request without it.
+    expect(
+      operation(management, "/v1/size-classes/{id}", "put").parameters,
+    ).toContainEqual(
       expect.objectContaining({ name: "Idempotency-Key", required: false }),
     );
     const start = operation(
@@ -447,6 +454,54 @@ describe("actual generated API references in the Workers runtime", () => {
         .content,
     );
     expect(RoleCreate.parse(requested[0]).name).toBe("report_a1b2c3");
+  });
+
+  it("documents the stable refusal reasons, the retry advice and the required keys of database mutations", async () => {
+    const doc = await document("/v1/openapi.json");
+    const schemas = doc.components!.schemas as Record<
+      string,
+      { enum?: string[]; properties?: Record<string, unknown> }
+    >;
+    expect(schemas.ErrorReason!.enum).toEqual(
+      expect.arrayContaining([
+        "name_in_use",
+        "not_ready",
+        "mutation_in_progress",
+        "generation_changed",
+        "role_limit",
+        "role_exists",
+      ]),
+    );
+    expect(schemas.ErrorDetails!.properties).toHaveProperty("reason");
+    // Every database mutation an integrator repeats names its key as required.
+    for (const [path, method] of [
+      ["/v1/databases", "post"],
+      ["/v1/databases/{id}", "patch"],
+      ["/v1/databases/{id}", "delete"],
+      ["/v1/databases/{id}/suspend", "post"],
+      ["/v1/databases/{id}/resume", "post"],
+      ["/v1/databases/{id}/restore", "post"],
+    ] as const)
+      expect(
+        operation(doc, path, method).parameters,
+        `${method} ${path}`,
+      ).toContainEqual(
+        expect.objectContaining({ name: "Idempotency-Key", required: true }),
+      );
+    // The answers that advise a delay say so in their headers.
+    for (const [path, method, status] of [
+      ["/v1/databases/{id}", "patch", "409"],
+      ["/v1/databases/{id}", "patch", "503"],
+      ["/v1/databases/{id}/resume", "post", "409"],
+      ["/v1/databases/{id}/roles", "post", "409"],
+    ] as const)
+      expect(
+        operation(doc, path, method).responses[status]!.headers,
+        `${method} ${path} ${status}`,
+      ).toHaveProperty("Retry-After");
+    expect(
+      operation(doc, "/v1/databases", "get").responses["400"]!.headers,
+    ).not.toHaveProperty("Retry-After");
   });
 
   it("limits callback replies to the outcomes produced by their current actions", async () => {

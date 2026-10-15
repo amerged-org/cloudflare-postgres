@@ -72,14 +72,6 @@ export async function listRoles(c: ApiContext, id: string): Promise<Response> {
     .all<RoleRow>();
   return c.json({ data: result.results.map(roleView), next_cursor: null });
 }
-/** A mutation that starts long-running regional work states its retry identity up front. */
-function requireIdempotencyKey(c: ApiContext, what: string): void {
-  if (!c.req.header("Idempotency-Key"))
-    throw new ApiError(
-      "invalid_request",
-      `${what} requires an Idempotency-Key`,
-    );
-}
 /** What a role is created with; the defaults are those of a plain login role. */
 interface RoleAttributes {
   validUntil: string | null;
@@ -164,6 +156,7 @@ async function deferPoolRoleChange(
     throw new ApiError(
       "conflict",
       "A role change is already waiting for pool release",
+      { reason: "pool_bound" },
     );
   const holder = await c.env.DB.prepare(
     "SELECT b.id,b.state,b.scope_json,b.holder_revision FROM pool_bindings b JOIN database_runtime_holders h ON h.binding_id=b.id AND h.database_id=b.database_id AND h.kind='pool' AND h.revision=b.holder_revision WHERE b.database_id=? AND b.state NOT IN('released','refused')",
@@ -183,7 +176,9 @@ async function deferPoolRoleChange(
         .bind(db.id)
         .first()
     )
-      throw new ApiError("conflict", "Pool holder requires physical recovery");
+      throw new ApiError("conflict", "Pool holder requires physical recovery", {
+        reason: "pool_bound",
+      });
     return undefined;
   }
   const scope = PoolBindingScope.parse(JSON.parse(holder.scope_json));
@@ -192,7 +187,9 @@ async function deferPoolRoleChange(
     scope.generation !== db.generation ||
     scope.database_id !== db.id
   )
-    throw new ApiError("conflict", "Pool holder requires physical recovery");
+    throw new ApiError("conflict", "Pool holder requires physical recovery", {
+      reason: "pool_bound",
+    });
   const operation = newOperationId(),
     now = new Date().toISOString(),
     deadline =
@@ -257,7 +254,9 @@ async function deferPoolRoleChange(
       }),
     ]);
     if (results[0]!.meta.changes !== 1)
-      throw new ApiError("conflict", "Database, role or pool holder changed");
+      throw new ApiError("conflict", "Database, role or pool holder changed", {
+        reason: "generation_changed",
+      });
   });
   hint(c, db.region_id, [db.id]);
   return databaseOperationResponse(c, operation);
@@ -533,7 +532,6 @@ export async function createRole(
   body: RoleCreate,
 ): Promise<Response> {
   const db = await databaseForRequest(c, id);
-  requireIdempotencyKey(c, "Role creation");
   return withIdempotency(c, {
     replay: async (name, status) =>
       status === 202
@@ -613,15 +611,28 @@ export async function createRole(
             removing
               ? "A role of this name is being deleted; create it again once the deletion has completed"
               : "Role already exists",
+            { reason: removing ? "role_being_deleted" : "role_exists" },
           );
         }
         throw error;
       }
-      if (result[0]!.meta.changes !== 1 || result[1]!.meta.changes !== 1)
-        throw new ApiError(
-          "conflict",
-          "Database changed or role limit reached",
-        );
+      if (result[0]!.meta.changes !== 1 || result[1]!.meta.changes !== 1) {
+        // A full database (a role awaiting its removal counts) is not cured by repeating.
+        const held = await c.env.DB.prepare(
+          "SELECT COUNT(*) count FROM roles WHERE database_id=?",
+        )
+          .bind(id)
+          .first<number>("count");
+        if ((held ?? 0) >= ROLE_LIMIT)
+          throw new ApiError(
+            "conflict",
+            `A database holds at most ${ROLE_LIMIT} roles`,
+            { reason: "role_limit" },
+          );
+        throw new ApiError("conflict", "Database changed; retry the request", {
+          reason: "generation_changed",
+        });
+      }
       hint(c, db.region_id, [id]);
       return roleResponse(c, id, body.name, 201);
     },
@@ -634,7 +645,6 @@ export async function resetPassword(
 ): Promise<Response> {
   const db = await databaseForRequest(c, id),
     row = await roleForRequest(c, id, name);
-  requireIdempotencyKey(c, "Password reset");
   return withIdempotency(c, {
     replay: async (role, status) =>
       status === 202
@@ -700,6 +710,7 @@ export async function resetPassword(
         throw new ApiError(
           "conflict",
           "Database or role changed; retry the request",
+          { reason: "generation_changed" },
         );
       hint(c, db.region_id, [id]);
       return roleResponse(c, id, name);
@@ -717,7 +728,6 @@ export async function deleteRole(
   name: string,
 ): Promise<Response> {
   const db = await databaseForRequest(c, id);
-  requireIdempotencyKey(c, "Role deletion");
   if (name === OWNER_ROLE_NAME)
     throw new ApiError("invalid_request", "The owner role cannot be deleted");
   if (name === MAINTENANCE_ROLE)
@@ -771,6 +781,7 @@ export async function deleteRole(
           throw new ApiError(
             "conflict",
             "Role is a member_of target of another role; delete the members first",
+            { reason: "role_has_members" },
           );
       }
       if (
@@ -783,6 +794,7 @@ export async function deleteRole(
         throw new ApiError(
           "conflict",
           "A role cannot be deleted while the database is bound to a shared pool; retry after it is released",
+          { reason: "pool_bound" },
         );
       if (
         await c.env.DB.prepare(
@@ -794,6 +806,7 @@ export async function deleteRole(
         throw new ApiError(
           "conflict",
           "A role change is already waiting for pool release",
+          { reason: "pool_bound" },
         );
       const operation = newOperationId(),
         now = new Date().toISOString(),
@@ -855,6 +868,7 @@ export async function deleteRole(
         throw new ApiError(
           "conflict",
           "Database or role changed; retry the request",
+          { reason: "generation_changed" },
         );
       hint(c, db.region_id, [id]);
       return databaseOperationResponse(c, operation);

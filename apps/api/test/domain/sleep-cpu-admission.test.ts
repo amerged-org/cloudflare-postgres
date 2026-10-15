@@ -9,6 +9,7 @@ import {
   fixture,
   observation,
   observedBody,
+  refusal,
   request,
 } from "./fixtures.ts";
 
@@ -228,7 +229,13 @@ it("refuses CPU reacquisition with stale or missing physical identity even in re
   await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
     .bind(new Date(Date.now() - 181_000).toISOString(), f.node)
     .run();
-  expect((await resume(f, f.first)).status).toBe(409);
+  // A start the node cannot hold is told apart from a change that raced the request.
+  expect(await refusal(await resume(f, f.first))).toEqual({
+    status: 409,
+    code: "conflict",
+    reason: "node_capacity",
+    retryAfter: "30",
+  });
   await env.DB.prepare(
     "UPDATE nodes SET last_observed_at=?,node_uid=NULL WHERE id=?",
   )

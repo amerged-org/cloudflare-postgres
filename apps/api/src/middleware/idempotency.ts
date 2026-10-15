@@ -4,8 +4,10 @@ import {
   IDEMPOTENCY_KEY_HEADER,
   IDEMPOTENCY_KEY_PATTERN,
 } from "@pgcf/contracts";
+import { routePath } from "hono/route";
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { requiredIdempotentPublicRoutes } from "../openapi-public-errors.ts";
 import { getAuth } from "./auth.ts";
 
 interface IdempotencyRow {
@@ -46,16 +48,28 @@ export async function requestHash(c: ApiContext): Promise<string> {
   );
 }
 
+/** The route as the OpenAPI registries spell it: the method and the path with `{name}` parameters. */
+function routeKey(c: ApiContext): string {
+  return `${c.req.method} ${routePath(c, -1).replace(/:([A-Za-z0-9_]+)/g, "{$1}")}`;
+}
+
+/**
+ * A mutation whose route is in `requiredIdempotentPublicRoutes` refuses a request without a key
+ * before any durable work; the same registry documents the header as required.
+ */
 export async function withIdempotency(
   c: ApiContext,
   handlers: IdempotencyHandlers,
 ): Promise<Response> {
   const auth = await getAuth(c);
   const key = c.req.header(IDEMPOTENCY_KEY_HEADER);
-  if (key === undefined)
+  if (key === undefined) {
+    if (requiredIdempotentPublicRoutes.has(routeKey(c)))
+      throw new ApiError("invalid_request", "Idempotency-Key is required");
     return handlers.execute({
       completeStatement: () => c.env.DB.prepare("SELECT 1"),
     });
+  }
   if (!IDEMPOTENCY_KEY_PATTERN.test(key))
     throw new ApiError("invalid_request", "Invalid Idempotency-Key");
   const hash = await requestHash(c);

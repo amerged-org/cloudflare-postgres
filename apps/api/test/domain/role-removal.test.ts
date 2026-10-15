@@ -14,6 +14,7 @@ import {
   fixture,
   observation,
   observedBody,
+  refusal,
   request,
 } from "./fixtures.ts";
 
@@ -215,7 +216,11 @@ describe("role removal", () => {
     const refused = await removeRole(f, "reader");
     expect(refused.status).toBe(409);
     expect(await refused.json()).toMatchObject({
-      error: { code: "conflict", message: expect.stringContaining("member") },
+      error: {
+        code: "conflict",
+        message: expect.stringContaining("member"),
+        details: { reason: "role_has_members" },
+      },
     });
     expect(await listed(f)).toEqual(["app", "reader", "report_job"]);
     await removal(f, "report_job");
@@ -311,17 +316,18 @@ describe("role removal", () => {
     expect(
       (await desired(f)).roles.find((role) => role.name === "report_job"),
     ).toEqual({ name: "report_job", state: "absent" });
+    // The name stays reserved until PostgreSQL has dropped the role.
     expect(
-      (
+      await refusal(
         await request(
           `/v1/databases/${f.id}/roles`,
           f.integrator,
           "POST",
           { name: "report_job" },
           key(),
-        )
-      ).status,
-    ).toBe(409);
+        ),
+      ),
+    ).toMatchObject({ status: 409, reason: "role_being_deleted" });
     // Deleting again is a new attempt with its own operation and generation.
     const second = await removal(f, "report_job");
     expect(second.operation.id).not.toBe(first.operation.id);
@@ -482,7 +488,12 @@ describe("role removal", () => {
       { name: "one_more" },
       key(),
     );
-    expect(created.status).toBe(409);
+    expect(await refusal(created)).toEqual({
+      status: 409,
+      code: "conflict",
+      reason: "role_limit",
+      retryAfter: null,
+    });
     // Once the region has confirmed the removal the slot is free again.
     await post(f, [
       report(f.id, await generationOf(f.id), {
@@ -511,7 +522,12 @@ describe("role removal", () => {
       .bind(f.id, Date.now())
       .run();
     const response = await removeRole(f, "report_job");
-    expect(response.status).toBe(409);
+    expect(await refusal(response)).toEqual({
+      status: 409,
+      code: "conflict",
+      reason: "pool_bound",
+      retryAfter: "5",
+    });
     expect(await listed(f)).toEqual(["app", "report_job"]);
     await env.DB.prepare(
       "DELETE FROM database_runtime_holders WHERE database_id=?",

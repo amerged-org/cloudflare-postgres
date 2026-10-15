@@ -5,6 +5,7 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import {
+  ErrorBody,
   hashApiKey,
   newAgentKey,
   newApiKey,
@@ -116,12 +117,16 @@ export async function cleanupFixtures(): Promise<void> {
   }
 }
 
+/** The database mutations that refuse a request without an Idempotency-Key, as `METHOD path`. */
+const KEYED_DATABASE_MUTATION =
+  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/resource-profile)$/;
 export async function request(
   path: string,
   key: string,
   method = "GET",
   body?: unknown,
-  idempotency?: string,
+  /** A string is sent as is; `null` sends none; omitted sends a fresh key where one is required. */
+  idempotency?: string | null,
   extraHeaders?: HeadersInit,
 ): Promise<Response> {
   const context = createExecutionContext();
@@ -129,6 +134,11 @@ export async function request(
   headers.set("Authorization", `Bearer ${key}`);
   if (body !== undefined) headers.set("Content-Type", "application/json");
   if (idempotency) headers.set("Idempotency-Key", idempotency);
+  else if (
+    idempotency === undefined &&
+    KEYED_DATABASE_MUTATION.test(`${method} ${path.split("?")[0]}`)
+  )
+    headers.set("Idempotency-Key", crypto.randomUUID());
   const response = await createApp().fetch(
     new Request(new URL(path, `https://${["api", "invalid"].join(".")}`), {
       method,
@@ -140,6 +150,16 @@ export async function request(
   );
   await waitOnExecutionContext(context);
   return response;
+}
+/** What a refusal tells a client: its code, the stable reason and the advised delay. */
+export async function refusal(response: Response) {
+  const { error } = ErrorBody.parse(await response.json());
+  return {
+    status: response.status,
+    code: error.code,
+    reason: error.details?.reason ?? null,
+    retryAfter: response.headers.get("Retry-After"),
+  };
 }
 export async function fixture(memory = 4096, storage: number | null = 30) {
   const now = new Date().toISOString(),

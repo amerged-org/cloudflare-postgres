@@ -1283,11 +1283,6 @@ export async function createFleetPatch(
   input: FleetPatchRequest,
 ) {
   await requireScope(c, "admin");
-  if (!c.req.header("Idempotency-Key"))
-    throw new ApiError(
-      "invalid_request",
-      "Idempotency-Key is required for fleet patches",
-    );
   const output = async (id: string) => {
     const row = await readFleetPatch(c.env, id);
     if (

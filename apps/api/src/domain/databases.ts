@@ -345,6 +345,7 @@ export async function createDatabase(
             throw new ApiError(
               "conflict",
               "A database with this name already exists",
+              { reason: "name_in_use" },
             );
           throw error;
         }
@@ -359,6 +360,7 @@ export async function createDatabase(
       throw new ApiError(
         "conflict",
         "Project, region or size class changed; retry the request",
+        { reason: "generation_changed" },
       );
     },
   });
@@ -529,7 +531,9 @@ export async function scheduleDatabaseResize(
     row.deleted_at !== null ||
     !["running", "suspended"].includes(row.desired_state)
   )
-    throw new ApiError("conflict", "Database is deleted");
+    throw new ApiError("conflict", "Database is deleted", {
+      reason: "database_deleted",
+    });
   const [previous, target] = await Promise.all([
     db
       .prepare("SELECT * FROM size_classes WHERE id=?")
@@ -604,7 +608,9 @@ export async function scheduleDatabaseResize(
       )
       .first<{ id: string }>();
     if (!existing)
-      throw new ApiError("conflict", "Database changed; retry the request");
+      throw new ApiError("conflict", "Database changed; retry the request", {
+        reason: "generation_changed",
+      });
     if (lease)
       await lease
         .completeStatement(existing.id, 202, {
@@ -622,7 +628,9 @@ export async function scheduleDatabaseResize(
         row.observed_power !== "hibernated"
       : row.observed_state !== "ready")
   )
-    throw new ApiError("conflict", "Database configuration is not ready");
+    throw new ApiError("conflict", "Database configuration is not ready", {
+      reason: "not_ready",
+    });
   if (!sleeping) {
     const node = (await placementNodes(db, row.region_id, row.id)).find(
       (value) => value.id === row.node_id,
@@ -654,6 +662,7 @@ export async function scheduleDatabaseResize(
       throw new ApiError(
         "capacity_exhausted",
         "Current node has insufficient memory, CPU or storage",
+        { reason: "node_capacity" },
       );
   }
   const nodeId = row.node_id;
@@ -732,10 +741,13 @@ export async function scheduleDatabaseResize(
         current.updated_at !== row.updated_at ||
         sleeping
       )
-        throw new ApiError("conflict", "Database changed; retry the request");
+        throw new ApiError("conflict", "Database changed; retry the request", {
+          reason: "generation_changed",
+        });
       throw new ApiError(
         "capacity_exhausted",
         "Current node capacity changed; retry the request",
+        { reason: "node_capacity" },
       );
     }
     return op;
@@ -757,7 +769,9 @@ export async function resizeDatabase(
         expectedGeneration !== undefined &&
         row.generation !== expectedGeneration
       )
-        throw new ApiError("conflict", "Database generation changed");
+        throw new ApiError("conflict", "Database generation changed", {
+          reason: "generation_changed",
+        });
       const op = await scheduleDatabaseResize(
         c.env,
         row,
@@ -786,7 +800,9 @@ export async function deleteDatabase(
           .bind(id, row.project_id)
           .first<{ id: string }>();
         if (!existing)
-          throw new ApiError("conflict", "Deletion operation is unavailable");
+          throw new ApiError("conflict", "Deletion operation is unavailable", {
+            reason: "database_deleted",
+          });
         await lease.completeStatement(existing.id, 202).run();
         return databaseOperationResponse(c, existing.id);
       }
@@ -874,7 +890,9 @@ export async function deleteDatabase(
         },
       );
       if (result[0]!.meta.changes !== 1)
-        throw new ApiError("conflict", "Database changed; retry the request");
+        throw new ApiError("conflict", "Database changed; retry the request", {
+          reason: "generation_changed",
+        });
       hint(c, row.region_id, [id]);
       return databaseOperationResponse(c, op);
     },
