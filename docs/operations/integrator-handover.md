@@ -641,10 +641,29 @@ pgcf -G "$PGCF_API/v1/usage" \
 | `reserved_storage_byte_seconds` | quota times provisioned seconds; **null for Thin volumes** (their snapshot carries no physical allocation), with the gap named |
 | `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the agent's filesystem samples in the period (bytes used; PVC capacity) |
 | `backup_bytes_max` | maximum archive size in R2 measured in the period |
-| `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway counters; `null` with `traffic_coverage` when any gateway interval is missing |
+| `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway counters of the hour, summed over its measurement intervals (none spans two hours); `null` with `traffic_coverage` when an interval of the hour is missing or unknown |
 
 For compute time price `awake_seconds` and `memory_mib_seconds`; for storage use
-`storage_allocated_bytes` and `storage_used_bytes_max`.
+`storage_allocated_bytes` and `storage_used_bytes_max`; for traffic read `ingress_bytes` and
+`egress_bytes` of final rows.
+
+**Traffic across an hour boundary.** The gateways count cumulative totals and the regional
+controller reads them about every 15 seconds. When two readings enclose a UTC hour boundary, the
+bytes, connections and connection time counted between them are split between the two hours pro
+rata by elapsed time, in whole numbers: the earlier hour receives the rounded-down share and the
+later hour the remainder, so the two hours always add up to exactly what the gateways counted.
+Example: 1,000 egress bytes counted between the readings at 11:59:50 and 12:00:05 are 666 bytes in
+the 11:00 row (10 of the 15 seconds) and 334 bytes in the 12:00 row (5 of the 15 seconds). The
+timing error is at most the interval between the two readings, normally about 15 seconds, and only
+in the two rows around a boundary; the sum over whole hours is exact. `connection_seconds` has
+millisecond resolution.
+
+**What stays unknown.** An interval is `null`, with `traffic_coverage` in `gaps`, when the gateway
+process restarted or was replaced, a counter went backwards, the set of gateways or their signing
+key changed in between, a report was incomplete, no reading arrived, or two readings are more than
+one UTC hour boundary apart (a controller outage of about an hour or more). A reading that shows
+nothing counted is a measured zero, not a gap. A day row is `null` when any of its hours is. Hours
+finalized before this attribution was deployed keep `null` traffic and are never recomputed.
 
 **Infrastructure cost** (`GET /v1/costs`, **admin only**, hourly, at most 31 days, one node or one
 region) is per node and built from monthly amounts the owner recorded as immutable facts
@@ -878,7 +897,7 @@ outcome and are not replayed.
 | Sleep sequence and refusals | `apps/regional/src/agent/sleep.ts`, `apps/native-controller/src/power.rs` |
 | PostgreSQL cluster, backup schedule, retention, `pg_hba` | `apps/native-controller/src/manifests.rs`, `infra/postgres/README.md`, `infra/platform/versions.lock.json` |
 | Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, `README.md` |
-| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts` |
+| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/native-controller/src/measurements.rs`, conformant to `apps/regional/src/agent/measurements.ts` |
 | Alerts, health | `apps/api/src/domain/{operational-health,infrastructure-alerts}.ts`, `docs/operations/infrastructure-backups.md` |
 | Recovery, maintenance | `docs/operations/recovery.md`, `docs/operations/fleet-patches.md` |
 | Measured numbers and open steps | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) |
