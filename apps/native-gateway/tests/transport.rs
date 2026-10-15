@@ -1117,7 +1117,7 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
             .filter_map(|line| serde_json::from_str(&line[line.find('{')?..]).ok())
             .filter(|line: &Value| line["event"] == "conn_stages")
             .collect();
-        assert_eq!(lines.len(), 3, "{stdout}");
+        assert_eq!(lines.len(), 4, "{stdout}");
         for line in &lines {
             // Only these fields: no role, address, token or payload byte.
             let mut keys = vec![
@@ -1126,6 +1126,7 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
                 "event",
                 "first_backend_ms",
                 "outcome",
+                "route",
                 "session_ms",
                 "startup_ms",
                 "upgrade_ms",
@@ -1161,6 +1162,13 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         for unreached in ["upgrade_ms", "startup_ms", "dial_ms", "first_backend_ms"] {
             assert!(lines[2][unreached].is_null());
         }
+        // The class of the writer the connection was admitted on, once a writer was chosen: a
+        // Ready endpoint, or the controller's attested Pod before the kubelet reports it.
+        assert_eq!(lines[0]["route"], "ready");
+        assert_eq!(lines[1]["route"], "ready");
+        assert!(lines[2]["route"].is_null());
+        assert_eq!(lines[3]["route"], "attested");
+        assert_eq!(lines[3]["outcome"], "client_closed");
         assert!(!stdout.contains("private_bearer_payload_canary"));
         return;
     }
@@ -1196,6 +1204,22 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         .replace("configmaps", &maps, Some(&issuer.trust))
         .unwrap();
     assert_eq!(fixture.upgrade(&route_token(962)).await.err(), Some(503));
+    // The cluster right after a fast wake: the writer is the attested Pod before its Ready.
+    fixture
+        .gateway
+        .fences
+        .write()
+        .await
+        .replace(attested_fence())
+        .unwrap();
+    unready_wake(&fixture, true).await;
+    let mut client = fixture
+        .upgrade(&admitted(963, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.ended().await;
     fixture.stop().await;
 }
 #[tokio::test]
@@ -1388,5 +1412,191 @@ async fn an_attested_unready_pod_is_routed_only_under_its_signed_thin_authority(
     fixture.login(&mut client).await;
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+
+/// The fence as its watch delivers it when the fence leaves `running`: the power state and the
+/// writer cache both carry the controller's attestation unchanged beside the new intent.
+async fn fence_quiesces(fixture: &Fixture, revision: u64) {
+    let mut maps = storage_maps();
+    maps[1]["data"]["intent.json"] =
+        json!({"database":DATABASE,"operation":operation(),"revision":revision,"mode":"quiesce"})
+            .to_string()
+            .into();
+    maps[1]["data"]["admission_target"] = attested_target().to_string().into();
+    maps.push(ca_map());
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("configmaps", &maps, None)
+        .unwrap();
+    fixture
+        .gateway
+        .fences
+        .write()
+        .await
+        .replace(HashMap::from([(
+            DATABASE.into(),
+            Fence {
+                admission_target: Some(serde_json::from_value(attested_target()).unwrap()),
+                ..fence("quiesce", revision)
+            },
+        )]))
+        .unwrap();
+    fixture
+        .gateway
+        .sessions
+        .lock()
+        .unwrap()
+        .signal(DATABASE, Action::Quiesce);
+}
+/// The session ends and not one frontend byte reaches PostgreSQL.
+async fn ends_without_forwarding(fixture: &mut Fixture, client: &mut Client) {
+    let _ = client.send(Message::Binary(query().into())).await;
+    let next = timeout(Duration::from_secs(1), client.next())
+        .await
+        .unwrap();
+    assert!(
+        matches!(next, Some(Ok(Message::Close(_))) | Some(Err(_)) | None),
+        "the session stayed open: {next:?}"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "frontend bytes crossed the withdrawn writer"
+    );
+}
+#[tokio::test]
+async fn a_v4_route_naming_another_pod_generation_or_route_revision_is_refused_while_the_pod_is_unready()
+ {
+    let fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    for route in [
+        admitted(990, 1, &cid(299), 19),
+        admitted(991, 2, &cid(200), 19),
+        admitted(992, 1, &cid(200), 20),
+    ] {
+        assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    // The same state admits the route that names exactly what the controller attested.
+    let client = fixture
+        .upgrade(&admitted(993, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    drop(client);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn an_established_session_on_an_unready_writer_closes_when_the_fence_leaves_running_or_the_container_restarts()
+ {
+    // The attestation holds only at the running revision it was made for, so the evidence a
+    // session was admitted on ends with it: the session is closed rather than drained.
+    let mut fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    let mut client = fixture
+        .upgrade(&admitted(994, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    fixture.login(&mut client).await;
+    fence_quiesces(&fixture, 2).await;
+    ends_without_forwarding(&mut fixture, &mut client).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.stop().await;
+    // A container restarted under another ID is not the one the controller attested.
+    let mut fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    let mut client = fixture
+        .upgrade(&admitted(995, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    fixture.login(&mut client).await;
+    let mut restarted = running_pod(false);
+    restarted["status"]["containerStatuses"][0]["containerID"] =
+        format!("containerd://{}", "b".repeat(64)).into();
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("pods", &[restarted], None)
+        .unwrap();
+    ends_without_forwarding(&mut fixture, &mut client).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_writer_replaced_between_admission_and_dial_is_not_dialled_on_the_unready_path() {
+    let fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    let mut client = fixture
+        .upgrade(&admitted(996, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    // Another Pod became the Service's Ready writer before the StartupMessage was dialled.
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("endpointslices", &[writer(&cid(299))], None)
+        .unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    let error = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert!(String::from_utf8_lossy(&error).contains("08006"));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+}
+/// One plain HTTP request to the gateway: the status and the body.
+async fn get(fixture: &Fixture, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", fixture.port))
+        .await
+        .unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(10), stream.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+#[tokio::test]
+async fn readyz_requires_the_pod_watch() {
+    // A writer the kubelet has not reported Ready is recognized only by the Pod watch, and the
+    // controller publishes a woken database on its attestation: a replica without the watch
+    // would answer that wake with a refusal the Edge does not retry.
+    let fixture = Fixture::new().await;
+    assert_eq!(get(&fixture, "/healthz").await.0, 200);
+    let (status, body) = get(&fixture, "/readyz").await;
+    assert_eq!((status, body.as_str()), (503, "unsynchronized\n"));
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("pods", &[], None)
+        .unwrap();
+    assert_eq!(get(&fixture, "/readyz").await, (200, "ok\n".into()));
+    // The watch is lost: the replica leaves the Service again, and stays alive.
+    fixture.gateway.targets.write().await.disconnect("pods");
+    assert_eq!(get(&fixture, "/readyz").await.0, 503);
+    assert_eq!(get(&fixture, "/healthz").await.0, 200);
     fixture.stop().await;
 }

@@ -1882,6 +1882,16 @@ mod tests {
             change(&mut value);
             self.maps[1]["data"][key] = value.to_string().into();
         }
+        /// What the kubelet reports of the resumed Pod: its endpoint and its `postgres`
+        /// container ready or not. Applied with the next `apply`.
+        fn kubelet(&mut self, ready: bool) {
+            self.slices[0]["endpoints"][0]["conditions"] = if ready {
+                json!({"ready":true})
+            } else {
+                json!({"ready":false,"serving":false,"terminating":false})
+            };
+            self.pods[0]["status"]["containerStatuses"][0]["ready"] = ready.into();
+        }
     }
     #[test]
     fn an_attested_pod_is_routed_before_its_ready_condition_and_keeps_its_route_when_ready() {
@@ -2073,5 +2083,145 @@ mod tests {
         wake.maps[2]["data"]["ca.crt"] = "refreshed public certificate material".into();
         wake.apply();
         assert!(wake.route().is_err());
+    }
+    #[test]
+    fn a_not_ready_flip_after_ready_withdraws_the_attested_route_and_permits() {
+        let mut wake = Wake::armed();
+        let attested = wake.route().unwrap();
+        assert!(attested.unready);
+        // The kubelet reports the Pod Ready: the attestation has done its work for it.
+        wake.kubelet(true);
+        wake.apply();
+        let ready = wake.route().unwrap();
+        assert!(!ready.unready);
+        // It is not Ready again while the fence still carries the same attestation: PostgreSQL
+        // down under the same container, an operator's fence, a lost node. Only the ordinary
+        // rules apply to that Pod and container from now on, and they refuse it.
+        wake.kubelet(false);
+        wake.apply();
+        assert!(wake.route().is_err());
+        for target in [&attested, &ready] {
+            assert!(!wake.state.permits(WAKE, target, control::now()));
+        }
+        // Neither the next list nor a watch event of the same Pod brings the route back.
+        wake.apply();
+        assert!(wake.route().is_err());
+        let pod = wake.pods[0].clone();
+        wake.state
+            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .unwrap();
+        assert!(wake.route().is_err());
+        assert!(!wake.state.permits(WAKE, &ready, control::now()));
+        // The kubelet's report is what routes it again.
+        wake.kubelet(true);
+        wake.apply();
+        let again = wake.route().unwrap();
+        assert!(!again.unready);
+        assert!(wake.state.permits(WAKE, &ready, control::now()));
+    }
+    #[test]
+    fn a_new_revision_of_the_attestation_is_not_spent_by_an_earlier_ready() {
+        let mut wake = Wake::armed();
+        wake.kubelet(true);
+        wake.apply();
+        assert!(!wake.route().unwrap().unready);
+        wake.kubelet(false);
+        wake.apply();
+        assert!(wake.route().is_err());
+        // The controller attests the same Pod and container at the next revision of the
+        // fence, as it does after every wake.
+        wake.edit("intent.json", |intent| intent["revision"] = 8.into());
+        wake.edit("admission_target", |target| target["generation"] = 8.into());
+        wake.apply();
+        assert!(wake.route().unwrap().unready);
+    }
+    #[test]
+    fn a_ready_endpoint_of_another_pod_wins_and_never_borrows_the_attestation() {
+        let mut wake = Wake::armed();
+        // Another Pod of the Service, Ready, whose container carries the attested ID but is
+        // not reported ready: the attestation names the first Pod, not this one.
+        let mut other = wake.slices[0].clone();
+        other["metadata"]["uid"] = wake_id(30).into();
+        other["endpoints"][0]["addresses"] = json!(["10.0.0.8"]);
+        other["endpoints"][0]["conditions"] = json!({"ready":true});
+        other["endpoints"][0]["targetRef"]["uid"] = wake_id(4).into();
+        wake.slices.push(other);
+        let mut pod = wake.pods[0].clone();
+        pod["metadata"]["uid"] = wake_id(4).into();
+        pod["status"]["podIP"] = "10.0.0.8".into();
+        wake.pods.push(pod);
+        wake.apply();
+        let routed = wake.route().unwrap();
+        assert_eq!(routed.pod_uid, wake_id(4));
+        assert_eq!(routed.address.to_string(), "10.0.0.8");
+        assert!(!routed.unready);
+        assert_eq!(routed.container_id, None);
+    }
+    #[test]
+    fn an_attested_pod_whose_watched_node_or_address_differs_from_its_endpoint_is_not_routed() {
+        let mut wake = Wake::armed();
+        wake.pods[0]["spec"]["nodeName"] = "customer-us2".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        let mut wake = Wake::armed();
+        wake.pods[0]["status"]["podIP"] = "10.0.0.8".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn a_stale_pod_watch_without_a_disconnect_withdraws_the_unready_route() {
+        let mut wake = Wake::armed();
+        let target = wake.route().unwrap();
+        // The watch neither failed nor delivered an event or bookmark for longer than it may.
+        wake.state.pods_observed = Instant::now().checked_sub(Duration::from_secs(71));
+        assert!(wake.state.pods_observed.is_some());
+        assert!(wake.route().is_err());
+        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        // Its next event is the proof of the Pod again.
+        let pod = wake.pods[0].clone();
+        wake.state
+            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .unwrap();
+        assert_eq!(wake.route().unwrap(), target);
+    }
+    #[test]
+    fn an_established_unready_target_fails_permits_on_every_withdrawal() {
+        let withdrawals: [(&str, fn(&mut Wake)); 5] = [
+            ("the fence quiesces at the next revision", |wake| {
+                wake.edit("intent.json", |intent| {
+                    intent["mode"] = "quiesce".into();
+                    intent["revision"] = 8.into();
+                });
+            }),
+            ("the container is restarted under a new ID", |wake| {
+                wake.pods[0]["status"]["containerStatuses"][0]["containerID"] =
+                    format!("containerd://{}", "b".repeat(64)).into();
+            }),
+            ("the endpoint names another Pod", |wake| {
+                wake.slices[0]["endpoints"][0]["targetRef"]["uid"] = wake_id(4).into();
+            }),
+            ("the CA is replaced", |wake| {
+                wake.maps[2]["metadata"]["annotations"]["pgcf.io/source-ca-secret-resource-version"] =
+                    "82".into();
+                wake.maps[2]["data"]["ca.crt"] = "refreshed public certificate material".into();
+            }),
+            ("the Pod is deleted", |wake| {
+                wake.pods[0]["metadata"]["deletionTimestamp"] = "2026-10-15T10:00:00Z".into();
+            }),
+        ];
+        for (reason, withdraw) in withdrawals {
+            let mut wake = Wake::armed();
+            let target = wake.route().unwrap();
+            assert!(
+                wake.state.permits(WAKE, &target, control::now()),
+                "{reason}"
+            );
+            withdraw(&mut wake);
+            wake.apply();
+            assert!(
+                !wake.state.permits(WAKE, &target, control::now()),
+                "{reason}"
+            );
+        }
     }
 }
