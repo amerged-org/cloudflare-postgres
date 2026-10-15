@@ -986,3 +986,32 @@ async fn the_target_is_published_after_every_gateway_acknowledged_and_with_the_r
     assert!(release < target, "the target precedes the release");
     assert_eq!(admission_target(&w)["generation"], 3);
 }
+
+#[tokio::test]
+async fn a_database_without_an_origin_operation_still_has_its_new_target_published() {
+    // A record without a creation or a recovery operation has no running intent to publish, and
+    // its target is still the one the gateway routes by: Cloudflare admitting it again under
+    // another epoch changes it.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(admission_target(&w)["admission_epoch"], 1);
+    w.kubelet_ready_now()();
+    w.server
+        .edit("Cluster", Some(&w.ns), "database", |cluster| {
+            cluster["status"]["conditions"] = json!([
+                {"type":"Ready","status":"True"},
+                {"type":"ContinuousArchiving","status":"True"}
+            ]);
+        });
+    w.db["creation"] = Value::Null;
+    w.db.as_object_mut().unwrap().remove("power");
+    w.db["admission"]["admission_epoch"] = 2.into();
+    let again = reconcile(&w).await;
+    assert_eq!(again["state"], "ready", "{again}");
+    assert_eq!(again["runtime_attestation"]["admission_epoch"], 2);
+    assert_eq!(admission_target(&w)["admission_epoch"], 2);
+}

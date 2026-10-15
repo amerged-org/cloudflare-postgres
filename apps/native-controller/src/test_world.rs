@@ -452,8 +452,9 @@ fn answers(
                 ("archive_listing", Cell::Bool(true)),
             ])
         } else if sql.contains("pg_stat_archiver") {
-            // `EXTRACT(EPOCH ...)` is a numeric with six decimals; never archived is `-1`.
-            let at = now_ms();
+            // `EXTRACT(EPOCH ...)` is a numeric with six decimals; never archived is `-1`. The
+            // last archive was a moment ago, never after the statement is asked.
+            let at = now_ms().saturating_sub(1000);
             one(vec![
                 ("ready_wal_files", text("0")),
                 ("archived_count", text("5")),

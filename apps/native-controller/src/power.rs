@@ -2445,6 +2445,8 @@ impl PowerCoordinator {
             || text(db, "desired_state") != "running"
             || origin.is_null()
         {
+            // No running intent is published for it; the target its attestation names is.
+            self.publish_target(db, None, &observation).await?;
             return Ok(Some(observation));
         }
         let result: Result<Option<PowerIntent>> = async {
