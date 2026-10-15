@@ -342,7 +342,7 @@ it("adds the database, Thin storage and cron alert kinds and the cron heartbeat 
       (name) =>
         name.endsWith(".sql") &&
         name > "0001_init.sql" &&
-        name < "0052_cron_heartbeat_and_alert_kinds.sql",
+        name < "0053_cron_heartbeat_and_alert_kinds.sql",
     ))
     db.exec(readFileSync(new URL(file, directory), "utf8"));
   const alert = (kind: string) =>
@@ -365,7 +365,7 @@ it("adds the database, Thin storage and cron alert kinds and the cron heartbeat 
     .all();
   db.exec(
     readFileSync(
-      new URL("0052_cron_heartbeat_and_alert_kinds.sql", directory),
+      new URL("0053_cron_heartbeat_and_alert_kinds.sql", directory),
       "utf8",
     ),
   );

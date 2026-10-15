@@ -41,7 +41,7 @@ pins. Missing or changed authority fails the daily run rather than choosing an
 unverified source. Backups use the existing administrator relay capability; this
 change grants no new regional Kubernetes RBAC or Talos credentials to Pods.
 
-Apply migration `0052_cron_heartbeat_and_alert_kinds.sql` with the Worker that
+Apply migration `0053_cron_heartbeat_and_alert_kinds.sql` with the Worker that
 introduces it, and keep the `CRON_WATCHDOG` Durable Object binding and its migration
 (`new_sqlite_classes: ["CronWatchdog"]`, tag `v4` in `apps/api/wrangler.example.jsonc`;
 use the next unused tag of the deployed configuration) in every deployed configuration:
