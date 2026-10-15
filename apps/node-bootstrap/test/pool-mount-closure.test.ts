@@ -255,6 +255,8 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
       await copy(`${member}/Cargo.toml`);
       await tree(`${member}/src`, ".rs");
     }
+    // Cargo resolves the supervisor manifest's declared fixture-gated test targets on load.
+    await tree("apps/pool-supervisor/tests", ".rs");
     await copy("apps/sandbox-controller/build.rs");
     await copy("apps/sandbox-controller/examples/pool_io_fixture.rs");
     await tree("apps/sandbox-controller/proto", ".proto");
