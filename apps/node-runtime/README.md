@@ -1,36 +1,39 @@
 # Prepared node runtime primitive
 
-This native Rust executable is the one-assignment namespace holder for the required shared
-prestarted compute pool. It prepares real private Linux network, IPC and UTS namespaces before
-any tenant request. It accepts one opened network-namespace descriptor from an authenticated
-local runtime controller, moves the same PID to that namespace, assigns the hostname, drops its
-privileges and closes the assignment channel. It never receives PostgreSQL data, passwords,
-mount paths or executable commands.
+This native Rust executable is the one-assignment namespace holder that the
+[sandbox controller](../sandbox-controller/README.md) prepares before any Pod request (the
+region's `compute_pool` slots). It prepares real private Linux network, IPC and UTS namespaces
+before any tenant request. It accepts one opened network-namespace descriptor from an
+authenticated local runtime controller, moves the same PID to that namespace, assigns the
+hostname, drops its privileges and closes the assignment channel. It never receives PostgreSQL
+data, passwords, mount paths or executable commands.
 
 **This is not a complete pool controller, CRI integration, CNPG adoption or database-readiness
-implementation.** A prepared namespace holder alone does not establish the first-read target.
-The external containerd sandbox controller, task endpoint association, cgroup accounting,
-release/profile selection, refill, tenant-runtime destruction and actual database acceptance
-remain required work. Existing servers do not execute this binary yet.
+implementation.** A prepared namespace holder alone does not establish a first-read target. The
+sandbox controller owns the containerd task endpoint association, cgroup accounting,
+release/profile selection, refill and tenant-runtime destruction; EU1 runs it as a Talos host
+extension service under the region's `compute_pool` policy and therefore executes this binary.
+The shared PostgreSQL pool built on these slots is deferred; its code is on main and not wired
+end to end.
 
 ## Runtime boundary
 
-The intended software-only integration retains normal CNPG-created database Pods and their
-immutable PVC specifications. A containerd sandbox-controller proxy maps each real Pod sandbox
-ID to one previously prepared slot and returns its existing runc TaskService endpoint. After
-assignment, containerd's ordinary child OCI specifications select the namespace paths of the
-returned PID. Each PostgreSQL/Barman child retains its own runc-enforced cgroup and actual mounts.
-A slot is destroyed after tenant use; it never returns to unassigned inventory.
+The software-only integration retains normal CNPG-created database Pods and their immutable PVC
+specifications. The sandbox controller, a containerd sandbox-controller proxy, maps each real Pod
+sandbox ID to one previously prepared slot and returns its existing runc TaskService endpoint.
+After assignment, containerd's ordinary child OCI specifications select the namespace paths of
+the returned PID. Each PostgreSQL/Barman child retains its own runc-enforced cgroup and actual
+mounts. A slot is destroyed after tenant use; it never returns to unassigned inventory.
 
 The pinned containerd 2.3.6 [external sandbox-controller API](https://github.com/containerd/containerd/blob/v2.3.6/api/services/sandbox/v1/sandbox.proto),
 [multiple-task runc service](https://github.com/containerd/containerd/blob/v2.3.6/cmd/containerd-shim-runc-v2/task/service.go#L223-L255),
 and [Pod namespace selection](https://github.com/containerd/containerd/blob/v2.3.6/internal/cri/opts/spec_opts.go#L347-L365)
-provide this integration seam. The actual adapter and CRI/Cilium/CNPG conformance have not yet
-been implemented or proved. Shared Pod PID/user namespace modes must be rejected until the
-slot also provides their required isolation; ordinary CNPG separate-container PID mode is the
-initial integration target. A controller must validate CNI namespace custody and operation,
-Pod/Node identity and resource limits before allowing any tenant task. It must reconcile an
-uncertain assignment by observation/destruction, never resend it to reuse a slot.
+provide this integration seam. Shared Pod PID/user namespace modes are rejected until the slot
+also provides their required isolation; ordinary CNPG separate-container PID mode is the
+supported mode. The sandbox controller validates CNI namespace custody and operation, Pod/Node
+identity and resource limits before allowing any tenant task. It reconciles an uncertain
+assignment by observation/destruction and never resends it to reuse a slot. CRI/Cilium/CNPG
+conformance and a first-read target are not claimed here; the ULTRA plan records acceptance.
 
 ## Local invocation and authority
 

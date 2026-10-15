@@ -19,8 +19,9 @@ measured local image identity is a test receipt, not an upstream published distr
 
 Reviewed: 2026-10-06. The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
-No upstream source is vendored in the repository. The regional image bundles zod and ships its MIT
-notice at `/app/licenses/zod/LICENSE`, copied from the lockfile-resolved installed package.
+No upstream source is vendored in the repository. The TypeScript regional image (`apps/regional`,
+which carries the bootstrap relay) bundles zod and ships its MIT notice at
+`/app/licenses/zod/LICENSE`, copied from the lockfile-resolved installed package.
 Direct application dependencies are listed below at the version
 resolved in `pnpm-lock.yaml`. Their transitive dependencies are recorded only in the lockfile.
 Recheck the exact release and its dependencies before upgrading or redistributing.
@@ -44,7 +45,7 @@ Pinned platform versions are in [infra/platform/versions.lock.json](infra/platfo
 | [cert-manager](https://github.com/cert-manager/cert-manager)                        | [Apache-2.0](https://github.com/cert-manager/cert-manager/blob/master/LICENSE)                                                                    | Certificates required by the Barman plugin.                                                                                             |
 | [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE) | Outbound regional and bootstrap-relay tunnels, pinned to multi-platform index `sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07`. |
 | [node:24.21.0-slim](https://github.com/nodejs/docker-node) | [Node.js MIT and bundled-component notices](https://github.com/nodejs/node/blob/v24.21.0/LICENSE); Debian packages retain their individual licenses | Redistributed runtime base image, pinned by its multi-platform digest in `apps/regional/Dockerfile`; see the base-image notice below. |
-| [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript)     | [Apache-2.0](https://github.com/kubernetes-client/javascript/blob/master/LICENSE)                                                                 | Kubernetes API access from the regional agent.                                                                                          |
+| [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript)     | [Apache-2.0](https://github.com/kubernetes-client/javascript/blob/master/LICENSE)                                                                 | Kubernetes API access of the TypeScript regional agent and gateway (bundled in the regional image; the EU fleet runs the native controller and gateway). |
 | [Neon serverless driver](https://github.com/neondatabase/serverless)                | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE)                                                                               | Client library compatible with the edge endpoint (WebSocket `Pool`/`Client`). Used by clients and tests, not bundled into the platform. |
 | [Docker Buildx 0.37.2](https://github.com/docker/buildx/releases/tag/v0.37.2) | [Apache-2.0](https://github.com/docker/buildx/blob/v0.37.2/LICENSE) | CI-only CLI plugin, installed from the official Linux AMD64 binary after checking its published SHA-256 and size from `infra/platform/versions.lock.json`; not bundled in runtime images. |
 
@@ -95,7 +96,7 @@ Redistributors must retain those notices and satisfy each component's applicable
 
 **Node bootstrap image:** `apps/node-bootstrap/Dockerfile` uses the same pinned Node base.
 It bundles yaml 2.9.1 (ISC) and zod 4.6.5 (MIT), with their installed license files under
-`/app/licenses`. The unmodified Talos CLI 1.14.1 (MPL-2.0) and Kubernetes CLI 1.36.5
+`/app/licenses`. The unmodified Talos CLI 1.14.2 (MPL-2.0) and Kubernetes CLI 1.36.5
 (Apache-2.0) are downloaded from their official releases and checked against the recorded
 SHA-256 for each supported architecture. Their license files are retained in the image.
 Helm `4.3.0` (Apache-2.0) is downloaded from the [official release](https://github.com/helm/helm/releases/tag/v4.3.0)
@@ -104,15 +105,15 @@ is retained at `/app/licenses/helm/LICENSE`. The qualified amd64 binary is extra
 verified official archive and additionally bound by its whole-file SHA-256 and size. Pinned
 Cilium `1.20.2` chart and Flux `2.9.6` install assets retain their Apache-2.0 notices under
 `/app/licenses/cilium` and `/app/licenses/flux`.
-The matching source releases are [Talos v1.14.1](https://github.com/siderolabs/talos/tree/v1.14.1)
+The matching source releases are [Talos v1.14.2](https://github.com/siderolabs/talos/tree/v1.14.2)
 and [Kubernetes v1.36.5](https://github.com/kubernetes/kubernetes/tree/v1.36.5).
 
 The actual base runs Debian Bookworm. Added direct Debian packages are pinned to
-ca-certificates `20250419~deb12u1`, curl `7.88.1-10+deb12u15` (build stage only) and
-openssh-client `1:9.2p1-2+deb12u10`. Their Debian copyright and source references remain
-under `/usr/share/doc`; these packages and their dependencies keep their own licenses.
-See the primary package records for [ca-certificates](https://packages.debian.org/bookworm/ca-certificates),
-[curl](https://packages.debian.org/bookworm/curl) and [OpenSSH](https://packages.debian.org/bookworm/openssh-client).
+ca-certificates `20250419~deb12u1` and openssh-client `1:9.2p1-2+deb12u10`. Their Debian
+copyright and source references remain under `/usr/share/doc`; these packages and their
+dependencies keep their own licenses. See the primary package records for
+[ca-certificates](https://packages.debian.org/bookworm/ca-certificates) and
+[OpenSSH](https://packages.debian.org/bookworm/openssh-client).
 Full payload qualification and immutable release digests bind the actual shipped dependency set.
 
 **Barman plugin images:** the pinned [plugin v0.15.1](https://github.com/cloudnative-pg/plugin-barman-cloud/tree/v0.15.1)
@@ -152,7 +153,8 @@ Rust1.99.0 and the immutable compiler test image are recorded in versions.lock.j
 The compiler image is used for isolated tests and is not published as a PGCF runtime. Preserve
 Rust standard-library and libc notices when distributing a static native executable; do not
 attribute their code to the project's Apache license alone. No upstream source is vendored here.
-The primitive is not yet installed on customer servers or integrated with containerd/CNPG.
+The primitive ships in the Talos sandbox extension next to the sandbox controller and runs on EU1
+as that controller's namespace holder; it holds no PostgreSQL data.
 
 CI host checks use the build-only [Protocol Buffers31.1 compiler](https://github.com/protocolbuffers/protobuf/releases/tag/v31.1)
 under [BSD-3-Clause](https://github.com/protocolbuffers/protobuf/blob/v31.1/LICENSE), matching the
@@ -238,11 +240,11 @@ read from the installed package manifests.
 | [@hono/zod-openapi](https://github.com/honojs/middleware/tree/main/packages/zod-openapi)                | 1.6.3   | MIT               | OpenAPI document generated from the route schemas.                                        |
 | [@kubernetes/client-node](https://github.com/kubernetes-client/javascript)                              | 2.0.0   | Apache-2.0        | Regional Kubernetes API client.                                                           |
 | [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                                     |
-| [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | Gateway server, agent link and CLI WebSocket client; CLI installs the upstream runtime package with its notice. |
+| [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | CLI WebSocket client, bootstrap relay, node-bootstrap transport proxies and the TypeScript regional gateway and agent link; CLI installs the upstream runtime package with its notice. |
 | [yaml](https://github.com/eemeli/yaml) | 2.9.1 | ISC | Parses and generates protected native bootstrap configuration; its installed license ships in the bootstrap image. |
 | [esbuild](https://github.com/evanw/esbuild)                                                             | 0.25.12 | MIT               | Bundles regional entry points and the installable CLI (build only).                  |
 | [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the live acceptance run (also listed above).                        |
-| [pg](https://github.com/brianc/node-postgres)                                                           | 8.23.1  | MIT               | Authenticated TLS readiness probes in the regional agent and PostgreSQL acceptance tools. |
+| [pg](https://github.com/brianc/node-postgres)                                                           | 8.23.1  | MIT               | PostgreSQL acceptance tools and the TypeScript regional agent's authenticated TLS readiness probes. |
 | [@types/pg](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/pg)                    | 8.23.1  | MIT               | PostgreSQL client types (development only).                                               |
 | [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                                           |
 | [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).                              |

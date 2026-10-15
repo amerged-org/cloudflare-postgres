@@ -1,18 +1,22 @@
 # Native regional gateway
 
-This Rust gateway implements the existing regional WebSocket/PostgreSQL transport and lifecycle
-controls. The deployed TypeScript gateway remains authoritative until the Rust image passes the
-same Dev acceptance. Local protocol tests do not establish database, backup or restore acceptance.
+This Rust gateway implements the regional WebSocket/PostgreSQL transport and lifecycle controls.
+It is the gateway deployed on the EU fleet (Deployment `pgcf-gateway`). Local protocol tests do
+not establish database, backup or restore acceptance; the ULTRA plan records those.
 
-The production entry point uses the same `PGCF_REGION_ID`, derived `PGCF_ROUTE_KEY`,
-`PGCF_GATEWAY_POD_UID`, `PGCF_GATEWAY_PORT`, `PGCF_GATEWAY_MEMORY_BYTES` and
-`PGCF_GATEWAY_DATABASE_MEMORY_BYTES` configuration. It reads only the projected Kubernetes
-ServiceAccount token and CA; its existing read-only ConfigMap permissions are sufficient.
-The gateway has no Contabo credentials or provider dependency.
+The production entry point is configured through `PGCF_REGION_ID`, the derived
+`PGCF_ROUTE_KEY`, `PGCF_GATEWAY_POD_UID`, `PGCF_GATEWAY_PORT`, `PGCF_GATEWAY_MEMORY_BYTES` and
+`PGCF_GATEWAY_DATABASE_MEMORY_BYTES`. It reads only the projected Kubernetes ServiceAccount
+token and CA, and its Kubernetes permissions are read-only: ConfigMaps in `pgcf-system`,
+EndpointSlices and, for the v4 route, Pods. The gateway has no Contabo credentials or provider
+dependency.
 
 - Cloudflare signs single-use, short-lived regional route tokens. The original StartupMessage
   and authentication bytes pass through unchanged; database and role must match the token before
-  any PostgreSQL dial. PostgreSQL TLS verifies the database CA and exact service DNS name.
+  any PostgreSQL dial. A v3 token also names the database generation and the verified primary
+  Pod, and a v4 token the admission route revision; the gateway compares them with its persisted
+  running fence and refuses a stale revision or another Pod. PostgreSQL TLS verifies the
+  database CA and exact service DNS name.
 - An authenticated Kubernetes list/watch maintains persisted fences, revisions and ConfigMap
   identities. Missing synchronization, identity replacement or invalid history blocks admission.
   Per-database epochs avoid interrupting unrelated startup work. Quiescence includes partial

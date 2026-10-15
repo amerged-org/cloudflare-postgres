@@ -4,24 +4,22 @@ This directory contains the platform release baseline for a fresh Talos **1.14.2
 **1.36.5** cluster. It supplies Cilium **1.20.2**, OpenEBS **4.6.1** with only LocalPV LVM
 **1.10.1**, cert-manager **v1.21.2**, CloudNativePG chart **0.29.1** / operator **1.30.1**, and the
 Barman Cloud plugin chart **0.8.1** / plugin **v0.15.1**. Flux **v2.9.6** reconciles these
-components; it does not upgrade Talos or Kubernetes. The regional components (`cloudflared`, gateway
-and agent) are a separate Flux Kustomization in [regional](regional); see
+components; it does not upgrade Talos or Kubernetes. The regional components (`cloudflared`,
+gateway and controller) are a separate Flux Kustomization over [regional](regional); see
 [Regional components](#regional-components).
 
-The default regional composition retains the TypeScript agent and gateway. A qualified release
-containing `regional` and `native-gateway` selects
-[`regional-gateway-native`](regional-gateway-native), preserving the legacy controller while
-replacing only the gateway. A release containing both `native-controller` and `native-gateway`
-selects [`regional-native`](regional-native), which reuses the gateway-first composition and
-adds the controller patch. Both reuse the same services, RBAC, network policies and resource limits;
-`regional-native` only adds read access to the RuntimeClass and admission policy that the controller
-waits for before it selects a region's compute pool. The existing fleet patch
-sets the exact selected image digests, cluster UID, PostgreSQL image and retained storage bindings.
-Future-node postjoin activation uses that same release path before admission; the original
-Factory bootstrap input remains unchanged. A single legacy `regional_image` is never interpreted
-as both native binaries. The controller has no HTTP listener; its authenticated Cloudflare link
-and release observation establish control-plane convergence. Gateway probes use its real
-`/healthz` and `/readyz` handlers.
+The regional composition is [`regional-native`](regional-native): the native Rust controller
+(Deployment `pgcf-agent`) and gateway (Deployment `pgcf-gateway`) on top of the shared
+[`regional`](regional) services, RBAC, network policies and resource limits, through
+[`regional-gateway-native`](regional-gateway-native), which swaps in the native gateway image.
+`regional-native` only adds read access to the RuntimeClass and admission policy that the
+controller waits for before it selects a region's compute pool, list/watch of the objects its
+runtime attestations follow, and the right to resize a parked instance Pod's requests in place.
+The existing fleet patch sets the exact selected image digests, cluster UID, PostgreSQL image and
+retained storage bindings. Future-node postjoin activation uses that same release path before
+admission; the original Factory bootstrap input remains unchanged. The controller has no HTTP
+listener; its authenticated Cloudflare link and release observation establish control-plane
+convergence. Gateway probes use its real `/healthz` and `/readyz` handlers.
 
 [versions.lock.json](versions.lock.json) records the official sources, checked chart/app mappings,
 OCI manifest digests, archive checksums and rendered image references. All five chart sources
@@ -38,18 +36,18 @@ These integrity checks do not establish vulnerability clearance or live fleet co
 The earlier platform baseline ran in the Contabo lab; live acceptance of this updated baseline
 is recorded in [PLAN.md](../../PLAN.md). The current deployment is EU only: it retains the EU
 control/relay node without new customer database placement and preserves the already-admitted
-EU worker as customer EU1 (formerly EU2), a V159 / Cloud VPS Plus 4 with 4 vCPU, 8 GiB RAM and
-150 GiB NVMe. EU1 requires no new join, re-adoption or reinstallation. The US region is
-cancelled. The first node of a new region bootstraps its own regional platform through AddNode
-from the [control-server configuration](../talos/README.md#control-server-configuration-per-region).
+EU worker as customer EU1 (formerly EU2), a Contabo Cloud VPS with 6 vCPU and 12 GB RAM. EU1
+requires no new join, re-adoption or reinstallation. The US region is cancelled. The first node
+of a new region bootstraps its own regional platform through AddNode from the
+[control-server configuration](../talos/README.md#control-server-configuration-per-region).
 System and platform resources remain reserved. The earlier EU1 removal drill is withheld. Node
 loss is recovered from R2.
 
 ## Ownership and prerequisites
 
-Flux owns the component releases and their configuration. The regional agent owns per-database
-namespaces and CNPG resources, and CNPG owns the database instances. This directory creates no
-database, role, backup destination, provider credential or public endpoint.
+Flux owns the component releases and their configuration. The regional controller owns
+per-database namespaces and CNPG resources, and CNPG owns the database instances. This directory
+creates no database, role, backup destination, provider credential or public endpoint.
 
 Prepare the cluster before installation:
 
@@ -66,7 +64,7 @@ Prepare the cluster before installation:
 - Keep authenticated Talos and Kubernetes configurations outside Git.
 - The Cilium values request WireGuard transparent encryption for inter-node Pod traffic, using
   the [documented Cilium 1.20.2 options](https://docs.cilium.io/en/stable/security/network/encryption-wireguard/).
-  Before a Phase 3 join, allow the required management and CNI ports only from exact peer-node
+  Before a node joins, allow the required management and CNI ports only from exact peer-node
   addresses, including UDP 51871 for WireGuard. Verify encryption and outside-allowlist denial
   before database placement on that node. This setting is not evidence of a live encrypted path.
 - Install the pinned Flux CLI from its
@@ -88,8 +86,8 @@ namespaces, HelmReleases and the StorageClass are protected from incidental Flux
 
 `pgcf-lvm` uses thick LVM volumes, `WaitForFirstConsumer`, ext4, expansion and **`Retain`**. It is
 not the default StorageClass; every database volume selects it explicitly. With `Retain`, deleting
-a PVC or namespace leaves its PV and the LVM logical volume behind, which leaks disk. The agent's
-delete flow therefore patches the database's PV to `persistentVolumeReclaimPolicy: Delete` first,
+a PVC or namespace leaves its PV and the LVM logical volume behind, which leaks disk. The
+controller's delete flow therefore patches the database's PV to `persistentVolumeReclaimPolicy: Delete` first,
 then deletes the namespace, and reports the database deleted only after the PV and its `LVMVolume`
 are gone. Local volumes do not survive the loss of their node; recovery comes from R2.
 
@@ -142,32 +140,37 @@ are separate procedures.
 
 ## Regional components
 
-[regional](regional) holds the workloads that connect a region to Cloudflare, all in namespace
-`pgcf-system` (Pod Security `restricted`, created in [base/namespaces.yaml](base/namespaces.yaml)).
-It is reconciled by its own Flux Kustomization, so a failure there cannot affect the five platform
-releases. [regional/flux-sync.example.yaml](regional/flux-sync.example.yaml) is the template for
-private installation configuration; it depends on the `pgcf-platform` Kustomization (CRDs, Cilium)
-and is excluded from the build.
+[regional](regional) holds the base manifests of the workloads that connect a region to
+Cloudflare, all in namespace `pgcf-system` (Pod Security `restricted`, created in
+[base/namespaces.yaml](base/namespaces.yaml)); the fleet patch deploys them through the
+`regional-native` composition. It is reconciled by its own Flux Kustomization, so a failure there
+cannot affect the five platform releases.
+[regional/flux-sync.example.yaml](regional/flux-sync.example.yaml) is the template for private
+installation configuration; it depends on the `pgcf-platform` Kustomization (CRDs, Cilium) and is
+excluded from the build.
 
 | Workload           | Replicas | Role                                                                                                                                                                                 |
 | ------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `pgcf-cloudflared` | 2        | Remotely managed Cloudflare Tunnel. No inbound ports; metrics on localhost. If the Phase 1 transport spike selects a Tunnel hostname, its hostname rule targets the gateway Service. |
-| `pgcf-gateway`     | 2        | WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.                                                                 |
-| `pgcf-agent`       | 1        | Reconciles desired state into Kubernetes. Strategy `Recreate`, so two agents never overlap.                                                                                          |
+| `pgcf-cloudflared` | 2        | Remotely managed Cloudflare Tunnel. No inbound ports; metrics on localhost. The Edge's VPC service binding reaches the gateway Service through it.                                   |
+| `pgcf-gateway`     | 2        | Native gateway: WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.                                                 |
+| `pgcf-agent`       | 1        | Native controller: reconciles desired state into Kubernetes. Strategy `Recreate`, so two controllers never overlap.                                                                  |
 
-Gateway and agent are two commands (`node /app/gateway.mjs`, `node /app/agent.mjs`) of one image
-referenced as `pgcf-regional`. `regional/kustomization.yaml` maps it to the GHCR repository with an
-`images:` entry and the published release digest. `cloudflared` is also pinned by digest.
-No `imagePullPolicy` is set. For Dev, keep a private overlay that references
-`regional` and sets a locally imported image and the pull policy, for example:
+Controller and gateway are separate static images, `pgcf-native-controller` (command
+`/pgcf-native-controller`) and `pgcf-native-gateway` (command `/pgcf-native-gateway`). The fleet
+patch maps them to their GHCR repositories with `images:` entries and the release's pinned
+digests; `cloudflared` is pinned by digest as well. No `imagePullPolicy` is set. For Dev, keep a
+private overlay that references `regional-native` and sets locally imported images and the pull
+policy, for example:
 
 ```yaml
 resources:
-  - ../../infra/platform/regional # path inside the private checkout
+  - ../../infra/platform/regional-native # path inside the private checkout
 images:
-  # The base already rewrote the name, so match the GHCR name, not `pgcf-regional`.
-  - name: ghcr.io/amerged-org/pgcf-regional
-    newName: pgcf-regional
+  - name: pgcf-native-controller
+    newName: pgcf-native-controller
+    newTag: dev-local
+  - name: pgcf-native-gateway
+    newName: pgcf-native-gateway
     newTag: dev-local
 patches:
   - target:
@@ -180,7 +183,7 @@ patches:
 ```
 
 The pinned `PGCF_POSTGRES_IMAGE` is supplied by ConfigMap `pgcf-regional` and recorded in the
-version lock. The agent validates the image digest before reconciling a database. Node capacity
+version lock. The controller refuses an image that is not digest-pinned. Node capacity
 uses `pgcf.io/storage-gib-total`, published from the measured dedicated LVM volume group by the
 native bootstrap job; Kubernetes ephemeral storage is not database capacity. Missing capacity
 is reported as unavailable and cannot admit a placement.
@@ -198,7 +201,7 @@ still needs the fresh-node live acceptance in PLAN.md.
 
 The following standalone [capacity publisher](../talos/publish-storage-capacity.ts) documents
 the earlier operator proof path and explicit recovery inputs. It is not a manual step in each
-programmed rollout. The regional agent can read Nodes but cannot annotate them; publication
+programmed rollout. The regional controller can read Nodes but cannot annotate them; publication
 belongs to the authenticated bootstrap flow or an explicit reviewed operator invocation.
 
 Prepare these runtime inputs from the approved cluster inventory and actual measured proof, not
@@ -246,27 +249,28 @@ publisher never uses them as measurement timestamps.
 
 ### Physical storage observations
 
-The Regional agent now samples the existing OpenEBS node driver's `/metrics` through the
-authenticated Kubernetes HTTPS Pod proxy. Each pinned LVM1.10.1 scrape executes `vgs`/`lvs`,
-unlike the change-only LVMNode resource. Current Node, namespace, driver Pod/DaemonSet and
-running-image identities are checked around the read. The scoped `openebs` observer Role
-permits GET only; it adds no `pods/exec`, node proxy, host writer or separate collector.
-`GET /v1/nodes/{id}/storage` exposes the latest fresh physical observation to administrators.
-Unknown, stale or changed-node observations cannot become zero usage or qualified capacity.
+The native controller samples the existing OpenEBS node driver's `/metrics` through the
+authenticated Kubernetes HTTPS Pod proxy: on its observation cadence and, on a node with a Thin
+selection, every `guard_seconds / 5` (2 s at the 10 s guard). Each pinned LVM 1.10.1 scrape
+executes `vgs`/`lvs`, unlike the change-only LVMNode resource. Current Node, namespace, driver
+Pod/DaemonSet and running-image identities are checked around the read. The scoped `openebs`
+observer Role permits GET only; it adds no `pods/exec`, node proxy, host writer or separate
+collector. `GET /v1/nodes/{id}/storage` exposes the latest fresh physical observation to
+administrators. Unknown, stale or changed-node observations cannot become zero usage or
+qualified capacity.
 
 VG total/free, thick allocated extents and thin-pool data/metadata consumption are separate
 facts. Percentage-derived allocation uses a conservative upper bound for LVM's reported
-precision. This reporting does **not** qualify thin storage or remove the existing thick
-quota debit. The three retained hosts were read with the new code on2026-10-08: each dedicated
-VG measured103,075,020,800 bytes, with thick allocation US0, EU1 5GiB and control10GiB;
-none has a thin pool and `dm_thin_pool` is not loaded. No host write or provider call occurred.
+precision. This reporting does **not** qualify thin storage: Thin activation needs a release-bound
+qualification receipt, and retained thick volumes keep their quota debit.
 
-Do not switch `pgcf-lvm` in place. The pinned [driver implementation](https://github.com/openebs/lvm-localpv/blob/e8a234cbfeef5fa16fde1330c8de2d91e31831f1/pkg/lvm/lvm_util.go)
-creates `pgcf_thinpool` from the first thin volume's requested size and attempts to remove it
-after the last thin volume is deleted. It does not implement automatic pool growth. Thin
-qualification therefore still requires supported Talos module loading, explicit pool sizing
-and growth, error-before-full behavior, metadata safety, discard/reclaim and a data-preserving
-transition from the retained thick volumes. The existing data and StorageClass remain intact.
+`pgcf-lvm` stays the thick StorageClass for retained volumes and is never switched in place.
+Thin volumes use a separate StorageClass per qualified profile that the Native executor creates
+when it activates a node's thin selection ([recovery](../../docs/operations/recovery.md#thin-storage-admission-and-protective-recovery)).
+The pinned [driver implementation](https://github.com/openebs/lvm-localpv/blob/e8a234cbfeef5fa16fde1330c8de2d91e31831f1/pkg/lvm/lvm_util.go)
+creates `pgcf_thinpool` from the first thin volume's requested size and does not implement
+automatic pool growth, so the executor initializes the pool with explicit sizing and grows it
+under journaled actions.
 
 Each binding's `smoke` object must contain three **actual, approved readbacks**: `before` the L2
 smoke PVC allocation, `allocated` while its logical volume exists, and `after` its verified deletion
@@ -302,7 +306,7 @@ and verifies physical reclamation before publication. Passing software checks do
 particular node's capacity publication or reserve/placement acceptance.
 
 Flux substitutes two variables from a private ConfigMap (`PGCF_REGION_ID` and `PGCF_API_HOST`, the
-host name of the API Worker) into ConfigMap `pgcf-regional` and the agent's egress policy.
+host name of the API Worker) into ConfigMap `pgcf-regional` and the controller's egress policy.
 
 ### Operator-created Secrets
 
@@ -313,24 +317,25 @@ the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the 
 | ------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `pgcf-cloudflared` | `token`                                      | cloudflared tunnel token (`TUNNEL_TOKEN`).                                                             |
 | `pgcf-gateway`     | `PGCF_ROUTE_KEY`                             | Gateway: the region's derived route keyring, JSON `{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`. |
-| `pgcf-agent`       | `PGCF_AGENT_KEY`                             | Agent: bearer key for the API Worker.                                                                  |
-| `pgcf-backup-s3`   | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | R2 S3 credential; the agent copies it into each database namespace as `archive-credentials`.           |
+| `pgcf-agent`       | `PGCF_AGENT_KEY`                             | Controller: bearer key for the API Worker.                                                             |
+| `pgcf-backup-s3`   | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | R2 S3 credential; the controller copies it into each database namespace as `archive-credentials`.      |
 
 ### Network and access rules
 
 - `default-deny` blocks all ingress and egress in `pgcf-system`; one CiliumNetworkPolicy per
-  workload adds the allowed paths. The current baseline covers the Tunnel fallback: cloudflared
-  may reach the gateway on 8080 and the Cloudflare edge on 7844; the gateway accepts traffic from
-  cloudflared only. If the Phase 1 spike selects Workers VPC TCP or HTTP, add only that verified
-  connector ingress before deployment. The gateway may reach the Kubernetes API
-  and port 5432 of database Pods in namespaces labelled `pgcf.io/database-id`. The agent reaches the
+  workload adds the allowed paths. cloudflared may reach the gateway on 8080 and the Cloudflare
+  edge on 7844; the gateway accepts traffic from cloudflared and from the controller's
+  authenticated controls only. The gateway may reach the Kubernetes API and port 5432 of
+  database Pods in namespaces labelled `pgcf.io/database-id`. The controller reaches the
   Kubernetes API, the API Worker host on 443 and CNPG Pods in labelled database namespaces on
-  5432 for authenticated role readiness and 9187 for real WAL archive metrics; nothing accepts inbound traffic besides the
-  gateway. Every policy also allows DNS.
-- The agent ClusterRole covers namespaces, Secrets (no list or watch), ResourceQuotas, LimitRanges,
-  NetworkPolicies, CiliumNetworkPolicies, CNPG `Cluster`, `ScheduledBackup` and Barman
-  `ObjectStore` resources, PersistentVolumes (get, list, patch, delete), `LVMVolume` (read), and
-  Nodes and Pods (read). It has no `pods/exec`, no RBAC or workload-controller rights. In
-  `pgcf-system` it manages ConfigMaps and reads the Secret `pgcf-backup-s3`; the gateway reads
-  ConfigMaps there. Database namespaces are dynamic, so the Secret rules cannot be
-  narrowed by name.
+  5432 for authenticated role readiness and 9187 for real WAL archive metrics; nothing accepts
+  inbound traffic besides the gateway. Every policy also allows DNS.
+- The controller ClusterRole (`pgcf-agent`) covers namespaces, Secrets (get), ResourceQuotas,
+  LimitRanges, NetworkPolicies, CiliumNetworkPolicies, CNPG `Cluster`, `ScheduledBackup` and
+  Barman `ObjectStore` resources, PersistentVolumes (get, list, patch, delete), `LVMVolume`
+  (read), and Nodes and Pods (read). The native overlay adds list and watch of Secrets,
+  ConfigMaps, PersistentVolumes and Nodes (metadata-only watches for its runtime attestations),
+  get of the RuntimeClass and admission policy it waits for, and `patch` of `pods/resize` for
+  the parked tier. It has no `pods/exec`, no RBAC or workload-controller rights. In `pgcf-system`
+  it manages ConfigMaps and reads the Secret `pgcf-backup-s3`; the gateway reads ConfigMaps
+  there. Database namespaces are dynamic, so the Secret rules cannot be narrowed by name.

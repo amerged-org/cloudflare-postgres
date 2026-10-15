@@ -4,8 +4,8 @@ Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare acc
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
 The VPS run real, unmodified PostgreSQL under CloudNativePG. The current deployment is EU only:
 the EU control/relay VPS and the already-admitted EU customer worker **EU1** (formerly EU2), a
-**V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM and 150 GiB NVMe**. EU1 keeps its existing
-installation, identity and data. The US region was cancelled on 2026-10-11; US and Oceania
+Contabo Cloud VPS with **6 vCPU and 12 GB RAM**. EU1 keeps its existing installation, identity
+and data. The US region was cancelled and its server marked lost on 2026-10-11; US and Oceania
 return later from the same per-region configuration. System and platform resources remain
 protected; server loss is recovered from R2.
 
@@ -14,7 +14,7 @@ protected; server loss is recovered from R2.
 - Databases sleep when idle and wake on the next connection.
 - Continuous backups to R2 with point-in-time recovery.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
-- Capacity and Contabo provisioning are implemented; complete autonomous admission and standing-policy activation remain under acceptance.
+- Capacity placement and Contabo provisioning are implemented; purchases stay off until the operator enables them, and the fully automatic node addition has not been accepted on a genuine purchase.
 
 Integrators keep their adapters and any tooling that moves their existing databases in their own
 repositories; the [integrator handover](docs/operations/integrator-handover.md) describes the API,
@@ -22,93 +22,33 @@ connections and limits they build on.
 
 ## Status
 
-**Overall product completion remains open (2026-10-08 correction).** The EU/US database lifecycle
-and RAM-trigger tests passed, but uniform fleet configuration, automatic admission, patch management
-and the approved fast-start architecture are incomplete. See the
-[unified corrective plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md).
-The earlier broad completion statement is withdrawn. The following are partial Dev results. Both EU nodes and
-all five Flux releases are Ready, with 95 GiB measured storage per node. The complete Dev path through
-the Dev installation's database hostname reaches real PostgreSQL with verified TLS, continuous WAL
-archiving and R2 backups.
+The [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md) is the canonical
+record of scope, measured results ([Done](docs/architecture/cloudflare-convergence-and-serverless-plan.md#done)),
+the [go-live path](docs/architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path) and
+the work that follows ([after go-live](docs/architecture/cloudflare-convergence-and-serverless-plan.md#after-go-live)).
+The first integrator creates its new databases on PGCF once that path is complete. This README
+states what runs where; it does not repeat measurements.
 
-Real E0–E6 passed, including complete TCP port scans of the observed node IPv4 from both sources.
-Five create/delete runs survived ten agent restarts with complete storage cleanup. Empty, failed,
-stale and out-of-order desired-state responses preserved storage and configuration generations.
-Loss of a ready database namespace reported recovery required rather than creating empty storage.
-The R2 outage test proved two failing archive observations under the active block and a successful
-new connection during the alarm. A separate restore drill preserved committed markers, omitted
-a rolled-back marker and reclaimed its target storage. API full restore, PITR and restore after
-source deletion have passed. EU capacity expansion, signed network verification and placement on
-both nodes have passed. US operator admission and cross-region recovery with the healthy EU
-source preserved have passed; the real76% RAM-rule test passed and automatic postjoin remains open.
-
-Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
-read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
-These observations do not establish maximum throughput or 1,000-customer capacity. Deployed Actor admission rejects unregistered routing hints before D1; the Edge no longer has a D1 binding. Known routes still require current authoritative D1. Default-text clients and raw COPY pass; decoded binary-result
-assertions remain failed on WebSocket and direct TCP with node-postgres 8.22. Intermittent Tail
-correlation remains unresolved.
-
-The installable CLI passed real psql transactions, rollback and 105 MB binary COPY integrity.
-CPU placement and Actor admission are deployed. A real resize to 512 MiB/250 millicores completed
-in 28 seconds with unchanged storage and data; storage-changing resize is refused. Persistent
-gateway fences survived a gateway replacement, and a fresh database verified the internal
-maintenance role's TLS and minimal grants. Usage rollups and lifecycle API/Actor logic are
-implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2.
-Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Instrumented cold
-connections have a twenty-run p50/p95/max of 8.412/9.160/9.708 seconds, accepted by the owner for v1.
-The owner-approved [Rust runtime and cold-start architecture](docs/architecture/rust-runtime-and-cold-starts.md)
-requires native regional services, a Rust/Wasm Edge and a shared pool of prestarted unassigned
-compute. Per-database warm reclaim is additional and cannot replace the pool; implementation
-and Dev acceptance are pending. All twenty starts preserved data, the original cluster/claim and credential
-UIDs/versions, and each caused one wake. The stale readiness snapshot
-is corrected; a verified read-only SQL archive check is deployed, but the first complete cold
-archive check still took 1.74 seconds. The finalized hourly awake-time measurement differs by
-at most 19.748 seconds from independent Kubernetes evidence, within the 60-second requirement.
-Unchanged credentials retain their UID/version through power revisions. A conservative new
-observation window recovered actual idle sleep after a quiet gateway replacement. A later
-unknown refusal safely restored running state; fixed-enum diagnostics now identify subsequent
-refusals without copying exception bodies.
-Twenty sequential connections plus a marker read on an always-warm Dev database measured
-p95 734 ms and maximum 911 ms; this does not establish application or load-capacity latency.
-The live collector
-preserves its checkpoint across configuration changes and measures allocation while hibernated.
-Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 bytes.
-The filesystem collector measured actual volume use in Dev. API full restore, PITR and restore
-after source deletion passed with separate volumes, verified SQL and removed temporary admin access.
-An isolated real Cloudflare admission probe refused excess registered attempts before D1 or wake.
-US installation reached Ready through the owner-authorized operator path; cross-region recovery passed.
-Missing samples stay unknown. Cost attribution is deferred.
-The already-admitted second EU node is retained as customer EU1 and serves a real capacity-test
-database. One matching V159 US1 was purchased through the API; its original-request audit and
-allocated 4 vCPU, 8,192 MiB RAM and 153,600 MiB NVMe were verified. Cross-region restore is
-implemented, delivered and accepted: the R2 restore into US1 preserved the healthy EU source. The
-original EU/US 300 GB SSD V155 orders were paid, then cancelled by the owner. A later V155
-NVMe-selector API test also allocated SSD and did not run an installer. Those failed selections
-are historical; the current V159 offer supplies the required 150 GiB NVMe without a storage
-add-on. EU1 is not reset, re-adopted or decommissioned; the earlier destructive loss and deletion
-kits remain outside this scope.
-US1 was admitted through the owner-authorized operator postjoin/admission path, preserving its
-original purchase and installation. EU1 and US1 passed real Cloudflare SQL/TLS, application roles,
-R2 base backup/WAL, restore and deletion with physical reclamation. The US region is now
-cancelled: US1 serves only as the R1.1 canary until 2026-11-05 and is then marked lost. Automatic
-postjoin admission remains open for the next genuine authorized node addition. Preserve both EU
-nodes and their existing data. Moving an integrator's existing databases is the integrator's task
-and needs the [customer handover gates](docs/operations/operator-installation.md#customer-migration-handover),
-including credential rotation, the integrator's transport and rebinding, and sufficient regional
-capacity.
+| Part                                             | State on the EU fleet                                                                                                                                  |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| API Worker, DatabaseActor, RegionLink, Workflows | TypeScript on Cloudflare, deployed; they remain TypeScript                                                                                             |
+| Edge Worker                                      | TypeScript (`apps/edge`) is deployed; the Rust/Wasm replacement (`apps/edge-rust`) is built by CI and not deployed                                     |
+| Regional controller                              | Native Rust (`apps/native-controller`, Deployment `pgcf-agent`), deployed                                                                              |
+| Regional gateway                                 | Native Rust (`apps/native-gateway`, Deployment `pgcf-gateway`), deployed                                                                               |
+| Bootstrap relay (EU control only)                | TypeScript (`apps/regional`) is deployed; the native replacement (`apps/native-bootstrap-relay`) is built and not deployed                             |
+| Database storage                                 | New databases use Thin LVM volumes on EU1; retained thick volumes keep their backend and data                                                          |
+| Idle sleep                                       | CNPG hibernation; the [parked sleep tier](docs/architecture/parked-instances.md) is implemented and the region policy `parked_tier` is its only switch |
+| Shared warm PostgreSQL pool                      | [Deferred](docs/architecture/warm-postgres-pool.md): its code is on main and not wired end to end; the parked tier is the path to a sub-second wake    |
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
-through the authenticated Cloudflare management API. Expansion requires ten fresh aligned
-consecutive minutes from every eligible customer node, each retaining its own Node UID.
-Existing capacity remains eligible during rollout under hard RAM, CPU, storage and full
-PostgreSQL/Barman startup-peak guards; there is no 81% placement cutoff. Missing observations
-remain unknown. Fresh installations do not purchase automatically or send notifications.
-An optional `max_nodes` limit can be removed with `null`; no fixed three-node ceiling is required.
-This installation's selected standing policy remains V159, one month, no storage add-on and a
-76% expansion threshold. Updating its live configuration and completing autonomous rollout
-remain acceptance work. Monetary and lifetime order-count ceilings are optional under explicit
-operator authority. The real RAM-threshold window and load cleanup passed.
-See [ULTRA status](docs/architecture/cloudflare-convergence-and-serverless-plan.md#done) for measured results and remaining work.
+through the authenticated management API. Expansion requires ten fresh aligned consecutive
+minutes from every eligible customer node, each retaining its own Node UID. Existing capacity
+remains eligible during rollout under hard RAM, CPU, storage and full PostgreSQL/Barman
+startup-peak guards; there is no 81% placement cutoff. Missing observations remain unknown. Fresh
+installations do not purchase automatically or send notifications, and this installation keeps
+purchases and autoscale off. An optional `max_nodes` limit can be removed with `null`; no fixed
+three-node ceiling is required. Monetary and lifetime order-count ceilings are optional under
+explicit operator authority.
 
 ## Architecture
 
@@ -116,24 +56,11 @@ The programmed installer selects a provider-verified source once and retains its
 Cloudflare across proof renewals. Renewed claims are short-lived; current job/binding authority,
 host keys, TLS, Cluster UID, Node UID and fresh native identity readbacks still fence execution.
 Kubernetes/Talos commands, transport grants and proof cleanup must make zero Contabo calls.
-Routine signed-proof admission likewise uses current Cloudflare/R2 custody. Fresh provider
-address and read-only firewall checks fence the first destructive installation checkpoint.
 Contabo remains at purchase, initial inventory/firewall/rescue, hypervisor and uncertain-provider
 resolution boundaries, including fresh verification before the first destructive write. Its
 credential-scoped client reuses and coalesces OAuth until early expiry or 401 invalidation;
-credential changes replace the client. Uncertain mutations are never replayed. The API repair is
-deployed and the programmed cleanup has removed the old owned probe namespaces. Fresh US proof
-now has a verified global IPv6/default-route prerequisite on the retained source host. Bounded
-failed-Pod diagnostics preserve recognized scanner codes before cleanup. Freshly authenticated
-TLS control connections retain signed source identity. Gateway ICMPv6 permits neighbor discovery.
-Completed scan observations remain fresh at report admission; historical start/control times are
-bounded against scan completion. Owned cleanup inventories the same 13 resource collections through
-bounded direct Kubernetes reads, without discovery, and refuses incomplete or foreign resources.
-The producer waits if the retained source observation is stale, while transport access remains
-refused. Real fresh observations permit new bounded authority for that same source; changed
-identities remain blocking and the freshness limit is unchanged.
-The original US node reached Ready through the owner-authorized operator path. Autonomous
-addition and the corrective common-runtime acceptance remain outstanding in PLAN.md.
+credential changes replace the client. Uncertain mutations are never replayed. The
+[operator installation runbook](docs/operations/operator-installation.md) states the sequence.
 
 ```mermaid
 flowchart LR
@@ -144,7 +71,7 @@ flowchart LR
   end
 
   subgraph CF["Your Cloudflare account: control plane"]
-    Edge["Edge Worker<br/>routing hints, signed route"]
+    Edge["Edge Worker<br/>routing hints, signed route token"]
     API["API Worker<br/>/v1"]
     DBA["DatabaseActor DO<br/>per database: wake, idle, usage"]
     RL["RegionLink DO<br/>per region"]
@@ -156,8 +83,8 @@ flowchart LR
 
   subgraph Region["Contabo region: Talos and Kubernetes"]
     CFD["cloudflared<br/>outbound tunnel"]
-    GW["Gateway<br/>Startup validation, TLS, traffic"]
-    Agent["Regional agent"]
+    GW["Native gateway<br/>Startup validation, TLS, traffic"]
+    Agent["Native controller<br/>(pgcf-agent)"]
     CNPG["CloudNativePG"]
     PG[("PostgreSQL per database<br/>local LVM volume")]
   end
@@ -168,7 +95,7 @@ flowchart LR
   Tools --> Edge
   Integrator -->|"manage, usage, costs"| API
   Edge <--> DBA
-  Edge -->|"native WebSocket, signed v2 route"| CFD
+  Edge -->|"native WebSocket, signed route token"| CFD
   CFD --> GW
   GW -->|"validated Startup, TLS"| PG
   API --> D1
@@ -183,7 +110,8 @@ flowchart LR
   Boot -->|"install Talos, join"| Region
 ```
 
-Connecting to a sleeping database:
+Connecting to a sleeping database (the idle sleep is CNPG hibernation, or the parked tier when the
+region policy enables it):
 
 ```mermaid
 sequenceDiagram
@@ -191,39 +119,41 @@ sequenceDiagram
   participant E as Edge Worker
   participant A as DatabaseActor
   participant R as RegionLink
-  participant G as Regional agent
+  participant G as Regional controller
   participant P as PostgreSQL
 
   C->>E: GET /v2?database=id&user=role (untrusted hints)
   E->>A: ensureAwake()
   A->>R: wake (coalesced)
   R->>G: wake db-id
-  G->>P: remove CNPG hibernation
+  G->>P: start PostgreSQL (unfence the parked Pod or remove CNPG hibernation)
   P-->>G: ready
   G-->>R: observed ready
   R-->>A: ready
   A-->>E: awake
-  E->>P: native WebSocket via Tunnel and gateway (signed v2 route)
-  C->>P: gateway validates Startup; PostgreSQL SCRAM end to end
+  E->>P: native WebSocket via Tunnel and gateway (signed route token)
+  C->>P: gateway validates Startup, PostgreSQL SCRAM end to end
 ```
 
-| Part                  | Where                | Job                                                                                    |
-| --------------------- | -------------------- | -------------------------------------------------------------------------------------- |
-| API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                         |
-| Edge Worker           | Cloudflare           | Database endpoint: Actor admission, wake, signed route, native forwarding              |
-| Regional agent        | Kubernetes           | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples   |
-| Gateway + cloudflared | Kubernetes           | Entry from Cloudflare; startup validation before PostgreSQL dial, TLS, stream counters |
-| Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                  |
-| Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin          |
+| Part                  | Where                | Job                                                                                                          |
+| --------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------ |
+| API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                                               |
+| Edge Worker           | Cloudflare           | Database endpoint: Actor admission, wake, signed route, native forwarding                                    |
+| Regional controller   | Kubernetes           | Native Rust (`pgcf-agent`): reconciles databases into CNPG resources; sleep/wake; reports status and samples |
+| Gateway + cloudflared | Kubernetes           | Native Rust gateway: entry from Cloudflare; startup validation before PostgreSQL dial, TLS, stream counters  |
+| Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                                        |
+| Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin                                |
 
 The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the single database hostname.
 Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with `pipelineConnect=false`
 and a `wsProxy` URL containing both URL-encoded hints. Requests to the bare `/v2` endpoint or with
-missing or invalid hints are unsupported. Actor admission checks the database and role against D1; Edge signs a
-v2 routing token with mandatory user, and returns the unopened upstream WebSocket for native
-forwarding. Admission failures return a small failure-only `101` WebSocket carrying a PostgreSQL
-SQLSTATE error before any gateway upgrade or PostgreSQL dial. Dev uses a VPC HTTP service with
-native forwarding; VPC TCP raw streams were unsuitable, and a signed Tunnel route is the fallback.
+missing or invalid hints are unsupported. Actor admission checks the database and role against D1.
+The Edge signs a route token that lives 30 seconds and names the database, role, region, database
+generation and verified primary Pod (v3; v4 adds the admission route revision), and returns the
+unopened upstream WebSocket for native forwarding. Admission failures return a small failure-only
+`101` WebSocket carrying a PostgreSQL SQLSTATE error before any gateway upgrade or PostgreSQL dial.
+Dev uses a VPC HTTP service with native forwarding; VPC TCP raw streams were unsuitable, and a
+signed Tunnel route is the fallback.
 
 The gateway checks the actual PostgreSQL StartupMessage database and user against the signed
 route before opening PostgreSQL. It owns SSL/GSS preludes, CancelRequest, startup parsing and the
@@ -235,7 +165,7 @@ events. SCRAM authentication runs end to end with PostgreSQL; uncertain writes a
 Build the CLI from this checkout with `pnpm --filter @pgcf/cli build`, then run:
 
 ```sh
-node packages/cli/dist/main.js connect --endpoint wss://db.your-domain --database <db-id> --user app
+node packages/cli/dist/main.js connect --endpoint wss://db.example.com --database <db-id> --user app
 ```
 
 Use the printed loopback port in psql or migration tools, with `host=127.0.0.1`, your database
@@ -249,8 +179,8 @@ during upstream startup). The packaged CLI includes the first-party and bundled-
 ## Self-hosting requirements
 
 - A Cloudflare account on the Workers Paid plan, with a zone that hosts one endpoint hostname
-  (`db.your-domain`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Containers.
-- A Contabo account with API credentials. The lab uses Cloud VPS with 4 vCPU and 8 GiB.
+  (`db.example.com`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Containers.
+- A Contabo account with API credentials. EU1 is a Cloud VPS with 6 vCPU and 12 GB RAM.
 
 The current target is the operator deployment on existing accounts: one EU control server and
 customer EU1. Each further region adds one control server and customer workers from the same
@@ -258,7 +188,7 @@ customer EU1. Each further region adds one control server and customer workers f
 Public-release installation polish follows separately; see [after go-live](docs/architecture/cloudflare-convergence-and-serverless-plan.md#after-go-live) in the ULTRA plan.
 
 The management API reference is generated at `/v1/openapi.json` from the shared contracts,
-including the public raw fleet-image GET/HEAD service. Regional agent operations are published
+including the public raw fleet-image GET/HEAD service. Regional controller operations are published
 at `/agent/v1/openapi.json`; operation callbacks and relays are published at
 `/internal/v1/openapi.json`. Each document contains only its interface and referenced schemas.
 Their `info.version` is the request-serving Worker's version ID; `info.x-worker-version` also
@@ -362,13 +292,17 @@ CI=true pnpm test
 ```
 
 CI downloads and verifies its Linux client before running this test. Missing native test
-configuration fails explicitly. Unit tests do not replace the live phase acceptance in PLAN.md.
+configuration fails explicitly. Unit tests do not replace the live acceptance recorded in the ULTRA plan.
 
 ## Documents
 
-- [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
-- [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): approved
-  target architecture, shared prestarted compute pool, routing and additional warm-reclaim acceptance.
+- [PLAN.md](PLAN.md): entry point to the ULTRA plan: scope, delivery architecture, Done and Open
+  status and the go-live path.
+- [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): the native
+  runtime architecture, verified routing and the cold-start design.
+- [Parked sleep tier](docs/architecture/parked-instances.md): the idle sleep that keeps the
+  instance Pod and stops only PostgreSQL.
+- [Warm PostgreSQL pool](docs/architecture/warm-postgres-pool.md): the deferred shared pool design.
 - [Integrator handover](docs/operations/integrator-handover.md): the model, lifecycle API, client
   behaviour, limits, metering and recovery for an integrator that creates databases on PGCF.
 - [Source-backed diagrams](docs/architecture/mermaider/README.md): declared Cloudflare resources,
@@ -376,8 +310,9 @@ configuration fails explicitly. Unit tests do not replace the live phase accepta
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
 - [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
 - [infra/](infra/README.md): Talos, platform and backup recipes.
-- [Native external probe](docs/operations/native-external-probe.md): the supplemental Dev TCP/25
-  check for Phase 1 network isolation, including provenance verification and cleanup.
+- [Native external probe](docs/operations/native-external-probe.md): the independent TCP/25 check
+  that Cloudflare Workers cannot perform, and the full IPv4 port scan from a native runner,
+  including provenance verification and cleanup.
 
 ## License
 
