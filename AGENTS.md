@@ -24,7 +24,7 @@ Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs, docs/operations 
 Approved runtime target: native Rust for the regional gateway, controller and bootstrap relay; Rust/Wasm for the Edge Worker.
 TypeScript remains for the management API, Durable Objects and Workflows; CLI and provisioning tools initially remain on Node.js.
 Shared zod contracts remain authoritative initially; Rust consumers use generated schemas/constants and behavioral conformance tests.
-Read docs/architecture/rust-runtime-and-cold-starts.md for the approved migration sequence and cold-start design; the deployed runtime remains TypeScript until replacement passes Dev acceptance.
+Read docs/architecture/rust-runtime-and-cold-starts.md for the approved migration sequence and cold-start design; the deployed controller and gateway are native; the bootstrap relay and the Edge Worker remain TypeScript until their replacements pass Dev acceptance.
 Rust is an owner-approved architecture choice; measurements validate its implementation, rather than being a prerequisite for choosing it.
 First-party code is Apache-2.0; upstream components keep their own licenses.
 Pin upstream versions and digests; record licenses and notices in THIRD_PARTY.md.
