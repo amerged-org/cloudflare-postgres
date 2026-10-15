@@ -1,16 +1,17 @@
 # Region executor for customer-worker patches
 
-Status: **proposal of 2026-10-11**, for the ULTRA row "Region controller" (Design). Not approved
+Status: **proposal of 2026-10-11**, for the fleet item of the ULTRA plan's
+[after go-live](cloudflare-convergence-and-serverless-plan.md#after-go-live) list. Not approved
 and not implemented. It recommends option (a) in its push form; option (b) is not pursued.
 
 Naming: this document calls the in-region component the **region executor**. It is not the regional
-lifecycle controller (`pgcf-agent` today, `native-controller` with R2). That controller is replaced
+lifecycle controller (the native controller, Deployment `pgcf-agent`). That controller is replaced
 by the patch's own `regional` stage and never receives region-admin material.
 
 ## 1. Context
 
-Database work already follows the target model: the regional agent pulls `/agent/v1/desired` and
-reports observations. Fleet patches run from outside. The `PatchNode` Workflow
+Database work already follows the target model: the regional controller pulls `/agent/v1/desired`
+and reports observations. Fleet patches run from outside. The `PatchNode` Workflow
 ([patch-node.ts](../../apps/api/src/workflows/patch-node.ts)) calls the `NodeBootstrap` Durable
 Object ([bootstrap-container.ts](../../apps/api/src/bootstrap-container.ts)) once per turn. Its
 Cloudflare container runs `runFleetPatch` ([fleet-patch.ts](../../apps/node-bootstrap/src/fleet-patch.ts))
@@ -53,10 +54,10 @@ Cloudflare through the existing callback protocol.
 
 The relay leaves the execution path of worker patches but still carries each turn's launch. Removing
 that too needs the pull variant in section 9, whose extra trust and versioning machinery is not
-justified by an observed problem. If the owner accepts this, the ULTRA row should read: customer
-worker turns execute on the control server against local Talos and Kubernetes APIs with checkpoints
-in Cloudflare; the relay only launches them and remains the execution path for AddNode, the control
-server and material rotation.
+justified by an observed problem. If the owner accepts this, the ULTRA plan's fleet item should
+read: customer worker turns execute on the control server against local Talos and Kubernetes APIs
+with checkpoints in Cloudflare; the relay only launches them and remains the execution path for
+AddNode, the control server and material rotation.
 
 ## 3. Turn protocol
 
@@ -125,8 +126,8 @@ server and material rotation.
 - During a turn the material is reachable by principals that can attach or exec into the Pod or create
   privileged Pods in its namespace: Cloudflare's admin kubeconfig, Flux (cluster-admin) and operators
   with cluster-wide Pod rights. Each already reaches node root on the control server, which holds the
-  region's Kubernetes, etcd and Talos CAs. The regional agent and native controller have no exec,
-  attach or Pod-create rights and cannot.
+  region's Kubernetes, etcd and Talos CAs. The native controller has no exec, attach or
+  Pod-create rights and cannot.
 - Customer workers never receive admin material (unchanged). Rotation material is never sent in-region:
   `fleetPatchPreparedAuthority` attaches it only to control-plane members, and the entry point refuses
   an input that carries it.
@@ -151,10 +152,10 @@ and members run customer first, control last. Customer turns therefore run on a 
 is not being patched, and the control server's own patch keeps the relay path. The first customer
 member's `kubernetes` stage runs `talosctl upgrade-k8s` against the control endpoint from the executor
 on that same control server: apid is unaffected, while kube-apiserver and kubelet restarts are transient
-for a running Pod. Host-ready and finalization passes of customer members also run in-region. R2's EU1
-patch runs in-region with no dependency on the regional controller's version, although that patch is
-what activates the native controller. A new region starts on the relay path (`AddNode`); its later
-worker turns are launched through the EU relay and execute locally.
+for a running Pod. Host-ready and finalization passes of customer members also run in-region. A
+customer member's patch runs in-region with no dependency on the regional controller's version,
+although its `regional` stage replaces the controller. A new region starts on the relay path
+(`AddNode`); its later worker turns are launched through the EU relay and execute locally.
 
 The control server's patch keeps the per-connection relay cost. After a customer member has converged
 the shared Flux and platform objects, its platform stages are read-mostly and use the batched reads.
@@ -169,8 +170,6 @@ can use a fenced row check that does not rebuild the private input.
 
 Not recommended:
 
-- **Sequencing:** EU runs the TypeScript agent; the native controller is activated by R2 through a
-  customer-worker patch, which is the operation that needs the in-region executor.
 - **Self-replacement:** the patch's `regional` stage replaces the controller Deployment (`Recreate`),
   so the executor would end itself mid-turn. The controller is not pinned to the control server and can
   run on the worker being rebooted.
@@ -218,9 +217,9 @@ executor identity. Every executor fix would then wait for a release.
 - `apps/node-bootstrap/src/server.ts`, `package.json` build entries, `Dockerfile`;
   `scripts/ci/image-profiles.ts` and `scripts/ci/image-qualification.ts` for the new entry point.
 - Tests beside each change; the existing executor tests stay because execution logic is unchanged.
-- `docs/operations/fleet-patches.md` (execution location) and the ULTRA row once measured.
+- `docs/operations/fleet-patches.md` (execution location) and the ULTRA plan once measured.
 
-Unchanged: regional agent, native controller, relay, Talos configuration, provider firewall, Flux
+Unchanged: native controller, relay, Talos configuration, provider firewall, Flux
 manifests and `THIRD_PARTY.md`. No new dependency, credential, CRD or Secret.
 
 ## 11. Riskiest parts
@@ -237,7 +236,7 @@ manifests and `THIRD_PARTY.md`. No new dependency, credential, CRD or Secret.
 
 ## 12. Acceptance
 
-The next customer-member patch on Dev (EU1's final pass or R2) completes its turns through the executor
-with zero operator interventions, and the six node checks pass. Record per turn the relay sessions,
+The next customer-member patch on Dev completes its turns through the executor with zero operator
+interventions, and the six node checks pass. Record per turn the relay sessions,
 executor start and pull time and turn duration in the ULTRA plan. Thin qualification and thin-storage
 turns, which also target customer workers, move only if their relay cost is observed to matter.

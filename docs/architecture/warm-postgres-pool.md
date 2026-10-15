@@ -1,9 +1,13 @@
 # Warm PostgreSQL pool
 
-Status: **alternative 8 approved on 2026-10-12; implementation and live acceptance remain open.**
-The owner reaffirmed the sleeping-database first SQL below one second as the primary product
-goal on 2026-10-13. The detailed alternative 8 design below governs the ULTRA rows "Sub-second
-decision" and "Pool cold-start test". Earlier proposal and fallback sections remain design context.
+Status: **alternative 8 was approved on 2026-10-12 and is deferred.** Its code is on main and not
+wired end to end: no emitter sets its three runtime switches, only two of its ten qualification
+gates have producers and qualification mode has no client admission. The go-live path reaches the
+sleeping-database first SQL below one second, the owner's primary product goal of 2026-10-13,
+through the [parked sleep tier](parked-instances.md); this pool is the zero-RAM tier below it. The
+ULTRA plan decides it after the parked tier is measured and deletes it if it stays unused. The
+detailed alternative 8 design below is the contract if it is built. Earlier proposal and fallback
+sections remain design context.
 
 Citations: repository `path:line` refer to origin/main 05489c8. `rt` is
 [rust-runtime-and-cold-starts.md](rust-runtime-and-cold-starts.md), `plan` is
@@ -59,8 +63,9 @@ Repository citations in this section refer to origin/main dc635b2; `gw/` is
 `apps/native-gateway/src/`. Sources [U25]–[U53] extend the list at the end; besides the pins
 above they are pinned to Talos 1.14.2, Cilium 1.20.2, Linux 6.18.54 (the kernel of Talos 1.14.2
 [U40]), lib-csi 0.9.0, the barman-cloud library 0.6.0 and Barman 3.20.1. Where this section and
-the summary of alternative 8 in §12 differ, this section applies. Nothing here is implemented or
-measured on EU1; statements marked *unproven* need the live proof of A8.7.
+the summary of alternative 8 in §12 differ, this section applies. Its code is on main and not
+wired end to end, and nothing here is measured on EU1; statements marked *unproven* need the live
+proof of A8.7.
 
 ### A8.0 Parts, holder invariant and eligibility
 
@@ -449,11 +454,11 @@ owner decision.
 | infra/platform/base/values/cilium.yaml | `labels` set to `k8s:!pgcf\.io/pool-`. |
 | THIRD_PARTY.md | The pool runs the pinned plugin sidecar image unmodified as its archiver. |
 
-**Owner priority:** implement and measure the shared pool on the selected R2b thin storage.
+**Acceptance rule (if built):** measure the shared pool on the selected R2b thin storage.
 A thick-volume pool hit alone does not satisfy this acceptance. The pool writer must retain
 Cloudflare's current thin authority, its measured I/O limits and fail-closed protection.
 
-**Live acceptance on EU1 through Cloudflare**, after R2b is accepted:
+**Live acceptance on EU1 through Cloudflare**, on the accepted R2b thin storage:
 1. *Hit or miss.* A sleeping database (Cluster hibernated, no CNPG Pod) with X ready pool Pods on
    its node; a normal client connection through the database hostname; `connect_ms` and `first_read_ms`
    from one instant, broken down into claim, permission and hint delivery, device checks, mount,
@@ -495,10 +500,13 @@ Cloudflare's current thin authority, its measured I/O limits and fail-closed pro
     to close the anonymous-mount gap; ordinary namespace enumeration alone cannot prove it.
 
 The orchestration that every wake needs (immediate publication, Actor push, route token with
-target and direct dial; rt §6, §9, §10) comes first, as the Owner direction states; it carries
-steps 5 and 6.
+target and direct dial; rt §6, §9, §10) was delivered first, as the Owner direction states, with
+the wake orchestration of the ULTRA plan's Done table; it carries steps 5 and 6.
 
-## 1. Decision requested from the owner
+## 1. Decision requested from the owner (earlier proposal, superseded)
+
+The owner chose alternative 8 on 2026-10-12, so the two decisions below are no longer open. They
+stay as the reasoning behind the fallback of §3.
 
 **Decision 1 (now).** Approve the early-postmaster binding of §3 as the shared-pool mechanism; it is
 built only after Gate 0. CNPG keeps creating and owning the instance Pod, its PVC and RBAC, WAL
@@ -515,7 +523,7 @@ whole in-Pod chain on every wake (plan:118). The pool-hit gate is then recorded 
 (rt:122-127) and only rejected alternative 8 remains.
 
 **Decision 2 (only if Gate 0's stop rule fires).** Either build the runner anyway for the stages it
-removes and keep the pool-hit gate open, which keeps go-live blocked (plan:22-25), or approve
+removes and keep the pool-hit gate open, or approve
 taking Pod creation off the hit path: PostgreSQL in pre-created pool Pods supervised by PGCF, with a
 late-bound volume (rejected alternative 8). That changes the CNPG-ownership constraint (rt:122) and
 needs its own design for archiving, backups and volume authority.
@@ -560,7 +568,7 @@ until Gate 0 shows otherwise. The 4–5 s after Ready are addressed for hits and
 approved immediate controller publication, Actor push and direct target routing (rt §6, §9, §10);
 their remaining cost under the native controller is unmeasured.
 
-## 3. Recommended mechanism
+## 3. Earlier proposal: the CNPG-owned runner (fallback)
 
 R2's pool stays as built: per node, `target_slots` tenant-free slots, each a namespace holder plus a
 stock runc v2 shim in an idle cgroup, refilled outside the claim path (sc/controller.rs:609-730;
@@ -770,7 +778,8 @@ runs before adoption.
   `CHECKPOINT` to the sleep proof; `pgcf_maintenance` then needs `pg_checkpoint`
   (packages/contracts/src/maintenance.ts:14-19). Fencing before hibernation would bound the stop by
   `switchoverDelay` instead, but CNPG then hibernates only a Healthy cluster, which a recreated
-  fenced Pod blocks [U20][U21]. An unclean stop costs a miss with CNPG crash recovery, never data.
+  fenced Pod blocks [U20][U21]; the parked tier demotes such a Pod by unfencing it first
+  (parked-instances.md 2.3). An unclean stop costs a miss with CNPG crash recovery, never data.
 - Explicit suspension still means real hibernation and an authorized resume (rt:205). Warm reclaim
   is unchanged (rt §12).
 
@@ -911,11 +920,12 @@ reruns the adoption and alias checks before a profile with the new hashes is app
    generic ephemeral volumes. Volumes cannot be added [U1], kubelet mounts before any container runs
    [U6], and generic ephemeral volumes create a new, empty PVC (rt:112).
 7. **Parked CNPG Pods per database through fencing**, the "wake without a new Pod" option of plan:118.
-   One Pod per database is not the pool (rt:70-72) and cannot satisfy its acceptance (rt:9-11,
-   rt:194). Parked Pods keep their requests, against the sleeping-CPU release (rt:5-7, plan:99).
-   Demotion to hibernation stalls once a parked Pod has been recreated, because CNPG hibernates only a
-   Healthy cluster [U20] and a fenced, NotReady instance keeps it from becoming Healthy [U21]. The
-   4–5 s after Ready remain. Its eligibility predicate and labels are reused here.
+   Rejected here as a replacement for the pool, because one Pod per database is not the pool
+   (rt:70-72) and cannot satisfy its acceptance. It was implemented as its own tier, the
+   [parked sleep tier](parked-instances.md): it shrinks the parked Pod's requests in place, and it
+   demotes a Pod that CNPG recreated while fenced by unfencing it first, because CNPG hibernates only
+   a Healthy cluster [U20] and a fenced, NotReady instance keeps it from becoming Healthy [U21]. Its
+   eligibility predicate and labels are reused here.
 8. **PGCF-supervised PostgreSQL in pre-created pool Pods, with the volume late-bound through a
    memory-backed emptyDir and HostToContainer propagation.** It is the only option that removes Pod
    creation from the hit path. But CNPG would not own the process: archiving, backups, roles and

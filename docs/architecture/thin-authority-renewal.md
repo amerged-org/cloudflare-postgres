@@ -1,9 +1,10 @@
 # Thin write authority from in-region observations
 
-Status: **option 1 approved by the owner on 2026-10-13**, including the EU1 thin selection.
-Implementation is in progress; CI, deployment and live acceptance remain required. The
+Status: **option 1 approved by the owner on 2026-10-13, including the EU1 thin selection, and
+deployed**: native sampling, capability gating and the composed authority run on the EU fleet.
+The live acceptance checks of section 11 remain required on the go-live release. The
 [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) records the current Done/Open state.
-Options 2 and 3 in section 12 remain comparison material.
+Options 2 and 3 (section 12) were not pursued.
 
 Implementation correction, 2026-10-14: the pinned kernel exempts metadata and swap bios from
 ordinary `io.max` throttling. The rate-window formulas below do not establish a hard bound on
@@ -33,7 +34,7 @@ Cloudflare stays the only party that decides. It alone signs the `sa1` write aut
 gateway and the host guard enforce, chooses its expiry, admits starts and orders pool growth.
 Option 1 changes where the facts behind a renewal come from.
 
-| Concern | Today | Option 1 |
+| Concern | Before option 1 | Option 1 (deployed) |
 | --- | --- | --- |
 | Pool and VG headroom | Relay readback by the NodeBootstrap executor, every `guard/2` | Native controller samples the OpenEBS exporter every `guard/5` (2 s at the 10 s guard) and posts each sample against a Cloudflare nonce |
 | Identity, inventory, per-writer IO limits, receipts, protections, pool actions | The same relay readback | The same relay readback, as an identity proof valid 300 s, refreshed every 60 s and on demand |
@@ -46,6 +47,8 @@ blocking the node (section 5). Section 8 adds first tokens for new writers from 
 without it every thin wake waits for a relay turn.
 
 ## 2. The problem in code terms
+
+This section describes the code before option 1; its citations are to the commit named above.
 
 Run `op_zsvnvfpzv4o2jb6ha9wi` (Dev EU1, 2026-10-12) measured the product-equivalent readback at
 27.5 s against `guard_seconds / 2` = 5 s; each relayed connection costs 2–6.6 s (plan:100,
@@ -304,12 +307,12 @@ path today's metrics already use (infra/platform/regional/rbac.yaml:150-166).
 The gateway forwards a byte only under a token naming the exact Pod (gw/targets.rs:313-405, 467-484;
 np/storage.rs:207-224). Cloudflare signs such a token only from slow-proof `io.max` evidence of that
 Pod (dom/node-thin-storage.ts:184-209), and every wake runs a new Pod at a new generation
-(dom/lifecycle.ts:35). Every thin wake therefore waits for a complete relay turn after Pod Ready. The
-host guard's startup grant (dom/node-thin-storage.ts:410-411) lets PostgreSQL start; it does not let
-clients connect.
+(dom/lifecycle.ts:35). Without the rule below every thin wake waits for a complete relay turn after
+Pod Ready. The host guard's startup grant (dom/node-thin-storage.ts:410-411) lets PostgreSQL start;
+it does not let clients connect.
 
-Proposed rule: Cloudflare may sign a token for (database, generation, Pod) without IO evidence of
-that Pod while
+Rule (implemented): Cloudflare may sign a token for (database, generation, Pod) without IO
+evidence of that Pod while
 
 1. a thin startup hold of this generation and node is current. It debits
    `max(startup_reserve_bytes, quota)` and is released only after a later slow proof shows the Pod's
@@ -330,39 +333,26 @@ response to the ready observation removes that period from the first SQL.
 
 A create still needs one slow turn after its claim binds, because only the slow readback establishes
 the receipt's LV UUID (dom/node-thin-storage-execution.ts:691-725); Cloudflare starts that turn at
-once. The rule does not depend on the renewal source and applies to option 2 as well.
+once. The rule does not depend on the renewal source.
 
-## 9. Change set
+## 9. Delivery
 
-| Component | Change |
-| --- | --- |
-| `packages/contracts` | `NodeThinStorageAuthority`: `inventory_observed_at`, `inventory_expires_at`, `inventory_revision`, and `expires_at <= inventory_expires_at`; headroom sample and response schemas; `storage_samples` (node, UID, period, qualification run) in the desired region; `THIN_INVENTORY_MAX_SECONDS = 300`, `THIN_INVENTORY_INTERVAL_SECONDS = 60`; `startup_bound` and `noflush_quiescence` evidence and decisions (section 10); regenerated native schemas and vectors. `sa1` claims unchanged. |
-| `apps/api` | Route and domain for headroom samples (nonce, checks, composition, tokens, growth trigger); a D1 migration adding the nonce columns to `node_thin_storage`; the slow report as identity proof with its own revision and the consistency check; the lease decoupled from the guard; inventory-time predicates (section 5); first tokens for held writers (section 8); NodeBootstrap cadence, triggers and transient retry (api/bootstrap-container.ts:365-434, 1684-1713); qualification-mode samples recorded as run evidence. |
-| `apps/node-bootstrap` | The thin storage report carries the identity-proof times and revision; qualification gates take their fast-sample evidence from Cloudflare. |
-| `apps/native-controller` | Per-node fast loop with nonce, completeness check and witnesses (nc/node_storage.rs); the request (nc/api.rs); responses update the cached authority and write tokens monotonically (nc/main.rs, nc/reconcile.rs). |
-| `apps/native-gateway`, `apps/sandbox-controller`, `packages/native-protocol` | None. |
-| `infra` | None. The controller already has `pods/proxy` GET in `openebs` and Node GET. |
-| Docs | The thin-storage admission and qualification sections of ops; the plan rows once measured. |
+Option 1 is deployed. The contracts and API carry the headroom sample route, the identity proof
+and the composed authority; the native controller runs the per-node fast loop; the NodeBootstrap
+executor's slow report is the identity proof; held writers get their first token as section 8
+describes. The sampling capability (`thin_storage_sampling_version` in the release) keeps the
+strict desired schemas back until every assigned controller has converged.
 
-## 10. Migration, receipt and qualification
+## 10. Qualification and receipt
 
-1. Deploy contracts and API. They are inert: no node has a thin selection, so the migration has no
-   rows to convert.
-2. Roll out an R2 successor whose controller runs the fast loop, to EU1 and control, without a
-   receipt. Control has no selection, so its loop stays idle.
-3. Run a new scratch-first qualification on EU1. `startup_bound` stops comparing the relay readback
-   with `guard/2` (ct/thin-qualification.ts:605). Cloudflare records the accepted fast samples for the
-   run's node in qualification mode (no authority, no tokens, witnesses checked against the run's
-   setup identity), and the gate requires the longest interval between accepted samples during the
-   bulk load to stay below `guard_seconds × 500 ms`, and the product identity turn, still measured as
-   today (nb/thin-qualification.ts:2703-2748), to stay below the 60 s cadence (27.5 s measured).
-   `noflush_quiescence` additionally requires an accepted sample while the writer's LV is suspended,
-   which proves that a protective quiesce cannot stall every renewal on its node.
-4. Continue R2b as planned (plan:101, ops:417-425).
-
-Run 10 cannot be reused: a receipt comes only from one completed run whose gates the current code
-computed (plan:212-218). With the same profile, driver image, host extension and kernel the
-receipt's qualified identity is unchanged; only its evidence and `receipt_sha256` are new.
+A receipt comes only from one completed run whose gates the current code computed. With option 1
+`startup_bound` compares the longest interval between accepted fast samples during the bulk load
+with `guard_seconds / 2` instead of the relay readback, and `noflush_quiescence` also requires an
+accepted sample while the writer's LV is suspended, which proves that a protective quiesce cannot
+stall every renewal on its node. The product identity turn still has to stay below the 60 s
+cadence. The run and its pass criteria are in the
+[qualification runbook](../operations/recovery.md#thin-storage-qualification-run); run 14
+produced EU1's receipt, and any change of kernel, driver image or host extension needs a new run.
 
 ## 11. Live acceptance on Dev EU1
 
@@ -389,56 +379,13 @@ receipt's qualified identity is unchanged; only its evidence and `receipt_sha256
 9. **Transient relay failure.** Restart the relay during a slow turn: the turn retries, the node stays
    `ready` and writes continue.
 
-## 12. Options 2 and 3
+## 12. Rejected options
 
-### Option 2: 120 s guard with lower write limits
-
-The 27.5 s turn fits inside `guard/2` = 60 s and the existing `startup_bound` criterion, so option 2
-needs a new profile and a new run but no new observer. It is not code-free: renewals must still reach
-the controller (section 2 shows that the 60 s pull leaves it with an expired authority for up to
-27.5 s of every cycle, depending on phase, so it would hibernate the node's thin databases); the
-smallest fix is a region-link hint for a full pull after each accepted report
-(api/region-link.ts:75-95). Section 5's transient retry is needed as well, and section 8's rule for
-wakes that do not wait for a turn.
-
-The price is headroom. `thinWriteExposure` (ct/database-storage.ts:87-104) charges each awake
-database for `W = guard + drain` seconds, one 64 KiB chunk per 64 KiB written plus one per write
-operation. At 10 MiB/s and 200 IOPS that is 22.5 MiB per second of window:
-
-| Window | Data per awake database | Metadata | Five awake (EU1's CPU limit, plan:182-185) |
-| --- | --- | --- | --- |
-| Option 2: 120 s guard + 10 s drain | 46,800 chunks = 2,925 MiB | 5.8 MiB | 14.3 GiB |
-| Option 1: 10 s guard + 10 s drain, same limits | 7,200 chunks = 450 MiB | 0.9 MiB | 2.2 GiB |
-
-The 10 s drain is that of the repository's profile fixtures; the run-10 profile's drain changes W in
-the same way. The profile must also keep startup reserve + 2,925 MiB + data reserve within the
-initial pool (ct/database-storage.ts:166-186), and EU1's whole VG holds 96 GiB
-(infra/platform/README.md:260-261). The limits cap bulk loads, restores, checkpoints and WAL of every
-database at 10 MiB/s and 200 IOPS. Writes continue for up to 120 s after the start of the read that
-justified them, and a protective stop reacts as late. Every relay dependency stays: one turn per node
-every 60 s, and a relay slow enough to need more than 60 s per turn has no larger guard to move to.
-Moving to option 1 later changes the profile again and needs another run. Acceptable as a bridge only
-if the owner accepts these limits; it does not remove any work option 1 needs.
-
-### Option 3: new thick databases as a bridge
-
-The native gateway refuses new thick databases today. It admits a database without thin authority
-only from the immutable Deployment list `PGCF_GATEWAY_LEGACY_BINDINGS_JSON` (gw/main.rs:64-65,
-gw/targets.rs:336-357, apps/native-gateway/README.md:62-70), which a fleet patch renders from the
-thick cohort it reads at patch time (nb/fleet-patch.ts:670-693, nb/fleet-legacy-storage.ts). The host
-guard is already dynamic: it replaces its thick set from each Cloudflare lease (sc/storage.rs:305-342,
-dom/node-thin-storage.ts:300-308).
-
-Instead of the list the gateway would need a second Cloudflare-signed authority: a domain-separated
-thick binding under the same pinned keys with the `LegacyStorageBinding` fields
-(ct/storage-write-authority.ts:17-29), signed after a high-trust readback of the new claim, volume and
-LV (today only the fleet patch reads them), carried in the `storage-<id>` ledger, checked in
-`binding()` instead of the map and revoked by generation and fence. Thick placement stays limited to
-nodes without a thin selection (dom/storage-capacity.ts:310-326), so EU1 could not be selected while
-the bridge lasts, and new nodes take thin storage only (plan:27-29, 58-64). Every bridge database
-stays thick for good: there is no in-place conversion, and a restore gets a new ID (plan:112). It
-would unblock SQL on new databases, which R2 node check 4 waits for (plan:98), at the cost of a
-permanent second cohort and a second signed path. Not recommended.
+Option 2, a 120 s guard with lower write limits, fits the 27.5 s relay turn inside `guard/2` but
+charges every awake database for a 130 s write window instead of 20 s (about 6.5 times the
+headroom at the same limits) and keeps every relay dependency. Option 3, new thick databases as a
+bridge, needs a second Cloudflare-signed authority and leaves a permanent second cohort of
+databases that never convert in place. Neither was pursued; their comparison is in Git history.
 
 ## 13. Open questions that need live proof
 

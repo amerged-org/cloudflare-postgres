@@ -1,16 +1,20 @@
 # Rust runtime and cold-start architecture
 
-Approved: **2026-10-05**. **The target architecture is approved; implementation and live acceptance are pending.**
+Approved: **2026-10-05**. **The target architecture is approved. The native regional controller
+and gateway are implemented and deployed on the EU fleet; the Rust/Wasm Edge and the native
+bootstrap relay are built and not deployed, and the shared compute pool is deferred.**
 
 Owner correction (2026-10-08): the [unified control/capacity/release plan](cloudflare-convergence-and-serverless-plan.md)
-now requires the actual-use resource model and uniform automatic fleet patching as part of completion.
+requires the actual-use resource model and uniform automatic fleet patching as part of completion.
 Earlier clauses preserving full sleeping CPU and logical disk reservations are superseded below.
-The Rust implementation and its measured first-read target remain required and unaccepted.
-The owner also explicitly requires Neon's **shared pool of prestarted, unassigned compute**.
-Per-database warm reclaim is an additional mode; it cannot substitute for that pool or satisfy
-its acceptance. The earlier database-bound-only interpretation is withdrawn.
 
-The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) is the canonical delivery sequence and Done/Open status, linked from [PLAN.md](../../PLAN.md). This document describes the approved architecture and its migration boundaries. It does not claim that the Rust components, routing caches, Actor snapshots or warm-reclaim runtime already exist. Completed results belong in the ULTRA Done/Open tables. Its October10 six-check node acceptance and R2 pool result supersede older long measurement series.
+The texts of 2026-10-05 and 2026-10-08 required Neon's **shared pool of prestarted, unassigned
+compute** before go-live. The go-live path now reaches a sub-second wake through the
+[parked sleep tier](parked-instances.md), which keeps the database's instance Pod and stops only
+PostgreSQL. The shared pool (alternative 8 of [warm-postgres-pool.md](warm-postgres-pool.md)) is
+deferred and not wired end to end; section 4 keeps its contract for the case that it is built.
+
+The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) is the canonical delivery sequence and Done/Open status, linked from [PLAN.md](../../PLAN.md). This document describes the architecture and its migration boundaries; the table in section 3 states which component is deployed. Completed results belong in the ULTRA Done/Open tables.
 
 ## 1. Decision and purpose
 
@@ -21,36 +25,46 @@ The migration combines a native runtime with changes to the connection and lifec
 Measurements validate this chosen architecture, establish its operating limits and guide subsequent improvements. Profiling is not a prerequisite for the Rust decision. Rust itself does not remove PostgreSQL startup, Kubernetes scheduling, network round trips or the memory occupied by a running database.
 
 The latency objective is **a first successful read below one second when a sleeping database
-is assigned a prestarted unassigned compute from the shared pool**, including ordinary client
-connection and authentication. Already-running warm connections, optional warm reclaim and pool
-miss/on-demand startup are separate measurements. Warm-only success does not satisfy the pool-hit
+is woken onto a runtime that already exists**, including ordinary client connection and
+authentication: its parked instance Pod or, if the shared pool is built, a prestarted unassigned
+compute. Already-running warm connections, optional warm reclaim and the ordinary wake of a fully
+hibernated database are separate measurements. An already-warm connection does not satisfy the
 target. This is a required Dev acceptance target, not an existing service guarantee.
 
 ## 2. Current implementation and evidence
 
-The current Edge, regional agent and regional gateway are TypeScript. The agent and gateway use the pinned Node runtime and remain running while an individual database hibernates. CNPG hibernation removes PostgreSQL Pods and retains the database's local LVM-backed PVC. Waking that database therefore recreates PostgreSQL runtime state; it does not start a new regional Node process.
+The regional controller and gateway are the native Rust binaries and run on the EU fleet
+(Deployments `pgcf-agent` and `pgcf-gateway`); both remain running while an individual database
+hibernates. The Edge Worker is the TypeScript `apps/edge`, and the bootstrap relay on EU control is
+the TypeScript relay of `apps/regional`; their Rust replacements are built and not deployed. CNPG
+hibernation removes PostgreSQL Pods and retains the database's local LVM-backed PVC. Waking that
+database therefore recreates PostgreSQL runtime state; it does not start a new regional process.
+The parked tier keeps the Pod of an idle sleep instead.
 
-The last complete historical series measured twenty independent wakes at p50/p95/max **8.412/9.160/9.708 seconds**. All twenty used distinct Pods with unchanged Cluster and PVC identities, one wake and one configuration revision per sample, preserved committed data and no rolled-back marker. The owner accepted these times for current v1. That series used an earlier regional image; subsequent four-run diagnostics do not replace it or establish the latency of every later change.
+The ULTRA plan's Done table holds the measured wake and awake numbers. The cold series measured
+`Client.connect()` and validated the marker query afterwards, outside that timer, while an
+always-warm diagnostic measured new connection plus first read (p95 734.438 ms); these values have
+different endpoints and must not be subtracted to estimate orchestration overhead. Future
+acceptance records connect and first-read durations for both warm and cold samples.
 
-An always-warm diagnostic measured new connection plus first read at p95 **734.438 ms**. The historical cold series measured `Client.connect()` and validated the marker query afterwards, outside that timer. These values have different endpoints and must not be subtracted to estimate orchestration overhead. Future acceptance records connect and first-read durations for both warm and cold samples.
-
-The existing agent already has an interruptible hint and a compensated one-second pending-wake cadence. The existing PostgreSQL startup/readiness probes are already configured at one second. The approved changes replace discovery polling and unnecessary serialized work; they do not assume an unchanged five-second loop or ten-second probe default.
+The native controller is driven by RegionLink hints and a bounded wake-priority queue, and the
+PostgreSQL startup/readiness probes are configured at one second.
 
 ## 3. Component ownership and build boundaries
 
-| Component | Approved target | Responsibility |
-| --- | --- | --- |
-| Management API | TypeScript Worker | Management, authorization, authoritative D1 state and installation policy |
-| DatabaseActor | TypeScript Durable Object | Admission snapshots, mutation barriers, wake coalescing, idle policy and lifecycle decisions |
-| RegionLink | TypeScript Durable Object | Authenticated regional connection and non-authoritative desired-state hints |
-| Workflows | TypeScript | Provisioning, restore and other long operations |
-| Edge Worker | Full Rust/Wasm Worker | Request validation, admission orchestration, routing-token signing, transport selection and bounded refusals |
-| Regional gateway | Native Rust binary | WebSocket/PostgreSQL transport, token/startup validation, TLS, activity and persisted fences |
-| Regional controller | Native Rust binary | Desired-state execution, readiness, watches, configuration/runtime proofs, health and observations |
-| Bootstrap byte relay | Native Rust binary | The existing authorized byte-relay function with bounded streams and independent workload rights |
-| Node reclaimer | Separate native Rust binary | Narrowly authorized reclaim of a bound PostgreSQL container on an approved node |
-| CLI and node-bootstrap tooling | Node.js initially | Local client bridge and long-running provisioning orchestration; optional later native work |
-| PostgreSQL, CNPG, Barman, Talos and Kubernetes platform | Unmodified pinned upstream components | Database engine, backup, operating system and orchestration |
+| Component | Approved target | Deployed on the EU fleet | Responsibility |
+| --- | --- | --- | --- |
+| Management API | TypeScript Worker | TypeScript Worker | Management, authorization, authoritative D1 state and installation policy |
+| DatabaseActor | TypeScript Durable Object | TypeScript Durable Object | Admission snapshots, mutation barriers, wake coalescing, idle policy and lifecycle decisions |
+| RegionLink | TypeScript Durable Object | TypeScript Durable Object | Authenticated regional connection and non-authoritative desired-state hints |
+| Workflows | TypeScript | TypeScript | Provisioning, restore and other long operations |
+| Edge Worker | Full Rust/Wasm Worker | TypeScript `apps/edge`; `apps/edge-rust` is built, not deployed | Request validation, admission orchestration, routing-token signing, transport selection and bounded refusals |
+| Regional gateway | Native Rust binary | Native Rust (`apps/native-gateway`) | WebSocket/PostgreSQL transport, token/startup validation, TLS, activity and persisted fences |
+| Regional controller | Native Rust binary | Native Rust (`apps/native-controller`) | Desired-state execution, readiness, watches, configuration/runtime proofs, health and observations |
+| Bootstrap byte relay | Native Rust binary | TypeScript relay (`apps/regional`); `apps/native-bootstrap-relay` is built, not deployed | The existing authorized byte-relay function with bounded streams and independent workload rights |
+| Node reclaimer | Separate native Rust binary | `apps/native-reclaimer` is built, not deployed | Narrowly authorized reclaim of a bound PostgreSQL container on an approved node |
+| CLI and node-bootstrap tooling | Node.js initially | Node.js | Local client bridge and long-running provisioning orchestration; optional later native work |
+| PostgreSQL, CNPG, Barman, Talos and Kubernetes platform | Unmodified pinned upstream components | Unmodified pinned upstream components | Database engine, backup, operating system and orchestration |
 
 Use one Rust workspace with a portable protocol/contract core and separate host implementations. Produce separate binaries and images for gateway, controller, relay and node reclaimer. Separate images permit independent deployment and retain separate service accounts, host access and resource limits. A common workspace is not a reason to grant the controller the reclaimer's privileges or to run every mode in one process.
 
@@ -58,7 +72,15 @@ The portable core is shared by native applications and the Wasm Edge. It contain
 
 Pin the Rust toolchain, dependency lockfile, build inputs and runtime-image digests when implementing the components. Retain upstream notices in THIRD_PARTY.md. Extend the existing single CI workflow with Rust build, conformance, tests and image qualification rather than introducing a second workflow or a language/load test matrix.
 
-## 4. Required shared prestarted compute pool
+## 4. Shared prestarted compute pool (deferred)
+
+**Status.** The pool is not on the go-live path. The [parked sleep tier](parked-instances.md) is
+the first sub-second tier; the shared pool, alternative 8 of
+[warm-postgres-pool.md](warm-postgres-pool.md), is the deeper tier below it. Its code is on main
+(supervisor, sandbox-controller pool modules, API pool domain) and is not wired end to end: no
+emitter sets its three runtime switches, only two of its ten qualification gates have producers
+and qualification mode has no client admission. The ULTRA plan decides it after the parked tier
+is measured and deletes it if it stays unused. The contract below applies if it is built.
 
 The target follows the three mechanisms described in Neon's
 [Cold starts just got hot](https://neon.com/blog/cold-starts-just-got-hot): start unassigned
@@ -67,9 +89,9 @@ Neon described a pool of empty computes receiving an endpoint configuration on a
 replenishment/recycling and slower on-demand fallback on a pool miss. Its historical latency
 results are reference measurements, not a guarantee for PGCF.
 
-**PGCF must implement a shared pool.** Keeping one PostgreSQL process or Pod alive for every idle
-database is not this mechanism. Neither an image cache, spare CPU, pre-pulled containers nor a
-pool of database client connections counts as a prestarted compute pool.
+**A shared pool, if built, is this mechanism.** Keeping one PostgreSQL Pod alive for every idle
+database is the parked tier, a different tier. Neither an image cache, spare CPU, pre-pulled
+containers nor a pool of database client connections counts as a prestarted compute pool.
 
 ### Pool and assignment contract
 
@@ -98,12 +120,12 @@ pool of database client connections counts as a prestarted compute pool.
   Do not conceal miss rate, add a new VPS merely to fill an idle pool, or present its latency as
   a pool hit. Explicit suspension continues to require an authorized resume.
 
-### Required storage and CNPG integration work
+### Storage and CNPG integration work
 
 Neon's storage/compute separation is an enabling architecture, described in its
 [architecture decisions](https://neon.com/blog/architecture-decisions-in-neon). PGCF currently has
 unmodified PostgreSQL with CNPG-owned lifecycle and local PGDATA/PVCs. That is a real integration
-constraint to solve, not a reason to replace the requested pool with per-database warm reclaim.
+constraint to solve, not a reason to substitute per-database warm reclaim for the pool.
 
 The first implementation stage must produce a working late-binding contract between a prestarted,
 unassigned runtime and a retained database volume. With local data, candidate slots must be on
@@ -179,19 +201,20 @@ starting the sandbox; calling it for placeholder Pods is not a later-assignment 
 The software-only factory is required research/implementation work, not an existing
 containerd/runc capability or an accepted design. The other direction requires a separately
 approved move to virtualization-capable hardware; the current V159 purchase authorization does
-not authorize it. Neither direction permits silently replacing the shared pool with per-database
-warm retention. No pool state may be reported ready from these findings.
+not authorize it. Neither direction is on the go-live path. No pool state may be reported ready
+from these findings.
 
-### Required pool acceptance
+### Pool acceptance (if built)
 
-Use the sub-second wake step of the [ULTRA go-live path](cloudflare-convergence-and-serverless-plan.md#go-live-path).
+Measure it like the sub-second wake step of the [ULTRA go-live path](cloudflare-convergence-and-serverless-plan.md#go-live-path).
 A real unassigned slot must exist before demand. Connect normally through Cloudflare to a sleeping
 database with no running tenant compute and measure connection through the first validated SQL
 result from the same start time. A pool hit must finish below one second, preserve committed data,
 bind the correct CNPG/volume/tenant identities and trigger refill. Label a miss as a miss.
 Existing exclusive-claim, isolation, exhaustion and uncertain-outcome behavior remains part of the
 implementation and focused regression tests. Fixed twenty-wake series and 30/120-minute idle soaks
-are no longer prerequisites. A same-Pod warm/reclaim result cannot replace this shared-pool result.
+are no longer prerequisites. A same-Pod warm, parked or reclaim result is a different tier and is
+measured separately; it neither satisfies nor replaces this shared-pool result.
 
 ## 5. Runtime states and idle policy
 
@@ -200,13 +223,19 @@ are no longer prerequisites. A same-Pod warm/reclaim result cannot replace this 
 | `active` | PostgreSQL, its bound Pod and Barman run | Normal authenticated work |
 | Always warm | The same running runtime remains available during idle periods | Normal warm connection; no reclaim or automatic hard sleep |
 | `warm_idle` | The same PostgreSQL process and Pod run; selected cold memory pages may be reclaimed | Admission revokes further reclaim; the kernel brings back the pages actually needed |
-| `waking` | A compatible prestarted pool slot is being claimed/bound, or the measured on-demand fallback is starting | Wait for the matching verified database-ready observation |
-| `hibernated` | No per-database compute runs; persistent volume/data remains | Claim an eligible shared pool slot; use bounded on-demand fallback on a recorded pool miss |
+| Parked (public state `hibernated`, region policy `parked_tier`) | The database's instance Pod, volume, sidecar and Lease stay; CNPG's fence stops PostgreSQL and the Pod's requests are shrunk | Unfence and resize back; a database that is not eligible is demoted to `hibernated` and takes the ordinary wake |
+| `waking` | The parked Pod is being unfenced, or CNPG creates a new instance Pod (a pool slot is claimed only if the deferred shared pool is built) | Wait for the matching verified database-ready observation |
+| `hibernated` | No per-database compute runs; persistent volume/data remains | Ordinary CNPG wake: a new instance Pod starts on the retained volume (an eligible pool slot only if that pool is built) |
 | Explicitly `suspended` | Integrator/owner admission block with real CNPG hibernation | Refuse connections until an explicit authorized resume |
 
 `warm_idle` is not a stopped database, a frozen process or zero resident memory. Kernel page-in on access is not restoration of a process snapshot. Host filesystem cache may survive real hibernation, but no cache-retention guarantee is made.
 
-Retain `sleep_after_seconds: null` as always warm. For a finite idle threshold, add an explicit generic idle action: `hibernate` or `warm_reclaim`. The established behavior remains the default for existing policies; warm reclaim is enabled only for an approved compatible resource class and node. An optional later threshold may move a warm-idle database into real hibernation through the existing safe shutdown path.
+`sleep_after_seconds: null` is always warm. A finite idle threshold puts the database to sleep as CNPG
+hibernation or, when the region policy `parked_tier` is enabled and the database is eligible, as a
+parked instance. Warm reclaim is a separate per-database policy (`PUT /v1/databases/{id}/warm-reclaim`)
+for an approved compatible resource class and a qualified node; a database with a qualified warm
+policy never takes the idle-sleep path. An optional later threshold may move a warm-idle database
+into real hibernation through the existing safe shutdown path.
 
 Idle eligibility comes from authenticated activity and absence of running work. WebSocket pings and unauthenticated transports do not fabricate user activity. Open transactions, prepared work, uncertain activity history and incomplete gateway inventory continue to prevent unsafe sleep. Explicit suspend always preserves its admission block and the quiescence/WAL/R2/CNPG safety sequence. Warm wake or application early wake must never implicitly resume an explicitly suspended database.
 
@@ -293,7 +322,10 @@ The required order is:
 
 Barrier state survives Actor/process interruption. If execution or snapshot publication is interrupted, reconcile from D1 and current regional proof before reopening. A timeout or lost response must not reopen the old snapshot merely because a mutation's outcome is unknown. Keep barriers limited to affected identities rather than installation-wide admission.
 
-Routing tokens carry the route revision, and the gateway checks it against the current admitted target/fence. Version the internal token contract and use an explicit temporary compatibility rollout when adding this field; the final native path does not silently accept a missing revision. Do not equate the new route revision with unchanged configuration or fabricate ready state from a requested wake.
+Routing tokens carry the database generation and the verified primary Pod (v3) and, where the region's release
+declares the admission snapshot, the independent route revision (v4); the gateway checks them against the current
+admitted target and persisted fence. Do not equate the route revision with unchanged configuration or fabricate
+ready state from a requested wake.
 
 ## 11. Authentication sequence
 
@@ -307,10 +339,12 @@ Successful proxy-side authentication cannot bypass PostgreSQL's authentication o
 
 ## 12. Additional warm reclaim and the node-local reclaimer
 
-This mode is additional to the required shared compute pool in section4. It may optimize an
-already assigned idle runtime; it is not pool implementation or evidence for pool-hit latency.
+**Status.** The API policy and the host publisher are implemented; the node reclaimer binary is built
+and not deployed, no node is qualified and no database carries a policy. This mode is additional to
+the parked tier and the deferred shared compute pool. It may optimize an already assigned idle
+runtime; it is not pool implementation or evidence for pool-hit latency.
 
-Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/machinery/config/types/block/zswap_config.go).
+Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/zswap_config.go).
 
 The reclaimer is a separate DaemonSet/binary on explicitly approved worker nodes. It is not part of the regional controller Pod and does not give the controller a writable host cgroup mount. The current control-plane/worker baseline remains outside the swap/reclaim trial; enable the trial only on a separately accepted, isolated Dev worker.
 
@@ -361,38 +395,48 @@ Report actual runtime activation separately from time between the user's applica
 
 ## 14. Migration and deployment
 
-Implement these dependent runtime pieces within the parallel Rust/pool workstream. Fleet delivery uses R1/R2 from the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#delivery-architecture):
+The dependent runtime pieces below are delivered through R1/R2 of the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#delivery-architecture). Status:
 
-0. **Shared pool/storage integration:** prove and implement the prestarted unassigned-runtime
-   boundary and data/CNPG late binding from section4. Resolve incompatibilities explicitly; the
-   pool must not be dropped or replaced by warm reclaim. This informs the controller contract.
-1. **Rust gateway:** preserve current contracts, authentication passthrough, protocol behavior and persisted fences; qualify the image and live Dev route.
-2. **Rust controller and bootstrap relay:** replace the full regional Node server implementation; implement shared-slot preparation, exclusive assignment, refill, retirement and observations alongside targeted desired-state execution; preserve persisted progress.
-3. **Warm routing and fingerprints:** publish identity-bound direct targets, separate configuration and activity/power revisions, and implement same-runtime attestations.
-4. **Rust/Wasm Edge and Actor snapshots:** preserve real VPC HTTP/unopened-WebSocket forwarding and add the mutation barrier plus versioned route snapshots/tokens.
-5. **Shared-pool Dev acceptance:** run the R2 shared-pool acceptance in section4 through the ordinary Cloudflare path.
-6. **Optional later warm reclaim:** evaluate separately after the required shared-pool result; it is not an additional customer-readiness gate.
+0. **Shared pool/storage integration:** deferred (section 4). The late-binding design and its code are
+   on main and not wired end to end.
+1. **Rust gateway:** implemented and deployed; it preserves the current contracts, authentication
+   passthrough, protocol behavior and persisted fences.
+2. **Rust controller:** implemented and deployed; it replaced the full regional Node server
+   implementation and preserves persisted progress. **Bootstrap relay:** the native replacement is
+   built and not deployed; a release that pins `native-bootstrap-relay` selects it.
+3. **Warm routing and fingerprints:** implemented in controller, gateway and API: identity-bound
+   direct targets, separate configuration and activity/power revisions and runtime attestations.
+   Route token v3 and attestation V1 run today; attestation V2, the admission snapshot and route
+   token v4 ship with the go-live release.
+4. **Rust/Wasm Edge and Actor snapshots:** the Actor's mutation barrier and versioned route snapshots
+   are implemented in the API; the Rust/Wasm Edge preserves real VPC HTTP/unopened-WebSocket
+   forwarding, is built and is not deployed.
+5. **Sub-second wake acceptance:** the go-live acceptance is the parked tier's wake through the normal
+   Cloudflare path (go-live path: sub-second wake). Shared-pool Dev acceptance (section 4) is deferred
+   with the pool.
+6. **Optional later warm reclaim:** evaluate separately; it is not a customer-readiness gate.
 7. **Later independent work:** proxy SCRAM, process/VM snapshot research and optional native CLI stream handling.
 
 The controller handoff retains a single reconciler per region. Use the existing `Recreate` ownership model, stop the previous process and confirm termination on a reachable node before starting its replacement. Do not force-delete an uncertain old Pod and allow two executors during a partition. Resume from current Cloudflare desired state and the existing storage/power/fence records; preserve credential Secret UIDs and versions when unchanged.
 
-Gateway deployments drain actual sessions. New replicas load complete persisted fence state before readiness. During mixed implementation rollout, both versions follow the same control/activity contracts and gateway inventory rules; an incomplete or changing inventory cannot authorize hibernation. Watch gaps invalidate current proofs until recovery, rather than silently accepting stale cache state.
+Gateway deployments drain actual sessions. New replicas load complete persisted fence state before readiness. An incomplete or changing inventory cannot authorize hibernation, and watch gaps invalidate current proofs until recovery, rather than silently accepting stale cache state.
 
-After each native replacement is accepted in Dev, remove its unused TypeScript server implementation and deployment/build path. Retain rollback through Git history and qualified pinned images, not parked code or branches. The management TypeScript applications and initial Node tooling remain intentional components.
+After each native replacement is accepted in Dev, remove its unused TypeScript server implementation and deployment/build path. The TypeScript agent and gateway sources remain only as the reference of the native conformance generators and test harnesses until their constants move into the contracts; the TypeScript relay and Edge remain until their replacements are deployed. Retain rollback through Git history and qualified pinned images, not parked code or branches. The management TypeScript applications and initial Node tooling remain intentional components.
 
 ## 15. Acceptance and measurements
 
 The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#node-acceptance) defines the six
-functional node checks. Its pool cold-start step after R2 requires a real shared-pool first SQL
-result below one second and refill after assignment. Run these through the normal Cloudflare path
-on Dev.
+functional node checks. Its sub-second wake step requires a woken parked database's first SQL
+below one second through the normal Cloudflare path; a shared-pool hit with refill after
+assignment is measured the same way if that pool is built. Run these on Dev.
 Focused regression tests cover changed authentication, TLS, fencing, claims, isolation and
 uncertain-write behavior. Reuse valid unchanged results; do not introduce a second live test matrix.
 
 Record the physical starting state and selected release. Measure `connect_ms` and `first_read_ms`
 from the same instant before connection; the latter includes the complete validated marker query.
-Label pool hits, misses and already-warm connections separately. Retain observed failures and
-unknowns. A slot-assignment duration alone is not SQL latency. No fixed repeated-cycle count,
+Label parked hits, pool hits (if built), demoted or hibernated misses and already-warm connections
+separately. Retain observed failures and unknowns. A slot-assignment duration alone is not SQL
+latency. No fixed repeated-cycle count,
 long laptop monitor or mandatory idle-soak series remains. If the target is missed, document the
 actual limiting stage and fix that observed class. Record completion in the ULTRA plan.
 
@@ -400,12 +444,14 @@ actual limiting stage and fix that observed class. Record completion in the ULTR
 
 Freezing a process, CRIU/container checkpoints and microVM snapshots are separate compute-lifecycle research. Warm reclaim does not require them and does not imply that their socket, storage, credential, WAL or runtime-restoration problems have been solved.
 
-The shared prestarted compute pool is required work in section4, not later research. Its local
-storage/CNPG assignment constraints must be resolved as part of implementation. A complete Neon
-Pageserver/Safekeeper storage replacement, branching, a shared tenant PostgreSQL process and
-per-database automatic compute resizing are not implied by the pool requirement. Any additional
-architecture change required for correct late binding must be identified and resolved explicitly.
+The shared prestarted compute pool is deferred work in section 4, not later research. If it is
+built, its local storage/CNPG assignment constraints must be resolved as part of implementation. A
+complete Neon Pageserver/Safekeeper storage replacement, branching, a shared tenant PostgreSQL
+process and per-database automatic compute resizing are not implied by the pool requirement. Any
+additional architecture change required for correct late binding must be identified and resolved
+explicitly.
 
-The approved target is a native Rust regional stack and full Rust/Wasm Edge, with a shared pool
-of prestarted unassigned compute, configuration-aware assignment, cached verified routing and
-safe hibernation. Warm reclaim remains an additional optimization for an assigned runtime.
+The approved target is a native Rust regional stack and full Rust/Wasm Edge, with cached verified
+routing and safe hibernation, a parked sleep tier for the first sub-second wake and, if built, a
+shared pool of prestarted unassigned compute with configuration-aware assignment. Warm reclaim
+remains an additional optimization for an assigned runtime.
