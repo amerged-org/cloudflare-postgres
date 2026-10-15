@@ -39,12 +39,14 @@
       { "name": "REGION_LINK", "class_name": "RegionLink" },
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
       { "name": "NODE_BOOTSTRAP", "class_name": "NodeBootstrap" },
+      { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
     ],
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RegionLink"] },
     { "tag": "v2", "new_sqlite_classes": ["DatabaseActor"] },
     { "tag": "v3", "new_sqlite_classes": ["NodeBootstrap"] },
+    { "tag": "v4", "new_sqlite_classes": ["CronWatchdog"] },
   ],
   "workflows": [
     {

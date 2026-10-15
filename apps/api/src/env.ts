@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
+import type { CronWatchdog } from "./cron-watchdog.ts";
 
 export type Env = Cloudflare.Env & {
   CF_VERSION_METADATA: WorkerVersionMetadata;
   PATCH_NODE: Workflow<{ operation_id: string }>;
   THIN_QUALIFICATION: Workflow<{ run_id: string }>;
   INFRASTRUCTURE_BACKUP?: Workflow<{ run_id: string }>;
+  CRON_WATCHDOG?: DurableObjectNamespace<CronWatchdog>;
   INFRASTRUCTURE_BACKUP_CF_TOKEN?: string;
   RESEND_API_KEY?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;

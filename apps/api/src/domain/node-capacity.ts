@@ -19,7 +19,7 @@ import {
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 import type { Env } from "../env.ts";
 import { regionalRamWindowSql } from "./memory-capacity.ts";
-import { runInfrastructureAlerts } from "./infrastructure-alerts.ts";
+import { cronErrorCode } from "./cron-health.ts";
 import {
   NodeAdditionRequest,
   NodeOrderConfiguration,
@@ -411,23 +411,27 @@ export async function runNodeCapacityCron(env: Env) {
     "SELECT region_id FROM node_region_policies ORDER BY region_id LIMIT 4",
   ).all<{ region_id: string }>();
   const decisions = [];
+  let failure: { error: unknown } | undefined;
   for (const row of policies.results) {
-    const decision = await runNodeCapacity(env, row.region_id);
-    decisions.push(decision);
     try {
-      await runInfrastructureAlerts(env, row.region_id);
-    } catch {
+      const decision = await runNodeCapacity(env, row.region_id);
+      decisions.push(decision);
+      if (decision.action !== "idle")
+        console.log(
+          JSON.stringify({ event: "node_capacity_decision", ...decision }),
+        );
+    } catch (error) {
+      // One region's failure must not skip the other regions; the cron step still reports it.
       console.error(
         JSON.stringify({
-          event: "infrastructure_alert_check_failed",
+          event: "node_capacity_failed",
           region_id: row.region_id,
+          error_code: cronErrorCode(error),
         }),
       );
+      failure ??= { error };
     }
-    if (decision.action !== "idle")
-      console.log(
-        JSON.stringify({ event: "node_capacity_decision", ...decision }),
-      );
   }
+  if (failure) throw failure.error;
   return decisions;
 }

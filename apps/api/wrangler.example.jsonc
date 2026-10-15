@@ -58,12 +58,16 @@
       { "name": "REGION_LINK", "class_name": "RegionLink" },
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
       { "name": "NODE_BOOTSTRAP", "class_name": "NodeBootstrap" },
+      // Checks the minute cron's heartbeat from its own alarm; keep the binding and the v4 migration
+      // in every deployed configuration so a stopped or failing cron is still reported.
+      { "name": "CRON_WATCHDOG", "class_name": "CronWatchdog" },
     ],
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RegionLink"] },
     { "tag": "v2", "new_sqlite_classes": ["DatabaseActor"] },
     { "tag": "v3", "new_sqlite_classes": ["NodeBootstrap"] },
+    { "tag": "v4", "new_sqlite_classes": ["CronWatchdog"] },
   ],
   "containers": [
     {

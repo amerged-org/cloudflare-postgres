@@ -191,6 +191,11 @@ it("reports every infrastructure alert kind of a region", async () => {
   const f = await fixture(),
     occurred_at = new Date().toISOString(),
     kinds = [
+      "control_cron_stalled",
+      "control_cron_step_failing",
+      "database_archive_failing",
+      "database_base_backup_stale",
+      "database_storage_protected",
       "infrastructure_backup_failed",
       "infrastructure_backup_stale",
       "regional_node_cap_reached",
@@ -199,6 +204,7 @@ it("reports every infrastructure alert kind of a region", async () => {
       "regional_node_stale",
       "regional_node_storage_warning",
       "regional_ram_warning",
+      "thin_storage_blocked",
     ];
   await env.DB.batch(
     kinds.map((kind) =>
@@ -226,4 +232,58 @@ it("reports every infrastructure alert kind of a region", async () => {
       ?.infrastructure_alerts?.map((alert) => alert.kind)
       .sort(),
   ).toEqual(kinds);
+});
+
+it("reports the minute cron's heartbeat with the regions", async () => {
+  const f = await fixture(),
+    now = Date.now();
+  const read = async () =>
+    (
+      await healthRequest("/v1/operational-health?scope=regions", f.admin)
+    ).json<{
+      cron: {
+        status: string;
+        last_started_at: string | null;
+        last_completed_at: string | null;
+        watchdog_checked_at: string | null;
+        failing_steps: { step: string; consecutive_failures: number }[];
+      };
+    }>();
+  await env.DB.prepare("DELETE FROM cron_heartbeat").run();
+  expect((await read()).cron).toEqual({
+    status: "unknown",
+    last_started_at: null,
+    last_completed_at: null,
+    watchdog_checked_at: null,
+    failing_steps: [],
+  });
+  const failing = JSON.stringify({
+    usage: {
+      consecutive_failures: 5,
+      error_code: "usage_cron_statement_budget",
+    },
+  });
+  await env.DB.prepare(
+    "INSERT INTO cron_heartbeat(singleton,started_at,completed_at,watchdog_checked_at,failing_steps_json) VALUES(1,?,?,?,?)",
+  )
+    .bind(
+      new Date(now - 10_000).toISOString(),
+      new Date(now - 5_000).toISOString(),
+      new Date(now - 1_000).toISOString(),
+      failing,
+    )
+    .run();
+  expect((await read()).cron).toMatchObject({
+    status: "failing",
+    last_completed_at: new Date(now - 5_000).toISOString(),
+    watchdog_checked_at: new Date(now - 1_000).toISOString(),
+    failing_steps: [{ step: "usage", consecutive_failures: 5 }],
+  });
+  await env.DB.prepare(
+    "UPDATE cron_heartbeat SET completed_at=?,failing_steps_json='{}'",
+  )
+    .bind(new Date(now - 6 * 60_000).toISOString())
+    .run();
+  expect((await read()).cron.status).toBe("stalled");
+  await env.DB.prepare("DELETE FROM cron_heartbeat").run();
 });

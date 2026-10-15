@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  INFRA_ALERT_ACTIONS,
   InfraAlert,
   InfraAlertStatus,
   type InfraAlertKind,
@@ -8,7 +9,12 @@ import {
   infrastructureBackupHealth,
   readInfrastructureBackupConfig,
 } from "./infrastructure-backups.ts";
-import { heartbeatHealth } from "./operational-health.ts";
+import {
+  BASE_BACKUP_MAX_AGE_MS,
+  heartbeatHealth,
+} from "./operational-health.ts";
+import { NODE_OBSERVATION_MAX_AGE_MS } from "./placement.ts";
+import { cronErrorCode, readCronHealth } from "./cron-health.ts";
 import type { Env } from "../env.ts";
 import {
   MEMORY_SAMPLE_MAX_AGE_MS,
@@ -236,6 +242,7 @@ export async function runInfrastructureAlerts(
   regionId: string,
   now = Date.now(),
   fetcher: typeof fetch = fetch,
+  deadline?: number,
 ): Promise<{ delivered: number; pending: number }> {
   const policy = await env.DB.prepare(
     "SELECT max_nodes,ram_warning_threshold_ppm,cap_warning_enabled,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm FROM node_region_policies WHERE region_id=?",
@@ -339,6 +346,7 @@ export async function runInfrastructureAlerts(
       regional_ram_utilization_ppm: utilization,
       allocated_nodes: allocated,
       max_nodes: policy.max_nodes,
+      action: INFRA_ALERT_ACTIONS[kind],
       ...detail,
     });
     await env.DB.prepare(
@@ -370,17 +378,25 @@ export async function runInfrastructureAlerts(
     now,
     fetcher,
     conditions,
+    deadline,
   );
 }
 
-async function deliverAlertRows(
+/**
+ * Sends each row once with a 5 s deadline. A caller that must not be held back passes `deadline`
+ * (epoch milliseconds): once it has passed, the remaining rows are left unclaimed, so the next
+ * run retries them at once instead of after the retry interval.
+ */
+export async function deliverAlertRows(
   env: Env,
   regionId: string,
   rows: AlertRow[],
   now: number,
   fetcher: typeof fetch,
   conditions?: AlertCondition[],
+  deadline?: number,
 ) {
+  if (rows.length === 0) return { delivered: 0, pending: 0 };
   const webhook = callback(env),
     config = await readInfrastructureBackupConfig(env.DB);
   const email =
@@ -397,7 +413,17 @@ async function deliverAlertRows(
   if (!webhook && !email) return { delivered: 0, pending: rows.length };
   const timestamp = new Date(now).toISOString();
   let delivered = 0;
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      console.error(
+        JSON.stringify({
+          event: "infrastructure_alert_deferred",
+          region_id: regionId,
+          deferred: rows.length - index,
+        }),
+      );
+      break;
+    }
     const condition = conditions?.find((value) => value.kind === row.kind);
     if (conditions && condition?.active !== true) continue;
     const claim = await env.DB.prepare(
@@ -434,6 +460,7 @@ async function deliverAlertRows(
           "Content-Type": "application/json",
           Authorization: `Bearer ${webhook?.token ?? email!.token}`,
           "Idempotency-Key": row.event_id,
+          "User-Agent": "pgcf-infrastructure-alerts",
         },
         body,
       };
@@ -457,15 +484,40 @@ async function deliverAlertRows(
       });
       const response = await Promise.race([delivery, deadline]);
       void response.body?.cancel().catch(() => {});
-      if (!response.ok) continue;
+      if (!response.ok) {
+        // Status only: the body and the destination's details stay out of the log.
+        console.error(
+          JSON.stringify({
+            event: "infrastructure_alert_delivery_failed",
+            region_id: regionId,
+            kind: row.kind,
+            event_id: row.event_id,
+            status: response.status,
+          }),
+        );
+        continue;
+      }
       const ack = await env.DB.prepare(
         "UPDATE infrastructure_alerts SET delivered_at=? WHERE region_id=? AND kind=? AND event_id=? AND active=1 AND delivered_at IS NULL AND last_attempt_at=?",
       )
         .bind(timestamp, regionId, row.kind, row.event_id, timestamp)
         .run();
       delivered += ack.meta.changes;
-    } catch {
+    } catch (error) {
       /* Same event ID and payload on retry; recipients must deduplicate callbacks, Resend uses its idempotency key. */
+      console.error(
+        JSON.stringify({
+          event: "infrastructure_alert_delivery_failed",
+          region_id: regionId,
+          kind: row.kind,
+          event_id: row.event_id,
+          reason:
+            error instanceof Error &&
+            error.message === "infrastructure_alert_timeout"
+              ? "timeout"
+              : "transport",
+        }),
+      );
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -473,96 +525,577 @@ async function deliverAlertRows(
   return { delivered, pending: rows.length - delivered };
 }
 
-/** Reuse existing heartbeat and daily backup health; one durable alarm episode per region and kind. */
+/** A protective stop raises database_storage_protected once it has lasted this long. */
+export const STORAGE_PROTECTION_ALERT_MS = 5 * 60_000;
+
+type EventDetail = Partial<
+  Pick<
+    InfraAlert,
+    "node_ids" | "backup_artifacts" | "database_ids" | "thin_storage" | "cron"
+  >
+>;
+/**
+ * What one evaluation says about a kind: its condition holds (`active`, naming the subjects that
+ * fail when it has any), is known to be over (`resolved`), or cannot be judged (`retain`: an
+ * unknown measurement neither starts nor clears an episode).
+ */
+type Observation =
+  | { state: "active"; detail: EventDetail; subjects?: string[] }
+  | { state: "resolved" }
+  | { state: "retain" };
+
+/** The databases or nodes a stored episode names. */
+function listedSubjects(payload: string): Set<string> {
+  const ids = new Set<string>();
+  try {
+    const event = JSON.parse(payload) as {
+      database_ids?: unknown;
+      node_ids?: unknown;
+      thin_storage?: unknown;
+    };
+    for (const list of [event.database_ids, event.node_ids])
+      if (Array.isArray(list))
+        for (const id of list) if (typeof id === "string") ids.add(id);
+    if (Array.isArray(event.thin_storage))
+      for (const entry of event.thin_storage) {
+        const id = (entry as { node_id?: unknown } | null)?.node_id;
+        if (typeof id === "string") ids.add(id);
+      }
+  } catch {
+    /* An unreadable payload names nobody; the next failing subject replaces the episode. */
+  }
+  return ids;
+}
+
+/**
+ * Moves one episode to what the evaluation observed and reports whether it wrote. A new episode
+ * gets a new event; a continuing one keeps its event ID and payload so retries stay identical. An
+ * active episode that fails a subject it does not list is replaced by a new event that lists the
+ * current subjects, so a later failure is announced instead of hiding behind the first one; a
+ * listed subject that recovers and fails again adds nothing.
+ */
+async function reconcileEpisode(
+  env: Env,
+  regionId: string,
+  kind: InfraAlertKind,
+  observation: Observation,
+  current: AlertRow | undefined,
+  now: number,
+  allocated: () => Promise<number>,
+): Promise<boolean> {
+  if (observation.state === "retain") return false;
+  const active = current?.active === 1;
+  if (observation.state === "resolved") {
+    if (!active) return false;
+    await env.DB.prepare(
+      "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND event_id=?",
+    )
+      .bind(regionId, kind, current!.event_id)
+      .run();
+    return true;
+  }
+  if (active) {
+    const named = observation.subjects;
+    if (!named?.length) return false;
+    const listed = listedSubjects(current!.payload);
+    if (named.every((id) => listed.has(id))) return false;
+  }
+  const event = InfraAlert.parse({
+    version: 1,
+    event_id: crypto.randomUUID(),
+    kind,
+    region_id: regionId,
+    occurred_at: new Date(now).toISOString(),
+    regional_ram_utilization_ppm: null,
+    allocated_nodes: await allocated(),
+    max_nodes: null,
+    action: INFRA_ALERT_ACTIONS[kind],
+    ...observation.detail,
+  });
+  // Arms a cleared episode, or replaces exactly the one this evaluation read.
+  await env.DB.prepare(
+    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0 OR infrastructure_alerts.event_id=?`,
+  )
+    .bind(
+      regionId,
+      kind,
+      event.event_id,
+      JSON.stringify(event),
+      current?.event_id ?? null,
+    )
+    .run();
+  return true;
+}
+
+const storedEpisodes = async (db: D1Database, regionId: string) =>
+  new Map(
+    (
+      await db
+        .prepare("SELECT * FROM infrastructure_alerts WHERE region_id=?")
+        .bind(regionId)
+        .all<AlertRow>()
+    ).results.map((row) => [row.kind, row] as const),
+  );
+const lazyAllocated = (db: D1Database, regionId: string) => {
+  let value: Promise<number> | undefined;
+  return () => (value ??= allocatedRegionalNodes(db, regionId));
+};
+
+/**
+ * The latest of a database's last completed base backup, its placement and its last wake: a
+ * database hibernated through its daily 03:00 backup skips it, so its 36 h count from waking. A
+ * `ready` event is deliberately not a wake: every generation bump (a role, a resize) writes one.
+ */
+const backupBaselineSql = (database: string) =>
+  `MAX(COALESCE(${database}.backup_last_completed_at,''),COALESCE((SELECT MAX(e.occurred_at) FROM lifecycle_events e WHERE e.database_id=${database}.id AND e.kind IN('created','woke')),''),${database}.created_at)`;
+
+interface Subject {
+  id: string;
+  detail: string | null;
+}
+type RegionSubjects = Map<
+  InfraAlertKind,
+  { failing: Subject[]; unresolved: number }
+>;
+/**
+ * One statement reads every database and Thin storage condition of a region. `failing` rows are
+ * the subjects that hold the condition now; `unresolved` rows are the subjects a still active
+ * episode names that are not yet known to be fine, so an unknown measurement keeps the episode.
+ */
+async function readRegionSubjects(
+  db: D1Database,
+  regionId: string,
+  now: number,
+): Promise<RegionSubjects> {
+  // D1 admits at most five terms in a compound SELECT, so each kind is one term that returns its
+  // failing subjects together with the subjects its active episode still names.
+  const baseline = backupBaselineSql("d"),
+    backupFailing = `(d.observed_state='ready' AND d.backup_observed_at IS NOT NULL AND d.backup_observed_at>=p.fresh
+      AND (d.backup_health='failing' OR (d.backup_health='ok' AND d.backup_last_completed_at IS NOT NULL))
+      AND ${baseline}<p.backup_before)`,
+    backupGood = `(d.backup_health='ok' AND d.backup_observed_at IS NOT NULL AND d.backup_observed_at>=p.fresh
+      AND ${baseline}>=p.backup_before)`;
+  const result = await db
+    .prepare(
+      `WITH p AS (SELECT ? region,? fresh,? backup_before,? protected_before)
+      SELECT * FROM (SELECT 'database_archive_failing' kind,
+          CASE WHEN d.observed_state='ready' AND d.observed_power='awake' AND d.archiving_health='failing' THEN 'failing' ELSE 'unresolved' END state,
+          d.id subject,NULL detail
+        FROM databases d,p WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.desired_state='running'
+          AND d.archiving_health<>'ok'
+          AND ((d.observed_state='ready' AND d.observed_power='awake' AND d.archiving_health='failing')
+            OR d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
+              WHERE a.region_id=d.region_id AND a.kind='database_archive_failing' AND a.active=1))
+        ORDER BY state,d.archiving_health_since,d.id LIMIT 64)
+      UNION ALL SELECT * FROM (SELECT 'database_base_backup_stale',
+          CASE WHEN ${backupFailing} THEN 'failing' ELSE 'unresolved' END state,d.id,NULL
+        FROM databases d,p WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.desired_state='running'
+          AND d.observed_power='awake'
+          AND (${backupFailing}
+            OR (d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
+              WHERE a.region_id=d.region_id AND a.kind='database_base_backup_stale' AND a.active=1)
+              AND NOT ${backupGood}))
+        ORDER BY state,${baseline},d.id LIMIT 64)
+      UNION ALL SELECT * FROM (SELECT 'thin_storage_blocked',
+          CASE WHEN t.status='blocked' THEN 'failing' ELSE 'unresolved' END state,t.node_id,t.error_code
+        FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id,p
+        WHERE n.region_id=p.region AND n.lost_at IS NULL
+          AND (t.status='blocked'
+            OR (t.status<>'ready' AND t.node_id IN(SELECT json_extract(s.value,'$.node_id')
+              FROM infrastructure_alerts a,json_each(a.payload,'$.thin_storage') s
+              WHERE a.region_id=n.region_id AND a.kind='thin_storage_blocked' AND a.active=1)))
+        ORDER BY state,t.node_id LIMIT 16)
+      UNION ALL SELECT * FROM (SELECT 'database_storage_protected',
+          CASE WHEN d.storage_protected_at<=p.protected_before THEN 'failing' ELSE 'unresolved' END state,
+          d.id,d.storage_protected_at
+        FROM databases d,p WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.desired_state='running'
+          AND d.storage_protected_at IS NOT NULL AND d.storage_protected_generation=d.generation
+          AND (d.storage_protected_at<=p.protected_before
+            OR d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
+              WHERE a.region_id=d.region_id AND a.kind='database_storage_protected' AND a.active=1))
+        ORDER BY state,d.storage_protected_at,d.id LIMIT 64)`,
+    )
+    .bind(
+      regionId,
+      new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
+      new Date(now - BASE_BACKUP_MAX_AGE_MS).toISOString(),
+      new Date(now - STORAGE_PROTECTION_ALERT_MS).toISOString(),
+    )
+    .all<{
+      kind: InfraAlertKind;
+      state: "failing" | "unresolved";
+      subject: string;
+      detail: string | null;
+    }>();
+  const subjects: RegionSubjects = new Map();
+  for (const row of result.results) {
+    const entry = subjects.get(row.kind) ?? { failing: [], unresolved: 0 };
+    if (row.state === "failing")
+      entry.failing.push({ id: row.subject, detail: row.detail });
+    else entry.unresolved++;
+    subjects.set(row.kind, entry);
+  }
+  return subjects;
+}
+
+const subjectObservation = (
+  entry: { failing: Subject[]; unresolved: number } | undefined,
+  detail: (failing: Subject[]) => EventDetail,
+): Observation =>
+  entry?.failing.length
+    ? {
+        state: "active",
+        detail: detail(entry.failing),
+        subjects: entry.failing.map((subject) => subject.id),
+      }
+    : entry?.unresolved
+      ? { state: "retain" }
+      : { state: "resolved" };
+
+const HEALTH_KINDS = [
+  "regional_node_stale",
+  "infrastructure_backup_failed",
+  "infrastructure_backup_stale",
+  "database_archive_failing",
+  "database_base_backup_stale",
+  "thin_storage_blocked",
+  "database_storage_protected",
+] as const satisfies readonly InfraAlertKind[];
+const pendingOf = (
+  episodes: Iterable<AlertRow>,
+  kinds: readonly InfraAlertKind[],
+) =>
+  [...episodes]
+    .filter(
+      (row) =>
+        row.active === 1 &&
+        row.delivered_at === null &&
+        kinds.includes(row.kind),
+    )
+    .sort((a, b) => (a.kind < b.kind ? -1 : 1));
+
+async function regionHealthAlerts(
+  env: Env,
+  regionId: string,
+  /** Null when the backup health could not be read: the backup kinds are then unknown. */
+  health: Awaited<ReturnType<typeof infrastructureBackupHealth>> | null,
+  now: number,
+  fetcher: typeof fetch,
+  deadline: number | undefined,
+) {
+  const nodes = await env.DB.prepare(
+    "SELECT id,last_observed_at,lost_at FROM nodes WHERE region_id=? AND node_uid IS NOT NULL AND (last_observed_at IS NOT NULL OR lost_at IS NOT NULL) ORDER BY id",
+  )
+    .bind(regionId)
+    .all<{
+      id: string;
+      last_observed_at: string | null;
+      lost_at: string | null;
+    }>();
+  const failedNodes = nodes.results
+    .filter((node) =>
+      ["stale", "lost"].includes(
+        heartbeatHealth(node.last_observed_at, node.lost_at, now).status,
+      ),
+    )
+    .slice(0, 64);
+  const backups = (health ?? []).filter(
+      (value) => value.region_id === regionId,
+    ),
+    backupObservation = (status: "failing" | "stale"): Observation => {
+      if (health === null) return { state: "retain" };
+      const artifacts = backups.filter((value) => value.status === status);
+      if (artifacts.length)
+        return {
+          state: "active",
+          detail: {
+            backup_artifacts: artifacts.map((value) => ({
+              kind: value.kind,
+              status,
+              last_completed_at: value.last_completed_at,
+              error_code: value.error_code,
+            })),
+          },
+        };
+      // An artifact whose health is unknown (its custody could not be read, or nothing has failed
+      // or completed yet) keeps an active episode: clearing it would send it again next minute.
+      return backups.some((value) => value.status === "unknown")
+        ? { state: "retain" }
+        : { state: "resolved" };
+    };
+  const current = await storedEpisodes(env.DB, regionId);
+  // The database and Thin storage reads fail on their own: the node and backup kinds above still
+  // evaluate, and the unread kinds are unknown (retained) for this minute.
+  let subjects: RegionSubjects | undefined,
+    readFailure: { error: unknown } | undefined;
+  try {
+    subjects = await readRegionSubjects(env.DB, regionId, now);
+  } catch (error) {
+    readFailure = { error };
+  }
+  const subjectOf = (
+    kind: InfraAlertKind,
+    detail: (failing: Subject[]) => EventDetail,
+  ): Observation =>
+    subjects
+      ? subjectObservation(subjects.get(kind), detail)
+      : { state: "retain" };
+  const observations: [InfraAlertKind, Observation][] = [
+    [
+      "regional_node_stale",
+      failedNodes.length
+        ? {
+            state: "active",
+            detail: { node_ids: failedNodes.map((node) => node.id) },
+            subjects: failedNodes.map((node) => node.id),
+          }
+        : { state: "resolved" },
+    ],
+    ["infrastructure_backup_failed", backupObservation("failing")],
+    ["infrastructure_backup_stale", backupObservation("stale")],
+    [
+      "database_archive_failing",
+      subjectOf("database_archive_failing", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
+      })),
+    ],
+    [
+      "database_base_backup_stale",
+      subjectOf("database_base_backup_stale", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
+      })),
+    ],
+    [
+      "thin_storage_blocked",
+      subjectOf("thin_storage_blocked", (failing) => ({
+        thin_storage: failing.map((subject) => ({
+          node_id: subject.id,
+          error_code: subject.detail,
+        })),
+      })),
+    ],
+    [
+      "database_storage_protected",
+      subjectOf("database_storage_protected", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
+      })),
+    ],
+  ];
+  await reconcileAndDeliver(
+    env,
+    regionId,
+    observations,
+    current,
+    HEALTH_KINDS,
+    now,
+    fetcher,
+    deadline,
+    readFailure,
+  );
+}
+
+/**
+ * Reconciles every kind of a region, delivers what is pending, then rethrows the first failure: a
+ * kind that fails to evaluate or write never keeps the others from being judged or sent.
+ */
+async function reconcileAndDeliver(
+  env: Env,
+  regionId: string,
+  observations: [InfraAlertKind, Observation][],
+  current: Map<InfraAlertKind, AlertRow>,
+  kinds: readonly InfraAlertKind[],
+  now: number,
+  fetcher: typeof fetch,
+  deadline: number | undefined,
+  earlier?: { error: unknown },
+) {
+  const allocated = lazyAllocated(env.DB, regionId);
+  let written = false,
+    failure = earlier;
+  for (const [kind, observation] of observations)
+    try {
+      written =
+        (await reconcileEpisode(
+          env,
+          regionId,
+          kind,
+          observation,
+          current.get(kind),
+          now,
+          allocated,
+        )) || written;
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "infrastructure_alert_episode_failed",
+          region_id: regionId,
+          kind,
+          error_code: cronErrorCode(error),
+        }),
+      );
+      failure ??= { error };
+    }
+  const rows = written
+    ? pendingOf((await storedEpisodes(env.DB, regionId)).values(), kinds)
+    : pendingOf(current.values(), kinds);
+  await deliverAlertRows(
+    env,
+    regionId,
+    rows,
+    now,
+    fetcher,
+    undefined,
+    deadline,
+  );
+  if (failure) throw failure.error;
+}
+
+/**
+ * Evaluates, for every region, the alarms that need no policy threshold: node heartbeats, daily
+ * backup health and the database and Thin storage conditions. One durable episode per region and
+ * kind; a region's failure is logged and does not skip the others, and an unreadable backup health
+ * leaves only the backup kinds unknown.
+ */
 export async function runInfrastructureHealthAlerts(
   env: Env,
   now = Date.now(),
   fetcher: typeof fetch = fetch,
+  deadline?: number,
 ) {
-  const health = await infrastructureBackupHealth(env, now),
-    regions = await env.DB.prepare("SELECT id FROM regions ORDER BY id").all<{
-      id: string;
-    }>();
-  for (const region of regions.results) {
-    const nodes = await env.DB.prepare(
-      "SELECT id,last_observed_at,lost_at FROM nodes WHERE region_id=? AND node_uid IS NOT NULL AND (last_observed_at IS NOT NULL OR lost_at IS NOT NULL) ORDER BY id",
-    )
-      .bind(region.id)
-      .all<{
-        id: string;
-        last_observed_at: string | null;
-        lost_at: string | null;
-      }>();
-    const failedNodes = nodes.results
-      .filter((node) =>
-        ["stale", "lost"].includes(
-          heartbeatHealth(node.last_observed_at, node.lost_at, now).status,
-        ),
-      )
-      .slice(0, 64);
-    const backups = health.filter((value) => value.region_id === region.id),
-      allocated = await allocatedRegionalNodes(env.DB, region.id);
-    const episodes = [
-      {
-        kind: "regional_node_stale" as const,
-        active: failedNodes.length > 0,
-        node_ids: failedNodes.map((node) => node.id),
-      },
-      {
-        kind: "infrastructure_backup_failed" as const,
-        active: backups.some((value) => value.status === "failing"),
-        backup_artifacts: backups
-          .filter((value) => value.status === "failing")
-          .map((value) => ({
-            kind: value.kind,
-            status: "failing" as const,
-            last_completed_at: value.last_completed_at,
-            error_code: value.error_code,
-          })),
-      },
-      {
-        kind: "infrastructure_backup_stale" as const,
-        active: backups.some((value) => value.status === "stale"),
-        backup_artifacts: backups
-          .filter((value) => value.status === "stale")
-          .map((value) => ({
-            kind: value.kind,
-            status: "stale" as const,
-            last_completed_at: value.last_completed_at,
-            error_code: value.error_code,
-          })),
-      },
-    ];
-    for (const { active, ...detail } of episodes) {
-      if (!active) {
-        await env.DB.prepare(
-          "UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=?",
-        )
-          .bind(region.id, detail.kind)
-          .run();
-        continue;
-      }
-      const event = InfraAlert.parse({
-        version: 1,
-        event_id: crypto.randomUUID(),
-        region_id: region.id,
-        occurred_at: new Date(now).toISOString(),
-        regional_ram_utilization_ppm: null,
-        allocated_nodes: allocated,
-        max_nodes: null,
-        ...detail,
-      });
-      await env.DB.prepare(
-        `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?) ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0`,
-      )
-        .bind(region.id, event.kind, event.event_id, JSON.stringify(event))
-        .run();
-    }
-    const rows = await env.DB.prepare(
-      "SELECT * FROM infrastructure_alerts WHERE region_id=? AND active=1 AND delivered_at IS NULL AND kind IN('regional_node_stale','infrastructure_backup_failed','infrastructure_backup_stale') ORDER BY kind",
-    )
-      .bind(region.id)
-      .all<AlertRow>();
-    await deliverAlertRows(env, region.id, rows.results, now, fetcher);
+  let failure: { error: unknown } | undefined,
+    health: Awaited<ReturnType<typeof infrastructureBackupHealth>> | null =
+      null;
+  try {
+    health = await infrastructureBackupHealth(env, now);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "infrastructure_backup_health_failed",
+        error_code: cronErrorCode(error),
+      }),
+    );
+    failure = { error };
   }
+  const regions = await env.DB.prepare(
+    "SELECT id FROM regions ORDER BY id",
+  ).all<{
+    id: string;
+  }>();
+  for (const region of regions.results)
+    try {
+      await regionHealthAlerts(env, region.id, health, now, fetcher, deadline);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "infrastructure_health_alert_failed",
+          region_id: region.id,
+          error_code: cronErrorCode(error),
+        }),
+      );
+      failure ??= { error };
+    }
+  if (failure) throw failure.error;
+}
+
+/** The capacity policy's thresholds for the first four regions with a policy, in region ID order. */
+export async function runCapacityAlertsCron(
+  env: Env,
+  now = Date.now(),
+  fetcher: typeof fetch = fetch,
+  deadline?: number,
+) {
+  const policies = await env.DB.prepare(
+    "SELECT region_id FROM node_region_policies ORDER BY region_id LIMIT 4",
+  ).all<{ region_id: string }>();
+  let failure: { error: unknown } | undefined;
+  for (const row of policies.results)
+    try {
+      await runInfrastructureAlerts(env, row.region_id, now, fetcher, deadline);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "infrastructure_alert_check_failed",
+          region_id: row.region_id,
+          error_code: cronErrorCode(error),
+        }),
+      );
+      failure ??= { error };
+    }
+  if (failure) throw failure.error;
+}
+
+const CRON_KINDS = [
+  "control_cron_stalled",
+  "control_cron_step_failing",
+] as const satisfies readonly InfraAlertKind[];
+
+/**
+ * Judges the minute cron's heartbeat and raises its alarms in every region. It never runs inside
+ * the cron: the CronWatchdog Durable Object alarm calls it, so a cron that is stopped, hanging or
+ * failing is reported by a clock the cron does not own.
+ */
+export async function runCronWatchdog(
+  env: Env,
+  now = Date.now(),
+  fetcher: typeof fetch = fetch,
+): Promise<void> {
+  const health = await readCronHealth(env.DB, now);
+  // Until the cron has recorded a run there is nothing to judge.
+  if (health.status === "unknown") return;
+  await env.DB.prepare(
+    "UPDATE cron_heartbeat SET watchdog_checked_at=? WHERE singleton=1",
+  )
+    .bind(new Date(now).toISOString())
+    .run();
+  const detail: EventDetail = {
+    cron: {
+      last_started_at: health.last_started_at,
+      last_completed_at: health.last_completed_at,
+      failing_steps: health.failing_steps,
+    },
+  };
+  const observations: [InfraAlertKind, Observation][] = [
+    [
+      "control_cron_stalled",
+      health.status === "stalled"
+        ? { state: "active", detail }
+        : { state: "resolved" },
+    ],
+    [
+      "control_cron_step_failing",
+      // A stalled cron's step counters are those of its last completed run: not a fresh measurement.
+      health.status === "stalled"
+        ? { state: "retain" }
+        : health.status === "failing"
+          ? { state: "active", detail }
+          : { state: "resolved" },
+    ],
+  ];
+  const regions = await env.DB.prepare(
+    "SELECT id FROM regions ORDER BY id",
+  ).all<{ id: string }>();
+  let failure: { error: unknown } | undefined;
+  for (const region of regions.results)
+    try {
+      await reconcileAndDeliver(
+        env,
+        region.id,
+        observations,
+        await storedEpisodes(env.DB, region.id),
+        CRON_KINDS,
+        now,
+        fetcher,
+        undefined,
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "cron_watchdog_region_failed",
+          region_id: region.id,
+          error_code: cronErrorCode(error),
+        }),
+      );
+      failure ??= { error };
+    }
+  if (failure) throw failure.error;
 }

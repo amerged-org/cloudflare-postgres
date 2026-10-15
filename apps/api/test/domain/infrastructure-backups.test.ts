@@ -1051,6 +1051,52 @@ it("first failed run is failing without an older success; stale grace expires an
     await infrastructureBackupHealth(env, at + 37 * 3600000),
   ).toContainEqual(expect.objectContaining({ status: "stale" }));
 });
+it("keeps a failed backup episode while its health is unknown instead of clearing and re-sending it", async () => {
+  const f = await fixture(),
+    at = Date.now(),
+    run = crypto.randomUUID(),
+    c = await configureInfrastructureBackups(
+      enabled(),
+      config(f.region),
+      at - 3600000,
+    );
+  await env.DB.prepare(
+    "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,?,1,?,'running',?,?)",
+  )
+    .bind(
+      run,
+      new Date(at).toISOString().slice(0, 10),
+      c.revision,
+      new Date(at - 1000).toISOString(),
+      new Date(at + 3600000).toISOString(),
+    )
+    .run();
+  await finishInfrastructureBackup(
+    env,
+    run,
+    new Error("infrastructure_backup_snapshot_source_unavailable"),
+  );
+  await runInfrastructureHealthAlerts(enabled(), Date.now());
+  const armed = (await infrastructureAlertStatus(env.DB, f.region)).find(
+    (a) => a.kind === "infrastructure_backup_failed",
+  );
+  expect(armed).toMatchObject({ active: true });
+  // The run history is gone: nothing failed, nothing completed and the 36 h grace has not run out.
+  await env.DB.prepare("DELETE FROM infrastructure_backup_runs").run();
+  expect(await infrastructureBackupHealth(env, Date.now())).toContainEqual(
+    expect.objectContaining({
+      kind: "d1",
+      region_id: f.region,
+      status: "unknown",
+    }),
+  );
+  await runInfrastructureHealthAlerts(enabled(), Date.now() + 1000);
+  expect(
+    (await infrastructureAlertStatus(env.DB, f.region)).find(
+      (a) => a.kind === "infrastructure_backup_failed",
+    ),
+  ).toMatchObject({ active: true, event_id: armed!.event_id });
+});
 it("retains lost/stale node episodes using existing heartbeat freshness, without recipient defaults", async () => {
   const f = await fixture(),
     at = Date.now();
