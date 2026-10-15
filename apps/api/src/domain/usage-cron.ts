@@ -177,7 +177,7 @@ export async function runUsageCron(
   const page = await db
     .prepare(
       `SELECT d.id,d.created_at,
-    CASE WHEN d.observed_state='deleted' THEN (SELECT MAX(occurred_at) FROM lifecycle_events WHERE database_id=d.id AND kind='deleted') ELSE NULL END terminal_at
+    CASE WHEN d.observed_state='deleted' THEN COALESCE((SELECT MAX(occurred_at) FROM lifecycle_events WHERE database_id=d.id AND kind='deleted'),d.deleted_at) ELSE NULL END terminal_at
     FROM databases d WHERE d.id>? ORDER BY d.id LIMIT ?`,
     )
     .bind(cursor ?? "", USAGE_CRON_PAGE_LIMIT + 1)

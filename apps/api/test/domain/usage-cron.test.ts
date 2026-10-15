@@ -508,7 +508,10 @@ describe("bounded usage cron", () => {
 });
 
 describe("backup measurement of a deleted database", () => {
-  async function deleted(deletedAt: (current: number) => number) {
+  async function deleted(
+    deletedAt: (current: number) => number,
+    { events = true, visits = 1 } = {},
+  ) {
     const f = await cohort(),
       id = f.ids[0]!,
       now = Date.now(),
@@ -528,8 +531,12 @@ describe("backup measurement of a deleted database", () => {
       env.DB.prepare(
         "UPDATE databases SET archive_path=?,created_at=? WHERE id=?",
       ).bind(archivePath, iso(current - 5 * USAGE_HOUR_MS), id),
-      f.event(id, "created", current - 5 * USAGE_HOUR_MS - start),
-      f.event(id, "deleted", removed - start),
+      ...(events
+        ? [
+            f.event(id, "created", current - 5 * USAGE_HOUR_MS - start),
+            f.event(id, "deleted", removed - start),
+          ]
+        : []),
       env.DB.prepare(
         "UPDATE databases SET desired_state='deleted',deleted_at=?,observed_state='deleted' WHERE id=?",
       ).bind(iso(removed), id),
@@ -537,19 +544,28 @@ describe("backup measurement of a deleted database", () => {
     const prefix = `${f.region}/${id}/${archivePath.slice(archivePath.lastIndexOf("/") + 1)}/database/`,
       key = `${prefix}fixture`;
     await env.ARCHIVE_US.put(key, new Uint8Array(37));
-    const result = await runUsageCron(env.DB, now, {
+    const archive = {
       ...env,
       ARCHIVE_BINDINGS: JSON.stringify({
         [f.region]: { binding: "ARCHIVE_US", bucket: "pgcf-api-us-test" },
       }),
-    });
+    };
+    let result = await runUsageCron(env.DB, now, archive);
+    for (let visit = 1; visit < visits; visit++) {
+      const again = await runUsageCron(env.DB, now, archive);
+      result = {
+        ...again,
+        backupMeasured: result.backupMeasured + again.backupMeasured,
+        backupUnavailable: result.backupUnavailable + again.backupUnavailable,
+      };
+    }
     await env.ARCHIVE_US.delete(key);
     const backups = (await env.DB.prepare(
       "SELECT count(*) n FROM usage_samples WHERE database_id=? AND source='backup'",
     )
       .bind(id)
       .first<{ n: number }>())!.n;
-    return { result, backups };
+    return { id, result, backups, current };
   }
   it("measures nothing once the deletion hour has passed", async () => {
     const { result, backups } = await deleted(
@@ -563,6 +579,18 @@ describe("backup measurement of a deleted database", () => {
     const { result, backups } = await deleted((current) => current);
     expect(result.backupMeasured).toBe(1);
     expect(backups).toBe(1);
+  });
+  it("ends a never-placed database with its deletion hour although it has no lifecycle events", async () => {
+    // The delete of an unplaced database settles in the API without any regional observation.
+    const { id, result, backups, current } = await deleted(
+      (current) => current - 3 * USAGE_HOUR_MS + 600_000,
+      { events: false, visits: 5 },
+    );
+    expect(result.backupMeasured + result.backupUnavailable).toBe(0);
+    expect(backups).toBe(0);
+    const hours = (await rows(id)).map((row) => row.hour);
+    expect(hours.at(-1)).toBe(iso(current - 3 * USAGE_HOUR_MS));
+    expect(await progress(id)).toBe(iso(current - 2 * USAGE_HOUR_MS));
   });
 });
 
