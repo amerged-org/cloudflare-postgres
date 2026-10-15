@@ -3,7 +3,10 @@
 Status: **implemented on branches, not deployed.** There is no release marker; the region policy
 `parked_tier` is the only switch (no backwards compatibility in Dev). Live findings of 2026-10-15
 changed section 3.3: the API keeps a stopping Pod's token until the controller's stop observation
-commits, and the wake token for a parked Pod needs its fast-wake claim.
+commits, and the wake token for a parked Pod needs its fast-wake claim. The controller publishes a
+resumed Pod on its attestation without the kubelet's Ready bit (section 2.2.1); that needs the
+gateway change of section 5.4 on the same node, so a fleet patch applies the gateway first, then
+the controller, in one release.
 Design date: 2026-10-15. Repository snapshot: origin/main `95e64ab`; every
 `path:line` below refers to that snapshot. CNPG citations (`cnpg:path:line`) refer to a clone of
 the v1.30.1 tag (commit `2a35abb`, the version the repository pins); `cnpg-plugin:path:line` refers
@@ -329,7 +332,8 @@ readiness predicates.
    `ca()` (2423-2453), `bind_volume`, `credential_acknowledged` (92-139), per-role logins
    (`postgres::roles`, postgres.rs:212-233, changed to dial the Pod IP and to run roles in
    parallel), `archive()` sample (675-774), runtime proof (1445-1509) and `runtime_readback`
-   (2008-2093). Predicates that today mean "kubelet says ready" are replaced in the parked path:
+   (2008-2093). Predicates that today mean "kubelet says ready" are replaced in the parked path
+   (as built: section 2.2.1):
    - `condition(cluster,"Ready") == "True"` (1307): vacuous here (phase never left Healthy); the
      real gates are the Pod identity and the SQL proof;
    - `primary_current` requiring Pod `Ready` (158-164), container `ready == true` (1327-1343) and
@@ -356,8 +360,43 @@ native gateway routes only to a Ready EndpointSlice endpoint (`targets.rs:499-50
 `postgres` container reports `ready` (`targets.rs:239-267`; README "exact Ready writer"). Without
 the gateway change (5.4) the controller must not publish `ready` before the endpoint is Ready, and
 the wake is bounded by the kubelet readiness probe (period 1 s, `manifests.rs:341`). The gateway
-change G-1 is implemented (5.4); the controller keeps this wait until the gateway image that
-carries G-1 runs, and only then stops waiting (gateway first, controller second).
+change G-1 is implemented (5.4), and with it the controller publishes on its own proof (2.2.1).
+
+#### 2.2.1 Fast ready: what stands in for the kubelet's Ready bit
+
+A resumed Pod is published once all of this holds, and not before; the gateway then routes to it by
+the attestation the controller persists (`admission_target`: Pod UID, container ID, CA identity).
+
+1. PostgreSQL answers on the Pod's own address with the right identity: database, role, server
+   address (`host(inet_server_addr())`), not in recovery, TLS, and a postmaster that started after
+   the unfence (the server's clock for its age, the controller's monotonic clock for the unfence).
+2. The Pod is the parked one: same UID, `postgres` and sidecar containers under the recorded IDs,
+   `postgres` running and not restarted since the fence was lifted. This is read before PostgreSQL
+   answers, after it, and once more at the end of the archive probe.
+3. The kubelet has actuated the requests the Pod was resized back to.
+4. Roles, archive identity, volume identity and thin authority, the CA and the applied objects are
+   verified exactly as for any wake.
+5. The attestation is a v2 proof read back against the Pod and the Cluster the archive probe read
+   last. The kubelet reports Ready, and CNPG writes the Cluster status, while the chain runs; a
+   proof read back against what was read before PostgreSQL answered would meet them. A resumed
+   Pod that cannot be attested (no admission, no complete watch, a read-back that moved) is not
+   published before the kubelet reports it Ready, because only the attestation lets the gateway
+   route to it.
+
+Later passes of a wake that did not finish continue on the same Pod under the ordinary chain, which
+waits for the kubelet's Ready bit and the Cluster's `Ready` condition (2.2 step 5).
+
+The kubelet's Ready bit is measured, not awaited: the phase `kubelet_ready_observed` ends in the
+first later read of the Pod that finds it set, counted from the answer of PostgreSQL (the span the
+wake used to wait).
+
+**The completed generation is written before the proof.** The namespace's `pgcf.io/generation`
+annotation marks the generation a pass completed, and the runtime proof names the namespace at its
+resourceVersion. It was written after the proof, so the first pass of every generation changed the
+namespace under its own proof and ended in `runtime proof changed before target publication` after
+the gateway fence had been released; the next pass repeated the whole chain. It is written before
+the proof now, and the proof waits (at most 500 ms) until the controller's own watch has delivered
+that write. This holds for every wake, not only the parked one.
 
 ### 2.3 Demotion: parked to hibernated
 
@@ -732,7 +771,7 @@ and unmeasured (V-6); it is the main density cost besides RAM.
 | `power.rs` | `Phase::{Parking,Parked}`; `park` record in `Progress`; validity rules in `progress_from` (491-509); `observation()` gains `power.parked`; `suspend_step`: S5-S10 after 1444-1447; `Parked` periodic branch (verify record, TTL, cap rank, drift) next to 1354-1390; demotion A/B; `prepare_running` parked branch before 2078 (eligibility, fast path, slow path); `finish_running` unchanged (2167 stays: hibernation `on` returns None); delete flow untouched |
 | `kubernetes.rs` | `resize_pod` (strategic-merge to `pods/<name>/resize`), `patch` with explicit content type; keep `named()` fixed paths (279-287); no list of Pods beyond existing |
 | `postgres.rs` | `connect_pod(db, ca, role, pwd, db, ip)` (reuse `connect_at` hostaddr, 96-129); `roles` dials the Pod IP and logs roles in with `try_join_all` (212-233) |
-| `reconcile.rs` | parked predicates replace kubelet-readiness gates in the fast path only (1307-1343, 158-164, 766); parallel eligibility reads; `needs_startup` (1140-1153) also treats a present fence annotation as a start and D-4 is fixed there; wake-phase timing events (section 6.3); `archive()` takes a `ready_required` flag |
+| `reconcile.rs` | parked predicates replace kubelet-readiness gates in the fast path only (1307-1343, 158-164, 766; as built: 2.2.1); parallel eligibility reads; `needs_startup` (1140-1153) also treats a present fence annotation as a start and D-4 is fixed there; wake-phase timing events (section 6.3); `archive()` takes a `ready_required` flag |
 | `main.rs` | `settle` (654-685): parked result re-queues at `min(+60 s, TTL deadline)`; parked-observation posting rule unchanged (1284-1293); no new job kind. A Pod event of a ready, including parked, cell sets `reattest` and classes its next pass `Wake` (`main.rs:543-546,594`): harmless (it only reorders and re-verifies), counted in L2 |
 | `contracts.rs`/generated | `database_valid`, `DatabaseObservationUpdate` schema (regenerated), `region.parking` accessor; no fingerprint change |
 | tests | section 7 |
@@ -890,7 +929,9 @@ e.g. `power.rs:1817-1819`) plus component-local monotonic `elapsedMs`.
   already generated into `power.generated.json` but not emitted by the native controller): emit
   `wake_hint_received` (the `desired` link message, `main.rs:871-872`), `desired_pull` (`main.rs:1079,1088,1220`),
   `wake_prepare`, `park_eligibility` (+reason), `unfence_patch`, `resize_up`, `pg_accepting`
-  (+poll count), `desired_apply`, `role_runtime_auth`, `archive_metrics`, `ca_publication`,
+  (+poll count), `resize_actuated`, `kubelet_ready_observed` (informational: when the kubelet's
+  Ready bit of the resumed Pod was first read, the wait the wake no longer pays),
+  `desired_apply`, `role_runtime_auth`, `archive_metrics`, `ca_publication`,
   `volume_identity`, `runtime_unchanged`, `fence_release`, `observation_post`; plus
   `reconcile_summary {calls, elapsedMs}` (count of Kubernetes calls) and `loop_lag_ms` of the
   single-threaded runtime (`main.rs:1322`, measurement cycle every 250 ms at 981-1012).
