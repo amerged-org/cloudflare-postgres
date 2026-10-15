@@ -966,6 +966,26 @@ e.g. `power.rs:1817-1819`) plus component-local monotonic `elapsedMs`.
 | 16 | `main.rs:1322,981-1012` | `current_thread` runtime shared with a 250 ms measurement cycle (4 GETs per database) | measure `loop_lag_ms` first; deprioritize or move the cycle only if lag is observed |
 | 17 | `cnpg:pkg/management/postgres/instance.go:1565` | instance manager sleeps 20 s inside its reconcile loop after lifting a fence (does not block readiness) | none; documented: a re-fence inside 20 s is deferred, and role/config changes after unfence wait for it (hence the slow path for them) |
 
+Items 11 to 14 are implemented in the API, measured in the Actor and desired-page tests as
+sequential D1 round trips (the Actor's concurrency block is held across every one of them in the
+claim):
+
+- Item 11, without a contract change: the page's region reads (capabilities, policy, thin nodes,
+  samples, fleet release, archive sources) are issued together, and each thin node is read once for
+  the page and its databases. One database: 10 sequential round trips became 3 (thick), 20 became
+  9 (thin).
+- Item 12: the claim reads the database row with the admission read, the epoch once (it inserts only
+  a first one), no presence for its own mutation, the pool capability with the pool runs, and issues
+  no fence after a returned batch. The hint leaves at the commit, before the snapshot publish, and
+  the committed row and operation are not read back. From the call to the hint: 16 round trips
+  became 7; to the registered waiter: 17 became 10.
+- Item 13: the push leaves at the commit, independent of the publish. A report is answered after at
+  most one second of publish, which then finishes in the background; `observation_commit` carries
+  the publish's steps and `actor_gate_held` names an Actor concurrency block held for a second.
+- Item 14: a publish whose snapshot is admissible at the wake's revision, with no barrier standing,
+  releases the waiters itself. A failed readiness read no longer fails a waiter: it is read again
+  with the next push or after the fallback interval, and every waiter keeps its own deadline.
+
 Optional, only if P0/P1 show the pull dominating: **speculative unfence on hint**. The existing
 principle (rt:264) says hints are not executable desired state; the unfence is idempotent,
 reversible and non-admitting (the gateway stays closed until the authoritative pull verifies), so
