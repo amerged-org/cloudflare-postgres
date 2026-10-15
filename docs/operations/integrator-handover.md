@@ -201,6 +201,7 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
 | `listDatabaseOperations` | `GET /v1/databases/{id}/operations` | newest first, the view of `getDatabaseOperation`; also the operations PGCF starts itself; a deleted database stays listable |
 | `listRegions` | `GET /v1/regions` | `{id, provider_region}` of the regions that accept placement ([1.2](#12-regions)) |
 | `getDatabaseArchive` | `GET /v1/databases/{id}/archive` | counts only |
+| `getDatabaseBackups` | `GET /v1/databases/{id}/backups` | the restorable window and the restorable base backups ([2.7](#27-backups-restorable-window-and-restore)) |
 | `getUsage` | `GET /v1/usage` | [5](#5-metering) |
 | `listSizeClasses` | `GET /v1/size-classes` | |
 | `listProjects`, `getProject`, `deleteProject` | `/v1/projects`, `/v1/projects/{id}` | |
@@ -428,15 +429,32 @@ backed up (CloudNativePG cannot back up a hibernated cluster); the hibernation s
 its last WAL first. Retention is `backup_retention_days` as a Barman recovery window. How
 retention behaves for a database that sleeps through its whole window is **not yet verified**.
 
-**What the API shows.** `GET /v1/databases/{id}/archive` returns only
-`{base_backup_count, wal_count, bytes}`, and `health.archiving` on the database says whether
-archiving works. There is **no endpoint that lists backups or the restorable window** (open work).
-Derive it:
+**What the API shows.** `GET /v1/databases/{id}/backups` reads the window a restore can reach and
+the base backups it can start from, from the very catalog the restore reads:
 
-- the earliest restorable instant is the end time of the oldest retained base backup whose WAL
-  chain is complete: the end of the first base backup for a young database, afterwards about
-  `backup_retention_days` back;
-- the latest restorable instant is the last archived WAL; `full` restores everything archived.
+```sh
+pgcf "$PGCF_API/v1/databases/<database-id>/backups"
+# {"database_id":"...","earliest_restorable_time":"2026-10-14T03:00:41.000Z",
+#  "latest_restorable_time":"2026-10-15T09:41:07.000Z",
+#  "base_backups":[{"id":"20261015T030000","started_at":"2026-10-15T03:00:00.000Z",
+#                   "completed_at":"2026-10-15T03:00:38.000Z"}, ...]}
+```
+
+- `earliest_restorable_time` is the end time of the oldest base backup whose data and WAL chain
+  are complete: the end of the first base backup for a young database, afterwards about
+  `backup_retention_days` back; no `pitr` target before it can be restored;
+- `latest_restorable_time` is when the newest archived WAL segment was uploaded, an **upper
+  bound**: a `pitr` target after the last commit in the archive fails recovery, and `full`
+  restores everything archived;
+- `base_backups` lists only restorable backups, newest first, at most 64 (the bound of the
+  catalog); one without its WAL chain is not restorable and is not listed.
+
+Both times are `null`, with no base backups, while the archive holds no complete base backup (a
+database younger than its first one), cannot be read completely (the catalog reads at most 16,000
+objects), or belongs to a deleted database past its retention. `null` means unknown. A deleted
+database inside its retention is read like a live one.
+`GET /v1/databases/{id}/archive` returns only `{base_backup_count, wal_count, bytes}`, and
+`health.archiving` on the database says whether archiving works.
 
 **Restore** never overwrites. It creates a **new database**:
 
@@ -864,8 +882,9 @@ disk verdicts for every project at once.
   archives the final WAL before the Pod goes, so a hibernated database is as recent as its last
   activity (by design; not independently tested after a node loss).
 - Point-in-time recovery reaches any instant between the oldest retained complete base backup and
-  the last archived WAL. The window per class is its `backup_retention_days`: 7 days for the Dev
-  test classes, 1 day for the 256 MiB class (plan). It is derived, not measured per class.
+  the last archived WAL; `GET /v1/databases/{id}/backups` states the window of a database. The
+  window per class is its `backup_retention_days`: 7 days for the Dev test classes, 1 day for the
+  256 MiB class (plan). It is derived, not measured per class.
 
 ### 7.3 Recovery time
 
@@ -917,8 +936,7 @@ the operator supplies it at handover.** Send:
 - A second customer node, redundancy and a measured recovery time; node drain and moving
   databases with their IDs kept (a restore always creates a new ID).
 - Alert delivery to a recipient; alert history, acknowledgement and test send.
-- Listing backups and the restorable window; finding deleted databases; explicit restore
-  refusals.
+- Finding deleted databases: the lists exclude them, so keep the IDs you were given.
 - An event stream or webhooks, an audit log.
 - Key expiry, last-use display, key rotation as a feature, a read-only scope; an API domain with
   rate limiting.
@@ -938,7 +956,7 @@ confirmation. The state column says what is measured and what is derived or open
 | Item | Where | State |
 | --- | --- | --- |
 | RPO per class | [7.2](#72-recovery-point) | derived: `archive_timeout_seconds` plus upload time; one measured sample (66.7 s with a 60 s timeout); no per-class measurement |
-| PITR window per class | [2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point) | derived from `backup_retention_days`; not listable through the API; no measured full-window restore |
+| PITR window per class | [2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point) | derived from `backup_retention_days`; the window of each database is readable through `GET /v1/databases/{id}/backups`; no measured full-window restore |
 | Parked hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | **not measured**: the parked tier is implemented; the hibernated wake is 8.1–9.4 s |
 | `57P03` meanings and retry rule | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee |
 | Connection limits | [3.6](#36-connection-limits) | stated; the deployed per-role and per-network values are not recorded in the repository |
@@ -1065,7 +1083,6 @@ these corrections; the code is authoritative.
 | `RoleName` is the pattern `^[a-z][a-z0-9_]{0,62}$` | also not `postgres`, `streaming_replica`, `pg_*`, `cnpg_*`; `RoleCreate` also refuses `pgcf_maintenance` | `400` |
 | `UsageQuery`: `project_id` and `database_id` both optional; `from` and `to` timestamps | exactly one scope; both boundaries aligned to the granularity (UTC hour or day); at most 31 days | `400` |
 | `SizeClass`/`SizeClassUpsert` fields independent | `cpu_request_millicores` must not exceed `cpu_millicores` | `400` |
-| `getDatabaseArchive`: "Read database backup and WAL archive status" | returns only `{database_id, base_backup_count, wal_count, bytes}` | there is no status or window; use `health.archiving` |
 | `RoleCreate.valid_until` is a `Timestamp`; `member_of` an array of at most 8 distinct `RoleName` | `valid_until` must be in the future when the request executes (not on a replay); every `member_of` entry must be a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `400` |
 | `POST /v1/api-keys` `201` `Location: /v1/api-keys/{id}` | no `GET` exists for that path (only `DELETE`) | do not follow it |
 | Idempotency described without retention | keys are kept 24 hours | retries after a day execute again |

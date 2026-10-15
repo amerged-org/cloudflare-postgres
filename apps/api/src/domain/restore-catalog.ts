@@ -84,11 +84,19 @@ function completeWalRange(info: RestoreBackup, names: Set<string>): boolean {
   return true;
 }
 
-export async function restoreBackup(
+/** What the archive of one database can be restored from, as the restore path reads it. */
+export interface RestoreCatalog {
+  /** The base backups whose data and complete WAL chain are archived, newest first. */
+  backups: RestoreBackup[];
+  /** When the newest archived WAL segment was uploaded; null while there is none. */
+  newestWalAt: string | null;
+}
+
+/** Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. */
+export async function readRestoreCatalog(
   bucket: R2Bucket,
   prefix: string,
-  target?: string,
-): Promise<RestoreBackup> {
+): Promise<RestoreCatalog> {
   const objects = new Map<string, R2Object>(),
     cursors = new Set<string>();
   let cursor: string | undefined;
@@ -131,6 +139,7 @@ export async function restoreBackup(
       { reason: "archive_unusable" },
     );
   const walNames = new Set<string>();
+  const walObjects = new Map<string, R2Object>();
   for (const key of objects.keys()) {
     if (!key.startsWith(`${prefix}wals/`)) continue;
     const name = key
@@ -144,6 +153,7 @@ export async function restoreBackup(
           { reason: "archive_unusable" },
         );
       walNames.add(name);
+      walObjects.set(name, objects.get(key)!);
     }
   }
   const backups: RestoreBackup[] = [];
@@ -171,15 +181,29 @@ export async function restoreBackup(
       )
     )
       continue;
-    if (
-      completeWalRange(info, walNames) &&
-      (target === undefined || info.end <= target)
-    )
-      backups.push(info);
+    if (completeWalRange(info, walNames)) backups.push(info);
   }
-  const selected = backups.sort(
-    (a, b) => b.end.localeCompare(a.end) || b.id.localeCompare(a.id),
-  )[0];
+  const newestWal = [...walNames].sort().at(-1);
+  return {
+    backups: backups.sort(
+      (a, b) => b.end.localeCompare(a.end) || b.id.localeCompare(a.id),
+    ),
+    newestWalAt:
+      newestWal === undefined
+        ? null
+        : walObjects.get(newestWal)!.uploaded.toISOString(),
+  };
+}
+
+export async function restoreBackup(
+  bucket: R2Bucket,
+  prefix: string,
+  target?: string,
+): Promise<RestoreBackup> {
+  const { backups } = await readRestoreCatalog(bucket, prefix);
+  const selected = backups.find(
+    (backup) => target === undefined || backup.end <= target,
+  );
   if (!selected)
     throw new ApiError(
       "conflict",

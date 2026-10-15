@@ -772,6 +772,42 @@ export const ApiKeyCreated = z
   .meta({ id: "ApiKeyCreated" });
 export type ApiKeyCreated = z.infer<typeof ApiKeyCreated>;
 
+/** One base backup a restore can start from: its data and the WAL chain after it are archived. */
+export const BaseBackup = z
+  .strictObject({
+    id: z
+      .string()
+      .regex(/^[0-9]{8}T[0-9]{6}$/)
+      .describe("The backup's identifier in the archive."),
+    started_at: Timestamp,
+    completed_at: Timestamp,
+  })
+  .meta({ id: "BaseBackup" });
+export type BaseBackup = z.infer<typeof BaseBackup>;
+
+/**
+ * What the archive of a database can restore. Both times are null while there is no complete base
+ * backup with its WAL chain, or the archive cannot be read completely or is past its retention.
+ */
+export const BackupCatalog = z
+  .strictObject({
+    database_id: DatabaseId,
+    earliest_restorable_time: Timestamp.nullable().describe(
+      "When the oldest restorable base backup finished: no `pitr` target before it can be restored.",
+    ),
+    latest_restorable_time: Timestamp.nullable().describe(
+      "When the newest archived WAL segment was uploaded: an upper bound of the window. A `pitr` target after the last commit in the archive fails recovery; `full` restores everything archived.",
+    ),
+    base_backups: z
+      .array(BaseBackup)
+      .max(64)
+      .describe(
+        "The restorable base backups, newest first; at most 64, the bound of the v1 recovery catalog.",
+      ),
+  })
+  .meta({ id: "BackupCatalog" });
+export type BackupCatalog = z.infer<typeof BackupCatalog>;
+
 export const DatabaseRestored = z
   .strictObject({ target_database: Database, operation: Operation })
   .meta({ id: "DatabaseRestored" });

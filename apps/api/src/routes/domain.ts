@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, z, type RouteConfig } from "@hono/zod-openapi";
 import {
+  BackupCatalog,
   ConnectionUri,
   Database,
   DatabaseCreate,
@@ -28,7 +29,7 @@ import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { agentRegion } from "../domain/agent-auth.ts";
 import { restoreDatabase } from "../domain/restore.ts";
-import { archiveSummary } from "../domain/archive.ts";
+import { archiveSummary, backupCatalog } from "../domain/archive.ts";
 import {
   createDatabase,
   deleteDatabase,
@@ -473,6 +474,20 @@ export function registerDomain(app: ApiApp): void {
       ),
     },
     async (c) => archiveSummary(c, DatabaseId.parse(c.req.param("id"))),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/databases/{id}/backups",
+      security,
+      tags: ["Backups"],
+      description:
+        "Reads the window a restore can reach and the base backups it can start from, from the catalog the restore path reads. `earliest_restorable_time` is when the oldest restorable base backup finished; `latest_restorable_time` is when the newest archived WAL segment was uploaded, an upper bound. Both are null, with no base backups, while the archive holds no complete base backup with its WAL chain, cannot be read completely, or belongs to a deleted database past its retention. A deleted database inside its retention is read like a live one.",
+      request: { params },
+      responses: responses(BackupCatalog),
+    },
+    async (c) => backupCatalog(c, DatabaseId.parse(c.req.param("id"))),
   );
   register(
     app,

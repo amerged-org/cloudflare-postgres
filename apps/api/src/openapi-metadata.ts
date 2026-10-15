@@ -263,7 +263,12 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "GET /v1/databases/{id}/archive": route(
     "getDatabaseArchive",
-    "Read database backup and WAL archive status",
+    "Count the base backups, WAL segments and bytes of a database archive",
+    "project",
+  ),
+  "GET /v1/databases/{id}/backups": route(
+    "getDatabaseBackups",
+    "Read the restorable window and base backups of a database",
     "project",
   ),
   "GET /v1/usage": route("getUsage", "Read measured usage rollups", "project"),

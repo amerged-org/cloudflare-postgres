@@ -32,6 +32,7 @@ import { syncDatabaseActor } from "./database-actor-sync.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { regionArchive } from "./archive-bindings.ts";
 import { restoreBackup } from "./restore-catalog.ts";
+import { retainedArchiveRestorable } from "./retained-archives.ts";
 interface Retained {
   roles_json: string;
   expires_at: string;
@@ -114,11 +115,7 @@ export async function restoreDatabase(
               .first<Retained>();
       if (
         source.deleted_at !== null &&
-        (!retained ||
-          retained.expires_at <= now ||
-          retained.cleanup_claim !== null ||
-          retained.archive_path !== source.archive_path ||
-          retained.storage_generation !== (source.storage_generation ?? 1))
+        !retainedArchiveRestorable(retained, source, now)
       )
         throw new ApiError(
           "conflict",

@@ -153,6 +153,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases/:id/operations",
   "/v1/usage",
   "/v1/databases/:id/archive",
+  "/v1/databases/:id/backups",
   "/agent/v1/desired",
   "/agent/v1/observations",
   "/agent/v1/activity",

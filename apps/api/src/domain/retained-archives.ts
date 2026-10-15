@@ -12,6 +12,28 @@ interface ExpiredArchive {
   cleanup_claim: string | null;
   backup_bucket: string;
 }
+/**
+ * Whether the archive of a deleted database can still be restored from: inside its recovery
+ * retention, not being cleaned up, and the one the database record names.
+ */
+export function retainedArchiveRestorable(
+  retained: {
+    expires_at: string;
+    cleanup_claim: string | null;
+    archive_path: string;
+    storage_generation: number;
+  } | null,
+  source: { archive_path: string; storage_generation?: number },
+  now: string,
+): boolean {
+  return (
+    retained !== null &&
+    retained.expires_at > now &&
+    retained.cleanup_claim === null &&
+    retained.archive_path === source.archive_path &&
+    retained.storage_generation === (source.storage_generation ?? 1)
+  );
+}
 const idle = `NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.source_database_id=a.source_database_id AND x.verified_at IS NULL AND o.status IN('pending','running'))`;
 export async function cleanupRetainedArchives(
   env: Env,
