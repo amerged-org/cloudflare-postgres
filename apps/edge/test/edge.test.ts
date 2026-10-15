@@ -1656,6 +1656,15 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.region_id).toBe(region);
     expect(log.outcome).toBe("accepted");
     expect(log.duration_ms).toBeGreaterThanOrEqual(0);
+    // Every stage that ran reports its milliseconds, so a slow admission can be located.
+    for (const stage of [
+      "limiter_ms",
+      "ensure_awake_ms",
+      "database_limiter_ms",
+      "token_ms",
+      "gateway_connect_ms",
+    ])
+      expect(log[stage]).toBeGreaterThanOrEqual(0);
     expect(Object.keys(log)).not.toContain("password");
     expect(Object.keys(log)).not.toContain("ingress_bytes");
     expect(Object.keys(log)).not.toContain("egress_bytes");

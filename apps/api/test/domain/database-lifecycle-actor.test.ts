@@ -858,6 +858,8 @@ it("wake_timing_events_name_the_database_and_the_wake_operation", async () => {
       ...key,
       revision: row.generation,
       at_ms: expect.any(Number),
+      requested_at_ms: expect.any(Number),
+      gate_ms: expect.any(Number),
       claim_ms: expect.any(Number),
       hint_ms: expect.any(Number),
     }),

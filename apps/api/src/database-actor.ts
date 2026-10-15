@@ -1025,6 +1025,7 @@ export class DatabaseActor extends DurableObject<Env> {
     operation: string,
     revision: number,
     started: number,
+    requested: number,
   ): Promise<boolean> {
     const stored = this.ctx.storage.sql
       .exec<{ operation: string; revision: number; hint_claimed: number }>(
@@ -1066,6 +1067,9 @@ export class DatabaseActor extends DurableObject<Env> {
                 operation,
                 revision,
                 at_ms: Date.now(),
+                // The wake was asked for at requested_at_ms; the claim began gate_ms later.
+                requested_at_ms: requested,
+                gate_ms: started - requested,
                 claim_ms: hinted - started,
                 hint_ms: Date.now() - hinted,
               }),
@@ -1078,6 +1082,7 @@ export class DatabaseActor extends DurableObject<Env> {
   private async claimWake(
     id: string,
     user: string,
+    requested: number,
   ): Promise<
     { operation: string; revision: number } | { failure: "08006" } | undefined
   > {
@@ -1151,6 +1156,7 @@ export class DatabaseActor extends DurableObject<Env> {
                   operation,
                   revision,
                   started,
+                  requested,
                 );
               return transition;
             },
@@ -1176,6 +1182,7 @@ export class DatabaseActor extends DurableObject<Env> {
             operation.id,
             row.generation,
             started,
+            requested,
           ))
         )
           return undefined;
@@ -1284,7 +1291,7 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "57P03" };
       if (current.observed_state === "error")
         return { ok: false, sqlstate: "57P03" };
-      const wake = await this.claimWake(id.data, role.data);
+      const wake = await this.claimWake(id.data, role.data, Date.now());
       if (wake && "failure" in wake)
         return { ok: false, sqlstate: wake.failure };
       if (!wake && deadline > Date.now()) return this.admit(id.data, role.data);

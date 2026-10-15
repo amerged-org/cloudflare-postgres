@@ -16,6 +16,15 @@ interface Hints {
   readonly user: string;
 }
 
+/** Milliseconds of each admission stage that ran, logged with the admission. */
+interface Timings {
+  limiter_ms?: number;
+  ensure_awake_ms?: number;
+  database_limiter_ms?: number;
+  token_ms?: number;
+  gateway_connect_ms?: number;
+}
+
 class AdmissionFailure extends Error {
   readonly sqlstate: string;
   readonly decoy: boolean;
@@ -46,6 +55,7 @@ async function admit(
   signal: AbortSignal,
   deadline: number,
   ctx: ExecutionContext,
+  timings: Timings,
 ): Promise<{ socket: WebSocket; region: string }> {
   const check = () => {
     if (signal.aborted)
@@ -59,9 +69,11 @@ async function admit(
   // These untrusted hints scope admission; PostgreSQL authenticates the user.
   const key = JSON.stringify([hints.database, hints.user, network]);
   let connectionAllowed: boolean;
+  const limiterStarted = Date.now();
   try {
     connectionAllowed = (await env.CONNECTION_RATE_LIMITER.limit({ key }))
       .success;
+    timings.limiter_ms = Date.now() - limiterStarted;
     check();
     if (!connectionAllowed)
       throw new AdmissionFailure("53300", "connection rate limit exceeded");
@@ -81,6 +93,7 @@ async function admit(
     );
   signal.addEventListener("abort", cancel, { once: true });
   let admitted;
+  const ensureStarted = Date.now();
   try {
     check();
     admitted = await actor.ensureAwake(hints.database, hints.user, {
@@ -88,6 +101,7 @@ async function admit(
       waiterId: cid,
     });
   } finally {
+    timings.ensure_awake_ms = Date.now() - ensureStarted;
     signal.removeEventListener("abort", cancel);
   }
   check();
@@ -122,10 +136,12 @@ async function admit(
   const route = admitted.region;
   // Unknown hints must not consume a real database's shared admission bucket.
   let databaseAllowed: boolean;
+  const databaseLimiterStarted = Date.now();
   try {
     databaseAllowed = (
       await env.DATABASE_CONNECTION_RATE_LIMITER.limit({ key: hints.database })
     ).success;
+    timings.database_limiter_ms = Date.now() - databaseLimiterStarted;
   } catch {
     throw new AdmissionFailure("53300", "connection admission unavailable");
   }
@@ -144,11 +160,15 @@ async function admit(
   };
   // The gateway dials only the admitted verified target. Temporary rollout compatibility
   // (route-token.ts): an admission without a verified target still receives a v2 route.
+  const tokenStarted = Date.now();
   const token = admitted.target
     ? await signRouteToken({ ...connection, target: admitted.target })
     : await signLegacyRouteToken(connection);
+  timings.token_ms = Date.now() - tokenStarted;
   check();
+  const gatewayStarted = Date.now();
   const socket = await connectGateway(route, token, env, signal);
+  timings.gateway_connect_ms = Date.now() - gatewayStarted;
   if (signal.aborted) {
     try {
       socket.accept({ allowHalfOpen: true });
@@ -167,6 +187,7 @@ async function boundedAdmission(
   hints: Hints,
   cid: string,
   ctx: ExecutionContext,
+  timings: Timings,
 ): Promise<{ socket: WebSocket; region: string }> {
   const deadline = Date.now() + ADMISSION_DEADLINE_MS;
   const controller = new AbortController();
@@ -183,7 +204,7 @@ async function boundedAdmission(
   const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
   const admission = Promise.race([
     interrupted,
-    admit(request, env, hints, cid, controller.signal, deadline, ctx),
+    admit(request, env, hints, cid, controller.signal, deadline, ctx, timings),
   ]);
   ctx.waitUntil(
     admission.then(
@@ -226,12 +247,20 @@ export default {
       return new Response("WebSocket upgrade required", { status: 426 });
     const started = Date.now();
     const cid = crypto.randomUUID();
+    const timings: Timings = {};
     let hints: Hints | null = null;
     let region: string | null = null;
     let outcome = "accepted";
     try {
       hints = routingHints(url);
-      const upstream = await boundedAdmission(request, env, hints, cid, ctx);
+      const upstream = await boundedAdmission(
+        request,
+        env,
+        hints,
+        cid,
+        ctx,
+        timings,
+      );
       region = upstream.region;
       // Attaching an unopened socket delegates the stream to the runtime.
       return new Response(null, { status: 101, webSocket: upstream.socket });
@@ -253,6 +282,8 @@ export default {
           user: hints?.user ?? null,
           region_id: region,
           duration_ms: Math.max(0, Date.now() - started),
+          // Where an admission spent its time; each key is present only for a stage that ran.
+          ...timings,
           outcome,
         }),
       );
