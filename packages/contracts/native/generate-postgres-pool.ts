@@ -234,7 +234,7 @@ const storageKeys = JSON.stringify({
 const storage = {
   claims: storageClaims,
   keys_json: storageKeys,
-  keys_sha256: bytesToHex(
+  trust_sha256: bytesToHex(
     new Uint8Array(
       await crypto.subtle.digest(
         "SHA-256",

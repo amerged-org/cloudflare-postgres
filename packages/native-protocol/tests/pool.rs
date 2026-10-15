@@ -50,7 +50,7 @@ fn initial_thin_writer_requires_exact_storage_authority_for_the_immutable_pool_p
     let document = &*pool::CONTRACT;
     let trust = pgcf_native_protocol::storage::StorageTrust::parse(
         document["storage"]["keys_json"].as_str().unwrap(),
-        document["storage"]["keys_sha256"].as_str().unwrap(),
+        document["storage"]["trust_sha256"].as_str().unwrap(),
     )
     .unwrap();
     let token = document["storage"]["token"].as_str().unwrap();

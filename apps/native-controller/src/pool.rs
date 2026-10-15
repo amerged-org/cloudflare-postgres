@@ -2362,7 +2362,7 @@ mod tests {
         let fixture = &pool::CONTRACT["storage"];
         let trust = pgcf_native_protocol::storage::StorageTrust::parse(
             fixture["keys_json"].as_str().unwrap(),
-            fixture["keys_sha256"].as_str().unwrap(),
+            fixture["trust_sha256"].as_str().unwrap(),
         )
         .unwrap();
         let token = fixture["token"].as_str().unwrap();
