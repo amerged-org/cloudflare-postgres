@@ -318,6 +318,47 @@ it("agent may relay each measured variant but cannot supply principal or mismatc
   ).toBe(400);
   expect((await sendUsage(f, [sample], f.foreignAgent)).status).toBe(404);
 });
+it("acknowledges the two fragments of a split hour-boundary interval once and a replay as duplicates", async () => {
+  const f = await ready(),
+    hour = Math.floor(Date.now() / 3600000) * 3600000 - 3600000,
+    producer = crypto.randomUUID(),
+    iso = (value: number) => new Date(value).toISOString();
+  // 1000 bytes counted between 10 s before and 5 s after the boundary: 666 and 334.
+  const fragment = (from: number, to: number, egress: number) => ({
+    database_id: f.id,
+    source: "gateway",
+    producer_id: producer,
+    sequence: to,
+    observed_at: iso(hour + 5000),
+    interval_start: iso(from),
+    interval_end: iso(to),
+    expected_producers: [producer],
+    ingress_bytes: 0,
+    egress_bytes: egress,
+    connections: 0,
+    connection_seconds: 0,
+  });
+  const pair = [
+    fragment(hour - 10_000, hour, 666),
+    fragment(hour, hour + 5_000, 334),
+  ];
+  expect(await (await sendUsage(f, pair)).json()).toEqual({
+    recorded: 2,
+    duplicates: 0,
+    refused: 0,
+  });
+  expect(await (await sendUsage(f, pair)).json()).toEqual({
+    recorded: 0,
+    duplicates: 2,
+    refused: 0,
+  });
+  const stored = await env.DB.prepare(
+    "SELECT json_extract(payload,'$.egress_bytes') egress FROM usage_samples WHERE database_id=? ORDER BY interval_start",
+  )
+    .bind(f.id)
+    .all<{ egress: number }>();
+  expect(stored.results.map((row) => row.egress)).toEqual([666, 334]);
+});
 it("a finalized hour refuses its late measurement without blocking the rest of the batch", async () => {
   const f = await ready(),
     current = storageSample(f.id),
