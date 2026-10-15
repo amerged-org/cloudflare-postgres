@@ -46,6 +46,7 @@ import {
 import {
   connectionUri,
   createRole,
+  deleteRole,
   listRoles,
   resetPassword,
 } from "../domain/roles.ts";
@@ -67,8 +68,73 @@ const responses = (schema: z.ZodType, status = 200) => ({
     content: json(schema),
   },
 });
+const jsonExample = (schema: z.ZodType, name: string, value: unknown) => ({
+  "application/json": { schema, examples: { [name]: { value } } },
+});
+/** Illustrative values only; they show the shape and are never served as data. */
+const exampleDatabase = {
+  id: "ab12cd34ef56gh78ij90",
+  project_id: "prj_abcdefghij1234567890",
+  region_id: "eu-1",
+  node_id: "nod_abcdefghij1234567890",
+  name: "orders",
+  size_class_id: "small",
+  desired_state: "running",
+  observed_state: "ready",
+  suspension_reason: null,
+  generation: 6,
+  storage_generation: 1,
+  observed_generation: 5,
+  status_message: null,
+  health: { archiving: "ok", since: "2030-01-01T09:00:00.000Z" },
+  created_at: "2030-01-01T08:00:00.000Z",
+  updated_at: "2030-01-01T09:30:00.000Z",
+};
+const exampleRoleDeletion = {
+  database: exampleDatabase,
+  operation: {
+    id: "op_abcdefghij1234567890",
+    kind: "database.role.delete",
+    status: "pending",
+    project_id: "prj_abcdefghij1234567890",
+    database_id: "ab12cd34ef56gh78ij90",
+    generation: 6,
+    error: null,
+    created_at: "2030-01-01T09:30:00.000Z",
+    updated_at: "2030-01-01T09:30:00.000Z",
+    completed_at: null,
+  },
+};
+const exampleRoleDeletionFailed = {
+  ...exampleRoleDeletion,
+  operation: {
+    ...exampleRoleDeletion.operation,
+    status: "failed",
+    error: {
+      code: "role_not_droppable",
+      message:
+        "The role owns objects or holds privileges and cannot be dropped; it stays unable to log in until they are removed",
+    },
+    updated_at: "2030-01-01T09:30:06.000Z",
+    completed_at: "2030-01-01T09:30:06.000Z",
+  },
+};
+const exampleRole = {
+  database_id: "ab12cd34ef56gh78ij90",
+  name: "report_a1b2c3",
+  owner: false,
+  password_revision: 1,
+  created_at: "2030-01-01T09:00:00.000Z",
+  updated_at: "2030-01-01T09:00:00.000Z",
+  valid_until: "2030-01-01T10:00:00.000Z",
+  connection_limit: 5,
+  member_of: ["reader"],
+  bypass_rls: false,
+};
 const security = [{ bearerAuth: [] }];
 const headers = z.object({ "Idempotency-Key": IdempotencyKey.optional() });
+/** Role mutations change credentials of a running database; their retries must be safe. */
+const requiredKey = z.object({ "Idempotency-Key": IdempotencyKey });
 const params = z.object({ id: DatabaseId });
 const roleParams = z.object({ id: DatabaseId, name: RoleName });
 const body = (schema: z.ZodType) => ({ required: true, content: json(schema) });
@@ -229,9 +295,27 @@ export function registerDomain(app: ApiApp): void {
       path: "/v1/databases/{id}/roles",
       security,
       tags: ["Roles"],
-      request: { headers, params, body: body(RoleCreate) },
+      description:
+        "Creates a login role and answers 201 with it. The service generates its password; an integrator key reads it with the connection URI. Optional attributes: `valid_until` (a time in the future, applied at whole seconds, truncated; PostgreSQL's VALID UNTIL: from then on the role cannot log in, and an expired credential does not wake a hibernated database), `connection_limit` (1 to 10000, PostgreSQL's CONNECTION LIMIT), `member_of` (up to 8 other live roles of this database, never `app`, `pgcf_maintenance`, `pg_*` or `cnpg_*`; the role inherits their privileges) and `bypass_rls` (PostgreSQL's BYPASSRLS). A database holds at most 100 roles; a deleted role counts until PostgreSQL has confirmed its removal. The role is registered at once and can connect when the database's `observed_generation` has reached its `generation`. An Idempotency-Key is required; a replay returns the retained result, also after `valid_until` has passed.",
+      request: {
+        headers: requiredKey,
+        params,
+        body: {
+          required: true,
+          content: jsonExample(RoleCreate, "temporary", {
+            name: "report_a1b2c3",
+            valid_until: "2030-01-01T10:00:00.000Z",
+            connection_limit: 5,
+            member_of: ["reader"],
+          }),
+        },
+      },
       responses: {
         ...responses(Role, 201),
+        201: {
+          description: "Role created",
+          content: jsonExample(Role, "created", exampleRole),
+        },
         202: {
           description: "Role change accepted after pool drain",
           content: json(DatabaseWithOperation),
@@ -252,7 +336,7 @@ export function registerDomain(app: ApiApp): void {
       path: "/v1/databases/{id}/roles/{name}/reset-password",
       security,
       tags: ["Roles"],
-      request: { headers, params: roleParams },
+      request: { headers: requiredKey, params: roleParams },
       responses: {
         ...responses(Role),
         202: {
@@ -263,6 +347,39 @@ export function registerDomain(app: ApiApp): void {
     },
     async (c) =>
       resetPassword(
+        c,
+        DatabaseId.parse(c.req.param("id")),
+        RoleName.parse(c.req.param("name")),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "delete",
+      path: "/v1/databases/{id}/roles/{name}",
+      security,
+      tags: ["Roles"],
+      description:
+        "Deletes a role. From the moment the request is accepted the role cannot connect: the edge refuses it and it is no longer listed. The answer is 202 with an operation of kind `database.role.delete`. The region sets the role to NOLOGIN, ends its sessions and drops it; the operation succeeds when PostgreSQL has confirmed that. A role that owns objects or holds privileges cannot be dropped: the operation then fails with `role_not_droppable` while the role stays unable to log in; remove those objects, then delete the role again, which starts a new operation. A hibernated database applies the removal at its next wake; the operation succeeds at once, because the role is already unroutable, and deleting the role again once the database runs starts an operation that reports what PostgreSQL did. The owner `app` and the maintenance role cannot be deleted, and neither can a role that other roles are `member_of` until they are deleted. The name can be created again once the removal is confirmed. An Idempotency-Key is required; another request for a role whose removal is in progress returns the same operation.",
+      request: { headers: requiredKey, params: roleParams },
+      responses: {
+        ...responses(DatabaseWithOperation, 202),
+        202: {
+          description: "Operation accepted",
+          content: {
+            "application/json": {
+              schema: DatabaseWithOperation,
+              examples: {
+                accepted: { value: exampleRoleDeletion },
+                "not droppable": { value: exampleRoleDeletionFailed },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (c) =>
+      deleteRole(
         c,
         DatabaseId.parse(c.req.param("id")),
         RoleName.parse(c.req.param("name")),

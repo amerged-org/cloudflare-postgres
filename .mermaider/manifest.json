@@ -33,7 +33,7 @@
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
-      "sha256": "733b963a494390781acec36966ddcfbaba0b10a2fcc5aabf16b296b90fe616e9"
+      "sha256": "af0017a561099c5ef20700915e283fc82bb3778f7f410b05e54e21e8855c1866"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.mmd",
@@ -49,10 +49,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "8255151197ba4cafd47bce5f159afe9f68be8ef2adc62b53c3278b76aa1006be"
+      "sha256": "c5d7052eb1cac8f90433e1937bde24c044e1a1b3dcecb455820d2a607f6f246d"
     }
   ],
-  "fingerprint": "d26f5878d749b183dddd5210d75aab97853e5bb93f3f3f8dae79fc44ad9c27b9",
+  "fingerprint": "b8f3ed87525d670db8e71c89c0e882f5be03ffd85203fe80fa2f79d617b0e356",
   "toolVersion": "0.1.1",
   "version": 1
 }

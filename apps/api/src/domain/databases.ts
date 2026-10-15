@@ -822,7 +822,7 @@ export async function deleteDatabase(
             c.env.DB.prepare(
               `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
           SELECT d.id,d.project_id,d.region_id,d.archive_path,d.storage_generation,
-          (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'updated_at',r.updated_at)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
+          (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'updated_at',r.updated_at,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
           d.deleted_at,strftime('%Y-%m-%dT%H:%M:%fZ',d.deleted_at,'+'||s.backup_retention_days||' days')
           FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=? AND (${guard.sql})`,
             ).bind(id, row.project_id, generation, now, ...guard.bindings),
@@ -850,6 +850,9 @@ export async function deleteDatabase(
               generation,
               ...guard.bindings,
             ),
+            c.env.DB.prepare(
+              `UPDATE role_deletions SET status='failed',error_code='superseded',error_message='Database deleted before the role removal completed',updated_at=?,completed_at=? WHERE database_id=? AND status IN('pending','running') AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=? AND generation=? AND kind='database.delete') AND (${guard.sql})`,
+            ).bind(now, now, id, op, id, generation, ...guard.bindings),
             c.env.DB.prepare(
               `UPDATE databases SET observed_state='deleted',observed_generation=generation,status_message=NULL
           WHERE id=? AND project_id=? AND generation=? AND desired_state='deleted' AND node_id IS NULL

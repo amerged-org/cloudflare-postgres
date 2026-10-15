@@ -153,7 +153,9 @@ function describeOperation(key: string, operation: Operation): void {
           ? "Optional for authenticated API-key creation. One-time credentials cannot be replayed: reuse of the same key returns 409. Bootstrap creation ignores this header."
           : key === "POST /v1/regions"
             ? "Optional for region creation. One-time regional agent credentials cannot be replayed: reuse of the same key returns 409."
-            : "Reusing a key with the same request returns the retained result; a different request conflicts. Omit only where optional.",
+            : requiredIdempotentPublicRoutes.has(key)
+              ? "Required; a request without it is refused. Reusing a key with the same request returns the retained result; a different request conflicts."
+              : "Reusing a key with the same request returns the retained result; a different request conflicts. Omit only where optional.",
       schema: { type: "string", pattern: "^[A-Za-z0-9._~-]{1,128}$" },
     });
   operation.parameters.push({

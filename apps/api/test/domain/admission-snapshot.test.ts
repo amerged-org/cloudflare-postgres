@@ -31,9 +31,15 @@ it("a v4 snapshot refuses stale runtime generation after an unrelated role chang
   expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
   expect(
     (
-      await request(`/v1/databases/${f.id}/roles`, f.integrator, "POST", {
-        name: "unrelated",
-      })
+      await request(
+        `/v1/databases/${f.id}/roles`,
+        f.integrator,
+        "POST",
+        {
+          name: "unrelated",
+        },
+        crypto.randomUUID(),
+      )
     ).status,
   ).toBe(201);
   expect(

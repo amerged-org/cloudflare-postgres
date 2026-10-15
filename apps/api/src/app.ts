@@ -140,6 +140,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases/:id/restore",
   "/v1/databases/:id/resume",
   "/v1/databases/:id/roles",
+  "/v1/databases/:id/roles/:name",
   "/v1/databases/:id/roles/:name/reset-password",
   "/v1/databases/:id/roles/:name/connection-uri",
   "/v1/operations/:id",

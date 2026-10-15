@@ -13,6 +13,7 @@ import {
   DatabaseId,
   NodeId,
   OperationId,
+  OWNER_ROLE_NAME,
   ProjectId,
   RegionId,
   RoleName,
@@ -465,6 +466,22 @@ export const ROLE_MEMBER_OF_MAX = 8;
 /** Roles of one database; the owner and roles whose removal is not confirmed count. */
 export const ROLE_LIMIT = 100;
 
+/**
+ * The instant, in milliseconds since the epoch, from which PostgreSQL refuses the credential of a
+ * role whose `valid_until` is given. The region hands the expiry to PostgreSQL as a Kubernetes
+ * time, which holds whole seconds, and cuts the fraction: a role is refused from the start of the
+ * second its expiry falls in. Everything that decides whether a role may log in uses this instant.
+ */
+export function roleExpiryInstant(validUntil: string): number {
+  return Math.floor(Date.parse(validUntil) / 1000) * 1000;
+}
+
+const RoleConnectionLimit = z
+  .number()
+  .int()
+  .min(1)
+  .max(ROLE_CONNECTION_LIMIT_MAX);
+
 export const Role = z
   .strictObject({
     database_id: DatabaseId,
@@ -473,17 +490,95 @@ export const Role = z
     password_revision: z.number().int().min(1),
     created_at: Timestamp,
     updated_at: Timestamp,
+    valid_until: Timestamp.nullable().describe(
+      "PostgreSQL VALID UNTIL: from this time, truncated to the whole second, the role cannot log in; null means never. An open session is not ended by it.",
+    ),
+    connection_limit: RoleConnectionLimit.nullable().describe(
+      "PostgreSQL CONNECTION LIMIT: concurrent sessions of the role; null means unlimited.",
+    ),
+    member_of: z
+      .array(RoleName)
+      .max(ROLE_MEMBER_OF_MAX)
+      .describe(
+        "The roles this role is a member of and inherits privileges from, ordered by name.",
+      ),
+    bypass_rls: z
+      .boolean()
+      .describe(
+        "PostgreSQL BYPASSRLS: the role ignores row-level security policies.",
+      ),
   })
-  .meta({ id: "Role" });
+  .meta({
+    id: "Role",
+    examples: [
+      {
+        database_id: "ab12cd34ef56gh78ij90",
+        name: "report_a1b2c3",
+        owner: false,
+        password_revision: 1,
+        created_at: "2030-01-01T09:00:00.000Z",
+        updated_at: "2030-01-01T09:00:00.000Z",
+        valid_until: "2030-01-01T10:00:00.000Z",
+        connection_limit: 5,
+        member_of: ["reader"],
+        bypass_rls: false,
+      },
+    ],
+  });
 export type Role = z.infer<typeof Role>;
 
 export const RoleCreate = z
-  .strictObject({ name: RoleName })
+  .strictObject({
+    name: RoleName,
+    valid_until: Timestamp.describe(
+      "Must lie in the future when the request executes, truncated to the whole second PostgreSQL applies it at. PostgreSQL enforces it as VALID UNTIL; the edge refuses an expired role before it would wake a hibernated database. No maximum.",
+    ).optional(),
+    connection_limit: RoleConnectionLimit.describe(
+      "PostgreSQL CONNECTION LIMIT, 1 to 10000; omitted means unlimited.",
+    ).optional(),
+    member_of: z
+      .array(RoleName)
+      .max(ROLE_MEMBER_OF_MAX)
+      .meta({
+        uniqueItems: true,
+        description:
+          "Distinct live roles of this database the role becomes a member of, at most 8; never `app`, `pgcf_maintenance`, `pg_*` or `cnpg_*`.",
+      })
+      .optional(),
+    bypass_rls: z
+      .boolean()
+      .describe("PostgreSQL BYPASSRLS; defaults to false.")
+      .optional(),
+  })
   .refine((role) => role.name !== MAINTENANCE_ROLE, {
     path: ["name"],
     message: "Role name is reserved for internal maintenance",
   })
-  .meta({ id: "RoleCreate" });
+  .refine(
+    (role) =>
+      (role.member_of ?? []).every(
+        (target) =>
+          target !== OWNER_ROLE_NAME &&
+          target !== MAINTENANCE_ROLE &&
+          target !== role.name,
+      ) && new Set(role.member_of).size === (role.member_of ?? []).length,
+    {
+      path: ["member_of"],
+      message:
+        "member_of names distinct roles other than the owner, the maintenance role and the role itself",
+    },
+  )
+  .meta({
+    id: "RoleCreate",
+    examples: [
+      {
+        name: "report_a1b2c3",
+        valid_until: "2030-01-01T10:00:00.000Z",
+        connection_limit: 5,
+        member_of: ["reader"],
+      },
+    ],
+  });
 export type RoleCreate = z.infer<typeof RoleCreate>;
 
 /** The password is part of `uri` only for integrator keys; admin keys never see passwords. */
@@ -512,6 +607,7 @@ export const OPERATION_KINDS = [
   "database.wake",
   "database.role.create",
   "database.role.reset_password",
+  "database.role.delete",
 ] as const;
 export const OperationKind = z
   .enum(OPERATION_KINDS)
@@ -539,7 +635,13 @@ export const Operation = z
     generation: z.number().int().min(1),
     error: z
       .strictObject({
-        code: z.string().min(1).max(64),
+        code: z
+          .string()
+          .min(1)
+          .max(64)
+          .describe(
+            "Machine-readable reason of a failed operation, for example `operation_timeout`, `superseded`, `power_busy` or, for database.role.delete, `role_not_droppable`.",
+          ),
         message: z.string().max(TEXT_MAX_LENGTH),
       })
       .nullable(),

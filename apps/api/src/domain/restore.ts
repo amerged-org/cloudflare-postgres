@@ -7,6 +7,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { keyring } from "../crypto/keyring.ts";
 import { databaseInsertStatement, hint } from "./databases.ts";
@@ -37,6 +38,38 @@ interface Retained {
   cleanup_claim: string | null;
   archive_path: string;
   storage_generation: number;
+}
+/**
+ * A role of the source: a live row, or an entry of a retained archive. Archives retained before
+ * roles had attributes lack them, and a role without them is a plain role.
+ */
+type SourceRole = Omit<
+  RoleRow,
+  | "valid_until"
+  | "connection_limit"
+  | "member_of_json"
+  | "bypass_rls"
+  | "created_by_key_id"
+  | "deleted_by_key_id"
+  | "delete_operation_id"
+> &
+  Partial<
+    Pick<
+      RoleRow,
+      "valid_until" | "connection_limit" | "member_of_json" | "bypass_rls"
+    >
+  > & { member_of?: string[] };
+function attributesOf(role: SourceRole) {
+  return {
+    validUntil: role.valid_until ?? null,
+    connectionLimit: role.connection_limit ?? null,
+    memberOf:
+      role.member_of ??
+      (role.member_of_json
+        ? (JSON.parse(role.member_of_json) as string[])
+        : []),
+    bypassRls: role.bypass_rls ? 1 : 0,
+  };
 }
 async function response(
   c: ApiContext,
@@ -135,7 +168,7 @@ export async function restoreDatabase(
         body.mode === "pitr" ? body.target_time : undefined,
       );
       const stored = retained
-        ? (JSON.parse(retained.roles_json) as RoleRow[])
+        ? (JSON.parse(retained.roles_json) as SourceRole[])
         : (
             await c.env.DB.prepare(
               "SELECT * FROM roles WHERE database_id=? AND deleted_at IS NULL ORDER BY name",
@@ -143,6 +176,7 @@ export async function restoreDatabase(
               .bind(sourceId)
               .all<RoleRow>()
           ).results;
+      const issuer = (await getAuth(c)).id;
       if (stored.filter((r) => r.owner === 1).length !== 1)
         throw new ApiError("conflict", "Source credentials are unavailable");
       const targetId = newDatabaseId(),
@@ -239,9 +273,10 @@ export async function restoreDatabase(
         c.env.DB.prepare(
           "UPDATE databases SET storage_generation=? WHERE id=? AND project_id=? AND created_at=?",
         ).bind(storageGeneration, targetId, source.project_id, now),
-        ...roles.map(({ row: r, encrypted: e }) =>
-          c.env.DB.prepare(
-            "INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at) SELECT id,?,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
+        ...roles.map(({ row: r, encrypted: e }) => {
+          const attributes = attributesOf(r);
+          return c.env.DB.prepare(
+            "INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at,valid_until,connection_limit,member_of_json,bypass_rls,created_by_key_id) SELECT id,?,?,?,?,?,?,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
           ).bind(
             r.name,
             r.owner,
@@ -251,11 +286,16 @@ export async function restoreDatabase(
             r.password_revision,
             now,
             now,
+            attributes.validUntil,
+            attributes.connectionLimit,
+            JSON.stringify(attributes.memberOf),
+            attributes.bypassRls,
+            issuer,
             targetId,
             source.project_id,
             now,
-          ),
-        ),
+          );
+        }),
         c.env.DB.prepare(
           "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.restore','pending',project_id,id,generation,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
         ).bind(op, now, now, targetId, source.project_id, now),

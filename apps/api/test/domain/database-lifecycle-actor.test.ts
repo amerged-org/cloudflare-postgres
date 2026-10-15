@@ -800,6 +800,8 @@ it("a current password revision on an idle sleeper advances configuration withou
         `/v1/databases/${f.id}/roles/app/reset-password`,
         f.integrator,
         "POST",
+        undefined,
+        crypto.randomUUID(),
       )
     ).status,
   ).toBe(200);

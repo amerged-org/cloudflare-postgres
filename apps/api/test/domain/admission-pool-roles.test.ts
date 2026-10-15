@@ -591,8 +591,18 @@ it("a deferred create exposes its new credentials through the existing scoped SD
       return response;
     },
   });
+  const until = new Date(Date.now() + 3_600_000).toISOString();
   const accepted = DatabaseWithOperation.parse(
-    await client.createRole(f.id, { name: "new_login" }, crypto.randomUUID()),
+    await client.createRole(
+      f.id,
+      {
+        name: "new_login",
+        valid_until: until,
+        connection_limit: 3,
+        bypass_rls: true,
+      },
+      crypto.randomUUID(),
+    ),
   );
   expect(accepted.operation.status).toBe("pending");
   await expect(
@@ -638,6 +648,14 @@ it("a deferred create exposes its new credentials through the existing scoped SD
   expect(
     decodeURIComponent(new URL(credential.uri).password) === decrypted,
   ).toBe(true);
+  // The deferred creation carries the attributes it was requested with.
+  expect(stored).toMatchObject({
+    valid_until: until,
+    connection_limit: 3,
+    member_of_json: "[]",
+    bypass_rls: 1,
+  });
+  expect(stored.created_by_key_id).toMatch(/^key_/);
   expect(
     (
       await request(

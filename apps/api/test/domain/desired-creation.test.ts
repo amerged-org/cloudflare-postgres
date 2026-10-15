@@ -56,6 +56,7 @@ describe("authoritative creation history in desired state", () => {
           f.integrator,
           "POST",
           { name: "reader" },
+          crypto.randomUUID(),
         )
       ).status,
     ).toBe(201);
@@ -99,6 +100,7 @@ describe("authoritative creation history in desired state", () => {
           f.integrator,
           "POST",
           { name: "reader" },
+          crypto.randomUUID(),
         )
       ).status,
     ).toBe(201);

@@ -68,8 +68,8 @@ it("records a heartbeat of every run and lists the steps it attempted", async ()
   });
   expect(Date.parse(row!.completed_at!)).toBeGreaterThanOrEqual(at);
   expect(new Set(CRON_STEPS).size).toBe(CRON_STEPS.length);
-  // An alert event lists at most 16 failing steps and a heartbeat row at most 4 KB of counters.
-  expect(CRON_STEPS.length).toBeLessThanOrEqual(16);
+  // An alert event lists at most 20 failing steps and a heartbeat row at most 4 KB of counters.
+  expect(CRON_STEPS.length).toBeLessThanOrEqual(20);
   // Alerting needs only D1 and a bounded send, so it leads; the dispatch's Workflow calls follow.
   expect(CRON_STEPS.slice(0, 3)).toEqual([
     "health_alerts",
@@ -148,6 +148,43 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
       error_code: "injected_step_failure",
     },
   });
+});
+
+it("isolates the role removal timeout: a failing statement is logged and counted and the steps after it still run", async () => {
+  const f = await fixture(),
+    at = Date.now();
+  expect(
+    (await f.create("database", f.integrator, crypto.randomUUID())).status,
+  ).toBe(202);
+  // A day-old idempotency key: its purge is a step that follows the role removal timeout.
+  await env.DB.prepare("UPDATE idempotency_keys SET created_at=?")
+    .bind(new Date(at - 25 * 3_600_000).toISOString())
+    .run();
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await runCron(
+    failing("UPDATE role_deletions SET status='failed'"),
+    at,
+  );
+  expect(result.step_failures).toEqual([
+    { step: "role_deletion_timeouts", error_code: "injected_step_failure" },
+  ]);
+  expect(result.purged).toBeGreaterThan(0);
+  expect(JSON.parse((await heartbeat())!.failing_steps_json)).toEqual({
+    role_deletion_timeouts: {
+      consecutive_failures: 1,
+      error_code: "injected_step_failure",
+    },
+  });
+  expect(
+    logged.mock.calls.some(
+      ([line]) =>
+        String(line).includes("cron_step_failed") &&
+        String(line).includes("role_deletion_timeouts"),
+    ),
+  ).toBe(true);
+  expect(CRON_STEPS.indexOf("role_deletion_timeouts")).toBeLessThan(
+    CRON_STEPS.indexOf("idempotency_purge"),
+  );
 });
 
 it("counts consecutive failed runs per step and forgets a step once it succeeds", async () => {

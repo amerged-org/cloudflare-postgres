@@ -23,7 +23,9 @@ import {
   newDatabaseId,
   newProjectId,
   newNodeId,
+  Role,
   RoleCreate,
+  roleExpiryInstant,
   SizeClassUpsert,
   MAINTENANCE_ROLE,
 } from "../src/index.ts";
@@ -81,6 +83,112 @@ it("reserves only the exact internal maintenance role in customer creation", () 
   expect(RoleCreate.parse({ name: "pgcf_customer" }).name).toBe(
     "pgcf_customer",
   );
+});
+
+describe("role lifecycle attributes", () => {
+  const until = "2031-01-02T03:04:05.678Z";
+  it("accepts expiry, a connection limit, memberships and row-level-security bypass on creation", () => {
+    expect(
+      RoleCreate.parse({
+        name: "report_job",
+        valid_until: until,
+        connection_limit: 5,
+        member_of: ["reader", "writer"],
+        bypass_rls: true,
+      }),
+    ).toEqual({
+      name: "report_job",
+      valid_until: until,
+      connection_limit: 5,
+      member_of: ["reader", "writer"],
+      bypass_rls: true,
+    });
+    // Every attribute is optional; a plain request keeps its wire shape.
+    expect(RoleCreate.parse({ name: "plain" })).toEqual({ name: "plain" });
+  });
+  it("bounds each attribute and refuses unknown or reserved targets", () => {
+    const base = { name: "report_job" };
+    const refused: Record<string, unknown>[] = [
+      { valid_until: "2031-01-02" },
+      { valid_until: "2031-01-02T03:04:05Z" },
+      { valid_until: null },
+      { connection_limit: 0 },
+      { connection_limit: 10001 },
+      { connection_limit: 1.5 },
+      { connection_limit: null },
+      { member_of: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] },
+      { member_of: ["reader", "reader"] },
+      { member_of: ["app"] },
+      { member_of: [MAINTENANCE_ROLE] },
+      { member_of: ["pg_read_all_data"] },
+      { member_of: ["pg_execute_server_program"] },
+      { member_of: ["cnpg_internal"] },
+      { member_of: ["postgres"] },
+      { member_of: ["report_job"] },
+      { member_of: "reader" },
+      { bypass_rls: "yes" },
+      { superuser: true },
+      { password: "chosen" },
+    ];
+    for (const extra of refused)
+      expect(
+        RoleCreate.safeParse({ ...base, ...extra }).success,
+        JSON.stringify(extra),
+      ).toBe(false);
+    expect(
+      RoleCreate.safeParse({ ...base, connection_limit: 10000, member_of: [] })
+        .success,
+    ).toBe(true);
+  });
+  it("returns every attribute on a role", () => {
+    const row = {
+      database_id: newDatabaseId(),
+      name: "report_job",
+      owner: false,
+      password_revision: 1,
+      created_at: "2030-01-01T00:00:00.000Z",
+      updated_at: "2030-01-01T00:00:00.000Z",
+    };
+    // A response omitting an attribute is not a role of this contract.
+    expect(Role.safeParse(row).success).toBe(false);
+    const full = {
+      ...row,
+      valid_until: until,
+      connection_limit: 5,
+      member_of: ["reader"],
+      bypass_rls: false,
+    };
+    expect(Role.parse(full)).toEqual(full);
+    const open = {
+      ...row,
+      valid_until: null,
+      connection_limit: null,
+      member_of: [],
+      bypass_rls: false,
+    };
+    expect(Role.parse(open)).toEqual(open);
+    expect(Role.safeParse({ ...full, member_of: ["Reader"] }).success).toBe(
+      false,
+    );
+    expect(Role.safeParse({ ...full, connection_limit: 0 }).success).toBe(
+      false,
+    );
+  });
+  it("names the role removal as an operation kind", () => {
+    expect(OperationKind.parse("database.role.delete")).toBe(
+      "database.role.delete",
+    );
+  });
+  it("takes the instant an expiry is applied at from its whole second", () => {
+    // PostgreSQL gets the expiry through a Kubernetes time, which holds whole seconds: the
+    // fraction is cut, so the credential is refused from the start of the second it falls in.
+    const second = Date.parse("2031-01-02T03:04:05.000Z");
+    for (const fraction of ["000", "001", "678", "999"])
+      expect(roleExpiryInstant(`2031-01-02T03:04:05.${fraction}Z`)).toBe(
+        second,
+      );
+    expect(roleExpiryInstant("2031-01-02T03:04:06.000Z")).toBe(second + 1000);
+  });
 });
 
 describe("node CPU measurement compatibility", () => {

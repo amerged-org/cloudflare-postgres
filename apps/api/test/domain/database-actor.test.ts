@@ -373,6 +373,7 @@ it("only a validated management seed for the exact actor creates its persistent 
   const persisted = await runInDurableObject(actor(id), (_instance, state) =>
     state.storage.sql.exec("SELECT * FROM database_presence").toArray(),
   );
+  // A role without an expiry is stored as it always was, the bare name.
   expect(persisted).toEqual([
     {
       ...snapshot,

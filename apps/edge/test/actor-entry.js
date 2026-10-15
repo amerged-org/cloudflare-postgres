@@ -50,6 +50,7 @@ export async function createUnrelatedRole(env, ctx, database) {
         headers: {
           Authorization: `Bearer ${key}`,
           "Content-Type": "application/json",
+          "Idempotency-Key": crypto.randomUUID(),
         },
         body: JSON.stringify({ name: "unrelated" }),
       }),
@@ -64,6 +65,10 @@ export async function createUnrelatedRole(env, ctx, database) {
       ctx,
     );
   } finally {
+    // The key's retained idempotency record references it.
+    await env.DB.prepare("DELETE FROM idempotency_keys WHERE api_key_id=?")
+      .bind(keyId)
+      .run();
     await env.DB.prepare("DELETE FROM api_keys WHERE id=?").bind(keyId).run();
   }
 }

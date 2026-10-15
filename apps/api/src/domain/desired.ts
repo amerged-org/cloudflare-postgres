@@ -121,7 +121,7 @@ export async function desired(
       : undefined;
   const result = await c.env.DB.prepare(
     `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
-    (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
+    (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'deleted_at',r.deleted_at,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls)) FROM roles r WHERE r.database_id=d.id) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
     m.password_ciphertext maintenance_ciphertext,m.password_iv maintenance_iv,m.password_kid maintenance_kid,m.password_revision maintenance_revision,
@@ -173,8 +173,17 @@ export async function desired(
           }),
         };
       }
-      const stored = JSON.parse(row.roles_json) as RoleRow[];
-      for (const role of stored.sort((a, b) => a.name.localeCompare(b.name)))
+      const stored = JSON.parse(row.roles_json) as (Omit<
+        RoleRow,
+        "member_of_json"
+      > & { member_of: string[] })[];
+      for (const role of stored.sort((a, b) => a.name.localeCompare(b.name))) {
+        // A deleted role is only named: the region removes it from PostgreSQL and reports back,
+        // and its credential is never sent again.
+        if (role.deleted_at !== null) {
+          roles.push({ name: role.name, state: "absent" });
+          continue;
+        }
         roles.push({
           name: role.name,
           owner: Boolean(role.owner),
@@ -184,7 +193,18 @@ export async function desired(
             iv: role.password_iv,
             kid: role.password_kid,
           }),
+          // Attributes appear only where they differ from a plain role, so a database without
+          // them keeps the wire shape every deployed consumer accepts.
+          ...(role.valid_until === null
+            ? {}
+            : { valid_until: role.valid_until }),
+          ...(role.connection_limit === null
+            ? {}
+            : { connection_limit: role.connection_limit }),
+          ...(role.member_of.length === 0 ? {} : { member_of: role.member_of }),
+          ...(role.bypass_rls ? { bypass_rls: true as const } : {}),
         });
+      }
     }
     const storage = row.storage_profile_json
       ? DesiredDatabaseStorage.parse(JSON.parse(row.storage_profile_json))

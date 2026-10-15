@@ -27,6 +27,29 @@ it("gives every alert kind one short runbook action", () => {
   }
 });
 
+it("lists at most 20 failing cron steps and keeps the longest such alert under the 4 KB the store checks", () => {
+  const steps = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      step: `step_${index}`.padEnd(32, "x"),
+      consecutive_failures: 1_000_000,
+      error_code: "e".repeat(64),
+    }));
+  const alert = (count: number) => ({
+    ...base,
+    kind: "control_cron_step_failing" as const,
+    event_id: crypto.randomUUID(),
+    cron: {
+      last_started_at: "2026-10-15T00:00:00.000Z",
+      last_completed_at: "2026-10-15T00:00:00.000Z",
+      failing_steps: steps(count),
+    },
+    action: "a".repeat(512),
+  });
+  const longest = InfraAlert.parse(alert(20));
+  expect(JSON.stringify(longest).length).toBeLessThanOrEqual(4096);
+  expect(InfraAlert.safeParse(alert(21)).success).toBe(false);
+});
+
 it("covers the database, Thin storage and cron conditions beside the infrastructure ones", () => {
   expect(InfraAlertKind.options).toEqual(
     expect.arrayContaining([

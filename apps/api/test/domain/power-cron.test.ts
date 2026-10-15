@@ -98,6 +98,8 @@ it("uses the current power revision after a role configuration change", async ()
         `/v1/databases/${f.id}/roles/app/reset-password`,
         f.integrator,
         "POST",
+        undefined,
+        crypto.randomUUID(),
       )
     ).status,
   ).toBe(200);

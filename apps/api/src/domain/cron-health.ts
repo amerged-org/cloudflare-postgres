@@ -5,8 +5,9 @@ import { Timestamp, type InfraCronFailingStep } from "@pgcf/contracts";
 /**
  * The minute cron's steps in execution order. Alerting needs only D1 and a bounded send, so it
  * leads; the daily backup dispatch follows, ahead of the steps that call out to other systems. No
- * more than 16 steps: an alert event lists at most that many failing steps. Every step runs in its
- * own failure boundary (see runCron).
+ * more than 20 steps: an alert event lists at most that many failing steps (a payload of 20 at
+ * their longest stays under D1's 4 KB check). Every step runs in its own failure boundary (see
+ * runCron).
  */
 export const CRON_STEPS = [
   "health_alerts",
@@ -17,6 +18,7 @@ export const CRON_STEPS = [
   "resource_profile_rollouts",
   "power_timeouts",
   "operation_timeouts",
+  "role_deletion_timeouts",
   "idempotency_purge",
   "region_hints",
   "database_actors",

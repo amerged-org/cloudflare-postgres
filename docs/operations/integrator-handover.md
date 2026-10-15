@@ -183,8 +183,9 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
 | `deleteDatabase` | `DELETE /v1/databases/{id}` | 202 |
 | `suspendDatabase`, `resumeDatabase` | `POST /v1/databases/{id}/suspend`, `/resume` | 202 |
 | `restoreDatabase` | `POST /v1/databases/{id}/restore` | 202, creates a new database |
-| `listDatabaseRoles`, `createDatabaseRole` | `GET`, `POST /v1/databases/{id}/roles` | at most 100 roles |
-| `resetDatabaseRolePassword` | `POST /v1/databases/{id}/roles/{name}/reset-password` | |
+| `listDatabaseRoles`, `createDatabaseRole` | `GET`, `POST /v1/databases/{id}/roles` | at most 100 roles; optional `valid_until`, `connection_limit`, `member_of`, `bypass_rls` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required |
+| `resetDatabaseRolePassword` | `POST /v1/databases/{id}/roles/{name}/reset-password` | `Idempotency-Key` required |
+| `deleteDatabaseRole` | `DELETE /v1/databases/{id}/roles/{name}` | 202, operation `database.role.delete` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required |
 | `getDatabaseConnectionUri` | `GET /v1/databases/{id}/roles/{name}/connection-uri` | password included for integrator keys |
 | `getDatabaseOperation` | `GET /v1/operations/{id}` | by ID only; no list endpoint |
 | `getDatabaseArchive` | `GET /v1/databases/{id}/archive` | counts only |
@@ -237,8 +238,9 @@ counts from readiness.
 
 Poll with a short interval at first and a longer one afterwards; there is no event stream or
 webhook (open work). Kinds you start: `database.create`, `database.restore` (it belongs to the new
-database), `database.delete`, `database.resize`, `database.suspend`, `database.resume`. PGCF starts
-`database.hibernate` (idle sleep) and `database.wake` (a connection) itself; you cannot list them.
+database), `database.delete`, `database.resize`, `database.suspend`, `database.resume`,
+`database.role.delete`. PGCF starts `database.hibernate` (idle sleep) and `database.wake` (a
+connection) itself; you cannot list them.
 
 The `Database` object: `desired_state` (`running`, `suspended`, `deleted`), `observed_state`
 (`pending`, `provisioning`, `hibernated`, `ready`, `error`, `deleting`, `deleted`),
@@ -257,12 +259,14 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
 ```
 
 - `app` is the database owner and not a superuser (the acceptance probe asserts
-  `rolsuper = false`). Roles you add are plain login roles without superuser, `createdb`,
-  `createrole`, replication or `bypassrls`; grant them privileges with SQL as `app`. Role names
-  match `^[a-z][a-z0-9_]{0,62}$` and may not be `postgres`, `streaming_replica`, `pg_*`, `cnpg_*`
-  or `pgcf_maintenance`. There is no API to delete a role or to choose a password.
+  `rolsuper = false`). Roles you add are login roles without superuser, `createdb`,
+  `createrole` or replication; `bypassrls` only when you ask for it (below). Grant them
+  privileges with SQL as `app`. Role names match `^[a-z][a-z0-9_]{0,62}$` and may not be
+  `postgres`, `streaming_replica`, `pg_*`, `cnpg_*` or `pgcf_maintenance`. There is no API to
+  choose a password.
 - Passwords are 43 characters of base64url, server-generated. Only an integrator key can read one,
   and only through the connection URI. `reset-password` replaces it (`password_revision` + 1).
+- Creating, resetting and deleting a role require an `Idempotency-Key` (`400` without one).
 - After `POST /roles` returns `201`, or `reset-password` returns `200`, the role is registered but
   the change reaches PostgreSQL with the database's next configuration pass. Wait until
   `observed_generation == generation` before connecting as the new role (earlier: `57P03`). A
@@ -271,6 +275,74 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   `202` and an operation; poll it like any operation. No database is bound to a pool Pod: the
   shared pool is deferred and not deployed.
 - The URI has no port and no `sslmode`; see [3.1](#31-driver-configuration) for how to use it.
+
+**Attributes at creation.** All are optional; a role created without them is the plain login role
+of before. None can be changed afterwards (there is no `PATCH`): delete the role and create it
+again.
+
+```sh
+pgcf -X POST "$PGCF_API/v1/databases/<database-id>/roles" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"name":"report_a1b2c3","valid_until":"2030-01-01T10:00:00.000Z","connection_limit":5,"member_of":["reader"]}'
+```
+
+| Field | Meaning | Limits |
+| --- | --- | --- |
+| `valid_until` | PostgreSQL `VALID UNTIL`: from this time the role cannot log in | a [timestamp](#20-conventions) in the future when the request executes, no maximum; PostgreSQL applies it at whole seconds, truncated, so `…:05.678Z` expires at `…:05.000Z` and a value whose whole second has already begun is refused with `400` |
+| `connection_limit` | PostgreSQL `CONNECTION LIMIT`: concurrent sessions of the role; one more gets `53300` "too many connections for role" | 1 to 10,000; omitted means unlimited |
+| `member_of` | the role is a member of these roles and inherits their privileges (`INHERIT`; `SET ROLE` to them stays possible, as for any PostgreSQL membership) | at most 8 distinct live roles of this database; never `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*` or the role itself; otherwise `400` |
+| `bypass_rls` | PostgreSQL `BYPASSRLS`: the role ignores row-level security policies, also `FORCE ROW LEVEL SECURITY`; it still needs table privileges. Typical use: an export or backup role | boolean, default `false` |
+
+`GET /v1/databases/{id}/roles` returns all four on every role (`null`, `[]`, `false` when not
+set). A role past its `valid_until` stays listed and counts toward the 100 roles until you delete
+it; its connection URI is still readable but a connection with it is refused. Expiry stops new
+logins only: **a session that is already open is not ended by it**. Delete the role to end its
+sessions.
+
+**Expired credentials.** The Edge refuses a role past `valid_until` with `28P01` before it would
+wake a hibernated database or spend connection budget, exactly the SQLSTATE PostgreSQL answers an
+expired password with ([A.4](#a4-sqlstate-at-connect-time)); it refuses from the start of the
+whole second the expiry falls in, the instant PostgreSQL enforces for anything that reaches it.
+
+**Deleting a role.**
+
+```sh
+pgcf -i -X DELETE "$PGCF_API/v1/databases/<database-id>/roles/report_a1b2c3" \
+  -H "Idempotency-Key: del-$KEY"
+# 202 {"database":{...},"operation":{"id":"op_...","kind":"database.role.delete","status":"pending",...}}
+```
+
+- **Unroutable at once.** From the moment the request is accepted the role is no longer listed, its
+  connection URI is `404`, and the Edge answers `28P01` to a new connection. A route token issued
+  just before lives up to 30 s. The region then sets the role to `NOLOGIN`, ends its sessions and
+  drops it; the operation is `succeeded` when PostgreSQL has confirmed that. Sessions that are open
+  at the time are ended once the role is `NOLOGIN`: do not rely on one surviving the deletion.
+- **A role that owns objects cannot be dropped.** If it owns objects or holds privileges
+  (including default privileges), PostgreSQL refuses `DROP ROLE`: the operation ends `failed` with
+  `error.code` `role_not_droppable`, and the role **stays unable to log in and unroutable**. To
+  prevent it, connect as the role while it is live and run `DROP OWNED BY CURRENT_USER` (or drop
+  its objects as `app`, which owns the `public` schema, and `REVOKE` what it holds) before
+  deleting it. Afterwards `DELETE` the role again under a new `Idempotency-Key` (the old key
+  replays the failed operation): a failed removal starts a new operation, and the region drops the
+  role as soon as nothing depends on it. The old operation stays `failed`.
+- **The name** is free again only when the removal is confirmed; creating it earlier is `409`
+  ("A role of this name is being deleted"). A role awaiting its removal counts toward the 100
+  roles.
+- **Hibernated database.** A suspended or idle-hibernated database has no PostgreSQL running, so the
+  region applies the removal at its next wake. The operation reports `succeeded` at once because
+  the role is already unroutable, **before** PostgreSQL has dropped it (a removal still waiting
+  when a running database goes to sleep ends the same way); if the drop then fails (the role owns
+  objects) the failure is not reported through that operation. To observe the outcome,
+  `resume` the database and, once it is running, `DELETE` the role again under a new key: that
+  starts a new operation which succeeds when PostgreSQL has dropped the role, or fails with
+  `role_not_droppable`; once the removal is complete the role is gone (`404`).
+- **Repeats.** Another `DELETE` of a role whose removal is still running, or whose operation
+  completed for a database that still is not running, returns the same operation, without a new
+  generation. After a removal was confirmed the role is `404`.
+- **Refusals.** `400` for the owner `app` and `pgcf_maintenance`; `404` for an unknown role;
+  `409` for a role that other live roles are `member_of` (delete the members first), for a database
+  bound to a shared pool, and while another role change waits. Deleting a database ends a pending
+  removal with `superseded`.
 
 ### 2.4 Suspend and resume
 
@@ -313,9 +385,9 @@ the capacity case. Retry later or free capacity.
 record ends as `observed_state: deleted` (the plan's EU acceptance row measured delete and storage
 reclaim in 93.3 s). The name is free at once. The backup archive is **retained** for the class's
 `backup_retention_days`; the database stays restorable until `deleted_at + backup_retention_days`
-(the API does not return that date). Role credentials are retained with it. A project can be
-deleted only after all its databases have finished deleting. Retained archives are removed by a
-cron after expiry.
+(the API does not return that date). Role credentials and attributes are retained with it; a role
+awaiting its removal is not. A project can be deleted only after all its databases have finished
+deleting. Retained archives are removed by a cron after expiry.
 
 A `409 conflict` from `DELETE` deletes nothing. "Database admission mutation is in progress" means
 another change to the same database holds it at that moment: a wake, an idle sleep or its
@@ -363,7 +435,7 @@ relationship that the operator configures (not applicable with one region).
 | Database ID and PostgreSQL database name | `<source-id>` | **new** `<target-id>` |
 | `name` | the old label | the `name` of the request; it must differ from every live database of the project (`409` otherwise) |
 | Project, size class, region | | the same (region unless `region_id` is given) |
-| Role names and passwords | | the same names and passwords registered at the time of the call (from the retained record for a deleted source) |
+| Role names, passwords and attributes (`valid_until`, `connection_limit`, `member_of`, `bypass_rls`) | | the same names, passwords and attributes registered at the time of the call (from the retained record for a deleted source); a role awaiting its removal is not copied, and an expired role is copied expired |
 | Data, grants, sequences | | from the backup, as of `target_time` or the end of the archive |
 
 The source keeps running until you delete it. Persist `source_id -> target_id`, the restore
@@ -535,6 +607,7 @@ a woken database sleeps again after 60 s idle.
 | Limit | Value | Where |
 | --- | --- | --- |
 | Server sessions | the class's `max_connections`; PostgreSQL reserves a few for superusers and PGCF's own maintenance and instance-manager sessions (exact count not recorded) | PostgreSQL; refusal is `53300` |
+| Sessions of one role | the role's `connection_limit` when set ([2.3](#23-roles-connection-uri-and-passwords)); PGCF's own readiness check logs in once per role for a moment and accepts a role that is at its limit | PostgreSQL; refusal is `53300` "too many connections for role" |
 | Sessions per database through one gateway | 200 (2,000 per gateway); beyond that the connection fails as `08006` | gateway constants |
 | New connections per database, all roles and networks | 120 per 60 s in the example Edge configuration; the plan records the same figure as the deployed handshake limit | Edge rate limiter; refusal is `53300` |
 | New connections per database, role and source network | 120 per 60 s in the example Edge configuration; the deployed value is installation configuration and **not recorded in this repository** | Edge rate limiter; refusal is `53300` |
@@ -825,7 +898,8 @@ the operator supplies it at handover.** Send:
 - Key expiry, last-use display, key rotation as a feature, a read-only scope; an API domain with
   rate limiting.
 - Infrastructure metrics history and measured CPU and RAM per database.
-- Role deletion, user-chosen passwords, renaming a database, a region list for integrators.
+- Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
+  per-role settings, renaming a database, a region list for integrators.
 - Cancel requests, replication connections, HTTP query mode, TCP access.
 - Budgets, quotas per tenant, compute and storage autoscaling, branching.
 - Maintenance-window notifications.
@@ -843,7 +917,8 @@ confirmation. The state column says what is measured and what is derived or open
 | Parked hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | **not measured**: the parked tier is implemented; the hibernated wake is 8.1–9.4 s |
 | `57P03` meanings and retry rule | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee |
 | Connection limits | [3.6](#36-connection-limits) | stated; the deployed per-role and per-network values are not recorded in the repository |
-| Role-change deferral on pool-bound databases | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code; the pool is deferred and not deployed |
+| Role-change deferral on pool-bound databases (a deletion is refused instead) | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code; the pool is deferred and not deployed |
+| Role deletion: unroutable at once, removal confirmed by PostgreSQL, hibernated database applies it at its next wake | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code and its tests; **not yet run against the live cluster** (live acceptance pending) |
 | Outage classes and maintenance windows | [7.1](#71-what-happens-in-each-situation) | classes stated; no window schedule and no announcement channel is defined |
 | New IDs after restore or node loss | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) | stated |
 | Capacity caps | [4](#4-capacity-and-limits-you-must-enforce) | arithmetic only; measured caps follow *Density on EU1* |
@@ -856,11 +931,11 @@ Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
 
 | Status | `error.code` | When | Retry |
 | --- | --- | --- | --- |
-| 400 | `invalid_request` | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink or change on thick, usage range not aligned or over 31 days | no |
+| 400 | `invalid_request` | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink or change on thick, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a `member_of` entry that is not a live role of the database (or is `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*`), deleting `app` or `pgcf_maintenance` | no |
 | 401 | `unauthorized` | key missing, malformed, unknown, revoked, or its project deleted | no |
 | 403 | `forbidden` | integrator key on an admin route | no |
 | 404 | `not_found` | unknown ID, an ID of another project, unknown route, a role route of a deleted database | no |
-| 409 | `conflict` | name in use, "Database is deleted", "Database configuration is not ready", "Database changed; retry the request" (also a resume without headroom), role exists or 100 roles, a role change already waiting, restore refusals ([2.7](#27-backups-restorable-window-and-restore)), project still holds databases | after reading state |
+| 409 | `conflict` | name in use, "Database is deleted", "Database configuration is not ready", "Database changed; retry the request" (also a resume without headroom), role exists or 100 roles, a role of that name "is being deleted", a role that other roles are `member_of` ("delete the members first"), a role deletion on a database bound to a shared pool, a role change already waiting, restore refusals ([2.7](#27-backups-restorable-window-and-restore)), project still holds databases | after reading state |
 | 409 | `conflict` | "Database admission mutation is in progress": another change to the same database holds it for the moment | yes, with backoff for up to about two minutes |
 | 409 | `idempotency_conflict` | same key, different request; replay of a credential-creating call | no |
 | 409 | `idempotency_in_progress` | same key still executing | yes, shortly |
@@ -873,9 +948,9 @@ Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
 ### A.2 Operation kinds
 
 `database.create`, `database.restore`, `database.delete`, `database.resize`, `database.suspend`,
-`database.resume` are started by you; `database.hibernate`, `database.wake` by PGCF;
-`database.role.create` and `database.role.reset_password` appear only when a role change is
-deferred behind a pool binding.
+`database.resume`, `database.role.delete` are started by you; `database.hibernate`,
+`database.wake` by PGCF; `database.role.create` and `database.role.reset_password` appear only
+when a role change is deferred behind a pool binding.
 
 ### A.3 Operation error codes
 
@@ -885,18 +960,19 @@ deferred behind a pool binding.
 | `operation_timeout` | no progress for 20 minutes ("Regional operation exceeded 20 minutes") |
 | `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running |
 | `pool_holder_unproved` | a deferred role change could not apply to the pool holder |
+| `role_not_droppable` | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 
 ### A.4 SQLSTATE at connect time
 
 | SQLSTATE | Message | Cause | Action |
 | --- | --- | --- | --- |
 | `3D000` | database does not exist | the `database` hint is missing or not a well-formed ID | fix the configuration |
-| `28P01` | authentication failed / password authentication failed | a malformed role; or an unknown database, unknown role or deleted database (indistinguishable from a wrong password by design); or a wrong password | check ID, role and password revision; do not loop |
+| `28P01` | authentication failed / password authentication failed | a malformed role; or an unknown database, unknown role, deleted role or deleted database (indistinguishable from a wrong password by design); or a role past its `valid_until` (it does not wake a hibernated database); or a wrong password | check ID, role, `valid_until` and password revision; do not loop |
 | `28000` | startup does not match the authorized route | StartupMessage `database` or `user` differs from the URL hints | fix the client |
 | `08P01` | duplicate connection admission hint / protocol violation | repeated `database` or `user`, or a malformed startup | fix the client |
 | `0A000` | replication connections are not supported / unsupported frontend protocol | | fix the client |
 | `57P03` | database is not accepting connections | not admissible now: manual suspension, provisioning, no capacity for a wake, error state, more than 32 waiters, or the wake did not finish within the 30 s deadline; see the table in [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | per cause |
-| `53300` | connection rate limit exceeded / database connection rate limit exceeded / connection admission unavailable; or PostgreSQL "too many clients" | Edge rate limiters, admission limit, or `max_connections` | back off; pool |
+| `53300` | connection rate limit exceeded / database connection rate limit exceeded / connection admission unavailable; or PostgreSQL "too many clients" / "too many connections for role" | Edge rate limiters, admission limit, `max_connections`, or the role's `connection_limit` | back off; pool |
 | `08006` | gateway connection failed / connection admission interrupted | the 30 s deadline passed during a wake (the usual outcome), you aborted, the per-database gateway limit was hit, or the gateway was unreachable | retry; the wake continues |
 
 ### A.5 Closing an established connection
@@ -942,7 +1018,7 @@ these corrections; the code is authoritative.
 | `UsageQuery`: `project_id` and `database_id` both optional; `from` and `to` timestamps | exactly one scope; both boundaries aligned to the granularity (UTC hour or day); at most 31 days | `400` |
 | `SizeClass`/`SizeClassUpsert` fields independent | `cpu_request_millicores` must not exceed `cpu_millicores` | `400` |
 | `getDatabaseArchive`: "Read database backup and WAL archive status" | returns only `{database_id, base_backup_count, wal_count, bytes}` | there is no status or window; use `health.archiving` |
-| Role routes emit no `Location` | the `202` of `POST /roles` and `/reset-password` (deferred behind a pool binding) carries `Location: /v1/operations/{id}` | read it or the body |
+| `RoleCreate.valid_until` is a `Timestamp`; `member_of` an array of at most 8 distinct `RoleName` | `valid_until` must be in the future when the request executes (not on a replay); every `member_of` entry must be a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `400` |
 | `POST /v1/api-keys` `201` `Location: /v1/api-keys/{id}` | no `GET` exists for that path (only `DELETE`) | do not follow it |
 | `resumeDatabase`: `409` only | a resume without CPU, RAM or storage headroom is also `409` ("Database changed; retry the request"); `503 capacity_exhausted` exists only for resize and profile assignment | treat a `409` on resume as possible capacity |
 | Idempotency described without retention | keys are kept 24 hours | retries after a day execute again |

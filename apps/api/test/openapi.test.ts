@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { ErrorBody } from "@pgcf/contracts";
+import {
+  DatabaseWithOperation,
+  ErrorBody,
+  Role,
+  RoleCreate,
+} from "@pgcf/contracts";
 import { NODE_OPERATOR_KUBERNETES_HEADERS } from "@pgcf/contracts/node-operator";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.ts";
@@ -337,6 +342,111 @@ describe("actual generated API references in the Workers runtime", () => {
         bytes: new TextEncoder().encode(JSON.stringify(doc)).length,
       })),
     );
+  });
+
+  it("documents the role lifecycle: attributes, deletion, required keys and the operation kind", async () => {
+    const doc = await document("/v1/openapi.json");
+    const create = operation(doc, "/v1/databases/{id}/roles", "post");
+    const remove = operation(doc, "/v1/databases/{id}/roles/{name}", "delete");
+    const reset = operation(
+      doc,
+      "/v1/databases/{id}/roles/{name}/reset-password",
+      "post",
+    );
+    for (const mutation of [create, remove, reset])
+      expect(mutation.parameters).toContainEqual(
+        expect.objectContaining({ name: "Idempotency-Key", required: true }),
+      );
+    // Reading a role never needs one.
+    expect(
+      operation(doc, "/v1/databases/{id}/roles", "get").parameters?.some(
+        (parameter) => parameter.name === "Idempotency-Key",
+      ),
+    ).toBe(false);
+    expect(remove.operationId).toBe("deleteDatabaseRole");
+    expect(remove.security).toEqual([{ bearerAuth: [] }]);
+    expect(Object.keys(remove.responses).sort()).toEqual([
+      "202",
+      "400",
+      "401",
+      "404",
+      "409",
+      "500",
+    ]);
+    expect(remove.responses["202"]!.headers).toHaveProperty("Location");
+    for (const text of ["NOLOGIN", "role_not_droppable", "hibernated"])
+      expect(remove.description, text).toContain(text);
+    for (const text of ["valid_until", "connection_limit", "member_of"])
+      expect(create.description, text).toContain(text);
+    const schemas = doc.components!.schemas as Record<
+      string,
+      {
+        properties?: Record<string, Record<string, unknown>>;
+        required?: string[];
+        enum?: string[];
+        examples?: unknown[];
+      }
+    >;
+    const input = schemas.RoleCreate!;
+    expect(input.required).toEqual(["name"]);
+    expect(Object.keys(input.properties!)).toEqual([
+      "name",
+      "valid_until",
+      "connection_limit",
+      "member_of",
+      "bypass_rls",
+    ]);
+    expect(input.properties!.connection_limit).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 10000,
+    });
+    expect(input.properties!.member_of).toMatchObject({
+      type: "array",
+      maxItems: 8,
+      uniqueItems: true,
+    });
+    expect(input.examples?.length).toBeGreaterThan(0);
+    const role = schemas.Role!;
+    expect(role.required).toEqual(
+      expect.arrayContaining([
+        "valid_until",
+        "connection_limit",
+        "member_of",
+        "bypass_rls",
+      ]),
+    );
+    expect(role.examples?.length).toBeGreaterThan(0);
+    expect(schemas.OperationKind!.enum).toContain("database.role.delete");
+    // The examples are copied by integrators, so each must be valid under its own contract.
+    const examples = (content: unknown) =>
+      Object.values(
+        (
+          content as Record<
+            string,
+            { examples?: Record<string, { value: unknown }> }
+          >
+        )["application/json"]!.examples!,
+      ).map((example) => example.value);
+    const accepted = examples(remove.responses["202"]!.content);
+    expect(accepted).toHaveLength(2);
+    for (const value of accepted)
+      expect(DatabaseWithOperation.parse(value).operation.kind).toBe(
+        "database.role.delete",
+      );
+    expect(DatabaseWithOperation.parse(accepted[1]).operation.error?.code).toBe(
+      "role_not_droppable",
+    );
+    const created = examples(create.responses["201"]!.content);
+    expect(Role.parse(created[0])).toMatchObject({
+      name: "report_a1b2c3",
+      member_of: ["reader"],
+    });
+    const requested = examples(
+      (create as unknown as { requestBody: { content: unknown } }).requestBody
+        .content,
+    );
+    expect(RoleCreate.parse(requested[0]).name).toBe("report_a1b2c3");
   });
 
   it("limits callback replies to the outcomes produced by their current actions", async () => {

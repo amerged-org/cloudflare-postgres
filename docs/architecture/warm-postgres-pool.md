@@ -335,7 +335,10 @@ terminal CNPG Pods (nc/power.rs:1310-1345).
   the detach path, which completes once in-flight work has ended, because busy sessions are never
   forced closed. A CNPG-owned wake then applies the managed roles, and admission reopens after
   acknowledgement. No new session can authenticate with an old password in between. Refusal would
-  fail an integrator's rotation whenever the database is busy.
+  fail an integrator's rotation whenever the database is busy. Deleting a role is the exception: it
+  is refused with 409 while the database is bound, because its removal (NOLOGIN, ending sessions,
+  DROP ROLE) runs through the CNPG-owned instance and the pool never changes roles; the integrator
+  retries after the release.
 - *Supervisor:* no ServiceAccount token and no Kubernetes access.
 
 ### A8.4 Network identity and late-set labels

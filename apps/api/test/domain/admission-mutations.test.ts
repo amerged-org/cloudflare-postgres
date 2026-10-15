@@ -176,6 +176,7 @@ it("a committed v4 role change cannot admit the preceding ready runtime without 
     {
       name: "unrelated",
     },
+    crypto.randomUUID(),
   );
   expect(changed.status).toBe(201);
   const row = await env.DB.prepare(
@@ -477,9 +478,15 @@ it("actual role create and password reset acquire their admission fence before t
   try {
     expect(
       (
-        await request(`/v1/databases/${f.id}/roles`, f.integrator, "POST", {
-          name: "unrelated",
-        })
+        await request(
+          `/v1/databases/${f.id}/roles`,
+          f.integrator,
+          "POST",
+          {
+            name: "unrelated",
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(201);
     expect(
@@ -488,6 +495,8 @@ it("actual role create and password reset acquire their admission fence before t
           `/v1/databases/${f.id}/roles/unrelated/reset-password`,
           f.integrator,
           "POST",
+          undefined,
+          crypto.randomUUID(),
         )
       ).status,
     ).toBe(200);

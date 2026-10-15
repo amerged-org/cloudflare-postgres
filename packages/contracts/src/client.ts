@@ -368,6 +368,21 @@ export class PgcfClient {
       input(IdempotencyKey, idempotencyKey),
     );
   }
+  /** The role is unroutable at once; the operation ends when PostgreSQL has dropped it. */
+  deleteRole(
+    id: string,
+    role: string,
+    idempotencyKey: string,
+  ): Promise<DatabaseWithOperation> {
+    return this.#request(
+      `/v1/databases/${input(DatabaseId, id)}/roles/${input(RoleName, role)}`,
+      "DELETE",
+      202,
+      DatabaseWithOperation,
+      undefined,
+      input(IdempotencyKey, idempotencyKey),
+    );
+  }
   getConnectionUri(id: string, role: string): Promise<ConnectionUri> {
     return this.#request(
       `/v1/databases/${input(DatabaseId, id)}/roles/${input(RoleName, role)}/connection-uri`,

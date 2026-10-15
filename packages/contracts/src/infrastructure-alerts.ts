@@ -69,7 +69,7 @@ export type InfraCronFailingStep = z.infer<typeof InfraCronFailingStep>;
 export const InfraCronHeartbeat = z.strictObject({
   last_started_at: Timestamp.nullable(),
   last_completed_at: Timestamp.nullable(),
-  failing_steps: z.array(InfraCronFailingStep).max(16),
+  failing_steps: z.array(InfraCronFailingStep).max(20),
 });
 export type InfraCronHeartbeat = z.infer<typeof InfraCronHeartbeat>;
 export const InfraAlert = z.strictObject({

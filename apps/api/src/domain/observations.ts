@@ -610,6 +610,57 @@ export async function observations(
             "UPDATE database_restores SET verified_at=COALESCE(verified_at,?) WHERE target_database_id=? AND operation_id=? AND EXISTS(SELECT 1 FROM databases d WHERE d.id=database_restores.target_database_id AND d.observed_state='ready' AND d.observed_generation=d.generation AND d.updated_at=?)",
           ).bind(now, row.id, restoration.operation_id, now),
         );
+      // The region's account of the roles it was asked to remove. It binds to the generation
+      // that asked, so a removal started after the region read its desired state cannot be
+      // completed by a report that predates it.
+      const removed = observation.roles?.removed ?? [],
+        blocked = observation.roles?.blocked ?? [];
+      if (observation.state === "ready" && (removed.length || blocked.length)) {
+        const current = `EXISTS(SELECT 1 FROM databases d WHERE d.id=? AND d.region_id=? AND d.generation=? AND d.observed_generation=? AND d.observed_state='ready' AND d.updated_at=?)`;
+        const currentBindings = [
+          row.id,
+          region.id,
+          observation.generation,
+          observation.generation,
+          now,
+        ];
+        if (removed.length)
+          statements.push(
+            c.env.DB.prepare(
+              `UPDATE role_deletions SET status='succeeded',updated_at=?,completed_at=?
+              WHERE database_id=? AND project_id=? AND status IN('pending','running') AND generation<=? AND role_name IN(SELECT value FROM json_each(?)) AND ${current}`,
+            ).bind(
+              now,
+              now,
+              row.id,
+              row.project_id,
+              observation.generation,
+              JSON.stringify(removed),
+              ...currentBindings,
+            ),
+            // The role is gone from PostgreSQL: its tombstone, with the credential it held, and
+            // its name are free.
+            c.env.DB.prepare(
+              `DELETE FROM roles WHERE database_id=? AND deleted_at IS NOT NULL AND name IN(SELECT value FROM json_each(?)) AND ${current}`,
+            ).bind(row.id, JSON.stringify(removed), ...currentBindings),
+          );
+        if (blocked.length)
+          statements.push(
+            c.env.DB.prepare(
+              `UPDATE role_deletions SET status='failed',error_code='role_not_droppable',error_message=?,updated_at=?,completed_at=?
+              WHERE database_id=? AND project_id=? AND status IN('pending','running') AND generation<=? AND role_name IN(SELECT value FROM json_each(?)) AND ${current}`,
+            ).bind(
+              "The role owns objects or holds privileges and cannot be dropped; it stays unable to log in until they are removed",
+              now,
+              now,
+              row.id,
+              row.project_id,
+              observation.generation,
+              JSON.stringify(blocked),
+              ...currentBindings,
+            ),
+          );
+      }
       if (applied && row.power_operation && observation.state !== "deleted") {
         if (observation.state === "ready")
           statements.push(
@@ -645,6 +696,26 @@ export async function observations(
           ),
         );
       }
+      // A removal still waiting when the database went to sleep ends as it would have for a
+      // sleeping database: the role is unroutable, and the region drops it at the next wake.
+      if (observation.state === "hibernated")
+        statements.push(
+          c.env.DB.prepare(
+            `UPDATE role_deletions SET status='succeeded',updated_at=?,completed_at=?
+         WHERE database_id=? AND project_id=? AND status IN('pending','running') AND generation<=?
+           AND EXISTS(SELECT 1 FROM databases d WHERE d.id=role_deletions.database_id AND d.region_id=? AND d.generation=?
+             AND d.observed_generation=d.generation AND d.desired_state='suspended' AND d.observed_power='hibernated' AND d.updated_at=?)`,
+          ).bind(
+            now,
+            now,
+            row.id,
+            row.project_id,
+            observation.generation,
+            region.id,
+            observation.generation,
+            now,
+          ),
+        );
       if (observation.state === "hibernated")
         statements.push(
           c.env.DB.prepare(

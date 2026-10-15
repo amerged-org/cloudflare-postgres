@@ -68,6 +68,10 @@ export async function cleanupFixtures(): Promise<void> {
       env.DB.prepare(
         `DELETE FROM pool_role_mutations WHERE ${databaseScope}`,
       ).bind(project, other),
+      env.DB.prepare(`DELETE FROM role_deletions WHERE ${databaseScope}`).bind(
+        project,
+        other,
+      ),
       env.DB.prepare(`DELETE FROM operations WHERE ${databaseScope}`).bind(
         project,
         other,

@@ -8,6 +8,7 @@ import {
   RoleName,
   Timestamp,
   newOperationId,
+  roleExpiryInstant,
 } from "@pgcf/contracts";
 import { z } from "zod";
 import {
@@ -61,20 +62,52 @@ type PersistedAdmissionMutationIntent = z.infer<
 const WAKE_FALLBACK_READ_MS = 1000;
 /** A concurrency block held this long is logged with its callback's name. */
 const GATE_LOG_MS = 1000;
+/**
+ * A role the actor may admit: live in D1, with the time its credential stops being accepted.
+ * A bare name (the form older persisted presence and seeds use) is a role without expiry.
+ */
+const PresenceRole = z.union([
+  RoleName.transform((name) => ({ name, valid_until: null as string | null })),
+  z.strictObject({ name: RoleName, valid_until: Timestamp.nullable() }),
+]);
 export const DatabasePresence = z
   .strictObject({
     database_id: DatabaseId,
     revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     updated_at: Timestamp,
     roles: z
-      .array(RoleName)
+      .array(PresenceRole)
       .max(100)
-      .refine((roles) => new Set(roles).size === roles.length)
-      .transform((roles) => [...roles].sort()),
+      .refine(
+        (roles) =>
+          new Set(roles.map((role) => role.name)).size === roles.length,
+      )
+      .transform((roles) =>
+        [...roles].sort((a, b) =>
+          a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+        ),
+      ),
     deleted: z.boolean(),
   })
   .refine((snapshot) => !snapshot.deleted || snapshot.roles.length === 0);
 export type DatabasePresence = z.infer<typeof DatabasePresence>;
+/**
+ * Whether a role can start a session now. PostgreSQL enforces VALID UNTIL on the password, but a
+ * hibernated database would be woken for a credential that can no longer log in, so the actor
+ * refuses it first, with the SQLSTATE PostgreSQL itself answers an expired password with. It
+ * refuses from the instant PostgreSQL does: the start of the second the expiry falls in.
+ */
+function roleAdmitted(
+  presence: DatabasePresence,
+  name: string,
+  now = Date.now(),
+): boolean {
+  const role = presence.roles.find((value) => value.name === name);
+  return (
+    role !== undefined &&
+    (role.valid_until === null || roleExpiryInstant(role.valid_until) > now)
+  );
+}
 export type { DatabaseAdmission } from "@pgcf/contracts";
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
   d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,
@@ -84,7 +117,8 @@ export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) AND NOT ${hasNonterminalPoolHolderSql("d")} THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
-  LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL WHERE d.id=? LIMIT 1`;
+  LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL
+    AND (r.valid_until IS NULL OR substr(r.valid_until,1,19)>strftime('%Y-%m-%dT%H:%M:%S','now')) WHERE d.id=? LIMIT 1`;
 interface AdmissionRow {
   unrelated_role_configuration: number;
   admission_snapshot_capable: number;
@@ -812,7 +846,13 @@ export class DatabaseActor extends DurableObject<Env> {
         next.database_id,
         next.revision,
         next.updated_at,
-        JSON.stringify(next.roles),
+        // A role without an expiry stays the bare name the previous Worker reads, so a rollback
+        // leaves every database that does not use expiries with a presence it still parses.
+        JSON.stringify(
+          next.roles.map((role) =>
+            role.valid_until === null ? role.name : role,
+          ),
+        ),
         Number(next.deleted),
       );
     });
@@ -827,7 +867,7 @@ export class DatabaseActor extends DurableObject<Env> {
       const snapshot = this.presence();
       if (!snapshot || snapshot.deleted)
         return { ok: false, sqlstate: "3D000" };
-      if (!snapshot.roles.includes(role.data))
+      if (!roleAdmitted(snapshot, role.data))
         return { ok: false, sqlstate: "28P01" };
       if (!(await this.revokeBeforeAdmission(id.data, Date.now() + 30000)))
         return { ok: false, sqlstate: "57P03" };
@@ -882,7 +922,7 @@ export class DatabaseActor extends DurableObject<Env> {
   ): Promise<AdmissionRow | DatabaseAdmission> {
     const snapshot = this.presence();
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
-    if (!snapshot.roles.includes(user)) return { ok: false, sqlstate: "28P01" };
+    if (!roleAdmitted(snapshot, user)) return { ok: false, sqlstate: "28P01" };
     const cached = this.snapshotAdmission(user);
     // Expired/nonready proof may use authoritative cold preparation; a closed barrier never can.
     if (
@@ -953,7 +993,7 @@ export class DatabaseActor extends DurableObject<Env> {
     this.identity(id.data);
     const snapshot = this.presence();
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
-    if (!snapshot.roles.includes(role.data))
+    if (!roleAdmitted(snapshot, role.data))
       return { ok: false, sqlstate: "28P01" };
     const configured = this.env.DATABASE_CONNECTION_LIMIT_PER_MINUTE ?? "12000";
     if (!/^[1-9][0-9]{0,4}$/.test(configured) || Number(configured) > 12000)

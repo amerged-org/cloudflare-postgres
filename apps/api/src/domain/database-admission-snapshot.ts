@@ -63,7 +63,7 @@ export async function readDatabaseAdmissionSnapshot(
     CASE WHEN ${hasNonterminalPoolHolderSql("d")} THEN 1 ELSE 0 END pool_holder,
     s.memory_mib,CASE WHEN policy.placement_mode='actual_ram' AND d.desired_state='running' THEN policy.postgres_memory_request_mib ELSE NULL END memory_request_mib,
     s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
-    (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json,
+    (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json,
     m.password_revision maintenance_revision
     FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions r ON r.id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
@@ -90,6 +90,7 @@ export async function readDatabaseAdmissionSnapshot(
       name: string;
       owner: number;
       revision: number;
+      valid_until: string | null;
     }[]
   ).sort(roleOrder);
   const deleted =
@@ -218,7 +219,9 @@ export async function readDatabaseAdmissionSnapshot(
       revision: row.generation,
       updated_at: row.presence_updated_at,
       deleted,
-      roles: deleted ? [] : roles.map((role) => role.name),
+      roles: deleted
+        ? []
+        : roles.map(({ name, valid_until }) => ({ name, valid_until })),
     }),
     snapshot: DatabaseAdmissionSnapshot.parse({
       v: 1,

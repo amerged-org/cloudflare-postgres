@@ -388,9 +388,15 @@ describe("manual in-place resize on real Workers D1", () => {
     );
     expect(
       (
-        await request(`/v1/databases/${f.id}/roles`, f.integrator, "POST", {
-          name: "reader",
-        })
+        await request(
+          `/v1/databases/${f.id}/roles`,
+          f.integrator,
+          "POST",
+          {
+            name: "reader",
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(201);
     expect(

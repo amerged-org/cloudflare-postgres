@@ -60,7 +60,16 @@ export interface RoleRow {
   password_revision: number;
   created_at: string;
   updated_at: string;
+  /** Set when the role was deleted through the API; the row stays until PostgreSQL confirms. */
   deleted_at: string | null;
+  valid_until: string | null;
+  connection_limit: number | null;
+  /** A JSON array of role names, ordered. */
+  member_of_json: string;
+  bypass_rls: number;
+  created_by_key_id: string | null;
+  deleted_by_key_id: string | null;
+  delete_operation_id: string | null;
 }
 export interface OperationRow {
   id: string;
@@ -122,6 +131,10 @@ export function roleView(row: RoleRow): Role {
     password_revision: row.password_revision,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    valid_until: row.valid_until,
+    connection_limit: row.connection_limit,
+    member_of: JSON.parse(row.member_of_json) as string[],
+    bypass_rls: Boolean(row.bypass_rls),
   });
 }
 export function operationView(row: OperationRow): Operation {
@@ -163,7 +176,8 @@ export async function operationForRequest(
   await getAuth(c);
   let row = await c.env.DB.prepare(
     `SELECT o.* FROM (SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM operations
-      UNION ALL SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM pool_role_mutations) o
+      UNION ALL SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM pool_role_mutations
+      UNION ALL SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM role_deletions) o
       JOIN projects p ON p.id=o.project_id AND p.deleted_at IS NULL JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id WHERE o.id=?`,
   )
     .bind(id)

@@ -190,6 +190,20 @@ export async function runCron(
       .run();
     return result.meta.changes;
   });
+  // A role removal the region never reported ends like any other regional operation; the role
+  // stays unroutable and the region is still asked, so a later report can still free its name.
+  const expiredRoleDeletions = await attempt(
+    "role_deletion_timeouts",
+    0,
+    async () => {
+      const result = await env.DB.prepare(
+        `UPDATE role_deletions SET status='failed',error_code='operation_timeout',error_message='Regional operation exceeded 20 minutes',updated_at=?,completed_at=? WHERE status IN('pending','running') AND updated_at<?`,
+      )
+        .bind(timestamp, timestamp, cutoff)
+        .run();
+      return result.meta.changes;
+    },
+  );
   const purged = await attempt("idempotency_purge", 0, () =>
     purgeIdempotency(env.DB, now),
   );
@@ -210,7 +224,7 @@ export async function runCron(
       DatabaseId.parse(hintCursor.database_id);
     }
     const pending = await env.DB.prepare(
-      `SELECT d.region_id,d.id FROM databases d WHERE d.node_id IS NOT NULL AND (d.generation>d.observed_generation OR (EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')) OR EXISTS(SELECT 1 FROM pool_role_mutations pr WHERE pr.database_id=d.id AND pr.status='pending')))
+      `SELECT d.region_id,d.id FROM databases d WHERE d.node_id IS NOT NULL AND (d.generation>d.observed_generation OR (EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')) OR EXISTS(SELECT 1 FROM pool_role_mutations pr WHERE pr.database_id=d.id AND pr.status='pending') OR EXISTS(SELECT 1 FROM role_deletions rd WHERE rd.database_id=d.id AND rd.status IN('pending','running'))))
       AND (d.region_id>? OR (d.region_id=? AND d.id>?)) ORDER BY d.region_id,d.id LIMIT 201`,
     )
       .bind(
@@ -294,7 +308,7 @@ export async function runCron(
       );
     }
   return {
-    failed: expired + power.recovered,
+    failed: expired + expiredRoleDeletions + power.recovered,
     purged,
     hinted,
     usage,

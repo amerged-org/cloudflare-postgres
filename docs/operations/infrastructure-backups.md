@@ -350,9 +350,9 @@ Rules of the database and Thin storage kinds:
 
 The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
 `infrastructure_backup_dispatch`, then `admission_recovery`, `pool_role_recovery`,
-`resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `idempotency_purge`,
-`region_hints`, `database_actors`, `usage`, `node_capacity`, `retained_archives`,
-`fleet_updates` and `fleet_rollouts`. Alerting needs only D1 and a bounded send, so it
+`resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `role_deletion_timeouts`,
+`idempotency_purge`, `region_hints`, `database_actors`, `usage`, `node_capacity`,
+`retained_archives`, `fleet_updates` and `fleet_rollouts`. Alerting needs only D1 and a bounded send, so it
 leads, and the daily backup dispatch follows ahead of the steps that call out to other
 systems: a step that fails, is slow or exhausts the invocation's D1 statement budget cannot
 starve them. A step that hangs still holds back the steps after it in that run; the stall

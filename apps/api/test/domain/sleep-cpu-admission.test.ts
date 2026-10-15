@@ -406,9 +406,15 @@ it("requires a current stop acknowledgement after a suspended database's role re
   ).toBe(0);
   expect(
     (
-      await request(`/v1/databases/${id}/roles`, f.integrator, "POST", {
-        name: "reader",
-      })
+      await request(
+        `/v1/databases/${id}/roles`,
+        f.integrator,
+        "POST",
+        {
+          name: "reader",
+        },
+        crypto.randomUUID(),
+      )
     ).status,
   ).toBe(201);
   expect(
@@ -454,9 +460,15 @@ it("completes the owned stop after an intervening role revision and keeps CPU fa
   );
   expect(
     (
-      await request(`/v1/databases/${id}/roles`, f.integrator, "POST", {
-        name: "reader",
-      })
+      await request(
+        `/v1/databases/${id}/roles`,
+        f.integrator,
+        "POST",
+        {
+          name: "reader",
+        },
+        crypto.randomUUID(),
+      )
     ).status,
   ).toBe(201);
   const response = await request(

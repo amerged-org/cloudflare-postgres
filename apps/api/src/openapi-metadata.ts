@@ -237,6 +237,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Reset a database role password",
     "project",
   ),
+  "DELETE /v1/databases/{id}/roles/{name}": route(
+    "deleteDatabaseRole",
+    "Delete a database role",
+    "project",
+  ),
   "GET /v1/databases/{id}/roles/{name}/connection-uri": route(
     "getDatabaseConnectionUri",
     "Read a Cloudflare database connection URI",

@@ -308,6 +308,7 @@ it("uses the management operation and role paths with caller-owned mutation keys
     restore: crypto.randomUUID(),
     roleCreate: crypto.randomUUID(),
     roleReset: crypto.randomUUID(),
+    roleDelete: crypto.randomUUID(),
     delete: crypto.randomUUID(),
   };
   const result = { database: f.database, operation: f.operation };
@@ -327,6 +328,10 @@ it("uses the management operation and role paths with caller-owned mutation keys
     password_revision: 1,
     created_at: f.database.created_at,
     updated_at: f.database.updated_at,
+    valid_until: null,
+    connection_limit: null,
+    member_of: [],
+    bypass_rls: false,
   };
   const host = ["db", "invalid"].join(".");
   const uri = {
@@ -348,6 +353,15 @@ it("uses the management operation and role paths with caller-owned mutation keys
     .mockResolvedValueOnce(Response.json({ data: [role], next_cursor: null }))
     .mockResolvedValueOnce(Response.json(role))
     .mockResolvedValueOnce(Response.json(uri))
+    .mockResolvedValueOnce(
+      Response.json(
+        {
+          database: f.database,
+          operation: { ...f.operation, kind: "database.role.delete" },
+        },
+        { status: 202 },
+      ),
+    )
     .mockResolvedValueOnce(Response.json(f.operation))
     .mockResolvedValueOnce(Response.json(result, { status: 202 }));
   const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
@@ -377,6 +391,10 @@ it("uses the management operation and role paths with caller-owned mutation keys
   });
   await client.resetRolePassword(f.database.id, "app", keys.roleReset);
   expect(await client.getConnectionUri(f.database.id, "app")).toEqual(uri);
+  expect(
+    (await client.deleteRole(f.database.id, "reader", keys.roleDelete))
+      .operation.kind,
+  ).toBe("database.role.delete");
   expect(await client.getOperation(f.operation.id)).toEqual(f.operation);
   await client.deleteDatabase(f.database.id, keys.delete);
   const path = `/v1/databases/${f.database.id}`;
@@ -395,6 +413,7 @@ it("uses the management operation and role paths with caller-owned mutation keys
     [`${path}/roles`, "GET"],
     [`${path}/roles/app/reset-password`, "POST"],
     [`${path}/roles/app/connection-uri`, "GET"],
+    [`${path}/roles/reader`, "DELETE"],
     [`/v1/operations/${f.operation.id}`, "GET"],
     [path, "DELETE"],
   ]);

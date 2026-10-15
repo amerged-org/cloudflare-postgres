@@ -647,6 +647,13 @@ existing API contracts:
 - `POST /v1/databases/{id}/roles` with `{"name":"<role>"}`; await role readback, then obtain
   `GET /v1/databases/{id}/roles/{role}/connection-uri`. Only integrator responses include the
   password; save them privately. Administrator responses cannot supply an application password.
+  The body may also carry `valid_until`, `connection_limit`, `member_of` and `bypass_rls`.
+  `DELETE /v1/databases/{id}/roles/{role}` makes a role unroutable at once and returns an
+  operation that ends when PostgreSQL has dropped it; both need an `Idempotency-Key` and are
+  described in the [integrator handover](integrator-handover.md#23-roles-connection-uri-and-passwords).
+  Release the regional controller that understands role attributes and removals before the API
+  that accepts them: an older controller refuses a desired record that carries either, and only
+  such databases are affected.
 - PGCF archive restore: `POST /v1/databases/{source-id}/restore` with
   `{"mode":"full","name":"recovered","region_id":"<region>"}` or PITR with `target_time`.
   It returns a **new database ID** and separate storage. Reuse the same key after an uncertain

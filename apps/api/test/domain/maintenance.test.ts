@@ -152,7 +152,7 @@ describe("encrypted internal maintenance credentials", () => {
       ).status,
     ).toBe(404);
     const presence = (await readDatabasePresence(env.DB, p.id))!;
-    expect(presence.roles).toEqual(["app"]);
+    expect(presence.roles).toEqual([{ name: "app", valid_until: null }]);
     const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(p.id));
     await actor.seed(presence);
     expect(await actor.admit(p.id, MAINTENANCE_ROLE)).toEqual({
@@ -243,16 +243,28 @@ describe("encrypted internal maintenance credentials", () => {
     await env.DB.batch(p.statements());
     expect(
       (
-        await request(`/v1/databases/${p.id}/roles`, f.integrator, "POST", {
-          name: MAINTENANCE_ROLE,
-        })
+        await request(
+          `/v1/databases/${p.id}/roles`,
+          f.integrator,
+          "POST",
+          {
+            name: MAINTENANCE_ROLE,
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(400);
     expect(
       (
-        await request(`/v1/databases/${p.id}/roles`, f.integrator, "POST", {
-          name: "pgcf_customer",
-        })
+        await request(
+          `/v1/databases/${p.id}/roles`,
+          f.integrator,
+          "POST",
+          {
+            name: "pgcf_customer",
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(201);
   });

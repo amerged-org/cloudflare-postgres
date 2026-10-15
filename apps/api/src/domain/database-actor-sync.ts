@@ -14,7 +14,7 @@ export async function readDatabasePresence(
       `SELECT d.id database_id,d.generation revision,
     CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END updated_at,
     CASE WHEN d.deleted_at IS NOT NULL OR d.desired_state='deleted' OR p.id IS NULL OR p.deleted_at IS NOT NULL THEN 1 ELSE 0 END deleted,
-    (SELECT json_group_array(name) FROM (SELECT name FROM roles WHERE database_id=d.id AND deleted_at IS NULL ORDER BY name)) roles_json
+    (SELECT json_group_array(json_object('name',name,'valid_until',valid_until)) FROM (SELECT name,valid_until FROM roles WHERE database_id=d.id AND deleted_at IS NULL ORDER BY name)) roles_json
     FROM databases d LEFT JOIN projects p ON p.id=d.project_id WHERE d.id=?`,
     )
     .bind(id)

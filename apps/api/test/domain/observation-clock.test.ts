@@ -158,9 +158,15 @@ describe("observation ordering on real Workers D1", () => {
       id = created.database.id;
     expect(
       (
-        await request(`/v1/databases/${id}/roles`, f.integrator, "POST", {
-          name: "reader",
-        })
+        await request(
+          `/v1/databases/${id}/roles`,
+          f.integrator,
+          "POST",
+          {
+            name: "reader",
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(201);
     const post = (generation: number, state = "ready") =>

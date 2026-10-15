@@ -58,6 +58,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /v1/databases/{id}/roles/{name}/reset-password": [
     400, 401, 404, 409, 500,
   ],
+  // 400: the owner or the maintenance role; 409: a member_of target, a pool binding, a change in progress.
+  "DELETE /v1/databases/{id}/roles/{name}": [400, 401, 404, 409, 500],
   "GET /v1/databases/{id}/roles/{name}/connection-uri": [400, 401, 404, 500],
   "GET /v1/operations/{id}": [400, 401, 404, 500],
   "GET /v1/databases/{id}/archive": [400, 401, 404, 500],
@@ -194,6 +196,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/databases/{id}/resume",
   "POST /v1/databases/{id}/roles",
   "POST /v1/databases/{id}/roles/{name}/reset-password",
+  "DELETE /v1/databases/{id}/roles/{name}",
   "POST /v1/costs/node-facts",
   "POST /v1/nodes/additions",
   "PUT /v1/nodes/{id}/compute-pool",
@@ -216,16 +219,22 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/regions/{target}/archive-sources/{source}",
 ]);
 
-/** The four handlers reject an omitted key before submitting durable long-running work. */
+/** These handlers reject an omitted key before submitting durable work: the long-running
+ * platform operations and the role mutations, which change credentials of a running database.
+ */
 export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/nodes/additions",
   "POST /v1/nodes/{id}/patches",
   "POST /v1/fleet/rollouts",
   "POST /v1/nodes/{id}/thin-qualifications",
+  "POST /v1/databases/{id}/roles",
+  "POST /v1/databases/{id}/roles/{name}/reset-password",
+  "DELETE /v1/databases/{id}/roles/{name}",
 ]);
 
 /** Explicit Location writes in platform/*.ts, databaseOperationResponse and restore.response.
- * Roles, cost facts, purchase approvals and Fleet/qualification acceptance do not emit Location.
+ * Cost facts, purchase approvals and Fleet/qualification acceptance do not emit Location; a role
+ * mutation does only when it answers 202 with an operation.
  */
 export const locationResponses: Readonly<
   Record<string, Readonly<Record<string, string>>>
@@ -263,6 +272,17 @@ export const locationResponses: Readonly<
   "PUT /v1/databases/{id}/resource-profile": {
     "202":
       "Database resize operation resource path for the selected resource profile.",
+  },
+  "POST /v1/databases/{id}/roles": {
+    "202":
+      "Role operation resource path, only when the change waits for a pool release.",
+  },
+  "POST /v1/databases/{id}/roles/{name}/reset-password": {
+    "202":
+      "Role operation resource path, only when the change waits for a pool release.",
+  },
+  "DELETE /v1/databases/{id}/roles/{name}": {
+    "202": "Role deletion operation resource path.",
   },
   "POST /v1/nodes/additions": {
     "202":
