@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, bytesToHex } from "@pgcf/contracts";
-import type { UsageSample } from "@pgcf/contracts/usage";
+import { USAGE_HOUR_MS, type UsageSample } from "@pgcf/contracts/usage";
 import { validatedArchivePrefix } from "./archive.ts";
 import { regionArchive, type ArchiveEnvironment } from "./archive-bindings.ts";
 import { recordUsageSample, type BackupUsageIdentity } from "./usage.ts";
@@ -24,7 +24,7 @@ export interface BackupMeasurementResult {
   status: "measured" | "unavailable";
   objects: number | null;
   sample?: Extract<UsageSample, { source: "backup" }>;
-  recorded?: "recorded" | "duplicate";
+  recorded?: "recorded" | "duplicate" | "unchanged";
 }
 type BackupEnvironment = Pick<Env, "DB"> & ArchiveEnvironment;
 const rowFor = (db: D1Database, id: string) =>
@@ -42,6 +42,30 @@ const sameIdentity = (a: ArchiveRow, b: ArchiveRow | null): boolean =>
   a.storage_generation === b.storage_generation &&
   a.deleted_at === b.deleted_at &&
   a.backup_bucket === b.backup_bucket;
+
+/**
+ * A size equal to the newest recorded one of the same UTC hour adds nothing to the hourly maximum,
+ * and an unknown size repeats the same gap. A change, or the first measurement of an hour, is recorded.
+ */
+async function repeatsLatest(
+  db: D1Database,
+  databaseId: string,
+  bytes: number | null,
+  observed: number,
+): Promise<boolean> {
+  const latest = await db
+    .prepare(
+      "SELECT observed_at,json_extract(payload,'$.backup_bytes') backup_bytes FROM usage_samples WHERE database_id=? AND source='backup' ORDER BY observed_at DESC LIMIT 1",
+    )
+    .bind(databaseId)
+    .first<{ observed_at: string; backup_bytes: number | null }>();
+  return (
+    latest !== null &&
+    latest.backup_bytes === bytes &&
+    Math.floor(Date.parse(latest.observed_at) / USAGE_HOUR_MS) ===
+      Math.floor(observed / USAGE_HOUR_MS)
+  );
+}
 
 export async function measureBackupUsage(
   env: BackupEnvironment,
@@ -166,6 +190,13 @@ export async function measureBackupUsage(
     backup_bytes: bytes,
   };
   try {
+    if (await repeatsLatest(env.DB, row.id, bytes, observed))
+      return {
+        status: bytes === null ? "unavailable" : "measured",
+        objects,
+        sample,
+        recorded: "unchanged",
+      };
     const recorded = await recordUsageSample(
       env.DB,
       { region_id: row.region_id, source: "backup" },

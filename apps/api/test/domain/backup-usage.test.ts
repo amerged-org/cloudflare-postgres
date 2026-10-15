@@ -545,3 +545,56 @@ it("accepts the finite object ceiling only with a completing page and safe byte 
   expect(overflow.status).toBe("unavailable");
   expect(overflow.sample?.backup_bytes).toBeNull();
 });
+
+it("records an unchanged backup size once per UTC hour while every change and every new hour is recorded", async () => {
+  const f = await setup(),
+    stored = async () =>
+      (
+        await env.DB.prepare(
+          "SELECT payload FROM usage_samples WHERE database_id=? AND source='backup' ORDER BY observed_at",
+        )
+          .bind(f.id)
+          .all<{ payload: string }>()
+      ).results.map((row) => JSON.parse(row.payload).backup_bytes);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-03-04T10:20:00.000Z"));
+  await put(f.prefix, "fixture", 23);
+  const first = await measureBackupUsage(env, f.id);
+  expect(first.recorded).toBe("recorded");
+  vi.setSystemTime(new Date("2026-03-04T10:50:00.000Z"));
+  const unchanged = await measureBackupUsage(env, f.id);
+  expect(unchanged.status).toBe("measured");
+  expect(unchanged.sample?.backup_bytes).toBe(23);
+  expect(unchanged.recorded).toBe("unchanged");
+  expect(await stored()).toEqual([23]);
+  await put(f.prefix, "more", 5);
+  expect((await measureBackupUsage(env, f.id)).recorded).toBe("recorded");
+  expect(await stored()).toEqual([23, 28]);
+  vi.setSystemTime(new Date("2026-03-04T11:00:00.000Z"));
+  expect((await measureBackupUsage(env, f.id)).recorded).toBe("recorded");
+  expect(await stored()).toEqual([23, 28, 28]);
+});
+it("keeps an unknown size as one record per hour and records its recovery", async () => {
+  const f = await setup(),
+    stored = async () =>
+      (
+        await env.DB.prepare(
+          "SELECT payload FROM usage_samples WHERE database_id=? AND source='backup' ORDER BY observed_at",
+        )
+          .bind(f.id)
+          .all<{ payload: string }>()
+      ).results.map((row) => JSON.parse(row.payload).backup_bytes);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-03-04T10:20:00.000Z"));
+  await put(f.prefix, "fixture", 7);
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockRejectedValue(new Error("fixture list failure"));
+  expect((await measureBackupUsage(env, f.id)).recorded).toBe("recorded");
+  vi.setSystemTime(new Date("2026-03-04T10:40:00.000Z"));
+  expect((await measureBackupUsage(env, f.id)).recorded).toBe("unchanged");
+  list.mockRestore();
+  vi.setSystemTime(new Date("2026-03-04T10:45:00.000Z"));
+  expect((await measureBackupUsage(env, f.id)).recorded).toBe("recorded");
+  expect(await stored()).toEqual([null, 7]);
+});

@@ -388,6 +388,100 @@ describe("hourly usage", () => {
       )?.n,
     ).toBe(1);
   });
+  it("rolls one held idle interval up exactly like the periodic samples it spans", () => {
+    const id = newDatabaseId(),
+      database = { id, project_id: "prj_" + id, created_at: iso(epoch) },
+      events = [
+        {
+          id: 1,
+          kind: "created",
+          occurred_at: iso(epoch),
+          resource_snapshot: JSON.stringify(resources),
+        },
+        {
+          id: 2,
+          kind: "ready",
+          occurred_at: iso(epoch),
+          resource_snapshot: JSON.stringify(resources),
+        },
+      ];
+    const interval = (
+      from: number,
+      to: number,
+      busy: boolean,
+    ): { payload: string } => ({
+      payload: JSON.stringify({
+        source: "gateway",
+        database_id: id,
+        producer_id: "gateway_a",
+        sequence: epoch + to,
+        observed_at: iso(epoch + to),
+        interval_start: iso(epoch + from),
+        interval_end: iso(epoch + to),
+        expected_producers: ["gateway_a"],
+        ingress_bytes: busy ? 100 : 0,
+        egress_bytes: busy ? 200 : 0,
+        connections: busy ? 1 : 0,
+        connection_seconds: busy ? 15 : 0,
+      }),
+    });
+    const period = 15_000,
+      busyAt = 40 * 60_000;
+    const periodic: { payload: string }[] = [];
+    for (let at = 0; at < USAGE_HOUR_MS; at += period)
+      periodic.push(interval(at, at + period, at === busyAt));
+    const held = [
+      interval(0, busyAt, false),
+      interval(busyAt, busyAt + period, true),
+      interval(busyAt + period, USAGE_HOUR_MS, false),
+    ];
+    const now = epoch + 3 * USAGE_HOUR_MS;
+    const expected = computeUsageHour(database, epoch, events, periodic, now);
+    const actual = computeUsageHour(database, epoch, events, held, now);
+    expect(expected.metrics).toMatchObject({
+      ingress_bytes: 100,
+      egress_bytes: 200,
+      connections: 1,
+      connection_seconds: 15,
+    });
+    expect(actual).toEqual(expected);
+    expect(actual.gaps).not.toContain("traffic_coverage");
+  });
+  it("accepts a producer's span after a long silence without consecutive sequences", async () => {
+    const f = await setup();
+    await env.DB.batch([f.event("created", 0), f.event("ready", 0)]);
+    const full = f.sample();
+    if (full.source !== "gateway") throw new Error("fixture");
+    const principal = { region_id: f.region, source: "gateway" as const };
+    const parts = [
+      { sequence: epoch + 15_000, from: 0, to: 15_000 },
+      { sequence: epoch + 3_000_000, from: 15_000, to: 3_000_000 },
+      { sequence: epoch + USAGE_HOUR_MS, from: 3_000_000, to: USAGE_HOUR_MS },
+    ];
+    for (const part of parts)
+      expect(
+        await recordUsageSample(
+          env.DB,
+          principal,
+          {
+            ...full,
+            sequence: part.sequence,
+            interval_start: iso(epoch + part.from),
+            interval_end: iso(epoch + part.to),
+            observed_at: iso(epoch + part.to),
+          },
+          epoch + USAGE_HOUR_MS,
+        ),
+      ).toBe("recorded");
+    const row = await rollupUsageHour(
+      env.DB,
+      f.id,
+      epoch,
+      epoch + USAGE_HOUR_MS,
+    );
+    expect(row.metrics.connections).toBe(0);
+    expect(row.gaps).not.toContain("traffic_coverage");
+  });
   it("requires every real gateway producer and complete interval coverage", async () => {
     const f = await setup();
     await env.DB.batch([f.event("created", 0), f.event("ready", 0)]);

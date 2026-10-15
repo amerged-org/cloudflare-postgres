@@ -10,6 +10,7 @@ import {
   gatewayActivityReportSchema,
 } from "@pgcf/contracts/gateway-activity";
 import { afterEach, expect, it, vi } from "vitest";
+import { runUsageCron } from "../../src/domain/usage-cron.ts";
 import {
   cleanupFixtures,
   fixture,
@@ -342,6 +343,45 @@ it("a finalized hour refuses its late measurement without blocking the rest of t
       .bind(f.id)
       .all(),
   ).toMatchObject({ results: [{ producer_id: current.producer_id }] });
+});
+it("acknowledges a replay of a pruned finalized hour as refused so a producer outbox drains", async () => {
+  const f = await ready(),
+    now = Date.now(),
+    hour = Math.floor(now / 3600000) * 3600000 - 30 * 3600000,
+    iso = (value: number) => new Date(value).toISOString(),
+    sample = { ...storageSample(f.id), observed_at: iso(hour + 1000) },
+    count = async () =>
+      (await env.DB.prepare(
+        "SELECT count(*) n FROM usage_samples WHERE database_id=?",
+      )
+        .bind(f.id)
+        .first<{ n: number }>())!.n;
+  expect(await (await sendUsage(f, [sample])).json()).toEqual({
+    recorded: 1,
+    duplicates: 0,
+    refused: 0,
+  });
+  await env.DB.batch([
+    env.DB.prepare("UPDATE databases SET created_at=? WHERE id=?").bind(
+      iso(hour),
+      f.id,
+    ),
+    env.DB.prepare(
+      "INSERT INTO usage_hourly(database_id,hour,metrics,gaps,final,computed_at) VALUES(?,?,'{}','[]',1,?)",
+    ).bind(f.id, iso(hour), iso(now)),
+    env.DB.prepare(
+      "INSERT INTO usage_rollup_progress(database_id,next_hour) VALUES(?,?)",
+    ).bind(f.id, iso(hour + 3600000)),
+  ]);
+  expect((await runUsageCron(env.DB, now)).pruned).toBe(1);
+  expect(await count()).toBe(0);
+  // The producer lost the acknowledgement and replays the sample whose row was pruned meanwhile.
+  expect(await (await sendUsage(f, [sample])).json()).toEqual({
+    recorded: 0,
+    duplicates: 0,
+    refused: 1,
+  });
+  expect(await count()).toBe(0);
 });
 it("both batch caps and the existing global body bound apply", async () => {
   const f = await ready(),

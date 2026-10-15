@@ -12,12 +12,14 @@ import {
   runUsageCron,
   USAGE_CRON_PAGE_LIMIT,
   USAGE_CRON_STATEMENT_LIMIT,
+  USAGE_PRUNE_BATCH,
+  USAGE_SAMPLE_RETENTION_MS,
 } from "../../src/domain/usage-cron.ts";
 import {
   recordUsageSample,
   usageLifecycleStatement,
 } from "../../src/domain/usage.ts";
-import { cleanupFixtures, fixture } from "./fixtures.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const start = Date.parse("2026-01-01T00:00:00.000Z"),
   iso = (value: number) => new Date(value).toISOString();
@@ -502,5 +504,330 @@ describe("bounded usage cron", () => {
       await env.ARCHIVE.delete(key);
       await env.ARCHIVE_US.delete(key);
     }
+  });
+});
+
+describe("backup measurement of a deleted database", () => {
+  async function deleted(deletedAt: (current: number) => number) {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = Date.now(),
+      current = Math.floor(now / USAGE_HOUR_MS) * USAGE_HOUR_MS,
+      removed = deletedAt(current),
+      archivePath = archiveDestinationPath(
+        "pgcf-api-us-test",
+        f.region,
+        id,
+        1,
+        newOperationId(),
+      );
+    await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
+      .bind("pgcf-api-us-test", f.region)
+      .run();
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE databases SET archive_path=?,created_at=? WHERE id=?",
+      ).bind(archivePath, iso(current - 5 * USAGE_HOUR_MS), id),
+      f.event(id, "created", current - 5 * USAGE_HOUR_MS - start),
+      f.event(id, "deleted", removed - start),
+      env.DB.prepare(
+        "UPDATE databases SET desired_state='deleted',deleted_at=?,observed_state='deleted' WHERE id=?",
+      ).bind(iso(removed), id),
+    ]);
+    const prefix = `${f.region}/${id}/${archivePath.slice(archivePath.lastIndexOf("/") + 1)}/database/`,
+      key = `${prefix}fixture`;
+    await env.ARCHIVE_US.put(key, new Uint8Array(37));
+    const result = await runUsageCron(env.DB, now, {
+      ...env,
+      ARCHIVE_BINDINGS: JSON.stringify({
+        [f.region]: { binding: "ARCHIVE_US", bucket: "pgcf-api-us-test" },
+      }),
+    });
+    await env.ARCHIVE_US.delete(key);
+    const backups = (await env.DB.prepare(
+      "SELECT count(*) n FROM usage_samples WHERE database_id=? AND source='backup'",
+    )
+      .bind(id)
+      .first<{ n: number }>())!.n;
+    return { result, backups };
+  }
+  it("measures nothing once the deletion hour has passed", async () => {
+    const { result, backups } = await deleted(
+      (current) => current - 3 * USAGE_HOUR_MS + 600_000,
+    );
+    expect(result.databases).toBe(1);
+    expect(result.backupMeasured + result.backupUnavailable).toBe(0);
+    expect(backups).toBe(0);
+  });
+  it("still measures during the deletion hour, which its last rollup includes", async () => {
+    const { result, backups } = await deleted((current) => current);
+    expect(result.backupMeasured).toBe(1);
+    expect(backups).toBe(1);
+  });
+});
+
+describe("raw usage sample retention", () => {
+  const principal = (
+    f: { region: string },
+    source: "agent" | "gateway" | "backup",
+  ) => ({ region_id: f.region, source });
+  /** One sample of every source inside the given hour offset from `start`. */
+  async function record(
+    f: Awaited<ReturnType<typeof cohort>>,
+    id: string,
+    hour: number,
+  ) {
+    const at = start + hour * USAGE_HOUR_MS,
+      now = at + USAGE_HOUR_MS;
+    await recordUsageSample(
+      env.DB,
+      principal(f, "gateway"),
+      {
+        source: "gateway",
+        database_id: id,
+        producer_id: "gateway_a",
+        sequence: hour,
+        observed_at: iso(now),
+        interval_start: iso(at),
+        interval_end: iso(now),
+        expected_producers: ["gateway_a"],
+        ingress_bytes: 7 + hour,
+        egress_bytes: 11,
+        connections: 1,
+        connection_seconds: 60,
+      },
+      now,
+    );
+    await recordUsageSample(
+      env.DB,
+      principal(f, "agent"),
+      {
+        source: "agent",
+        database_id: id,
+        producer_id: "agent_a",
+        sequence: hour,
+        observed_at: iso(at + 600_000),
+        storage_used_bytes: 1000 + hour,
+        storage_allocated_bytes: 5 * 1024 ** 3,
+      },
+      now,
+    );
+    await recordUsageSample(
+      env.DB,
+      principal(f, "backup"),
+      {
+        source: "backup",
+        database_id: id,
+        producer_id: "r2_a",
+        sequence: hour,
+        observed_at: iso(at + 1_200_000),
+        backup_bytes: 500 + hour,
+      },
+      now,
+    );
+  }
+  /** Stored samples per hour offset from `start`. */
+  async function perHour(id: string) {
+    const stored = await env.DB.prepare(
+      "SELECT interval_start FROM usage_samples WHERE database_id=?",
+    )
+      .bind(id)
+      .all<{ interval_start: string }>();
+    const counts: Record<number, number> = {};
+    for (const { interval_start } of stored.results) {
+      const hour = Math.floor(
+        (Date.parse(interval_start) - start) / USAGE_HOUR_MS,
+      );
+      counts[hour] = (counts[hour] ?? 0) + 1;
+    }
+    return counts;
+  }
+  const history = async (
+    f: { integrator: string },
+    id: string,
+    hours: number,
+  ) =>
+    (
+      await request(
+        `/v1/usage?${new URLSearchParams({
+          database_id: id,
+          from: iso(start),
+          to: iso(start + hours * USAGE_HOUR_MS),
+          granularity: "hour",
+        })}`,
+        f.integrator,
+      )
+    ).json();
+
+  it("prunes samples of finalized hours past the window and leaves rollups and public history unchanged", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = start + 30 * USAGE_HOUR_MS;
+    await env.DB.batch([f.event(id, "created"), f.event(id, "ready")]);
+    for (const hour of [0, 1, 7, 28, 29]) await record(f, id, hour);
+    expect(USAGE_SAMPLE_RETENTION_MS).toBe(24 * USAGE_HOUR_MS);
+    // The first visit finalizes hours 0 and 1; none of their samples is old enough yet.
+    expect((await runUsageCron(env.DB, now)).pruned).toBe(0);
+    expect(await perHour(id)).toEqual({ 0: 3, 1: 3, 7: 3, 28: 3, 29: 3 });
+    const finalized = (await rows(id)).filter((row) => row.final === 1);
+    expect(finalized.map((row) => row.hour)).toEqual([
+      iso(start),
+      iso(start + USAGE_HOUR_MS),
+    ]);
+    expect(JSON.parse(finalized[0]!.metrics)).toMatchObject({
+      ingress_bytes: 7,
+      storage_used_bytes_max: 1000,
+      backup_bytes_max: 500,
+    });
+    const before = await history(f, id, 2);
+    let pruned = 0;
+    for (let visit = 0; visit < 16; visit++)
+      pruned += (await runUsageCron(env.DB, now)).pruned;
+    // Hours 0 and 1 are final and older than one day; hour 7 is final but inside the window;
+    // hours 28 and 29 are not final.
+    expect(await perHour(id)).toEqual({ 7: 3, 28: 3, 29: 3 });
+    expect(pruned).toBe(6);
+    expect(
+      (await rows(id)).filter(
+        (row) => row.hour < iso(start + 2 * USAGE_HOUR_MS),
+      ),
+    ).toEqual(finalized);
+    expect(await history(f, id, 2)).toEqual(before);
+    expect(
+      JSON.parse(
+        (await rows(id)).find(
+          (row) => row.hour === iso(start + 7 * USAGE_HOUR_MS),
+        )!.metrics,
+      ),
+    ).toMatchObject({ ingress_bytes: 14, backup_bytes_max: 507 });
+  });
+  it("never removes samples of a hour its rollup has not finalized, however old", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = start + 48 * USAGE_HOUR_MS;
+    await env.DB.batch([f.event(id, "created"), f.event(id, "ready")]);
+    await record(f, id, 0);
+    const failed = await runUsageCron(loseWrite(env.DB, id, false), now);
+    expect(failed.failed).toBe(1);
+    expect(failed.pruned).toBe(0);
+    expect(await progress(id)).toBe(iso(start));
+    expect(await perHour(id)).toEqual({ 0: 3 });
+    await runUsageCron(env.DB, now);
+    expect(JSON.parse((await rows(id))[0]!.metrics)).toMatchObject({
+      ingress_bytes: 7,
+      backup_bytes_max: 500,
+    });
+    expect((await rows(id))[0]!.final).toBe(1);
+    await runUsageCron(env.DB, now);
+    expect(await perHour(id)).toEqual({});
+  });
+  it("prunes everything of a deleted database once its window is closed, rollups included untouched", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = start + 40 * USAGE_HOUR_MS,
+      deletedAt = start + 2 * USAGE_HOUR_MS + 600_000;
+    await env.DB.batch([
+      f.event(id, "created"),
+      f.event(id, "ready"),
+      f.event(id, "deleted", deletedAt - start),
+      env.DB.prepare(
+        "UPDATE databases SET desired_state='deleted',deleted_at=?,observed_state='deleted' WHERE id=?",
+      ).bind(iso(deletedAt), id),
+    ]);
+    for (const hour of [0, 1, 2]) await record(f, id, hour);
+    // A backup measured after the deletion hour belongs to no rollup at all.
+    await recordUsageSample(
+      env.DB,
+      principal(f, "backup"),
+      {
+        source: "backup",
+        database_id: id,
+        producer_id: "r2_late",
+        sequence: 99,
+        observed_at: iso(start + 4 * USAGE_HOUR_MS + 60_000),
+        backup_bytes: 1,
+      },
+      start + 5 * USAGE_HOUR_MS,
+    );
+    for (let visit = 0; visit < 6; visit++) await runUsageCron(env.DB, now);
+    const saved = await rows(id);
+    expect(saved).toHaveLength(3);
+    expect(saved.every((row) => row.final === 1)).toBe(true);
+    expect(await progress(id)).toBe(iso(start + 3 * USAGE_HOUR_MS));
+    expect(await perHour(id)).toEqual({});
+    await runUsageCron(env.DB, now);
+    expect(await rows(id)).toEqual(saved);
+  });
+  it("removes a bounded batch per visit and drains a larger backlog across visits", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = start + 40 * USAGE_HOUR_MS,
+      extra = 50;
+    await env.DB.batch([f.event(id, "created"), f.event(id, "ready")]);
+    const insert = env.DB.prepare(
+      `INSERT INTO usage_samples(database_id,source,producer_id,sequence,interval_start,interval_end,observed_at,payload)
+      VALUES(?,'backup','r2_backlog',?,?,?,?,?)`,
+    );
+    const statements = Array.from(
+      { length: USAGE_PRUNE_BATCH + extra },
+      (_, index) => {
+        const at = iso(start + 60_000 + index * 1000);
+        return insert.bind(
+          id,
+          index,
+          at,
+          at,
+          at,
+          JSON.stringify({
+            source: "backup",
+            database_id: id,
+            producer_id: "r2_backlog",
+            sequence: index,
+            observed_at: at,
+            backup_bytes: index,
+          }),
+        );
+      },
+    );
+    for (let offset = 0; offset < statements.length; offset += 100)
+      await env.DB.batch(statements.slice(offset, offset + 100));
+    const count = async () =>
+      (await env.DB.prepare(
+        "SELECT count(*) n FROM usage_samples WHERE database_id=?",
+      )
+        .bind(id)
+        .first<{ n: number }>())!.n;
+    // The first visit finalizes the hour; only then does the pointer cover the backlog.
+    await runUsageCron(env.DB, now);
+    expect(await count()).toBe(USAGE_PRUNE_BATCH + extra);
+    expect((await runUsageCron(env.DB, now)).pruned).toBe(USAGE_PRUNE_BATCH);
+    expect(await count()).toBe(extra);
+    expect((await runUsageCron(env.DB, now)).pruned).toBe(extra);
+    expect(await count()).toBe(0);
+  });
+  it("keeps the usage rollups running when the housekeeping delete fails", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = start + 40 * USAGE_HOUR_MS;
+    await env.DB.batch([f.event(id, "created"), f.event(id, "ready")]);
+    await record(f, id, 0);
+    const failing = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            if (sql.startsWith("DELETE FROM usage_samples"))
+              throw new Error("test_prune_failure");
+            return target.prepare(sql);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await runUsageCron(failing, now);
+    const result = await runUsageCron(failing, now);
+    expect(result.failed).toBe(0);
+    expect(result.pruned).toBe(0);
+    expect((await rows(id)).filter((row) => row.final === 1)).toHaveLength(4);
+    expect(await perHour(id)).toEqual({ 0: 3 });
   });
 });

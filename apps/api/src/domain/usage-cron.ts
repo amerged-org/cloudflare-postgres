@@ -8,6 +8,10 @@ import type { ArchiveEnvironment } from "./archive-bindings.ts";
 export const USAGE_CRON_PAGE_LIMIT = 24;
 export const USAGE_CRON_STATEMENT_LIMIT = 600;
 export const USAGE_CRON_CATCHUP_HOURS = 2;
+/** Raw samples of a finalized hour stay one UTC day behind its immutable rollup. */
+export const USAGE_SAMPLE_RETENTION_MS = 24 * USAGE_HOUR_MS;
+/** Rows removed per database visit, so the backlog drains without holding D1 for long. */
+export const USAGE_PRUNE_BATCH = 1000;
 class StatementBudgetExceeded extends Error {}
 interface DatabasePageRow {
   id: string;
@@ -23,6 +27,7 @@ export interface UsageCronResult {
   exhausted: boolean;
   overlap: boolean;
   next: string | null;
+  pruned: number;
   backupMeasured: number;
   backupUnavailable: number;
 }
@@ -103,6 +108,38 @@ function creationHour(value: string): number {
 }
 const iso = (value: number) => new Date(value).toISOString();
 
+/**
+ * Removes one bounded batch of raw samples that no rollup reads again. Every hour before the
+ * progress pointer is final (its row is immutable and a late sample for it is refused), and a
+ * deleted database's closed window is never rolled up again. Housekeeping must not block metering.
+ */
+async function pruneUsageSamples(
+  db: D1Database,
+  databaseId: string,
+  covered: number,
+  now: number,
+): Promise<number> {
+  const retained =
+    Math.floor((now - USAGE_SAMPLE_RETENTION_MS) / USAGE_HOUR_MS) *
+    USAGE_HOUR_MS;
+  try {
+    const result = await db
+      .prepare(
+        "DELETE FROM usage_samples WHERE rowid IN (SELECT rowid FROM usage_samples WHERE database_id=? AND interval_start<? ORDER BY interval_start LIMIT ?) RETURNING rowid",
+      )
+      .bind(databaseId, iso(Math.min(retained, covered)), USAGE_PRUNE_BATCH)
+      .all();
+    // meta.changes would also count the revision upserts of the delete trigger.
+    return result.results.length;
+  } catch (error) {
+    if (error instanceof StatementBudgetExceeded) throw error;
+    console.warn(
+      JSON.stringify({ event: "usage_prune_failed", database_id: databaseId }),
+    );
+    return 0;
+  }
+}
+
 export async function runUsageCron(
   input: D1Database,
   now = Date.now(),
@@ -122,6 +159,7 @@ export async function runUsageCron(
     exhausted: false,
     overlap: false,
     next: null,
+    pruned: 0,
     backupMeasured: 0,
     backupUnavailable: 0,
   };
@@ -158,14 +196,15 @@ export async function runUsageCron(
       if (terminal !== null && terminal < created)
         throw new Error("invalid_usage_deletion_timestamp");
       let materializationNow = now;
-      if (archive) {
+      // A deleted database's rollups end with its deletion hour; later backup bytes belong to no hour.
+      if (archive && (terminal === null || current <= terminal)) {
         const measured = await measureBackupUsage(
           { ...archive, DB: db },
           row.id,
         );
         if (measured.status === "measured") result.backupMeasured++;
         else result.backupUnavailable++;
-        if (measured.sample) {
+        if (measured.sample && measured.recorded !== "unchanged") {
           const sampled = Date.parse(measured.sample.observed_at);
           if (Math.floor(sampled / USAGE_HOUR_MS) * USAGE_HOUR_MS === current)
             materializationNow = Math.max(now, sampled);
@@ -191,6 +230,12 @@ export async function runUsageCron(
         (terminal !== null && next > terminal + USAGE_HOUR_MS)
       )
         throw new Error("invalid_usage_database_cursor");
+      result.pruned += await pruneUsageSamples(
+        db,
+        row.id,
+        terminal !== null && next > terminal ? Infinity : next,
+        now,
+      );
       const visited = new Set<number>();
       for (let index = 0; index < USAGE_CRON_CATCHUP_HOURS; index++) {
         if (next > current || (terminal !== null && next > terminal)) break;
