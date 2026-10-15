@@ -20,6 +20,7 @@ import {
   postgresPoolSql,
   postgresPoolQualificationCapable,
 } from "./fleet-releases.ts";
+import { parkedRecordFresh, readParkedRecord } from "./parked-tier.ts";
 import {
   PoolBinding,
   PoolHostCustody,
@@ -283,30 +284,18 @@ async function heldWriterPod(
   return runtime.pod_uid;
 }
 
-export async function storageWriteAuthorityForDatabase(
+/** What every writer token of a retained thin volume stands on: the receipt, the profile and a
+ * current, write-allowed physical reading of the node that has this very volume. */
+async function currentWriterContext(
   env: Env,
   database: DatabaseRow,
-  now = Date.now(),
+  now: number,
   snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
-): Promise<string | undefined> {
-  const { readPostgresPoolBindingForDatabase, hasNonterminalPoolHolderSql } =
-    await import("./postgres-pool.ts");
-  const pool = await readPostgresPoolBindingForDatabase(env, database.id);
-  if (pool && !["released", "refused"].includes(pool.state))
-    return issuePostgresPoolStorageAuthority(env, pool, now, snapshot);
-  if (
-    await env.DB.prepare(
-      `SELECT 1 FROM databases d WHERE d.id=? AND ${hasNonterminalPoolHolderSql("d")}`,
-    )
-      .bind(database.id)
-      .first()
-  )
-    return undefined;
+) {
   if (
     !database.node_id ||
     !database.storage_profile_json ||
     !database.storage_volume_json ||
-    database.desired_state !== "running" ||
     database.deleted_at
   )
     return undefined;
@@ -335,47 +324,40 @@ export async function storageWriteAuthorityForDatabase(
     )
   )
     return undefined;
-  const volume = authority.volumes.find(
-    (volume) =>
-      volume.database_id === database.id &&
-      volume.generation === database.generation &&
-      volume.storage_generation === receipt.storage_generation,
+  return { storage, receipt, authority, current };
+}
+
+/** The measured volume is this database's volume, in the profile's classes. */
+function volumeMatchesReceipt(
+  volume: NodeThinStorageAuthority["volumes"][number],
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+) {
+  return (
+    volume.storage_uid === receipt.storage_uid &&
+    volume.namespace_uid === receipt.namespace_uid &&
+    volume.cluster_uid === receipt.cluster_uid &&
+    volume.lv_uuid === receipt.lv_uuid &&
+    volume.volume_handle === receipt.volume_handle &&
+    volume.pvc_uid === receipt.pvc_uid &&
+    volume.pv_uid === receipt.pv_uid &&
+    volume.storage_class === storage.storage_class &&
+    volume.volume_attributes_class === storage.volume_attributes_class
   );
-  if (
-    volume &&
-    (volume.storage_uid !== receipt.storage_uid ||
-      volume.namespace_uid !== receipt.namespace_uid ||
-      volume.cluster_uid !== receipt.cluster_uid ||
-      volume.lv_uuid !== receipt.lv_uuid ||
-      volume.volume_handle !== receipt.volume_handle ||
-      volume.pvc_uid !== receipt.pvc_uid ||
-      volume.pv_uid !== receipt.pv_uid ||
-      volume.storage_class !== storage.storage_class ||
-      volume.volume_attributes_class !== storage.volume_attributes_class ||
-      volume.io.length > 1)
-  )
-    return undefined;
-  const io = volume?.io[0];
-  if (
-    io &&
-    (io.write_bytes_per_second > storage.write_bytes_per_second ||
-      io.write_iops_per_second > storage.write_iops_per_second)
-  )
-    return undefined;
-  // Measured IO limits name the writer; until the identity proof has them, only a held writer.
-  const pod =
-    io?.pod_uid ??
-    (await heldWriterPod(
-      env,
-      database,
-      storage,
-      receipt,
-      authority,
-      current!.row.qualification_json,
-    ));
-  if (!pod) return undefined;
+}
+
+/** Cloudflare's signature over one named writer. Stable within one accepted physical revision:
+ * polling never extends a stale read's deadline. */
+async function signStorageWriter(
+  env: Env,
+  database: DatabaseRow,
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+  authority: NodeThinStorageAuthority,
+  pod: string,
+  now: number,
+) {
   const key = await nodeProofSigningKey(env);
-  // Stable within one accepted physical revision: polling never extends a stale read's deadline.
   const claims: StorageWriteClaims = {
     v: 1,
     kid: key.kid,
@@ -400,6 +382,181 @@ export async function storageWriteAuthorityForDatabase(
     write_allowed: true,
   };
   return signStorageWriteAuthority(claims, key.privateKey, now);
+}
+
+/**
+ * The Pod a parked database still holds, when the controller's word and the node's own reading
+ * agree: the controller's fresh report names it and the latest identity proof measured exactly
+ * that one Pod's io.max on this volume (the proof counts every non-terminal instance Pod as a
+ * writer, whatever its desired state). No other source names a Pod for a suspended database, so
+ * no token can exist for a Pod that was not both attested and evidenced.
+ * It serves two moments: while the database sleeps parked, and while its wake of exactly the
+ * current generation reuses the Pod. The generation of the reading may be older than the row: a
+ * sleep or a D1-only resize bumps it.
+ */
+async function parkedHolder(
+  env: Pick<Env, "DB">,
+  database: DatabaseRow,
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+  authority: NodeThinStorageAuthority,
+  now: number,
+): Promise<string | undefined> {
+  const parked = readParkedRecord(database.parked_json);
+  if (
+    !parked ||
+    database.observed_power !== "hibernated" ||
+    database.deleted_at !== null ||
+    !parkedRecordFresh(parked, now)
+  )
+    return undefined;
+  if (database.desired_state === "suspended") {
+    // Parked steady state: only an idle sleep is parked; an explicit suspension is a real stop.
+    if (database.suspension_reason !== "idle") return undefined;
+  } else if (database.desired_state === "running") {
+    // Waking from parked: the wake of exactly this generation. The guard retires the previous
+    // holder of a volume whose new generation starts without a token, so the token has to be in
+    // the first lease of the wake. Once the guard accepted it, it holds this Pod as the writer of
+    // the generation: a replacement Pod for the same generation is refused until a newer one, so
+    // a wake that must take the slow path after this lease cannot create its Pod.
+    if (
+      !(await env.DB.prepare(
+        "SELECT 1 FROM operations o WHERE o.id=? AND o.database_id=? AND o.project_id=? AND o.generation=? AND o.kind IN('database.wake','database.resume') AND o.status IN('pending','running')",
+      )
+        .bind(
+          database.power_operation ?? "",
+          database.id,
+          database.project_id,
+          database.generation,
+        )
+        .first())
+    )
+      return undefined;
+  } else return undefined;
+  const volumes = authority.volumes.filter(
+    (volume) =>
+      volume.database_id === database.id &&
+      volume.storage_generation === receipt.storage_generation &&
+      volume.generation <= database.generation,
+  );
+  const volume = volumes.length === 1 ? volumes[0] : undefined;
+  const io = volume?.io[0];
+  if (
+    !volume ||
+    volume.quiesced ||
+    !volumeMatchesReceipt(volume, storage, receipt) ||
+    volume.io.length !== 1 ||
+    !io ||
+    io.pod_uid !== parked.pod_uid ||
+    io.write_bytes_per_second > storage.write_bytes_per_second ||
+    io.write_iops_per_second > storage.write_iops_per_second
+  )
+    return undefined;
+  return parked.pod_uid;
+}
+
+export async function storageWriteAuthorityForDatabase(
+  env: Env,
+  database: DatabaseRow,
+  now = Date.now(),
+  snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
+): Promise<string | undefined> {
+  const { readPostgresPoolBindingForDatabase, hasNonterminalPoolHolderSql } =
+    await import("./postgres-pool.ts");
+  const pool = await readPostgresPoolBindingForDatabase(env, database.id);
+  if (pool && !["released", "refused"].includes(pool.state))
+    return issuePostgresPoolStorageAuthority(env, pool, now, snapshot);
+  if (
+    await env.DB.prepare(
+      `SELECT 1 FROM databases d WHERE d.id=? AND ${hasNonterminalPoolHolderSql("d")}`,
+    )
+      .bind(database.id)
+      .first()
+  )
+    return undefined;
+  if (database.desired_state !== "running") return undefined;
+  const context = await currentWriterContext(env, database, now, snapshot);
+  if (!context) return undefined;
+  const { storage, receipt, authority, current } = context;
+  const volume = authority.volumes.find(
+    (volume) =>
+      volume.database_id === database.id &&
+      volume.generation === database.generation &&
+      volume.storage_generation === receipt.storage_generation,
+  );
+  if (
+    volume &&
+    (!volumeMatchesReceipt(volume, storage, receipt) || volume.io.length > 1)
+  )
+    return undefined;
+  const io = volume?.io[0];
+  if (
+    io &&
+    (io.write_bytes_per_second > storage.write_bytes_per_second ||
+      io.write_iops_per_second > storage.write_iops_per_second)
+  )
+    return undefined;
+  // Measured IO limits name the writer; until the identity proof has them, only a held writer,
+  // or the parked Pod that a wake of this very generation reuses.
+  const pod =
+    io?.pod_uid ??
+    (await heldWriterPod(
+      env,
+      database,
+      storage,
+      receipt,
+      authority,
+      current!.row.qualification_json,
+    )) ??
+    (await parkedHolder(env, database, storage, receipt, authority, now));
+  if (!pod) return undefined;
+  return signStorageWriter(
+    env,
+    database,
+    storage,
+    receipt,
+    authority,
+    pod,
+    now,
+  );
+}
+
+/**
+ * For the host lease only: the writer token of a database that sleeps parked. The guard freezes
+ * the volume and stops the tasks of any Pod whose entry is not a running one with a valid token
+ * naming it, so a parked Pod has to be presented as the running writer it physically is.
+ * Never used for desired state or headroom responses: nothing else may hold a token for it.
+ * The caller has excluded every unresolved pool holder.
+ */
+async function parkedStorageWriteAuthority(
+  env: Env,
+  database: DatabaseRow,
+  now: number,
+  snapshot: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
+): Promise<string | undefined> {
+  if (database.desired_state !== "suspended" || !database.parked_json)
+    return undefined;
+  const context = await currentWriterContext(env, database, now, snapshot);
+  if (!context) return undefined;
+  const { storage, receipt, authority } = context;
+  const pod = await parkedHolder(
+    env,
+    database,
+    storage,
+    receipt,
+    authority,
+    now,
+  );
+  if (!pod) return undefined;
+  return signStorageWriter(
+    env,
+    database,
+    storage,
+    receipt,
+    authority,
+    pod,
+    now,
+  );
 }
 
 /** Real pre-grant cgroup/device custody can precede the mount. It is not PG readiness.
@@ -867,9 +1024,25 @@ export async function hostStorageLease(
       (pool !== undefined &&
         pool.device !== null &&
         pool.holder_boot_id === bootId);
-    const runtimeAuthority = poolMayWrite
-      ? await storageWriteAuthorityForDatabase(c.env, row, now, current)
-      : undefined;
+    // A parked database (D1: suspended, idle, hibernated) still holds its own Pod with PostgreSQL
+    // stopped. The host guard stops the tasks and freezes the volume of any Pod whose entry is not
+    // running with a valid token naming it, and it retires the previous holder when the next
+    // generation starts without one. So this entry is the one place where the lease says "running"
+    // for a database whose desired state is "suspended": no write can happen (no postmaster, the
+    // gateway refuses), and the token exists only while the controller's report is fresh and the
+    // node's own reading evidences exactly that Pod.
+    const parkedAuthority =
+      poolMayWrite &&
+      !unresolvedPool &&
+      row.desired_state === "suspended" &&
+      row.parked_json
+        ? await parkedStorageWriteAuthority(c.env, row, now, current)
+        : undefined;
+    const runtimeAuthority =
+      parkedAuthority ??
+      (poolMayWrite
+        ? await storageWriteAuthorityForDatabase(c.env, row, now, current)
+        : undefined);
     // Startup authority cannot substitute forever for missing IO evidence of a Ready writer.
     const readyWithoutWriter =
       row.desired_state === "running" &&
@@ -895,6 +1068,7 @@ export async function hostStorageLease(
       null;
     if (
       row.stop_operation &&
+      parkedAuthority === undefined &&
       !unresolvedPool &&
       receipt &&
       current?.row.current_qualified === 1 &&
@@ -958,7 +1132,7 @@ export async function hostStorageLease(
               !current ||
               current.row.error_code !== null ||
               current.row.status === "blocked",
-      desired_state: row.desired_state,
+      desired_state: parkedAuthority ? "running" : row.desired_state,
       node_uid: storage.node_uid,
       volume_group_uuid: storage.volume_group_uuid,
       pool_uuid: storage.pool_uuid,
