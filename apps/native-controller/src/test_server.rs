@@ -22,17 +22,18 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 type LoseReply = Box<dyn Fn(&str, &Value) -> bool + Send>;
+type Matching = Box<dyn Fn(&str, &str) -> bool + Send>;
 type RefuseWrite = Box<dyn Fn(&str, &Value) -> Option<u16> + Send>;
 type RefuseRead = Box<dyn Fn(&str) -> Option<u16> + Send>;
 type DuringText = Box<dyn FnOnce(&mut BTreeMap<String, Value>) + Send>;
 /// How long a read waits in a `Gate` for the others of its group before it gives up.
 const GATE_WAIT: Duration = Duration::from_millis(300);
-/// Holds the reads of the paths it matches until `want` of them wait together, and then lets that
-/// group go: a test sees whether a group of reads was issued at once. Reads issued one after
-/// another never fill a group, and each of them gives up after `GATE_WAIT`; the gate counts the
-/// groups it let go and the reads that gave up.
+/// Holds the requests (method, path) it matches until `want` of them wait together, and then lets
+/// that group go: a test sees whether a group of requests was issued at once. Requests issued one
+/// after another never fill a group, and each of them gives up after `GATE_WAIT`; the gate counts
+/// the groups it let go and the requests that gave up.
 pub struct Gate {
-    matching: Box<dyn Fn(&str) -> bool + Send>,
+    matching: Matching,
     want: usize,
     waiting: usize,
     generation: u64,
@@ -40,7 +41,7 @@ pub struct Gate {
     pub gave_up: usize,
 }
 impl Gate {
-    pub fn new(want: usize, matching: impl Fn(&str) -> bool + Send + 'static) -> Self {
+    pub fn new(want: usize, matching: impl Fn(&str, &str) -> bool + Send + 'static) -> Self {
         Self {
             matching: Box::new(matching),
             want,
@@ -76,7 +77,7 @@ pub struct State {
     /// Every committed write as one line, appended to a log other doubles also write to, so a
     /// test can assert the order of effects across the cluster, the gateway and PostgreSQL.
     pub log: Option<Arc<Mutex<Vec<String>>>>,
-    /// Holds reads until a group of them is issued together.
+    /// Holds requests until a group of them is issued together.
     pub gate: Option<Gate>,
     /// The first committed PATCH or DELETE matching (path, body) closes the connection without a
     /// reply.
@@ -458,12 +459,12 @@ impl Server {
                         .unwrap_or_default();
                     let mut body = vec![0; length];
                     tls.read_exact(&mut body).await.unwrap();
-                    // A read of a gated path waits for the others of its group.
+                    // A request the gate matches waits for the others of its group.
                     let mut held = None;
-                    if method == "GET" {
+                    {
                         let mut state = state.lock().unwrap();
                         if let Some(gate) = state.gate.as_mut()
-                            && (gate.matching)(&path)
+                            && (gate.matching)(&method, &path)
                         {
                             gate.waiting += 1;
                             if gate.waiting >= gate.want {

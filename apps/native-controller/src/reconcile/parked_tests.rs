@@ -682,13 +682,13 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     let at = w.server.state.lock().unwrap().requests.len();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
-    assert_eq!(requests_since(&w, at), (102, 19), "the wake");
+    assert_eq!(requests_since(&w, at), (101, 19), "the wake");
     let _ = w.watch_delivers();
     w.kubelet_ready_now()();
     let at = w.server.state.lock().unwrap().requests.len();
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
-    assert_eq!(requests_since(&w, at), (85, 0), "the pass after it");
+    assert_eq!(requests_since(&w, at), (84, 0), "the pass after it");
 }
 
 #[tokio::test]
@@ -834,8 +834,8 @@ async fn a_generation_is_applied_by_reading_its_objects_together_and_writing_the
     // each is a group of eight read together, which two groups of four fill, and the pass
     // that read them one after another would fill none.
     let matching = objects.clone();
-    w.server.state.lock().unwrap().gate = Some(Gate::new(4, move |at| {
-        matching.iter().any(|object| object == at)
+    w.server.state.lock().unwrap().gate = Some(Gate::new(4, move |method, at| {
+        method == "GET" && matching.iter().any(|object| object == at)
     }));
     let at = w.server.state.lock().unwrap().requests.len();
     let observed = reconcile(&w).await;
@@ -891,7 +891,7 @@ async fn the_proof_reads_the_resources_it_names_back_together() {
     let volume = json!({"claimUid":claim_uid(),"volumeUid":volume_uid(),"handle":HANDLE});
     // Eleven reads: the claim, the volume and the receipt, and each of the eight resources of
     // the proof again. Read one after another, no group of three is ever together.
-    w.server.state.lock().unwrap().gate = Some(Gate::new(3, |_| true));
+    w.server.state.lock().unwrap().gate = Some(Gate::new(3, |method, _| method == "GET"));
     let continuity = w
         .reconciler
         .runtime_readback(
@@ -943,4 +943,46 @@ async fn a_parked_wake_logs_the_maintenance_role_in_once() {
     assert_eq!(count("app"), 1, "{logins:?}");
     assert_eq!(count("reader_query"), 1, "{logins:?}");
     assert_eq!(logins.len(), 3, "{logins:?}");
+}
+
+#[tokio::test]
+async fn the_target_is_published_after_every_gateway_acknowledged_and_with_the_read_back() {
+    // The gateway routes a resumed Pod by the target the controller writes into the fence. It is
+    // written once every gateway has acknowledged the release, and not before; what follows the
+    // acknowledgements, the read-back of the gateways and of the fence, and the write of the
+    // target, needs nothing of the other and is issued together.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let fence = path(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+    );
+    let storage = path("ConfigMap", Some(SYSTEM), &format!("storage-{}", w.id));
+    let gateways = format!("/api/v1/namespaces/{SYSTEM}/pods");
+    let released = w.log.clone();
+    let after_release = move |method: &str, at: &str| {
+        released
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line == "GATEWAY release")
+            && ((method == "GET" && (at == storage || at == gateways)) || at == fence)
+    };
+    w.server.state.lock().unwrap().gate = Some(Gate::new(4, after_release));
+    w.log.lock().unwrap().clear();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let gate = w.server.state.lock().unwrap().gate.take().unwrap();
+    assert_eq!(
+        (gate.rounds, gate.gave_up),
+        (1, 0),
+        "the read-back and the target were not issued together"
+    );
+    let release = at(&w, &["GATEWAY release"]);
+    let target = at(&w, &["PATCH", "gateway-fence-", "admission_target"]);
+    assert!(release < target, "the target precedes the release");
+    assert_eq!(admission_target(&w)["generation"], 3);
 }

@@ -2504,18 +2504,70 @@ impl PowerCoordinator {
         } else {
             desired_power(db)?.ok_or("wake intent missing")?
         };
-        let result=tokio::time::timeout(Duration::from_secs(10),async{
-   let(physical,cluster)=self.anchor(db).await?;let mut map=self.fence(db).await?;let prior=map.as_ref().map(|m|progress_from(m,self.now())).transpose()?.flatten();if prior.as_ref().is_some_and(|p|!physical.matches(&p.anchor)){return Err(Fault::Recovery("power_storage_identity_changed"));}
-   if cluster["metadata"]["annotations"][HIBERNATION]=="on"{return Ok(None);}
-   let mut progress=Progress::new(intent.clone(),Phase::Awake,physical,self.now());
-   // An awake database's record says when its wake completed: another pass over it leaves it as it is.
-   if let Some(prior)=prior.as_ref().filter(|p|p.phase==Phase::Awake&&p.target==intent){progress.started_at=prior.started_at;}
-   let current=self.write(db,map.as_ref(),Some(&intent),&progress).await?;map=Some(current.clone());self.bind_fence(db,&current).await?;let snapshot=self.snapshot().await?;self.controls(&intent,&snapshot,"release").await?;
-   if self.gateways().await?!=snapshot.pods{return Ok(None);}let current=self.fence(db).await?.ok_or(Fault::Stale)?;if uid(&current)?!=uid(map.as_ref().unwrap())?||intent_from(&current,text(db,"id"))?!=intent{return Ok(None);}
-   let mut value=observation.clone();if !db["power"].is_null(){value["power"]=json!({"operation":intent.operation,"revision":intent.revision,"state":"awake"});}Ok(Some(value))
-  }).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let (physical, cluster) = self.anchor(db).await?;
+            let map = self.fence(db).await?;
+            let prior = map
+                .as_ref()
+                .map(|m| progress_from(m, self.now()))
+                .transpose()?
+                .flatten();
+            if prior.as_ref().is_some_and(|p| !physical.matches(&p.anchor)) {
+                return Err(Fault::Recovery("power_storage_identity_changed"));
+            }
+            if cluster["metadata"]["annotations"][HIBERNATION] == "on" {
+                return Ok(None);
+            }
+            let mut progress = Progress::new(intent.clone(), Phase::Awake, physical, self.now());
+            // An awake database's record says when its wake completed: another pass over it
+            // leaves it as it is.
+            if let Some(prior) = prior
+                .as_ref()
+                .filter(|p| p.phase == Phase::Awake && p.target == intent)
+            {
+                progress.started_at = prior.started_at;
+            }
+            let current = self
+                .write(db, map.as_ref(), Some(&intent), &progress)
+                .await?;
+            self.bind_fence(db, &current).await?;
+            let snapshot = self.snapshot().await?;
+            self.controls(&intent, &snapshot, "release").await?;
+            // Every gateway has acknowledged the release. The read-back that the gateways and
+            // the fence are still what they were released under, and the publication of the
+            // target the gateway routes this revision by, need nothing of one another and are
+            // issued together; the target is never written before the acknowledgements, and the
+            // observation that names it is posted after both.
+            let read_back = async {
+                let (gateways, fence) = tokio::try_join!(self.gateways(), self.fence(db))?;
+                if gateways != snapshot.pods {
+                    return Ok::<bool, Fault>(false);
+                }
+                let fence = fence.ok_or(Fault::Stale)?;
+                Ok(uid(&fence)? == uid(&current)?
+                    && intent_from(&fence, text(db, "id"))? == intent)
+            };
+            let (confirmed, published) = tokio::join!(
+                read_back,
+                self.publish_target(db, Some(&current), &observation)
+            );
+            if !confirmed? {
+                return Ok(None);
+            }
+            let mut value = observation.clone();
+            if !db["power"].is_null() {
+                value["power"] = json!({"operation":intent.operation,"revision":intent.revision,"state":"awake"});
+            }
+            Ok(Some((value, published)))
+        })
+        .await;
         Ok(match result {
-            Ok(Ok(value)) => value,
+            // A target that could not be published is an error of the pass, as it always was.
+            Ok(Ok(Some((value, published)))) => {
+                published?;
+                Some(value)
+            }
+            Ok(Ok(None)) => None,
             Ok(Err(Fault::Recovery(_))) => {
                 let mut value = observation;
                 value["state"] = "error".into();
@@ -2524,6 +2576,70 @@ impl PowerCoordinator {
             }
             _ => None,
         })
+    }
+    /// Writes the target the gateway routes the running revision of `db` to by into its fence:
+    /// the Pod, its container and the CA that the v2 runtime attestation of `observation`
+    /// names. `fence` is the fence as the running intent was written, or read here. Nothing is
+    /// written for an observation without such an attestation, or while the controller's watch
+    /// no longer holds the objects it names at the versions it names.
+    pub(crate) async fn publish_target(
+        &self,
+        db: &Value,
+        fence: Option<&Value>,
+        observation: &Value,
+    ) -> std::result::Result<(), Error> {
+        let proof = &observation["runtime_attestation"];
+        if proof["v"] != 2 {
+            return Ok(());
+        }
+        let read;
+        let map = match fence {
+            Some(map) => map,
+            None => {
+                read = self
+                    .fence(db)
+                    .await?
+                    .ok_or("admitted running fence missing")?;
+                &read
+            }
+        };
+        let intent: Value = serde_json::from_str(text(&map["data"], "intent.json"))?;
+        if intent["database"] != db["id"]
+            || intent["revision"] != db["generation"]
+            || intent["mode"] != "running"
+        {
+            return Err("admitted fence revision changed".into());
+        }
+        let target = json!({"v":1,"generation":proof["generation"],"route_revision":proof["route_revision"],"admission_epoch":proof["admission_epoch"],"pod_uid":proof["pod_uid"],"container_id":proof["container_id"],"ca_secret_uid":proof["ca_secret_uid"],"ca_secret_resource_version":proof["ca_secret_resource_version"],"ca_sha256":proof["ca_sha256"],"tls_server_name":proof["tls_server_name"]});
+        if !valid_schema("gatewayAdmissionTarget", &target) {
+            return Err("admitted target contract invalid".into());
+        }
+        if !self.k8s.runtime_proof_current(proof) {
+            return Err("runtime proof changed before target publication".into());
+        }
+        if let Some(raw) = map["data"]["admission_target"].as_str() {
+            let prior: Value = serde_json::from_str(raw)?;
+            if !valid_schema("gatewayAdmissionTarget", &prior)
+                || prior["route_revision"].as_u64() > target["route_revision"].as_u64()
+                || prior["admission_epoch"].as_u64() > target["admission_epoch"].as_u64()
+                || prior["generation"].as_u64() > target["generation"].as_u64()
+            {
+                return Err("admitted target history regressed".into());
+            }
+            if prior == target {
+                return Ok(());
+            }
+        }
+        self.k8s
+            .patch(
+                map,
+                &json!({"data":{"admission_target":serde_json::to_string(&target)?}}),
+            )
+            .await?;
+        if !self.k8s.runtime_proof_current(proof) {
+            return Err("runtime proof changed during target publication".into());
+        }
+        Ok(())
     }
 }
 fn storage_class(db: &Value) -> Result<&str> {

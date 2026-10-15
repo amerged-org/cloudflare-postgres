@@ -1859,9 +1859,6 @@ impl Reconciler {
         } else {
             release.pending();
         }
-        if let Some(result) = &result {
-            self.persist_admission_target(db, result).await?;
-        }
         // The roles awaiting removal advance after the database is ready, never before: readiness
         // waits for the present roles only. The Cluster is not written until the attestation above
         // was formed and published, which pins the Cluster's version.
@@ -2450,63 +2447,9 @@ impl Reconciler {
             json!({"v":1,"controller_epoch":start.0,"watch_epoch":start.1,"coverage":"complete","resource_versions":versions}),
         ))
     }
+    /// Publishes the target of a pool holder's running revision: its fence, as it stands.
     async fn persist_admission_target(&self, db: &Value, observation: &Value) -> Result<(), Error> {
-        let proof = &observation["runtime_attestation"];
-        if proof["v"] != 2 {
-            return Ok(());
-        }
-        let map = self
-            .k8s
-            .read(
-                "ConfigMap",
-                Some(SYSTEM),
-                &format!("gateway-fence-{}", text(db, "id")),
-            )
-            .await?
-            .ok_or("admitted running fence missing")?;
-        owned(
-            &map,
-            db,
-            &format!("gateway-fence-{}", text(db, "id")),
-            Some(SYSTEM),
-        )?;
-        let intent: Value = serde_json::from_str(text(&map["data"], "intent.json"))?;
-        if intent["database"] != db["id"]
-            || intent["revision"] != db["generation"]
-            || intent["mode"] != "running"
-        {
-            return Err("admitted fence revision changed".into());
-        }
-        let target = json!({"v":1,"generation":proof["generation"],"route_revision":proof["route_revision"],"admission_epoch":proof["admission_epoch"],"pod_uid":proof["pod_uid"],"container_id":proof["container_id"],"ca_secret_uid":proof["ca_secret_uid"],"ca_secret_resource_version":proof["ca_secret_resource_version"],"ca_sha256":proof["ca_sha256"],"tls_server_name":proof["tls_server_name"]});
-        if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget", &target) {
-            return Err("admitted target contract invalid".into());
-        }
-        if !self.k8s.runtime_proof_current(proof) {
-            return Err("runtime proof changed before target publication".into());
-        }
-        if let Some(raw) = map["data"]["admission_target"].as_str() {
-            let prior: Value = serde_json::from_str(raw)?;
-            if !pgcf_native_protocol::valid_schema("gatewayAdmissionTarget", &prior)
-                || prior["route_revision"].as_u64() > target["route_revision"].as_u64()
-                || prior["admission_epoch"].as_u64() > target["admission_epoch"].as_u64()
-                || prior["generation"].as_u64() > target["generation"].as_u64()
-            {
-                return Err("admitted target history regressed".into());
-            }
-            if prior == target {
-                return Ok(());
-            }
-        }
-        self.k8s
-            .patch(
-                &map,
-                &json!({"data":{"admission_target":serde_json::to_string(&target)?}}),
-            )
-            .await?;
-        if !self.k8s.runtime_proof_current(proof) {
-            return Err("runtime proof changed during target publication".into());
-        }
-        Ok(())
+        self.power.publish_target(db, None, observation).await
     }
     pub fn new(
         k8s: Kubernetes,
