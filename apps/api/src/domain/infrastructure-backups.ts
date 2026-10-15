@@ -332,15 +332,16 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
       /* The record is for operators: a failed write never stops the Cron that alerting follows. */
     }
   } else if (attempt) {
-    // One attempt at a time across days, so a retry never competes with another capture.
+    // One attempt at a time across days, so a retry never competes with another capture. The run
+    // takes the configuration revision in the same statement that inserts it: a notification PUT
+    // landing after the read above would otherwise leave the new run revoked at birth.
     await env.DB.prepare(
-      "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) SELECT ?,?,?,?,'pending',?,? WHERE NOT EXISTS(SELECT 1 FROM infrastructure_backup_runs WHERE status IN('pending','running')) ON CONFLICT(day,attempt) DO NOTHING",
+      "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) SELECT ?,?,?,revision,'pending',?,? FROM infrastructure_backup_config WHERE singleton=1 AND enabled=1 AND NOT EXISTS(SELECT 1 FROM infrastructure_backup_runs WHERE status IN('pending','running')) ON CONFLICT(day,attempt) DO NOTHING",
     )
       .bind(
         crypto.randomUUID(),
         day,
         attempt,
-        config.revision,
         at,
         new Date(now + MAX_RUN_MS).toISOString(),
       )

@@ -9,6 +9,7 @@ import {
   initializeInfrastructureBackup,
   prepareInfrastructureBackupInput,
   readInfrastructureBackupConfig,
+  runInfrastructureBackupCron,
 } from "../../src/domain/infrastructure-backups.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
@@ -254,4 +255,52 @@ it("reads one coherent authority snapshot during a real concurrent notification 
   const current = await assertBackupRun(f.binding, pending.id);
   expect(current.row.config_revision).toBe(updated.revision);
   expect(current.config.revision).toBe(updated.revision);
+});
+
+it("keeps the day's run valid when alert email changes between the cron's configuration read and its run insert", async () => {
+  const f = await configured(),
+    created: string[] = [];
+  const interleaved = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.startsWith("INSERT INTO infrastructure_backup_runs"))
+            return statement;
+          return {
+            bind: (...values: unknown[]) => ({
+              run: async () => {
+                // The operator's PUT lands after the cron read the configuration and before its insert.
+                await configureInfrastructureBackups(f.binding, {
+                  ...f.input,
+                  notification_sender: "alerts@example.invalid",
+                });
+                return statement.bind(...values).run();
+              },
+            }),
+          } as unknown as D1PreparedStatement;
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await runInfrastructureBackupCron({
+    ...f.binding,
+    DB: interleaved,
+    INFRASTRUCTURE_BACKUP: {
+      async get() {
+        throw new Error("instance.not_found");
+      },
+      async create(options: { id: string }) {
+        created.push(options.id);
+      },
+    } as unknown as Workflow<{ run_id: string }>,
+  });
+  expect(created).toHaveLength(1);
+  const current = await readInfrastructureBackupConfig(env.DB);
+  expect(current.revision).toBe(f.config.revision + 1);
+  expect(await revision(created[0]!)).toBe(current.revision);
+  await expect(assertBackupRun(f.binding, created[0]!)).resolves.toMatchObject({
+    row: { status: "pending" },
+  });
 });
