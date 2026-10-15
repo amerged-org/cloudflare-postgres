@@ -32,6 +32,31 @@ export function patchSingleton(
 const object = patchObject,
   objects = patchObjects,
   singleton = patchSingleton;
+/** Every CNPG Cluster is Ready or Hibernated. A Cluster that is being deleted, or whose database
+ *  namespace is, can never become Ready again: waiting for it would hold every release forever. */
+function databasesReady(clusters: string, databaseNamespaces: string): boolean {
+  const deleting = new Set(
+    objects(object(JSON.parse(databaseNamespaces)).items)
+      .map((v) => object(v.metadata))
+      .filter((metadata) => metadata.deletionTimestamp)
+      .map((metadata) => metadata.name),
+  );
+  return objects(object(JSON.parse(clusters)).items).every((v) => {
+    const metadata = object(v.metadata);
+    if (metadata.deletionTimestamp || deleting.has(metadata.namespace))
+      return true;
+    const conditions = objects(object(v.status).conditions);
+    return (
+      conditions.some((c) => c.type === "Ready" && c.status === "True") ||
+      conditions.some(
+        (c) =>
+          c.type === "cnpg.io/hibernation" &&
+          c.status === "True" &&
+          c.reason === "Hibernated",
+      )
+    );
+  });
+}
 /** Read-only runtime collector shared by the programmed executor and direct operator acceptance. */
 export async function collectFleetPatchRuntime(
   input: Pick<
@@ -56,6 +81,7 @@ export async function collectFleetPatchRuntime(
     system,
     schematic,
     clusters,
+    databaseNamespaces,
     allNodes,
   ] = await Promise.allSettled([
     kube(["get", "namespace", "kube-system", "-o", "json"]),
@@ -86,11 +112,21 @@ export async function collectFleetPatchRuntime(
       "-o",
       "json",
     ]),
+    // A deleted database keeps its labelled namespace Terminating while its Pod is stuck.
+    kube([
+      "get",
+      "namespaces",
+      "--selector",
+      "pgcf.io/database-id",
+      "-o",
+      "json",
+    ]),
     kube(["get", "nodes", "-o", "json"]),
   ]).then((results) => {
     const failure = results.find((v) => v.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
     return results.map((v) => (v as PromiseFulfilledResult<string>).value) as [
+      string,
       string,
       string,
       string,
@@ -151,18 +187,7 @@ export async function collectFleetPatchRuntime(
     node_ready: objects(object(n.status).conditions).some(
       (v) => v.type === "Ready" && v.status === "True",
     ),
-    databases_ready: objects(object(JSON.parse(clusters)).items).every((v) => {
-      const conditions = objects(object(v.status).conditions);
-      return (
-        conditions.some((c) => c.type === "Ready" && c.status === "True") ||
-        conditions.some(
-          (c) =>
-            c.type === "cnpg.io/hibernation" &&
-            c.status === "True" &&
-            c.reason === "Hibernated",
-        )
-      );
-    }),
+    databases_ready: databasesReady(clusters, databaseNamespaces),
     cluster_nodes: clusterNodes.map((v) => ({
       node_uid: object(v.metadata).uid,
       kubelet_version: object(object(v.status).nodeInfo).kubeletVersion,

@@ -251,10 +251,16 @@ function runtime(
                 stdout = JSON.stringify({
                   gitVersion: facts.kubernetes_version,
                 });
+              else if (args.includes("namespaces"))
+                stdout = JSON.stringify({ items: [] });
               else
                 stdout = JSON.stringify({
                   items: [
                     {
+                      metadata: {
+                        name: "database",
+                        namespace: "pgcf-db-aaaaaaaaaaaaaaaaaaaa",
+                      },
                       status: {
                         conditions: [
                           {
@@ -487,6 +493,65 @@ test("fresh cluster/node identity changes and unhealthy databases prevent a writ
   r.facts = { ...r.fixture.facts, databases_ready: false };
   await assert.rejects(r.turn(), /patch_checkpoint_invalid/);
   assert.equal(r.writes.length, 0);
+});
+/** Answers the executor's CNPG Cluster and database-namespace reads with exactly these objects. */
+function databases(
+  r: ReturnType<typeof runtime>,
+  clusters: object[],
+  namespaces: object[],
+) {
+  const reply = (items: object[]) =>
+    Promise.resolve({ exit_code: 0, stdout: JSON.stringify({ items }) });
+  r.kubeProbe = (command) =>
+    command.args.includes("clusters.postgresql.cnpg.io")
+      ? reply(clusters)
+      : command.args.includes("namespaces")
+        ? reply(namespaces)
+        : undefined;
+}
+test("a Cluster whose database is being deleted never blocks a release but an Active database still does", async () => {
+  const deleting = { deletionTimestamp: "2026-10-15T09:00:00Z" },
+    cluster = (id: string, ready: boolean, metadata: object = {}) => ({
+      metadata: {
+        name: "database",
+        namespace: `pgcf-db-${id}`,
+        ...metadata,
+      },
+      status: {
+        conditions: [{ type: "Ready", status: ready ? "True" : "False" }],
+      },
+    }),
+    namespace = (id: string, metadata: object = {}) => ({
+      metadata: {
+        name: `pgcf-db-${id}`,
+        labels: { "pgcf.io/database-id": id },
+        ...metadata,
+      },
+    });
+  // A deleted database whose Pod is stuck keeps its namespace Terminating and its Cluster not Ready.
+  const released = runtime();
+  databases(
+    released,
+    [cluster("live", true), cluster("gone", false)],
+    [namespace("live"), namespace("gone", deleting)],
+  );
+  await released.turn();
+  assert.equal(released.current.state, "confirmed");
+  assert.equal(released.current.observed?.databases_ready, true);
+  // The same not Ready Cluster in an Active namespace is a database that is down: the release waits.
+  const blocked = runtime();
+  databases(
+    blocked,
+    [cluster("live", true), cluster("gone", false)],
+    [namespace("live"), namespace("gone")],
+  );
+  await assert.rejects(blocked.turn(), /patch_preflight_unhealthy/);
+  assert.equal(blocked.current.state, "pending");
+  // A Cluster that is itself being deleted can never become Ready either.
+  const removed = runtime();
+  databases(removed, [cluster("gone", false, deleting)], [namespace("gone")]);
+  await removed.turn();
+  assert.equal(removed.current.state, "confirmed");
 });
 test("a modified desired spec and off-origin callback are rejected before access", () => {
   const { input } = patchFixture();
