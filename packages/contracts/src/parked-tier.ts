@@ -24,10 +24,17 @@ export const ParkedTierPolicy = z.strictObject({
   sidecar_memory_mib: z.number().int().min(16).max(4096),
 });
 export type ParkedTierPolicy = z.infer<typeof ParkedTierPolicy>;
-/** The Pod a hibernated observation still holds: its effective scheduling request after the resize. */
+/**
+ * The Pod a hibernated observation still holds: its effective scheduling request after the
+ * resize. `wake: "fast"` is claimed only while the controller has just established every
+ * predicate of the fast wake (the Pod, its containers, the node boot, the fleet release and the
+ * desired manifests are all unchanged since the Pod was parked); a Pod that drifted is demoted,
+ * and a wake of a Pod without the claim is an ordinary one.
+ */
 export const ParkedObservation = z.strictObject({
   pod_uid: z.uuid(),
   cpu_millicores: Count,
   memory_mib: Count,
+  wake: z.literal("fast").optional(),
 });
 export type ParkedObservation = z.infer<typeof ParkedObservation>;

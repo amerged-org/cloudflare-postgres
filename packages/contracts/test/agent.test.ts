@@ -1013,6 +1013,37 @@ it("a parked Pod is reported only inside a hibernated observation without refusa
   ).toBe(false);
 });
 
+it("a parked Pod claims a fast wake only with the literal fast", () => {
+  const value = observation();
+  const databases = value.databases as Record<string, unknown>[];
+  const parked = { pod_uid: randomUUID(), cpu_millicores: 15, memory_mib: 160 };
+  const hibernated = (claim: unknown) => ({
+    ...databases[0],
+    state: "hibernated",
+    power: {
+      operation: newOperationId(),
+      revision: 1,
+      state: "hibernated",
+      parked: claim,
+    },
+  });
+  // Without the claim the Pod is parked but a wake is not promised to be fast.
+  for (const claim of [parked, { ...parked, wake: "fast" }])
+    expect(
+      ObservationRequest.safeParse({
+        ...value,
+        databases: [hibernated(claim)],
+      }).success,
+    ).toBe(true);
+  for (const wake of ["slow", "", true, null, 1])
+    expect(
+      ObservationRequest.safeParse({
+        ...value,
+        databases: [hibernated({ ...parked, wake })],
+      }).success,
+    ).toBe(false);
+});
+
 it("hibernation observations require an exact power identity and cannot claim ready", () => {
   const value = observation();
   const databases = value.databases as Record<string, unknown>[];

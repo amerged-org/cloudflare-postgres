@@ -2097,7 +2097,6 @@
                       "type": "number",
                       "const": 1
                     },
-                    "parked_tier_version": { "type": "number", "const": 1 },
                     "components": {
                       "minItems": 1,
                       "maxItems": 128,
@@ -3433,7 +3432,8 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
-                }
+                },
+                "wake": { "type": "string", "const": "fast" }
               },
               "required": ["pod_uid", "cpu_millicores", "memory_mib"],
               "additionalProperties": false
@@ -4288,7 +4288,8 @@
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 9007199254740991
-                      }
+                      },
+                      "wake": { "type": "string", "const": "fast" }
                     },
                     "required": ["pod_uid", "cpu_millicores", "memory_mib"],
                     "additionalProperties": false
@@ -5330,7 +5331,8 @@
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 9007199254740991
-                      }
+                      },
+                      "wake": { "type": "string", "const": "fast" }
                     },
                     "required": ["pod_uid", "cpu_millicores", "memory_mib"],
                     "additionalProperties": false

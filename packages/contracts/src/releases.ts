@@ -210,8 +210,6 @@ export const FleetReleaseSpec = z
     postgres_pool_qualification: PostgresPoolQualification.optional(),
     /** Cloudflare-only declaration of the nonce-bound native controller sampling protocol. */
     thin_storage_sampling_version: z.literal(1).optional(),
-    /** Cloudflare-only declaration that this release's native controller parks idle databases. */
-    parked_tier_version: z.literal(1).optional(),
     components: z.array(FleetReleaseComponent).min(1).max(128),
     roles: z.strictObject({ control_relay: Role, customer: Role }),
   })
@@ -306,14 +304,6 @@ export const FleetReleaseSpec = z
         code: "custom",
         message:
           "Runtime attestation v2 requires the native controller on every role",
-      });
-    if (
-      spec.parked_tier_version !== undefined &&
-      spec.runtime_attestation_version !== 2
-    )
-      context.addIssue({
-        code: "custom",
-        message: "The parked tier requires runtime attestation v2",
       });
     if (
       spec.thin_storage_sampling_version !== undefined &&
