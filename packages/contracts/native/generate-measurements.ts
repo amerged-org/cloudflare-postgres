@@ -80,9 +80,48 @@ const cases = [
     continuous: true,
   },
   {
-    name: "cross_hour_never_distributes_counter_delta",
-    previous: { ...prior, observedAt: at(USAGE_HOUR_MS - 1000) },
-    current: { ...current, observedAt: at(USAGE_HOUR_MS + 1000) },
+    // 10 s before and 5 s after the boundary: floor(50*10/15)=33, 66, 0 and 333 ms; the rest is later.
+    name: "cross_hour_splits_known_delta_pro_rata",
+    previous: { ...prior, observedAt: at(USAGE_HOUR_MS - 10000) },
+    current: { ...current, observedAt: at(USAGE_HOUR_MS + 5000) },
+    continuous: true,
+  },
+  {
+    name: "cross_hour_quiet_interval_is_two_known_zeros",
+    previous: { ...prior, observedAt: at(USAGE_HOUR_MS - 10000) },
+    current: { ...prior, observedAt: at(USAGE_HOUR_MS + 5000) },
+    continuous: true,
+  },
+  {
+    // A counter product above 2^53: the earlier fragment takes floor(MAX*2/3), computed exactly.
+    name: "cross_hour_split_is_exact_beyond_2_pow_53",
+    previous: {
+      ...prior,
+      observedAt: at(USAGE_HOUR_MS - 2),
+      ingressBytes: 0,
+    },
+    current: {
+      ...prior,
+      observedAt: at(USAGE_HOUR_MS + 1),
+      ingressBytes: Number.MAX_SAFE_INTEGER,
+    },
+    continuous: true,
+  },
+  {
+    name: "cross_hour_restart_stays_unknown",
+    previous: { ...prior, observedAt: at(USAGE_HOUR_MS - 10000) },
+    current: {
+      ...current,
+      processEpoch: uid(4),
+      observedAt: at(USAGE_HOUR_MS + 5000),
+    },
+    continuous: true,
+  },
+  {
+    // The hour in between has no fragment, so the delta of a span over two boundaries stays unknown.
+    name: "span_over_two_boundaries_stays_unknown",
+    previous: { ...prior, observedAt: at(USAGE_HOUR_MS - 10000) },
+    current: { ...current, observedAt: at(2 * USAGE_HOUR_MS + 5000) },
     continuous: true,
   },
   {

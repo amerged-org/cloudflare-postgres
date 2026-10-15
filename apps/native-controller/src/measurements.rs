@@ -271,47 +271,106 @@ fn checkpoint(resource: &Value, identity: &Value) -> Result<Value, Error> {
     }
     Ok(result)
 }
+/// The cumulative gateway counters: the usage sample field and the report field it is counted from.
+const COUNTERS: [(&str, &str); 4] = [
+    ("ingress_bytes", "ingressBytes"),
+    ("egress_bytes", "egressBytes"),
+    ("connections", "totalConnections"),
+    ("connection_seconds", "connectionMilliseconds"),
+];
+/// Whole seconds are integers, like the JSON the TypeScript authority writes.
+fn seconds(milliseconds: u64) -> Value {
+    if milliseconds.is_multiple_of(1000) {
+        Value::from(milliseconds / 1000)
+    } else {
+        Value::from(milliseconds as f64 / 1000.0)
+    }
+}
+/// The traffic between two observations of one gateway counter run. A sample never crosses a UTC
+/// hour, so a span that touches two adjacent hours is two fragments. A known delta is split between
+/// them pro rata by elapsed time in exact integer arithmetic: the earlier fragment takes the floor of
+/// its share and the later one the remainder, so the parts always add up to the measured delta. The
+/// timing error is bounded by the span, one measurement interval. A restart, counter reset,
+/// inventory change or incomplete report is unknown in every fragment, and so is a span over more
+/// than two hours: the hours in between have no fragment to receive a share.
+///
+/// `unchanged_until` is when `previous`, held across quiet cycles, was last seen with its counters
+/// unchanged: the traffic was counted after it, so the share is spread over that window instead of
+/// the whole held span. Without it the window is the span itself.
 fn differences(
     previous: &Value,
     current: &Value,
     expected: &Value,
     continuous: bool,
+    unchanged_until: Option<u64>,
 ) -> Result<Vec<Value>, Error> {
     let start = millis(&previous["observedAt"])?;
     let end = millis(&current["observedAt"])?;
     if end <= start {
         return Ok(vec![]);
     }
-    let fields = [
-        "ingressBytes",
-        "egressBytes",
-        "totalConnections",
-        "connectionMilliseconds",
-    ];
     let known = continuous
         && same_epoch(previous, current)
         && history(previous)
         && history(current)
-        && fields.iter().all(|f| {
-            integer(previous, f)
+        && COUNTERS.iter().all(|(_, field)| {
+            integer(previous, field)
                 .ok()
-                .zip(integer(current, f).ok())
+                .zip(integer(current, field).ok())
                 .is_some_and(|(a, b)| b >= a)
         });
     let hour = limit("USAGE_HOUR_MS");
-    let same_hour = start / hour == (end - 1) / hour;
-    let intervals = if same_hour {
+    let (first, last) = (start / hour, (end - 1) / hour);
+    let boundary = (first + 1) * hour;
+    let fragments = if first == last {
         vec![(start, end)]
     } else {
-        let first = (start / hour + 1) * hour;
-        let last = (end - 1) / hour * hour;
-        let mut result = vec![(start, first)];
-        if last >= first {
-            result.push((last, end));
-        }
-        result
+        vec![(start, boundary), (last * hour, end)]
     };
-    intervals.into_iter().map(|(start,end)|{let diff=|field:&str|if known&&same_hour{Value::from(number(current,field)-number(previous,field))}else{Value::Null};let sample=json!({"database_id":current["database"],"source":"gateway","producer_id":producer(current),"sequence":end,"observed_at":current["observedAt"],"interval_start":iso(start)?,"interval_end":iso(end)?,"expected_producers":expected,"ingress_bytes":diff("ingressBytes"),"egress_bytes":diff("egressBytes"),"connections":diff("totalConnections"),"connection_seconds":if known&&same_hour{json!((number(current,"connectionMilliseconds")-number(previous,"connectionMilliseconds"))as f64/1000.0)}else{Value::Null}});if !schema_valid("UsageSample",&sample){return Err("measurement delta invalid".into());}Ok(sample)}).collect()
+    let window = unchanged_until.map_or(start, |at| at.clamp(start, end - 1));
+    // What each fragment receives of one counter's delta; `None` where it is unknown.
+    let shares = |field: &str| -> Vec<Option<u64>> {
+        if !known {
+            return vec![None; fragments.len()];
+        }
+        let delta = number(current, field) - number(previous, field);
+        match last - first {
+            0 => vec![Some(delta)],
+            1 => {
+                let before = u128::from(boundary.saturating_sub(window));
+                let earlier = u64::try_from(u128::from(delta) * before / u128::from(end - window))
+                    .expect("a share of a delta fits the delta");
+                vec![Some(earlier), Some(delta - earlier)]
+            }
+            _ => vec![None, None],
+        }
+    };
+    let counted = COUNTERS.map(|(_, field)| shares(field));
+    fragments
+        .iter()
+        .enumerate()
+        .map(|(index, &(from, to))| {
+            let value = |counter: usize| counted[counter][index].map_or(Value::Null, Value::from);
+            let sample = json!({
+                "database_id": current["database"],
+                "source": "gateway",
+                "producer_id": producer(current),
+                "sequence": to,
+                "observed_at": current["observedAt"],
+                "interval_start": iso(from)?,
+                "interval_end": iso(to)?,
+                "expected_producers": expected,
+                "ingress_bytes": value(0),
+                "egress_bytes": value(1),
+                "connections": value(2),
+                "connection_seconds": counted[3][index].map_or(Value::Null, seconds),
+            });
+            if !schema_valid("UsageSample", &sample) {
+                return Err("measurement delta invalid".into());
+            }
+            Ok(sample)
+        })
+        .collect()
 }
 /// The storage gauge most recently handed to the outbox, with the UTC hour it was taken in.
 type Gauge = (Option<u64>, Option<u64>, u64);
@@ -1113,19 +1172,13 @@ impl Measurements {
         Ok(())
     }
 }
-/// A known, measured interval in which nothing was counted.
+/// A known, measured interval inside one UTC hour in which nothing was counted. An interval over the
+/// boundary is never held: both of its fragments are emitted so that each hour is complete.
 fn quiet(samples: &[Value]) -> bool {
-    !samples.is_empty()
-        && samples.iter().all(|sample| {
-            [
-                "ingress_bytes",
-                "egress_bytes",
-                "connections",
-                "connection_seconds",
-            ]
+    samples.len() == 1
+        && COUNTERS
             .iter()
-            .all(|field| sample[*field].as_f64() == Some(0.0))
-        })
+            .all(|(field, _)| samples[0][*field].as_f64() == Some(0.0))
 }
 fn advance(
     work: &mut Work,
@@ -1277,6 +1330,9 @@ fn advance(
     // A pod whose counters did not move keeps its last emitted observation as the baseline, so the
     // next sample spans the quiet period instead of one sample per cycle recording nothing.
     let mut held = HashSet::new();
+    // A held pod was seen with unchanged counters at every cycle since its baseline report, the last
+    // one at the time the baseline was sampled.
+    let unchanged_until = millis(&prior["sampledAt"]).ok();
     if let Some(previous) = previous {
         let mut expected = reports.iter().map(producer).collect::<Vec<_>>();
         expected.sort();
@@ -1287,6 +1343,7 @@ fn advance(
                     report,
                     &json!(expected),
                     continuous && ((!had_gap && !gap_detected) || recovered),
+                    unchanged_until,
                 )?;
                 if quiet(&samples) {
                     held.insert(text(report, "pod").to_string());
@@ -1353,7 +1410,7 @@ mod tests {
         }
     }
     #[test]
-    fn authoritative_typescript_counter_deltas_never_distribute_unknown_traffic() {
+    fn authoritative_typescript_counter_deltas_split_known_traffic_pro_rata() {
         for value in vectors()["differences"].as_array().unwrap() {
             assert_eq!(
                 json!(
@@ -1361,7 +1418,8 @@ mod tests {
                         &value["previous"],
                         &value["current"],
                         &value["expected_producers"],
-                        value["continuous"].as_bool().unwrap()
+                        value["continuous"].as_bool().unwrap(),
+                        None
                     )
                     .unwrap()
                 ),
@@ -1508,7 +1566,7 @@ mod tests {
         assert_eq!(work.checkpoint["baseline"]["reports"], json!([report]));
     }
     #[test]
-    fn a_quiet_interval_across_the_hour_closes_as_unknown_fragments() {
+    fn a_quiet_interval_across_the_hour_closes_as_two_known_zero_fragments() {
         let (mut work, snapshot) = quiet_work();
         let report = observed(&work, 3_605_000, 0);
         advance(
@@ -1526,7 +1584,84 @@ mod tests {
         assert_eq!(samples[0]["interval_end"], iso(3_600_000).unwrap());
         assert_eq!(samples[1]["interval_start"], iso(3_600_000).unwrap());
         assert_eq!(samples[1]["interval_end"], iso(3_605_000).unwrap());
-        assert!(samples.iter().all(|s| s["ingress_bytes"].is_null()));
+        for sample in &samples {
+            for field in [
+                "ingress_bytes",
+                "egress_bytes",
+                "connections",
+                "connection_seconds",
+            ] {
+                assert_eq!(sample[field], 0, "{field}");
+            }
+        }
+        // Closing the span moves the baseline, so the hour that ended is complete.
+        assert_eq!(work.checkpoint["baseline"]["reports"], json!([report]));
+    }
+    #[test]
+    fn traffic_over_the_hour_is_split_pro_rata_and_moves_the_baseline() {
+        let (mut work, snapshot) = quiet_work();
+        let first = observed(&work, 3_590_000, 10);
+        advance(
+            &mut work,
+            &[first],
+            &snapshot,
+            None,
+            "agent_test",
+            3_590_000,
+        )
+        .unwrap();
+        // Ten of the fifteen seconds since the last observation lie before the boundary.
+        let report = observed(&work, 3_605_000, 30);
+        advance(
+            &mut work,
+            std::slice::from_ref(&report),
+            &snapshot,
+            None,
+            "agent_test",
+            3_605_000,
+        )
+        .unwrap();
+        let samples = gateway_samples(&work);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0]["ingress_bytes"], 10);
+        assert_eq!(samples[1]["interval_start"], iso(3_590_000).unwrap());
+        assert_eq!(samples[1]["interval_end"], iso(3_600_000).unwrap());
+        assert_eq!(samples[1]["ingress_bytes"], 20);
+        assert_eq!(samples[2]["interval_start"], iso(3_600_000).unwrap());
+        assert_eq!(samples[2]["interval_end"], iso(3_605_000).unwrap());
+        assert_eq!(samples[2]["ingress_bytes"], 10);
+        assert_eq!(work.checkpoint["baseline"]["reports"], json!([report]));
+    }
+    #[test]
+    fn traffic_after_a_held_interval_is_split_over_the_cycle_that_counted_it() {
+        let (mut work, snapshot) = quiet_work();
+        let held = work.checkpoint["baseline"]["reports"].clone();
+        for at in [3_560_000, 3_585_000] {
+            let report = observed(&work, at, 0);
+            advance(&mut work, &[report], &snapshot, None, "agent_test", at).unwrap();
+        }
+        assert!(gateway_samples(&work).is_empty());
+        assert_eq!(work.checkpoint["baseline"]["reports"], held);
+        // The counters were last seen unchanged at 3_585_000: the 30 bytes were counted in the 20 s
+        // after it, fifteen of them before the boundary, not spread over the whole held hour.
+        let report = observed(&work, 3_605_000, 30);
+        advance(
+            &mut work,
+            std::slice::from_ref(&report),
+            &snapshot,
+            None,
+            "agent_test",
+            3_605_000,
+        )
+        .unwrap();
+        let samples = gateway_samples(&work);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["interval_start"], iso(115000).unwrap());
+        assert_eq!(samples[0]["interval_end"], iso(3_600_000).unwrap());
+        assert_eq!(samples[0]["ingress_bytes"], 22);
+        assert_eq!(samples[1]["interval_start"], iso(3_600_000).unwrap());
+        assert_eq!(samples[1]["interval_end"], iso(3_605_000).unwrap());
+        assert_eq!(samples[1]["ingress_bytes"], 8);
         assert_eq!(work.checkpoint["baseline"]["reports"], json!([report]));
     }
     #[test]

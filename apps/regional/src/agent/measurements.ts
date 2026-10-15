@@ -478,6 +478,15 @@ function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
       : { gapSince: value.gapSince as string }),
   };
 }
+/**
+ * The traffic between two observations of one gateway counter run. A sample never crosses a UTC
+ * hour, so a span that touches two adjacent hours is two fragments. A known delta is split between
+ * them pro rata by elapsed time in exact integer arithmetic: the earlier fragment takes the floor of
+ * its share and the later one the remainder, so the parts always add up to the measured delta. The
+ * timing error is bounded by the span, one measurement interval. A restart, counter reset,
+ * inventory change or incomplete report is unknown in every fragment, and so is a span over more
+ * than two hours: the hours in between have no fragment to receive a share.
+ */
 function differences(
   previous: GatewayActivityReport,
   current: GatewayActivityReport,
@@ -504,18 +513,29 @@ function differences(
         current[field] !== null &&
         current[field]! >= previous[field]!,
     );
-  const sameHour =
-    Math.floor(start / USAGE_HOUR_MS) === Math.floor((end - 1) / USAGE_HOUR_MS);
-  const intervals: { start: number; end: number }[] = [];
-  if (sameHour) intervals.push({ start, end });
-  else {
-    // Only null coverage fragments are split; traffic is never distributed across an unknown hour boundary.
-    const firstEnd = (Math.floor(start / USAGE_HOUR_MS) + 1) * USAGE_HOUR_MS;
-    intervals.push({ start, end: firstEnd });
-    const lastStart = Math.floor((end - 1) / USAGE_HOUR_MS) * USAGE_HOUR_MS;
-    if (lastStart >= firstEnd) intervals.push({ start: lastStart, end });
-  }
-  return intervals.map((interval) =>
+  const firstHour = Math.floor(start / USAGE_HOUR_MS),
+    lastHour = Math.floor((end - 1) / USAGE_HOUR_MS);
+  const boundary = (firstHour + 1) * USAGE_HOUR_MS;
+  const intervals =
+    firstHour === lastHour
+      ? [{ start, end }]
+      : [
+          { start, end: boundary },
+          { start: lastHour * USAGE_HOUR_MS, end },
+        ];
+  /** The share of each fragment of one counter's delta, or null where it is unknown. */
+  const shares = (field: (typeof fields)[number]): (number | null)[] => {
+    if (!known) return intervals.map(() => null);
+    const delta = current[field]! - previous[field]!;
+    if (intervals.length === 1) return [delta];
+    if (lastHour !== firstHour + 1) return [null, null];
+    const earlier = Number(
+      (BigInt(delta) * BigInt(boundary - start)) / BigInt(end - start),
+    );
+    return [earlier, delta - earlier];
+  };
+  const [ingress, egress, connections, milliseconds] = fields.map(shares);
+  return intervals.map((interval, index) =>
     UsageSample.parse({
       database_id: current.database,
       source: "gateway",
@@ -525,22 +545,11 @@ function differences(
       interval_start: new Date(interval.start).toISOString(),
       interval_end: new Date(interval.end).toISOString(),
       expected_producers: expected,
-      ingress_bytes:
-        known && sameHour
-          ? current.ingressBytes! - previous.ingressBytes!
-          : null,
-      egress_bytes:
-        known && sameHour ? current.egressBytes! - previous.egressBytes! : null,
-      connections:
-        known && sameHour
-          ? current.totalConnections! - previous.totalConnections!
-          : null,
+      ingress_bytes: ingress![index],
+      egress_bytes: egress![index],
+      connections: connections![index],
       connection_seconds:
-        known && sameHour
-          ? (current.connectionMilliseconds! -
-              previous.connectionMilliseconds!) /
-            1000
-          : null,
+        milliseconds![index] === null ? null : milliseconds![index]! / 1000,
     }),
   );
 }

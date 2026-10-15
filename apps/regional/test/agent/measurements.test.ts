@@ -7,6 +7,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { AgentApi } from "../../src/agent/api-client.ts";
 import {
   measurementBatches,
+  measurementDifferences,
   volumeUsedBytes,
 } from "../../src/agent/measurements.ts";
 import { newDatabaseId } from "@pgcf/contracts";
@@ -513,7 +514,7 @@ test("counter epoch changes produce a coverage gap and never subtract across pro
   );
 });
 
-test("UTC hour straddles remain null fragments and never allocate traffic proportionally", async () => {
+test("a UTC hour straddle splits the measured delta pro rata between its two hour fragments", async () => {
   const state = await setup();
   const hour = Math.floor(state.now() / 3600000) * 3600000;
   state.clock(hour + 3599000);
@@ -525,16 +526,201 @@ test("UTC hour straddles remain null fragments and never allocate traffic propor
   const samples = state.usages
     .at(-1)!
     .samples.filter((value) => value.source === "gateway");
+  // Two respondents, each with one fragment in the hour that ended and one in the next.
   assert.equal(samples.length, 4);
   for (const sample of samples) {
-    assert.equal(sample.ingress_bytes, null);
-    assert.equal(sample.egress_bytes, null);
-    if (sample.source === "gateway")
-      assert.equal(
-        Math.floor(Date.parse(sample.interval_start) / 3600000),
-        Math.floor((Date.parse(sample.interval_end) - 1) / 3600000),
-      );
+    assert.equal(sample.source, "gateway");
+    if (sample.source !== "gateway") continue;
+    assert.equal(
+      Math.floor(Date.parse(sample.interval_start) / 3600000),
+      Math.floor((Date.parse(sample.interval_end) - 1) / 3600000),
+    );
+    // One second of the fifteen falls before the boundary: floor(25/15) and floor(50/15).
+    const earlier = Date.parse(sample.interval_end) === hour + 3600000;
+    assert.equal(sample.ingress_bytes, earlier ? 1 : 24);
+    assert.equal(sample.egress_bytes, earlier ? 3 : 47);
+    assert.equal(sample.connections, 0);
+    assert.equal(sample.connection_seconds, 0);
   }
+});
+
+const boundary = Date.parse("2026-03-01T12:00:00.000Z");
+function counted(
+  observed: number,
+  counters: {
+    ingress: number;
+    egress: number;
+    connections: number;
+    ms: number;
+  },
+  change: Partial<GatewayActivityReport> = {},
+): GatewayActivityReport {
+  const at = (value: number) => new Date(value).toISOString();
+  return {
+    region: "eu-test",
+    database: "aaaaaaaaaaaaaaaaaaaa",
+    revision: 1,
+    pod: "01234567-89ab-4def-8123-000000000001",
+    processEpoch: "01234567-89ab-4def-8123-000000000002",
+    epoch: "01234567-89ab-4def-8123-000000000003",
+    startedAt: at(boundary - 7200000),
+    counterStartedAt: at(boundary - 7200000),
+    observedAt: at(observed),
+    history: "complete",
+    countersSince: at(boundary - 7200000),
+    ingressBytes: counters.ingress,
+    egressBytes: counters.egress,
+    totalConnections: counters.connections,
+    connectionMilliseconds: counters.ms,
+    connections: 0,
+    authenticatedConnections: 0,
+    busyConnections: 0,
+    pendingDials: 0,
+    lastActivityAt: at(boundary - 7200000),
+    ...change,
+  };
+}
+const gatewayFragments = (
+  previous: GatewayActivityReport,
+  current: GatewayActivityReport,
+  continuous = true,
+) =>
+  measurementDifferences(
+    previous,
+    current,
+    [`gw_${current.pod}_${current.processEpoch}_${current.epoch}`],
+    continuous,
+  ).map((sample) => {
+    assert.equal(sample.source, "gateway");
+    if (sample.source !== "gateway") throw new Error("fixture");
+    return {
+      from: Date.parse(sample.interval_start) - boundary,
+      to: Date.parse(sample.interval_end) - boundary,
+      ingress: sample.ingress_bytes,
+      egress: sample.egress_bytes,
+      connections: sample.connections,
+      seconds: sample.connection_seconds,
+    };
+  });
+
+test("1000 egress bytes counted between 11:59:50 and 12:00:05 land 666 before and 334 after the boundary", () => {
+  const fragments = gatewayFragments(
+    counted(boundary - 10_000, {
+      ingress: 100,
+      egress: 200,
+      connections: 4,
+      ms: 3000,
+    }),
+    counted(boundary + 5_000, {
+      ingress: 150,
+      egress: 1200,
+      connections: 5,
+      ms: 3500,
+    }),
+  );
+  assert.deepEqual(fragments, [
+    {
+      from: -10_000,
+      to: 0,
+      ingress: 33,
+      egress: 666,
+      connections: 0,
+      seconds: 0.333,
+    },
+    {
+      from: 0,
+      to: 5_000,
+      ingress: 17,
+      egress: 334,
+      connections: 1,
+      seconds: 0.167,
+    },
+  ]);
+});
+
+test("a quiet interval over the boundary is two known zero fragments, never unknown", () => {
+  const same = { ingress: 7, egress: 9, connections: 2, ms: 4000 };
+  assert.deepEqual(
+    gatewayFragments(
+      counted(boundary - 10_000, same),
+      counted(boundary + 5_000, same),
+    ),
+    [
+      {
+        from: -10_000,
+        to: 0,
+        ingress: 0,
+        egress: 0,
+        connections: 0,
+        seconds: 0,
+      },
+      { from: 0, to: 5_000, ingress: 0, egress: 0, connections: 0, seconds: 0 },
+    ],
+  );
+});
+
+test("a delta stays unknown when the span over the boundary is not one continuous counter run", () => {
+  const before = { ingress: 100, egress: 200, connections: 4, ms: 3000 },
+    after = { ingress: 150, egress: 300, connections: 5, ms: 3500 };
+  const unknown = (from: number, to: number) => ({
+    from,
+    to,
+    ingress: null,
+    egress: null,
+    connections: null,
+    seconds: null,
+  });
+  const previous = counted(boundary - 10_000, before);
+  // A restart, a reset counter, a changed inventory and an incomplete history are each unknown.
+  assert.deepEqual(
+    gatewayFragments(
+      previous,
+      counted(boundary + 5_000, after, {
+        processEpoch: "01234567-89ab-4def-8123-000000000004",
+      }),
+    ),
+    [unknown(-10_000, 0), unknown(0, 5_000)],
+  );
+  assert.deepEqual(
+    gatewayFragments(
+      previous,
+      counted(boundary + 5_000, { ...after, ingress: 99 }),
+    ),
+    [unknown(-10_000, 0), unknown(0, 5_000)],
+  );
+  assert.deepEqual(
+    gatewayFragments(previous, counted(boundary + 5_000, after), false),
+    [unknown(-10_000, 0), unknown(0, 5_000)],
+  );
+  assert.deepEqual(
+    gatewayFragments(
+      previous,
+      counted(boundary + 5_000, after, {
+        history: "partial",
+        lastActivityAt: null,
+      }),
+    ),
+    [unknown(-10_000, 0), unknown(0, 5_000)],
+  );
+  // Hours between the two ends have no fragment, so a span over two boundaries cannot be split.
+  assert.deepEqual(
+    gatewayFragments(previous, counted(boundary + 7_205_000, after)),
+    [unknown(-10_000, 0), unknown(7_200_000, 7_205_000)],
+  );
+});
+
+test("a split is exact in integer arithmetic for counters whose product exceeds 2^53", () => {
+  const huge = Number.MAX_SAFE_INTEGER,
+    none = { egress: 0, connections: 0, ms: 0 };
+  // Two of three milliseconds fall before the boundary. Floating point rounds up to ...661 here.
+  assert.equal(Math.floor((huge * 2) / 3), 6004799503160661);
+  const [earlier, later] = gatewayFragments(
+    counted(boundary - 2, { ingress: 0, ...none }),
+    counted(boundary + 1, { ingress: huge, ...none }),
+  );
+  assert.equal(earlier!.ingress, 6004799503160660);
+  assert.equal(later!.ingress, 3002399751580331);
+  assert.equal(earlier!.ingress! + later!.ingress!, huge);
 });
 
 test("active SQL and pending dials are forwarded as busy evidence, even for idle-open connections", async () => {

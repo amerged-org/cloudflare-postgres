@@ -447,6 +447,98 @@ describe("hourly usage", () => {
     expect(actual).toEqual(expected);
     expect(actual.gaps).not.toContain("traffic_coverage");
   });
+  it("books a counter delta split over a UTC hour boundary into both hourly rows without a coverage gap", async () => {
+    const f = await setup();
+    await env.DB.batch([f.event("created", 0), f.event("ready", 0)]);
+    const full = f.sample();
+    if (full.source !== "gateway") throw new Error("fixture");
+    const principal = { region_id: f.region, source: "gateway" as const };
+    // The gateway counted 1000 egress bytes between 00:59:50 and 01:00:05; ten of the fifteen
+    // seconds lie before the boundary, so its fragments carry 666 and 334 bytes.
+    const hour = USAGE_HOUR_MS,
+      fragments = [
+        { from: 0, to: hour - 10_000, egress: 0 },
+        { from: hour - 10_000, to: hour, egress: 666 },
+        { from: hour, to: hour + 5_000, egress: 334 },
+        { from: hour + 5_000, to: 2 * hour, egress: 0 },
+      ];
+    for (const part of fragments)
+      expect(
+        await recordUsageSample(
+          env.DB,
+          principal,
+          {
+            ...full,
+            sequence: epoch + part.to,
+            interval_start: iso(epoch + part.from),
+            interval_end: iso(epoch + part.to),
+            observed_at: iso(epoch + Math.max(part.to, hour + 5_000)),
+            egress_bytes: part.egress,
+          },
+          epoch + 2 * hour,
+        ),
+      ).toBe("recorded");
+    const first = await rollupUsageHour(env.DB, f.id, epoch, epoch + 2 * hour),
+      second = await rollupUsageHour(
+        env.DB,
+        f.id,
+        epoch + hour,
+        epoch + 2 * hour,
+      );
+    for (const [row, egress] of [
+      [first, 666],
+      [second, 334],
+    ] as const) {
+      expect(row.metrics).toMatchObject({
+        ingress_bytes: 0,
+        egress_bytes: egress,
+        connections: 0,
+        connection_seconds: 0,
+      });
+      expect(row.gaps).not.toContain("traffic_coverage");
+      expect(row.gaps).not.toContain("egress_bytes");
+    }
+    expect(first.metrics.egress_bytes! + second.metrics.egress_bytes!).toBe(
+      1000,
+    );
+    // The integrator reads the same numbers, and a final row stays as it was computed.
+    const final = epoch + 4 * hour;
+    await rollupUsageHour(env.DB, f.id, epoch, final);
+    await rollupUsageHour(env.DB, f.id, epoch + hour, final);
+    const history = await (
+      await getUsage(f.integrator, {
+        database_id: f.id,
+        from: iso(epoch),
+        to: iso(epoch + 2 * hour),
+        granularity: "hour",
+      })
+    ).json<{
+      data: { final: boolean; metrics: { egress_bytes: number | null } }[];
+    }>();
+    expect(
+      history.data.map((row) => [row.final, row.metrics.egress_bytes]),
+    ).toEqual([
+      [true, 666],
+      [true, 334],
+    ]);
+    await expect(
+      recordUsageSample(
+        env.DB,
+        principal,
+        {
+          ...full,
+          producer_id: "gateway_b",
+          expected_producers: ["gateway_b"],
+          sequence: 1,
+          egress_bytes: 5,
+        },
+        final,
+      ),
+    ).rejects.toThrow("finalized");
+    expect(
+      (await rollupUsageHour(env.DB, f.id, epoch, final)).metrics.egress_bytes,
+    ).toBe(666);
+  });
   it("accepts a producer's span after a long silence without consecutive sequences", async () => {
     const f = await setup();
     await env.DB.batch([f.event("created", 0), f.event("ready", 0)]);
