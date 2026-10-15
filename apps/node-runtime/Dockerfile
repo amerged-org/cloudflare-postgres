@@ -17,6 +17,8 @@ COPY apps/sandbox-controller/ apps/sandbox-controller/
 COPY apps/native-gateway/ apps/native-gateway/
 COPY packages/native-protocol/ packages/native-protocol/
 COPY packages/contracts/native/ packages/contracts/native/
+# A sandbox-controller test pins its LVM binary hash to the qualified storage source lock.
+COPY infra/storage/sources.lock.json infra/storage/sources.lock.json
 COPY LICENSE /licenses/pgcf/LICENSE
 RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && cargo fmt --all -- --check \
