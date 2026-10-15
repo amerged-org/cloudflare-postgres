@@ -1015,3 +1015,283 @@ async fn a_database_without_an_origin_operation_still_has_its_new_target_publish
     assert_eq!(again["runtime_attestation"]["admission_epoch"], 2);
     assert_eq!(admission_target(&w)["admission_epoch"], 2);
 }
+
+/// A database that completed its wake: its fence is running, its target published, its proof the
+/// watch holds. The observation of that pass comes with it.
+async fn completed() -> (World, Value) {
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let _ = w.watch_delivers();
+    (w, woken)
+}
+/// Holds the requests `gate` matches until a group of them is issued together, and says how many
+/// groups it let go and how many requests gave up waiting for one.
+fn hold(w: &World, gate: Gate) {
+    w.server.state.lock().unwrap().gate = Some(gate);
+}
+fn held(w: &World) -> (usize, usize) {
+    let gate = w.server.state.lock().unwrap().gate.take().unwrap();
+    (gate.rounds, gate.gave_up)
+}
+fn primary(w: &World) -> String {
+    path("Pod", Some(&w.ns), "database-1")
+}
+fn fence_path(w: &World) -> String {
+    path(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+    )
+}
+fn storage_path(w: &World) -> String {
+    path("ConfigMap", Some(SYSTEM), &format!("storage-{}", w.id))
+}
+fn cluster_object(w: &World) -> String {
+    path("Cluster", Some(&w.ns), "database")
+}
+
+#[tokio::test]
+async fn a_pass_reads_the_identity_of_the_cluster_with_the_fence_it_looks_at_next() {
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let cluster = path("Namespace", None, "kube-system");
+    let fence = fence_path(&w);
+    hold(
+        &w,
+        Gate::new(2, move |method, at| {
+            method == "GET" && (at == cluster || at == fence)
+        })
+        .once(),
+    );
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn a_pass_reads_what_it_needs_of_the_database_together_before_it_judges_any() {
+    // The Node, the marker of a deletion, the namespace, the receipt and the Cluster of the
+    // database: none depends on another, and the pass judges them in the order it always did.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let wanted = [
+        path("Node", None, NODE),
+        path("ConfigMap", Some(SYSTEM), &format!("delete-{}", w.id)),
+        path("Namespace", None, &w.ns),
+        storage_path(&w),
+        cluster_object(&w),
+    ];
+    hold(
+        &w,
+        Gate::new(5, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .once(),
+    );
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_release_proves_the_anchor_and_reads_the_fence_together() {
+    let (w, woken) = completed().await;
+    let intent = serde_json::to_value(desired_power(&w.db).unwrap().unwrap()).unwrap();
+    // The anchor (namespace, Cluster, receipt) and the fence with its receipt: five reads.
+    let wanted = [
+        path("Namespace", None, &w.ns),
+        cluster_object(&w),
+        storage_path(&w),
+        fence_path(&w),
+    ];
+    hold(
+        &w,
+        Gate::new(5, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .once(),
+    );
+    let released = w
+        .reconciler
+        .power
+        .finish_running(&w.db, woken, Some(&intent))
+        .await
+        .unwrap()
+        .expect("released");
+    assert_eq!(released["state"], "ready");
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_release_binds_the_fence_while_it_reads_the_gateways() {
+    let (w, woken) = completed().await;
+    let intent = serde_json::to_value(desired_power(&w.db).unwrap().unwrap()).unwrap();
+    // The anchor and the fence read the receipt twice; then the receipt, the gateway Pods and the
+    // keyring are read for the binding and the snapshot.
+    let wanted = [
+        storage_path(&w),
+        format!("/api/v1/namespaces/{SYSTEM}/pods"),
+        path("Secret", Some(SYSTEM), "pgcf-gateway"),
+    ];
+    hold(
+        &w,
+        Gate::new(3, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .after(2)
+        .once(),
+    );
+    let released = w
+        .reconciler
+        .power
+        .finish_running(&w.db, woken, Some(&intent))
+        .await
+        .unwrap()
+        .expect("released");
+    assert_eq!(released["state"], "ready");
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_archive_probe_reads_the_bindings_it_checks_together() {
+    let (w, _) = completed().await;
+    let cluster = w.server.get("Cluster", Some(&w.ns), "database").unwrap();
+    let pod = w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
+    // The credential is read first and again after the questions, with the Cluster, the Pod and
+    // the receipt the health of the archive is recorded in.
+    let wanted = [
+        path("Secret", Some(&w.ns), "maintenance-credentials"),
+        cluster_object(&w),
+        primary(&w),
+        storage_path(&w),
+    ];
+    hold(
+        &w,
+        Gate::new(4, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .after(1)
+        .once(),
+    );
+    let probed = w
+        .reconciler
+        .archive(
+            &w.db,
+            &cluster,
+            &pod,
+            w.authority.pem.as_bytes(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(probed.pod["metadata"]["uid"], pod["metadata"]["uid"]);
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_volume_is_bound_while_the_receipt_is_read() {
+    let (w, _) = completed().await;
+    let cluster = w.server.get("Cluster", Some(&w.ns), "database").unwrap();
+    let pod = w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
+    let receipt = w
+        .server
+        .get("ConfigMap", Some(SYSTEM), &format!("storage-{}", w.id))
+        .unwrap();
+    let stored = state(&receipt).unwrap();
+    let wanted = [
+        path("PersistentVolumeClaim", Some(&w.ns), "database-1"),
+        storage_path(&w),
+    ];
+    hold(
+        &w,
+        Gate::new(2, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .once(),
+    );
+    let identity = w
+        .reconciler
+        .bind_volume(&w.db, &cluster, &pod, &Value::Null, &stored)
+        .await
+        .unwrap();
+    assert!(identity.is_some());
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_runtime_label_is_checked_while_the_primary_is_read() {
+    let (w, _) = completed().await;
+    let cluster = w.server.get("Cluster", Some(&w.ns), "database").unwrap();
+    let context = w
+        .reconciler
+        .context(&w.db, &w.snapshot, false)
+        .await
+        .unwrap();
+    let wanted = [path("Namespace", None, &w.ns), primary(&w)];
+    hold(
+        &w,
+        Gate::new(2, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .once(),
+    );
+    let selected = w
+        .reconciler
+        .runtime_selected(&w.db, &context, &json!(namespace_uid()), &cluster)
+        .await
+        .unwrap();
+    assert!(selected);
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_authority_is_read_while_its_published_copy_is() {
+    let (w, _) = completed().await;
+    let cluster = w.server.get("Cluster", Some(&w.ns), "database").unwrap();
+    let wanted = [
+        path("Secret", Some(&w.ns), "database-ca"),
+        path("ConfigMap", Some(SYSTEM), &format!("ca-{}", w.id)),
+    ];
+    hold(
+        &w,
+        Gate::new(2, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .once(),
+    );
+    let authority = w.reconciler.ca(&w.db, &cluster).await.unwrap();
+    assert!(authority.is_some());
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_resumed_pod_is_read_while_the_wake_is_recorded() {
+    // The record of the wake is written before the Cluster is, and the Pod's restarts are read
+    // before the fence is lifted: neither waits for the other.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let fence = fence_path(&w);
+    let pod = primary(&w);
+    hold(
+        &w,
+        Gate::new(2, move |method, at| {
+            (method == "GET" && at == pod) || (method == "PATCH" && at == fence)
+        })
+        .after(1)
+        .once(),
+    );
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(held(&w), (1, 0));
+}

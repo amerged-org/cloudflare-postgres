@@ -2507,8 +2507,7 @@ impl PowerCoordinator {
             desired_power(db)?.ok_or("wake intent missing")?
         };
         let result = tokio::time::timeout(Duration::from_secs(10), async {
-            let (physical, cluster) = self.anchor(db).await?;
-            let map = self.fence(db).await?;
+            let ((physical, cluster), map) = tokio::try_join!(self.anchor(db), self.fence(db))?;
             let prior = map
                 .as_ref()
                 .map(|m| progress_from(m, self.now()))
@@ -2532,8 +2531,11 @@ impl PowerCoordinator {
             let current = self
                 .write(db, map.as_ref(), Some(&intent), &progress)
                 .await?;
-            self.bind_fence(db, &current).await?;
-            let snapshot = self.snapshot().await?;
+            // The binding may write the receipt: both are awaited, so that no write is dropped
+            // half sent when the other fails.
+            let (bound, snapshot) = tokio::join!(self.bind_fence(db, &current), self.snapshot());
+            bound?;
+            let snapshot = snapshot?;
             self.controls(&intent, &snapshot, "release").await?;
             // Every gateway has acknowledged the release. The read-back that the gateways and
             // the fence are still what they were released under, and the publication of the

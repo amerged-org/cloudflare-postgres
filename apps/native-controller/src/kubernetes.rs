@@ -1209,10 +1209,12 @@ impl Kubernetes {
         Ok(String::from_utf8_lossy(&bounded(response, 2 * 1024 * 1024).await?).into_owned())
     }
     pub async fn assert_cluster(&self, uid: &str) -> Result<(), Error> {
-        let cluster = self
-            .read("Namespace", None, "kube-system")
-            .await?
-            .ok_or("cluster identity missing")?;
+        let cluster = self.read("Namespace", None, "kube-system").await?;
+        Self::cluster_is(cluster.as_ref(), uid)
+    }
+    /// Whether `kube_system`, the namespace the identity of a cluster is, is the cluster `uid`.
+    pub fn cluster_is(kube_system: Option<&Value>, uid: &str) -> Result<(), Error> {
+        let cluster = kube_system.ok_or("cluster identity missing")?;
         if uid.is_empty() || text(&cluster["metadata"], "uid") != uid {
             return Err("cluster identity changed".into());
         }

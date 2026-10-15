@@ -1090,13 +1090,17 @@ impl PowerCoordinator {
         // releases hibernation while the Pod's requests return.
         let started = Instant::now();
         let progress = self.wake_progress(&prior, intent);
-        let map = self.write(db, Some(&map), None, &progress).await?;
+        // The record of the wake is written before the Cluster is, and the Pod's restarts are read
+        // before the fence is lifted: neither waits for the other.
+        let ns = namespace(db);
+        let (written, pod) = tokio::join!(
+            self.write(db, Some(&map), None, &progress),
+            self.k8s.read("Pod", Some(&ns), &park.pod_name)
+        );
+        let map = written?;
+        let pod = pod?;
         let lift = timing::Phase::begin(db, "unfence_patch");
         let mut resize = timing::Phase::begin(db, "resize_up");
-        let pod = self
-            .k8s
-            .read("Pod", Some(&namespace(db)), &park.pod_name)
-            .await?;
         let postgres_restarts = pod
             .as_ref()
             .and_then(|pod| named(&pod["status"]["containerStatuses"], POSTGRES))

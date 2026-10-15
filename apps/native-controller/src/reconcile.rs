@@ -641,15 +641,16 @@ impl Reconciler {
         authority: &Value,
         stored: &Value,
     ) -> Result<Option<Value>, Error> {
-        let Some(identity) = self.volume(db, cluster, pod, authority).await? else {
+        let name = format!("storage-{}", text(db, "id"));
+        // The volume is derived while the receipt it is recorded in is read.
+        let (identity, current) = tokio::try_join!(
+            self.volume(db, cluster, pod, authority),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &name)
+        )?;
+        let Some(identity) = identity else {
             return Ok(None);
         };
-        let name = format!("storage-{}", text(db, "id"));
-        let current = self
-            .k8s
-            .read("ConfigMap", Some(SYSTEM), &name)
-            .await?
-            .ok_or("storage receipt disappeared")?;
+        let current = current.ok_or("storage receipt disappeared")?;
         owned(&current, db, &name, Some(SYSTEM))?;
         if state(&current)? != *stored {
             return Err("storage receipt changed before physical binding".into());
@@ -829,11 +830,7 @@ impl Reconciler {
                 let failed=row.try_get::<_,String>("failed_count")?.parse::<u64>()?;
                 if [count,archived,failed].iter().any(|n|*n>9_007_199_254_740_991){return Err("archive SQL count invalid".into());}
                 let source=format!("cnpg_collector_pg_wal_archive_status{{value=\"ready\"}} {count}\ncnpg_pg_stat_archiver_archived_count {archived}\ncnpg_pg_stat_archiver_last_archived_time {time}");
-                let sample=health::metrics(&source,now)?;
-                let secret=maintenance.as_ref().ok_or("archive secret missing")?;
-                let fresh=self.k8s.read("Secret",Some(&ns),"maintenance-credentials").await?.ok_or("archive secret disappeared")?;
-                if fresh["metadata"]["uid"]!=secret["metadata"]["uid"]||fresh["metadata"]["resourceVersion"]!=secret["metadata"]["resourceVersion"]{return Err("archive secret changed during probe".into());}
-                Ok(sample)
+                health::metrics(&source,now)
             }.await;
             result.ok()
         } else {
@@ -864,11 +861,34 @@ impl Reconciler {
             .await;
             result.ok()
         };
-        let (fresh_cluster, fresh_pod) = tokio::try_join!(
+        // What the probe is bound to is read again together after it: the credential it logged in
+        // with (a changed one makes the sample none), the Cluster, the Pod and the receipt the
+        // health of the archive is recorded in.
+        let storage_name = format!("storage-{}", text(db, "id"));
+        let (fresh_secret, fresh_cluster, fresh_pod, receipt) = tokio::join!(
+            async {
+                if sql_eligible {
+                    self.k8s
+                        .read("Secret", Some(&ns), "maintenance-credentials")
+                        .await
+                } else {
+                    Ok(None)
+                }
+            },
             self.k8s.read("Cluster", Some(&ns), "database"),
             self.k8s
-                .read("Pod", Some(&ns), text(&pod["metadata"], "name"))
-        )?;
+                .read("Pod", Some(&ns), text(&pod["metadata"], "name")),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &storage_name),
+        );
+        let sample = if sql_eligible {
+            let unchanged = matches!((&maintenance, &fresh_secret), (Some(secret), Ok(Some(fresh)))
+                if fresh["metadata"]["uid"] == secret["metadata"]["uid"]
+                    && fresh["metadata"]["resourceVersion"] == secret["metadata"]["resourceVersion"]);
+            sample.filter(|_| unchanged)
+        } else {
+            sample
+        };
+        let (fresh_cluster, fresh_pod) = (fresh_cluster?, fresh_pod?);
         let fresh_cluster = fresh_cluster.ok_or("archive Cluster disappeared")?;
         let fresh_pod = fresh_pod.ok_or("archive primary disappeared")?;
         if fresh_cluster["metadata"]["uid"] != cluster["metadata"]["uid"]
@@ -884,7 +904,7 @@ impl Reconciler {
             return Err("archive binding changed during probe".into());
         }
         let (archive, alarm) =
-            health::archive_health(&self.k8s, db, &fresh_cluster, sample).await?;
+            health::archive_health(&self.k8s, db, &fresh_cluster, sample, receipt?).await?;
         Ok(Probed {
             archive,
             alarm,
@@ -1023,12 +1043,23 @@ impl Reconciler {
                 text(&pool["profile"], "release_id")
             )
         };
-        self.runtime_label(db, context, namespace_uid).await?;
         let primary = text(&cluster["status"], "currentPrimary");
+        // The label is checked (and written, if it differs) while the primary is read: the
+        // Pod does not depend on the label of its namespace.
+        let (labelled, pod) = tokio::join!(self.runtime_label(db, context, namespace_uid), async {
+            if dns_label(primary) {
+                self.k8s.read("Pod", Some(&ns), primary).await
+            } else {
+                Ok(None)
+            }
+        });
+        // Both were awaited, so that the write of the label is not dropped half sent.
+        labelled?;
+        let pod = pod?;
         if !dns_label(primary) {
             return Ok(false);
         }
-        let Some(pod) = self.k8s.read("Pod", Some(&ns), primary).await? else {
+        let Some(pod) = pod else {
             return Ok(false);
         };
         if text(&pod["metadata"], "uid").is_empty()
@@ -1201,10 +1232,17 @@ impl Reconciler {
         // Absence of the desired pool branch means CF selected ordinary CNPG. Retained
         // local records must still be verified/handed back before the normal wake path.
         let state_name = text(db, "desired_state");
+        let id = text(db, "id");
         // The identity of the cluster is read once by a pass: everything the pass goes on to
-        // read, it reads from this cluster.
-        self.k8s.assert_cluster(&self.cluster_uid).await?;
-        if !self.ensure_pool_handoff(db).await? {
+        // read, it reads from this cluster. It is read together with the fence the pass looks
+        // at next, and judged first.
+        let gateway_fence = format!("gateway-fence-{id}");
+        let (kube_system, handoff) = tokio::try_join!(
+            self.k8s.read("Namespace", None, "kube-system"),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &gateway_fence),
+        )?;
+        Kubernetes::cluster_is(kube_system.as_ref(), &self.cluster_uid)?;
+        if !self.pool_handoff(db, handoff).await? {
             return Ok(None);
         }
         if state_name == "deleted" {
@@ -1213,39 +1251,37 @@ impl Reconciler {
                 .delete_database(db, &snapshot.region["storage_nodes"])
                 .await;
         }
-        let (authority, node_observed) =
-            match self.guard(db, snapshot, state_name == "running").await {
-                Ok(value) => value,
-                Err(error) if error.downcast_ref::<ExpiredStorageSnapshot>().is_some() => {
-                    return Err(error);
+        let ns = namespace(db);
+        let fence_name = format!("storage-{id}");
+        // What the pass needs to know of the database is read together: the Node and the host
+        // authority it stands on, the marker of a deletion, its namespace, its receipt and its
+        // Cluster. None depends on another, and they are judged in the order they always were.
+        let deletion = format!("delete-{id}");
+        let (guarded, retired, ns_read, fence_read, cluster_read) = tokio::join!(
+            self.guard(db, snapshot, state_name == "running"),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &deletion),
+            self.k8s.read("Namespace", None, &ns),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &fence_name),
+            self.k8s.read("Cluster", Some(&ns), "database"),
+        );
+        let (authority, node_observed) = match guarded {
+            Ok(value) => value,
+            Err(error) if error.downcast_ref::<ExpiredStorageSnapshot>().is_some() => {
+                return Err(error);
+            }
+            Err(error) => {
+                if state_name == "running" && !db["storage"].is_null() {
+                    return self.power.protect_storage(db).await;
                 }
-                Err(error) => {
-                    if state_name == "running" && !db["storage"].is_null() {
-                        return self.power.protect_storage(db).await;
-                    }
-                    return Err(error);
-                }
-            };
-        if self
-            .k8s
-            .read(
-                "ConfigMap",
-                Some(SYSTEM),
-                &format!("delete-{}", text(db, "id")),
-            )
-            .await?
-            .is_some()
-        {
+                return Err(error);
+            }
+        };
+        if retired?.is_some() {
             return Err("database deletion is irreversible".into());
         }
-        let ns = namespace(db);
-        let mut ns_current = self.k8s.read("Namespace", None, &ns).await?;
-        let fence_name = format!("storage-{}", text(db, "id"));
-        let mut fence = self
-            .k8s
-            .read("ConfigMap", Some(SYSTEM), &fence_name)
-            .await?;
-        let prior_cluster = self.k8s.read("Cluster", Some(&ns), "database").await?;
+        let mut ns_current = ns_read?;
+        let mut fence = fence_read?;
+        let prior_cluster = cluster_read?;
         for item in [&ns_current, &fence, &prior_cluster].into_iter().flatten() {
             let (name, scope) = if text(item, "kind") == "Namespace" {
                 (ns.as_str(), None)
@@ -2007,7 +2043,13 @@ impl Reconciler {
     }
     async fn ensure_pool_handoff(&self, db: &Value) -> Result<bool, Error> {
         let name = format!("gateway-fence-{}", text(db, "id"));
-        let Some(map) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+        let map = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await?;
+        self.pool_handoff(db, map).await
+    }
+    /// Verifies and hands back what a retained pool holder left in the fence `map` of `db`;
+    /// `false` while that is not complete.
+    async fn pool_handoff(&self, db: &Value, map: Option<Value>) -> Result<bool, Error> {
+        let Some(map) = map else {
             return Ok(true);
         };
         let key = pgcf_native_protocol::pool::constant("binding_record_key")
@@ -2773,11 +2815,13 @@ impl Reconciler {
             return Ok(None);
         }
         let ns = namespace(db);
-        let secret = self
-            .k8s
-            .read("Secret", Some(&ns), name)
-            .await?
-            .ok_or("CNPG CA secret disappeared")?;
+        // The authority is read while the ConfigMap it is published in is.
+        let published_name = format!("ca-{}", text(db, "id"));
+        let (secret, published) = tokio::try_join!(
+            self.k8s.read("Secret", Some(&ns), name),
+            self.k8s.read("ConfigMap", Some(SYSTEM), &published_name)
+        )?;
+        let secret = secret.ok_or("CNPG CA secret disappeared")?;
         if !cluster_owned(&secret, cluster)
             || text(&secret["metadata"], "uid").is_empty()
             || text(&secret["metadata"], "resourceVersion").is_empty()
@@ -2795,7 +2839,7 @@ impl Reconciler {
         if !db["admission"].is_null() {
             manifest["metadata"]["annotations"] = json!({"pgcf.io/source-ca-secret-uid":secret["metadata"]["uid"],"pgcf.io/source-ca-secret-resource-version":secret["metadata"]["resourceVersion"]});
         }
-        self.apply(db, &manifest).await?;
+        self.apply_to(db, &manifest, published).await?;
         Ok(Some((ca, secret)))
     }
     async fn map_recovery(

@@ -35,6 +35,10 @@ const GATE_WAIT: Duration = Duration::from_millis(300);
 pub struct Gate {
     matching: Matching,
     want: usize,
+    /// Matching requests that pass before the gate holds the first.
+    skip: usize,
+    /// The gate stops matching once it let one group go.
+    once: bool,
     waiting: usize,
     generation: u64,
     pub rounds: usize,
@@ -45,11 +49,23 @@ impl Gate {
         Self {
             matching: Box::new(matching),
             want,
+            skip: 0,
+            once: false,
             waiting: 0,
             generation: 0,
             rounds: 0,
             gave_up: 0,
         }
+    }
+    /// Lets the first `requests` matching requests pass before it holds any.
+    pub fn after(mut self, requests: usize) -> Self {
+        self.skip = requests;
+        self
+    }
+    /// Holds one group only: what matches after it is let go goes through.
+    pub fn once(mut self) -> Self {
+        self.once = true;
+        self
     }
 }
 #[derive(Default)]
@@ -464,7 +480,12 @@ impl Server {
                     {
                         let mut state = state.lock().unwrap();
                         if let Some(gate) = state.gate.as_mut()
+                            && !(gate.once && gate.rounds > 0)
                             && (gate.matching)(&method, &path)
+                            && (gate.skip == 0 || {
+                                gate.skip -= 1;
+                                false
+                            })
                         {
                             gate.waiting += 1;
                             if gate.waiting >= gate.want {

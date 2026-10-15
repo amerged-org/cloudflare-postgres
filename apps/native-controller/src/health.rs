@@ -229,18 +229,17 @@ pub fn archive_transition(
         })),
     ))
 }
+/// The health of the archive of `db` from one sample, recorded in its storage receipt `fence` (the
+/// caller read it). `kube` writes the record when it changed.
 pub async fn archive_health(
     kube: &Kubernetes,
     db: &Value,
     cluster: &Value,
     sample: Option<ArchiveSample>,
+    fence: Option<Value>,
 ) -> Result<(Value, bool), Error> {
     let now = now_ms();
-    let name = format!("storage-{}", text(db, "id"));
-    let fence = kube
-        .read("ConfigMap", Some(SYSTEM), &name)
-        .await?
-        .ok_or("archive storage receipt missing")?;
+    let fence = fence.ok_or("archive storage receipt missing")?;
     owned(&fence, db, Some(SYSTEM))?;
     if generation(&fence) != number(db, "generation") {
         return Err("archive storage revision changed".into());
