@@ -8,7 +8,6 @@ ignored local state or a private deployment repository.
 | --- | --- |
 | [talos/](talos/README.md) | Talos patches and the Contabo rescue install path for a node |
 | [platform/](platform/README.md) | Pinned Flux baseline: Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin |
-| [backups/](backups/README.md) | Reference CNPG/Barman resources for R2 backups, full restore and PITR |
 
 Ownership:
 
