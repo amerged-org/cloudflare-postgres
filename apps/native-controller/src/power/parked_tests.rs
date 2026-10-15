@@ -147,7 +147,7 @@ async fn an_idle_sleep_parks_only_after_the_recorded_segment_is_archived() {
     // The closed segment is recorded, but its `.done` is absent: nothing may be fenced.
     assert!(sleep_pass(&w).await.is_none());
     assert_eq!(progress(&w)["phase"], "archive");
-    assert_eq!(progress(&w)["segment"], "000000010000000000000007");
+    assert_eq!(progress(&w)["segment"], "0000000100000000000000A7");
     assert!(annotations(&w)[FENCE].is_null());
     assert!(patches(&w, &cluster_path(&w)).is_empty());
     w.sql.lock().unwrap().archived = true;

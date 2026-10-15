@@ -3,6 +3,14 @@
 //! password and answers extended-protocol queries with canned rows, so the controller's real SQL
 //! runs against a socket. Stopping it closes the listener, which then refuses connections like a
 //! Pod whose postmaster is gone.
+//!
+//! Its cells carry PostgreSQL's own types and wire forms, not the nearest Rust value: a handler
+//! that returns `Text` where PostgreSQL returns `inet` hides the decode the controller really
+//! performs. The forms below were read from PostgreSQL 18.6 of the product image (`\gdesc` and
+//! the text output of every statement the controller issues): `current_database()` is `name`,
+//! `inet_server_addr()` is `inet` whose cast to `text` keeps the netmask (`10.0.0.7/32`) while
+//! `host()` drops it, `EXTRACT(EPOCH ...)::text` is a numeric with six decimals, an LSN and a WAL
+//! file name use upper-case hexadecimal, and `pg_stat_clear_snapshot()` is `void`.
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -15,28 +23,55 @@ use tokio_rustls::TlsAcceptor;
 #[derive(Clone, Debug)]
 pub enum Cell {
     Text(String),
+    /// The `name` type (`current_database()`, `datname`, `pg_get_userbyid()`); text on the wire.
+    Name(String),
     Bool(bool),
     Int4(i32),
     Int8(i64),
+    /// An `inet` value in PostgreSQL's binary form. Only a cast to `text` or `host()` makes it
+    /// text; read as a string it is a `WrongType` error, as with the real server.
+    Inet(String),
+    /// The `void` of `pg_stat_clear_snapshot()`: no bytes.
+    Void,
 }
 impl Cell {
     fn oid(&self) -> i32 {
         match self {
             Self::Text(_) => 25,
+            Self::Name(_) => 19,
             Self::Bool(_) => 16,
             Self::Int4(_) => 23,
             Self::Int8(_) => 20,
+            Self::Inet(_) => 869,
+            Self::Void => 2278,
         }
     }
     fn encode(&self, binary: bool) -> Vec<u8> {
         match (self, binary) {
-            (Self::Text(v), _) => v.as_bytes().to_vec(),
+            (Self::Text(v) | Self::Name(v), _) => v.as_bytes().to_vec(),
             (Self::Bool(v), true) => vec![u8::from(*v)],
             (Self::Bool(v), false) => vec![if *v { b't' } else { b'f' }],
             (Self::Int4(v), true) => v.to_be_bytes().to_vec(),
             (Self::Int4(v), false) => v.to_string().into_bytes(),
             (Self::Int8(v), true) => v.to_be_bytes().to_vec(),
             (Self::Int8(v), false) => v.to_string().into_bytes(),
+            (Self::Void, _) => Vec::new(),
+            (Self::Inet(v), binary) => {
+                let address: std::net::IpAddr = v.parse().expect("an inet cell holds an address");
+                let (family, bits, octets) = match address {
+                    std::net::IpAddr::V4(a) => (2_u8, 32_u8, a.octets().to_vec()),
+                    std::net::IpAddr::V6(a) => (3_u8, 128_u8, a.octets().to_vec()),
+                };
+                if binary {
+                    // `inet_send`: family, bits, is_cidr, address length, address.
+                    let mut out = vec![family, bits, 0, octets.len() as u8];
+                    out.extend(octets);
+                    out
+                } else {
+                    // `inet_out` omits the netmask of a host address.
+                    v.clone().into_bytes()
+                }
+            }
         }
     }
 }

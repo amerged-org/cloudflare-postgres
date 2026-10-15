@@ -1287,7 +1287,7 @@ static POWER_CONTRACT: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| 
     ))
     .expect("generated power constants")
 });
-fn sql(name: &str) -> &'static str {
+pub(crate) fn sql(name: &str) -> &'static str {
     POWER_CONTRACT["constants"]["SLEEP_SQL"][name]
         .as_str()
         .expect("generated SQL")

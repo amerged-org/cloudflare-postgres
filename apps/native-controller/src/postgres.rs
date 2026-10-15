@@ -240,7 +240,12 @@ pub async fn pool_idle(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Err
         text(db, "id"),
     )
     .await?;
-    let rows=session.query("SELECT current_database()::text, current_user::text, inet_server_addr()::text, pg_is_in_recovery(), (SELECT count(*)::text FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()), (SELECT count(*)::text FROM pg_prepared_xacts)",&[]).await?;
+    idle_on(&session, db, role, text(scope, "pool_pod_ip")).await
+}
+/// Whether the PostgreSQL behind `session` is the database's primary at `address`, has no client
+/// backend besides the session and holds no prepared transaction.
+async fn idle_on(session: &Session, db: &Value, role: &str, address: &str) -> Result<bool, Error> {
+    let rows = session.query(IDLE_QUERY, &[]).await?;
     if rows.len() != 1 {
         return Ok(false);
     }
@@ -248,7 +253,7 @@ pub async fn pool_idle(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Err
     Ok(probe_identity_current(
         text(db, "id"),
         &row.try_get::<_, String>(0)?,
-        text(scope, "pool_pod_ip"),
+        address,
         &row.try_get::<_, String>(2)?,
         row.try_get(3)?,
     ) && row.try_get::<_, String>(1)? == role
@@ -298,7 +303,7 @@ async fn role_current(
             .await?
         }
     };
-    let rows=session.query("SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, inet_server_addr()::text, pg_is_in_recovery()",&[]).await?;
+    let rows = session.query(ROLE_QUERY, &[]).await?;
     if rows.len() != 1 {
         return Ok(false);
     }
@@ -334,7 +339,7 @@ async fn role_current(
     ) {
         return Ok(false);
     }
-    let privileges=session.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user",&[]).await?;
+    let privileges = session.query(PRIVILEGES_QUERY, &[]).await?;
     if privileges.len() != 1
         || !(0..5).all(|i| privileges[0].try_get::<_, bool>(i).is_ok_and(|v| !v))
         || !privileges[0].try_get::<_, bool>(5)?
@@ -372,6 +377,15 @@ async fn roles_at(
     })
     .await?
 }
+/// What a pool holder's PostgreSQL says of itself, by position: its database, its user, the
+/// address it was reached at (`host()`: the cast of an `inet` to `text` keeps the netmask, which no
+/// Pod address has), whether it is a standby, and its client backends and prepared transactions.
+pub(crate) const IDLE_QUERY: &str = "SELECT current_database()::text, current_user::text, pg_catalog.host(pg_catalog.inet_server_addr()), pg_is_in_recovery(), (SELECT count(*)::text FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()), (SELECT count(*)::text FROM pg_prepared_xacts)";
+/// A role's own view of the server: user, version, settings, database and the address it was
+/// reached at (see `IDLE_QUERY` for `host()`), by position.
+pub(crate) const ROLE_QUERY: &str = "SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, pg_catalog.host(pg_catalog.inet_server_addr()), pg_is_in_recovery()";
+/// A role's privileges: none beyond login.
+pub(crate) const PRIVILEGES_QUERY: &str = "SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user";
 /// The readiness of a resumed Pod by SQL: its database and TLS, whether it is a primary, which
 /// Pod answers, and how long ago its postmaster started on the server's own clock.
 pub const ACCEPTING_QUERY: &str = "SELECT pg_catalog.current_database() AS database,
@@ -464,6 +478,128 @@ mod tests {
             .user("app")
             .ssl_mode(SslMode::Require);
         (config, ca.pem(), server)
+    }
+    /// The wire forms of PostgreSQL's `inet` as the controller's statements meet them: the cast to
+    /// `text` keeps the netmask, so a comparison with the Pod's address can only hold for `host()`.
+    #[test]
+    fn a_server_address_with_its_netmask_is_not_the_pods_address() {
+        assert!(!probe_identity_current(
+            "database",
+            "database",
+            "10.0.0.7",
+            "10.0.0.7/32",
+            false
+        ));
+        assert!(!probe_identity_current(
+            "database",
+            "database",
+            "fd00::7",
+            "fd00::7/128",
+            false
+        ));
+        assert!(probe_identity_current(
+            "database", "database", "fd00::7", "fd00::7", false
+        ));
+    }
+    /// A double that answers one statement with one cell, to a session without the world.
+    async fn answer_with(
+        cell: crate::test_postgres::Cell,
+    ) -> (Session, crate::test_postgres::Postgres) {
+        let authority = crate::test_postgres::Authority::new();
+        let server = crate::test_postgres::Postgres::start(
+            &authority,
+            HOST,
+            None,
+            Arc::new(move |_, _, _| {
+                crate::test_postgres::Answer::Rows(vec![vec![("value", cell.clone())]])
+            }),
+        )
+        .await;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(HOST)
+            .hostaddr(server.address.ip())
+            .port(server.address.port())
+            .user("app")
+            .ssl_mode(SslMode::Require);
+        (
+            open(&config, authority.pem.as_bytes()).await.unwrap(),
+            server,
+        )
+    }
+    #[tokio::test]
+    async fn an_inet_cell_is_binary_and_no_text_decode_accepts_it() {
+        use crate::test_postgres::Cell;
+        let (session, _server) = answer_with(Cell::Inet("10.0.0.7".into())).await;
+        let rows = session
+            .query("SELECT inet_server_addr()", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].columns()[0].type_(),
+            &tokio_postgres::types::Type::INET
+        );
+        assert!(rows[0].try_get::<_, String>(0).is_err());
+        // The cast to text is what keeps the netmask; the cell for it is text with `/32`.
+        let (session, _server) = answer_with(Cell::Text("10.0.0.7/32".into())).await;
+        let rows = session
+            .query("SELECT inet_server_addr()::text", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].try_get::<_, String>(0).unwrap(), "10.0.0.7/32");
+        // `name` decodes as a string, as `current_database()` does in the sleep proof.
+        let (session, _server) = answer_with(Cell::Name("database".into())).await;
+        let rows = session
+            .query("SELECT current_database()", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].columns()[0].type_(),
+            &tokio_postgres::types::Type::NAME
+        );
+        assert_eq!(rows[0].try_get::<_, String>(0).unwrap(), "database");
+    }
+    /// The whole role login of a database whose PostgreSQL answers as the real server does: the
+    /// address it reports for itself is the Pod's, printed without a netmask.
+    #[tokio::test]
+    async fn a_role_login_accepts_the_address_postgresql_reports_for_the_pod() {
+        use crate::test_world::{POD_IP, World};
+        let mut w = World::awake().await;
+        w.wake(3);
+        let socket = w.reconciler.power.postgres;
+        let all = roles(&w.db, w.authority.pem.as_bytes(), POD_IP, socket)
+            .await
+            .unwrap();
+        assert!(all, "every role of the Pod logs in");
+        let concurrently = roles_pod(&w.db, w.authority.pem.as_bytes(), POD_IP, socket.unwrap())
+            .await
+            .unwrap();
+        assert!(concurrently);
+        // Another Pod answering is not this one.
+        assert!(
+            !roles(&w.db, w.authority.pem.as_bytes(), "10.0.0.99", socket)
+                .await
+                .unwrap()
+        );
+    }
+    /// The idleness check of a pool holder reads the same address the same way.
+    #[tokio::test]
+    async fn a_pool_holder_is_idle_at_the_address_postgresql_reports_for_it() {
+        use crate::test_world::{POD_IP, World};
+        let w = World::awake().await;
+        let role = text(&w.db["maintenance"], "role");
+        let session = connect_via(
+            &w.db,
+            w.authority.pem.as_bytes(),
+            role,
+            text(&w.db["maintenance"], "password"),
+            text(&w.db, "id"),
+            w.reconciler.power.postgres,
+        )
+        .await
+        .unwrap();
+        assert!(idle_on(&session, &w.db, role, POD_IP).await.unwrap());
+        assert!(!idle_on(&session, &w.db, role, "10.0.0.99").await.unwrap());
     }
     #[tokio::test]
     async fn a_dropped_session_terminates_and_ends_tls_with_close_notify() {

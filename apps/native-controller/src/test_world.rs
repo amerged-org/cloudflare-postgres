@@ -184,7 +184,9 @@ impl Gateway {
 pub struct Sql {
     pub busy: i32,
     pub prepared: i32,
-    /// The closed segment `pg_switch_wal()` reports and whether its `.done` exists.
+    /// The closed segment `pg_switch_wal()` reports and whether its `.done` exists. WAL file names
+    /// are upper-case hexadecimal, so a name without a letter would hide a validator that rejects
+    /// them.
     pub segment: String,
     pub archived: bool,
     pub postmaster_age_ms: i64,
@@ -195,15 +197,36 @@ impl Default for Sql {
         Self {
             busy: 0,
             prepared: 0,
-            segment: "000000010000000000000007".into(),
+            segment: "0000000100000000000000A7".into(),
             archived: true,
             postmaster_age_ms: 5,
             recovery: false,
         }
     }
 }
+/// The LSN `pg_switch_wal()` returns when it closed `segment`: the first byte after it, in
+/// PostgreSQL's `pg_lsn` text form (`<log>/<offset>`, upper-case hexadecimal).
+fn lsn_after(segment: &str) -> String {
+    let log = u64::from_str_radix(&segment[8..16], 16).unwrap();
+    let number = u64::from_str_radix(&segment[16..24], 16).unwrap();
+    format!("{log:X}/{:X}", (number + 1) * 0x100_0000)
+}
+/// The server address column of a statement, as PostgreSQL returns the select-list expression
+/// the statement holds: `host()` prints the address alone, a cast to `text` keeps the netmask the
+/// `inet` carries (`10.0.0.7/32`), and the bare `inet` is a binary value no text decode accepts.
+fn server_address(sql: &str, ip: &str) -> Cell {
+    let plain = sql.replace("pg_catalog.", "");
+    if plain.contains("host(inet_server_addr())") {
+        Cell::Text(ip.into())
+    } else if plain.contains("inet_server_addr()::text") {
+        Cell::Text(format!("{ip}/32"))
+    } else {
+        Cell::Inet(ip.into())
+    }
+}
 /// PostgreSQL answers only while its instance is unfenced: CNPG's instance manager does not
-/// start it before the fence annotation is gone.
+/// start it before the fence annotation is gone. Every cell has the type and the text form the
+/// real server gives the statement's expression (see `test_postgres`).
 fn answers(
     db: Value,
     state: Arc<Mutex<Sql>>,
@@ -226,12 +249,32 @@ fn answers(
         };
         log.lock().unwrap().push(format!("SQL {user} {kind}"));
         let text = |v: &str| Cell::Text(v.to_string());
+        let name = |v: &str| Cell::Name(v.to_string());
         let one = |row: Vec<(&'static str, Cell)>| Answer::Rows(vec![row]);
+        let id = crate::contracts::text(&db, "id");
         let size = &db["size"];
         let memory = crate::contracts::number(size, "memory_mib");
         let request = crate::contracts::optional_number(size, "memory_request_mib", memory);
         if sql.contains("pg_stat_clear_snapshot") {
-            one(vec![("pg_stat_clear_snapshot", text(""))])
+            one(vec![("pg_stat_clear_snapshot", Cell::Void)])
+        } else if sql.contains("backend_type='client backend'") {
+            // The pool holder's idleness: the statement reads its columns by position.
+            let column = if sql
+                .replace("pg_catalog.", "")
+                .contains("host(inet_server_addr())")
+            {
+                "host"
+            } else {
+                "inet_server_addr"
+            };
+            one(vec![
+                ("current_database", text(id)),
+                ("current_user", text(user)),
+                (column, server_address(sql, POD_IP)),
+                ("pg_is_in_recovery", Cell::Bool(s.recovery)),
+                ("count", text("0")),
+                ("count", text("0")),
+            ])
         } else if sql.contains("pg_prepared_xacts") {
             one(vec![
                 ("busy", Cell::Int4(s.busy)),
@@ -239,7 +282,7 @@ fn answers(
             ])
         } else if sql.contains("pg_switch_wal") {
             one(vec![
-                ("lsn", text("0/7000000")),
+                ("lsn", text(&lsn_after(&s.segment))),
                 ("segment", text(&s.segment)),
             ])
         } else if sql.contains("pg_ls_archive_statusdir() WHERE name=$1") {
@@ -247,18 +290,18 @@ fn answers(
             one(vec![("done", Cell::Bool(s.archived))])
         } else if sql.contains("pg_postmaster_start_time") {
             one(vec![
-                ("database", text(crate::contracts::text(&db, "id"))),
+                ("database", name(id)),
                 ("recovery", Cell::Bool(s.recovery)),
                 ("tls", Cell::Bool(true)),
-                ("server_address", text(POD_IP)),
+                ("server_address", server_address(sql, POD_IP)),
                 ("postmaster_age_ms", Cell::Int8(s.postmaster_age_ms)),
             ])
-        } else if sql.contains("server_address") {
+        } else if sql.contains("AS server_address") {
             one(vec![
-                ("database", text(crate::contracts::text(&db, "id"))),
+                ("database", name(id)),
                 ("role", text(user)),
                 ("recovery", Cell::Bool(s.recovery)),
-                ("server_address", text(POD_IP)),
+                ("server_address", server_address(sql, POD_IP)),
                 ("tls", Cell::Bool(true)),
                 ("rolsuper", Cell::Bool(false)),
                 ("rolcreatedb", Cell::Bool(false)),
@@ -270,17 +313,30 @@ fn answers(
                 ("archive_listing", Cell::Bool(true)),
             ])
         } else if sql.contains("pg_stat_archiver") {
+            // `EXTRACT(EPOCH ...)` is a numeric with six decimals; never archived is `-1`.
+            let at = now_ms();
             one(vec![
                 ("ready_wal_files", text("0")),
                 ("archived_count", text("5")),
-                ("last_archived_time", text(&(now_ms() / 1000).to_string())),
+                (
+                    "last_archived_time",
+                    text(&format!("{}.{:06}", at / 1000, (at % 1000) * 1000)),
+                ),
                 ("failed_count", text("0")),
             ])
         } else if sql.contains("current_setting('server_version')") {
+            let column = if sql
+                .replace("pg_catalog.", "")
+                .contains("host(inet_server_addr())")
+            {
+                "host"
+            } else {
+                "inet_server_addr"
+            };
             one(vec![
                 ("current_user", text(user)),
-                ("server_version", text("18.1")),
-                ("server_version_num", Cell::Int4(180001)),
+                ("server_version", text("18.6 (Debian 18.6-1.pgdg13+2)")),
+                ("server_version_num", Cell::Int4(180006)),
                 ("max_connections", Cell::Int4(20)),
                 (
                     "shared_buffers",
@@ -291,8 +347,8 @@ fn answers(
                     text(&((memory / 2) * 1024 * 1024).to_string()),
                 ),
                 ("archive_timeout", Cell::Int4(60)),
-                ("current_database", text(crate::contracts::text(&db, "id"))),
-                ("inet_server_addr", text(POD_IP)),
+                ("current_database", text(id)),
+                (column, server_address(sql, POD_IP)),
                 ("pg_is_in_recovery", Cell::Bool(s.recovery)),
             ])
         } else if sql.contains("FROM pg_roles WHERE rolname=current_user") {
@@ -306,7 +362,7 @@ fn answers(
             ])
         } else if sql.contains("pg_has_role(r.oid,'pg_read_all_stats','MEMBER') AS stats") {
             one(vec![
-                ("database", text(crate::contracts::text(&db, "id"))),
+                ("database", name(id)),
                 ("recovery", Cell::Bool(s.recovery)),
                 ("tls", Cell::Bool(true)),
                 ("rolsuper", Cell::Bool(false)),
@@ -633,5 +689,302 @@ impl World {
             "{observed}"
         );
         w
+    }
+}
+
+/// The double against what PostgreSQL 18.6 of the product image describes for every statement the
+/// controller sends to a database. The column types are the `\gdesc` output of the real server and
+/// the value shapes its text output; a statement that changes, or a double that answers it with a
+/// shape the server does not produce, fails here instead of in a live wake.
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::{contracts::constant, postgres, power::sql};
+    use tokio_postgres::types::Type;
+
+    type Case<'a> = (&'a str, Option<&'a str>, Vec<(&'a str, Type)>);
+    /// Every statement the controller sends to a database with the columns PostgreSQL 18.6 of the
+    /// product image describes for it (`""` matches any name). `role` is the bound parameter of
+    /// the two identity statements.
+    fn pinned(role: &str) -> Vec<Case<'_>> {
+        let bools = |names: &[&'static str]| -> Vec<(&'static str, Type)> {
+            names.iter().map(|n| (*n, Type::BOOL)).collect()
+        };
+        let archive_identity = constant("ARCHIVE_IDENTITY_QUERY").as_str().unwrap();
+        let archive = constant("ARCHIVE_QUERY").as_str().unwrap();
+        vec![
+            (
+                sql("CLEAR"),
+                None,
+                vec![("pg_stat_clear_snapshot", Type::VOID)],
+            ),
+            (
+                sql("GUARD"),
+                None,
+                vec![("busy", Type::INT4), ("prepared", Type::INT4)],
+            ),
+            (
+                sql("IDENTITY"),
+                Some(role),
+                [
+                    vec![("database", Type::NAME)],
+                    bools(&[
+                        "recovery",
+                        "tls",
+                        "rolsuper",
+                        "rolcreatedb",
+                        "rolcreaterole",
+                        "rolreplication",
+                        "rolbypassrls",
+                        "stats",
+                    ]),
+                ]
+                .concat(),
+            ),
+            (
+                sql("SWITCH"),
+                None,
+                vec![("lsn", Type::TEXT), ("segment", Type::TEXT)],
+            ),
+            (
+                sql("ARCHIVE_STATUS"),
+                Some("0000000100000000000000A7.done"),
+                vec![("done", Type::BOOL)],
+            ),
+            (
+                archive_identity,
+                Some(role),
+                [
+                    vec![
+                        ("database", Type::NAME),
+                        ("role", Type::TEXT),
+                        ("recovery", Type::BOOL),
+                        ("server_address", Type::TEXT),
+                    ],
+                    bools(&[
+                        "tls",
+                        "rolsuper",
+                        "rolcreatedb",
+                        "rolcreaterole",
+                        "rolreplication",
+                        "rolbypassrls",
+                        "only_stats",
+                        "stats",
+                        "archive_listing",
+                    ]),
+                ]
+                .concat(),
+            ),
+            (
+                archive,
+                None,
+                vec![
+                    ("ready_wal_files", Type::TEXT),
+                    ("archived_count", Type::TEXT),
+                    ("last_archived_time", Type::TEXT),
+                    ("failed_count", Type::TEXT),
+                ],
+            ),
+            (
+                postgres::ROLE_QUERY,
+                None,
+                vec![
+                    ("", Type::TEXT),
+                    ("", Type::TEXT),
+                    ("", Type::INT4),
+                    ("", Type::INT4),
+                    ("", Type::TEXT),
+                    ("", Type::TEXT),
+                    ("", Type::INT4),
+                    ("", Type::TEXT),
+                    ("", Type::TEXT),
+                    ("", Type::BOOL),
+                ],
+            ),
+            (
+                postgres::IDLE_QUERY,
+                None,
+                vec![
+                    ("", Type::TEXT),
+                    ("", Type::TEXT),
+                    ("", Type::TEXT),
+                    ("", Type::BOOL),
+                    ("", Type::TEXT),
+                    ("", Type::TEXT),
+                ],
+            ),
+            (
+                postgres::PRIVILEGES_QUERY,
+                None,
+                bools(&[
+                    "rolsuper",
+                    "rolcreatedb",
+                    "rolcreaterole",
+                    "rolreplication",
+                    "rolbypassrls",
+                    "rolcanlogin",
+                ]),
+            ),
+            (
+                postgres::ACCEPTING_QUERY,
+                None,
+                vec![
+                    ("database", Type::NAME),
+                    ("recovery", Type::BOOL),
+                    ("tls", Type::BOOL),
+                    ("server_address", Type::TEXT),
+                    ("postmaster_age_ms", Type::INT8),
+                ],
+            ),
+        ]
+    }
+    fn text_of(row: &tokio_postgres::Row, column: &str) -> String {
+        row.try_get::<_, String>(column).unwrap()
+    }
+    /// Runs every pinned statement over `client` and checks what comes back against the forms of a
+    /// PostgreSQL text output: the columns' types and names, the shape of an LSN, a WAL file name,
+    /// an epoch, a server version and a server address. Every cell is what the real server gives.
+    async fn conforms(client: &tokio_postgres::Client, role: &str) {
+        for (statement, parameter, expected) in pinned(role) {
+            let rows = match parameter {
+                Some(value) => client.query(statement, &[&value]).await,
+                None => client.query(statement, &[]).await,
+            }
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+            assert_eq!(rows.len(), 1, "{statement}");
+            let columns = rows[0].columns();
+            assert_eq!(columns.len(), expected.len(), "{statement}");
+            for (column, (name, kind)) in columns.iter().zip(&expected) {
+                assert_eq!(column.type_(), kind, "{statement}: {}", column.name());
+                if !name.is_empty() {
+                    assert_eq!(column.name(), *name, "{statement}");
+                }
+            }
+        }
+        let upper_hex = |v: &str| {
+            !v.is_empty()
+                && v.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+        };
+        let switched = client.query(sql("SWITCH"), &[]).await.unwrap();
+        let (lsn, segment) = (
+            text_of(&switched[0], "lsn"),
+            text_of(&switched[0], "segment"),
+        );
+        let (log, offset) = lsn.split_once('/').unwrap();
+        assert!(upper_hex(log) && upper_hex(offset), "{lsn}");
+        assert!(segment.len() == 24 && upper_hex(&segment), "{segment}");
+        // `EXTRACT(EPOCH ...)` is a numeric printed with six decimals; never archived is `-1`.
+        let archive = constant("ARCHIVE_QUERY").as_str().unwrap();
+        let time = text_of(
+            &client.query(archive, &[]).await.unwrap()[0],
+            "last_archived_time",
+        );
+        assert!(
+            time == "-1"
+                || time.split_once('.').is_some_and(|(whole, fraction)| {
+                    !whole.is_empty()
+                        && whole.bytes().all(|b| b.is_ascii_digit())
+                        && fraction.len() == 6
+                        && fraction.bytes().all(|b| b.is_ascii_digit())
+                }),
+            "{time}"
+        );
+        // The server's own version string and numeric version.
+        let settings = &client.query(postgres::ROLE_QUERY, &[]).await.unwrap()[0];
+        let version = settings.try_get::<_, String>(1).unwrap();
+        let number = version.split_whitespace().next().unwrap();
+        assert!(
+            number.split('.').count() == 2
+                && number
+                    .split('.')
+                    .all(|part| part.bytes().all(|b| b.is_ascii_digit())),
+            "{version}"
+        );
+        assert!(settings.try_get::<_, i32>(2).unwrap() >= 180_000);
+        // Every address a statement returns as text is an address and carries no netmask.
+        let address = |text: String| {
+            assert!(!text.contains('/'), "{text}");
+            text.parse::<std::net::IpAddr>()
+                .unwrap_or_else(|_| panic!("{text} is an address"));
+            text
+        };
+        let role_address = address(settings.try_get::<_, String>(8).unwrap());
+        let idle = &client.query(postgres::IDLE_QUERY, &[]).await.unwrap()[0];
+        assert_eq!(address(idle.try_get::<_, String>(2).unwrap()), role_address);
+        let accepting = &client.query(postgres::ACCEPTING_QUERY, &[]).await.unwrap()[0];
+        assert_eq!(text_of(accepting, "server_address"), role_address);
+        let identity = &client
+            .query(
+                constant("ARCHIVE_IDENTITY_QUERY").as_str().unwrap(),
+                &[&role],
+            )
+            .await
+            .unwrap()[0];
+        assert_eq!(text_of(identity, "server_address"), role_address);
+    }
+    /// The table above against a real PostgreSQL: set `PGCF_TEST_POSTGRES_ADDR` to `host:port` of
+    /// a server that trusts `postgres` (the product image started with `initdb -A trust` does).
+    /// The statements are read only apart from the WAL switch of the sleep proof. Without the
+    /// variable the test is skipped.
+    #[tokio::test]
+    async fn the_pinned_forms_are_what_a_real_postgresql_gives() {
+        let Ok(address) = std::env::var("PGCF_TEST_POSTGRES_ADDR") else {
+            eprintln!("skipped: PGCF_TEST_POSTGRES_ADDR names no PostgreSQL");
+            return;
+        };
+        let (host, port) = address.rsplit_once(':').expect("host:port");
+        let (client, connection) = tokio_postgres::Config::new()
+            .host(host)
+            .port(port.parse().unwrap())
+            .user("postgres")
+            .dbname("postgres")
+            .connect(tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        conforms(&client, "postgres").await;
+    }
+    /// The double answers the same statements with the same types and forms, and the three ways
+    /// an `inet` reaches a column.
+    #[tokio::test]
+    async fn the_double_gives_every_statement_the_types_and_forms_postgresql_does() {
+        let w = World::awake().await;
+        let role = crate::contracts::text(&w.db["maintenance"], "role");
+        let session = postgres::connect_via(
+            &w.db,
+            w.authority.pem.as_bytes(),
+            role,
+            crate::contracts::text(&w.db["maintenance"], "password"),
+            crate::contracts::text(&w.db, "id"),
+            w.reconciler.power.postgres,
+        )
+        .await
+        .unwrap();
+        conforms(&session.client, role).await;
+        let settings = &session.query(postgres::ROLE_QUERY, &[]).await.unwrap()[0];
+        assert_eq!(settings.try_get::<_, String>(8).unwrap(), POD_IP);
+        assert_eq!(
+            settings.try_get::<_, String>(1).unwrap(),
+            "18.6 (Debian 18.6-1.pgdg13+2)"
+        );
+        // The three forms of the same value: `host()` is the address alone, the cast to `text`
+        // keeps the netmask (the form that blocked every wake of r2.12), and the bare `inet` is a
+        // binary value that no string decode accepts.
+        let wanted = "pg_catalog.host(pg_catalog.inet_server_addr())";
+        assert!(postgres::ROLE_QUERY.contains(wanted));
+        let cast = postgres::ROLE_QUERY.replace(wanted, "inet_server_addr()::text");
+        let row = &session.query(cast.as_str(), &[]).await.unwrap()[0];
+        assert_eq!(row.try_get::<_, String>(8).unwrap(), format!("{POD_IP}/32"));
+        let bare = postgres::ROLE_QUERY.replace(wanted, "inet_server_addr()");
+        let row = &session.query(bare.as_str(), &[]).await.unwrap()[0];
+        assert_eq!(row.columns()[8].type_(), &Type::INET);
+        assert!(row.try_get::<_, String>(8).is_err());
+        // A WAL file name of the double carries a letter, as about half of PostgreSQL's do.
+        let segment = text_of(
+            &session.query(sql("SWITCH"), &[]).await.unwrap()[0],
+            "segment",
+        );
+        assert!(segment.bytes().any(|b| b.is_ascii_uppercase()), "{segment}");
     }
 }
