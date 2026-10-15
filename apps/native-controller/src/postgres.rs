@@ -7,8 +7,10 @@ use crate::{
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde_json::Value;
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 use tokio_postgres::{Client, Row, config::SslMode, types::ToSql};
+/// PostgreSQL's port inside a database Pod.
+pub const PORT: u16 = 5432;
 pub struct Session {
     pub client: Client,
     task: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
@@ -66,6 +68,18 @@ pub async fn connect(
 ) -> Result<Session, Error> {
     connect_at(db, ca, role, password, database, None).await
 }
+/// Like `connect`, with the socket given: `None` dials the tenant's Service by name. TLS always
+/// verifies the Service name, so a Pod address never weakens the server identity.
+pub async fn connect_via(
+    db: &Value,
+    ca: &[u8],
+    role: &str,
+    password: &str,
+    database: &str,
+    socket: Option<SocketAddr>,
+) -> Result<Session, Error> {
+    connect_at(db, ca, role, password, database, socket).await
+}
 /// TLS keeps the tenant's exact CNPG server name while the socket uses the authenticated pool Pod IP.
 pub async fn connect_pool(
     db: &Value,
@@ -91,7 +105,15 @@ pub async fn connect_pool(
     } {
         return Err("pool PostgreSQL address is not private".into());
     }
-    connect_at(db, ca, role, password, database, Some(address)).await
+    connect_at(
+        db,
+        ca,
+        role,
+        password,
+        database,
+        Some(SocketAddr::new(address, PORT)),
+    )
+    .await
 }
 async fn connect_at(
     db: &Value,
@@ -99,7 +121,7 @@ async fn connect_at(
     role: &str,
     password: &str,
     database: &str,
-    address: Option<std::net::IpAddr>,
+    socket: Option<SocketAddr>,
 ) -> Result<Session, Error> {
     let recovery = !db["recovery"].is_null();
     let role_allowed = pgcf_native_protocol::valid_role(role)
@@ -114,7 +136,7 @@ async fn connect_at(
     let mut config = tokio_postgres::Config::new();
     config
         .host(format!("database-rw.{}.svc", namespace(db)))
-        .port(5432)
+        .port(socket.map_or(PORT, |socket| socket.port()))
         .user(role)
         .password(password)
         .dbname(database)
@@ -122,8 +144,8 @@ async fn connect_at(
         .options("-c statement_timeout=5000")
         .connect_timeout(Duration::from_secs(5))
         .ssl_mode(SslMode::Require);
-    if let Some(address) = address {
-        config.hostaddr(address);
+    if let Some(socket) = socket {
+        config.hostaddr(socket.ip());
     }
     open(&config, ca).await
 }
@@ -164,8 +186,32 @@ fn probe_identity_current(
                 actual_address.parse::<std::net::IpAddr>().ok() == Some(expected)
             })
 }
-pub async fn roles(db: &Value, ca: &[u8], primary_address: &str) -> Result<bool, Error> {
-    roles_at(db, ca, primary_address, None).await
+/// Where a role's login dials: the tenant's Service, a pool Pod's recorded address, or the
+/// instance Pod itself.
+enum Route<'a> {
+    /// The tenant's Service by name, or the given socket in its place.
+    Service(Option<SocketAddr>),
+    Pool(&'a Value),
+    Pod(SocketAddr),
+}
+/// Every role logs in through the tenant's Service (`socket` is `None`), one after the other.
+pub async fn roles(
+    db: &Value,
+    ca: &[u8],
+    primary_address: &str,
+    socket: Option<SocketAddr>,
+) -> Result<bool, Error> {
+    roles_at(db, ca, primary_address, Route::Service(socket)).await
+}
+/// Every role logs in to the instance Pod itself, concurrently: the kubelet's readiness, and so
+/// the Service's endpoint, is not awaited.
+pub async fn roles_pod(
+    db: &Value,
+    ca: &[u8],
+    primary_address: &str,
+    socket: SocketAddr,
+) -> Result<bool, Error> {
+    roles_at(db, ca, primary_address, Route::Pod(socket)).await
 }
 pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
     roles_at(
@@ -174,7 +220,7 @@ pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Er
         scope["pool_pod_ip"]
             .as_str()
             .ok_or("pool PostgreSQL address absent")?,
-        Some(scope),
+        Route::Pool(scope),
     )
     .await
 }
@@ -209,28 +255,130 @@ pub async fn pool_idle(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Err
         && row.try_get::<_, String>(4)? == "0"
         && row.try_get::<_, String>(5)? == "0")
 }
+/// A role's login, its server settings and its privileges against the desired state.
+async fn role_current(
+    db: &Value,
+    ca: &[u8],
+    primary_address: &str,
+    route: &Route<'_>,
+    role: &Value,
+) -> Result<bool, Error> {
+    let session = match route {
+        Route::Service(socket) => {
+            connect_via(
+                db,
+                ca,
+                text(role, "name"),
+                text(role, "password"),
+                text(db, "id"),
+                *socket,
+            )
+            .await?
+        }
+        Route::Pool(scope) => {
+            connect_pool(
+                db,
+                scope,
+                ca,
+                text(role, "name"),
+                text(role, "password"),
+                text(db, "id"),
+            )
+            .await?
+        }
+        Route::Pod(socket) => {
+            connect_via(
+                db,
+                ca,
+                text(role, "name"),
+                text(role, "password"),
+                text(db, "id"),
+                Some(*socket),
+            )
+            .await?
+        }
+    };
+    let rows=session.query("SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, inet_server_addr()::text, pg_is_in_recovery()",&[]).await?;
+    if rows.len() != 1 {
+        return Ok(false);
+    }
+    let row = &rows[0];
+    let tuning = parameters(db);
+    let shared = text(&tuning, "shared_buffers")
+        .trim_end_matches("MB")
+        .parse::<u64>()?;
+    let version: String = row.try_get(1)?;
+    let server_num: i32 = row.try_get(2)?;
+    let max_connections: i32 = row.try_get(3)?;
+    let buffers: String = row.try_get(4)?;
+    let cache: String = row.try_get(5)?;
+    let archive: i32 = row.try_get(6)?;
+    if row.try_get::<_, String>(0)? != text(role, "name")
+        || server_num / 10000 != 18
+        || db["postgres"]["version"]
+            .as_str()
+            .is_some_and(|pin| version.split_whitespace().next() != Some(pin))
+        || u64::try_from(max_connections).ok() != Some(number(&db["size"], "max_connections"))
+        || buffers.parse::<u64>()? != shared * 1024 * 1024
+        || cache.parse::<u64>()? != number(&db["size"], "memory_mib") / 2 * 1024 * 1024
+        || u64::try_from(archive).ok() != Some(number(&db["size"], "archive_timeout_seconds"))
+    {
+        return Ok(false);
+    }
+    if !probe_identity_current(
+        text(db, "id"),
+        &row.try_get::<_, String>(7)?,
+        primary_address,
+        &row.try_get::<_, String>(8)?,
+        row.try_get::<_, bool>(9)?,
+    ) {
+        return Ok(false);
+    }
+    let privileges=session.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user",&[]).await?;
+    if privileges.len() != 1
+        || !(0..5).all(|i| privileges[0].try_get::<_, bool>(i).is_ok_and(|v| !v))
+        || !privileges[0].try_get::<_, bool>(5)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
 async fn roles_at(
     db: &Value,
     ca: &[u8],
     primary_address: &str,
-    scope: Option<&Value>,
+    route: Route<'_>,
 ) -> Result<bool, Error> {
     if text(db, "desired_state") != "running" {
         return Ok(false);
     }
-    tokio::time::timeout(Duration::from_secs(20),async{
-  for role in db["roles"].as_array().ok_or("roles unavailable")?{
-   let session=if let Some(scope)=scope {connect_pool(db,scope,ca,text(role,"name"),text(role,"password"),text(db,"id")).await?} else {connect(db,ca,text(role,"name"),text(role,"password"),text(db,"id")).await?};
-   let rows=session.query("SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, inet_server_addr()::text, pg_is_in_recovery()",&[]).await?;
-   if rows.len()!=1{return Ok::<bool,Error>(false);}let row=&rows[0];let tuning=parameters(db);let shared=text(&tuning,"shared_buffers").trim_end_matches("MB").parse::<u64>()?;let version:String=row.try_get(1)?;let server_num:i32=row.try_get(2)?;let max_connections:i32=row.try_get(3)?;let buffers:String=row.try_get(4)?;let cache:String=row.try_get(5)?;let archive:i32=row.try_get(6)?;
-   if row.try_get::<_,String>(0)?!=text(role,"name")||server_num/10000!=18||db["postgres"]["version"].as_str().is_some_and(|pin|version.split_whitespace().next()!=Some(pin))||u64::try_from(max_connections).ok()!=Some(number(&db["size"],"max_connections"))||buffers.parse::<u64>()?!=shared*1024*1024||cache.parse::<u64>()?!=number(&db["size"],"memory_mib")/2*1024*1024||u64::try_from(archive).ok()!=Some(number(&db["size"],"archive_timeout_seconds")){return Ok(false);}
-   if !probe_identity_current(text(db,"id"),&row.try_get::<_,String>(7)?,primary_address,&row.try_get::<_,String>(8)?,row.try_get::<_,bool>(9)?){return Ok(false);}
-   let privileges=session.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user",&[]).await?;
-   if privileges.len()!=1||!(0..5).all(|i|privileges[0].try_get::<_,bool>(i).is_ok_and(|v|!v))||!privileges[0].try_get::<_,bool>(5)?{return Ok(false);}
-  }
-  Ok(true)
- }).await?
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let roles = db["roles"].as_array().ok_or("roles unavailable")?;
+        if matches!(route, Route::Pod(_)) {
+            let all = futures_util::future::try_join_all(
+                roles
+                    .iter()
+                    .map(|role| role_current(db, ca, primary_address, &route, role)),
+            )
+            .await?;
+            return Ok::<bool, Error>(all.into_iter().all(|ok| ok));
+        }
+        for role in roles {
+            if !role_current(db, ca, primary_address, &route, role).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .await?
 }
+/// The readiness of a resumed Pod by SQL: its database and TLS, whether it is a primary, which
+/// Pod answers, and how long ago its postmaster started on the server's own clock.
+pub const ACCEPTING_QUERY: &str = "SELECT pg_catalog.current_database() AS database,
+ pg_catalog.pg_is_in_recovery() AS recovery,
+ (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,
+ pg_catalog.host(pg_catalog.inet_server_addr()) AS server_address,
+ (pg_catalog.date_part('epoch', pg_catalog.clock_timestamp() - pg_catalog.pg_postmaster_start_time()) * 1000)::pg_catalog.int8 AS postmaster_age_ms";
 
 #[cfg(test)]
 mod tests {

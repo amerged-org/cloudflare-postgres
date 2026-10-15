@@ -4,7 +4,7 @@ use crate::{
     Error,
     contracts::{constant, database_valid, generation, namespace, number, text},
     kubernetes::{Kubernetes, terminal_pod},
-    postgres,
+    postgres, timing,
 };
 use base64::{
     Engine,
@@ -28,10 +28,17 @@ const GENERATION: &str = "pgcf.io/generation";
 const POWER_REVISION: &str = "pgcf.io/power-revision";
 const POWER_OPERATION: &str = "pgcf.io/power-operation";
 const HIBERNATION: &str = "cnpg.io/hibernation";
+/// CNPG's instance fence: a JSON list of instance names, `["*"]` for every instance.
+const FENCE: &str = "cnpg.io/fencedInstances";
 const FENCE_BINDING: &str = "pgcf.io/gateway-fence-uid";
 const VOLUME_IDENTITY: &str = "pgcf.io/volume-identity";
 const MAX_WAIT: u64 = 600_000;
+/// How long one sleep pass waits for the fenced PostgreSQL to be seen stopped.
+const STOP_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
+mod parked;
+pub(crate) use parked::fenced;
+use parked::{Resumed, Retained};
 #[derive(Debug)]
 enum Fault {
     Stale,
@@ -137,6 +144,10 @@ enum Phase {
     Wake,
     Awake,
     Refused,
+    /// The fence is written and the stop of PostgreSQL is being confirmed (parked sleep tier).
+    Parking,
+    /// PostgreSQL is stopped by CNPG's fence; the instance Pod stays (parked sleep tier).
+    Parked,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -164,6 +175,9 @@ struct Progress {
     key_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     segment: Option<String>,
+    /// The retained instance Pod of a parked database, from `Parking` until its demotion ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park: Option<Park>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -180,9 +194,44 @@ impl Progress {
             key_uid: None,
             key_version: None,
             segment: None,
+            park: None,
             extra: Map::new(),
         }
     }
+}
+/// One container's resource requests as Kubernetes quantity strings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContainerRequests {
+    cpu: String,
+    memory: String,
+}
+/// The requests of the two containers the parked tier resizes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Requests {
+    postgres: ContainerRequests,
+    sidecar: ContainerRequests,
+}
+/// The instance Pod a parked database keeps: the identity a wake or a demotion must find again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Park {
+    pod_name: String,
+    pod_uid: String,
+    /// Container IDs of `postgres` and the `plugin-barman-cloud` sidecar.
+    postgres_container_id: String,
+    sidecar_container_id: String,
+    node_boot_id: String,
+    release_id: String,
+    spec_sha256: String,
+    assignment_revision: u64,
+    requests_before: Requests,
+    requests_parked: Requests,
+    parked_at: u64,
+    /// PostgreSQL was seen stopped and fenced: nothing can have been written since, whatever
+    /// gateway Pods came and went. Set when the Pod is parked, not while it is being parked.
+    stopped: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,16 +311,71 @@ struct RetirementReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     marker_version: Option<String>,
 }
+/// What a retained Pod is judged against, for a sleep as for a wake: the node and the fleet
+/// release it must still be under, and the manifests the desired state would apply to it.
+pub struct Basis<'a> {
+    pub node: &'a Value,
+    pub release: &'a Value,
+    /// The manifests desired state would apply; `None` when they cannot be built.
+    pub manifests: Option<&'a [Value]>,
+    pub runtime_class: &'a str,
+}
+/// What the sleep step needs from the regional snapshot and the database's Node.
+pub struct Sleep<'a> {
+    /// `region.parking`; null while the region has no parked sleep tier.
+    pub parking: &'a Value,
+    pub basis: Basis<'a>,
+}
+#[cfg(test)]
+static NOTHING: Value = Value::Null;
+#[cfg(test)]
+impl Basis<'static> {
+    /// Nothing is known of the retained Pod's surroundings: it is never judged fit to resume.
+    fn cold() -> Self {
+        Self {
+            node: &NOTHING,
+            release: &NOTHING,
+            manifests: None,
+            runtime_class: "",
+        }
+    }
+}
+#[cfg(test)]
+impl Sleep<'static> {
+    /// A region without the parked sleep tier: every idle sleep is a real hibernation.
+    fn cold() -> Self {
+        Self {
+            parking: &NOTHING,
+            basis: Basis::cold(),
+        }
+    }
+}
+/// The identity of the retained Pod that a fast wake resumed; the verification chain must find it.
+pub struct ParkedWake {
+    pub pod_name: String,
+    pub pod_uid: String,
+    pub postgres_container_id: String,
+    pub sidecar_container_id: String,
+    /// Taken before the unfence was sent: a postmaster older than this did not start for it.
+    pub started: std::time::Instant,
+}
 pub enum PrepareRunning {
     Proceed,
     Pending,
     Observation(Value),
+    /// The fence was lifted on the retained Pod: PostgreSQL starts on it.
+    Parked(ParkedWake),
 }
 pub struct PowerCoordinator {
     k8s: Kubernetes,
     region: String,
     replicas: usize,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    /// Where PostgreSQL clients dial instead of the Pod's address and port 5432. Only a test
+    /// double sets it.
+    pub(crate) postgres: Option<std::net::SocketAddr>,
+    /// How long a sleep waits for PostgreSQL to be seen stopped after it fenced the instance.
+    pub(crate) stop_budget: Duration,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 fn now() -> u64 {
@@ -490,10 +594,48 @@ fn progress_from(map: &Value, now: u64) -> Result<Option<Progress>> {
     }
     if matches!(
         p.phase,
-        Phase::Archive | Phase::Proved | Phase::Hibernating | Phase::Hibernated
+        Phase::Archive
+            | Phase::Proved
+            | Phase::Hibernating
+            | Phase::Hibernated
+            | Phase::Parking
+            | Phase::Parked
     ) && (p.segment.is_none() || p.proof_intent.is_none())
     {
         return Err(Fault::Recovery("power_segment_missing"));
+    }
+    match &p.park {
+        None if matches!(p.phase, Phase::Parking | Phase::Parked) => {
+            return Err(Fault::Recovery("power_park_missing"));
+        }
+        Some(_)
+            if !matches!(
+                p.phase,
+                Phase::Parking | Phase::Parked | Phase::Hibernating | Phase::Wake
+            ) =>
+        {
+            return Err(Fault::Recovery("power_park_invalid"));
+        }
+        Some(park) => {
+            for text in [
+                &park.pod_name,
+                &park.postgres_container_id,
+                &park.sidecar_container_id,
+                &park.node_boot_id,
+                &park.release_id,
+                &park.spec_sha256,
+            ] {
+                required(text, 4096)?;
+            }
+            if !valid_pattern("uuid", &park.pod_uid)
+                || park.parked_at > now
+                || park.parked_at > MAX_SAFE
+                || park.assignment_revision > MAX_SAFE
+            {
+                return Err(Fault::Recovery("power_park_invalid"));
+            }
+        }
+        None => {}
     }
     if let Some(gateways) = &p.gateways {
         validate_pods(gateways)?;
@@ -502,7 +644,13 @@ fn progress_from(map: &Value, now: u64) -> Result<Option<Progress>> {
     }
     if matches!(
         p.phase,
-        Phase::Switching | Phase::Archive | Phase::Proved | Phase::Hibernating | Phase::Hibernated
+        Phase::Switching
+            | Phase::Archive
+            | Phase::Proved
+            | Phase::Hibernating
+            | Phase::Hibernated
+            | Phase::Parking
+            | Phase::Parked
     ) && p.gateways.is_none()
     {
         return Err(Fault::Recovery("power_continuity_missing"));
@@ -529,6 +677,24 @@ fn observation(db: &Value, intent: &PowerIntent, state: &str, refusal: Option<Re
         let text = serde_json::to_value(refusal).unwrap();
         value["power"]["refusal"] = text.clone();
         value["message"] = format!("sleep refused: {}", text.as_str().unwrap()).into();
+    }
+    value
+}
+/// A hibernated observation whose instance Pod is still alive with PostgreSQL stopped. `fast`
+/// claims that the Pod's wake is the fast one: every predicate of it was just established.
+fn parked_observation(
+    db: &Value,
+    intent: &PowerIntent,
+    pod_uid: &str,
+    cpu_millicores: u64,
+    memory_mib: u64,
+    fast: bool,
+) -> Value {
+    let mut value = observation(db, intent, "hibernated", None);
+    value["power"]["parked"] =
+        json!({"pod_uid":pod_uid,"cpu_millicores":cpu_millicores,"memory_mib":memory_mib});
+    if fast {
+        value["power"]["parked"]["wake"] = "fast".into();
     }
     value
 }
@@ -561,6 +727,8 @@ impl PowerCoordinator {
             region,
             replicas,
             http,
+            postgres: None,
+            stop_budget: STOP_BUDGET,
             clock,
         })
     }
@@ -1050,16 +1218,25 @@ impl PowerCoordinator {
         {
             return Err(Fault::Stale);
         }
+        // A wake always lifts the instance fence a retained Pod may still carry, together with
+        // hibernation, so CNPG can never create a fenced replacement Pod.
+        let unfence = hibernation == "off";
         if revision == intent.revision
             && cluster["metadata"]["annotations"][POWER_OPERATION] == intent.operation
             && cluster["metadata"]["annotations"][HIBERNATION] == hibernation
+            && !(unfence && cluster["metadata"]["annotations"].get(FENCE).is_some())
         {
             return Ok(());
         }
-        let actual=self.k8s.patch(cluster,&json!({"metadata":{"annotations":{POWER_REVISION:intent.revision.to_string(),POWER_OPERATION:intent.operation,HIBERNATION:hibernation}}})).await?;
+        let mut patch = json!({"metadata":{"annotations":{POWER_REVISION:intent.revision.to_string(),POWER_OPERATION:intent.operation,HIBERNATION:hibernation}}});
+        if unfence {
+            patch["metadata"]["annotations"][FENCE] = Value::Null;
+        }
+        let actual = self.k8s.patch(cluster, &patch).await?;
         if annotation_number(&actual, POWER_REVISION)? != Some(intent.revision)
             || actual["metadata"]["annotations"][POWER_OPERATION] != intent.operation
             || actual["metadata"]["annotations"][HIBERNATION] != hibernation
+            || (unfence && actual["metadata"]["annotations"].get(FENCE).is_some())
         {
             return Err(Fault::Unavailable("cluster_power_write_unknown"));
         }
@@ -1166,12 +1343,13 @@ impl PowerCoordinator {
             )?;
             let ca = required(text(&ca["data"], "ca.crt"), 128 * 1024)?;
             postgres::validate_ca(ca.as_bytes())?;
-            let session = postgres::connect(
+            let session = postgres::connect_via(
                 db,
                 ca.as_bytes(),
                 role,
                 text(&db["maintenance"], "password"),
                 text(db, "id"),
+                self.postgres,
             )
             .await?;
             let rows = session.query(sql("IDENTITY"), &[&role]).await?;
@@ -1261,18 +1439,28 @@ impl PowerCoordinator {
             })),
         }
     }
-    pub async fn suspend(&self, db: &Value) -> std::result::Result<Option<Value>, Error> {
+    pub async fn suspend(
+        &self,
+        db: &Value,
+        sleep: &Sleep<'_>,
+    ) -> std::result::Result<Option<Value>, Error> {
         if !database_valid(db) || text(db, "desired_state") != "suspended" {
             return Err("invalid suspension desired state".into());
         }
         let intent = desired_power(db)?.ok_or("suspension intent missing")?;
-        Ok(
-            tokio::time::timeout(Duration::from_secs(10), self.suspend_step(db, &intent))
-                .await
-                .unwrap_or_default(),
+        Ok(tokio::time::timeout(
+            Duration::from_secs(10),
+            self.suspend_step(db, &intent, sleep),
         )
+        .await
+        .unwrap_or_default())
     }
-    async fn suspend_step(&self, db: &Value, intent: &PowerIntent) -> Option<Value> {
+    async fn suspend_step(
+        &self,
+        db: &Value,
+        intent: &PowerIntent,
+        sleep: &Sleep<'_>,
+    ) -> Option<Value> {
         match self.protected_manual_suspend(db, intent).await {
             Ok(Some(result)) => return result,
             Ok(None) => {}
@@ -1300,6 +1488,33 @@ impl PowerCoordinator {
                 .is_some_and(|p| p.target.revision > intent.revision)
             {
                 return Err(Fault::Stale);
+            }
+            // A database that holds its instance Pod (parked, being parked or demoted) is
+            // handled apart: it is never proved again, and never refused for an unknown write.
+            if let (Some(held), Some(current)) =
+                (progress.as_ref().filter(|p| p.park.is_some()), map.as_ref())
+            {
+                match self
+                    .retained_sleep(
+                        db,
+                        intent,
+                        sleep,
+                        current.clone(),
+                        held.clone(),
+                        cluster.clone(),
+                    )
+                    .await
+                {
+                    Ok(Retained::Observed(value)) => return Ok(value),
+                    Ok(Retained::Ordinary) => {
+                        if let Some(p) = progress.as_mut() {
+                            p.park = None;
+                        }
+                    }
+                    Err(Fault::Recovery(reason)) => return Err(Fault::Recovery(reason)),
+                    Err(Fault::Stale) => return Err(Fault::Stale),
+                    Err(_) => return Ok(None),
+                }
             }
             if progress.as_ref().is_none_or(|p| p.target != *intent) {
                 let already_off = progress
@@ -1445,6 +1660,17 @@ impl PowerCoordinator {
             if !latest.matches(&p.anchor) {
                 return Err(Fault::Recovery("power_storage_identity_changed"));
             }
+            // Step S5: a proved idle sleep keeps the Pod when the region's tier admits it. Any
+            // read that fails here only means the ordinary hibernation.
+            if let Ok(Some(park)) = self.park_plan(db, intent, &cluster, sleep).await {
+                // Step S6: the record is persisted before the Cluster is written (S7).
+                p.phase = Phase::Parking;
+                p.park = Some(park);
+                current = self.write(db, Some(&current), None, p).await?;
+                map = Some(current);
+                self.cluster_fence(intent, &cluster).await?;
+                return Ok(None);
+            }
             p.phase = Phase::Hibernating;
             current = self.write(db, Some(&current), None, p).await?;
             map = Some(current);
@@ -1457,10 +1683,12 @@ impl PowerCoordinator {
             Err(Fault::Stale) => None,
             Err(Fault::Recovery(message)) => Some(recovery_observation(db, message)),
             Err(error) => {
-                if progress
-                    .as_ref()
-                    .is_some_and(|p| matches!(p.phase, Phase::Hibernating | Phase::Hibernated))
-                {
+                if progress.as_ref().is_some_and(|p| {
+                    matches!(
+                        p.phase,
+                        Phase::Hibernating | Phase::Hibernated | Phase::Parking | Phase::Parked
+                    )
+                }) {
                     return None;
                 }
                 if matches!(
@@ -2029,11 +2257,16 @@ impl PowerCoordinator {
         Ok(Some(value))
     }
 
-    pub async fn prepare_running(&self, db: &Value) -> std::result::Result<PrepareRunning, Error> {
+    pub async fn prepare_running(
+        &self,
+        db: &Value,
+        basis: &Basis<'_>,
+    ) -> std::result::Result<PrepareRunning, Error> {
         if !database_valid(db) || text(db, "desired_state") != "running" {
             return Err("invalid running desired state".into());
         }
         let intent = desired_power(db)?.ok_or("wake intent missing")?;
+        let phase = timing::Phase::begin(db, "wake_prepare");
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             let map = self.fence(db).await?;
             let protected = self.storage_protection_for_running(db, &intent).await?;
@@ -2044,8 +2277,9 @@ impl PowerCoordinator {
             {
                 return Ok(PrepareRunning::Proceed);
             }
-            let (physical, cluster) = self.anchor(db).await?;
-            let previous = map
+            let (physical, mut cluster) = self.anchor(db).await?;
+            let mut map = map;
+            let mut previous = map
                 .as_ref()
                 .map(|m| progress_from(m, self.now()))
                 .transpose()?
@@ -2066,6 +2300,34 @@ impl PowerCoordinator {
             // or hibernation-off changes. CAS clearing belongs only to the new CF intent.
             self.clear_storage_protection(db, &intent, &physical.storage_uid)
                 .await?;
+            // A database that retains its instance Pod resumes it when nothing it was parked
+            // under has changed, and otherwise demotes it before the ordinary CNPG wake.
+            if let (Some(held), Some(current)) =
+                (previous.as_ref().filter(|p| p.park.is_some()), map.as_ref())
+            {
+                match self
+                    .resume_retained(
+                        db,
+                        &intent,
+                        current.clone(),
+                        held.clone(),
+                        cluster.clone(),
+                        basis,
+                    )
+                    .await
+                {
+                    Ok((Resumed::Fast(resumed), ..)) => return Ok(PrepareRunning::Parked(resumed)),
+                    Ok((Resumed::Waiting, ..)) => return Ok(PrepareRunning::Pending),
+                    Ok((Resumed::Ordinary, next_map, next_progress, next_cluster)) => {
+                        map = Some(next_map);
+                        previous = Some(next_progress);
+                        cluster = next_cluster;
+                    }
+                    // An unknown write or a conflict is read again by the next pass.
+                    Err(Fault::Unavailable(_)) => return Ok(PrepareRunning::Pending),
+                    Err(error) => return Err(error),
+                }
+            }
             let mut progress = Progress::new(intent.clone(), Phase::Wake, physical, self.now());
             if let Some(prior) = &previous
                 && prior.target.revision == intent.revision
@@ -2079,13 +2341,19 @@ impl PowerCoordinator {
             Ok(PrepareRunning::Proceed)
         })
         .await;
-        Ok(match result {
+        let outcome = match result {
             Ok(Ok(value)) => value,
             Ok(Err(Fault::Stale)) | Err(_) => PrepareRunning::Pending,
             Ok(Err(_)) => {
                 PrepareRunning::Observation(recovery_observation(db, "wake identity unavailable"))
             }
-        })
+        };
+        match &outcome {
+            PrepareRunning::Proceed | PrepareRunning::Parked(_) => phase.completed(),
+            PrepareRunning::Pending => phase.pending(),
+            PrepareRunning::Observation(_) => phase.failed(),
+        }
+        Ok(outcome)
     }
     pub async fn publish_ready_fence(
         &self,
@@ -4193,7 +4461,11 @@ mod tls_tests {
         )
         .unwrap();
         coordinator.http = controls.client.clone();
-        let result = coordinator.suspend(&db).await.unwrap().unwrap();
+        let result = coordinator
+            .suspend(&db, &Sleep::cold())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             result["state"],
             "hibernated",
@@ -4212,7 +4484,11 @@ mod tls_tests {
                 .any(|path| path.contains("maintenance-credentials") || path.contains("ca-"))
         );
         assert_eq!(controls.calls.load(Ordering::SeqCst), 3);
-        let repeated = coordinator.suspend(&db).await.unwrap().unwrap();
+        let repeated = coordinator
+            .suspend(&db, &Sleep::cold())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(repeated["state"], "hibernated");
         let objects = server.objects.lock().unwrap();
         let map = objects
@@ -4251,14 +4527,26 @@ mod tls_tests {
             .unwrap()
             .get_mut(&cluster_path)
             .unwrap()["status"]["conditions"] = json!([]);
-        assert!(coordinator.suspend(&db).await.unwrap().is_none());
+        assert!(
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
         {
             let mut objects = server.objects.lock().unwrap();
             objects.get_mut(&cluster_path).unwrap()["status"]["conditions"] =
                 json!([{"type":HIBERNATION,"status":"True","reason":"Stopping"}]);
         }
-        assert!(coordinator.suspend(&db).await.unwrap().is_none());
+        assert!(
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .is_none()
+        );
         {
             let mut objects = server.objects.lock().unwrap();
             objects.get_mut(&cluster_path).unwrap()["status"]["conditions"] =
@@ -4266,15 +4554,31 @@ mod tls_tests {
             objects.get_mut(&pods_path).unwrap()["items"] =
                 json!([{"kind":"Pod","metadata":{"namespace":ns,"uid":id(88)}}]);
         }
-        assert!(coordinator.suspend(&db).await.unwrap().is_none());
+        assert!(
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
         server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"] = json!([]);
         controls.busy.store(true, Ordering::SeqCst);
-        assert!(coordinator.suspend(&db).await.unwrap().is_none());
+        assert!(
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
         controls.busy.store(false, Ordering::SeqCst);
         controls.swap.store(true, Ordering::SeqCst);
-        let rejected = coordinator.suspend(&db).await.unwrap().unwrap();
+        let rejected = coordinator
+            .suspend(&db, &Sleep::cold())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rejected["state"], "error");
         assert!(rejected.get("power").is_none());
         assert_eq!(rejected["archive"]["continuous"], false);
@@ -4316,7 +4620,11 @@ mod tls_tests {
             .get_mut(&storage_path)
             .unwrap()["data"][protection_key()] = marker.to_string().into();
         assert_eq!(
-            coordinator.suspend(&db).await.unwrap().unwrap()["state"],
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .unwrap()["state"],
             "error"
         );
         marker["generation"] = 1.into();
@@ -4328,7 +4636,11 @@ mod tls_tests {
             .get_mut(&storage_path)
             .unwrap()["data"][protection_key()] = marker.to_string().into();
         assert_eq!(
-            coordinator.suspend(&db).await.unwrap().unwrap()["state"],
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .unwrap()["state"],
             "error"
         );
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
@@ -4367,7 +4679,11 @@ mod tls_tests {
         let name = format!("gateway-fence-{}", text(&db, "id"));
         server.objects.lock().unwrap().insert(format!("/api/v1/namespaces/pgcf-system/configmaps/{name}"),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&intent).unwrap(),"power.json":raw}}));
         assert_eq!(
-            coordinator.suspend(&db).await.unwrap().unwrap()["state"],
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .unwrap()["state"],
             "hibernated"
         );
         assert_eq!(
@@ -4405,7 +4721,10 @@ mod tls_tests {
         )
         .unwrap();
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Proceed
         ));
         assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
@@ -4447,7 +4766,10 @@ mod tls_tests {
         let path = format!("/api/v1/namespaces/pgcf-system/configmaps/{name}");
         server.objects.lock().unwrap().insert(path.clone(),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":raw}}));
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Observation(_)
         ));
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
@@ -4466,7 +4788,10 @@ mod tls_tests {
         db["generation"] = 2.into();
         db["power"] = json!({"operation":format!("op_{}","z".repeat(20)),"revision":2,"mode":"running","reason":null});
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Proceed
         ));
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 1);
@@ -4496,7 +4821,10 @@ mod tls_tests {
         )
         .unwrap();
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Observation(_)
         ));
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
@@ -4551,7 +4879,10 @@ mod tls_tests {
             .get_mut(&storage_path)
             .unwrap()["data"][protection_key()] = marker.to_string().into();
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Observation(_)
         ));
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
@@ -4569,7 +4900,10 @@ mod tls_tests {
             .get_mut(&storage_path)
             .unwrap()["data"][protection_key()] = marker.to_string().into();
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Observation(_)
         ));
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
@@ -4586,7 +4920,10 @@ mod tls_tests {
             .get_mut(&storage_path)
             .unwrap()["data"][protection_key()] = marker.to_string().into();
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Observation(_)
         ));
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
@@ -4598,7 +4935,10 @@ mod tls_tests {
         db["creation"] = Value::Null;
         assert!(database_valid(&db));
         assert!(matches!(
-            coordinator.prepare_running(&db).await.unwrap(),
+            coordinator
+                .prepare_running(&db, &Basis::cold())
+                .await
+                .unwrap(),
             PrepareRunning::Proceed
         ));
     }
@@ -4767,7 +5107,11 @@ mod tls_tests {
         )
         .unwrap();
         coordinator.http = controls.client.clone();
-        let result = coordinator.suspend(&db).await.unwrap().unwrap();
+        let result = coordinator
+            .suspend(&db, &Sleep::cold())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result["state"], "hibernated");
         // The control endpoint accepts only the live Pod: begin, close and status reached it alone.
         assert_eq!(controls.calls.load(Ordering::SeqCst), 3);
@@ -4800,12 +5144,22 @@ mod tls_tests {
         let ns = namespace(&db);
         let pods_path = format!("/api/v1/namespaces/{ns}/pods");
         server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"] = json!([{"kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":id(88),"deletionTimestamp":"2026-10-11T00:00:00Z","labels":{"cnpg.io/cluster":"database"}},"status":{"phase":"Running"}}]);
-        assert!(coordinator.suspend(&db).await.unwrap().is_none());
+        assert!(
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
         server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"][0]["status"]["phase"] =
             "Failed".into();
         assert_eq!(
-            coordinator.suspend(&db).await.unwrap().unwrap()["state"],
+            coordinator
+                .suspend(&db, &Sleep::cold())
+                .await
+                .unwrap()
+                .unwrap()["state"],
             "hibernated"
         );
     }
@@ -4855,7 +5209,11 @@ mod tls_tests {
         p.key_version = Some(snapshot.key_version);
         let name = format!("gateway-fence-{}", text(&db, "id"));
         server.objects.lock().unwrap().insert(format!("/api/v1/namespaces/pgcf-system/configmaps/{name}"),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":serde_json::to_string(&p).unwrap()}}));
-        let result = coordinator.suspend(&db).await.unwrap().unwrap();
+        let result = coordinator
+            .suspend(&db, &Sleep::cold())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result["state"], "hibernated", "{result}");
         assert_eq!(result["power"]["revision"], 2);
         assert!(
@@ -4962,3 +5320,5 @@ mod tls_tests {
         );
     }
 }
+#[cfg(test)]
+mod parked_tests;

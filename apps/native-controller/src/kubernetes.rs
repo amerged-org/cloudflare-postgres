@@ -680,6 +680,18 @@ impl Kubernetes {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Option<Value>, Error> {
+        self.request_as(method, path, body, "application/merge-patch+json")
+            .await
+    }
+    /// `patch_type` is the Content-Type of a PATCH body; other methods send plain JSON.
+    async fn request_as(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        patch_type: &str,
+    ) -> Result<Option<Value>, Error> {
+        crate::timing::count_call();
         let token = tokio::fs::read_to_string(&self.token).await?;
         if token.trim().is_empty() {
             return Err("Kubernetes bearer missing".into());
@@ -697,7 +709,7 @@ impl Kubernetes {
                 .header(
                     "Content-Type",
                     if method == Method::PATCH {
-                        "application/merge-patch+json"
+                        patch_type
                     } else {
                         "application/json"
                     },
@@ -874,6 +886,60 @@ impl Kubernetes {
             || text(&actual["metadata"], "resourceVersion").is_empty()
         {
             return Err("Kubernetes patch readback identity changed".into());
+        }
+        Ok(actual)
+    }
+    /// Resizes the requests of named containers of a running Pod in place, through the `resize`
+    /// subresource. It is a strategic merge, because a JSON merge patch would replace the
+    /// container lists, and its only precondition is the Pod's UID: a Pod's resourceVersion churns
+    /// with every status write. Only requests are sent, so limits and the QoS class stay.
+    pub async fn resize_pod(
+        &self,
+        pod: &Value,
+        containers: &[(&str, Value)],
+        init_containers: &[(&str, Value)],
+    ) -> Result<Value, Error> {
+        let uid = text(&pod["metadata"], "uid");
+        let name = text(&pod["metadata"], "name");
+        let ns = pod["metadata"]["namespace"].as_str();
+        if uid.is_empty()
+            || text(pod, "kind") != "Pod"
+            || ns.is_none()
+            || !pod["metadata"]["deletionTimestamp"].is_null()
+            || containers.is_empty()
+        {
+            return Err("Kubernetes resize identity unavailable".into());
+        }
+        let list = |items: &[(&str, Value)]| -> Vec<Value> {
+            items
+                .iter()
+                .map(|(name, requests)| json!({"name":name,"resources":{"requests":requests}}))
+                .collect()
+        };
+        let mut spec = json!({"containers":list(containers)});
+        if !init_containers.is_empty() {
+            spec["initContainers"] = list(init_containers).into();
+        }
+        let body = json!({"metadata":{"uid":uid},"spec":spec});
+        let path = format!("{}/resize", named("Pod", ns, name)?);
+        let result = self
+            .request_as(
+                Method::PATCH,
+                &path,
+                Some(&body),
+                "application/strategic-merge-patch+json",
+            )
+            .await?
+            .ok_or("Kubernetes resize target disappeared")?;
+        if text(&result["metadata"], "uid") != uid {
+            return Err("Kubernetes resized identity changed".into());
+        }
+        let actual = self
+            .read("Pod", ns, name)
+            .await?
+            .ok_or("Kubernetes resized Pod disappeared")?;
+        if text(&actual["metadata"], "uid") != uid {
+            return Err("Kubernetes resize readback identity changed".into());
         }
         Ok(actual)
     }
@@ -1358,5 +1424,76 @@ mod transport_tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         task.await.unwrap();
         tokio::fs::remove_file(token).await.unwrap();
+    }
+}
+#[cfg(test)]
+mod resize_tests {
+    use crate::test_server::{Server, uid};
+    use serde_json::json;
+    #[tokio::test]
+    async fn a_resize_is_a_strategic_merge_of_requests_under_the_pod_uid() {
+        let server = Server::start().await;
+        server.put(json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"database-1","namespace":"pgcf-db-a","uid":uid(1)},
+            "spec":{"containers":[{"name":"postgres","image":"x","resources":{"requests":{"cpu":"25m","memory":"128Mi"},"limits":{"cpu":"250m"}}},{"name":"other","image":"y"}]},"status":{}}));
+        let pod = server
+            .k8s
+            .read("Pod", Some("pgcf-db-a"), "database-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let resized = server
+            .k8s
+            .resize_pod(
+                &pod,
+                &[("postgres", json!({"cpu":"10m","memory":"96Mi"}))],
+                &[],
+            )
+            .await
+            .unwrap();
+        let containers = &resized["spec"]["containers"];
+        assert_eq!(
+            containers[0]["resources"]["requests"],
+            json!({"cpu":"10m","memory":"96Mi"})
+        );
+        assert_eq!(containers[0]["resources"]["limits"], json!({"cpu":"250m"}));
+        assert_eq!(containers[1], json!({"name":"other","image":"y"}));
+        {
+            let state = server.state.lock().unwrap();
+            // Only the named containers' requests, under the UID alone: a Pod's resourceVersion
+            // churns.
+            assert_eq!(
+                state.writes[0].2,
+                json!({"metadata":{"uid":uid(1)},"spec":{"containers":[{"name":"postgres","resources":{"requests":{"cpu":"10m","memory":"96Mi"}}}]}})
+            );
+            assert_eq!(
+                state.patch_types[0],
+                (
+                    "/api/v1/namespaces/pgcf-db-a/pods/database-1/resize".to_string(),
+                    "application/strategic-merge-patch+json".to_string()
+                )
+            );
+        }
+        // Another Pod's identity is refused by the server under the UID precondition; a deleting
+        // Pod and a resize of nothing are refused before anything is sent.
+        let mut forged = pod.clone();
+        forged["metadata"]["uid"] = uid(2).into();
+        assert!(
+            server
+                .k8s
+                .resize_pod(&forged, &[("postgres", json!({"cpu":"5m"}))], &[])
+                .await
+                .is_err()
+        );
+        let mut deleting = pod.clone();
+        deleting["metadata"]["deletionTimestamp"] = "2026-10-15T00:00:00Z".into();
+        assert!(
+            server
+                .k8s
+                .resize_pod(&deleting, &[("postgres", json!({"cpu":"5m"}))], &[])
+                .await
+                .is_err()
+        );
+        assert!(server.k8s.resize_pod(&pod, &[], &[]).await.is_err());
+        assert_eq!(server.state.lock().unwrap().writes.len(), 1);
     }
 }

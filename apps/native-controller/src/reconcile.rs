@@ -8,7 +8,8 @@ use crate::{
     health::{self, ArchiveSample, Health},
     kubernetes::{Kubernetes, bounded},
     manifests, postgres,
-    power::{PowerCoordinator, PrepareRunning, desired_power},
+    power::{Basis, ParkedWake, PowerCoordinator, PrepareRunning, Sleep, desired_power, fenced},
+    timing,
 };
 use base64::{
     Engine,
@@ -32,6 +33,8 @@ const SWITCH: &str = "pgcf.io/runtime-switch";
 const PRESTARTED: &str = "pgcf-prestarted";
 const PROFILE: &str = "pgcf.io/compute-profile";
 const ADMISSION: &str = "pgcf-cnpg-prestarted";
+/// Longest a fast wake polls for PostgreSQL after the unfence; later passes use the kubelet.
+const ACCEPT_BUDGET: Duration = Duration::from_secs(5);
 struct RuntimeResources<'a> {
     namespace: &'a Value,
     cluster: &'a Value,
@@ -45,7 +48,9 @@ pub struct Reconciler {
     pub health: Health,
     pub cluster_uid: String,
     postgres_image: String,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    /// How long a resumed Pod is polled for a fresh, accepting postmaster before the pass ends.
+    pub(crate) accept_budget: Duration,
     pool: Option<crate::pool::Runtime>,
 }
 fn uid(v: &Value) -> Result<&str, Error> {
@@ -104,13 +109,15 @@ fn hibernated(cluster: &Value) -> bool {
             })
 }
 /// Whether applying `db` to its Cluster starts PostgreSQL on the volume, which a thin volume
-/// admits only under a current Cloudflare startup hold: resuming a hibernated Cluster, a Cluster
-/// without a primary, and a change of image, resources or parameters that rolls the primary.
+/// admits only under a current Cloudflare startup hold: resuming a hibernated Cluster or lifting
+/// the fence of a parked one, a Cluster without a primary, and a change of image, resources or
+/// parameters that rolls the primary.
 fn starts_postgres(cluster: Option<&Value>, db: &Value, default_image: &str) -> bool {
     let size = &db["size"];
     let expected = json!({"requests":{"cpu":format!("{}m",optional_number(size,"cpu_request_millicores",number(size,"cpu_millicores"))),"memory":format!("{}Mi",optional_number(size,"memory_request_mib",number(size,"memory_mib")))},"limits":{"cpu":format!("{}m",number(size,"cpu_millicores")),"memory":format!("{}Mi",number(size,"memory_mib"))}});
     cluster.is_none_or(|cluster| {
         hibernated(cluster)
+            || fenced(cluster)
             || text(&cluster["status"], "currentPrimary").is_empty()
             || text(&cluster["spec"], "imageName")
                 != db["postgres"]["image"].as_str().unwrap_or(default_image)
@@ -195,6 +202,55 @@ fn primary_current(pod: &Value, cluster: &Value, db: &Value, context: &Value) ->
         && pod["metadata"]["deletionTimestamp"].is_null()
         && text(&pod["spec"], "runtimeClassName") == runtime_class(context)
 }
+/// The desired record of a sleeping database as its wake will receive it: the API states the
+/// power of a sleeping database as a sleep and leaves out the regional scheduling request.
+fn awake(db: &Value, scheduling: &Value) -> Value {
+    let mut awake = db.clone();
+    awake["desired_state"] = "running".into();
+    if awake["power"].is_object() {
+        awake["power"]["mode"] = "running".into();
+        awake["power"]["reason"] = Value::Null;
+    }
+    if let Some(request) = scheduling["postgres_memory_request_mib"].as_u64() {
+        awake["size"]["memory_request_mib"] = request.into();
+    }
+    awake
+}
+/// What a sleeping database's retained Pod is judged against.
+pub(crate) struct RetainedManifests {
+    pub(crate) manifests: Option<Vec<Value>>,
+    pub(crate) runtime_class: &'static str,
+}
+/// The Pod a fast wake resumed is the primary only while it is still that Pod: the same UID and
+/// containers, Running on its node under the selected runtime. Its Ready bit is not read.
+fn resumed_current(
+    pod: &Value,
+    cluster: &Value,
+    db: &Value,
+    context: &Value,
+    wake: &ParkedWake,
+) -> bool {
+    let container = |statuses: &Value, name: &str| {
+        statuses
+            .as_array()
+            .and_then(|all| all.iter().find(|c| text(c, "name") == name))
+            .map(|c| text(c, "containerID").to_string())
+    };
+    cluster_owned(pod, cluster)
+        && pod["metadata"]["uid"] == wake.pod_uid.as_str()
+        && pod["metadata"]["deletionTimestamp"].is_null()
+        && text(&pod["status"], "phase") == "Running"
+        && pod["spec"]["nodeName"] == db["node"]
+        && text(&pod["spec"], "runtimeClassName") == runtime_class(context)
+        && container(&pod["status"]["containerStatuses"], "postgres").as_deref()
+            == Some(wake.postgres_container_id.as_str())
+        && container(
+            &pod["status"]["initContainerStatuses"],
+            "plugin-barman-cloud",
+        )
+        .as_deref()
+            == Some(wake.sidecar_container_id.as_str())
+}
 pub(crate) fn cluster_owned(v: &Value, cluster: &Value) -> bool {
     v["metadata"]["ownerReferences"]
         .as_array()
@@ -239,7 +295,7 @@ pub fn quantity(v: &Value) -> Option<f64> {
     let n = value.parse::<f64>().ok()? * factor;
     n.is_finite().then_some(n)
 }
-fn contains(actual: &Value, desired: &Value, path: &str) -> bool {
+pub(crate) fn contains(actual: &Value, desired: &Value, path: &str) -> bool {
     if [
         "resources.requests.cpu",
         "resources.requests.memory",
@@ -705,12 +761,15 @@ impl Reconciler {
         }
         Ok(Some(identity))
     }
+    /// `ready_required` is the kubelet's Ready bit of the Pod; a resumed Pod is judged by its
+    /// identity and SQL instead, and its sessions then dial the Pod itself.
     async fn archive(
         &self,
         db: &Value,
         cluster: &Value,
         pod: &Value,
         ca: &[u8],
+        ready_required: bool,
     ) -> Result<(Value, bool), Error> {
         let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
         let ns = namespace(db);
@@ -735,7 +794,8 @@ impl Reconciler {
         });
         let sample = if sql_eligible {
             let result=async {
-                let session=postgres::connect(db,ca,text(&db["maintenance"],"role"),text(&db["maintenance"],"password"),text(db,"id")).await?;
+                let socket=if ready_required{self.power.postgres}else{Some(self.power.pod_socket(text(&pod["status"],"podIP"))?)};
+                let session=postgres::connect_via(db,ca,text(&db["maintenance"],"role"),text(&db["maintenance"],"password"),text(db,"id"),socket).await?;
                 let identity=session.query(constant("ARCHIVE_IDENTITY_QUERY").as_str().ok_or("archive SQL not generated")?,&[&text(&db["maintenance"],"role")]).await?;
                 if identity.len()!=1{return Err::<ArchiveSample,Error>("archive SQL identity missing".into());}
                 let row=&identity[0];
@@ -796,7 +856,7 @@ impl Reconciler {
             || fresh_cluster["status"]["currentPrimary"] != pod["metadata"]["name"]
             || fresh_pod["metadata"]["uid"] != pod["metadata"]["uid"]
             || fresh_pod["status"]["podIP"] != pod["status"]["podIP"]
-            || condition(&fresh_pod, "Ready") != Some("True")
+            || (ready_required && condition(&fresh_pod, "Ready") != Some("True"))
             || !contains(&fresh_cluster["spec"], &cluster["spec"], "")
             || !contains(&cluster["spec"], &fresh_cluster["spec"], "")
             || !fresh_pod["metadata"]["deletionTimestamp"].is_null()
@@ -804,6 +864,68 @@ impl Reconciler {
             return Err("archive binding changed during probe".into());
         }
         health::archive_health(&self.k8s, db, &fresh_cluster, sample).await
+    }
+    /// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster: the
+    /// maintenance role connects to the Pod's own address under the tenant's TLS name and finds
+    /// the right database, a primary, TLS, this Pod, and a postmaster that started after the
+    /// unfence was sent. Polls inside the pass; false means not within the window.
+    async fn pg_accepting(
+        &self,
+        db: &Value,
+        ca: &[u8],
+        pod: &Value,
+        wake: &ParkedWake,
+    ) -> Result<bool, Error> {
+        let mut phase = timing::Phase::begin(db, "pg_accepting");
+        let ip = text(&pod["status"], "podIP");
+        let socket = self.power.pod_socket(ip)?;
+        let role = text(&db["maintenance"], "role");
+        if db["maintenance"].is_null() {
+            phase.failed();
+            return Err("maintenance authority absent".into());
+        }
+        let deadline = wake.started + self.accept_budget;
+        let mut polls = 0_u64;
+        loop {
+            polls += 1;
+            let attempt = async {
+                let session = postgres::connect_via(
+                    db,
+                    ca,
+                    role,
+                    text(&db["maintenance"], "password"),
+                    text(db, "id"),
+                    Some(socket),
+                )
+                .await?;
+                let rows = session.query(postgres::ACCEPTING_QUERY, &[]).await?;
+                let [row] = rows.as_slice() else {
+                    return Ok::<bool, Error>(false);
+                };
+                // The server's own clock measures the postmaster's age; the controller's
+                // monotonic clock measures the time since the unfence was sent. A postmaster
+                // older than that did not start for this wake.
+                let age: i64 = row.try_get("postmaster_age_ms")?;
+                let since = i64::try_from(wake.started.elapsed().as_millis()).unwrap_or(i64::MAX);
+                Ok(row.try_get::<_, String>("database")? == text(db, "id")
+                    && !row.try_get::<_, bool>("recovery")?
+                    && row.try_get::<_, bool>("tls")?
+                    && row.try_get::<_, String>("server_address")? == ip
+                    && (0..=since.saturating_add(250)).contains(&age))
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if let Ok(Ok(true)) = tokio::time::timeout(remaining, attempt).await {
+                phase.note("polls", polls);
+                phase.completed();
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                phase.note("polls", polls);
+                phase.pending();
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     /// Writes the database's token into its ledger, never over a newer one; `decided` is the
     /// revision of the node authority under which the token (or its absence) was decided.
@@ -1164,8 +1286,27 @@ impl Reconciler {
             // Later writes use the exact CAS result rather than the read before binding.
             fence = Some(written);
         }
+        let finalized = !db["recovery"].is_null()
+            && stored["recoveryMappedOperation"] == db["recovery"]["operation_id"];
         if state_name == "suspended" {
-            return self.power.suspend(db).await;
+            let retained = self
+                .retained_manifests(db, snapshot, prior_cluster.as_ref(), finalized)
+                .await;
+            return self
+                .power
+                .suspend(
+                    db,
+                    &Sleep {
+                        parking: &snapshot.region["parking"],
+                        basis: Basis {
+                            node: &node_observed,
+                            release: &snapshot.fleet_release,
+                            manifests: retained.manifests.as_deref(),
+                            runtime_class: retained.runtime_class,
+                        },
+                    },
+                )
+                .await;
         }
         if !db["storage"].is_null()
             && starts_postgres(prior_cluster.as_ref(), db, &self.postgres_image)
@@ -1178,9 +1319,10 @@ impl Reconciler {
             )));
         }
         let intent = desired_power(db)?;
-        let finalized = !db["recovery"].is_null()
-            && stored["recoveryMappedOperation"] == db["recovery"]["operation_id"];
         let context = self.context(db, snapshot, finalized).await?;
+        // Built here for a retained Pod's eligibility; a build failure surfaces where it always did.
+        let built = manifests::build(db, &context);
+        let mut parked: Option<ParkedWake> = None;
         if intent.is_some() {
             // CNPG creates the woken primary as soon as hibernation is released, and admission
             // matches the namespace label at that moment, so the runtime is selected first.
@@ -1190,10 +1332,17 @@ impl Reconciler {
                         .await?,
                 );
             }
-            match self.power.prepare_running(db).await? {
+            let basis = Basis {
+                node: &node_observed,
+                release: &snapshot.fleet_release,
+                manifests: built.as_ref().ok().map(Vec::as_slice),
+                runtime_class: runtime_class(&context),
+            };
+            match self.power.prepare_running(db, &basis).await? {
                 PrepareRunning::Pending => return Ok(Some(observation(db, "provisioning", None))),
                 PrepareRunning::Observation(v) => return Ok(Some(v)),
                 PrepareRunning::Proceed => {}
+                PrepareRunning::Parked(resumed) => parked = Some(resumed),
             }
         }
         if fence.is_none() && !db["storage"].is_null() {
@@ -1228,7 +1377,7 @@ impl Reconciler {
             }
         }
         fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
-        let mut manifests = manifests::build(db, &context)?;
+        let mut manifests = built?;
         let mut desired_ns = manifests.remove(0);
         desired_ns["metadata"]["annotations"] =
             json!({ACCEPTED:number(db,"generation").to_string()});
@@ -1249,6 +1398,7 @@ impl Reconciler {
         stored["namespaceUid"] = namespace_value["metadata"]["uid"].clone();
         fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
         let mut applied = vec![];
+        let apply_phase = timing::Phase::begin(db, "desired_apply");
         for manifest in &manifests {
             let actual = self.apply(db, manifest).await?;
             if text(manifest, "kind") == "Cluster" {
@@ -1264,6 +1414,7 @@ impl Reconciler {
         fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
         self.renew_storage_authority(db, integer(&authority, "revision").ok())
             .await?;
+        apply_phase.completed();
         let Some(cluster) = self.k8s.read("Cluster", Some(&ns), "database").await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
@@ -1277,9 +1428,12 @@ impl Reconciler {
         {
             return Ok(Some(observation(db, "provisioning", None)));
         }
+        let ca_phase = timing::Phase::begin(db, "ca_publication");
         let Some((ca, ca_secret)) = self.ca(db, &cluster).await? else {
+            ca_phase.pending();
             return Ok(Some(observation(db, "provisioning", None)));
         };
+        ca_phase.completed();
         if !db["recovery"].is_null() && !finalized {
             let primary = text(&cluster["status"], "currentPrimary");
             if primary.is_empty() {
@@ -1322,7 +1476,9 @@ impl Reconciler {
                 return Ok(Some(observation(db, "provisioning", None)));
             }
         }
-        if condition(&cluster, "Ready") != Some("True") {
+        // The Ready condition of a Cluster whose phase never left healthy says nothing about a
+        // resumed Pod; its identity and a SQL proof take the place of the kubelet's opinion.
+        if parked.is_none() && condition(&cluster, "Ready") != Some("True") {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let primary = text(&cluster["status"], "currentPrimary");
@@ -1332,7 +1488,16 @@ impl Reconciler {
         let Some(pod) = self.k8s.read("Pod", Some(&ns), primary).await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
-        if !primary_current(&pod, &cluster, db, &context) {
+        let current = match &parked {
+            Some(wake) => resumed_current(&pod, &cluster, db, &context, wake),
+            None => primary_current(&pod, &cluster, db, &context),
+        };
+        if !current {
+            return Ok(Some(observation(db, "provisioning", None)));
+        }
+        if let Some(wake) = &parked
+            && !self.pg_accepting(db, &ca, &pod, wake).await?
+        {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let expected_image = db["postgres"]["image"]
@@ -1348,7 +1513,7 @@ impl Reconciler {
             .ok_or("postgres runtime proof missing")?;
         let image_id = text(status, "imageID");
         if postgres_container["image"] != expected_image
-            || status["ready"] != true
+            || (parked.is_none() && status["ready"] != true)
             || status["state"]["running"].is_null()
             || !image_id.ends_with(
                 expected_image
@@ -1372,21 +1537,37 @@ impl Reconciler {
         {
             return Ok(Some(observation(db, "provisioning", None)));
         }
+        let volume_phase = timing::Phase::begin(db, "volume_identity");
         let Some(volume_identity) = self
             .bind_volume(db, &cluster, &pod, &authority, &stored)
             .await?
         else {
+            volume_phase.pending();
             return Ok(Some(observation(db, "provisioning", None)));
         };
+        volume_phase.completed();
         if applied.iter().any(|resource| {
             text(resource, "kind") == "Secret" && !credential_acknowledged(db, &cluster, resource)
         }) {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let proof_continuity = self.k8s.runtime_continuity();
-        if !postgres::roles(db, &ca, text(&pod["status"], "podIP")).await? {
+        let roles = timing::Phase::begin(db, "role_runtime_auth");
+        let roles_ok = match &parked {
+            Some(_) => {
+                let ip = text(&pod["status"], "podIP");
+                postgres::roles_pod(db, &ca, ip, self.power.pod_socket(ip)?).await?
+            }
+            None => {
+                postgres::roles(db, &ca, text(&pod["status"], "podIP"), self.power.postgres).await?
+            }
+        };
+        if !roles_ok {
+            roles.pending();
             return Ok(Some(observation(db, "provisioning", None)));
         }
+        roles.completed();
+        let unchanged = timing::Phase::begin(db, "runtime_unchanged");
         for actual in &applied {
             let Some(fresh) = self
                 .k8s
@@ -1397,6 +1578,7 @@ impl Reconciler {
                 )
                 .await?
             else {
+                unchanged.pending();
                 return Ok(Some(observation(db, "provisioning", None)));
             };
             if fresh["metadata"]["uid"] != actual["metadata"]["uid"]
@@ -1406,6 +1588,7 @@ impl Reconciler {
                     !contains(&fresh["spec"], &actual["spec"], "")
                 }
             {
+                unchanged.pending();
                 return Ok(Some(observation(db, "provisioning", None)));
             }
         }
@@ -1418,9 +1601,15 @@ impl Reconciler {
             || current_ca["metadata"]["resourceVersion"] != ca_secret["metadata"]["resourceVersion"]
             || !cluster_owned(&current_ca, &cluster)
         {
+            unchanged.pending();
             return Ok(Some(observation(db, "provisioning", None)));
         }
-        let (archive, archive_alarm) = self.archive(db, &cluster, &pod, &ca).await?;
+        unchanged.completed();
+        let metrics = timing::Phase::begin(db, "archive_metrics");
+        let (archive, archive_alarm) = self
+            .archive(db, &cluster, &pod, &ca, parked.is_none())
+            .await?;
+        metrics.completed();
         let established =
             db["creation"]["ever_ready"] == true || db["recovery"]["ever_ready"] == true;
 
@@ -1528,12 +1717,18 @@ impl Reconciler {
         if generation(&final_ns) != number(db, "generation") {
             self.k8s.patch(&final_ns,&json!({"metadata":{"annotations":{GENERATION:number(db,"generation").to_string(),ACCEPTED:number(db,"generation").to_string()}}})).await?;
         }
+        let release = timing::Phase::begin(db, "fence_release");
         let result = if let Some(intent) = intent {
             let intent = serde_json::to_value(intent)?;
             self.power.finish_running(db, result, Some(&intent)).await?
         } else {
             self.power.publish_ready_fence(db, result).await?
         };
+        if result.as_ref().is_some_and(|v| v["state"] == "ready") {
+            release.completed();
+        } else {
+            release.pending();
+        }
         if let Some(result) = &result {
             self.persist_admission_target(db, result).await?;
         }
@@ -2187,6 +2382,7 @@ impl Reconciler {
             cluster_uid,
             postgres_image,
             http,
+            accept_budget: ACCEPT_BUDGET,
             pool: None,
         })
     }
@@ -2338,7 +2534,37 @@ impl Reconciler {
             self.k8s.create(&manifest).await
         }
     }
-    async fn context(
+    /// The manifests the wake of a sleeping database would apply, for judging the instance Pod an
+    /// idle sleep may keep. Only a database that can hold such a Pod needs them: it sleeps idle
+    /// under an enabled parking policy and its Cluster is not hibernated. Manifests that cannot
+    /// be built leave that Pod's wake unproven, never assumed.
+    pub(crate) async fn retained_manifests(
+        &self,
+        db: &Value,
+        snapshot: &DesiredSnapshot,
+        cluster: Option<&Value>,
+        finalized: bool,
+    ) -> RetainedManifests {
+        let none = RetainedManifests {
+            manifests: None,
+            runtime_class: "",
+        };
+        if snapshot.region["parking"]["enabled"] != true
+            || text(&db["power"], "reason") != "idle"
+            || cluster.is_none_or(hibernated)
+        {
+            return none;
+        }
+        let awake = awake(db, &snapshot.region["scheduling"]);
+        let Ok(context) = self.context(&awake, snapshot, finalized).await else {
+            return none;
+        };
+        RetainedManifests {
+            manifests: manifests::build(&awake, &context).ok(),
+            runtime_class: runtime_class(&context),
+        }
+    }
+    pub(crate) async fn context(
         &self,
         db: &Value,
         snapshot: &DesiredSnapshot,
@@ -2680,6 +2906,10 @@ mod tests {
         assert!(!changed(&|c| {
             c["status"]["conditions"] =
                 json!([{"type":"cnpg.io/hibernation","status":"False","reason":"Hibernated"}]);
+        }));
+        // A fenced instance starts PostgreSQL when the fence is lifted.
+        assert!(changed(&|c| {
+            c["metadata"]["annotations"]["cnpg.io/fencedInstances"] = "[\"*\"]".into();
         }));
         assert!(changed(&|c| c["status"]["currentPrimary"] = "".into()));
         assert!(changed(
@@ -3205,3 +3435,5 @@ mod runtime_tests {
         assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
     }
 }
+#[cfg(test)]
+mod parked_tests;

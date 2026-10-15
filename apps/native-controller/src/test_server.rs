@@ -21,6 +21,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 type LoseReply = Box<dyn Fn(&str, &Value) -> bool + Send>;
+type RefuseWrite = Box<dyn Fn(&str, &Value) -> Option<u16> + Send>;
+type RefuseRead = Box<dyn Fn(&str) -> Option<u16> + Send>;
 type DuringText = Box<dyn FnOnce(&mut BTreeMap<String, Value>) + Send>;
 #[derive(Default)]
 pub struct State {
@@ -28,6 +30,15 @@ pub struct State {
     pub texts: BTreeMap<String, String>,
     /// Every accepted write as (method, path, request body).
     pub writes: Vec<(String, String, Value)>,
+    /// The Content-Type of every PATCH, in the order of `writes`' PATCH entries: (path, type).
+    pub patch_types: Vec<(String, String)>,
+    /// A write for which this returns a status is refused with it and never committed.
+    pub refuse: Option<RefuseWrite>,
+    /// A read for which this returns a status fails with it.
+    pub refuse_read: Option<RefuseRead>,
+    /// Every committed write as one line, appended to a log other doubles also write to, so a
+    /// test can assert the order of effects across the cluster, the gateway and PostgreSQL.
+    pub log: Option<Arc<Mutex<Vec<String>>>>,
     /// The first committed PATCH or DELETE matching (path, body) closes the connection without a
     /// reply.
     pub lose: Option<LoseReply>,
@@ -101,10 +112,53 @@ fn listed(key: &str, path: &str) -> bool {
         parts.join("/") == path
     }
 }
+/// Strategic merge of the lists the Pod resize subresource edits: named containers merge by name.
+fn strategic_merge(value: &mut Value, patch: &Value) {
+    match (value.is_array(), patch.as_array()) {
+        (true, Some(items)) if items.iter().all(|item| item["name"].is_string()) => {
+            for item in items {
+                let existing = value
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|v| v["name"] == item["name"]);
+                match existing {
+                    Some(current) => strategic_merge(current, item),
+                    None => value.as_array_mut().unwrap().push(item.clone()),
+                }
+            }
+        }
+        _ => {
+            if let Some(object) = patch.as_object() {
+                if !value.is_object() {
+                    *value = json!({});
+                }
+                for (key, new) in object {
+                    if new.is_null() {
+                        value.as_object_mut().unwrap().remove(key);
+                    } else {
+                        strategic_merge(&mut value[key], new);
+                    }
+                }
+            } else {
+                *value = patch.clone();
+            }
+        }
+    }
+}
 fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
     let reply = |status: u16, value: &Value| Some((status, serde_json::to_vec(value).unwrap()));
+    if matches!(method, "POST" | "PATCH" | "DELETE") {
+        let sent: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if let Some(status) = state.refuse.as_ref().and_then(|refuse| refuse(path, &sent)) {
+            return reply(status, &json!({"reason":"Refused"}));
+        }
+    }
     match method {
         "GET" => {
+            if let Some(status) = state.refuse_read.as_ref().and_then(|refuse| refuse(path)) {
+                return reply(status, &json!({"reason":"Refused"}));
+            }
             if let Some(text) = state.texts.get(path).cloned() {
                 if let Some(during) = state.during_text.take() {
                     during(&mut state.objects);
@@ -148,6 +202,38 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
             state.objects.insert(key.clone(), value.clone());
             state.writes.push((method.into(), key, value.clone()));
             reply(201, &value)
+        }
+        "PATCH" if path.ends_with("/resize") => {
+            // The Pod resize subresource: a strategic merge under a UID precondition only.
+            let patch: Value = serde_json::from_slice(body).unwrap();
+            let target = path.trim_end_matches("/resize");
+            let Some(mut current) = state.objects.get(target).cloned() else {
+                return reply(404, &json!({}));
+            };
+            if patch["metadata"]["uid"] != current["metadata"]["uid"] {
+                return reply(409, &json!({"reason":"Conflict"}));
+            }
+            strategic_merge(&mut current, &patch);
+            // The kubelet actuates an accepted resize at once: what the containers' statuses
+            // report follows the new requests.
+            for (spec, status) in [
+                ("containers", "containerStatuses"),
+                ("initContainers", "initContainerStatuses"),
+            ] {
+                for container in patch["spec"][spec].as_array().into_iter().flatten() {
+                    let requests = container["resources"]["requests"].clone();
+                    let seen = current["status"][status]
+                        .as_array_mut()
+                        .and_then(|all| all.iter_mut().find(|s| s["name"] == container["name"]));
+                    if let Some(seen) = seen {
+                        seen["resources"] = json!({"requests":requests});
+                        seen["allocatedResources"] = requests;
+                    }
+                }
+            }
+            advance(&mut current);
+            state.objects.insert(target.into(), current.clone());
+            committed(state, method, path, patch, &current)
         }
         "PATCH" => {
             let patch: Value = serde_json::from_slice(body).unwrap();
@@ -205,6 +291,9 @@ fn committed(
     current: &Value,
 ) -> Option<(u16, Vec<u8>)> {
     let lose = state.lose.as_ref().is_some_and(|lose| lose(path, &body));
+    if let Some(log) = &state.log {
+        log.lock().unwrap().push(format!("{method} {path} {body}"));
+    }
     state.writes.push((method.into(), path.into(), body));
     if lose {
         state.lose = None;
@@ -279,9 +368,23 @@ impl Server {
                                 .map(|(_, n)| n.trim().parse::<usize>().unwrap())
                         })
                         .unwrap_or(0);
+                    let content_type = header
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+                                .map(|(_, value)| value.trim().to_string())
+                        })
+                        .unwrap_or_default();
                     let mut body = vec![0; length];
                     tls.read_exact(&mut body).await.unwrap();
-                    let response = handle(&mut state.lock().unwrap(), &method, &path, &body);
+                    let response = {
+                        let mut state = state.lock().unwrap();
+                        if method == "PATCH" {
+                            state.patch_types.push((path.clone(), content_type));
+                        }
+                        handle(&mut state, &method, &path, &body)
+                    };
                     let Some((status, body)) = response else {
                         return;
                     };

@@ -147,7 +147,7 @@ def start():
         raise
 
 def run(path, worktree, target, target_dir, example="pool-kubernetes"):
-    if example not in ("pool-kubernetes", "pool-qualification-kubernetes"):
+    if example not in ("pool-kubernetes", "pool-qualification-kubernetes", "parked-kubernetes"):
         raise RuntimeError("Fixture example invalid")
     if not target_dir or len(target_dir)>96 or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-/" for c in target_dir) or ".." in target_dir:
         raise RuntimeError("Fixture target directory invalid")
@@ -171,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--worktree",type=Path,default=Path(__file__).resolve().parents[3])
     parser.add_argument("--target-volume",default="pgcf-diag-target-amd64")
     parser.add_argument("--target-dir",default="warm-pool-routing-kubernetes")
-    parser.add_argument("--example", choices=["pool-kubernetes", "pool-qualification-kubernetes"], default="pool-kubernetes")
+    parser.add_argument("--example", choices=["pool-kubernetes", "pool-qualification-kubernetes", "parked-kubernetes"], default="pool-kubernetes")
     args=parser.parse_args()
     try:
         if args.mode=="start":start()

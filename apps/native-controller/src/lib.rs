@@ -15,7 +15,12 @@ pub mod postgres;
 pub mod power;
 pub mod reconcile;
 #[cfg(test)]
+mod test_postgres;
+#[cfg(test)]
 mod test_server;
+#[cfg(test)]
+mod test_world;
+pub mod timing;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Plain-HTTP client for in-cluster endpoints (gateway activity and power, PostgreSQL exporter).
 /// The image is `FROM scratch`, where Linux has no platform CA roots, so it pins an empty trust

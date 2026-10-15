@@ -8,6 +8,7 @@ use pgcf_native_controller::{
     measurements::Measurements,
     node_storage::{Renewal, Sampler, driver_image, sample_node},
     reconcile::{Reconciler, newer_token, storage_claims, storage_snapshot_expired},
+    timing,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1003,7 +1004,12 @@ async fn run() -> Result<(), Error> {
             result=pool_refills.join_next(), if !pool_refills.is_empty() => {
                 if !matches!(result,Some(Ok(Ok(())))) {eprintln!("{{\"event\":\"pool_inventory_cycle_unknown\"}}");}
             },
-            _ = meter_interval.tick() => {
+            scheduled = meter_interval.tick() => {
+                // The runtime is one thread: a late tick is the lag every task of it suffers.
+                let lag = Instant::now().saturating_duration_since(scheduled);
+                if lag >= Duration::from_millis(50) {
+                    eprintln!("{}", json!({"event":"loop_lag_ms","lag_ms":lag.as_millis() as u64}));
+                }
                 if control_healthy && have_full_snapshot && metering.is_empty() {
                     let measurements=measurements.clone();
                     let databases:Vec<_>=cells.values().filter(|cell|Instant::now().duration_since(cell.authority_at)<=Duration::from_secs(90)).map(|cell|cell.db.clone()).collect();
@@ -1088,7 +1094,15 @@ async fn run() -> Result<(), Error> {
                             pulls.spawn_local(async move { (None, Instant::now(), api.desired(None).await) });
                         }
                     },
-                    Some(Hint::Pull(Some(ids))) => pull_ids.extend(ids),
+                    Some(Hint::Pull(Some(ids))) => {
+                        // A hint for a sleeping database is the start of a wake.
+                        for id in &ids {
+                            if cells.get(id).is_some_and(|cell| cell.db["desired_state"] == "suspended") {
+                                timing::point("wake_hint_received", id);
+                            }
+                        }
+                        pull_ids.extend(ids);
+                    },
                     Some(Hint::Kube(id, kind)) => {
                         for id in kube_hint_ids(&cells,&id) {
                             if let Some(cell) = cells.get_mut(&id) {
@@ -1104,6 +1118,7 @@ async fn run() -> Result<(), Error> {
                 if let Some(Ok((requested, pulled_at, result))) = result {
                     if let Some(ids) = &requested {
                         for id in ids { targeted_pulls.remove(id); }
+                        timing::pulled(ids, pulled_at.into_std(), result.is_ok());
                     }
                     let is_full = requested.is_none();
                     if is_full { pull_full = false; }
@@ -1277,7 +1292,7 @@ async fn run() -> Result<(), Error> {
                         }
                         let observed = tokio::time::timeout(
                             RECONCILE_BUDGET,
-                            controller.reconcile(&db, &snapshot),
+                            timing::summarized(&db, controller.reconcile(&db, &snapshot)),
                         )
                         .await
                         .map_err(|_| "database reconcile deadline exceeded")??;
@@ -1289,7 +1304,9 @@ async fn run() -> Result<(), Error> {
                                     "ready" | "deleted" | "hibernated"
                                 ))
                         {
+                            let post = timing::Phase::begin(&db, "observation_post");
                             api.observation(observation.clone()).await?;
+                            post.completed();
                         }
                         Ok(observed)
                     }
