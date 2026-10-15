@@ -13,6 +13,7 @@ COPY apps/edge-rust/ apps/edge-rust/
 COPY apps/native-reclaimer/ apps/native-reclaimer/
 COPY apps/native-bootstrap-relay/ apps/native-bootstrap-relay/
 COPY apps/node-runtime/ apps/node-runtime/
+COPY apps/pool-supervisor/ apps/pool-supervisor/
 COPY apps/native-controller/ apps/native-controller/
 COPY apps/sandbox-controller/ apps/sandbox-controller/
 COPY apps/native-gateway/ apps/native-gateway/
