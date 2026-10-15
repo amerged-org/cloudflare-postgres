@@ -34,7 +34,7 @@ import { desiredRegionArchiveSources } from "./region-archive-sources.ts";
 import { desiredDeferredPoolRole } from "./roles.ts";
 
 import {
-  desiredRegionStorageNodes,
+  readRegionThinStorage,
   storageWriteAuthorityForDatabase,
 } from "./node-thin-storage.ts";
 import { desiredRegionStorageSamples } from "./node-thin-storage-samples.ts";
@@ -72,22 +72,39 @@ export async function desired(
 ): Promise<Response> {
   const started = Date.now();
   const region = await agentRegion(c);
-  const admissionCapable = await admissionSnapshotCapable(c.env.DB, region.id);
-  const poolCapable = await postgresPoolCapable(c.env.DB, region.id);
+  // The controller pulls this page on every wake hint. What depends only on the region is read
+  // together; the pool policies and the rows follow the capability they depend on.
+  const [
+    admissionCapable,
+    poolCapable,
+    policy,
+    thin,
+    storageSamples,
+    fleetRelease,
+    recoverySources,
+  ] = await Promise.all([
+    admissionSnapshotCapable(c.env.DB, region.id),
+    postgresPoolCapable(c.env.DB, region.id),
+    c.env.DB.prepare(
+      "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json,parked_tier_json FROM node_region_policies WHERE region_id=?",
+    )
+      .bind(region.id)
+      .first<{
+        placement_mode: string;
+        maximum_database_memory_mib: number | null;
+        postgres_memory_request_mib: number | null;
+        compute_pool_json: string | null;
+        parked_tier_json: string | null;
+      }>(),
+    readRegionThinStorage(c.env, region.id),
+    desiredRegionStorageSamples(c.env, region.id),
+    readDesiredFleetRelease(c.env.DB, region.id),
+    desiredRegionArchiveSources(c.env, region.id),
+  ]);
+  const storageNodes = thin.nodes;
   const postgresPools = poolCapable
     ? await readPostgresPoolPolicies(c.env, region.id)
     : [];
-  const policy = await c.env.DB.prepare(
-    "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json,parked_tier_json FROM node_region_policies WHERE region_id=?",
-  )
-    .bind(region.id)
-    .first<{
-      placement_mode: string;
-      maximum_database_memory_mib: number | null;
-      postgres_memory_request_mib: number | null;
-      compute_pool_json: string | null;
-      parked_tier_json: string | null;
-    }>();
   // The region policy is the only switch, and it is served whether enabled or not: a disabled
   // policy is how the controller learns to demote what it parked. A stored policy that no longer
   // parses is served as none, which demotes the same way.
@@ -102,8 +119,6 @@ export async function desired(
           postgres_memory_request_mib: policy.postgres_memory_request_mib,
         }
       : undefined;
-  const storageNodes = await desiredRegionStorageNodes(c.env, region.id),
-    storageSamples = await desiredRegionStorageSamples(c.env, region.id);
   const result = await c.env.DB.prepare(
     `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
@@ -174,8 +189,14 @@ export async function desired(
     const storage = row.storage_profile_json
       ? DesiredDatabaseStorage.parse(JSON.parse(row.storage_profile_json))
       : undefined;
+    // The page's own reading of the node judges its database: the node is not read again.
     const storageAuthority = storage
-      ? await storageWriteAuthorityForDatabase(c.env, row)
+      ? await storageWriteAuthorityForDatabase(
+          c.env,
+          row,
+          undefined,
+          row.node_id === null ? undefined : thin.snapshots.get(row.node_id),
+        )
       : undefined;
     const physical = storageNodes.find(
       (value) => value.node_id === row.node_id,
@@ -303,8 +324,6 @@ export async function desired(
       }),
     );
   }
-  const fleetRelease = await readDesiredFleetRelease(c.env.DB, region.id);
-  const recoverySources = await desiredRegionArchiveSources(c.env, region.id);
   const response = c.json(
     DesiredResponse.parse({
       ...(fleetRelease ? { fleet_release: fleetRelease } : {}),

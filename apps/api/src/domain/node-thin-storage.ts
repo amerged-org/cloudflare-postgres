@@ -167,26 +167,46 @@ export async function readCurrentNodeThinStorage(
   return { row, profile, authority, reclamation };
 }
 
-/** No native proof means no authority; ordinary regional physical metrics cannot fill this gap. */
+/**
+ * Every thin node of a region at one instant: the authority each hands out, and the reading it came
+ * from, which a database of that node's page entry is judged by without reading the node again.
+ * No native proof means no authority; ordinary regional physical metrics cannot fill this gap.
+ */
+export async function readRegionThinStorage(
+  env: Pick<Env, "DB">,
+  regionId: string,
+  now = Date.now(),
+) {
+  const [samplingCapable, rows] = await Promise.all([
+    thinStorageSamplingCapable(env.DB, regionId),
+    env.DB.prepare(
+      "SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE n.region_id=? ORDER BY n.id",
+    )
+      .bind(regionId)
+      .all<{ node_id: string }>(),
+  ]);
+  const readings = await Promise.all(
+    rows.results.map((row) =>
+      readCurrentNodeThinStorage(env, row.node_id, now),
+    ),
+  );
+  const nodes: NodeThinStorageAuthority[] = [],
+    snapshots = new Map<string, (typeof readings)[number]>();
+  rows.results.forEach((row, index) => {
+    const current = readings[index];
+    snapshots.set(row.node_id, current);
+    const proof = current?.authority ?? current?.reclamation;
+    if (proof && (samplingCapable || proof.inventory_observed_at === undefined))
+      nodes.push(proof);
+  });
+  return { nodes, snapshots };
+}
 export async function desiredRegionStorageNodes(
   env: Pick<Env, "DB">,
   regionId: string,
   now = Date.now(),
 ): Promise<NodeThinStorageAuthority[]> {
-  const samplingCapable = await thinStorageSamplingCapable(env.DB, regionId);
-  const rows = await env.DB.prepare(
-    "SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE n.region_id=? ORDER BY n.id",
-  )
-    .bind(regionId)
-    .all<{ node_id: string }>();
-  const result: NodeThinStorageAuthority[] = [];
-  for (const row of rows.results) {
-    const current = await readCurrentNodeThinStorage(env, row.node_id, now);
-    const proof = current?.authority ?? current?.reclamation;
-    if (proof && (samplingCapable || proof.inventory_observed_at === undefined))
-      result.push(proof);
-  }
-  return result;
+  return (await readRegionThinStorage(env, regionId, now)).nodes;
 }
 
 /** A protective stop is released only by an authorized newer generation, never by a renewal. */
