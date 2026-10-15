@@ -366,6 +366,8 @@ configuration fails explicitly. Unit tests do not replace the live phase accepta
 - [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
 - [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): approved
   target architecture, shared prestarted compute pool, routing and additional warm-reclaim acceptance.
+- [Integrator handover](docs/operations/integrator-handover.md): the model, lifecycle API, client
+  behaviour, limits, metering and recovery for an integrator that creates databases on PGCF.
 - [Source-backed diagrams](docs/architecture/mermaider/README.md): declared Cloudflare resources,
   CI dependencies, current core D1 tables and the reviewed AddNode orchestration.
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
