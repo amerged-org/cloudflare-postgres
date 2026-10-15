@@ -2,7 +2,11 @@
 // The API half of the parked sleep tier on real D1: observation, accounting, host lease and policy.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
-import { DatabaseWithOperation } from "@pgcf/contracts";
+import {
+  DatabaseWithOperation,
+  DesiredResponse,
+  type ParkedTierPolicy,
+} from "@pgcf/contracts";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import {
   awakeWriter,
@@ -11,6 +15,7 @@ import {
   idleIntent,
   parkedPod,
   parkedWriter,
+  type AwakeWriter,
 } from "./parked-tier-fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
@@ -19,6 +24,7 @@ import {
   nodeCpuHeadroomSql,
 } from "../../src/domain/startup-admission.ts";
 import { placementNodes } from "../../src/domain/placement.ts";
+import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -30,10 +36,34 @@ afterEach(async () => {
       .run();
 });
 
+const policy: ParkedTierPolicy = {
+  enabled: true,
+  ttl_seconds: 600,
+  max_per_node: 8,
+  postgres_cpu_millicores: 10,
+  postgres_memory_mib: 96,
+  sidecar_cpu_millicores: 5,
+  sidecar_memory_mib: 64,
+};
+/** The fixture's own runtime policy plus the parked tier, as the owner's PUT would carry it. */
+const region = (id: string, parked: ParkedTierPolicy | null | undefined) => ({
+  region_id: id,
+  max_nodes: 2,
+  purchases_enabled: false,
+  order: null,
+  placement_mode: "actual_ram" as const,
+  maximum_database_memory_mib: 4096,
+  postgres_memory_request_mib: 128,
+  ...(parked === undefined ? {} : { parked_tier: parked }),
+});
 const parkedRecord = async (id: string) => {
   const raw = (await databaseRow(id)).parked_json;
   return raw === null || raw === undefined ? null : JSON.parse(raw);
 };
+const desired = async (w: AwakeWriter) =>
+  DesiredResponse.parse(
+    await (await request("/agent/v1/desired", w.f.agent)).json(),
+  );
 it("parked_observation_is_stored_only_for_idle_sleeps_and_cleared_by_ready_or_demotion", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases)),
     intent = await idleIntent(w);
@@ -276,4 +306,79 @@ it("a_parked_database_can_be_resized_while_it_counts_as_cold", async () => {
       .bind(target)
       .run();
   }
+});
+
+it("desired_region_parking_follows_the_region_policy", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases)),
+    region_id = w.f.region;
+  const parking = async () => (await desired(w)).region.parking;
+  // Nothing is served until the operator writes a policy: the region is as it was before.
+  expect(await parking()).toBeUndefined();
+  await configureNodeRegionPolicy(env.DB, region(region_id, policy));
+  expect(await parking()).toEqual(policy);
+  // A disabled policy is still served: it is how the controller learns to demote.
+  await configureNodeRegionPolicy(
+    env.DB,
+    region(region_id, { ...policy, enabled: false }),
+  );
+  expect(await parking()).toEqual({ ...policy, enabled: false });
+  // Omitting it keeps it; null removes it.
+  await configureNodeRegionPolicy(env.DB, region(region_id, undefined));
+  expect(await parking()).toEqual({ ...policy, enabled: false });
+  await configureNodeRegionPolicy(env.DB, region(region_id, null));
+  expect(await parking()).toBeUndefined();
+});
+
+it("capacity_policy_parked_tier_roundtrip_and_keep_semantics", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases)),
+    path = `/v1/regions/${w.f.region}/capacity-policy`,
+    admin = w.f.admin;
+  const read = async () =>
+    (await (await request(path, admin)).json()) as Record<string, unknown>;
+  const stored = await read();
+  // Returned only when set.
+  expect(stored).not.toHaveProperty("parked_tier");
+  const set = await request(path, admin, "PUT", {
+    ...stored,
+    parked_tier: policy,
+  });
+  expect(set.status).toBe(200);
+  expect(await set.json()).toMatchObject({ parked_tier: policy });
+  expect(await read()).toMatchObject({ parked_tier: policy });
+  // Omitted on PUT: keeps the stored value.
+  const kept = await request(path, admin, "PUT", { ...stored });
+  expect(kept.status).toBe(200);
+  expect(await read()).toMatchObject({ parked_tier: policy });
+  // Another change in the same document leaves it too.
+  const edited = await request(path, admin, "PUT", {
+    ...stored,
+    parked_tier: { ...policy, ttl_seconds: 300, max_per_node: 3 },
+  });
+  expect(edited.status).toBe(200);
+  expect(await read()).toMatchObject({
+    parked_tier: { ...policy, ttl_seconds: 300, max_per_node: 3 },
+  });
+  // Bounds belong to the contract: beyond the startup-probe kill nothing is stored.
+  for (const invalid of [
+    { ...policy, ttl_seconds: 3301 },
+    { ...policy, ttl_seconds: 59 },
+    { ...policy, max_per_node: 65 },
+    { ...policy, unknown: true },
+  ]) {
+    const refused = await request(path, admin, "PUT", {
+      ...stored,
+      parked_tier: invalid,
+    });
+    expect(refused.status).toBe(400);
+  }
+  expect(await read()).toMatchObject({
+    parked_tier: { ...policy, ttl_seconds: 300, max_per_node: 3 },
+  });
+  // null removes it.
+  const cleared = await request(path, admin, "PUT", {
+    ...stored,
+    parked_tier: null,
+  });
+  expect(cleared.status).toBe(200);
+  expect(await read()).not.toHaveProperty("parked_tier");
 });

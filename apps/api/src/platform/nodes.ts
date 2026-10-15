@@ -308,6 +308,7 @@ export async function getCapacityPolicy(
       standing_cost_profile: string | null;
       compute_pool_json: string | null;
       thin_storage_json: string | null;
+      parked_tier_json: string | null;
     }>();
   if (!row)
     throw new ApiError("not_found", "Region capacity policy is not configured");
@@ -334,6 +335,9 @@ export async function getCapacityPolicy(
         : {}),
       ...(row.thin_storage_json
         ? { thin_storage: JSON.parse(row.thin_storage_json) }
+        : {}),
+      ...(row.parked_tier_json
+        ? { parked_tier: JSON.parse(row.parked_tier_json) }
         : {}),
       standing_cost_profile:
         row.standing_cost_profile === null
@@ -413,6 +417,9 @@ export async function setCapacityPolicy(
         ...(policy.thin_storage === undefined
           ? {}
           : { thin_storage: policy.thin_storage }),
+        ...(policy.parked_tier === undefined
+          ? {}
+          : { parked_tier: policy.parked_tier }),
         autoscale_enabled: policy.autoscale_enabled,
         adopt_instance_ids: policy.adopt_instance_ids,
       },
