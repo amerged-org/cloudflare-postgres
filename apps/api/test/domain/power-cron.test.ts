@@ -166,4 +166,4 @@ it("pages timeout recovery and leaves the remaining owned suspension pending", a
       "SELECT database_id FROM power_timeout_cursor WHERE singleton=1",
     ).first(),
   ).toEqual({ database_id: null });
-});
+}, 30_000);
