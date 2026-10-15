@@ -1,7 +1,7 @@
 # Retained-node fleet patches
 
 These per-node endpoints are existing building blocks. The one-request fleet coordinator is
-implemented; its rollouts patched EU1 and control through R2.11 (both R2.11 patches completed on 2026-10-14). EU1 has reported `pending` since its Thin block (see go-live step 2 in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path)).
+implemented; its rollouts patched EU1 and control through R2.11 (both R2.11 patches completed on 2026-10-14). EU1 has reported `pending` since its Thin block (see go-live step 3 in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path)).
 Manual orchestration of these endpoints does not establish automatic fleet acceptance.
 
 The management API provides an assignment-bound `PatchNode` Workflow and a separate Native

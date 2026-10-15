@@ -1,9 +1,8 @@
 # ULTRA — customer-ready PostgreSQL
 
 Canonical scope and status. The owner decision of **11 October 2026** makes the fleet EU-only. On
-**15 October 2026** the owner approved going live: OMH creates its new databases on PGCF once the
-[go-live path](#go-live-path) is complete; existing Neon databases move afterwards in a separate
-step.
+**15 October 2026** the owner approved going live: the first integrator creates its new databases
+on PGCF once the [go-live path](#go-live-path) is complete.
 
 ## Fixed scope
 
@@ -67,7 +66,7 @@ no region-wide maintenance lock; later acceptance uses dedicated test projects w
   stay dormant and are not reused.
 - **Current constraints.** EU selects a receipt-bearing release (R2.11) with matching `compute_pool`
   and `thin_storage` templates, so the R2b gate is met. `AddNode` still needs every live EU member
-  converged, and EU1 reports `pending` while Thin is blocked (go-live step 2). An EU addition also
+  converged, and EU1 reports `pending` while Thin is blocked (go-live step 3). An EU addition also
   lacks the write-once EU installation profile, and its outside network proof needs a Ready node in
   another Contabo region; while EU is the only region it needs the manual network-proof path. The
   purchase itself checks neither, so purchases stay off.
@@ -81,7 +80,7 @@ no region-wide maintenance lock; later acceptance uses dedicated test projects w
 | EU-only fleet | US1 marked lost 2026-10-11; EU material revision 3 (Talos 1.14.2, Kubernetes 1.36.5) active with retired authority rejected; R1.2 converged on EU1 and control without operator intervention. |
 | EU acceptance (standard runtime) | New database ready in 30.7 s, SQL through Cloudflare 0.57 s, base backup and WAL in R2 after 20.7 s, delete and storage reclaim 93.3 s. |
 | Wake path | Cold wake to first row 8.1–9.4 s (Gate 0, 2026-10-12, no RuntimeClass); awake first row 0.47–0.96 s (0.54–0.61 s in the Gate 0 warm rounds); Pod Ready → Edge admission about 1.1–2.9 s after the wake orchestration (was 4–5 s; Pod Ready at one-second resolution). |
-| R2 native runtime | R2.11's native controller and gateway patches completed on EU1 (09:45Z) and control (09:51Z) on 2026-10-14; since the Thin block (go-live step 2) EU1 and the R2.11 rollout report `pending`. The usage outbox drains and a woken database sleeps after 60 s idle. |
+| R2 native runtime | R2.11's native controller and gateway patches completed on EU1 (09:45Z) and control (09:51Z) on 2026-10-14; since the Thin block (go-live step 3) EU1 and the R2.11 rollout report `pending`. The usage outbox drains and a woken database sleeps after 60 s idle. |
 | EU1 upgrade | 6 vCPU and 12 GB (11,943 MiB visible); the reboot's configuration proof and kubelet pin were renewed through the fleet path; idle node CPU 3.23 %, RAM 8.72 %. |
 | Thin qualification | Run 14 passed all seven gates; `startup_bound` maximum sample gap 3,574 ms < 5,000 ms; cleanup restored the volume group byte-exactly. |
 | Thin authority renewal | Option 1 deployed: native sampling every 2 s, capability gating and composed authority; scrape p99 119–134 ms in the qualification windows. |
@@ -105,17 +104,15 @@ its measured result. Steps 8–13 run in parallel with 2–7; the canary starts 
 | 4 | Thin acceptance | The R2.10 pass (2026-10-14 07:25–07:35Z) committed 1,000 rows and archived base backup and WAL, but its restore could not restart after a startup-authority gap (fixed in R2.11); the only restore with a matching digest ran on R2.9 after a manual base backup. None of it applies to the go-live release. | On the go-live release: create, SQL through Cloudflare, automatic base backup and WAL, restore with the same digest, delete with reclaim, idle sleep and wake; a control reboot while a Thin database is awake under writes shows the protective stop, resume and no lost acknowledged commit; the checks of section 11 of the [renewal proposal](thin-authority-renewal.md) pass. |
 | 5 | Sub-second wake | Not measured yet on the parked tier. Budget (spec 6.1): the awake path is 0.47–0.96 s (0.54–0.61 s warm) from a laptop; the first parked implementation is expected at 1.3–2.2 s with kubelet readiness in the loop, about 1.1–1.2 s with direct SQL readiness, a gateway change that routes to the attested Pod before its Ready condition, and the trims of spec 6.4; below 1 s needs a further 130–200 ms. PostgreSQL's clean start is 111–117 ms on EU1. Measure from a Cloudflare Worker as well as a laptop. | A woken parked database's first SQL through Cloudflare is measured stage by stage in milliseconds, five times with a 2 minute gap, and its p50 is below 1 s; misses (demoted, hibernated) are labelled; data and archive continuity hold. |
 | 6 | Parked tier acceptance | Not run. Includes TTL and cap demotion, controller and CNPG-operator restarts, an instance manager killed, a Pod deleted by hand, role password reset and resize while parked, manual suspend, delete with reclaim, and the cost of the sidecar's catalog maintenance while parked. | Spec 7.3 L0–L7 and live checks V-1…V-13 pass on EU1; RAM and CPU per parked database and the CNPG operator load are measured; the per-node cap is set from them. |
-| 7 | Density on EU1 | Defined [below](#density-load-test-12-gb-node); runs after steps 5–6 because parked databases change idle RAM and the awake budget. | Awake limit K, sleep release and storm admission match the code for the class mix; maximum Thin databases per class and the memory-start bound are recorded; caps OMH must enforce are stated. |
+| 7 | Density on EU1 | Defined [below](#density-load-test-12-gb-node); runs after steps 5–6 because parked databases change idle RAM and the awake budget. | Awake limit K, sleep release and storm admission match the code for the class mix; maximum Thin databases per class and the memory-start bound are recorded; caps integrators must enforce are stated. |
 | 8 | Alerts | Waiting for the owner's Resend secret (`RESEND_API_KEY`) in Cloudflare, a sender on a Resend-verified domain and a recipient. Alert kinds cover infrastructure only: EU1 Thin has been `blocked` since 2026-10-14 16:01Z with no alarm, and the only EU database reports archive and disk `unknown`. The minute cron runs about 15 steps unisolated and ends with alerting and backup dispatch, so an earlier failure silently disables both. Changing the sender or recipient revokes an unfinished daily backup run. | One real alarm arrives at the named recipient; RAM, CPU, storage and infrastructure-backup alarms, per-database WAL-archive failure, base backup older than 36 h (hibernated skips excluded), Thin `blocked` and protective stop are delivered, each with a runbook action; a stopped or failing cron raises an alarm that does not depend on the cron; configuration is set outside the 00:00Z backup window. |
 | 9 | Backups | 2026-10-14 failed all three automatic same-day attempts with `infrastructure_backup_operator_portforward_timeout` while an R2.8 rollout was patching control (00:00–00:34Z); same-day retry works (2026-10-12 completed on attempt 3). Daily artifacts have only been read back, never restored; Cloudflare states that a running D1 export blocks other D1 requests while the 2 s write-authority samples need D1 within a 10 s guard. | The port-forward cause is fixed or rollouts avoid the window; one D1 artifact is decrypted with the offline key copy and imported into a scratch D1 with integrity checks, and the etcd artifact passes a snapshot status check; the export's request-block window is measured and a night with an awake Thin database under writes and one wake during the export shows no protective stop and no failed wake, otherwise method or schedule change. |
 | 10 | Control database growth | `usage_samples` has no retention: 636,689 rows for 66 databases since 2026-10-04, and the hibernated retained database alone wrote 17,456 rows (9 MB) in 24 h (gateway 11,340, agent 5,646, backup 470). At 100 databases D1's 10 GB limit is about two weeks away and the blocking export grows with it (413 MB on 2026-10-13, 468 MB on 2026-10-15). | Idle hibernated databases emit no samples; raw samples covered by finalized hourly rollups are pruned in bounded batches; D1 bytes per database per day and the headroom to 10 GB are recorded. |
 | 11 | Credential hygiene | The EU-archive read key issued for the US region and the US R2, Tunnel and source-read tokens are still valid (US1 is cancelled but running until 2026-11-04 and its configuration is treated as compromised); the Cloudflare account that holds PGCF's D1 and R2 is shared with unrelated projects whose account-wide tokens can read or change them (owner decision, see After go-live). | Each US credential is revoked and a read with it is refused while EU archive reads and writes still work; the pending US database record is removed; `ARCHIVE_US` is kept. |
 | 12 | Recovery | Per-database restore returns a new ID. Replacing a lost EU1 needs a purchase, `AddNode` recover, the EU installation profile and the manual network-proof path; control (relay, API server, sampling source) has no loss procedure; lost-node patch closure is open, so an unfinished patch on a lost EU1 blocks the region's rollout guard. | The EU installation profile exists; the owner has pre-approved a costed replacement order for an EU1 loss (or EU2 exists); lost-node patch closure is delivered; the runbooks for EU1 loss and control loss are written with their preconditions checked and state the measured control-reboot impact; no purchase is made. |
-| 13 | Integrator access and catalog | Project-scoped credential isolation has not been exercised live. Eight size classes are enabled, six of them test classes, and the 256 MiB class keeps backups for one day. | OMH has its own key whose scope and rotation are verified live; the owner approves the production class catalog (memory, CPU, storage, `max_connections`, `sleep_after_seconds`, `archive_timeout`, `backup_retention_days`) and test classes are disabled; the deployed handshake limit (120 new WebSocket connections per 60 s per database) is stated. |
-| 14 | Handover | Open | The [integrator handover](../operations/integrator-handover.md) states measured values: RPO and PITR window per class, Thin hit and miss latency, 57P03 meanings and retry rule, connection limits, role-change deferral on pool-bound databases, outage classes and maintenance windows, new IDs after restore or node loss, capacity caps; OMH confirms it in writing. |
-| 15 | OMH adapter | Not implemented (OMH decision D381); to be built in the OMH repository. | From OMH staging through `db.ohmyho.st` with the Neon serverless driver: create, role and connection URI, password reset, suspend and resume, resize, PITR restore rebound to the new ID, delete; 57P03 and capacity waits handled; hourly usage of a pool-served database matches its awake time. |
-| 16 | Canary | Open | At least five internal OMH databases run on the go-live release for at least 72 h including two nightly backup windows: each shows a completed base backup younger than 36 h and continuous WAL, no `53300` refusals, one PITR restore is rebound by OMH and no acknowledged commit is lost; then OMH creates all new databases on PGCF. |
-| 17 | Neon migration | After step 16; separate task. | Existing OMH databases move with a verified copy and a way back to Neon. |
+| 13 | Integrator access and catalog | Project-scoped credential isolation has not been exercised live. Eight size classes are enabled, six of them test classes, and the 256 MiB class keeps backups for one day. | The integrator has its own key whose scope and rotation are verified live; the owner approves the production class catalog (memory, CPU, storage, `max_connections`, `sleep_after_seconds`, `archive_timeout`, `backup_retention_days`) and test classes are disabled; the deployed handshake limit (120 new WebSocket connections per 60 s per database) is stated. |
+| 14 | Handover | Open | The [integrator handover](../operations/integrator-handover.md) states measured values: RPO and PITR window per class, Thin hit and miss latency, 57P03 meanings and retry rule, connection limits, role-change deferral on pool-bound databases, outage classes and maintenance windows, new IDs after restore or node loss, capacity caps; the first integrator confirms it in writing. |
+| 15 | Canary | Open | At least five internal databases of the first integrator run on the go-live release for at least 72 h including two nightly backup windows: each shows a completed base backup younger than 36 h and continuous WAL, no `53300` refusals, one PITR restore is rebound by the integrator and no acknowledged commit is lost; then the integrator creates all new databases on PGCF. |
 
 ## After go-live
 
@@ -165,7 +162,7 @@ Six checks per node:
 1. Selected Talos/Kubernetes release and Node Ready.
 2. Flux/Helm/platform Ready at the selected immutable revision.
 3. Fresh actual RAM and inventory in Cloudflare.
-4. Real SQL through `db.ohmyho.st`, correct roles/TLS, deletion and physical storage reclamation.
+4. Real SQL through the database hostname, correct roles/TLS, deletion and physical storage reclamation.
 5. R2 base backup, archived WAL and real restore into a separate target.
 6. Existing databases and committed markers preserved.
 
@@ -179,7 +176,7 @@ new workload density still requires measurement.
 
 ## Density load test (12 GB node)
 
-Go-live step 8's density and sleeping-CPU-release measurement: EU1 (6 vCPU, owner-upgraded 12 GB
+Go-live step 7's density and sleeping-CPU-release measurement: EU1 (6 vCPU, owner-upgraded 12 GB
 RAM; 11,943 MiB visible after the upgrade) runs
 16 × 256 MiB and 1 × 1 GiB thin databases (`sleep_after_seconds` 60) through Cloudflare.
 
@@ -227,7 +224,7 @@ platform Pod eviction, OOM or restart; MemoryPressure outside S6; EU1 NotReady; 
 samples; a node addition; a volume at 80 % or thin data at its reserve; a data-safety violation; a
 retained database changing state; overlap with thin qualification, a rollout or the 03:00 backups.
 
-**Prerequisites.** Go-live steps 2–5; retained databases suspended; `autoscale_enabled` false, no
+**Prerequisites.** Go-live steps 2–6; retained databases suspended; `autoscale_enabled` false, no
 held node addition, purchases off. The run follows the warm pool, which changes P and idle RAM.
 
 ## Thin storage qualification gates
