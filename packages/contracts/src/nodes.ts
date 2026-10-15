@@ -249,7 +249,7 @@ export const NodeRegionPolicy = z
     parked_tier: ParkedTierPolicy.nullable()
       .optional()
       .describe(
-        "Optional parked sleep tier: after an idle sleep the database's instance Pod stays and only PostgreSQL stops, so the next connection wakes in a fraction of a Pod start. ttl_seconds bounds how long a database stays parked, max_per_node how many databases a node parks (the oldest demote to full hibernation first). Returned only when set; omitted on PUT keeps it, null removes it.",
+        "Optional parked sleep tier: after an idle sleep the database's instance Pod stays and only PostgreSQL stops, so the next connection wakes in a fraction of a Pod start. enabled switches parking on or off (off demotes every parked database to full hibernation), ttl_seconds bounds how long a database stays parked, max_per_node how many databases a node parks (the oldest demote to full hibernation first). Returned only when set; omitted on PUT keeps it, null removes it.",
       ),
   })
   .superRefine((policy, context) => {

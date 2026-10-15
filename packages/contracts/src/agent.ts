@@ -369,7 +369,7 @@ export const DesiredRegion = z.strictObject({
   /** Current authoritative region pool template, including assigned per-Pod overhead. */
   compute_pool: ComputePoolPolicy.nullable().optional(),
   postgres_pools: z.array(PostgresPoolPolicyState).max(1000).optional(),
-  /** Idle-sleep parking policy; present only for a region whose every node runs a capable controller. */
+  /** The region's idle-sleep parking policy, present whenever one is set (enabled or not). */
   parking: ParkedTierPolicy.optional(),
   /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
   storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
