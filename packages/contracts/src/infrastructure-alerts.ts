@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { Timestamp } from "./api.ts";
-import { RegionId, NodeId } from "./ids.ts";
+import { DatabaseId, NodeId, RegionId } from "./ids.ts";
 
 export const InfraAlertKind = z
   .enum([
@@ -13,13 +13,65 @@ export const InfraAlertKind = z
     "regional_node_ram_warning",
     "regional_node_cpu_warning",
     "regional_node_storage_warning",
+    "database_archive_failing",
+    "database_base_backup_stale",
+    "thin_storage_blocked",
+    "database_storage_protected",
+    "control_cron_stalled",
+    "control_cron_step_failing",
   ])
   .describe(
-    "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: a daily D1 or etcd backup of the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy.",
+    "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: a daily D1 or etcd backup of the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy. " +
+      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's Thin storage is blocked and withholds write authority (thin_storage lists each node with its thin_storage_* error_code, or null while only pool headroom blocks writes). database_storage_protected: a running database has been stopped by storage write protection for at least 5 minutes (database_ids). " +
+      "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
   );
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
 
+/** One short English runbook action per kind; it travels in every new event's `action` field. */
+export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
+  regional_ram_warning:
+    "Regional RAM use is above its threshold. Read GET /v1/regions/{id}/capacity-decision, then add a node or reduce awake databases; review ram_warning_threshold_ppm.",
+  regional_node_cap_reached:
+    "The region reached max_nodes. Raise max_nodes with PUT /v1/regions/{id}/capacity-policy or free a node slot; no node is added while the cap holds.",
+  regional_node_stale:
+    "A node stopped reporting or is marked lost. Check the server and its regional controller; if the server is gone, follow the lost-node runbook in docs/operations/recovery.md.",
+  infrastructure_backup_failed:
+    "A daily D1 or etcd backup failed. Read GET /v1/infrastructure-backups for the artifact error_code and fix it; same-day retries run automatically (docs/operations/infrastructure-backups.md).",
+  infrastructure_backup_stale:
+    "No complete infrastructure backup for over 36 h. Read GET /v1/infrastructure-backups and the cron heartbeat in GET /v1/operational-health?scope=regions, and fix the cause before the next 00:00Z run.",
+  regional_node_ram_warning:
+    "A node's ten-minute RAM average is above its threshold. Find the node in node_ids and reduce awake databases there or add capacity.",
+  regional_node_cpu_warning:
+    "A node's ten-minute CPU average is above its threshold. Find the node in node_ids and reduce awake databases there or add capacity.",
+  regional_node_storage_warning:
+    "A node's thin pool or volume group is filling. Grow the pool or free space by deleting or moving databases; see Thin storage admission in docs/operations/recovery.md.",
+  database_archive_failing:
+    "WAL archiving of the listed databases is failing. Check R2 reachability, the region's archive credentials and the database's backup plugin; WAL accumulates on the volume until archiving works again.",
+  database_base_backup_stale:
+    "The listed awake databases have no completed base backup for 36 h of awake time. Check their scheduled backup and R2 access; read backup.status in GET /v1/operational-health?scope=databases.",
+  thin_storage_blocked:
+    "Thin write authority is blocked on a listed node, so its databases take protective stops. With a thin_storage_* error_code, repeat PUT /v1/nodes/{id}/storage-profile with the current expected_revision once the lease expires (docs/operations/recovery.md); without one, free pool headroom.",
+  database_storage_protected:
+    "The listed databases have been stopped by storage write protection for over 5 minutes. PGCF resumes them once Thin write authority is current; if it persists check thin_storage_blocked and the node's storage.",
+  control_cron_stalled:
+    "The minute cron has not completed a run for over 5 minutes. Check the Worker's cron trigger and logs (cron_step_failed, cron_completed) and redeploy the Worker if its trigger is missing.",
+  control_cron_step_failing:
+    "A cron step failed in each of its last runs. Read the Worker logs for cron_step_failed with the step named in cron.failing_steps and fix its cause; later steps keep running.",
+};
+
 const Ppm = z.number().int().min(0).max(1_000_000);
+export const InfraCronFailingStep = z.strictObject({
+  step: z.string().min(1).max(32),
+  consecutive_failures: z.number().int().min(1).max(1_000_000),
+  error_code: z.string().max(64).nullable(),
+});
+export type InfraCronFailingStep = z.infer<typeof InfraCronFailingStep>;
+export const InfraCronHeartbeat = z.strictObject({
+  last_started_at: Timestamp.nullable(),
+  last_completed_at: Timestamp.nullable(),
+  failing_steps: z.array(InfraCronFailingStep).max(16),
+});
+export type InfraCronHeartbeat = z.infer<typeof InfraCronHeartbeat>;
 export const InfraAlert = z.strictObject({
   version: z.literal(1),
   event_id: z.uuid(),
@@ -49,6 +101,22 @@ export const InfraAlert = z.strictObject({
   /** Per-node warnings: the configured threshold and the highest utilization among node_ids. */
   threshold_ppm: Ppm.nullable().optional(),
   utilization_ppm: Ppm.nullable().optional(),
+  /** Database kinds: the affected databases, longest-standing first. */
+  database_ids: z.array(DatabaseId).max(64).optional(),
+  /** thin_storage_blocked: each blocked node with the error code that blocked it, null while only headroom does. */
+  thin_storage: z
+    .array(
+      z.strictObject({
+        node_id: NodeId,
+        error_code: z.string().max(128).nullable(),
+      }),
+    )
+    .max(16)
+    .optional(),
+  /** Cron kinds: the heartbeat the watchdog read and every step that failed in the latest completed run. */
+  cron: InfraCronHeartbeat.optional(),
+  /** Short runbook action of the kind (INFRA_ALERT_ACTIONS); absent on episodes started before it existed. */
+  action: z.string().max(512).optional(),
 });
 export type InfraAlert = z.infer<typeof InfraAlert>;
 

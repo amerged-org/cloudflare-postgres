@@ -334,6 +334,73 @@ it("adds opt-in per-node warning thresholds and CPU samples while preserving pol
   expect(() => alert("regional_node_disk_warning")).toThrow(/CHECK/);
 });
 
+it("adds the database, Thin storage and cron alert kinds and the cron heartbeat while preserving episodes", () => {
+  const directory = new URL("../../../apps/api/migrations/", import.meta.url);
+  for (const file of readdirSync(directory)
+    .sort()
+    .filter(
+      (name) =>
+        name.endsWith(".sql") &&
+        name > "0001_init.sql" &&
+        name < "0052_cron_heartbeat_and_alert_kinds.sql",
+    ))
+    db.exec(readFileSync(new URL(file, directory), "utf8"));
+  const alert = (kind: string) =>
+    run(
+      "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES('eu-1',?,1,?,?)",
+      kind,
+      crypto.randomUUID(),
+      JSON.stringify({ kind, occurred_at: NOW }),
+    );
+  alert("regional_node_stale");
+  alert("infrastructure_backup_failed");
+  run(
+    "UPDATE infrastructure_alerts SET delivered_at=?,last_attempt_at=? WHERE kind='regional_node_stale'",
+    NOW,
+    NOW,
+  );
+  expect(() => alert("database_archive_failing")).toThrow(/CHECK/);
+  const episodes = db
+    .prepare("SELECT * FROM infrastructure_alerts ORDER BY kind")
+    .all();
+  db.exec(
+    readFileSync(
+      new URL("0052_cron_heartbeat_and_alert_kinds.sql", directory),
+      "utf8",
+    ),
+  );
+  expect(
+    db.prepare("SELECT * FROM infrastructure_alerts ORDER BY kind").all(),
+  ).toEqual(episodes);
+  for (const kind of [
+    "database_archive_failing",
+    "database_base_backup_stale",
+    "thin_storage_blocked",
+    "database_storage_protected",
+    "control_cron_stalled",
+    "control_cron_step_failing",
+  ])
+    alert(kind);
+  expect(() => alert("regional_node_disk_warning")).toThrow(/CHECK/);
+  expect(() => alert("regional_node_stale")).toThrow(/UNIQUE|PRIMARY/);
+  // One heartbeat row; the failing-step counters are JSON no larger than a payload.
+  expect(db.prepare("SELECT * FROM cron_heartbeat").all()).toEqual([]);
+  run("INSERT INTO cron_heartbeat(singleton,started_at) VALUES(1,?)", NOW);
+  expect(db.prepare("SELECT * FROM cron_heartbeat").get()).toEqual({
+    singleton: 1,
+    started_at: NOW,
+    completed_at: null,
+    watchdog_checked_at: null,
+    failing_steps_json: "{}",
+  });
+  expect(() =>
+    run("INSERT INTO cron_heartbeat(singleton,started_at) VALUES(2,?)", NOW),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run("UPDATE cron_heartbeat SET failing_steps_json='not json'"),
+  ).toThrow(/CHECK/);
+});
+
 it("preserves legacy policy and approval bytes when adding explicit uncapped and unknown-cost values", () => {
   const directory = new URL("../../../apps/api/migrations/", import.meta.url);
   for (const file of readdirSync(directory)
