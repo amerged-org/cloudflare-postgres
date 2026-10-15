@@ -50,6 +50,9 @@ import {
   BucketName,
   HttpsUrl,
   OperationStatus,
+  ROLE_CONNECTION_LIMIT_MAX,
+  ROLE_LIMIT,
+  ROLE_MEMBER_OF_MAX,
   Timestamp,
   TEXT_MAX_LENGTH,
 } from "./api.ts";
@@ -174,13 +177,62 @@ export const DesiredSize = z
   );
 export type DesiredSize = z.infer<typeof DesiredSize>;
 
+/**
+ * A role the database holds. The attributes appear only where they differ from a plain role
+ * (no expiry, no limit, no membership, NOBYPASSRLS), so a database without them keeps the wire
+ * shape every deployed consumer accepts.
+ */
 export const DesiredRole = z.strictObject({
   name: RoleName,
   owner: z.boolean(),
   password: RolePassword,
   revision: z.number().int().min(1),
+  valid_until: Timestamp.describe(
+    "VALID UNTIL; applied at whole seconds, truncated. Absent means no expiry.",
+  ).optional(),
+  connection_limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(ROLE_CONNECTION_LIMIT_MAX)
+    .describe("CONNECTION LIMIT. Absent means unlimited.")
+    .optional(),
+  member_of: z
+    .array(RoleName)
+    .max(ROLE_MEMBER_OF_MAX)
+    .describe(
+      "Other present roles of this record the role is a member of. Absent means none.",
+    )
+    .optional(),
+  bypass_rls: z
+    .literal(true)
+    .describe("BYPASSRLS. Absent means NOBYPASSRLS.")
+    .optional(),
 });
 export type DesiredRole = z.infer<typeof DesiredRole>;
+/**
+ * A role deleted through the API whose removal from PostgreSQL is not yet confirmed. The region
+ * sets it to NOLOGIN, ends its sessions, then drops it, and reports the outcome in the
+ * observation's `roles`.
+ */
+export const DesiredRoleRemoval = z
+  .strictObject({
+    name: RoleName,
+    state: z.literal("absent"),
+  })
+  .describe("A deleted role the region must remove; it carries no credential.");
+export type DesiredRoleRemoval = z.infer<typeof DesiredRoleRemoval>;
+export function isRoleRemoval(
+  role: DesiredRole | DesiredRoleRemoval,
+): role is DesiredRoleRemoval {
+  return "state" in role;
+}
+/** The roles a database holds now, without those awaiting removal. */
+export function presentRoles(db: {
+  roles: readonly (DesiredRole | DesiredRoleRemoval)[];
+}): DesiredRole[] {
+  return db.roles.filter((role): role is DesiredRole => !isRoleRemoval(role));
+}
 
 export const DesiredCreation = z.strictObject({
   operation_id: OperationId,
@@ -250,7 +302,10 @@ export const DesiredDatabase = z
       })
       .optional(),
     size: DesiredSize,
-    roles: z.array(DesiredRole).max(100).default([]),
+    roles: z
+      .array(z.union([DesiredRole, DesiredRoleRemoval]))
+      .max(ROLE_LIMIT)
+      .default([]),
     maintenance: MaintenanceCredential.optional(),
     // Older desired pages omit this field; omission cannot authorize initial storage.
     creation: DesiredCreation.nullable().optional(),
@@ -340,6 +395,15 @@ export const DesiredDatabase = z
         });
       }
       names.add(role.name);
+      if (isRoleRemoval(role)) {
+        if (role.name === OWNER_ROLE_NAME)
+          ctx.addIssue({
+            code: "custom",
+            path: ["roles"],
+            message: "The owner role cannot be removed",
+          });
+        continue;
+      }
       if (role.owner) {
         owners += 1;
         if (role.name !== OWNER_ROLE_NAME) {
@@ -351,6 +415,22 @@ export const DesiredDatabase = z
         }
       }
     }
+    // A membership names another role the database holds now; the owner is never a target.
+    const present = new Map(
+      presentRoles(db).map((role) => [role.name, role] as const),
+    );
+    for (const role of presentRoles(db))
+      for (const target of role.member_of ?? [])
+        if (
+          target === role.name ||
+          target === OWNER_ROLE_NAME ||
+          present.get(target)?.owner !== false
+        )
+          ctx.addIssue({
+            code: "custom",
+            path: ["roles"],
+            message: `${role.name} is a member of ${target}, which is not another role of this database`,
+          });
     if (
       owners > 1 ||
       (["running", "suspended"].includes(db.desired_state) && owners !== 1)
@@ -582,6 +662,28 @@ export const DatabaseObservation = z
       })
       .optional(),
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
+    /**
+     * The fate of the roles the desired record asked to remove: `removed` roles are confirmed
+     * absent from PostgreSQL; a `blocked` role is still there, set to NOLOGIN, because dropping
+     * it failed on the objects or privileges it holds. Only a ready database reports them.
+     */
+    roles: z
+      .strictObject({
+        removed: z
+          .array(RoleName)
+          .max(ROLE_LIMIT)
+          .describe("Roles confirmed absent from PostgreSQL."),
+        blocked: z
+          .array(RoleName)
+          .max(ROLE_LIMIT)
+          .describe(
+            "Roles that cannot be dropped because they own objects or hold privileges; they stay NOLOGIN.",
+          ),
+      })
+      .describe(
+        "The fate of the roles the desired record asked to remove; sent only with a ready database that has such roles.",
+      )
+      .optional(),
     backup: BackupObservation.optional(),
     runtime_attestation: DatabaseRuntimeAttestation.optional(),
     archive: z.strictObject({
@@ -601,6 +703,18 @@ export const DatabaseObservation = z
         code: "custom",
         path: ["archive", "health"],
         message: "Explicit archive health must match continuous archive proof",
+      });
+    if (
+      db.roles &&
+      (db.state !== "ready" ||
+        new Set([...db.roles.removed, ...db.roles.blocked]).size !==
+          db.roles.removed.length + db.roles.blocked.length)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["roles"],
+        message:
+          "Role removals are reported by a ready observation and name each role once",
       });
     if (
       db.power?.refusal &&

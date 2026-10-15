@@ -23,6 +23,7 @@ import {
   Operation,
   DatabaseWithOperation,
   DesiredResponse,
+  presentRoles,
 } from "@pgcf/contracts";
 import {
   DatabaseRuntimeAttestationV2,
@@ -66,7 +67,7 @@ async function reportResumedReady(
     generation: desired.generation,
     route_revision: desired.admission!.route_revision,
     admission_epoch: desired.admission!.admission_epoch,
-    applied_role_revisions: desired.roles.map((r) => ({
+    applied_role_revisions: presentRoles(desired).map((r) => ({
       name: r.name,
       revision: r.revision,
     })),
@@ -281,7 +282,7 @@ it("exposes the deferred operation through normal scoped GET and replay without 
     kind: "reset",
     name: "app",
   });
-  expect(db.roles.find((r) => r.name === "app")?.revision).toBe(
+  expect(presentRoles(db).find((r) => r.name === "app")?.revision).toBe(
     f.proof.applied_role_revisions.find((r) => r.name === "app")?.revision,
   );
   expect(Object.keys(db.pending_pool_role!)).not.toContain(

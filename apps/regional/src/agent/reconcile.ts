@@ -29,6 +29,7 @@ import {
   ARCHIVE_DESTINATION_PATTERN,
   postgresCpuRequestMillicores,
   postgresImageIdMatches,
+  presentRoles,
   DesiredDatabaseStorage,
 } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
@@ -2075,7 +2076,7 @@ export class Reconciler {
       assertOwned(actual, db.id, manifest.metadata.name);
       const credential =
         manifest.kind === "Secret" &&
-        (db.roles.some(
+        (presentRoles(db).some(
           (role) => roleSecretName(role.name) === manifest.metadata.name,
         ) ||
           (!!db.maintenance &&
@@ -2091,7 +2092,7 @@ export class Reconciler {
       if (credential) identities.push(actual);
       if (manifest.kind === "Secret") {
         const role =
-          db.roles.find(
+          presentRoles(db).find(
             (value) => roleSecretName(value.name) === manifest.metadata.name,
           ) ??
           (db.maintenance &&

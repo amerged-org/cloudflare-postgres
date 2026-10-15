@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Real local D1/Actor scheduling; no live pool latency or workload measurement is claimed.
 import { env } from "cloudflare:workers";
-import { SIDECAR } from "@pgcf/contracts";
+import { SIDECAR, presentRoles } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import {
   postgresPoolFixture,
@@ -158,9 +158,13 @@ it("charges the ready pool scheduling share before a cold start and converts tha
   expect((await admitted()).results).toEqual([]);
   await publishDatabaseAdmission(env, f.id);
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(f.id));
-  await actor.ensureAwake(f.id, f.desired.roles.find((r) => r.owner)!.name, {
-    deadline: Date.now() + 1000,
-  });
+  await actor.ensureAwake(
+    f.id,
+    presentRoles(f.desired).find((r) => r.owner)!.name,
+    {
+      deadline: Date.now() + 1000,
+    },
+  );
   expect(
     await env.DB.prepare("SELECT state FROM pool_pods WHERE pod_uid=?")
       .bind(f.pod.pool_pod_uid)

@@ -273,6 +273,83 @@ const vectors = await Promise.all(
         },
       },
     })),
+    {
+      // Every attribute a role can carry: an expiry with milliseconds (the Cluster holds whole
+      // seconds), a connection limit, a membership and BYPASSRLS.
+      name: "role-attributes",
+      db: {
+        ...db,
+        roles: [
+          ...db.roles,
+          {
+            name: "report_job",
+            owner: false,
+            password: "s".repeat(43),
+            revision: 3,
+            valid_until: "2031-01-02T03:04:05.678Z",
+            connection_limit: 5,
+            member_of: ["reader_query"],
+            bypass_rls: true as const,
+          },
+        ],
+      },
+      ctx,
+    },
+    {
+      // A role follows the roles it is a member of; the rest keep their input order.
+      name: "role-membership-order",
+      db: {
+        ...db,
+        roles: [
+          ...db.roles,
+          {
+            name: "leaf_job",
+            owner: false,
+            password: "t".repeat(43),
+            revision: 1,
+            member_of: ["mid_job"],
+          },
+          {
+            name: "mid_job",
+            owner: false,
+            password: "u".repeat(43),
+            revision: 1,
+            member_of: ["base_job", "reader_query"],
+          },
+          {
+            name: "other_job",
+            owner: false,
+            password: "v".repeat(43),
+            revision: 1,
+          },
+          {
+            name: "base_job",
+            owner: false,
+            password: "w".repeat(43),
+            revision: 1,
+          },
+        ],
+      },
+      ctx,
+    },
+    ...[false, true].map((dropping) => ({
+      // A deleted role is disabled first and dropped once the Cluster names it; it has no Secret.
+      name: dropping ? "role-removal-drop" : "role-removal-disable",
+      db: {
+        ...db,
+        roles: [
+          ...db.roles,
+          { name: "report_job", state: "absent" as const },
+          {
+            name: "later_job",
+            owner: false,
+            password: "x".repeat(43),
+            revision: 4,
+          },
+        ],
+      },
+      ctx: dropping ? { ...ctx, droppingRoles: ["report_job"] } : ctx,
+    })),
   ].map(async (v) => ({
     ...v,
     manifests: buildDatabaseManifests(v.db, v.ctx),

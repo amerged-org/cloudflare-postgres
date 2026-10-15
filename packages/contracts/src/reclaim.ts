@@ -448,7 +448,11 @@ export function reclaimConfigurationInput(
       backup_retention_days: number;
     };
     postgres?: { image: string };
-    roles: { name: string; owner: boolean; revision: number }[];
+    /** Roles awaiting removal (`state: "absent"`) are not part of the configuration. */
+    roles: (
+      | { name: string; owner: boolean; revision: number }
+      | { name: string; state: "absent" }
+    )[];
     maintenance?: { revision: number };
     storage_generation?: number;
     archive: { destination_path: string; server_name: string };
@@ -489,7 +493,10 @@ export function reclaimConfigurationInput(
     db.storage_generation ?? 1,
     db.archive.destination_path,
     db.archive.server_name,
-    [...db.roles]
+    db.roles
+      .filter(
+        (r): r is Extract<typeof r, { revision: number }> => !("state" in r),
+      )
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
       .map((r) => [r.name, r.owner, r.revision]),
     db.maintenance?.revision ?? null,

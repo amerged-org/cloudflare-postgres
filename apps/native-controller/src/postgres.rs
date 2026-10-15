@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     Error,
-    contracts::{constant, database_valid, namespace, number, text},
+    contracts::{constant, database_valid, namespace, number, present_roles, text},
     manifests::parameters,
 };
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde_json::Value;
-use std::{net::SocketAddr, time::Duration};
-use tokio_postgres::{Client, Row, config::SslMode, types::ToSql};
+use std::{
+    collections::BTreeSet,
+    net::SocketAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio_postgres::{
+    Client, Row,
+    config::SslMode,
+    types::{Timestamp, ToSql},
+};
 /// PostgreSQL's port inside a database Pod.
 pub const PORT: u16 = 5432;
 pub struct Session {
@@ -224,6 +232,72 @@ pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Er
     )
     .await
 }
+/// A session of the maintenance role; `socket` as for `connect_via`.
+pub async fn maintenance(
+    db: &Value,
+    ca: &[u8],
+    socket: Option<SocketAddr>,
+) -> Result<Session, Error> {
+    if db["maintenance"].is_null() {
+        return Err("maintenance authority absent".into());
+    }
+    connect_via(
+        db,
+        ca,
+        text(&db["maintenance"], "role"),
+        text(&db["maintenance"], "password"),
+        text(db, "id"),
+        socket,
+    )
+    .await
+}
+/// A role as the catalogs hold it, for its removal.
+pub enum Held {
+    Absent,
+    Login,
+    NoLogin,
+}
+/// Whether PostgreSQL has the role, and whether it can still log in.
+pub async fn held(session: &Session, name: &str) -> Result<Held, Error> {
+    let rows = session.query(ROLE_CATALOG_QUERY, &[&name]).await?;
+    match rows.as_slice() {
+        [] => Ok(Held::Absent),
+        [row] if row.try_get::<_, bool>("rolcanlogin")? => Ok(Held::Login),
+        [_] => Ok(Held::NoLogin),
+        _ => Err("role catalog ambiguous".into()),
+    }
+}
+/// The objects and privileges, in any database, that depend on the role.
+pub async fn dependencies(session: &Session, name: &str) -> Result<i64, Error> {
+    let rows = session.query(DEPENDENCIES_QUERY, &[&name]).await?;
+    let [row] = rows.as_slice() else {
+        return Err("role dependencies unavailable".into());
+    };
+    Ok(row.try_get(0)?)
+}
+/// Ends the sessions of the role and says whether none remain. A refusal for want of
+/// `pg_signal_backend` is not an error: the role keeps its sessions until the grant arrives.
+pub async fn end_sessions(session: &Session, name: &str) -> Result<bool, Error> {
+    match session.query(TERMINATE_QUERY, &[&name]).await {
+        Ok(_) => {}
+        Err(error)
+            if error
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|error| error.code())
+                .is_some_and(|code| {
+                    *code == tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE
+                }) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    }
+    let rows = session.query(SESSIONS_QUERY, &[&name]).await?;
+    let [row] = rows.as_slice() else {
+        return Err("role sessions unavailable".into());
+    };
+    Ok(row.try_get::<_, i64>(0)? == 0)
+}
 /// A drained gateway is necessary but not sufficient: prepared transactions and real
 /// background client backends also prevent a clean pool stop.
 pub async fn pool_idle(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
@@ -260,6 +334,46 @@ async fn idle_on(session: &Session, db: &Value, role: &str, address: &str) -> Re
         && row.try_get::<_, String>(4)? == "0"
         && row.try_get::<_, String>(5)? == "0")
 }
+/// How far ahead of its expiry a role's credential is no longer one a login can prove: a client
+/// that connects after the check finds it expired.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(10);
+/// Whether a role's credential has expired, or does within `EXPIRY_MARGIN`, by the controller's
+/// clock. PostgreSQL refuses an expired credential, so its login says nothing of the credential.
+fn expiring(role: &Value, now: SystemTime) -> bool {
+    let Some(until) = role["valid_until"].as_str().and_then(|until| {
+        time::OffsetDateTime::parse(until, &time::format_description::well_known::Rfc3339).ok()
+    }) else {
+        return false;
+    };
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let until = until.unix_timestamp_nanos() / 1_000_000;
+    until <= i128::try_from(now + EXPIRY_MARGIN.as_millis()).unwrap_or(i128::MAX)
+}
+/// Whether a startup was refused for too many connections. PostgreSQL checks a role's own limit
+/// only after the credential was accepted.
+fn too_many_connections(error: &Error) -> bool {
+    error
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(|error| error.code())
+        .is_some_and(|code| *code == tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS)
+}
+/// A session of `role` on the route the logins of the database take.
+async fn open_on(
+    db: &Value,
+    ca: &[u8],
+    route: &Route<'_>,
+    role: &str,
+    password: &str,
+) -> Result<Session, Error> {
+    let database = text(db, "id");
+    match route {
+        Route::Service(socket) => connect_via(db, ca, role, password, database, *socket).await,
+        Route::Pool(scope) => connect_pool(db, scope, ca, role, password, database).await,
+        Route::Pod(socket) => connect_via(db, ca, role, password, database, Some(*socket)).await,
+    }
+}
 /// A role's login, its server settings and its privileges against the desired state.
 async fn role_current(
     db: &Value,
@@ -268,40 +382,16 @@ async fn role_current(
     route: &Route<'_>,
     role: &Value,
 ) -> Result<bool, Error> {
-    let session = match route {
-        Route::Service(socket) => {
-            connect_via(
-                db,
-                ca,
-                text(role, "name"),
-                text(role, "password"),
-                text(db, "id"),
-                *socket,
-            )
-            .await?
+    if expiring(role, SystemTime::now()) {
+        return Ok(true);
+    }
+    let session = match open_on(db, ca, route, text(role, "name"), text(role, "password")).await {
+        Ok(session) => session,
+        // The credential was accepted: PostgreSQL refuses a role at its limit afterwards.
+        Err(error) if role.get("connection_limit").is_some() && too_many_connections(&error) => {
+            return Ok(true);
         }
-        Route::Pool(scope) => {
-            connect_pool(
-                db,
-                scope,
-                ca,
-                text(role, "name"),
-                text(role, "password"),
-                text(db, "id"),
-            )
-            .await?
-        }
-        Route::Pod(socket) => {
-            connect_via(
-                db,
-                ca,
-                text(role, "name"),
-                text(role, "password"),
-                text(db, "id"),
-                Some(*socket),
-            )
-            .await?
-        }
+        Err(error) => return Err(error),
     };
     let rows = session.query(ROLE_QUERY, &[]).await?;
     if rows.len() != 1 {
@@ -340,11 +430,100 @@ async fn role_current(
         return Ok(false);
     }
     let privileges = session.query(PRIVILEGES_QUERY, &[]).await?;
+    // Superuser, createdb, createrole and replication are never granted; BYPASSRLS only where the
+    // record states it; and the role logs in.
     if privileges.len() != 1
-        || !(0..5).all(|i| privileges[0].try_get::<_, bool>(i).is_ok_and(|v| !v))
+        || !(0..4).all(|i| privileges[0].try_get::<_, bool>(i).is_ok_and(|v| !v))
+        || privileges[0].try_get::<_, bool>(4)? != (role["bypass_rls"] == true)
         || !privileges[0].try_get::<_, bool>(5)?
     {
         return Ok(false);
+    }
+    Ok(true)
+}
+/// A role carries an attribute a plain login role does not.
+fn attributed(role: &Value) -> bool {
+    ["valid_until", "connection_limit", "bypass_rls"]
+        .iter()
+        .any(|attribute| role.get(*attribute).is_some())
+        || role["member_of"]
+            .as_array()
+            .is_some_and(|targets| !targets.is_empty())
+}
+/// The unix second an expiry falls in: its milliseconds are cut, as the Cluster cuts them.
+fn whole_seconds(until: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(until, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|until| until.unix_timestamp())
+}
+/// Whether the catalogs hold the role as the record states it: it logs in, its expiry (to the
+/// whole second; NULL and `infinity` are none), its connection limit, BYPASSRLS and exactly the
+/// memberships asked for.
+async fn catalog_holds(session: &Session, role: &Value) -> Result<bool, Error> {
+    let name = text(role, "name");
+    let rows = session.query(ROLE_CATALOG_QUERY, &[&name]).await?;
+    let [row] = rows.as_slice() else {
+        return Ok(false);
+    };
+    let limit: i32 = row.try_get("rolconnlimit")?;
+    let expiry: Option<Timestamp<SystemTime>> = row.try_get("rolvaliduntil")?;
+    let held_until = match expiry {
+        None | Some(Timestamp::PosInfinity) => None,
+        Some(Timestamp::Value(at)) => Some(time::OffsetDateTime::from(at).unix_timestamp()),
+        // Always expired: no expiry the record can state.
+        Some(Timestamp::NegInfinity) => return Ok(false),
+    };
+    if row.try_get::<_, String>("rolname")? != name
+        || !row.try_get::<_, bool>("rolcanlogin")?
+        || row.try_get::<_, bool>("rolbypassrls")? != (role["bypass_rls"] == true)
+        || i64::from(limit) != role["connection_limit"].as_i64().unwrap_or(-1)
+        || held_until != role["valid_until"].as_str().and_then(whole_seconds)
+    {
+        return Ok(false);
+    }
+    let held = session
+        .query(MEMBERSHIP_QUERY, &[&name])
+        .await?
+        .iter()
+        .map(|granted| granted.try_get::<_, String>(0))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let wanted: BTreeSet<String> = role["member_of"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|target| target.as_str().map(str::to_string))
+        .collect();
+    Ok(held == wanted)
+}
+/// Whether the catalogs hold every role as the record states it, read in one session of the
+/// maintenance role on the route of the logins. A record whose roles are all plain needs no
+/// session: the login proves them. Attributes without the credential to read them are unproven.
+async fn attributes_current(
+    db: &Value,
+    ca: &[u8],
+    route: &Route<'_>,
+    roles: &[&Value],
+) -> Result<bool, Error> {
+    // The owner is the application's bootstrap role, not a role CNPG manages.
+    let managed: Vec<&&Value> = roles.iter().filter(|role| role["owner"] != true).collect();
+    if !managed.iter().any(|role| attributed(role)) {
+        return Ok(true);
+    }
+    if db["maintenance"].is_null() {
+        return Ok(false);
+    }
+    let session = open_on(
+        db,
+        ca,
+        route,
+        text(&db["maintenance"], "role"),
+        text(&db["maintenance"], "password"),
+    )
+    .await?;
+    for role in managed {
+        if !catalog_holds(&session, role).await? {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -358,7 +537,9 @@ async fn roles_at(
         return Ok(false);
     }
     tokio::time::timeout(Duration::from_secs(20), async {
-        let roles = db["roles"].as_array().ok_or("roles unavailable")?;
+        db["roles"].as_array().ok_or("roles unavailable")?;
+        // A role awaiting removal has no credential to log in with.
+        let roles: Vec<&Value> = present_roles(db).collect();
         if matches!(route, Route::Pod(_)) {
             let all = futures_util::future::try_join_all(
                 roles
@@ -366,14 +547,17 @@ async fn roles_at(
                     .map(|role| role_current(db, ca, primary_address, &route, role)),
             )
             .await?;
-            return Ok::<bool, Error>(all.into_iter().all(|ok| ok));
-        }
-        for role in roles {
-            if !role_current(db, ca, primary_address, &route, role).await? {
-                return Ok(false);
+            if !all.into_iter().all(|ok| ok) {
+                return Ok::<bool, Error>(false);
+            }
+        } else {
+            for role in &roles {
+                if !role_current(db, ca, primary_address, &route, role).await? {
+                    return Ok(false);
+                }
             }
         }
-        Ok(true)
+        attributes_current(db, ca, &route, &roles).await
     })
     .await?
 }
@@ -384,8 +568,20 @@ pub(crate) const IDLE_QUERY: &str = "SELECT current_database()::text, current_us
 /// A role's own view of the server: user, version, settings, database and the address it was
 /// reached at (see `IDLE_QUERY` for `host()`), by position.
 pub(crate) const ROLE_QUERY: &str = "SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, pg_catalog.host(pg_catalog.inet_server_addr()), pg_is_in_recovery()";
-/// A role's privileges: none beyond login.
+/// A role's privileges: none beyond login, and row security bypassed only where the record asks.
 pub(crate) const PRIVILEGES_QUERY: &str = "SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user";
+/// The row of a role in the catalog by name, columns by position. `rolvaliduntil` is a
+/// `timestamptz`, NULL for no expiry and possibly `infinity`; `rolconnlimit` is -1 for no limit.
+/// No row is a role PostgreSQL does not have.
+pub(crate) const ROLE_CATALOG_QUERY: &str = "SELECT rolname, rolcanlogin, rolvaliduntil, rolconnlimit, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = $1";
+/// The roles a role is a member of, one row each.
+pub(crate) const MEMBERSHIP_QUERY: &str = "SELECT granted.rolname FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid JOIN pg_catalog.pg_roles member ON member.oid = m.member WHERE member.rolname = $1";
+/// The objects and privileges in any database that depend on a role: what makes `DROP ROLE` fail.
+pub(crate) const DEPENDENCIES_QUERY: &str = "SELECT count(*) FROM pg_catalog.pg_shdepend d JOIN pg_catalog.pg_roles r ON r.oid = d.refobjid WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND r.rolname = $1";
+/// Ends the sessions of a role; the role is bound, never part of the text.
+pub(crate) const TERMINATE_QUERY: &str = "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1 AND pid <> pg_catalog.pg_backend_pid()";
+/// The sessions of a role that are still there.
+pub(crate) const SESSIONS_QUERY: &str = "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE usename = $1 AND pid <> pg_catalog.pg_backend_pid()";
 /// The readiness of a resumed Pod by SQL: its database and TLS, whether it is a primary, which
 /// Pod answers, and how long ago its postmaster started on the server's own clock.
 pub const ACCEPTING_QUERY: &str = "SELECT pg_catalog.current_database() AS database,
@@ -412,6 +608,7 @@ mod tests {
             "database", "database", "10.0.0.7", "10.0.0.7", true
         ));
     }
+    use crate::test_postgres::Instant;
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
     use tokio::{
@@ -578,6 +775,427 @@ mod tests {
         // Another Pod answering is not this one.
         assert!(
             !roles(&w.db, w.authority.pem.as_bytes(), "10.0.0.99", socket)
+                .await
+                .unwrap()
+        );
+    }
+    /// The role a statement concerns is bound, never part of its text, whatever the role is called.
+    #[test]
+    fn the_role_statements_bind_the_role() {
+        for statement in [
+            ROLE_CATALOG_QUERY,
+            MEMBERSHIP_QUERY,
+            DEPENDENCIES_QUERY,
+            TERMINATE_QUERY,
+            SESSIONS_QUERY,
+        ] {
+            assert_eq!(statement.matches("$1").count(), 1, "{statement}");
+            // The only literal is the catalog the dependencies are read from.
+            assert!(
+                !statement
+                    .replace("'pg_catalog.pg_authid'", "")
+                    .contains('\''),
+                "{statement}"
+            );
+        }
+    }
+    /// The role functions against a real PostgreSQL: the forms they decode, the catalog rows they
+    /// compare, the sessions they end and the privilege refusal they read as "not yet". Set
+    /// `PGCF_TEST_POSTGRES_ADDR` to `host:port` of a scratch server that trusts its roles (the
+    /// product image started with `initdb -A trust` does). The test creates roles named
+    /// `pgcf_t_*` and drops them again. Without the variable it is skipped.
+    #[tokio::test]
+    async fn the_role_functions_read_and_end_what_a_real_postgresql_holds() {
+        let Ok(address) = std::env::var("PGCF_TEST_POSTGRES_ADDR") else {
+            eprintln!("skipped: PGCF_TEST_POSTGRES_ADDR names no PostgreSQL");
+            return;
+        };
+        let (host, port) = address.rsplit_once(':').expect("host:port");
+        let port: u16 = port.parse().unwrap();
+        async fn session(host: &str, port: u16, user: &str) -> Session {
+            let (client, connection) = tokio_postgres::Config::new()
+                .host(host)
+                .port(port)
+                .user(user)
+                .dbname("postgres")
+                .connect(tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            Session {
+                client,
+                task: tokio::spawn(connection),
+            }
+        }
+        let admin = session(host, port, "postgres").await;
+        let teardown = "DROP TABLE IF EXISTS pgcf_t_object;
+            DROP ROLE IF EXISTS pgcf_t_report, pgcf_t_plain, pgcf_t_reader, pgcf_t_maintenance, pgcf_t_stats";
+        admin.client.batch_execute(teardown).await.unwrap();
+        admin
+            .client
+            .batch_execute(
+                "CREATE ROLE pgcf_t_reader NOLOGIN;
+                CREATE ROLE pgcf_t_report LOGIN CONNECTION LIMIT 5 VALID UNTIL '2031-01-02T03:04:05Z' IN ROLE pgcf_t_reader BYPASSRLS;
+                CREATE ROLE pgcf_t_plain LOGIN;
+                CREATE ROLE pgcf_t_maintenance LOGIN;
+                GRANT pg_read_all_stats, pg_signal_backend TO pgcf_t_maintenance;
+                CREATE ROLE pgcf_t_stats LOGIN;
+                GRANT pg_read_all_stats TO pgcf_t_stats",
+            )
+            .await
+            .unwrap();
+        let maintenance = session(host, port, "pgcf_t_maintenance").await;
+        // The catalogs hold the role as the record states it, to the whole second of its expiry.
+        let report = serde_json::json!({"name":"pgcf_t_report","owner":false,"valid_until":"2031-01-02T03:04:05.678Z","connection_limit":5,"member_of":["pgcf_t_reader"],"bypass_rls":true});
+        assert!(catalog_holds(&maintenance, &report).await.unwrap());
+        for (key, wrong) in [
+            ("connection_limit", serde_json::json!(4)),
+            ("valid_until", serde_json::json!("2031-01-02T03:04:06.000Z")),
+            ("member_of", serde_json::json!([])),
+            ("bypass_rls", serde_json::Value::Null),
+        ] {
+            let mut role = report.clone();
+            role[key] = wrong;
+            assert!(!catalog_holds(&maintenance, &role).await.unwrap(), "{key}");
+        }
+        // NULL and infinity are no expiry; any other instant is one.
+        let plain = serde_json::json!({"name":"pgcf_t_plain","owner":false});
+        assert!(catalog_holds(&maintenance, &plain).await.unwrap());
+        admin
+            .client
+            .batch_execute("ALTER ROLE pgcf_t_plain VALID UNTIL 'infinity'")
+            .await
+            .unwrap();
+        assert!(catalog_holds(&maintenance, &plain).await.unwrap());
+        admin
+            .client
+            .batch_execute("ALTER ROLE pgcf_t_plain VALID UNTIL '2031-01-02T03:04:05Z'")
+            .await
+            .unwrap();
+        assert!(!catalog_holds(&maintenance, &plain).await.unwrap());
+        admin
+            .client
+            .batch_execute("ALTER ROLE pgcf_t_plain VALID UNTIL 'infinity'")
+            .await
+            .unwrap();
+        // Whether the role is there and can log in.
+        assert!(matches!(
+            held(&maintenance, "pgcf_t_report").await.unwrap(),
+            Held::Login
+        ));
+        assert!(matches!(
+            held(&maintenance, "pgcf_t_gone").await.unwrap(),
+            Held::Absent
+        ));
+        admin
+            .client
+            .batch_execute("ALTER ROLE pgcf_t_report NOLOGIN")
+            .await
+            .unwrap();
+        assert!(matches!(
+            held(&maintenance, "pgcf_t_report").await.unwrap(),
+            Held::NoLogin
+        ));
+        // What keeps DROP ROLE from succeeding, in any database.
+        assert_eq!(
+            dependencies(&maintenance, "pgcf_t_report").await.unwrap(),
+            0
+        );
+        admin
+            .client
+            .batch_execute(
+                "CREATE TABLE pgcf_t_object (id int); ALTER TABLE pgcf_t_object OWNER TO pgcf_t_report",
+            )
+            .await
+            .unwrap();
+        assert!(dependencies(&maintenance, "pgcf_t_report").await.unwrap() > 0);
+        admin
+            .client
+            .batch_execute("DROP TABLE pgcf_t_object")
+            .await
+            .unwrap();
+        assert_eq!(
+            dependencies(&maintenance, "pgcf_t_report").await.unwrap(),
+            0
+        );
+        // Without pg_signal_backend the sessions of a role stay, and that is not an error.
+        let victim = session(host, port, "pgcf_t_plain").await;
+        let weak = session(host, port, "pgcf_t_stats").await;
+        assert!(!end_sessions(&weak, "pgcf_t_plain").await.unwrap());
+        assert!(victim.client.simple_query("SELECT 1").await.is_ok());
+        // With it they end, and the role's session count reaches zero.
+        let mut none = false;
+        for _ in 0..50 {
+            none = end_sessions(&maintenance, "pgcf_t_plain").await.unwrap();
+            if none {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(none, "the sessions of the role did not leave");
+        assert!(victim.client.simple_query("SELECT 1").await.is_err());
+        admin.client.batch_execute(teardown).await.unwrap();
+    }
+    /// A world whose record holds the role `report_job` beside `reader_query`, with the
+    /// attributes `extra` states, and whose catalogs hold every role as the record states it.
+    async fn world_with_role(extra: serde_json::Value) -> crate::test_world::World {
+        let mut w = crate::test_world::World::awake().await;
+        w.wake(3);
+        let mut role = serde_json::json!({"name":"report_job","owner":false,"password":"q".repeat(43),"revision":3});
+        for (key, value) in extra.as_object().unwrap() {
+            role[key] = value.clone();
+        }
+        w.db["roles"].as_array_mut().unwrap().push(role);
+        w.catalog_follows_desired();
+        w
+    }
+    /// Whether every present role of the record logs in and holds what the record states.
+    async fn verified(w: &crate::test_world::World) -> Result<bool, Error> {
+        roles(
+            &w.db,
+            w.authority.pem.as_bytes(),
+            crate::test_world::POD_IP,
+            w.reconciler.power.postgres,
+        )
+        .await
+    }
+    /// An expiry `seconds` from now, in the contract's form (UTC, milliseconds).
+    fn expiry_in(seconds: i64) -> String {
+        let at = time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds);
+        let at = at.replace_nanosecond(0).unwrap();
+        at.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+            .replace('Z', ".000Z")
+    }
+    fn catalog_row(
+        w: &crate::test_world::World,
+        role: &str,
+        change: impl FnOnce(&mut crate::test_world::RoleRow),
+    ) {
+        change(w.sql.lock().unwrap().roles.get_mut(role).unwrap());
+    }
+    fn log_has(w: &crate::test_world::World, needle: &str) -> bool {
+        w.log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(needle))
+    }
+    /// A role that bypasses row security is verified by its own view of its privileges: it must
+    /// bypass exactly where the record says, and a plain role must not.
+    #[tokio::test]
+    async fn a_role_must_bypass_row_security_exactly_where_the_record_says() {
+        let w = world_with_role(serde_json::json!({"bypass_rls":true})).await;
+        assert!(verified(&w).await.unwrap());
+        catalog_row(&w, "report_job", |role| role.bypass_rls = false);
+        assert!(
+            !verified(&w).await.unwrap(),
+            "the record asks for BYPASSRLS"
+        );
+        catalog_row(&w, "report_job", |role| role.bypass_rls = true);
+        catalog_row(&w, "reader_query", |role| role.bypass_rls = true);
+        assert!(
+            !verified(&w).await.unwrap(),
+            "a plain role bypasses nothing"
+        );
+    }
+    /// PostgreSQL refuses the credential of an expired role, so its login proves nothing and
+    /// cannot keep the database from becoming ready; the catalog still has to hold the expiry.
+    #[tokio::test]
+    async fn an_expired_role_is_not_logged_in_but_its_expiry_is_verified() {
+        let w = world_with_role(serde_json::json!({"valid_until":expiry_in(-3600)})).await;
+        w.sql.lock().unwrap().refused.insert(
+            "report_job".into(),
+            ("28P01", "password authentication failed"),
+        );
+        assert!(verified(&w).await.unwrap());
+        assert!(!log_has(&w, "SQL report_job"), "no login was attempted");
+        // The catalog still has to hold the expiry the record states.
+        catalog_row(&w, "report_job", |role| role.valid_until = None);
+        assert!(!verified(&w).await.unwrap());
+    }
+    /// An expiry a few seconds ahead is as good as passed by the time a client connects; one
+    /// further ahead is logged in like any role, and a refused login is an error as before.
+    #[tokio::test]
+    async fn only_an_expiry_inside_ten_seconds_skips_the_login() {
+        let refused = ("28P01", "password authentication failed");
+        let soon = world_with_role(serde_json::json!({"valid_until":expiry_in(5)})).await;
+        soon.sql
+            .lock()
+            .unwrap()
+            .refused
+            .insert("report_job".into(), refused);
+        assert!(verified(&soon).await.unwrap());
+        let later = world_with_role(serde_json::json!({"valid_until":expiry_in(120)})).await;
+        later
+            .sql
+            .lock()
+            .unwrap()
+            .refused
+            .insert("report_job".into(), refused);
+        assert!(verified(&later).await.is_err());
+        later.sql.lock().unwrap().refused.clear();
+        assert!(verified(&later).await.unwrap());
+        assert!(log_has(&later, "SQL report_job role login"));
+    }
+    /// PostgreSQL checks a role's connection limit only after the credential was accepted, so a
+    /// login refused with 53300 proves the credential for a role that has a limit and nothing
+    /// for a role that has none.
+    #[tokio::test]
+    async fn a_login_refused_at_the_connection_limit_has_authenticated_only_a_limited_role() {
+        let limit = ("53300", "too many connections for role");
+        let w = world_with_role(serde_json::json!({"connection_limit":1})).await;
+        w.sql
+            .lock()
+            .unwrap()
+            .refused
+            .insert("report_job".into(), limit);
+        assert!(verified(&w).await.unwrap());
+        w.sql.lock().unwrap().refused.clear();
+        w.sql
+            .lock()
+            .unwrap()
+            .refused
+            .insert("reader_query".into(), limit);
+        assert!(verified(&w).await.is_err(), "reader_query has no limit");
+    }
+    /// The catalogs hold what the record states, to the precision the record has: an expiry to
+    /// the whole second, a limit, the exact set of memberships and the ability to log in.
+    #[tokio::test]
+    async fn the_catalogs_must_hold_the_attributes_the_record_states() {
+        let w = world_with_role(serde_json::json!({"valid_until":"2031-01-02T03:04:05.678Z","connection_limit":5,"member_of":["reader_query"],"bypass_rls":true})).await;
+        assert!(verified(&w).await.unwrap());
+        let at = Instant::At(
+            time::OffsetDateTime::parse(
+                "2031-01-02T03:04:05Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap()
+            .unix_timestamp(),
+            0,
+        );
+        assert_eq!(
+            w.sql.lock().unwrap().roles["report_job"].valid_until,
+            Some(at)
+        );
+        type Change = Box<dyn Fn(&mut crate::test_world::RoleRow)>;
+        let wrong: Vec<(&str, Change)> = vec![
+            (
+                "a limit that is not the record's",
+                Box::new(|r| r.connection_limit = 4),
+            ),
+            ("no limit", Box::new(|r| r.connection_limit = -1)),
+            (
+                "an expiry a second later",
+                Box::new(move |r| {
+                    r.valid_until = Some(match at {
+                        Instant::At(seconds, micros) => Instant::At(seconds + 1, micros),
+                        other => other,
+                    })
+                }),
+            ),
+            ("no expiry", Box::new(|r| r.valid_until = None)),
+            (
+                "an infinite expiry",
+                Box::new(|r| r.valid_until = Some(Instant::Infinity)),
+            ),
+            (
+                "a past infinite expiry",
+                Box::new(|r| r.valid_until = Some(Instant::NegativeInfinity)),
+            ),
+            ("a missing membership", Box::new(|r| r.member_of.clear())),
+            (
+                "an extra membership",
+                Box::new(|r| r.member_of.push("pg_read_all_data".into())),
+            ),
+            (
+                "another membership",
+                Box::new(|r| r.member_of = vec!["other_job".into()]),
+            ),
+            ("a role that cannot log in", Box::new(|r| r.login = false)),
+        ];
+        for (reason, change) in wrong {
+            let held_before = w.sql.lock().unwrap().roles["report_job"].clone();
+            catalog_row(&w, "report_job", |role| change(role));
+            assert!(!verified(&w).await.unwrap(), "{reason}");
+            w.sql
+                .lock()
+                .unwrap()
+                .roles
+                .insert("report_job".into(), held_before);
+        }
+        // Held to the second the record has, which is the whole second of its milliseconds.
+        assert!(verified(&w).await.unwrap());
+        // A role PostgreSQL does not have is not verified.
+        w.sql.lock().unwrap().roles.remove("report_job");
+        assert!(!verified(&w).await.unwrap());
+    }
+    /// An infinite expiry is no expiry, as NULL is; a plain role with an expiry is not plain.
+    #[tokio::test]
+    async fn infinity_is_no_expiry_for_a_role_the_record_leaves_without_one() {
+        let w = world_with_role(serde_json::json!({"connection_limit":5})).await;
+        catalog_row(&w, "reader_query", |role| {
+            role.valid_until = Some(Instant::Infinity)
+        });
+        assert!(verified(&w).await.unwrap());
+        catalog_row(&w, "reader_query", |role| {
+            role.valid_until = Some(Instant::At(1_900_000_000, 0))
+        });
+        assert!(!verified(&w).await.unwrap());
+    }
+    /// Without the maintenance credential nothing can read the catalogs: a record that states an
+    /// attribute is not verified, and a plain record still is, by the logins alone.
+    #[tokio::test]
+    async fn attributes_cannot_be_verified_without_the_maintenance_credential() {
+        let mut w = world_with_role(serde_json::json!({"connection_limit":5})).await;
+        w.db.as_object_mut().unwrap().remove("maintenance");
+        assert!(!verified(&w).await.unwrap());
+        let mut plain = crate::test_world::World::awake().await;
+        plain.wake(3);
+        plain.db.as_object_mut().unwrap().remove("maintenance");
+        assert!(verified(&plain).await.unwrap());
+    }
+    /// A database whose roles are all plain is verified by its logins alone: no catalog is read.
+    #[tokio::test]
+    async fn a_database_of_plain_roles_reads_no_catalog() {
+        let mut w = crate::test_world::World::awake().await;
+        w.wake(3);
+        assert!(verified(&w).await.unwrap());
+        assert!(
+            !log_has(&w, "role attributes"),
+            "{:?}",
+            w.log.lock().unwrap()
+        );
+        assert!(!log_has(&w, "role memberships"));
+    }
+    /// A role awaiting removal has no credential: no login is attempted for it, on any route.
+    #[tokio::test]
+    async fn a_role_awaiting_removal_is_not_logged_in() {
+        let mut w = crate::test_world::World::awake().await;
+        w.wake(3);
+        w.db["roles"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"gone_job","state":"absent"}));
+        assert!(verified(&w).await.unwrap());
+        let socket = w.reconciler.power.postgres.unwrap();
+        assert!(
+            roles_pod(
+                &w.db,
+                w.authority.pem.as_bytes(),
+                crate::test_world::POD_IP,
+                socket
+            )
+            .await
+            .unwrap()
+        );
+        assert!(!log_has(&w, "SQL gone_job"));
+        // The pool route reads the same roles: a record with nothing but a removal needs no
+        // connection at all, where a login attempt without a credential would fail.
+        let mut pooled = w.db.clone();
+        pooled["roles"] = serde_json::json!([{"name":"gone_job","state":"absent"}]);
+        let scope = serde_json::json!({"pool_pod_ip":"10.0.0.7"});
+        assert!(
+            pool_roles(&pooled, &scope, w.authority.pem.as_bytes())
                 .await
                 .unwrap()
         );

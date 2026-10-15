@@ -12,15 +12,17 @@ import {
   RoleName,
   SIDECAR,
   gib,
+  isRoleRemoval,
   mib,
   millicores,
   postgresParameters,
   postgresCpuRequestMillicores,
+  presentRoles,
   resourceQuotaFor,
   computePoolOverhead,
   ComputePoolPolicy,
 } from "@pgcf/contracts";
-import type { K8sObject } from "@pgcf/contracts";
+import type { DesiredRole, K8sObject } from "@pgcf/contracts";
 
 export interface BuildContext {
   backup: {
@@ -38,6 +40,11 @@ export interface BuildContext {
   storageClass: "pgcf-lvm";
   recoveryFinalized?: boolean;
   computePool?: ComputePoolPolicy | null;
+  /**
+   * The roles awaiting removal whose entry in the Cluster already asks CNPG to drop them. Every
+   * other removal entry is disabled first: it can no longer log in, and its sessions end.
+   */
+  droppingRoles?: readonly string[];
 }
 
 const DNS_LABEL = /^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
@@ -108,6 +115,13 @@ function endpointLabels(
 
 function validateContext(ctx: BuildContext): URL {
   if (ctx.computePool != null) ComputePoolPolicy.parse(ctx.computePool);
+  if (
+    ctx.droppingRoles !== undefined &&
+    (!Array.isArray(ctx.droppingRoles) ||
+      !ctx.droppingRoles.every((name) => RoleName.safeParse(name).success))
+  ) {
+    throw new TypeError("invalid build context");
+  }
   let endpoint: URL;
   try {
     endpoint = new URL(ctx.backup.endpointUrl);
@@ -146,6 +160,29 @@ function validateContext(ctx: BuildContext): URL {
     throw new TypeError("invalid build context");
   }
   return endpoint;
+}
+
+/**
+ * The roles in input order, each only after the roles it is a member of: the first role whose
+ * memberships are all emitted comes next. Without memberships the input order is kept. A cycle,
+ * which PostgreSQL refuses, is emitted as it stands.
+ */
+function membershipOrder(roles: readonly DesiredRole[]): DesiredRole[] {
+  const names = new Set(roles.map((role) => role.name));
+  const emitted = new Set<string>();
+  const remaining = [...roles];
+  const ordered: DesiredRole[] = [];
+  while (remaining.length > 0) {
+    const ready = remaining.findIndex((role) =>
+      (role.member_of ?? []).every(
+        (target) => emitted.has(target) || !names.has(target),
+      ),
+    );
+    const [next] = remaining.splice(Math.max(ready, 0), 1);
+    ordered.push(next!);
+    emitted.add(next!.name);
+  }
+  return ordered;
 }
 
 export function databaseNamespace(id: string): string {
@@ -224,10 +261,10 @@ export function buildDatabaseManifests(
     cpu: millicores(db.size.cpu_millicores),
     memory: mib(db.size.memory_mib),
   };
+  const dropping = new Set(ctx.droppingRoles ?? []);
   const managedRoles = [
-    ...db.roles
-      .filter((role) => !role.owner)
-      .map((role) => ({
+    ...membershipOrder(presentRoles(db).filter((role) => !role.owner)).map(
+      (role) => ({
         name: role.name,
         ensure: "present",
         login: true,
@@ -235,10 +272,28 @@ export function buildDatabaseManifests(
         createdb: false,
         createrole: false,
         replication: false,
-        bypassrls: false,
+        bypassrls: role.bypass_rls === true,
         inherit: true,
+        ...(role.connection_limit !== undefined
+          ? { connectionLimit: role.connection_limit }
+          : {}),
+        // The Cluster serialises metav1.Time in whole seconds, so the fraction is cut, not rounded.
+        ...(role.valid_until !== undefined
+          ? { validUntil: `${role.valid_until.slice(0, 19)}Z` }
+          : {}),
+        ...(role.member_of?.length
+          ? { inRoles: [...new Set(role.member_of)].sort() }
+          : {}),
         passwordSecret: { name: roleSecretName(role.name) },
-      })),
+      }),
+    ),
+    ...db.roles
+      .filter(isRoleRemoval)
+      .map((role) =>
+        dropping.has(role.name)
+          ? { name: role.name, ensure: "absent" }
+          : { name: role.name, ensure: "present", login: false },
+      ),
     ...(db.maintenance
       ? [
           {
@@ -251,7 +306,12 @@ export function buildDatabaseManifests(
             replication: false,
             bypassrls: false,
             inherit: true,
-            inRoles: ["pg_read_all_stats"],
+            // The statistics it samples; and, only while a role awaits removal, the sessions of
+            // that role it ends before the role is dropped. Any other database keeps the manifests
+            // it always had.
+            inRoles: db.roles.some(isRoleRemoval)
+              ? ["pg_read_all_stats", "pg_signal_backend"]
+              : ["pg_read_all_stats"],
             passwordSecret: { name: MAINTENANCE_SECRET },
           },
         ]
@@ -448,7 +508,7 @@ export function buildDatabaseManifests(
         ],
       },
     },
-    ...db.roles.map((role): K8sObject => ({
+    ...presentRoles(db).map((role): K8sObject => ({
       apiVersion: "v1",
       kind: "Secret",
       metadata: {

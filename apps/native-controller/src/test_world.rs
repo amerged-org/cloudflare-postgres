@@ -4,10 +4,10 @@
 //! a PostgreSQL socket. The controller's real code runs against it; nothing here is product code.
 use crate::{
     api::DesiredSnapshot,
-    contracts::{namespace, text},
+    contracts::{namespace, present_roles, text},
     manifests,
     reconcile::Reconciler,
-    test_postgres::{Answer, Authority, Cell, Handler, Postgres},
+    test_postgres::{Answer, Authority, Cell, Handler, Instant, Login, Postgres},
     test_server::{Server, uid},
 };
 use base64::{
@@ -16,7 +16,7 @@ use base64::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 use tokio::{
@@ -179,6 +179,38 @@ impl Gateway {
     }
 }
 
+/// What the catalogs of the PostgreSQL double hold of one role.
+#[derive(Clone, Debug)]
+pub struct RoleRow {
+    /// `rolcanlogin`.
+    pub login: bool,
+    /// `rolvaliduntil`: `None` is NULL.
+    pub valid_until: Option<Instant>,
+    /// `rolconnlimit`: `-1` is no limit.
+    pub connection_limit: i32,
+    /// `rolbypassrls`.
+    pub bypass_rls: bool,
+    /// The names of the roles it is a member of.
+    pub member_of: Vec<String>,
+    /// The `pg_shdepend` rows that depend on it.
+    pub dependencies: i64,
+    /// Its client backends in `pg_stat_activity`.
+    pub sessions: i64,
+}
+impl Default for RoleRow {
+    /// A plain role: it logs in, never expires, has no limit, no membership and no object.
+    fn default() -> Self {
+        Self {
+            login: true,
+            valid_until: None,
+            connection_limit: -1,
+            bypass_rls: false,
+            member_of: vec![],
+            dependencies: 0,
+            sessions: 0,
+        }
+    }
+}
 /// What the PostgreSQL double answers; tests change it between passes.
 #[derive(Clone)]
 pub struct Sql {
@@ -195,6 +227,15 @@ pub struct Sql {
     /// the log (`accepting`, `role login`, `archive`): the change lands before the answer does, so
     /// the controller's next read sees it.
     pub during: HashMap<&'static str, Arc<dyn Fn() + Send + Sync>>,
+    /// The roles of the database by name, as `pg_roles` and its neighbours hold them. A role that
+    /// is not here does not exist in PostgreSQL.
+    pub roles: BTreeMap<String, RoleRow>,
+    /// Roles whose startup PostgreSQL refuses, with the SQLSTATE and message of the FATAL.
+    pub refused: BTreeMap<String, (&'static str, &'static str)>,
+    /// The maintenance role does not hold `pg_signal_backend`: ending a session is refused.
+    pub signal_denied: bool,
+    /// An ended backend takes its time to leave `pg_stat_activity`.
+    pub sessions_linger: bool,
 }
 impl Default for Sql {
     fn default() -> Self {
@@ -206,6 +247,10 @@ impl Default for Sql {
             postmaster_age_ms: 5,
             recovery: false,
             during: HashMap::new(),
+            roles: BTreeMap::new(),
+            refused: BTreeMap::new(),
+            signal_denied: false,
+            sessions_linger: false,
         }
     }
 }
@@ -243,16 +288,30 @@ fn answers(
         if fenced() {
             return Answer::Error("57P03", "the database system is starting up");
         }
+        // The role a role statement is bound to; a statement being described has no parameter.
+        let role = parameters.first().map(String::as_str);
         let kind = if sql.contains("pg_postmaster_start_time") {
             "accepting".to_string()
         } else if sql.contains("current_setting('server_version')") {
             "role login".to_string()
         } else if sql.contains("pg_stat_archiver") {
             "archive".to_string()
+        } else if sql.contains("pg_terminate_backend") {
+            format!("role terminate {}", role.unwrap_or(""))
+        } else if sql.contains("rolvaliduntil") {
+            format!("role attributes {}", role.unwrap_or(""))
+        } else if sql.contains("WHERE member.rolname = $1") {
+            format!("role memberships {}", role.unwrap_or(""))
+        } else if sql.contains("pg_shdepend") {
+            format!("role dependencies {}", role.unwrap_or(""))
+        } else if sql.contains("FROM pg_catalog.pg_stat_activity WHERE usename = $1") {
+            format!("role sessions {}", role.unwrap_or(""))
         } else {
             sql.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
         };
-        log.lock().unwrap().push(format!("SQL {user} {kind}"));
+        log.lock()
+            .unwrap()
+            .push(format!("SQL {user} {kind}").trim_end().to_string());
         if let Some(during) = s.during.get(kind.as_str()) {
             during();
         }
@@ -263,7 +322,79 @@ fn answers(
         let size = &db["size"];
         let memory = crate::contracts::number(size, "memory_mib");
         let request = crate::contracts::optional_number(size, "memory_request_mib", memory);
-        if sql.contains("pg_stat_clear_snapshot") {
+        if sql.contains("rolvaliduntil") {
+            // A role's row by name: no row for a role PostgreSQL does not have. A statement being
+            // described has no parameter and answers with a row for its layout.
+            let row = |at: &str, held: &RoleRow| {
+                vec![
+                    ("rolname", name(at)),
+                    ("rolcanlogin", Cell::Bool(held.login)),
+                    (
+                        "rolvaliduntil",
+                        held.valid_until
+                            .map_or(Cell::Null(Cell::TIMESTAMPTZ), Cell::Timestamptz),
+                    ),
+                    ("rolconnlimit", Cell::Int4(held.connection_limit)),
+                    ("rolbypassrls", Cell::Bool(held.bypass_rls)),
+                ]
+            };
+            match role {
+                None => one(row("described", &RoleRow::default())),
+                Some(at) => Answer::Rows(
+                    s.roles
+                        .get(at)
+                        .map(|held| vec![row(at, held)])
+                        .unwrap_or_default(),
+                ),
+            }
+        } else if sql.contains("WHERE member.rolname = $1") {
+            // One `name` per role it is a member of.
+            match role {
+                None => one(vec![("rolname", name("described"))]),
+                Some(at) => Answer::Rows(
+                    s.roles
+                        .get(at)
+                        .map(|held| {
+                            held.member_of
+                                .iter()
+                                .map(|granted| vec![("rolname", name(granted))])
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+            }
+        } else if sql.contains("pg_shdepend") {
+            let count = role
+                .and_then(|at| s.roles.get(at))
+                .map_or(0, |held| held.dependencies);
+            one(vec![("count", Cell::Int8(count))])
+        } else if sql.contains("pg_terminate_backend") {
+            match role {
+                None => one(vec![("pg_terminate_backend", Cell::Bool(true))]),
+                Some(at) => {
+                    let sessions = s.roles.get(at).map_or(0, |held| held.sessions);
+                    if sessions > 0 && s.signal_denied {
+                        // Only a backend that is there to be ended raises it.
+                        return Answer::Error("42501", "permission denied to terminate process");
+                    }
+                    if !s.sessions_linger
+                        && let Some(held) = state.lock().unwrap().roles.get_mut(at)
+                    {
+                        held.sessions = 0;
+                    }
+                    Answer::Rows(
+                        (0..sessions)
+                            .map(|_| vec![("pg_terminate_backend", Cell::Bool(true))])
+                            .collect(),
+                    )
+                }
+            }
+        } else if sql.contains("FROM pg_catalog.pg_stat_activity WHERE usename = $1") {
+            let count = role
+                .and_then(|at| s.roles.get(at))
+                .map_or(0, |held| held.sessions);
+            one(vec![("count", Cell::Int8(count))])
+        } else if sql.contains("pg_stat_clear_snapshot") {
             one(vec![("pg_stat_clear_snapshot", Cell::Void)])
         } else if sql.contains("backend_type='client backend'") {
             // The pool holder's idleness: the statement reads its columns by position.
@@ -360,12 +491,16 @@ fn answers(
                 ("pg_is_in_recovery", Cell::Bool(s.recovery)),
             ])
         } else if sql.contains("FROM pg_roles WHERE rolname=current_user") {
+            // The role's own privileges: BYPASSRLS is the one attribute a role can be given.
             one(vec![
                 ("rolsuper", Cell::Bool(false)),
                 ("rolcreatedb", Cell::Bool(false)),
                 ("rolcreaterole", Cell::Bool(false)),
                 ("rolreplication", Cell::Bool(false)),
-                ("rolbypassrls", Cell::Bool(false)),
+                (
+                    "rolbypassrls",
+                    Cell::Bool(s.roles.get(user).is_some_and(|held| held.bypass_rls)),
+                ),
                 ("rolcanlogin", Cell::Bool(true)),
             ])
         } else if sql.contains("pg_has_role(r.oid,'pg_read_all_stats','MEMBER') AS stats") {
@@ -548,11 +683,15 @@ impl World {
                     c["metadata"]["annotations"]["cnpg.io/fencedInstances"].is_string()
                 })
         });
-        let postgres = Postgres::start(
+        let sql = self.sql.clone();
+        let login: Login =
+            Arc::new(move |user: &str| sql.lock().unwrap().refused.get(user).copied());
+        let postgres = Postgres::start_with(
             &self.authority,
             &format!("database-rw.{}.svc", self.ns),
             address,
             answers(self.db.clone(), self.sql.clone(), fenced, self.log.clone()),
+            login,
         )
         .await;
         self.reconciler.power.postgres = Some(postgres.address);
@@ -581,6 +720,103 @@ impl World {
         self.db["desired_state"] = "running".into();
         self.db["power"] = json!({"operation":format!("op_{}","w".repeat(20)),"revision":generation,"mode":"running","reason":null});
         self.db["size"]["memory_request_mib"] = 128.into();
+    }
+    /// A running database in the ordinary CNPG runtime, at generation 2 and without a power
+    /// intent: CNPG reconciled its Cluster, its Pod is ready and PostgreSQL answers, so one pass
+    /// of the reconciler finds it ready. The catalogs of PostgreSQL hold its roles as the record
+    /// states them.
+    pub async fn running() -> Self {
+        let mut w = Self::awake().await;
+        w.db["generation"] = 2.into();
+        w.db["desired_state"] = "running".into();
+        w.db.as_object_mut().unwrap().remove("power");
+        w.db["size"]["memory_request_mib"] = 128.into();
+        w.catalog_follows_desired();
+        w
+    }
+    /// PostgreSQL's catalogs hold every present role of the record other than the owner as the
+    /// record states it: it logs in, expires, is limited, is a member and bypasses row security
+    /// exactly as asked. A role the catalogs hold already keeps its sessions and objects.
+    pub fn catalog_follows_desired(&self) {
+        let mut sql = self.sql.lock().unwrap();
+        for role in present_roles(&self.db).filter(|role| role["owner"] != true) {
+            let name = text(role, "name");
+            let held = sql.roles.entry(name.to_string()).or_default();
+            held.login = true;
+            held.valid_until = role["valid_until"].as_str().map(|until| {
+                let at = time::OffsetDateTime::parse(
+                    until,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+                Instant::At(at.unix_timestamp(), 0)
+            });
+            held.connection_limit = role["connection_limit"]
+                .as_i64()
+                .map_or(-1, |limit| i32::try_from(limit).unwrap());
+            held.bypass_rls = role["bypass_rls"] == true;
+            held.member_of = role["member_of"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|target| target.as_str().map(str::to_string))
+                .collect();
+        }
+    }
+    /// CNPG has reconciled every present role of the record: the Cluster's status names it
+    /// reconciled with the version of the Secret it applied (a Secret the controller creates
+    /// starts at version 1).
+    pub fn cnpg_reconciles(&self) {
+        let mut names: Vec<String> = present_roles(&self.db)
+            .filter(|role| role["owner"] != true)
+            .map(|role| text(role, "name").to_string())
+            .collect();
+        names.push(text(&self.db["maintenance"], "role").to_string());
+        let mut passwords = json!({});
+        for name in &names {
+            let secret = if *name == text(&self.db["maintenance"], "role") {
+                "maintenance-credentials".to_string()
+            } else {
+                manifests::role_secret(name)
+            };
+            let version = self
+                .server
+                .get("Secret", Some(&self.ns), &secret)
+                .map_or("1".to_string(), |s| {
+                    text(&s["metadata"], "resourceVersion").to_string()
+                });
+            passwords[name] = json!({"resourceVersion": version});
+        }
+        self.server
+            .edit("Cluster", Some(&self.ns), "database", |cluster| {
+                cluster["status"]["managedRolesStatus"] =
+                    json!({"byStatus":{"reconciled":names},"passwordStatus":passwords});
+            });
+    }
+    /// The Cluster's entry for the managed role `name`, as the controller applied it.
+    pub fn managed_role(&self, name: &str) -> Option<Value> {
+        self.server.get("Cluster", Some(&self.ns), "database")?["spec"]["managed"]["roles"]
+            .as_array()?
+            .iter()
+            .find(|role| role["name"] == name)
+            .cloned()
+    }
+    /// The record states a new role at the next generation, which CNPG then reconciles.
+    pub fn add_role(&mut self, role: Value) {
+        self.db["roles"].as_array_mut().unwrap().push(role);
+        self.db["generation"] = (self.db["generation"].as_u64().unwrap() + 1).into();
+        self.cnpg_reconciles();
+        self.catalog_follows_desired();
+    }
+    /// The API deleted `name`: at the next generation the record holds a removal entry for it,
+    /// which is all that is left of the role in the record.
+    pub fn delete_role(&mut self, name: &str) {
+        for role in self.db["roles"].as_array_mut().unwrap() {
+            if role["name"] == name {
+                *role = json!({"name":name,"state":"absent"});
+            }
+        }
+        self.db["generation"] = (self.db["generation"].as_u64().unwrap() + 1).into();
     }
     /// One pass of the sleep step, the retained Pod judged against what a reconcile would apply.
     pub async fn sleep_pass(&self) -> Option<Value> {
@@ -844,7 +1080,57 @@ mod wire_tests {
                     ("postmaster_age_ms", Type::INT8),
                 ],
             ),
+            // The role lifecycle: a role's row by name (NULL expiry for none), and the counts
+            // that decide whether it can be dropped and whether sessions remain.
+            (
+                postgres::ROLE_CATALOG_QUERY,
+                Some(role),
+                vec![
+                    ("rolname", Type::NAME),
+                    ("rolcanlogin", Type::BOOL),
+                    ("rolvaliduntil", Type::TIMESTAMPTZ),
+                    ("rolconnlimit", Type::INT4),
+                    ("rolbypassrls", Type::BOOL),
+                ],
+            ),
+            (
+                postgres::DEPENDENCIES_QUERY,
+                Some(role),
+                vec![("count", Type::INT8)],
+            ),
+            (
+                postgres::SESSIONS_QUERY,
+                Some(role),
+                vec![("count", Type::INT8)],
+            ),
         ]
+    }
+    /// The role statements that answer a row per match, which may be none: their columns, read
+    /// from the statement the server describes.
+    async fn describes(client: &tokio_postgres::Client) {
+        for (statement, expected) in [
+            (postgres::MEMBERSHIP_QUERY, vec![("rolname", Type::NAME)]),
+            (
+                postgres::TERMINATE_QUERY,
+                vec![("pg_terminate_backend", Type::BOOL)],
+            ),
+        ] {
+            let prepared = client
+                .prepare(statement)
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error}"));
+            assert_eq!(prepared.params().len(), 1, "{statement}");
+            let columns: Vec<_> = prepared
+                .columns()
+                .iter()
+                .map(|column| (column.name().to_string(), column.type_().clone()))
+                .collect();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(name, kind)| (name.to_string(), kind))
+                .collect();
+            assert_eq!(columns, expected, "{statement}");
+        }
     }
     fn text_of(row: &tokio_postgres::Row, column: &str) -> String {
         row.try_get::<_, String>(column).unwrap()
@@ -853,6 +1139,7 @@ mod wire_tests {
     /// PostgreSQL text output: the columns' types and names, the shape of an LSN, a WAL file name,
     /// an epoch, a server version and a server address. Every cell is what the real server gives.
     async fn conforms(client: &tokio_postgres::Client, role: &str) {
+        describes(client).await;
         for (statement, parameter, expected) in pinned(role) {
             let rows = match parameter {
                 Some(value) => client.query(statement, &[&value]).await,
@@ -959,6 +1246,12 @@ mod wire_tests {
     async fn the_double_gives_every_statement_the_types_and_forms_postgresql_does() {
         let w = World::awake().await;
         let role = crate::contracts::text(&w.db["maintenance"], "role");
+        // The role the statements are bound to exists in the catalogs of the double.
+        w.sql
+            .lock()
+            .unwrap()
+            .roles
+            .insert(role.to_string(), RoleRow::default());
         let session = postgres::connect_via(
             &w.db,
             w.authority.pem.as_bytes(),

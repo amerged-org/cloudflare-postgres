@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Client } from "pg";
 import type { ClientConfig } from "pg";
-import { DesiredDatabase, postgresParameters } from "@pgcf/contracts";
+import {
+  DesiredDatabase,
+  postgresParameters,
+  presentRoles,
+} from "@pgcf/contracts";
 import { databaseNamespace, roleSecretName } from "./builders/index.ts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {
@@ -16,7 +20,9 @@ export function credentialSecretMatches(
   secret: Resource,
 ): boolean {
   const name = secret.metadata.name;
-  const role = db.roles.find((value) => roleSecretName(value.name) === name);
+  const role = presentRoles(db).find(
+    (value) => roleSecretName(value.name) === name,
+  );
   const credentials =
     role ??
     (db.maintenance && name === "maintenance-credentials"
@@ -70,7 +76,8 @@ export async function probeRoles(
   );
   const host = `database-rw.${databaseNamespace(db.id)}.svc`;
   const bounded = AbortSignal.any([signal, AbortSignal.timeout(20_000)]);
-  for (const role of db.roles) {
+  // A role awaiting removal has no credential; the legacy agent leaves its removal to the controller.
+  for (const role of presentRoles(db)) {
     if (bounded.aborted) return false;
     const client = createClient({
       host,

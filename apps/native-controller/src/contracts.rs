@@ -62,6 +62,37 @@ pub fn constant(name: &str) -> &'static Value {
 pub fn namespace(db: &Value) -> String {
     format!("pgcf-db-{}", text(db, "id"))
 }
+/// Whether `role` is a removal entry, `{name, state:"absent"}`: a role the API deleted whose
+/// removal from PostgreSQL is not yet confirmed. It has no credential and no attribute.
+pub fn role_removal(role: &Value) -> bool {
+    role.get("state").is_some()
+}
+/// The roles the database holds now, without those awaiting removal.
+pub fn present_roles(db: &Value) -> impl Iterator<Item = &Value> {
+    db["roles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|role| !role_removal(role))
+}
+/// The roles whose removal from PostgreSQL the desired record awaits.
+pub fn removal_roles(db: &Value) -> impl Iterator<Item = &Value> {
+    db["roles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|role| role_removal(role))
+}
+/// The credentials a runtime attestation says were applied: each present role and its revision.
+/// `None` when the record states no role set at all.
+pub fn applied_role_revisions(db: &Value) -> Option<Vec<Value>> {
+    db["roles"].as_array()?;
+    Some(
+        present_roles(db)
+            .map(|role| serde_json::json!({"name":role["name"],"revision":role["revision"]}))
+            .collect(),
+    )
+}
 pub fn generation(value: &Value) -> u64 {
     value["metadata"]["annotations"]["pgcf.io/generation"]
         .as_str()
@@ -125,25 +156,70 @@ pub fn database_valid(db: &Value) -> bool {
             return false;
         }
     }
+    let maintenance = constant("MAINTENANCE_ROLE").as_str().unwrap();
+    let owner_name = constant("OWNER_ROLE_NAME").as_str().unwrap();
     let mut names = HashSet::new();
     let mut owners = 0;
     for role in db["roles"].as_array().into_iter().flatten() {
         let name = text(role, "name");
-        if !pgcf_native_protocol::valid_role(name)
-            || name == constant("MAINTENANCE_ROLE").as_str().unwrap()
-            || !names.insert(name)
+        if !pgcf_native_protocol::valid_role(name) || name == maintenance || !names.insert(name) {
+            return false;
+        }
+        if role_removal(role) {
+            // Nothing but its name and state, which the schema holds; the owner is never removed.
+            if name == owner_name {
+                return false;
+            }
+            continue;
+        }
+        let owns = role["owner"] == true;
+        if owns {
+            owners += 1;
+            if name != owner_name {
+                return false;
+            }
+        }
+        // The owner is a plain role; the attributes belong to the roles created beside it.
+        if (owns || name == owner_name)
+            && ["valid_until", "connection_limit", "member_of", "bypass_rls"]
+                .iter()
+                .any(|attribute| role.get(*attribute).is_some())
         {
             return false;
         }
-        if role["owner"] == true {
-            owners += 1;
-            if name != constant("OWNER_ROLE_NAME").as_str().unwrap() {
-                return false;
-            }
+        if role.get("valid_until").is_some_and(|until| {
+            until
+                .as_str()
+                .and_then(|until| {
+                    time::OffsetDateTime::parse(
+                        until,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .ok()
+                })
+                .is_none_or(|until| !until.offset().is_utc())
+        }) {
+            return false;
         }
     }
     if owners > 1 || (["running", "suspended"].contains(&state) && owners != 1) {
         return false;
+    }
+    // A membership names another role the record holds now: never the owner, the maintenance
+    // role, the role itself or a role awaiting removal.
+    let present: HashMap<&str, &Value> = present_roles(db)
+        .map(|role| (text(role, "name"), role))
+        .collect();
+    for role in present.values() {
+        for target in role["member_of"].as_array().into_iter().flatten() {
+            let target = target.as_str().unwrap_or("");
+            if target == text(role, "name")
+                || target == owner_name
+                || present.get(target).is_none_or(|t| t["owner"] != false)
+            {
+                return false;
+            }
+        }
     }
     let size = &db["size"];
     let storage = &db["storage"];
@@ -205,10 +281,8 @@ pub fn desired_valid(value: &Value, region: &str) -> bool {
 /// Same nonsecret tuple as the authoritative reclaimConfigurationInput TypeScript helper.
 pub fn configuration_input(db: &Value, fallback: &str) -> Value {
     let size = &db["size"];
-    let mut roles: Vec<_> = db["roles"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    // A role awaiting removal is not part of the configuration the runtime attests.
+    let mut roles: Vec<_> = present_roles(db)
         .map(|role| serde_json::json!([role["name"], role["owner"], number(role, "revision")]))
         .collect();
     roles.sort_by(|a, b| a[0].as_str().cmp(&b[0].as_str()));
@@ -371,5 +445,191 @@ mod tests {
         db = v[0]["db"].clone();
         db["roles"][1]["name"] = "pgcf_maintenance".into();
         assert!(!database_valid(&db));
+    }
+    /// The record of the first vector (the owner and `reader_query`) with `roles` in place of its own.
+    fn with_roles(roles: Vec<Value>) -> Value {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/controller-vectors.generated.json"
+        ))
+        .unwrap();
+        let mut db = vectors[0]["db"].clone();
+        db["roles"] = roles.into();
+        db
+    }
+    fn plain(name: &str) -> Value {
+        serde_json::json!({"name":name,"owner":false,"password":"q".repeat(43),"revision":1})
+    }
+    fn attributed(name: &str, extra: Value) -> Value {
+        let mut role = plain(name);
+        for (key, value) in extra.as_object().unwrap() {
+            role[key] = value.clone();
+        }
+        role
+    }
+    fn owner() -> Value {
+        serde_json::json!({"name":"app","owner":true,"password":"p".repeat(43),"revision":1})
+    }
+    fn removal(name: &str) -> Value {
+        serde_json::json!({"name":name,"state":"absent"})
+    }
+    #[test]
+    fn a_role_awaiting_removal_and_role_attributes_are_valid_when_their_rules_hold() {
+        use serde_json::json;
+        let all = attributed(
+            "report_job",
+            json!({"valid_until":"2031-01-02T03:04:05.678Z","connection_limit":5,"member_of":["reader"],"bypass_rls":true}),
+        );
+        assert!(database_valid(&with_roles(vec![
+            owner(),
+            plain("reader"),
+            all.clone()
+        ])));
+        assert!(database_valid(&with_roles(vec![
+            owner(),
+            plain("reader"),
+            removal("gone_job"),
+            all
+        ])));
+        // A removal is not an owner: a running database needs exactly one present owner.
+        assert!(!database_valid(&with_roles(vec![removal("gone_job")])));
+    }
+    #[test]
+    fn role_removals_and_memberships_obey_the_rules_the_contract_states() {
+        use serde_json::json;
+        let member = |targets: Value| attributed("report_job", json!({"member_of":targets}));
+        let refused: Vec<(&str, Vec<Value>)> = vec![
+            (
+                "a removal repeats a present role",
+                vec![owner(), plain("reader"), removal("reader")],
+            ),
+            (
+                "a removal repeats a removal",
+                vec![owner(), removal("gone_job"), removal("gone_job")],
+            ),
+            (
+                "the owner cannot be removed",
+                vec![removal("app"), plain("reader")],
+            ),
+            (
+                "the maintenance role is not a customer role",
+                vec![owner(), removal("pgcf_maintenance")],
+            ),
+            (
+                "a membership of a role awaiting removal",
+                vec![owner(), removal("gone_job"), member(json!(["gone_job"]))],
+            ),
+            (
+                "a membership of a role the record does not hold",
+                vec![owner(), member(json!(["reader"]))],
+            ),
+            (
+                "a membership of the owner",
+                vec![owner(), member(json!(["app"]))],
+            ),
+            (
+                "a membership of itself",
+                vec![owner(), member(json!(["report_job"]))],
+            ),
+            (
+                "a membership of the maintenance role",
+                vec![
+                    owner(),
+                    plain("reader"),
+                    member(json!(["pgcf_maintenance"])),
+                ],
+            ),
+        ];
+        for (reason, roles) in refused {
+            assert!(!database_valid(&with_roles(roles)), "{reason}");
+        }
+        // The owner carries none of the role attributes.
+        for extra in [
+            json!({"valid_until":"2031-01-02T03:04:05.000Z"}),
+            json!({"connection_limit":5}),
+            json!({"member_of":["reader"]}),
+            json!({"bypass_rls":true}),
+        ] {
+            let mut owner = owner();
+            for (key, value) in extra.as_object().unwrap() {
+                owner[key] = value.clone();
+            }
+            assert!(
+                !database_valid(&with_roles(vec![owner, plain("reader")])),
+                "{extra}"
+            );
+        }
+        // A removal carries nothing but its name and state.
+        let mut loaded = removal("gone_job");
+        loaded["password"] = "q".repeat(43).into();
+        assert!(!database_valid(&with_roles(vec![owner(), loaded])));
+        // An expiry is a UTC instant with milliseconds, as the contract states it.
+        for expiry in [
+            "2031-01-02T03:04:05Z",
+            "2031-01-02T03:04:05.000+02:00",
+            "tomorrow",
+            "2031-02-29T03:04:05.000Z",
+        ] {
+            let role = attributed("report_job", json!({"valid_until":expiry}));
+            assert!(
+                !database_valid(&with_roles(vec![owner(), role])),
+                "{expiry}"
+            );
+        }
+    }
+    #[test]
+    fn an_attestation_names_the_present_roles_and_their_revisions_only() {
+        use serde_json::json;
+        let db = with_roles(vec![owner(), removal("gone_job"), plain("reader")]);
+        assert_eq!(
+            applied_role_revisions(&db).unwrap(),
+            vec![
+                json!({"name":"app","revision":1}),
+                json!({"name":"reader","revision":1})
+            ]
+        );
+        assert_eq!(removal_roles(&db).count(), 1);
+        assert_eq!(present_roles(&db).count(), 2);
+        // A record that states no role set attests none.
+        assert!(applied_role_revisions(&json!({"id":"db"})).is_none());
+    }
+    #[test]
+    fn a_role_awaiting_removal_is_not_part_of_the_configuration() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/controller-vectors.generated.json"
+        ))
+        .unwrap();
+        let fallback = text(&vectors[0]["ctx"], "postgresImage");
+        let plain = vectors[0]["db"].clone();
+        let mut awaiting = plain.clone();
+        awaiting["roles"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, serde_json::json!({"name":"gone_job","state":"absent"}));
+        assert_eq!(
+            configuration_input(&awaiting, fallback),
+            configuration_input(&plain, fallback)
+        );
+        assert_eq!(
+            configuration_fingerprint(&awaiting, fallback).unwrap(),
+            configuration_fingerprint(&plain, fallback).unwrap()
+        );
+        // The TypeScript helper's vector for a record with a removal says the same.
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "role-removal-disable")
+            .unwrap();
+        assert_eq!(
+            configuration_input(&vector["db"], fallback),
+            vector["configuration_input"]
+        );
+        let names: Vec<_> = vector["configuration_input"][7]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|role| role[0].clone())
+            .collect();
+        assert!(!names.contains(&"report_job".into()), "{names:?}");
     }
 }

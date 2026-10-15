@@ -62,6 +62,18 @@ test("archive statements contain only read-only identity and archive observation
   );
 });
 
+// The maintenance role holds pg_read_all_stats for the sample and pg_signal_backend to end the
+// sessions of a role awaiting removal; the identity proof must not read the second as a privilege
+// the role should not have, or every sample of every database would be refused.
+test("the identity proof admits exactly the memberships the maintenance role is given", () => {
+  assert.ok(
+    ARCHIVE_IDENTITY_QUERY.includes(
+      "granted.rolname NOT IN ('pg_read_all_stats','pg_signal_backend')",
+    ),
+  );
+  assert.ok(!ARCHIVE_IDENTITY_QUERY.includes("<>'pg_read_all_stats'"));
+});
+
 const id = newDatabaseId(),
   host = `database-rw.pgcf-db-${id}.svc`;
 const folder = mkdtempSync(join(tmpdir(), "pgcf-archive-ca-"));

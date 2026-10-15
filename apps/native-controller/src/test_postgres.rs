@@ -11,6 +11,17 @@
 //! `inet_server_addr()` is `inet` whose cast to `text` keeps the netmask (`10.0.0.7/32`) while
 //! `host()` drops it, `EXTRACT(EPOCH ...)::text` is a numeric with six decimals, an LSN and a WAL
 //! file name use upper-case hexadecimal, and `pg_stat_clear_snapshot()` is `void`.
+//!
+//! The role statements of the role lifecycle read the catalogs of PostgreSQL 18: `pg_roles.rolname`
+//! is `name`, `rolcanlogin` and `rolbypassrls` are `bool`, `rolconnlimit` is `int4` (`-1` is no
+//! limit) and `rolvaliduntil` is `timestamptz`, which is NULL for no expiry and may be `infinity`;
+//! its binary form is an `int8` of microseconds since 2000-01-01 UTC, `infinity` is `i64::MAX`,
+//! and its text form is `2030-01-02 03:04:05+00` in a UTC session. `pg_auth_members` joined to
+//! `pg_roles` yields one `name` per granted role, `pg_shdepend.refobjid` is `oid` and only its
+//! `count(*)` (`int8`) leaves the server, and `pg_terminate_backend()` is `bool`. A NULL is a
+//! length of -1 with its column's type, never a text. PostgreSQL refuses a login with a FATAL
+//! ErrorResponse at startup: `28P01` for a failed or expired credential, before authentication
+//! succeeds, and `53300` for a role at its connection limit, after `AuthenticationOk`.
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -18,6 +29,51 @@ use tokio::{
     net::TcpListener,
 };
 use tokio_rustls::TlsAcceptor;
+
+/// A `timestamptz` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instant {
+    /// Seconds since the Unix epoch and the microseconds within the second.
+    At(i64, u32),
+    Infinity,
+    NegativeInfinity,
+}
+impl Instant {
+    /// Seconds from 1970-01-01 to 2000-01-01, the epoch of PostgreSQL's timestamps.
+    const POSTGRES_EPOCH_SECONDS: i64 = 946_684_800;
+    fn binary(self) -> i64 {
+        match self {
+            Self::At(seconds, micros) => {
+                (seconds - Self::POSTGRES_EPOCH_SECONDS) * 1_000_000 + i64::from(micros)
+            }
+            Self::Infinity => i64::MAX,
+            Self::NegativeInfinity => i64::MIN,
+        }
+    }
+    fn text(self) -> String {
+        match self {
+            Self::Infinity => "infinity".into(),
+            Self::NegativeInfinity => "-infinity".into(),
+            Self::At(seconds, micros) => {
+                let at = time::OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+                let fraction = if micros == 0 {
+                    String::new()
+                } else {
+                    format!(".{micros:06}").trim_end_matches('0').to_string()
+                };
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}{fraction}+00",
+                    at.year(),
+                    u8::from(at.month()),
+                    at.day(),
+                    at.hour(),
+                    at.minute(),
+                    at.second()
+                )
+            }
+        }
+    }
+}
 
 /// One cell of a canned result row.
 #[derive(Clone, Debug)]
@@ -33,8 +89,14 @@ pub enum Cell {
     Inet(String),
     /// The `void` of `pg_stat_clear_snapshot()`: no bytes.
     Void,
+    /// A `timestamptz` (`pg_roles.rolvaliduntil`); NULL is `Null` of its type.
+    Timestamptz(Instant),
+    /// A NULL of the type with this OID: a length of -1 in both formats.
+    Null(i32),
 }
 impl Cell {
+    /// The OID of `timestamptz`, for a `Null` of it.
+    pub const TIMESTAMPTZ: i32 = 1184;
     fn oid(&self) -> i32 {
         match self {
             Self::Text(_) => 25,
@@ -44,10 +106,14 @@ impl Cell {
             Self::Int8(_) => 20,
             Self::Inet(_) => 869,
             Self::Void => 2278,
+            Self::Timestamptz(_) => Self::TIMESTAMPTZ,
+            Self::Null(oid) => *oid,
         }
     }
-    fn encode(&self, binary: bool) -> Vec<u8> {
-        match (self, binary) {
+    /// The bytes of the cell, or `None` for the NULL that is sent as a length of -1.
+    fn encode(&self, binary: bool) -> Option<Vec<u8>> {
+        Some(match (self, binary) {
+            (Self::Null(_), _) => return None,
             (Self::Text(v) | Self::Name(v), _) => v.as_bytes().to_vec(),
             (Self::Bool(v), true) => vec![u8::from(*v)],
             (Self::Bool(v), false) => vec![if *v { b't' } else { b'f' }],
@@ -56,6 +122,8 @@ impl Cell {
             (Self::Int8(v), true) => v.to_be_bytes().to_vec(),
             (Self::Int8(v), false) => v.to_string().into_bytes(),
             (Self::Void, _) => Vec::new(),
+            (Self::Timestamptz(at), true) => at.binary().to_be_bytes().to_vec(),
+            (Self::Timestamptz(at), false) => at.text().into_bytes(),
             (Self::Inet(v), binary) => {
                 let address: std::net::IpAddr = v.parse().expect("an inet cell holds an address");
                 let (family, bits, octets) = match address {
@@ -72,7 +140,7 @@ impl Cell {
                     v.clone().into_bytes()
                 }
             }
-        }
+        })
     }
 }
 pub type Row = Vec<(&'static str, Cell)>;
@@ -84,6 +152,9 @@ pub enum Answer {
 /// Maps (statement text, bound text parameters, session user) to an answer. It is also called
 /// without parameters to describe a statement, so it must not depend on them for the layout.
 pub type Handler = Arc<dyn Fn(&str, &[String], &str) -> Answer + Send + Sync>;
+/// Whether the server lets a startup of this user in: `None` accepts it; `Some((SQLSTATE,
+/// message))` refuses it with a FATAL ErrorResponse and closes, as PostgreSQL does.
+pub type Login = Arc<dyn Fn(&str) -> Option<(&'static str, &'static str)> + Send + Sync>;
 
 /// A throwaway certificate authority whose leaf certificates PostgreSQL doubles present.
 pub struct Authority {
@@ -115,12 +186,23 @@ impl Drop for Postgres {
     }
 }
 impl Postgres {
-    /// Listens on `address` (a random loopback port when `None`) with a certificate for `name`.
+    /// Listens on `address` (a random loopback port when `None`) with a certificate for `name`;
+    /// every login is accepted.
     pub async fn start(
         authority: &Authority,
         name: &str,
         address: Option<SocketAddr>,
         handler: Handler,
+    ) -> Self {
+        Self::start_with(authority, name, address, handler, Arc::new(|_| None)).await
+    }
+    /// Like `start`, with the logins `login` refuses.
+    pub async fn start_with(
+        authority: &Authority,
+        name: &str,
+        address: Option<SocketAddr>,
+        handler: Handler,
+        login: Login,
     ) -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
         let leaf = rcgen::CertificateParams::new(vec![name.into()])
@@ -144,9 +226,9 @@ impl Postgres {
                 let Ok((tcp, _)) = listener.accept().await else {
                     return;
                 };
-                let (acceptor, handler) = (acceptor.clone(), handler.clone());
+                let (acceptor, handler, login) = (acceptor.clone(), handler.clone(), login.clone());
                 tokio::spawn(async move {
-                    let _ = session(acceptor, tcp, handler).await;
+                    let _ = session(acceptor, tcp, handler, login).await;
                 });
             }
         });
@@ -197,10 +279,27 @@ fn parameter_count(sql: &str) -> i16 {
     }
     most
 }
+/// An ErrorResponse of the severity, SQLSTATE and message; FATAL ends the session.
+fn error_response(severity: &str, code: &str, text: &str) -> Vec<u8> {
+    let mut fields = Vec::new();
+    for (tag, value) in [
+        (b'S', severity),
+        (b'V', severity),
+        (b'C', code),
+        (b'M', text),
+    ] {
+        fields.push(tag);
+        fields.extend_from_slice(value.as_bytes());
+        fields.push(0);
+    }
+    fields.push(0);
+    message(b'E', &fields)
+}
 async fn session(
     acceptor: TlsAcceptor,
     mut tcp: tokio::net::TcpStream,
     handler: Handler,
+    login: Login,
 ) -> std::io::Result<()> {
     let mut request = [0; 8];
     tcp.read_exact(&mut request).await?;
@@ -218,6 +317,15 @@ async fn session(
         if name == "user" {
             user = value;
         }
+    }
+    if let Some((code, text)) = login(&user) {
+        // A failed credential (class 28) is refused before authentication succeeds; any other
+        // refusal, such as a role at its connection limit, follows AuthenticationOk.
+        if !code.starts_with("28") {
+            tls.write_all(&message(b'R', &0_i32.to_be_bytes())).await?;
+        }
+        tls.write_all(&error_response("FATAL", code, text)).await?;
+        return Ok(());
     }
     // AuthenticationOk and ReadyForQuery.
     tls.write_all(&message(b'R', &0_i32.to_be_bytes())).await?;
@@ -317,24 +425,20 @@ async fn session(
                                     [one] => *one == 1,
                                     many => many.get(index).is_some_and(|f| *f == 1),
                                 };
-                                let bytes = cell.encode(binary);
-                                data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-                                data.extend(bytes);
+                                match cell.encode(binary) {
+                                    Some(bytes) => {
+                                        data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                                        data.extend(bytes);
+                                    }
+                                    // A NULL is a length of -1 and no bytes.
+                                    None => data.extend_from_slice(&(-1_i32).to_be_bytes()),
+                                }
                             }
                             out.extend(message(b'D', &data));
                         }
                         out.extend(message(b'C', format!("SELECT {}\0", rows.len()).as_bytes()));
                     }
-                    Answer::Error(code, text) => {
-                        let mut fields = Vec::new();
-                        for (tag, value) in [(b'S', "ERROR"), (b'C', code), (b'M', text)] {
-                            fields.push(tag);
-                            fields.extend_from_slice(value.as_bytes());
-                            fields.push(0);
-                        }
-                        fields.push(0);
-                        out.extend(message(b'E', &fields));
-                    }
+                    Answer::Error(code, text) => out.extend(error_response("ERROR", code, text)),
                 }
             }
             b'S' => {

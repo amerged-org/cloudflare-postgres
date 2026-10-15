@@ -11,6 +11,8 @@ import test from "node:test";
 import { createSecureContext, TLSSocket } from "node:tls";
 import { Client } from "pg";
 import type { ClientConfig } from "pg";
+import { presentRoles } from "@pgcf/contracts";
+import type { DesiredDatabase } from "@pgcf/contracts";
 import {
   probeRoles,
   READINESS_SETTINGS_QUERY,
@@ -31,7 +33,7 @@ const frame = (type: string, body: Buffer) =>
   Buffer.concat([Buffer.from(type), int32(body.length + 4), body]);
 
 async function postgresFixture(
-  database: ReturnType<typeof fixture>["db"],
+  database: DesiredDatabase,
   certificateHost: string,
   abortOnQuery?: () => void,
   sharedBuffersMib = Math.floor(database.size.memory_mib / 4),
@@ -106,7 +108,7 @@ async function postgresFixture(
           if (type === "p") {
             const password = packet.subarray(5, -1).toString();
             if (
-              database.roles.find((role) => role.name === username)
+              presentRoles(database).find((role) => role.name === username)
                 ?.password !== password
             ) {
               secure.end(
@@ -250,6 +252,32 @@ test("readiness authenticates every desired role over verified TLS and rejects a
       ),
       false,
     );
+  } finally {
+    await server.close();
+  }
+});
+
+test("readiness does not authenticate a role awaiting removal, which has no credential", async () => {
+  const { db } = fixture();
+  const wanted: DesiredDatabase = {
+    ...db,
+    roles: [...db.roles, { name: "gone_job", state: "absent" }],
+  };
+  const server = await postgresFixture(
+    wanted,
+    `database-rw.pgcf-db-${db.id}.svc`,
+  );
+  try {
+    assert.equal(
+      await probeRoles(
+        wanted,
+        server.ca,
+        new AbortController().signal,
+        server.factory,
+      ),
+      true,
+    );
+    assert.deepEqual(server.authenticated, ["app"]);
   } finally {
     await server.close();
   }

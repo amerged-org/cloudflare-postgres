@@ -7,14 +7,19 @@ import {
   newRolePassword,
   archiveDestinationPath,
 } from "@pgcf/contracts";
-import type { DesiredDatabase, K8sObject } from "@pgcf/contracts";
+import type { DesiredDatabase, DesiredRole, K8sObject } from "@pgcf/contracts";
 import type { BuildContext } from "../../src/agent/builders/index.ts";
 import { roleSecretName } from "../../src/agent/builders/index.ts";
 import { DATABASE_LABEL } from "../../src/agent/observe.ts";
 import { record } from "../../src/agent/types.ts";
 import type { Kubernetes, Resource } from "../../src/agent/types.ts";
 
-export function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
+/** A desired database whose roles are all present; removal entries have their own tests. */
+export type PlainDatabase = Omit<DesiredDatabase, "roles"> & {
+  roles: DesiredRole[];
+};
+
+export function fixture(): { db: PlainDatabase; ctx: BuildContext } {
   const id = newDatabaseId();
   const operationId = newOperationId();
   return {

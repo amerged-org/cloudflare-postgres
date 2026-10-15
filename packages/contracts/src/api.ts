@@ -458,6 +458,13 @@ export type DatabaseRestore = z.infer<typeof DatabaseRestore>;
 
 // ---------- Roles and connection URIs ----------
 
+/** PostgreSQL's CONNECTION LIMIT of an API role; omitted or null means unlimited. */
+export const ROLE_CONNECTION_LIMIT_MAX = 10000;
+/** The roles a new role can be made a member of. */
+export const ROLE_MEMBER_OF_MAX = 8;
+/** Roles of one database; the owner and roles whose removal is not confirmed count. */
+export const ROLE_LIMIT = 100;
+
 export const Role = z
   .strictObject({
     database_id: DatabaseId,

@@ -12,7 +12,7 @@ import {
   MAINTENANCE_ROLE,
   MAINTENANCE_BOOTSTRAP_SQL,
 } from "@pgcf/contracts";
-import type { DesiredDatabase, K8sObject } from "@pgcf/contracts";
+import type { DesiredDatabase, DesiredRole, K8sObject } from "@pgcf/contracts";
 import {
   buildCaConfigMap,
   buildDatabaseManifests,
@@ -49,7 +49,10 @@ test("uses the persisted per-database release image instead of regional defaults
   );
 });
 
-function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
+/** A database whose roles are all plain; removal entries have their own tests. */
+type PlainDatabase = Omit<DesiredDatabase, "roles"> & { roles: DesiredRole[] };
+
+function fixture(): { db: PlainDatabase; ctx: BuildContext } {
   return {
     db: {
       id,
@@ -142,7 +145,7 @@ function array(value: unknown): unknown[] {
 
 function normalize(
   resources: K8sObject[],
-  db: DesiredDatabase,
+  db: PlainDatabase,
   ctx: BuildContext,
 ): unknown[] {
   const substitutions = new Map<string, string>([
@@ -690,4 +693,197 @@ test("one-second startup and readiness cadence preserves the startup budget and 
   assert.equal(record(probes.readiness).timeoutSeconds, undefined);
   assert.equal(startup.successThreshold, undefined);
   assert.equal(record(probes.readiness).successThreshold, undefined);
+});
+
+function withRoles(
+  db: PlainDatabase,
+  ...roles: DesiredDatabase["roles"]
+): DesiredDatabase {
+  return { ...db, roles: [...db.roles, ...roles] };
+}
+
+function attributed(name: string, extra: Partial<DesiredRole>): DesiredRole {
+  return {
+    name,
+    owner: false,
+    password: newRolePassword(),
+    revision: 1,
+    ...extra,
+  };
+}
+
+function managedRoles(
+  db: DesiredDatabase,
+  ctx: BuildContext,
+): Record<string, unknown>[] {
+  const spec = record(object(buildDatabaseManifests(db, ctx), "Cluster").spec);
+  return array(record(spec.managed).roles).map(record);
+}
+
+test("role attributes reach the managed role only when set, and an expiry is cut to whole seconds", () => {
+  const { db, ctx } = fixture();
+  assert.deepEqual(Object.keys(managedRoles(db, ctx)[0]!).toSorted(), [
+    "bypassrls",
+    "createdb",
+    "createrole",
+    "ensure",
+    "inherit",
+    "login",
+    "name",
+    "passwordSecret",
+    "replication",
+    "superuser",
+  ]);
+  const role = attributed("report_job", {
+    valid_until: "2031-01-02T03:04:05.999Z",
+    connection_limit: 5,
+    member_of: [managedRole],
+    bypass_rls: true,
+  });
+  assert.deepEqual(managedRoles(withRoles(db, role), ctx)[1], {
+    name: "report_job",
+    ensure: "present",
+    login: true,
+    superuser: false,
+    createdb: false,
+    createrole: false,
+    replication: false,
+    bypassrls: true,
+    inherit: true,
+    connectionLimit: 5,
+    validUntil: "2031-01-02T03:04:05Z",
+    inRoles: [managedRole],
+    passwordSecret: { name: roleSecretName("report_job") },
+  });
+  // An empty membership list is no membership, and memberships are sorted and distinct.
+  const bare = managedRoles(
+    withRoles(db, attributed("report_job", { member_of: [] })),
+    ctx,
+  )[1]!;
+  assert.equal("inRoles" in bare, false);
+  const sorted = managedRoles(
+    withRoles(
+      db,
+      attributed("zeta_job", {}),
+      attributed("alpha_job", {}),
+      attributed("report_job", { member_of: ["zeta_job", "alpha_job"] }),
+    ),
+    ctx,
+  )[3]!;
+  assert.deepEqual(sorted.inRoles, ["alpha_job", "zeta_job"]);
+});
+
+test("a role is emitted after the roles it is a member of and otherwise in input order", () => {
+  const { db, ctx } = fixture();
+  const roles = [
+    attributed("leaf_job", { member_of: ["mid_job"] }),
+    attributed("mid_job", { member_of: ["base_job"] }),
+    attributed("other_job", {}),
+    attributed("base_job", {}),
+  ];
+  const names = (database: DesiredDatabase) =>
+    managedRoles(database, ctx).map((entry) => entry.name);
+  assert.deepEqual(names(withRoles(db, ...roles)), [
+    managedRole,
+    "other_job",
+    "base_job",
+    "mid_job",
+    "leaf_job",
+  ]);
+  // Without memberships the input order is kept, so plain databases do not move.
+  const flat = roles.map((role) => ({ ...role, member_of: undefined }));
+  assert.deepEqual(names(withRoles(db, ...flat)), [
+    managedRole,
+    "leaf_job",
+    "mid_job",
+    "other_job",
+    "base_job",
+  ]);
+});
+
+test("a role awaiting removal is disabled, then dropped once named, and never gets a Secret", () => {
+  const { db, ctx } = fixture();
+  db.maintenance = {
+    role: MAINTENANCE_ROLE,
+    password: newRolePassword(),
+    revision: 1,
+  };
+  const wanted = withRoles(
+    db,
+    { name: "report_job", state: "absent" },
+    attributed("later_job", {}),
+  );
+  const secrets = (database: DesiredDatabase, context: BuildContext) =>
+    buildDatabaseManifests(database, context)
+      .filter((resource) => resource.kind === "Secret")
+      .map((resource) => resource.metadata.name);
+  assert.equal(
+    secrets(wanted, ctx).includes(roleSecretName("report_job")),
+    false,
+  );
+  assert.equal(
+    secrets(wanted, ctx).includes(roleSecretName("later_job")),
+    true,
+  );
+  // Present roles, then removals, then the maintenance role.
+  const disabled = managedRoles(wanted, ctx);
+  assert.deepEqual(
+    disabled.map((entry) => entry.name),
+    [managedRole, "later_job", "report_job", MAINTENANCE_ROLE],
+  );
+  assert.deepEqual(disabled[2], {
+    name: "report_job",
+    ensure: "present",
+    login: false,
+  });
+  // The maintenance role may end the sessions of the role it removes, and only while one awaits
+  // removal: every other database keeps the memberships and manifests it always had.
+  assert.deepEqual(disabled[3]!.inRoles, [
+    "pg_read_all_stats",
+    "pg_signal_backend",
+  ]);
+  assert.deepEqual(
+    managedRoles(withRoles(db, attributed("later_job", {})), ctx).at(-1)!
+      .inRoles,
+    ["pg_read_all_stats"],
+  );
+  // Only a removal entry is dropped: a present role or an unknown name in the context is ignored.
+  const dropping = {
+    ...ctx,
+    droppingRoles: ["report_job", managedRole, "unknown_job"],
+  };
+  const dropped = managedRoles(wanted, dropping);
+  assert.deepEqual(dropped[2], { name: "report_job", ensure: "absent" });
+  assert.equal(dropped[0]!.ensure, "present");
+  assert.equal(dropped[0]!.login, true);
+  assert.deepEqual(
+    dropped.map((entry) => entry.name),
+    disabled.map((entry) => entry.name),
+  );
+  for (const droppingRoles of [["Upper"], ["pg_admin"], [1], "report_job"]) {
+    assert.throws(
+      () =>
+        buildDatabaseManifests(wanted, {
+          ...ctx,
+          droppingRoles,
+        } as unknown as BuildContext),
+      TypeError,
+    );
+  }
+});
+
+test("a membership of a role awaiting removal is refused before manifests are built", () => {
+  const { db, ctx } = fixture();
+  assert.throws(
+    () =>
+      buildDatabaseManifests(
+        withRoles(
+          db,
+          { name: "gone_job", state: "absent" },
+          attributed("report_job", { member_of: ["gone_job"] }),
+        ),
+        ctx,
+      ),
+    TypeError,
+  );
 });

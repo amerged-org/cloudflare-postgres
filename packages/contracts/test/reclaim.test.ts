@@ -5,6 +5,8 @@ import { base64urlToBytes } from "../src/encoding.ts";
 import {
   ReclaimClaims,
   reclaimClaimsValidAt,
+  reclaimConfigurationFingerprint,
+  reclaimConfigurationInput,
   verifyReclaimIntent,
   signReclaimIntent,
 } from "../src/reclaim.ts";
@@ -76,4 +78,41 @@ it("a real unrelated signer cannot forge an authorization", async () => {
   expect(
     await verifyReclaimIntent(token, new Map([["cf-unit", original]]), 1000),
   ).toBeNull();
+});
+it("a role awaiting removal is not part of the configuration the runtime attests", async () => {
+  const database = (
+    roles: Parameters<typeof reclaimConfigurationInput>[0]["roles"],
+  ) => ({
+    pg_major: 18,
+    size: {
+      memory_mib: 256,
+      cpu_millicores: 250,
+      storage_gib: 5,
+      max_connections: 20,
+      archive_timeout_seconds: 60,
+      backup_retention_days: 7,
+    },
+    roles,
+    archive: { destination_path: "s3://b/r/d/g1-op", server_name: "database" },
+  });
+  const owner = { name: "app", owner: true, revision: 1 };
+  const reader = { name: "reader", owner: false, revision: 3 };
+  const removal = { name: "gone", state: "absent" as const };
+  const image = `registry.example/postgres@sha256:${"a".repeat(64)}`;
+  expect(
+    reclaimConfigurationInput(database([owner, removal, reader]), image),
+  ).toEqual(reclaimConfigurationInput(database([reader, owner]), image));
+  expect(
+    await reclaimConfigurationFingerprint(
+      database([owner, removal, reader]),
+      image,
+    ),
+  ).toBe(
+    await reclaimConfigurationFingerprint(database([owner, reader]), image),
+  );
+  expect(
+    await reclaimConfigurationFingerprint(database([owner]), image),
+  ).not.toBe(
+    await reclaimConfigurationFingerprint(database([owner, reader]), image),
+  );
 });

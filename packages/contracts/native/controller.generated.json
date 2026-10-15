@@ -821,22 +821,57 @@
           "maxItems": 100,
           "type": "array",
           "items": {
-            "type": "object",
-            "properties": {
-              "name": { "$ref": "#/$defs/RoleName" },
-              "owner": { "type": "boolean" },
-              "password": {
-                "type": "string",
-                "pattern": "^[A-Za-z0-9_-]{43}$"
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "name": { "$ref": "#/$defs/RoleName" },
+                  "owner": { "type": "boolean" },
+                  "password": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{43}$"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "valid_until": {
+                    "description": "VALID UNTIL; applied at whole seconds, truncated. Absent means no expiry.",
+                    "$ref": "#/$defs/Timestamp"
+                  },
+                  "connection_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000,
+                    "description": "CONNECTION LIMIT. Absent means unlimited."
+                  },
+                  "member_of": {
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/RoleName" },
+                    "description": "Other present roles of this record the role is a member of. Absent means none."
+                  },
+                  "bypass_rls": {
+                    "type": "boolean",
+                    "const": true,
+                    "description": "BYPASSRLS. Absent means NOBYPASSRLS."
+                  }
+                },
+                "required": ["name", "owner", "password", "revision"],
+                "additionalProperties": false
               },
-              "revision": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 9007199254740991
+              {
+                "type": "object",
+                "properties": {
+                  "name": { "$ref": "#/$defs/RoleName" },
+                  "state": { "type": "string", "const": "absent" }
+                },
+                "required": ["name", "state"],
+                "additionalProperties": false,
+                "description": "A deleted role the region must remove; it carries no credential."
               }
-            },
-            "required": ["name", "owner", "password", "revision"],
-            "additionalProperties": false
+            ]
           }
         },
         "maintenance": {
@@ -3241,22 +3276,57 @@
                 "maxItems": 100,
                 "type": "array",
                 "items": {
-                  "type": "object",
-                  "properties": {
-                    "name": { "$ref": "#/$defs/RoleName" },
-                    "owner": { "type": "boolean" },
-                    "password": {
-                      "type": "string",
-                      "pattern": "^[A-Za-z0-9_-]{43}$"
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "name": { "$ref": "#/$defs/RoleName" },
+                        "owner": { "type": "boolean" },
+                        "password": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9_-]{43}$"
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 9007199254740991
+                        },
+                        "valid_until": {
+                          "description": "VALID UNTIL; applied at whole seconds, truncated. Absent means no expiry.",
+                          "$ref": "#/$defs/Timestamp"
+                        },
+                        "connection_limit": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 10000,
+                          "description": "CONNECTION LIMIT. Absent means unlimited."
+                        },
+                        "member_of": {
+                          "maxItems": 8,
+                          "type": "array",
+                          "items": { "$ref": "#/$defs/RoleName" },
+                          "description": "Other present roles of this record the role is a member of. Absent means none."
+                        },
+                        "bypass_rls": {
+                          "type": "boolean",
+                          "const": true,
+                          "description": "BYPASSRLS. Absent means NOBYPASSRLS."
+                        }
+                      },
+                      "required": ["name", "owner", "password", "revision"],
+                      "additionalProperties": false
                     },
-                    "revision": {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 9007199254740991
+                    {
+                      "type": "object",
+                      "properties": {
+                        "name": { "$ref": "#/$defs/RoleName" },
+                        "state": { "type": "string", "const": "absent" }
+                      },
+                      "required": ["name", "state"],
+                      "additionalProperties": false,
+                      "description": "A deleted role the region must remove; it carries no credential."
                     }
-                  },
-                  "required": ["name", "owner", "password", "revision"],
-                  "additionalProperties": false
+                  ]
                 }
               },
               "maintenance": {
@@ -3443,6 +3513,26 @@
           "additionalProperties": false
         },
         "message": { "type": "string", "maxLength": 4096 },
+        "roles": {
+          "type": "object",
+          "properties": {
+            "removed": {
+              "maxItems": 100,
+              "type": "array",
+              "items": { "$ref": "#/$defs/RoleName" },
+              "description": "Roles confirmed absent from PostgreSQL."
+            },
+            "blocked": {
+              "maxItems": 100,
+              "type": "array",
+              "items": { "$ref": "#/$defs/RoleName" },
+              "description": "Roles that cannot be dropped because they own objects or hold privileges; they stay NOLOGIN."
+            }
+          },
+          "required": ["removed", "blocked"],
+          "additionalProperties": false,
+          "description": "The fate of the roles the desired record asked to remove; sent only with a ready database that has such roles."
+        },
         "backup": {
           "type": "object",
           "properties": {
@@ -4185,6 +4275,7 @@
       "$defs": {
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
         "Timestamp": {
           "type": "string",
           "format": "date-time",
@@ -4193,8 +4284,7 @@
         "RegionId": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-        },
-        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+        }
       }
     },
     "DatabaseObservationUpdate": {
@@ -4299,6 +4389,26 @@
                 "additionalProperties": false
               },
               "message": { "type": "string", "maxLength": 4096 },
+              "roles": {
+                "type": "object",
+                "properties": {
+                  "removed": {
+                    "maxItems": 100,
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/RoleName" },
+                    "description": "Roles confirmed absent from PostgreSQL."
+                  },
+                  "blocked": {
+                    "maxItems": 100,
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/RoleName" },
+                    "description": "Roles that cannot be dropped because they own objects or hold privileges; they stay NOLOGIN."
+                  }
+                },
+                "required": ["removed", "blocked"],
+                "additionalProperties": false,
+                "description": "The fate of the roles the desired record asked to remove; sent only with a ready database that has such roles."
+              },
               "backup": {
                 "type": "object",
                 "properties": {
@@ -5066,11 +5176,11 @@
         },
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
         "RegionId": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-        },
-        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+        }
       }
     },
     "ObservationRequest": {
@@ -5342,6 +5452,26 @@
                 "additionalProperties": false
               },
               "message": { "type": "string", "maxLength": 4096 },
+              "roles": {
+                "type": "object",
+                "properties": {
+                  "removed": {
+                    "maxItems": 100,
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/RoleName" },
+                    "description": "Roles confirmed absent from PostgreSQL."
+                  },
+                  "blocked": {
+                    "maxItems": 100,
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/RoleName" },
+                    "description": "Roles that cannot be dropped because they own objects or hold privileges; they stay NOLOGIN."
+                  }
+                },
+                "required": ["removed", "blocked"],
+                "additionalProperties": false,
+                "description": "The fate of the roles the desired record asked to remove; sent only with a ready database that has such roles."
+              },
               "backup": {
                 "type": "object",
                 "properties": {
@@ -6224,11 +6354,11 @@
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
         "RegionId": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-        },
-        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+        }
       }
     },
     "RegionalInventory": {
@@ -9732,7 +9862,7 @@
   },
   "constants": {
     "DATABASE_RUNTIME_PROOF_MAX_AGE_MS": 60000,
-    "ARCHIVE_IDENTITY_QUERY": "SELECT pg_catalog.current_database() AS database,pg_catalog.current_setting('session_authorization') AS role,\n pg_catalog.pg_is_in_recovery() AS recovery,pg_catalog.host(pg_catalog.inet_server_addr()) AS server_address,\n (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,\n r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls,\n NOT EXISTS(SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid=m.roleid WHERE m.member=r.oid AND granted.rolname<>'pg_read_all_stats') AS only_stats,\n pg_catalog.pg_has_role(r.oid,'pg_read_all_stats','MEMBER') AS stats,\n pg_catalog.has_function_privilege(r.oid,'pg_catalog.pg_ls_archive_statusdir()','EXECUTE') AS archive_listing\n FROM pg_catalog.pg_roles r WHERE r.rolname=$1 AND r.rolname=pg_catalog.current_setting('session_authorization')",
+    "ARCHIVE_IDENTITY_QUERY": "SELECT pg_catalog.current_database() AS database,pg_catalog.current_setting('session_authorization') AS role,\n pg_catalog.pg_is_in_recovery() AS recovery,pg_catalog.host(pg_catalog.inet_server_addr()) AS server_address,\n (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,\n r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls,\n NOT EXISTS(SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid=m.roleid WHERE m.member=r.oid AND granted.rolname NOT IN ('pg_read_all_stats','pg_signal_backend')) AS only_stats,\n pg_catalog.pg_has_role(r.oid,'pg_read_all_stats','MEMBER') AS stats,\n pg_catalog.has_function_privilege(r.oid,'pg_catalog.pg_ls_archive_statusdir()','EXECUTE') AS archive_listing\n FROM pg_catalog.pg_roles r WHERE r.rolname=$1 AND r.rolname=pg_catalog.current_setting('session_authorization')",
     "ARCHIVE_QUERY": "SELECT (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_ls_archive_statusdir() WHERE name LIKE '%.ready') AS ready_wal_files,\n archived_count::text,COALESCE(EXTRACT(EPOCH FROM last_archived_time)::text,'-1') AS last_archived_time,failed_count::text\n FROM pg_catalog.pg_stat_archiver",
     "ARCHIVE_FAILURE_MS": 600000,
     "WAL_BACKLOG_LIMIT": 32,

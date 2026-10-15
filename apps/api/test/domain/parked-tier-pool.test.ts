@@ -2,6 +2,7 @@
 // A Pod that a parked database still holds: the shared pool must neither claim its volume nor
 // ignore its CPU. Real local D1/Actor scheduling; no live pool latency is claimed.
 import { env } from "cloudflare:workers";
+import { presentRoles } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { postgresPoolFixture } from "./postgres-pool-fixture.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
@@ -60,9 +61,13 @@ it("pool_claim_is_refused_for_a_parked_database", async () => {
   await parkedHint(f.id, crypto.randomUUID()).run();
   await publishDatabaseAdmission(env, f.id);
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(f.id));
-  await actor.ensureAwake(f.id, f.desired.roles.find((r) => r.owner)!.name, {
-    deadline: Date.now() + 1000,
-  });
+  await actor.ensureAwake(
+    f.id,
+    presentRoles(f.desired).find((r) => r.owner)!.name,
+    {
+      deadline: Date.now() + 1000,
+    },
+  );
   expect(
     await env.DB.prepare("SELECT state FROM pool_pods WHERE pod_uid=?")
       .bind(f.pod.pool_pod_uid)

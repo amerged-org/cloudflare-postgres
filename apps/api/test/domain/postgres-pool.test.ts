@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
-import { DesiredResponse, FleetReleaseSpec } from "@pgcf/contracts";
+import {
+  DesiredResponse,
+  FleetReleaseSpec,
+  presentRoles,
+} from "@pgcf/contracts";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import {
   admissionSnapshotFixture,
@@ -148,6 +152,7 @@ it("grants qualification cleanup only to its exact current stop and fences a del
     f.integrator,
     "POST",
     { name: "candidate_cleanup" },
+    crypto.randomUUID(),
   );
   expect(stop.status).toBe(202);
   await env.DB.prepare(
@@ -191,6 +196,7 @@ it("requires fresh exact cleanup-worker IO rather than reusing the old tenant re
     f.integrator,
     "POST",
     { name: "cleanup_io_writer" },
+    crypto.randomUUID(),
   );
   expect(response.status).toBe(202);
   const op = ((await response.json()) as { operation: { id: string } })
@@ -552,6 +558,7 @@ it("retains one immutable cleanup budget across polls and completes it only with
     f.integrator,
     "POST",
     { name: "cleanup_writer" },
+    crypto.randomUUID(),
   );
   expect(requested.status).toBe(202);
   const op = ((await requested.json()) as { operation: { id: string } })
@@ -1302,7 +1309,7 @@ it("coalesces actual capable Actor cold wakes into one pool holder and returns t
   });
   await publishDatabaseAdmission(env, f.id);
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(f.id));
-  const user = f.desired.roles.find((role) => role.owner)!.name;
+  const user = presentRoles(f.desired).find((role) => role.owner)!.name;
   const waking = [actor.ensureAwake(f.id, user), actor.ensureAwake(f.id, user)];
   const completed = Promise.all(waking);
   completed.catch(() => undefined);

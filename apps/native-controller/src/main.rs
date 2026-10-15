@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use pgcf_native_controller::{
     Error,
     api::{ControlApi, DesiredSnapshot},
-    contracts::{constant, integer, number, schema_valid, text},
+    contracts::{constant, integer, number, removal_roles, schema_valid, text},
     diagnostics::error_code,
     kubernetes::Kubernetes,
     measurements::Measurements,
@@ -657,6 +657,23 @@ fn renewed(cell: &mut Cell, started: Instant, ok: bool, marker: u64, now: Instan
         cell.due = now + Duration::from_secs(1);
     }
 }
+/// Whether a role the record awaits the removal of is neither removed nor blocked in `observed`:
+/// each pass advances such a role one step, so the database is looked at again at once. Without
+/// the maintenance credential no pass can advance a removal, and looking again changes nothing.
+fn removal_pending(db: &Value, observed: &Value) -> bool {
+    if db["maintenance"].is_null() {
+        return false;
+    }
+    let reported = |key: &str, name: &str| {
+        observed["roles"][key]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|reported| reported == name))
+    };
+    removal_roles(db).any(|role| {
+        let name = text(role, "name");
+        !reported("removed", name) && !reported("blocked", name)
+    })
+}
 /// Records a finished reconcile of `cell`'s current generation that started at hint `marker`.
 fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u64) {
     if let Some(observed) = observed {
@@ -678,7 +695,12 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u
             }
             // A result from before the latest hint may still name a replaced Pod.
             cell.reattest &= cell.hints != marker;
-            cell.due = started + Duration::from_secs(60);
+            cell.due = started
+                + Duration::from_secs(if removal_pending(&cell.db, observed) {
+                    1
+                } else {
+                    60
+                });
             return;
         }
     }
@@ -1775,6 +1797,64 @@ mod tests {
         // The next wake of the same database is a new power operation.
         database.db = wake("db", &operation(2));
         assert_eq!(class(&database, &Renewals::default(), 0), Class::Wake);
+    }
+    /// A deleted role is advanced one step per pass, so a ready database that still awaits a
+    /// removal is looked at again within a second; one whose removals are confirmed or blocked
+    /// keeps the steady cadence of a ready database.
+    #[test]
+    fn a_ready_database_with_a_removal_in_progress_is_due_again_in_a_second() {
+        let now = Instant::now();
+        let roles = json!([
+            {"name":"app","owner":true,"password":"p".repeat(43),"revision":1},
+            {"name":"gone_job","state":"absent"},
+            {"name":"stuck_job","state":"absent"}
+        ]);
+        let maintenance = json!({"role":"pgcf_maintenance","password":"m".repeat(43),"revision":1});
+        let mut database = cell(
+            json!({"id":"db","generation":3,"roles":roles,"maintenance":maintenance}),
+            now,
+            false,
+        );
+        let ready = |roles: Value| json!({"state":"ready","roles":roles});
+        // Neither removed nor blocked: pending.
+        finish(
+            &mut database,
+            now,
+            Some(&ready(json!({"removed":["gone_job"],"blocked":[]}))),
+        );
+        assert!(database.ready);
+        assert_eq!(database.due, now + Duration::from_secs(1));
+        finish(
+            &mut database,
+            now,
+            Some(&ready(json!({"removed":[],"blocked":[]}))),
+        );
+        assert_eq!(database.due, now + Duration::from_secs(1));
+        // Every removal settled: removed or blocked.
+        finish(
+            &mut database,
+            now,
+            Some(&ready(
+                json!({"removed":["gone_job"],"blocked":["stuck_job"]}),
+            )),
+        );
+        assert_eq!(database.due, now + Duration::from_secs(60));
+        // A ready result that says nothing of the roles it still awaits leaves them pending.
+        finish(&mut database, now, Some(&json!({"state":"ready"})));
+        assert_eq!(database.due, now + Duration::from_secs(1));
+        // A database that awaits no removal keeps the steady cadence.
+        let mut plain = cell(
+            json!({"id":"db","generation":3,"roles":[roles[0].clone()]}),
+            now,
+            false,
+        );
+        finish(&mut plain, now, Some(&json!({"state":"ready"})));
+        assert_eq!(plain.due, now + Duration::from_secs(60));
+        // Without the maintenance credential nothing can advance a removal: looking again each
+        // second would change nothing, so the database keeps the steady cadence.
+        let mut keyless = cell(json!({"id":"db","generation":3,"roles":roles}), now, false);
+        finish(&mut keyless, now, Some(&json!({"state":"ready"})));
+        assert_eq!(keyless.due, now + Duration::from_secs(60));
     }
     #[test]
     fn a_pod_change_of_a_ready_database_is_urgent_re_attestation() {

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     Error,
-    contracts::{constant, database_valid, namespace, number, optional_number, schema_valid, text},
+    contracts::{
+        constant, database_valid, namespace, number, optional_number, present_roles, removal_roles,
+        schema_valid, text,
+    },
 };
 use base64::{
     Engine,
@@ -10,7 +13,7 @@ use base64::{
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
+use std::{collections::HashSet, net::IpAddr};
 
 pub fn role_secret(name: &str) -> String {
     let readable = format!("role-{name}");
@@ -103,6 +106,72 @@ fn object_store(
         metadata(name, ns, id),
         json!({"configuration":{"destinationPath":destination,"endpointURL":url,"s3Credentials":{"accessKeyId":{"name":credential,"key":"AWS_ACCESS_KEY_ID"},"secretAccessKey":{"name":credential,"key":"AWS_SECRET_ACCESS_KEY"}},"wal":{"compression":"gzip"},"data":{"compression":"gzip"}},"instanceSidecarConfiguration":sidecar(ctx)}),
     )
+}
+/// The removal entries whose role the Cluster already asks CNPG to drop (see `build`).
+fn dropping_roles(ctx: &Value) -> Result<HashSet<&str>, Error> {
+    match &ctx["droppingRoles"] {
+        Value::Null => Ok(HashSet::new()),
+        Value::Array(names) => names
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .filter(|name| pgcf_native_protocol::valid_role(name))
+                    .ok_or_else(|| "invalid build context".into())
+            })
+            .collect(),
+        _ => Err("invalid build context".into()),
+    }
+}
+/// The roles in input order, each only after the roles it is a member of: the first role whose
+/// memberships are all emitted comes next. Without memberships the input order is kept. A cycle,
+/// which PostgreSQL refuses, is emitted as it stands.
+fn membership_order<'a>(roles: impl Iterator<Item = &'a Value>) -> Vec<&'a Value> {
+    let mut remaining: Vec<&Value> = roles.collect();
+    let names: HashSet<&str> = remaining.iter().map(|role| text(role, "name")).collect();
+    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|role| {
+            role["member_of"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .all(|target| emitted.contains(target) || !names.contains(target))
+        });
+        let next = remaining.remove(ready.unwrap_or(0));
+        emitted.insert(text(next, "name"));
+        ordered.push(next);
+    }
+    ordered
+}
+/// A present role as CNPG manages it: today's keys, and an expiry, a limit and memberships only
+/// where the role has them.
+fn managed_role(role: &Value) -> Value {
+    let name = text(role, "name");
+    let mut entry = json!({"name":name,"ensure":"present","login":true,"superuser":false,"createdb":false,"createrole":false,"replication":false,"bypassrls":role["bypass_rls"] == true,"inherit":true,"passwordSecret":{"name":role_secret(name)}});
+    if let Some(limit) = role.get("connection_limit") {
+        entry["connectionLimit"] = limit.clone();
+    }
+    // The Cluster serialises metav1.Time in whole seconds, so the fraction is cut, not rounded.
+    if let Some(until) = role["valid_until"]
+        .as_str()
+        .and_then(|until| until.get(..19))
+    {
+        entry["validUntil"] = format!("{until}Z").into();
+    }
+    let mut memberships: Vec<&str> = role["member_of"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    memberships.sort_unstable();
+    memberships.dedup();
+    if !memberships.is_empty() {
+        entry["inRoles"] = json!(memberships);
+    }
+    entry
 }
 pub fn build(db: &Value, ctx: &Value) -> Result<Vec<Value>, Error> {
     if !database_valid(db) || text(db, "desired_state") != "running" {
@@ -230,8 +299,11 @@ pub fn build(db: &Value, ctx: &Value) -> Result<Vec<Value>, Error> {
     let owner_name = constant("OWNER_ROLE_NAME")
         .as_str()
         .ok_or("owner role missing")?;
+    db["roles"].as_array().ok_or("roles missing")?;
+    let dropping = dropping_roles(ctx)?;
     let mut managed = vec![];
-    for role in db["roles"].as_array().ok_or("roles missing")? {
+    let present: Vec<&Value> = present_roles(db).collect();
+    for role in &present {
         let name = text(role, "name");
         result.push(secret(
             &role_secret(name),
@@ -240,9 +312,18 @@ pub fn build(db: &Value, ctx: &Value) -> Result<Vec<Value>, Error> {
             name,
             text(role, "password"),
         ));
-        if role["owner"] != true {
-            managed.push(json!({"name":name,"ensure":"present","login":true,"superuser":false,"createdb":false,"createrole":false,"replication":false,"bypassrls":false,"inherit":true,"passwordSecret":{"name":role_secret(name)}}));
-        }
+    }
+    for role in membership_order(present.into_iter().filter(|role| role["owner"] != true)) {
+        managed.push(managed_role(role));
+    }
+    // A removal entry never has a Secret: it is disabled first, then dropped once named.
+    for role in removal_roles(db) {
+        let name = text(role, "name");
+        managed.push(if dropping.contains(name) {
+            json!({"name":name,"ensure":"absent"})
+        } else {
+            json!({"name":name,"ensure":"present","login":false})
+        });
     }
     if !db["maintenance"].is_null() {
         let role = constant("MAINTENANCE_ROLE")
@@ -255,7 +336,15 @@ pub fn build(db: &Value, ctx: &Value) -> Result<Vec<Value>, Error> {
             role,
             text(&db["maintenance"], "password"),
         ));
-        managed.push(json!({"name":role,"ensure":"present","login":true,"superuser":false,"createdb":false,"createrole":false,"replication":false,"bypassrls":false,"inherit":true,"inRoles":["pg_read_all_stats"],"passwordSecret":{"name":"maintenance-credentials"}}));
+        // The statistics it samples; and, only while a role awaits removal, the sessions of that
+        // role it ends before the role is dropped. Any other database keeps the manifests it
+        // always had.
+        let memberships: &[&str] = if removal_roles(db).next().is_some() {
+            &["pg_read_all_stats", "pg_signal_backend"]
+        } else {
+            &["pg_read_all_stats"]
+        };
+        managed.push(json!({"name":role,"ensure":"present","login":true,"superuser":false,"createdb":false,"createrole":false,"replication":false,"bypassrls":false,"inherit":true,"inRoles":memberships,"passwordSecret":{"name":"maintenance-credentials"}}));
     }
     result.push(archive_secret(
         "archive-credentials",
@@ -389,6 +478,169 @@ mod tests {
                 "{}",
                 v["name"]
             );
+        }
+    }
+    fn vector(name: &str) -> Value {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/controller-vectors.generated.json"
+        ))
+        .unwrap();
+        vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == name)
+            .unwrap()
+            .clone()
+    }
+    /// The entries of `spec.managed.roles`, by name and in order.
+    fn managed(manifests: &[Value]) -> Vec<Value> {
+        manifests.iter().find(|m| m["kind"] == "Cluster").unwrap()["spec"]["managed"]["roles"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+    #[test]
+    fn the_maintenance_role_may_end_sessions_only_while_a_role_awaits_removal() {
+        let memberships = |name: &str| {
+            let v = vector(name);
+            managed(&build(&v["db"], &v["ctx"]).unwrap())
+                .into_iter()
+                .find(|r| r["name"] == "pgcf_maintenance")
+                .unwrap()["inRoles"]
+                .clone()
+        };
+        // A database that awaits no removal keeps the manifests it always had.
+        assert_eq!(
+            memberships("entry-request-limit-split"),
+            json!(["pg_read_all_stats"])
+        );
+        // Ending the sessions of a role it removes needs pg_signal_backend, disabled or dropping.
+        for stage in ["role-removal-disable", "role-removal-drop"] {
+            assert_eq!(
+                memberships(stage),
+                json!(["pg_read_all_stats", "pg_signal_backend"]),
+                "{stage}"
+            );
+        }
+        // The bootstrap SQL is untouched: CNPG grants the membership, a fresh database or not.
+        assert!(
+            !constant("MAINTENANCE_BOOTSTRAP_SQL")
+                .to_string()
+                .contains("pg_signal_backend")
+        );
+    }
+    #[test]
+    fn role_attributes_reach_the_managed_role_only_when_set() {
+        let v = vector("role-attributes");
+        let roles = managed(&build(&v["db"], &v["ctx"]).unwrap());
+        let plain = roles.iter().find(|r| r["name"] == "reader_query").unwrap();
+        let mut keys: Vec<_> = plain.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "bypassrls",
+                "createdb",
+                "createrole",
+                "ensure",
+                "inherit",
+                "login",
+                "name",
+                "passwordSecret",
+                "replication",
+                "superuser"
+            ]
+        );
+        let limited = roles.iter().find(|r| r["name"] == "report_job").unwrap();
+        // The Cluster holds metav1.Time in whole seconds: the fraction is cut, never rounded up.
+        assert_eq!(limited["validUntil"], "2031-01-02T03:04:05Z");
+        assert_eq!(limited["connectionLimit"], 5);
+        assert_eq!(limited["inRoles"], json!(["reader_query"]));
+        assert_eq!(limited["bypassrls"], true);
+    }
+    #[test]
+    fn a_role_is_emitted_after_the_roles_it_is_a_member_of() {
+        let v = vector("role-membership-order");
+        let names: Vec<_> = managed(&build(&v["db"], &v["ctx"]).unwrap())
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "reader_query",
+                "other_job",
+                "base_job",
+                "mid_job",
+                "leaf_job",
+                "pgcf_maintenance"
+            ]
+        );
+        // Without memberships the input order stands: plain databases do not move.
+        let mut flat = v["db"].clone();
+        for role in flat["roles"].as_array_mut().unwrap() {
+            role.as_object_mut().unwrap().remove("member_of");
+        }
+        let names: Vec<_> = managed(&build(&flat, &v["ctx"]).unwrap())
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "reader_query",
+                "leaf_job",
+                "mid_job",
+                "other_job",
+                "base_job",
+                "pgcf_maintenance"
+            ]
+        );
+    }
+    #[test]
+    fn a_role_awaiting_removal_is_disabled_then_dropped_and_never_gets_a_secret() {
+        let v = vector("role-removal-disable");
+        let disabled = build(&v["db"], &v["ctx"]).unwrap();
+        let roles = managed(&disabled);
+        assert_eq!(
+            roles.iter().map(|r| r["name"].clone()).collect::<Vec<_>>(),
+            [
+                "reader_query",
+                "later_job",
+                "report_job",
+                "pgcf_maintenance"
+            ]
+        );
+        assert_eq!(
+            roles[2],
+            json!({"name":"report_job","ensure":"present","login":false})
+        );
+        let secrets: Vec<_> = disabled
+            .iter()
+            .filter(|m| m["kind"] == "Secret")
+            .map(|m| m["metadata"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!secrets.contains(&role_secret("report_job")), "{secrets:?}");
+        assert!(secrets.contains(&role_secret("later_job")));
+        // Named in the context, a removal entry is dropped; a present role or an unknown name is not.
+        let mut ctx = v["ctx"].clone();
+        ctx["droppingRoles"] = json!(["report_job", "reader_query", "unknown_job"]);
+        let dropped = managed(&build(&v["db"], &ctx).unwrap());
+        assert_eq!(dropped[2], json!({"name":"report_job","ensure":"absent"}));
+        assert_eq!(dropped[0]["ensure"], "present");
+        assert_eq!(dropped[0]["login"], true);
+        assert_eq!(dropped.len(), roles.len());
+        // A context that names a role badly is not a context.
+        for invalid in [
+            json!(["Upper"]),
+            json!(["pg_admin"]),
+            json!([1]),
+            json!("report_job"),
+        ] {
+            let mut ctx = v["ctx"].clone();
+            ctx["droppingRoles"] = invalid;
+            assert!(build(&v["db"], &ctx).is_err());
         }
     }
 }

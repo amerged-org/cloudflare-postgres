@@ -6,6 +6,7 @@ import {
   DatabaseStorageVolumeReceipt,
   DesiredDatabaseStorage,
   newOperationId,
+  presentRoles,
 } from "@pgcf/contracts";
 import {
   DatabaseRuntimeAttestationV2,
@@ -39,9 +40,15 @@ export async function admissionSnapshotFixture(
   }
   expect(
     (
-      await request(`/v1/databases/${id}/roles`, f.integrator, "POST", {
-        name: "reader",
-      })
+      await request(
+        `/v1/databases/${id}/roles`,
+        f.integrator,
+        "POST",
+        {
+          name: "reader",
+        },
+        crypto.randomUUID(),
+      )
     ).status,
   ).toBe(201);
   const releaseId = `admission-${crypto.randomUUID()}`;
@@ -195,7 +202,7 @@ export async function admissionSnapshotFixture(
     ),
     route_revision: epoch.route_revision,
     admission_epoch: epoch.admission_revision,
-    applied_role_revisions: desired.roles.map(({ name, revision }) => ({
+    applied_role_revisions: presentRoles(desired).map(({ name, revision }) => ({
       name,
       revision,
     })),

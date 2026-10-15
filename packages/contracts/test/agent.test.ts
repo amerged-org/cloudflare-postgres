@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  DatabaseObservation,
   DesiredDatabase,
   postgresImageIdMatches,
   DesiredSize,
@@ -276,6 +277,155 @@ it("keeps maintenance separate and optional on desired pages", () => {
       ],
     }).success,
   ).toBe(false);
+});
+
+describe("role lifecycle on desired pages", () => {
+  const password = newRolePassword();
+  const owner = { name: "app", owner: true, password, revision: 1 };
+  const reader = { name: "reader", owner: false, password, revision: 2 };
+  const withRoles = (...roles: unknown[]) => ({ ...desired(), roles });
+  it("keeps a plain role on its legacy wire shape and carries attributes only when set", () => {
+    const plain = withRoles(owner, reader);
+    expect(DesiredDatabase.parse(plain).roles).toEqual([owner, reader]);
+    const limited = {
+      name: "report_job",
+      owner: false,
+      password,
+      revision: 1,
+      valid_until: "2031-01-02T03:04:05.000Z",
+      connection_limit: 5,
+      member_of: ["reader"],
+      bypass_rls: true,
+    };
+    expect(
+      DesiredDatabase.parse(withRoles(owner, reader, limited)).roles,
+    ).toEqual([owner, reader, limited]);
+  });
+  it("names a role to remove without a credential", () => {
+    const removal = { name: "report_job", state: "absent" };
+    const parsed = DesiredDatabase.parse(withRoles(owner, reader, removal));
+    expect(parsed.roles).toEqual([owner, reader, removal]);
+    for (const refused of [
+      { ...removal, password },
+      { ...removal, owner: false },
+      { ...removal, revision: 1 },
+      { ...removal, state: "present" },
+      {
+        name: "report_job",
+        owner: false,
+        password,
+        revision: 1,
+        state: "absent",
+      },
+    ])
+      expect(
+        DesiredDatabase.safeParse(withRoles(owner, refused)).success,
+        JSON.stringify(refused),
+      ).toBe(false);
+  });
+  it("does not let a removal stand for the owner or repeat a role", () => {
+    expect(
+      DesiredDatabase.safeParse(
+        withRoles(owner, { name: "gone", state: "absent" }),
+      ).success,
+    ).toBe(true);
+    for (const roles of [
+      [{ name: "app", state: "absent" }],
+      [owner, reader, { name: "reader", state: "absent" }],
+      [
+        owner,
+        { name: "gone", state: "absent" },
+        { name: "gone", state: "absent" },
+      ],
+      [owner, { name: MAINTENANCE_ROLE, state: "absent" }],
+    ])
+      expect(DesiredDatabase.safeParse(withRoles(...roles)).success).toBe(
+        false,
+      );
+  });
+  it("requires memberships to name other present roles of the same page", () => {
+    const member = (member_of: string[]) => ({
+      name: "report_job",
+      owner: false,
+      password,
+      revision: 1,
+      member_of,
+    });
+    expect(
+      DesiredDatabase.safeParse(withRoles(owner, reader, member(["reader"])))
+        .success,
+    ).toBe(true);
+    for (const roles of [
+      [owner, member(["reader"])],
+      [owner, reader, { name: "reader", state: "absent" }, member(["reader"])],
+      [owner, member(["app"])],
+      [owner, member(["report_job"])],
+      [owner, reader, member([MAINTENANCE_ROLE])],
+    ])
+      expect(DesiredDatabase.safeParse(withRoles(...roles)).success).toBe(
+        false,
+      );
+  });
+  it("bounds expiry and connection limit like the management contract", () => {
+    const attributes = (extra: Record<string, unknown>) => ({
+      name: "report_job",
+      owner: false,
+      password,
+      revision: 1,
+      ...extra,
+    });
+    expect(
+      DesiredDatabase.safeParse(
+        withRoles(owner, attributes({ connection_limit: 10000 })),
+      ).success,
+    ).toBe(true);
+    for (const extra of [
+      { connection_limit: 0 },
+      { connection_limit: 10001 },
+      { valid_until: "tomorrow" },
+      { bypass_rls: "yes" },
+    ])
+      expect(
+        DesiredDatabase.safeParse(withRoles(owner, attributes(extra))).success,
+        JSON.stringify(extra),
+      ).toBe(false);
+  });
+  it("reports removals on a ready observation only", () => {
+    const base = {
+      id,
+      generation: 4,
+      archive: { continuous: true, ready_wal_files: 0 },
+    };
+    const report = { removed: ["report_job"], blocked: ["other_job"] };
+    expect(
+      DatabaseObservation.parse({ ...base, state: "ready", roles: report })
+        .roles,
+    ).toEqual(report);
+    expect(
+      DatabaseObservation.safeParse({
+        ...base,
+        state: "ready",
+        roles: { removed: [], blocked: [] },
+      }).success,
+    ).toBe(true);
+    for (const roles of [
+      { removed: ["report_job"], blocked: ["report_job"] },
+      { removed: ["Report"], blocked: [] },
+      { removed: [] },
+      { removed: [], blocked: [], extra: [] },
+    ])
+      expect(
+        DatabaseObservation.safeParse({ ...base, state: "ready", roles })
+          .success,
+        JSON.stringify(roles),
+      ).toBe(false);
+    for (const state of ["provisioning", "error", "deleting", "deleted"])
+      expect(
+        DatabaseObservation.safeParse({ ...base, state, roles: report })
+          .success,
+        state,
+      ).toBe(false);
+  });
 });
 
 describe("node observation identity", () => {

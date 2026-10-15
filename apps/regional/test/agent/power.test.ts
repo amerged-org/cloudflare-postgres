@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ApiException } from "@kubernetes/client-node";
 import { randomBytes, randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { newOperationId, newRolePassword } from "@pgcf/contracts";
+import { newOperationId, newRolePassword, presentRoles } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import { gatewayFenceName } from "@pgcf/contracts/gateway-control";
 import type { AuthenticationProbe } from "../../src/agent/readiness.ts";
@@ -1111,7 +1111,7 @@ test("resume from actual hibernation preserves every storage UID and gates new c
     roles: [{ ...target.roles[0]!, password, revision: 2 }],
   };
   const denied = await reconciler(state, { probe }, async (actual) => {
-    assert.equal(actual.roles[0]!.password, password);
+    assert.equal(presentRoles(actual)[0]!.password, password);
     return false;
   }).reconcile(wake, state.ctx);
   assert.equal(denied?.state, "provisioning");
@@ -1123,7 +1123,7 @@ test("resume from actual hibernation preserves every storage UID and gates new c
     "quiesce",
   );
   const ready = await reconciler(state, { probe }, async (actual) => {
-    assert.equal(actual.roles[0]!.password, password);
+    assert.equal(presentRoles(actual)[0]!.password, password);
     return true;
   }).reconcile(wake, state.ctx);
   assert.equal(ready?.state, "ready");

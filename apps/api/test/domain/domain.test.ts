@@ -7,6 +7,7 @@ import {
   archiveDestinationPath,
   newDatabaseId,
   newOperationId,
+  presentRoles,
 } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
@@ -325,9 +326,9 @@ describe("database domain on real Workers D1", () => {
     const desired = DesiredResponse.parse(
       await (await request("/agent/v1/desired", f.agent)).json(),
     );
-    expect(desired.databases.find((d) => d.id === id)?.roles[0]?.password).toBe(
-      password,
-    );
+    expect(
+      presentRoles(desired.databases.find((d) => d.id === id)!)[0]?.password,
+    ).toBe(password);
     const roles = await (
       await request(`/v1/databases/${id}/roles`, f.admin)
     ).json();
@@ -351,9 +352,15 @@ describe("database domain on real Workers D1", () => {
     ).toBe(404);
     expect(
       (
-        await request(`/v1/databases/${id}/roles`, f.otherKey, "POST", {
-          name: "reader",
-        })
+        await request(
+          `/v1/databases/${id}/roles`,
+          f.otherKey,
+          "POST",
+          {
+            name: "reader",
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(404);
     expect(
@@ -362,6 +369,8 @@ describe("database domain on real Workers D1", () => {
           `/v1/databases/${id}/roles/app/reset-password`,
           f.otherKey,
           "POST",
+          undefined,
+          crypto.randomUUID(),
         )
       ).status,
     ).toBe(404);
@@ -382,9 +391,15 @@ describe("database domain on real Workers D1", () => {
     ).toEqual({ accepted: 0 });
     expect(
       (
-        await request(`/v1/databases/${id}/roles`, f.integrator, "POST", {
-          name: "reader",
-        })
+        await request(
+          `/v1/databases/${id}/roles`,
+          f.integrator,
+          "POST",
+          {
+            name: "reader",
+          },
+          crypto.randomUUID(),
+        )
       ).status,
     ).toBe(201);
     expect(await (await post(f.agent, [observation(id, 1)])).json()).toEqual({

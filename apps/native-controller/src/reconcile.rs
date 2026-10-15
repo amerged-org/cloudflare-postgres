@@ -3,7 +3,8 @@ use crate::{
     Error,
     api::DesiredSnapshot,
     contracts::{
-        constant, database_valid, generation, integer, namespace, number, optional_number, text,
+        applied_role_revisions, constant, database_valid, generation, integer, namespace, number,
+        optional_number, present_roles, text,
     },
     health::{self, ArchiveSample, Health},
     kubernetes::{Kubernetes, bounded},
@@ -25,6 +26,8 @@ use std::{
     net::IpAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+mod removal;
 
 const SYSTEM: &str = "pgcf-system";
 const LABEL: &str = "pgcf.io/database-id";
@@ -153,11 +156,8 @@ fn starts_postgres(cluster: Option<&Value>, db: &Value, default_image: &str) -> 
 }
 fn credential_acknowledged(db: &Value, cluster: &Value, secret: &Value) -> bool {
     let name = text(&secret["metadata"], "name");
-    let role = db["roles"].as_array().and_then(|roles| {
-        roles
-            .iter()
-            .find(|role| manifests::role_secret(text(role, "name")) == name)
-    });
+    // A role awaiting removal has no Secret to acknowledge.
+    let role = present_roles(db).find(|role| manifests::role_secret(text(role, "name")) == name);
     let role = role.or_else(|| {
         (name == "maintenance-credentials" && !db["maintenance"].is_null())
             .then_some(&db["maintenance"])
@@ -1336,7 +1336,9 @@ impl Reconciler {
             )));
         }
         let intent = desired_power(db)?;
-        let context = self.context(db, snapshot, finalized).await?;
+        let mut context = self.context(db, snapshot, finalized).await?;
+        // The Cluster says which roles awaiting removal it already drops; the rest are disabled.
+        context["droppingRoles"] = removal::cluster_drops(db, prior_cluster.as_ref());
         // Built here for a retained Pod's eligibility; a build failure surfaces where it always did.
         let built = manifests::build(db, &context);
         let mut parked: Option<ParkedWake> = None;
@@ -1742,12 +1744,9 @@ impl Reconciler {
                         proof["region_id"] = self.power.region().into();
                         proof["route_revision"] = db["admission"]["route_revision"].clone();
                         proof["admission_epoch"] = db["admission"]["admission_epoch"].clone();
-                        proof["applied_role_revisions"] = db["roles"]
-                            .as_array()
+                        proof["applied_role_revisions"] = applied_role_revisions(db)
                             .ok_or("runtime role set missing")?
-                            .iter()
-                            .map(|role| json!({"name":role["name"],"revision":role["revision"]}))
-                            .collect();
+                            .into();
                         proof["tls_server_name"] = format!("database-rw.{ns}.svc").into();
                         proof["ca_secret_uid"] = current_ca["metadata"]["uid"].clone();
                         proof["ca_secret_resource_version"] =
@@ -1791,7 +1790,7 @@ impl Reconciler {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let release = timing::Phase::begin(db, "fence_release");
-        let result = if let Some(intent) = intent {
+        let mut result = if let Some(intent) = intent {
             let intent = serde_json::to_value(intent)?;
             self.power.finish_running(db, result, Some(&intent)).await?
         } else {
@@ -1804,6 +1803,18 @@ impl Reconciler {
         }
         if let Some(result) = &result {
             self.persist_admission_target(db, result).await?;
+        }
+        // The roles awaiting removal advance after the database is ready, never before: readiness
+        // waits for the present roles only. The Cluster is not written until the attestation above
+        // was formed and published, which pins the Cluster's version.
+        if let Some(value) = result.as_mut().filter(|value| value["state"] == "ready") {
+            let socket = match &parked {
+                Some(_) => Some(self.power.pod_socket(text(&pod["status"], "podIP"))?),
+                None => self.power.postgres,
+            };
+            if let Some(roles) = self.advance_removals(db, &context, &ca, socket).await {
+                value["roles"] = roles;
+            }
         }
         Ok(result)
     }
@@ -2259,7 +2270,7 @@ impl Reconciler {
                     .ok_or("pool runtime proof age missing")?,
             )
             .ok_or("pool proof clock exceeded")?;
-        let proof = json!({"v":2,"kind":"pool","database_id":db["id"],"generation":db["generation"],"storage_generation":scope["storage"]["storage_generation"],"region_id":self.power.region(),"node_uid":scope["node_uid"],"boot_id":scope["boot_id"],"cluster_uid":self.cluster_uid,"namespace_uid":tenant["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":storage["metadata"]["uid"],"pvc_uid":claim["metadata"]["uid"],"pv_uid":pv["metadata"]["uid"],"pod_uid":pod["metadata"]["uid"],"container_id":scope["container_id"],"postgres_image_sha256":scope["class"]["postgres_image_sha256"],"memory_request_bytes":scope["class"]["memory_request_bytes"],"memory_limit_bytes":scope["class"]["memory_limit_bytes"],"observed_at":verified,"configuration_fingerprint":scope["configuration_fingerprint"],"route_revision":db["admission"]["route_revision"],"admission_epoch":db["admission"]["admission_epoch"],"applied_role_revisions":db["roles"].as_array().ok_or("pool roles missing")?.iter().map(|role|json!({"name":role["name"],"revision":role["revision"]})).collect::<Vec<_>>(),"tls_server_name":format!("database-rw.{ns}.svc"),"ca_secret_uid":ca_secret["metadata"]["uid"],"ca_secret_resource_version":ca_secret["metadata"]["resourceVersion"],"ca_sha256":bundle["ca_sha256"],"pod_ip":scope["pool_pod_ip"],"postgres_port":5432,"observation":{"v":1,"controller_epoch":start.0,"watch_epoch":start.1,"coverage":"complete","verified_at":verified,"expires_at":expiry,"resource_versions":versions},"binding_id":scope["binding_id"],"scope_sha256":binding["scope_sha256"],"holder_revision":binding["holder_revision"],"pool_namespace_uid":pool_ns["metadata"]["uid"],"pool_namespace_resource_version":pool_ns["metadata"]["resourceVersion"]});
+        let proof = json!({"v":2,"kind":"pool","database_id":db["id"],"generation":db["generation"],"storage_generation":scope["storage"]["storage_generation"],"region_id":self.power.region(),"node_uid":scope["node_uid"],"boot_id":scope["boot_id"],"cluster_uid":self.cluster_uid,"namespace_uid":tenant["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":storage["metadata"]["uid"],"pvc_uid":claim["metadata"]["uid"],"pv_uid":pv["metadata"]["uid"],"pod_uid":pod["metadata"]["uid"],"container_id":scope["container_id"],"postgres_image_sha256":scope["class"]["postgres_image_sha256"],"memory_request_bytes":scope["class"]["memory_request_bytes"],"memory_limit_bytes":scope["class"]["memory_limit_bytes"],"observed_at":verified,"configuration_fingerprint":scope["configuration_fingerprint"],"route_revision":db["admission"]["route_revision"],"admission_epoch":db["admission"]["admission_epoch"],"applied_role_revisions":applied_role_revisions(db).ok_or("pool roles missing")?,"tls_server_name":format!("database-rw.{ns}.svc"),"ca_secret_uid":ca_secret["metadata"]["uid"],"ca_secret_resource_version":ca_secret["metadata"]["resourceVersion"],"ca_sha256":bundle["ca_sha256"],"pod_ip":scope["pool_pod_ip"],"postgres_port":5432,"observation":{"v":1,"controller_epoch":start.0,"watch_epoch":start.1,"coverage":"complete","verified_at":verified,"expires_at":expiry,"resource_versions":versions},"binding_id":scope["binding_id"],"scope_sha256":binding["scope_sha256"],"holder_revision":binding["holder_revision"],"pool_namespace_uid":pool_ns["metadata"]["uid"],"pool_namespace_resource_version":pool_ns["metadata"]["resourceVersion"]});
         let mut result = observation(db, "ready", None);
         result["runtime_attestation"] = proof.clone();
         let report = json!({"v":1,"runtime":proof,"supervisor":reply});
@@ -2629,9 +2640,10 @@ impl Reconciler {
             return none;
         }
         let awake = awake(db, &snapshot.region["scheduling"]);
-        let Ok(context) = self.context(&awake, snapshot, finalized).await else {
+        let Ok(mut context) = self.context(&awake, snapshot, finalized).await else {
             return none;
         };
+        context["droppingRoles"] = removal::cluster_drops(&awake, cluster);
         RetainedManifests {
             manifests: manifests::build(&awake, &context).ok(),
             runtime_class: runtime_class(&context),
@@ -3510,3 +3522,5 @@ mod runtime_tests {
 }
 #[cfg(test)]
 mod parked_tests;
+#[cfg(test)]
+mod removal_tests;
