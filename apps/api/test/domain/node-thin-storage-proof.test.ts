@@ -726,6 +726,133 @@ it("refuses a stale storage generation during an identity turn without blocking 
   expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
 });
 
+/** A node whose pool can take a 5 GiB database, read by the stored identity proof. */
+async function roomyIdentity() {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const physical = {
+    ...f.authority.physical,
+    free_bytes: 80 * gib,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_total_bytes: 16 * gib,
+    },
+  };
+  await identityProof(f, { physical });
+  return { f, physical };
+}
+const thinLv = (lv_uuid: string) => ({
+  name: `pvc-${crypto.randomUUID()}`,
+  lv_uuid,
+  size_bytes: 5 * gib,
+  segtype: "thin",
+});
+
+it("refuses as stale an identity proof whose only unaccounted LV is the new volume of a database placed during its turn", async () => {
+  const { f, physical } = await roomyIdentity();
+  // The turn starts with the node's database list; a database is placed while it reads, and its
+  // thin LV exists by the time the executor lists LVM. Nothing in the read attributes it.
+  await prepareThinStorageLease(f.local, f.node, false);
+  DatabaseWithOperation.parse(await (await f.create()).json());
+  const fresh = thinLv("RACEXX-1234-1234-1234-1234-1234-ABCDEF"),
+    before = await row(f);
+  await expect(
+    report(f, {
+      physical,
+      physical_lvs: [lvs.pool, lvs.data, lvs.meta, fresh],
+      data_accounting_complete: false,
+      write_allowed: false,
+    }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  // Nothing installed, nothing blocked: the executor retries with the current list, and samples keep
+  // renewing the previous identity with the new LV inside the unbound startup hold.
+  expect(await row(f)).toMatchObject({
+    authority_revision: before.authority_revision,
+    authority_json: before.authority_json,
+    status: "ready",
+    error_code: null,
+  });
+  const renewed = NodeStorageHeadroomResponse.parse(
+    (
+      await post(
+        f,
+        sample(f, await nonce(f), {
+          physical,
+          lvs: [
+            {
+              name: "pgcf_thinpool",
+              segtype: "thin-pool",
+              size_bytes: 2 * gib,
+            },
+            { name: fresh.name, segtype: "thin", size_bytes: fresh.size_bytes },
+          ],
+          lv_count: 2,
+        }),
+      )
+    ).body,
+  );
+  expect(renewed.accepted).toBe(true);
+  expect(renewed.authority?.write_allowed).toBe(true);
+});
+
+it("refuses as stale an identity proof that could not yet see the volume of a listed database", async () => {
+  const { f, physical } = await roomyIdentity();
+  // The database is in the turn's list, but its PersistentVolume is not visible to the read yet.
+  DatabaseWithOperation.parse(await (await f.create()).json());
+  await prepareThinStorageLease(f.local, f.node, false);
+  await expect(
+    report(f, {
+      physical,
+      physical_lvs: [
+        lvs.pool,
+        lvs.data,
+        lvs.meta,
+        thinLv("NOPVXX-1234-1234-1234-1234-1234-ABCDEF"),
+      ],
+      data_accounting_complete: false,
+      write_allowed: false,
+    }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
+});
+
+it("still installs an identity proof whose unaccounted LV is old or beyond the unbound startup holds", async () => {
+  // No startup hold awaits a volume: a new unattributed LV is a real accounting gap.
+  const plain = await roomyIdentity();
+  await prepareThinStorageLease(plain.f.local, plain.f.node, false);
+  expect(
+    await report(plain.f, {
+      physical: plain.physical,
+      physical_lvs: [
+        lvs.pool,
+        lvs.data,
+        lvs.meta,
+        thinLv("ORPHAN-1234-1234-1234-1234-1234-ABCDEF"),
+      ],
+      data_accounting_complete: false,
+      write_allowed: false,
+    }),
+  ).toMatchObject({ accepted: true, write_allowed: false });
+  // An LV the stored identity already read without attributing it stays a gap even beside a hold.
+  const old = await roomyIdentity(),
+    orphan = thinLv("OLDLVX-1234-1234-1234-1234-1234-ABCDEF");
+  await identityProof(old.f, {
+    physical: old.physical,
+    physical_lvs: [lvs.pool, lvs.data, lvs.meta, orphan],
+    data_accounting_complete: false,
+    write_allowed: false,
+  });
+  DatabaseWithOperation.parse(await (await old.f.create()).json());
+  await prepareThinStorageLease(old.f.local, old.f.node, false);
+  expect(
+    await report(old.f, {
+      physical: old.physical,
+      physical_lvs: [lvs.pool, lvs.data, lvs.meta, orphan],
+      data_accounting_complete: false,
+      write_allowed: false,
+    }),
+  ).toMatchObject({ accepted: true, write_allowed: false });
+});
+
 it("deduplicates two startup holds for the same proved volume during a 95 s identity lease", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
     bound = await boundDatabase(f),

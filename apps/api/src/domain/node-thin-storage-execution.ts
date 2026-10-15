@@ -898,6 +898,39 @@ async function acceptIdentityProof(
       a.physical,
       headroom,
     );
+  // The read's database list is the one its lease was issued with, and its turn lasts most of a
+  // minute. A database placed meanwhile, or one whose PersistentVolume the read could not see yet,
+  // leaves a thin LV the read cannot attribute, and installing it would deny writes on the whole
+  // node until the next proof. When every unattributed thin LV is new to the stored identity and
+  // they fit the unbound startup holds (the rule a sample applies to new LVs), the read is stale:
+  // refuse it for a retry with the current list while samples keep renewing the stored identity.
+  if (!a.data_accounting_complete) {
+    const attributed = new Set(a.volumes.map((volume) => volume.lv_uuid)),
+      known = retainedPoolAuthority(row)?.physical_lvs ?? [],
+      unattributed = a.physical_lvs.filter(
+        (lv) => lv.segtype === "thin" && !attributed.has(lv.lv_uuid),
+      ),
+      bytes = unattributed.reduce((sum, lv) => sum + lv.size_bytes, 0),
+      unbound = [...holds.exposures]
+        .filter(([key]) => key.startsWith("unknown:"))
+        .reduce((sum, [, value]) => sum + value, 0);
+    if (
+      unattributed.length > 0 &&
+      a.physical_lvs.every((lv) =>
+        ["thin", "thin-pool", "linear"].includes(lv.segtype),
+      ) &&
+      unattributed.every(
+        (lv) =>
+          !known.some(
+            (read) => read.lv_uuid === lv.lv_uuid || read.name === lv.name,
+          ),
+      ) &&
+      unattributed.length <= holds.newVolumes &&
+      Number.isSafeInteger(bytes) &&
+      bytes <= unbound
+    )
+      return closed();
+  }
   // A first identity still sees its newly measured LV and an unbound startup hold separately.
   // Preserve that conservative denial while installing verified receipts under the existing CAS.
   // Only a later fresh sample can use the installed exact bindings to remove double exposure;
