@@ -1,6 +1,7 @@
 # Selected only by a release containing both qualified native runtime images.
 # The common regional resources remain the single source for RBAC, network, services and limits;
-# the native controller adds only read access to the runtime admission it waits for.
+# the native controller adds read access to the runtime admission it waits for and the right to
+# resize the requests of a parked instance Pod in place.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:

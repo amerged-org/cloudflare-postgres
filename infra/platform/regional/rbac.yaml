@@ -83,7 +83,8 @@ rules:
     resources: [pods]
     verbs: [watch]
   # A runtime switch deletes only the exact primary Pod under its UID and resourceVersion, so that
-  # CNPG recreates it under the selected RuntimeClass. Pods are never created, updated or patched.
+  # CNPG recreates it under the selected RuntimeClass. Pods are never created or updated; only the
+  # native overlay patches one, in place and for its requests, through pods/resize.
   - apiGroups: [""]
     resources: [pods]
     verbs: [delete]
