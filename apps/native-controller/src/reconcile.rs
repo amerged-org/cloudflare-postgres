@@ -36,6 +36,9 @@ const ADMISSION: &str = "pgcf-cnpg-prestarted";
 /// Longest a fast wake polls for PostgreSQL after the unfence, and then for the kubelet's Ready
 /// and the Pod's requests; later passes continue on the same Pod.
 const ACCEPT_BUDGET: Duration = Duration::from_secs(5);
+/// Longest the controller waits for its own watch to deliver a write of its own before it reads
+/// the runtime proof back.
+const WATCH_LAG: Duration = Duration::from_millis(500);
 struct RuntimeResources<'a> {
     namespace: &'a Value,
     cluster: &'a Value,
@@ -1655,7 +1658,7 @@ impl Reconciler {
         if finalized {
             result["recovery"] = json!({"operation_id":db["recovery"]["operation_id"],"storage_generation":optional_number(db,"storage_generation",1),"verified":true});
         }
-        let final_ns = self
+        let mut final_ns = self
             .k8s
             .read("Namespace", None, &ns)
             .await?
@@ -1665,6 +1668,16 @@ impl Reconciler {
                 != Some(number(db, "generation").to_string().as_str())
         {
             return Err("Namespace generation changed before readiness".into());
+        }
+        // The completed generation is this controller's own write to the namespace the runtime
+        // proof names at its version, so it is written before the proof and seen by the watch the
+        // proof is read back against: written after, it would change the namespace under the
+        // proof of the first pass of every generation.
+        if generation(&final_ns) != number(db, "generation") {
+            final_ns = self.k8s.patch(&final_ns,&json!({"metadata":{"annotations":{GENERATION:number(db,"generation").to_string(),ACCEPTED:number(db,"generation").to_string()}}})).await?;
+            if proof_continuity.is_some() && !db["admission"].is_null() {
+                self.k8s.observed(&final_ns, WATCH_LAG).await;
+            }
         }
         if is_ready {
             let cid = text(status, "containerID")
@@ -1730,9 +1743,6 @@ impl Reconciler {
             if crate::contracts::schema_valid("DatabaseRuntimeAttestation", &proof) {
                 result["runtime_attestation"] = proof;
             }
-        }
-        if generation(&final_ns) != number(db, "generation") {
-            self.k8s.patch(&final_ns,&json!({"metadata":{"annotations":{GENERATION:number(db,"generation").to_string(),ACCEPTED:number(db,"generation").to_string()}}})).await?;
         }
         let release = timing::Phase::begin(db, "fence_release");
         let result = if let Some(intent) = intent {

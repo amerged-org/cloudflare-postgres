@@ -370,6 +370,39 @@ impl Kubernetes {
                 })
         })
     }
+    /// The watch of an in-process test world: every runtime kind is live and the cache holds
+    /// exactly `objects` at their current versions, as a watch without lag would.
+    #[cfg(test)]
+    pub(crate) fn mirror<'a>(&self, objects: impl IntoIterator<Item = &'a Value>) {
+        let mut state = self.continuity.lock().unwrap();
+        state.objects.clear();
+        for kind in RUNTIME_WATCH_KINDS {
+            state.connected(kind, "1");
+        }
+        for object in objects {
+            if let Some(kind) = object["kind"]
+                .as_str()
+                .filter(|kind| RUNTIME_WATCH_KINDS.contains(kind))
+            {
+                state.observe(kind, object, false);
+            }
+        }
+    }
+    /// Waits for at most `within` until the watch holds `resource` at its version: a write of
+    /// this controller is part of the world a runtime proof describes only once its own watch has
+    /// delivered it. `false` means it has not within `within`.
+    pub async fn observed(&self, resource: &Value, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.runtime_resource_current(resource) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
     pub async fn version(&self) -> Result<Value, Error> {
         self.request(Method::GET, "/version", None)
             .await?
@@ -1166,6 +1199,35 @@ mod tests {
         assert!(
             kube.runtime_proof_current(&proof),
             "CNPG still checks its own tenant namespace"
+        );
+    }
+    #[tokio::test]
+    async fn a_write_of_the_controller_is_observed_once_its_watch_delivers_it() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let kube = Kubernetes::with_ca(
+            Url::parse("https://localhost/").unwrap(),
+            identity.cert.pem().as_bytes(),
+            PathBuf::from("unused-observed-token"),
+        )
+        .unwrap();
+        let namespace = serde_json::json!({"kind":"Namespace","metadata":{"name":"pgcf-db-a","uid":"01234567-89ab-4def-8123-0123456789ab","resourceVersion":"2"}});
+        assert!(
+            !kube.observed(&namespace, Duration::from_millis(20)).await,
+            "nothing is watched yet"
+        );
+        let watch = kube.clone();
+        let delivered = namespace.clone();
+        let delivery = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            watch.mirror([&delivered]);
+        });
+        assert!(kube.observed(&namespace, Duration::from_secs(5)).await);
+        delivery.await.unwrap();
+        let mut newer = namespace.clone();
+        newer["metadata"]["resourceVersion"] = "3".into();
+        assert!(
+            !kube.observed(&newer, Duration::from_millis(20)).await,
+            "the version the watch holds is not the newer write"
         );
     }
     #[test]

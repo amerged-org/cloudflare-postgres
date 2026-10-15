@@ -303,3 +303,46 @@ fn a_resumed_pod_is_current_only_while_it_is_the_same_running_pod() {
     ready["status"]["conditions"] = json!([{"type":"Ready","status":"False"}]);
     assert!(resumed_current(&ready, &cluster, &db, &context, &wake));
 }
+
+#[tokio::test]
+async fn a_new_generation_is_published_with_its_proof_in_one_pass() {
+    // The completed generation is a write of the controller to the namespace the runtime proof
+    // names: written before the proof, the first pass of the generation publishes it; written
+    // after, that pass changed the namespace under its own proof and ended in an error, after the
+    // gateway fence was released, and the next pass repeated the whole chain.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.quick();
+    w.wake(3);
+    // CNPG replaced the retained Pod: the ordinary wake of a running instance applies.
+    w.pod(true);
+    w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+        pod["metadata"]["uid"] = crate::test_server::uid(77).into();
+    });
+    w.start_postgres().await;
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let proof = &observed["runtime_attestation"];
+    assert_eq!(proof["v"], 2, "{observed}");
+    assert_eq!(proof["pod_uid"], crate::test_server::uid(77));
+    let namespace = w.server.get("Namespace", None, &w.ns).unwrap();
+    assert_eq!(
+        namespace["metadata"]["annotations"]["pgcf.io/generation"],
+        "3"
+    );
+    assert_eq!(
+        proof["observation"]["resource_versions"]["namespace"],
+        namespace["metadata"]["resourceVersion"]
+    );
+    let map = w
+        .server
+        .get(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("gateway-fence-{}", w.id),
+        )
+        .unwrap();
+    let target: Value = serde_json::from_str(text(&map["data"], "admission_target")).unwrap();
+    assert_eq!(target["pod_uid"], crate::test_server::uid(77));
+    assert_eq!(target["generation"], 3);
+}

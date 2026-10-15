@@ -47,7 +47,18 @@ pub struct State {
     pub lose: Option<LoseReply>,
     /// Runs once while a text body is served, e.g. to replace an object during a scrape.
     pub during_text: Option<DuringText>,
+    /// The controller's watch cache, kept equal to `objects` after every change when set (a watch
+    /// without lag): the runtime proof of an admitted database needs complete watch coverage.
+    pub watch: Option<Kubernetes>,
     serial: u64,
+}
+impl State {
+    /// Brings the watch cache, if there is one, to the objects as they are now.
+    pub fn sync(&self) {
+        if let Some(watch) = &self.watch {
+            watch.mirror(self.objects.values());
+        }
+    }
 }
 pub struct Server {
     pub k8s: Kubernetes,
@@ -403,7 +414,11 @@ impl Server {
                         if method == "PATCH" {
                             state.patch_types.push((path.clone(), content_type));
                         }
-                        handle(&mut state, &method, &path, &body)
+                        let response = handle(&mut state, &method, &path, &body);
+                        if method != "GET" {
+                            state.sync();
+                        }
+                        response
                     };
                     let Some((status, body)) = response else {
                         return;
@@ -439,7 +454,16 @@ impl Server {
             value["metadata"]["namespace"].as_str(),
             value["metadata"]["name"].as_str().unwrap(),
         );
-        self.state.lock().unwrap().objects.insert(key, value);
+        let mut state = self.state.lock().unwrap();
+        state.objects.insert(key, value);
+        state.sync();
+    }
+    /// From now on the controller's watch cache follows every change of the objects: complete
+    /// coverage at the current versions, with no lag.
+    pub fn watch(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.watch = Some(self.k8s.clone());
+        state.sync();
     }
     pub fn get(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<Value> {
         self.state
@@ -456,14 +480,9 @@ impl Server {
         name: &str,
         edit: impl FnOnce(&mut Value),
     ) {
-        edit(
-            self.state
-                .lock()
-                .unwrap()
-                .objects
-                .get_mut(&path(kind, namespace, name))
-                .unwrap(),
-        );
+        let mut state = self.state.lock().unwrap();
+        edit(state.objects.get_mut(&path(kind, namespace, name)).unwrap());
+        state.sync();
     }
 }
 /// Every request the Cloudflare API double received, as (path, JSON body).

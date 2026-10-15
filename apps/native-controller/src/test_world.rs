@@ -520,6 +520,12 @@ impl World {
                       "containerStatuses":[{"name":"postgres","ready":ready,"containerID":POSTGRES_CONTAINER,"imageID":IMAGE,"state":{"running":{"startedAt":"2026-10-15T00:00:00Z"}},"restartCount":0,"resources":{"requests":requests}}],
                       "initContainerStatuses":[{"name":"plugin-barman-cloud","ready":true,"containerID":SIDECAR_CONTAINER,"state":{"running":{"startedAt":"2026-10-15T00:00:00Z"}},"restartCount":0,"resources":{"requests":side}}]}}));
     }
+    /// A database Cloudflare admitted: its running proof is the v2 attestation the gateway routes
+    /// by, which needs the controller's watch to cover every object the proof names.
+    pub fn admitted(&mut self) {
+        self.db["admission"] = json!({"v":1,"admission_epoch":1,"route_revision":1});
+        self.server.watch();
+    }
     /// The CA ConfigMap the agent publishes for the gateway; the maintenance Secret is among the
     /// applied manifests already.
     pub fn maintenance_credentials(&self) {
