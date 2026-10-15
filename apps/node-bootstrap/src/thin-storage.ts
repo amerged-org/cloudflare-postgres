@@ -19,7 +19,10 @@ import {
   STORAGE_PROTECTION_LEDGER_KEY,
   DatabaseId,
 } from "@pgcf/contracts";
-import { readHostConfiguration } from "./fleet-host-configuration.ts";
+import {
+  hostFilesMaterialized,
+  readHostConfiguration,
+} from "./fleet-host-configuration.ts";
 import {
   readFleetTalosExtensions,
   readFleetTalosServices,
@@ -1411,21 +1414,25 @@ export async function thinStorageHostConfiguration(
 ) {
   assertThinStorageHostSettings(input);
   const lease = input.lease;
+  // A failed file read rejects with its own error: one still failing after its repeats or cut by the
+  // turn's deadline stays transient. Only a file read back with other content is unqualified.
   return (
-    await readHostConfiguration(
-      { talos },
-      input.host_configuration,
-      undefined,
-      false,
-      lease.configuration_boot_id
-        ? {
-            boot_id: lease.boot_id,
-            configuration_boot_id: lease.configuration_boot_id,
-          }
-        : undefined,
-      true,
-    )
-  ).matches;
+    (
+      await readHostConfiguration(
+        { talos },
+        input.host_configuration,
+        undefined,
+        false,
+        lease.configuration_boot_id
+          ? {
+              boot_id: lease.boot_id,
+              configuration_boot_id: lease.configuration_boot_id,
+            }
+          : undefined,
+      )
+    ).matches &&
+    (await hostFilesMaterialized({ talos }, input.host_configuration))
+  );
 }
 
 export async function runThinStorage(

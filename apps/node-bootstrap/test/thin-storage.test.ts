@@ -9,7 +9,13 @@ import { stringify } from "yaml";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
-import { BootstrapError, runCommand } from "../src/bootstrap.ts";
+import {
+  BootstrapError,
+  runCommand,
+  type Command,
+  type CommandResult,
+} from "../src/bootstrap.ts";
+import { ThinWorld } from "./thin-qualification.fixture.ts";
 import {
   issueAgain,
   readCommand,
@@ -29,6 +35,7 @@ import {
   assertThinStorageHostSettings,
   thinStorageHostConfiguration,
   openThinSession,
+  verifyThinNode,
 } from "../src/thin-storage.ts";
 import type {
   NodeThinStorageInput,
@@ -184,6 +191,149 @@ test("on a STATE-loaded boot the executor proves host files with the completed p
   await assert.rejects(
     thinStorageHostConfiguration(witnessed(boot), talos),
     /persistence_unproved/,
+  );
+});
+test("a failed host-file read stays a transient turn failure; only a file read back with other content leaves the host guard unqualified", async () => {
+  const world = new ThinWorld({
+    id: "op_abcdefghijklmnopqrst",
+    node_id: "nod_abcdefghij0123456789",
+    region_id: "eu-dev",
+    node_uid: randomUUID(),
+    cluster_uid: randomUUID(),
+    name: "eu1",
+    provider_instance_id: "202610110001",
+    address: "192.0.2.21",
+  });
+  const ids = world.ids,
+    files = hostInput.host_configuration.files;
+  // Active and persistent configuration declare both fixed files; only their physical reads vary.
+  const machineconfig = ["v1alpha1", "persistent"]
+    .map((id) =>
+      JSON.stringify({
+        metadata: { type: "MachineConfigs.config.talos.dev", id },
+        spec: stringify({
+          version: "v1alpha1",
+          machine: { files: files.map((file) => ({ ...file, op: "create" })) },
+        }),
+      }),
+    )
+    .join("\n");
+  // The real session, its read repeats and its deadline around the real node and host guard checks.
+  const turn = (
+    budget_ms: number,
+    read: (path: string, command: Command) => Promise<CommandResult>,
+  ) =>
+    openThinSession(
+      {
+        callback: {
+          url: `https://api.invalid/internal/v1/node-thin-storage/${ids.node_id}`,
+          bearer: "t".repeat(43),
+        },
+        cluster_endpoint: `https://${ids.address}:6443/`,
+        talos_admin_config: JSON.stringify({
+          context: "test",
+          contexts: {
+            test: { ca: "test-only", crt: "test-only", key: "test-only" },
+          },
+        }),
+        kubeconfig: JSON.stringify({
+          clusters: [
+            {
+              cluster: {
+                server: `https://${ids.address}:6443/`,
+                "certificate-authority-data": "test-only",
+              },
+            },
+          ],
+          users: [
+            {
+              user: {
+                "client-certificate-data": "test-only",
+                "client-key-data": "test-only",
+              },
+            },
+          ],
+        }),
+        address: ids.address,
+        budget_ms,
+        deadline_code: "thin_storage_turn_timeout",
+        prefix: "pgcf-thin-host-files-test-",
+      },
+      {
+        proxy: async () => ({
+          url: "http://127.0.0.1:1",
+          close: async () => {},
+        }),
+        request: async () => {
+          throw new Error("unexpected_callback");
+        },
+        run: async (command) => {
+          const args = command.args.slice(6);
+          if (command.executable === "talosctl" && args[1] === "machineconfig")
+            return { exit_code: 0, stdout: machineconfig };
+          if (
+            command.executable === "talosctl" &&
+            args[0] === "read" &&
+            files.some((file) => file.path === args[1])
+          )
+            return await read(args[1]!, command);
+          return await world.command(command);
+        },
+      },
+      (session) =>
+        verifyThinNode(
+          session,
+          {
+            node_id: ids.node_id,
+            region_id: ids.region_id,
+            node_uid: ids.node_uid,
+            cluster_uid: ids.cluster_uid,
+            name: ids.name,
+            provider_instance_id: ids.provider_instance_id,
+            driver_image: world.driverImage,
+            host_extension_version: world.extension,
+            boot_id: world.boot,
+            kernel_version: world.kernel,
+          },
+          async () => {},
+          () =>
+            thinStorageHostConfiguration(hostInput, (args) =>
+              session.talos(args),
+            ),
+        ),
+    );
+  const failedWith = (code: string) => (error: unknown) =>
+    error instanceof BootstrapError && error.code === code;
+  // A relay round trip that still fails after its repeats proves nothing about the file.
+  let attempts = 0;
+  await assert.rejects(
+    turn(10_000, async (path) =>
+      path === files[1].path
+        ? (attempts++, { exit_code: 1, stdout: "" })
+        : { exit_code: 0, stdout: files[0].content },
+    ),
+    failedWith("thin_storage_command_failed"),
+  );
+  assert.equal(attempts, 3);
+  // Nor does the turn's own deadline cancelling real hung reads.
+  await assert.rejects(
+    turn(300, (_path, command) =>
+      runCommand({
+        ...command,
+        executable: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+      }),
+    ),
+    failedWith("thin_storage_turn_timeout"),
+  );
+  // Settings read back with other content block the node even when the other read fails.
+  await assert.rejects(
+    turn(10_000, async (path) =>
+      path === files[1].path
+        ? { exit_code: 1, stdout: "" }
+        : { exit_code: 0, stdout: '{"version":0}\n' },
+    ),
+    failedWith("thin_storage_host_guard_unqualified"),
   );
 });
 const action = {

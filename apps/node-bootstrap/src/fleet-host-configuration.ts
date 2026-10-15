@@ -257,6 +257,24 @@ export function hostConfigurationReapplyReadback(
   }
   return proveMachineConfiguration(snapshot);
 }
+/** Every fixed host file reads back with its declared content. A file read back with other content
+ * decides false; a failed read proves nothing about its file and rejects with its own error. */
+export async function hostFilesMaterialized(
+  commands: HostConfigurationCommands,
+  input: NodeHostConfigurationPrivate,
+) {
+  const reads = await Promise.allSettled(
+    input.files.map(
+      async (file) =>
+        (await commands.talos(["read", file.path])) === file.content,
+    ),
+  );
+  if (reads.some((read) => read.status === "fulfilled" && !read.value))
+    return false;
+  const failed = reads.find((read) => read.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
+  return true;
+}
 export async function readHostConfiguration(
   commands: HostConfigurationCommands,
   input: NodeHostConfigurationPrivate,
@@ -293,16 +311,11 @@ export async function readHostConfiguration(
           admitted,
         )
       : !!value.state_loaded);
+  // Talos writes these /var files only at boot. Until a fleet patch's activation reboot a file can
+  // be absent, and its read fails like a lost relay round trip, so here any failure is unmaterialized.
   const materialized =
     !requireMaterializedFiles ||
-    (
-      await Promise.allSettled(
-        input.files.map(
-          async (file) =>
-            (await commands.talos(["read", file.path])) === file.content,
-        ),
-      )
-    ).every((result) => result.status === "fulfilled" && result.value);
+    (await hostFilesMaterialized(commands, input).catch(() => false));
   return {
     ...value,
     thin_pool_required: requireThinPool,

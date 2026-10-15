@@ -207,6 +207,24 @@ test("a persisted new declaration cannot prove unchanged old physical host files
   );
   assert.equal(observed.configured, true);
   assert.equal(observed.matches, false);
+  // Talos writes the files only at boot: before a patch's activation reboot one can be absent.
+  const absent = await readHostConfiguration(
+    {
+      talos: async (args: string[]) => {
+        if (args[0] === "get") return configList(declared);
+        if (args[1] === host.files[0]!.path)
+          throw Error("patch_command_failed");
+        return host.files[1]!.content;
+      },
+    },
+    host,
+    undefined,
+    false,
+    undefined,
+    true,
+  );
+  assert.equal(absent.configured, true);
+  assert.equal(absent.matches, false);
 });
 test("a state-loaded changed boot has only the real active resource; unwitnessed absence and divergent resources remain blocked", async () => {
   const boot = { boot_id: randomUUID(), configuration_boot_id: randomUUID() };
