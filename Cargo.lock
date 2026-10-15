@@ -1460,22 +1460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgcf-native-reclaimer"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "jsonschema",
- "libc",
- "pgcf-native-controller",
- "pgcf-native-protocol",
- "ring",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
 name = "pgcf-node-runtime"
 version = "0.1.0"
 dependencies = [

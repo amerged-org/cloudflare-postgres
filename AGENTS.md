@@ -21,7 +21,7 @@ Record completed steps and measured numbers in the ULTRA plan linked by PLAN.md;
 Never give effort or duration estimates (weeks, days, hours or any other unit) for planned work, in plans, designs, reports or replies.
 Repository documentation is written in English; discussion with the owner may be in German.
 Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs, docs/operations runbooks and docs/architecture proposals.
-Approved runtime target: native Rust for the regional gateway, controller, bootstrap relay and node reclaimer; Rust/Wasm for the Edge Worker.
+Approved runtime target: native Rust for the regional gateway, controller and bootstrap relay; Rust/Wasm for the Edge Worker.
 TypeScript remains for the management API, Durable Objects and Workflows; CLI and provisioning tools initially remain on Node.js.
 Shared zod contracts remain authoritative initially; Rust consumers use generated schemas/constants and behavioral conformance tests.
 Read docs/architecture/rust-runtime-and-cold-starts.md for the approved migration sequence and cold-start design; the deployed runtime remains TypeScript until replacement passes Dev acceptance.

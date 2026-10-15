@@ -20,7 +20,6 @@ const selected = (value: Partial<ImageInputs> = {}): ImageInputs => ({
   rust_gateway: false,
   native_controller: false,
   rust_bootstrap_relay: false,
-  native_reclaimer: false,
   sandbox_controller: false,
   pool_supervisor: false,
   ...value,
@@ -61,7 +60,7 @@ test("supervisor manifest and auto-discovered targets invalidate every shipped w
     ["apps/pool-supervisor/tests/kernel.rs"],
     "push",
   );
-  assert.equal(addedTarget.native_reclaimer, true);
+  assert.equal(addedTarget.native_controller, true);
   assert.equal(addedTarget.pool_supervisor, true);
 });
 
@@ -130,7 +129,6 @@ test("exact Skopeo installer publication run and env do not rebuild native artif
     rust_gateway: true,
     native_controller: true,
     rust_bootstrap_relay: true,
-    native_reclaimer: true,
     sandbox_controller: true,
     pool_supervisor: true,
   });
@@ -171,7 +169,6 @@ test("workflow build recipes and consumed native schema bytes still invalidate t
     rust_gateway: true,
     native_controller: true,
     rust_bootstrap_relay: true,
-    native_reclaimer: true,
     sandbox_controller: true,
     pool_supervisor: true,
   });
@@ -269,18 +266,13 @@ test("actual storage and native inputs select only their affected runtime artifa
   );
   assert.deepEqual(
     selectImageInputs(["apps/native-controller/src/kubernetes.rs"], "push"),
-    selected({ native_controller: true, native_reclaimer: true }),
+    selected({ native_controller: true }),
   );
-  for (const [path, flag] of [
-    ["apps/native-bootstrap-relay/src/main.rs", "rust_bootstrap_relay"],
-    ["apps/native-reclaimer/src/main.rs", "native_reclaimer"],
-  ])
-    assert.equal(
-      (
-        selectImageInputs([path!], "push") as unknown as Record<string, unknown>
-      )[flag!],
-      true,
-    );
+  assert.equal(
+    selectImageInputs(["apps/native-bootstrap-relay/src/main.rs"], "push")
+      .rust_bootstrap_relay,
+    true,
+  );
   assert.equal(
     (
       selectImageInputs(
@@ -300,7 +292,6 @@ test("actual storage and native inputs select only their affected runtime artifa
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -323,7 +314,6 @@ test("actual storage and native inputs select only their affected runtime artifa
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -334,7 +324,6 @@ test("actual storage and native inputs select only their affected runtime artifa
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -355,7 +344,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -368,7 +356,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -391,7 +378,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -409,7 +395,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_gateway: true,
       native_controller: true,
       rust_bootstrap_relay: true,
-      native_reclaimer: true,
       sandbox_controller: true,
       pool_supervisor: true,
     }),
@@ -424,7 +409,6 @@ test("PostgreSQL inputs stay scoped and manual, unavailable or malformed compari
     rust_gateway: true,
     native_controller: true,
     rust_bootstrap_relay: true,
-    native_reclaimer: true,
     sandbox_controller: true,
     pool_supervisor: true,
   });
@@ -770,7 +754,6 @@ async function nativeReceiptZip(
       "rust-gateway",
       "native-controller",
       "rust-bootstrap-relay",
-      "native-reclaimer",
       "sandbox-controller",
     ]) {
       const path = join(directory, "pgcf-native-image-gate", profile);
@@ -799,7 +782,7 @@ async function nativeReceiptZip(
           digest: "sha256:" + "b".repeat(64),
           manifestDigest: "sha256:" + "b".repeat(64),
           configDigest:
-            broken && profile === "native-reclaimer"
+            broken && profile === "rust-bootstrap-relay"
               ? "sha256:" + "f".repeat(64)
               : config,
           layersVerified: 1,
@@ -820,7 +803,7 @@ async function nativeReceiptZip(
     await rm(zip, { force: true });
   }
 }
-test("partial Native receipts reuse exactly four proved runtimes without baselining unfinished Talos output", async () => {
+test("partial Native receipts reuse exactly three proved runtimes without baselining unfinished Talos output", async () => {
   const history = await failedPushHistory("infra/storage/image.test.mjs");
   try {
     const run = { ...successfulRun(history.failed, 2), conclusion: "failure" },
@@ -905,7 +888,6 @@ test("partial Native receipts reuse exactly four proved runtimes without baselin
         rust_gateway: true,
         native_controller: true,
         rust_bootstrap_relay: true,
-        native_reclaimer: true,
         sandbox_controller: true,
         pool_supervisor: true,
       }),

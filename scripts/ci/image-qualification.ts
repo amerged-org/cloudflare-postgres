@@ -508,7 +508,6 @@ type ToolStage =
   | "runtime_native_controller"
   | "runtime_pool_supervisor"
   | "runtime_rust_bootstrap_relay"
-  | "runtime_native_reclaimer"
   | "runtime_sandbox_controller"
   | "runtime_sandbox_holder"
   | "runtime_postgres"
@@ -594,7 +593,6 @@ export interface RuntimeCheck {
     | "native-controller"
     | "pool-supervisor"
     | "rust-bootstrap-relay"
-    | "native-reclaimer"
     | "sandbox-controller"
     | "sandbox-holder";
 }
@@ -655,21 +653,15 @@ export function runtimeChecks(
         version: "native-controller",
       },
     ];
-  if (profile === "rust-bootstrap-relay" || profile === "native-reclaimer")
+  if (profile === "rust-bootstrap-relay")
     return [
       {
-        stage:
-          profile === "rust-bootstrap-relay"
-            ? "runtime_rust_bootstrap_relay"
-            : "runtime_native_reclaimer",
-        entrypoint:
-          profile === "rust-bootstrap-relay"
-            ? "/pgcf-native-bootstrap-relay"
-            : "/pgcf-native-reclaimer",
+        stage: "runtime_rust_bootstrap_relay",
+        entrypoint: "/pgcf-native-bootstrap-relay",
         args: ["--version"],
         exit: 0,
         stderr: "",
-        version: profile,
+        version: "rust-bootstrap-relay",
       },
     ];
   if (profile === "sandbox-controller" || profile === "sandbox-extension")
@@ -852,7 +844,6 @@ export function validateRuntimeResult(
     check.version === "native-controller" ||
     check.version === "pool-supervisor" ||
     check.version === "rust-bootstrap-relay" ||
-    check.version === "native-reclaimer" ||
     check.version === "sandbox-controller" ||
     check.version === "sandbox-holder"
   ) {
@@ -871,11 +862,9 @@ export function validateRuntimeResult(
             ? "pgcf-native-controller"
             : check.version === "rust-bootstrap-relay"
               ? "pgcf-native-bootstrap-relay"
-              : check.version === "native-reclaimer"
-                ? "pgcf-native-reclaimer"
-                : check.version === "sandbox-controller"
-                  ? "pgcf-sandbox-controller"
-                  : "pgcf-node-runtime";
+              : check.version === "sandbox-controller"
+                ? "pgcf-sandbox-controller"
+                : "pgcf-node-runtime";
     const packagePath =
       check.version === "pool-supervisor"
         ? "pool-supervisor"
@@ -885,11 +874,9 @@ export function validateRuntimeResult(
             ? "native-controller"
             : check.version === "rust-bootstrap-relay"
               ? "native-bootstrap-relay"
-              : check.version === "native-reclaimer"
-                ? "native-reclaimer"
-                : check.version === "sandbox-controller"
-                  ? "sandbox-controller"
-                  : "node-runtime";
+              : check.version === "sandbox-controller"
+                ? "sandbox-controller"
+                : "node-runtime";
     const sourceVersion = /^version\s*=\s*"([^"\r\n]+)"\s*$/m.exec(
       readFileSync(`apps/${packagePath}/Cargo.toml`, "utf8"),
     )?.[1];
@@ -928,23 +915,14 @@ export function validateRuntimeResult(
         `runtime_generated_input_invalid:${check.stage}`,
       );
     }
-    if (
-      check.version === "rust-bootstrap-relay" ||
-      check.version === "native-reclaimer"
-    ) {
+    if (check.version === "rust-bootstrap-relay") {
       const sha = (path: string) =>
         createHash("sha256").update(readFileSync(path)).digest("hex");
-      const contract =
-        check.version === "rust-bootstrap-relay" ? "bootstrap" : "reclaim";
-      const field =
-        check.version === "rust-bootstrap-relay"
-          ? "bootstrapContractSha256"
-          : "reclaimContractSha256";
       requireCheck(
         value.protocolSha256 ===
           sha("packages/contracts/native/protocol.generated.json") &&
-          value[field] ===
-            sha(`packages/contracts/native/${contract}.generated.json`),
+          value.bootstrapContractSha256 ===
+            sha("packages/contracts/native/bootstrap.generated.json"),
         `runtime_generated_input_invalid:${check.stage}`,
       );
     }
@@ -1135,7 +1113,6 @@ export function rustArtifactPaths(profile: ImageProfile) {
   if (profile === "native-controller") return ["pgcf-native-controller"];
   if (profile === "rust-bootstrap-relay")
     return ["pgcf-native-bootstrap-relay"];
-  if (profile === "native-reclaimer") return ["pgcf-native-reclaimer"];
   const prefix = profile === "sandbox-extension" ? "rootfs/" : "";
   return [
     prefix + "usr/local/bin/pgcf-sandbox-controller",
@@ -1207,14 +1184,6 @@ export async function verifyRustAssembly(
           [
             "bootstrap.generated.json",
             "packages/contracts/native/bootstrap.generated.json",
-          ],
-        ]
-      : []),
-    ...(profile === "native-reclaimer"
-      ? [
-          [
-            "reclaim.generated.json",
-            "packages/contracts/native/reclaim.generated.json",
           ],
         ]
       : []),

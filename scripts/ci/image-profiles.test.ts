@@ -58,6 +58,7 @@ test("profile parsing rejects unknown modes and retains immutable upstream build
   assert.equal(imageProfile(), "regional");
   assert.equal(imageProfile("sandbox-extension"), "sandbox-extension");
   assert.throws(() => imageProfile("talos-installer"), /profile/i);
+  assert.throws(() => imageProfile("native-reclaimer"), /profile/i);
   assert.throws(() => imageProfile(null), /profile/i);
   assert.equal(isRustProfile("sandbox-extension"), true);
   assert.equal(isRustProfile("native-controller"), true);

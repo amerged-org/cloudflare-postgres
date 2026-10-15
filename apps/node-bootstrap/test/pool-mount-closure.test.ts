@@ -257,7 +257,6 @@ test("real thin device writes share one measured Pod ancestor budget", async () 
       "apps/node-runtime",
       "packages/native-protocol",
       "apps/native-gateway",
-      "apps/native-reclaimer",
       "apps/native-bootstrap-relay",
       "apps/pool-supervisor",
     ]) {

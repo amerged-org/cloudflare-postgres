@@ -206,11 +206,11 @@ permission, because it can only end the single writer.
 **A8.1.6 The privileged component and its authority.** The node agent is the sandbox controller.
 node-bootstrap is a Cloudflare Container (apps/api/wrangler.example.jsonc:67-70) that reaches
 nodes through the Talos API; it is not a node service. Of PGCF's node components only the sandbox
-controller is a Talos host service (infra/talos/sandbox/service.yaml:2-16); the node reclaimer is
-restricted to bounded memory reclaim (rt:315-321). The sandbox controller already runs in CRI's
-PID and mount context with the host `/proc` handle (sc/host_context.rs:21-22, 113-199), issues
-device-mapper ioctls (sc/storage_dm.rs:61-90), verifies Cloudflare's Ed25519 authority against
-pinned keys (sc/storage.rs:147-176, 239) and persists owner records (sc/controller.rs:70-115).
+controller is a Talos host service (infra/talos/sandbox/service.yaml:2-16). The sandbox controller
+already runs in CRI's PID and mount context with the host `/proc` handle (sc/host_context.rs:21-22,
+113-199), issues device-mapper ioctls (sc/storage_dm.rs:61-90), verifies Cloudflare's Ed25519
+authority against pinned keys (sc/storage.rs:147-176, 239) and persists owner records
+(sc/controller.rs:70-115).
 - *Signed bind permission.* Ed25519 with prefix `pb1` and domain `pgcf-pool-bind/v1\n`, signed with
   the existing storage-authority keys under that separate domain
   (packages/contracts/src/storage-write-authority.ts:7-12, 85-111), so the node needs no new trust

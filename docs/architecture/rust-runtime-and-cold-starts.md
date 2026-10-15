@@ -18,7 +18,7 @@ The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) is the canonical
 
 ## 1. Decision and purpose
 
-Rust is the chosen implementation language for the first-party regional server applications: the PostgreSQL gateway, the entire lifecycle controller, the bootstrap byte relay and a separate node-local memory reclaimer. The entire Edge Worker also moves to Rust compiled to WebAssembly. TypeScript remains the language of the management API, DatabaseActor, RegionLink and Workflows. The CLI and node-bootstrap orchestration remain Node.js initially. No first-party Go implementation is planned.
+Rust is the chosen implementation language for the first-party regional server applications: the PostgreSQL gateway, the entire lifecycle controller and the bootstrap byte relay. The entire Edge Worker also moves to Rust compiled to WebAssembly. TypeScript remains the language of the management API, DatabaseActor, RegionLink and Workflows. The CLI and node-bootstrap orchestration remain Node.js initially. No first-party Go implementation is planned.
 
 The migration combines a native runtime with changes to the connection and lifecycle paths. It does not consist only of translating the existing reconciliation loop. The controller becomes event-driven, publishes ready database observations immediately, retains verified runtime state, and keeps inventory and metering work outside the wake path. The gateway connects through an identity-bound direct target cache. The Actor provides a versioned admission snapshot without a D1 read on every ordinary warm connection.
 
@@ -62,11 +62,10 @@ PostgreSQL startup/readiness probes are configured at one second.
 | Regional gateway | Native Rust binary | Native Rust (`apps/native-gateway`) | WebSocket/PostgreSQL transport, token/startup validation, TLS, activity and persisted fences |
 | Regional controller | Native Rust binary | Native Rust (`apps/native-controller`) | Desired-state execution, readiness, watches, configuration/runtime proofs, health and observations |
 | Bootstrap byte relay | Native Rust binary | TypeScript relay (`apps/regional`); `apps/native-bootstrap-relay` is built, not deployed | The existing authorized byte-relay function with bounded streams and independent workload rights |
-| Node reclaimer | Separate native Rust binary | `apps/native-reclaimer` is built, not deployed | Narrowly authorized reclaim of a bound PostgreSQL container on an approved node |
 | CLI and node-bootstrap tooling | Node.js initially | Node.js | Local client bridge and long-running provisioning orchestration; optional later native work |
 | PostgreSQL, CNPG, Barman, Talos and Kubernetes platform | Unmodified pinned upstream components | Unmodified pinned upstream components | Database engine, backup, operating system and orchestration |
 
-Use one Rust workspace with a portable protocol/contract core and separate host implementations. Produce separate binaries and images for gateway, controller, relay and node reclaimer. Separate images permit independent deployment and retain separate service accounts, host access and resource limits. A common workspace is not a reason to grant the controller the reclaimer's privileges or to run every mode in one process.
+Use one Rust workspace with a portable protocol/contract core and separate host implementations. Produce separate binaries and images for gateway, controller and relay. Separate images permit independent deployment and retain separate service accounts, host access and resource limits. A common workspace is not a reason to grant the controller host privileges or to run every mode in one process.
 
 The portable core is shared by native applications and the Wasm Edge. It contains bounded protocol parsing, routing-token primitives, generated contract types/constants and related validation. Kubernetes clients, native sockets, Cloudflare host bindings and node filesystem access stay outside it. Do not add per-frame Node/Rust IPC or a Rust sidecar behind a Node data relay.
 
@@ -337,7 +336,7 @@ The later module must define and verify both client-facing and backend authentic
 
 Successful proxy-side authentication cannot bypass PostgreSQL's authentication or the target/fence guards. No authentication change is bundled into the first gateway port, and no connection pooling or uncertain-write replay is introduced as an incidental consequence.
 
-## 12. Additional warm reclaim and the node-local reclaimer
+## 12. Additional warm reclaim
 
 **Status.** The API policy and the host publisher are implemented; the node reclaimer binary is built
 and not deployed, no node is qualified and no database carries a policy. This mode is additional to
@@ -346,13 +345,15 @@ runtime; it is not pool implementation or evidence for pool-hit latency.
 
 Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/zswap_config.go).
 
-The reclaimer is a separate DaemonSet/binary on explicitly approved worker nodes. It is not part of the regional controller Pod and does not give the controller a writable host cgroup mount. The current control-plane/worker baseline remains outside the swap/reclaim trial; enable the trial only on a separately accepted, isolated Dev worker.
+**Status (2026-10-15).** The node-local reclaimer binary and its image were deleted; no release contained it and nothing deployed it. The control-plane half remains: the API's per-database policy and per-node qualification endpoints, the signed reclaim scopes, the host extension's reclaim publisher and the Actor's revoke barrier. Qualification requires a `node-reclaimer` image component in the release specification, so no node can qualify until a consumer is built again and passes its own Dev acceptance.
+
+A node-local reclaimer is a separate DaemonSet/binary on explicitly approved worker nodes. It is not part of the regional controller Pod and does not give the controller a writable host cgroup mount. The current control-plane/worker baseline remains outside the swap/reclaim trial; enable the trial only on a separately accepted, isolated Dev worker.
 
 ### Authorization and scope
 
-A short-lived reclaim authorization binds database ID, operation/revision, node UID, namespace/Cluster/Pod UID, container identity, storage generation, permitted reclaim budget and expiry. The reclaimer verifies local identity and derives the target cgroup from trusted local workload inventory. The caller cannot supply an arbitrary filesystem path.
+A short-lived reclaim authorization binds database ID, operation/revision, node UID, namespace/Cluster/Pod UID, container identity, storage generation, permitted reclaim budget and expiry. The consumer verifies local identity and derives the target cgroup from trusted local workload inventory. The caller cannot supply an arbitrary filesystem path.
 
-Reclaim is restricted to the authorized PostgreSQL container and bounded reclaim interface. Exclude the node's system/control-plane services and unrelated containers. The reclaimer receives no PostgreSQL password, no D1 write authority and no general container-runtime control capability. Host access and the service account remain separate from gateway/controller rights.
+Reclaim is restricted to the authorized PostgreSQL container and bounded reclaim interface. Exclude the node's system/control-plane services and unrelated containers. The consumer receives no PostgreSQL password, no D1 write authority and no general container-runtime control capability. Host access and the service account remain separate from gateway/controller rights.
 
 Use small bounded reclaim steps and report their actual results. An expired lease, identity change, controller loss or revoked intent stops further steps. A reclaim failure is neither proof of hibernation nor proof of database failure. PostgreSQL remains running.
 

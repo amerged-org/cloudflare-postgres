@@ -18,7 +18,6 @@ const profiles = [
   "native-controller",
   "pool-supervisor",
   "rust-bootstrap-relay",
-  "native-reclaimer",
   "sandbox-controller",
   "sandbox-extension",
   "talos-recipe",
@@ -34,7 +33,6 @@ export const isRustProfile = (profile: ImageProfile) =>
   profile === "native-controller" ||
   profile === "pool-supervisor" ||
   profile === "rust-bootstrap-relay" ||
-  profile === "native-reclaimer" ||
   profile === "sandbox-controller" ||
   profile === "sandbox-extension";
 
@@ -194,9 +192,7 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
       ? "pgcf-native-gateway"
       : profile === "native-controller"
         ? "pgcf-native-controller"
-        : profile === "rust-bootstrap-relay"
-          ? "pgcf-native-bootstrap-relay"
-          : "pgcf-native-reclaimer";
+        : "pgcf-native-bootstrap-relay";
   return [binary, "licenses/pgcf/LICENSE"];
 }
 

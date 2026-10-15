@@ -18,7 +18,6 @@ export interface ImageInputs {
   rust_gateway: boolean;
   native_controller: boolean;
   rust_bootstrap_relay: boolean;
-  native_reclaimer: boolean;
   sandbox_controller: boolean;
   pool_supervisor: boolean;
 }
@@ -30,7 +29,6 @@ const all = (): ImageInputs => ({
   rust_gateway: true,
   native_controller: true,
   rust_bootstrap_relay: true,
-  native_reclaimer: true,
   sandbox_controller: true,
   pool_supervisor: true,
 });
@@ -232,7 +230,6 @@ export function selectImageInputs(
     rust_gateway: false,
     native_controller: false,
     rust_bootstrap_relay: false,
-    native_reclaimer: false,
     sandbox_controller: false,
     pool_supervisor: false,
   };
@@ -288,11 +285,10 @@ export function selectImageInputs(
       result.rust_gateway = true;
       result.native_controller = true;
       result.rust_bootstrap_relay = true;
-      result.native_reclaimer = true;
       result.sandbox_controller = true;
       result.pool_supervisor = true;
     }
-    // The reclaimer uses only pure controller helpers, never this runtime schema.
+    // Only the controller embeds this runtime schema.
     if (path === "packages/contracts/native/controller.generated.json")
       result.native_controller = true;
     if (path === ".dockerignore") result.storage = true;
@@ -307,24 +303,13 @@ export function selectImageInputs(
       result.rust_bootstrap_relay = true;
     if (rustInputs(path, "apps/native-bootstrap-relay"))
       result.rust_bootstrap_relay = true;
-    if (rustInputs(path, "apps/native-reclaimer"))
-      result.native_reclaimer = true;
     if (rustInputs(path, "apps/native-controller"))
       result.native_controller = true;
     if (rustInputs(path, "apps/pool-supervisor")) result.pool_supervisor = true;
-    if (
-      path === "apps/native-controller/Cargo.toml" ||
-      path === "apps/native-controller/build.rs" ||
-      (path.startsWith("apps/native-controller/src/") &&
-        path.endsWith(".rs") &&
-        path !== "apps/native-controller/src/main.rs")
-    )
-      result.native_reclaimer = true;
     if (path === "apps/native-gateway/license-bundle.sh") {
       result.rust_gateway = true;
       result.native_controller = true;
       result.rust_bootstrap_relay = true;
-      result.native_reclaimer = true;
       result.sandbox_controller = true;
       result.pool_supervisor = true;
     }
@@ -437,7 +422,6 @@ const imageJobs = {
     "rust_gateway",
     "native_controller",
     "rust_bootstrap_relay",
-    "native_reclaimer",
     "sandbox_controller",
     "pool_supervisor",
   ],
@@ -447,9 +431,8 @@ const runtimeProfiles = {
   rust_gateway: "rust-gateway",
   native_controller: "native-controller",
   rust_bootstrap_relay: "rust-bootstrap-relay",
-  native_reclaimer: "native-reclaimer",
 } as const;
-// The established partial-job receipt bundle covers these four runtimes only.
+// The established partial-job receipt bundle covers these three runtimes only.
 // The supervisor requires a successful whole native job before reusing its image.
 /** One failed image job does not revoke another group's successfully qualified immutable artifacts. */
 export async function changedImageInputsFromSuccessfulRun(

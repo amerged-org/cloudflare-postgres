@@ -8,7 +8,6 @@ RUN apk add --no-cache protobuf=31.1-r1 protobuf-dev=31.1-r1
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps/edge-rust/ apps/edge-rust/
-COPY apps/native-reclaimer/ apps/native-reclaimer/
 COPY apps/native-bootstrap-relay/ apps/native-bootstrap-relay/
 COPY apps/node-runtime/ apps/node-runtime/
 COPY apps/pool-supervisor/ apps/pool-supervisor/

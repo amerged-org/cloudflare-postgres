@@ -503,16 +503,18 @@ Pod, PostgreSQL, Barman and their active CPU accounting; it does not count as a 
 
 `GET`/`PUT /v1/nodes/{id}/warm-reclaim-qualification` records an independently accepted isolated
 worker proof bound to the current Node UID, boot, sealed cluster/material and selected release.
-A control-plane node, missing qualification or stale/mismatched runtime proof cannot issue reclaim.
+A control-plane node, missing qualification, a release without a `node-reclaimer` image component or
+a stale/mismatched runtime proof cannot issue reclaim.
 No retained node is implicitly qualified by deploying this source. The approved
 isolated-worker and actual encrypted-swap acceptance remain required before any live trial.
 
 The protected host publisher uses the existing regional identity to fetch
 `GET /agent/v1/nodes/{id}/reclaim` and post bounded observations to
 `POST /agent/v1/nodes/{id}/reclaim-observations`. It publishes a two-second envelope of CF-signed,
-five-second maximum rc1 scopes. The unprivileged reclaimer (built, not deployed) receives public
-verification keys and local identity snapshots; it receives no CF write credential, PostgreSQL
-credential or CRI socket.
+five-second maximum rc1 scopes. A consumer receives public verification keys and local identity
+snapshots; it receives no CF write credential, PostgreSQL credential or CRI socket. The node
+reclaimer that consumed them was deleted on 2026-10-15 and no replacement exists, so the scopes are
+published but nothing executes them.
 
 The Actor persists one idle episode with its own revision. Renewal cannot replenish its budget
 or change its runtime scope. Before a connection uses the warm route, the Actor persists a higher

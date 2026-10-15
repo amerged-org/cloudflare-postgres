@@ -1426,87 +1426,73 @@ test("storage assembly binds upstream archive, local exporter patch, Apache lice
   }
 });
 
-test("relay and reclaimer qualification require their own compiled contracts and source identity", async () => {
-  for (const [profile, packageName, contractName, field] of [
-    [
-      "rust-bootstrap-relay",
-      "native-bootstrap-relay",
-      "bootstrap",
-      "bootstrapContractSha256",
-    ],
-    [
-      "native-reclaimer",
-      "native-reclaimer",
-      "reclaim",
-      "reclaimContractSha256",
-    ],
-  ] as const) {
-    const check = runtimeChecks(profile)[0]!;
-    assert.equal(check.entrypoint, `/pgcf-${packageName}`);
-    assert.equal(
-      validateDockerfile(
-        "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch\n",
-        profile,
+test("relay qualification requires its own compiled contract and source identity", async () => {
+  const profile = "rust-bootstrap-relay";
+  const check = runtimeChecks(profile)[0]!;
+  assert.equal(check.entrypoint, "/pgcf-native-bootstrap-relay");
+  assert.equal(
+    validateDockerfile(
+      "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch\n",
+      profile,
+    ),
+    rustBuilder,
+  );
+  const sha = async (path: string) =>
+    createHash("sha256")
+      .update(await readFile(path))
+      .digest("hex");
+  const identity = {
+    sourceRevision: "a".repeat(40),
+    versionsLockSha256: "b".repeat(64),
+    cargoLockSha256: "c".repeat(64),
+  };
+  const version = {
+    program: "pgcf-native-bootstrap-relay",
+    version: "0.1.0",
+    rustVersion,
+    ...identity,
+    protocolSha256: await sha(
+      "packages/contracts/native/protocol.generated.json",
+    ),
+    bootstrapContractSha256: await sha(
+      "packages/contracts/native/bootstrap.generated.json",
+    ),
+  };
+  const result = (value: unknown) => ({
+    stdout: JSON.stringify(value),
+    stderr: "",
+    exit: 0,
+  });
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(check, result(version), identity),
+  );
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        check,
+        result({ ...version, bootstrapContractSha256: "d".repeat(64) }),
+        identity,
       ),
-      rustBuilder,
-    );
-    const sha = async (path: string) =>
-      createHash("sha256")
-        .update(await readFile(path))
-        .digest("hex");
-    const identity = {
-      sourceRevision: "a".repeat(40),
-      versionsLockSha256: "b".repeat(64),
-      cargoLockSha256: "c".repeat(64),
-    };
-    const version = {
-      program: `pgcf-${packageName}`,
-      version: "0.1.0",
-      rustVersion,
-      ...identity,
-      protocolSha256: await sha(
-        "packages/contracts/native/protocol.generated.json",
+    /runtime_generated_input_invalid/,
+  );
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        check,
+        result({ ...version, protocolSha256: "d".repeat(64) }),
+        identity,
       ),
-      [field]: await sha(
-        `packages/contracts/native/${contractName}.generated.json`,
+    /runtime_generated_input_invalid/,
+  );
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        check,
+        result({ ...version, sourceRevision: "d".repeat(40) }),
+        identity,
       ),
-    };
-    const result = (value: unknown) => ({
-      stdout: JSON.stringify(value),
-      stderr: "",
-      exit: 0,
-    });
-    assert.doesNotThrow(() =>
-      validateRuntimeResult(check, result(version), identity),
-    );
-    assert.throws(
-      () =>
-        validateRuntimeResult(
-          check,
-          result({ ...version, [field]: "d".repeat(64) }),
-          identity,
-        ),
-      /runtime_generated_input_invalid/,
-    );
-    assert.throws(
-      () =>
-        validateRuntimeResult(
-          check,
-          result({ ...version, protocolSha256: "d".repeat(64) }),
-          identity,
-        ),
-      /runtime_generated_input_invalid/,
-    );
-    assert.throws(
-      () =>
-        validateRuntimeResult(
-          check,
-          result({ ...version, sourceRevision: "d".repeat(40) }),
-          identity,
-        ),
-      /runtime_provenance_invalid/,
-    );
-  }
+    /runtime_provenance_invalid/,
+  );
 });
 
 test("Rust publication requires real compiled artifact identities and no claimed shipped builder prefix", () => {
