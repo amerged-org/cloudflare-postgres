@@ -9,7 +9,7 @@
   "files": [
     {
       "path": "docs/architecture/mermaider/add-node.md",
-      "sha256": "88d8ab16953d6f2986691c7281c7814dfc3ac532fca111fff28a16346bde27db"
+      "sha256": "e26b4dfdae4c42bf964b900e8b6a6e5eea08dce5323d1eb5e4cfccbfcd8fb8d0"
     },
     {
       "path": "docs/architecture/mermaider/add-node.mmd",
@@ -49,10 +49,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "0b2a1b74525e888855833a8b4e435c83e3868dfe00e874713a190c8961af728c"
+      "sha256": "a98b4cba5d80bab548ab1f752bb3b39538ee23752ddcc5299131b0c562b14662"
     }
   ],
-  "fingerprint": "cda733a8c6efbf17887363996db3d979e9b6bd7932b50d26a4c4d3ae9b14d28f",
+  "fingerprint": "9935f036fb8f69673901bd12ad79beb48bc10f819159b6f7d25deabf99fd3840",
   "toolVersion": "0.1.1",
   "version": 1
 }

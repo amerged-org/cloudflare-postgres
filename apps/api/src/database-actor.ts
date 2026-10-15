@@ -37,6 +37,7 @@ interface ReclaimState {
 
 import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
+import { thinStorageTurnsFor } from "./domain/databases.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 import {
@@ -993,6 +994,7 @@ export class DatabaseActor extends DurableObject<Env> {
             this.localAdmissionActor(id),
           );
           if (result[0]!.meta.changes !== 1) return undefined;
+          this.ctx.waitUntil(thinStorageTurnsFor(this.env, [id]));
           row = await this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
             .bind(id)
             .first<DatabaseRow>();

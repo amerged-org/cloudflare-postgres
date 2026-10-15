@@ -1356,6 +1356,22 @@ export async function requestThinStorageTurn(env: Env, nodeId: string) {
     env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
   ).thinStorageDue(nodeId);
 }
+/** A thin database just placed on a node, or starting there again, needs the node's next identity
+ * proof: only a proof reads a new volume into its receipt or measures the Pod writing to it, and the
+ * first write token waits for that. Ask for the turn now instead of at the next cadence. */
+export async function requestThinStorageTurnsFor(
+  env: Env,
+  databaseIds: readonly string[],
+) {
+  if (databaseIds.length === 0) return;
+  const nodes = await env.DB.prepare(
+    "SELECT DISTINCT d.node_id FROM databases d JOIN node_thin_storage t ON t.node_id=d.node_id WHERE d.id IN(SELECT value FROM json_each(?)) AND d.storage_profile_json IS NOT NULL",
+  )
+    .bind(JSON.stringify(databaseIds))
+    .all<{ node_id: string }>();
+  for (const { node_id } of nodes.results)
+    await requestThinStorageTurn(env, node_id).catch(() => undefined);
+}
 export async function processNodeThinStorage(env: Env, nodeId: string) {
   const input = await prepareThinStorageLease(env, nodeId);
   if (!input) return;

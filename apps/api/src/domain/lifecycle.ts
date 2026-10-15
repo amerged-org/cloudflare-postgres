@@ -10,7 +10,11 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
-import { databaseOperationResponse, hint } from "./databases.ts";
+import {
+  databaseOperationResponse,
+  hint,
+  thinStorageTurnsFor,
+} from "./databases.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
 import {
   databaseStartupHeadroomSql,
@@ -235,6 +239,7 @@ export async function changePower(
       if (result[0]!.meta.changes !== 1)
         throw new ApiError("conflict", "Database changed; retry the request");
       hint(c, row.region_id, [id]);
+      if (!sleeping) c.executionCtx.waitUntil(thinStorageTurnsFor(c.env, [id]));
       return databaseOperationResponse(c, op);
     },
   });

@@ -1954,6 +1954,18 @@ export class NodeBootstrap extends DurableObject<Env> {
       await this.ctx.container?.destroy();
       return;
     }
+    // A turn needs its executor. Without the container binding none can run here, and a reserved
+    // lease would only hold the node's physical operations for 95 s: keep the cadence instead.
+    if (!this.ctx.container) {
+      console.error(
+        JSON.stringify({
+          event: "thin_storage_executor_unavailable",
+          node_id: nodeId,
+        }),
+      );
+      await this.#retryThinStorageTurn();
+      return;
+    }
     try {
       const row = await readThinStorageLeaseRow(this.env, nodeId);
       if (row.error_code) {

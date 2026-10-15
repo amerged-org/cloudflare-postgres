@@ -12,6 +12,7 @@ import {
   request,
 } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
+import { awakeWriter, hibernated, idleIntent } from "./parked-tier-fixture.ts";
 import {
   type Fixture,
   gib,
@@ -544,6 +545,14 @@ it("retains demand received during a failed turn while applying its backoff", as
   expect(requested).toBe(true);
 });
 
+/** Forget every turn the node's executor was asked for, as a fresh Durable Object would. */
+async function forgetTurns(f: Fixture) {
+  await runInDurableObject(stub(f), async (_instance, state) => {
+    await state.storage.deleteAlarm();
+    await state.storage.deleteAll();
+  });
+}
+
 it("asks for an identity turn at once when a thin database is ready without a receipt", async () => {
   const f = await thinExecutionFixture(releases);
   await identityProof(f, {
@@ -562,6 +571,8 @@ it("asks for an identity turn at once when a thin database is ready without a re
   const postgres = f.qualified.spec.components.find(
     (c) => c.name === "postgres",
   )!;
+  // The placement asked for a turn already; a ready report without a receipt asks again.
+  await forgetTurns(f);
   expect(await turnRequested(f)).toBe(false);
   const ready = await request(
     "/agent/v1/observations",
@@ -579,6 +590,66 @@ it("asks for an identity turn at once when a thin database is ready without a re
   );
   expect(ready.status).toBe(200);
   expect(await turnRequested(f)).toBe(true);
+});
+
+it("a due identity turn without an executor reserves no lease and keeps its cadence", async () => {
+  const f = await thinExecutionFixture(releases);
+  const result = await runInDurableObject(stub(f), async (_instance, state) => {
+    await state.storage.put("thinStorageNodeId", f.node);
+    await state.storage.deleteAlarm();
+    const before = Date.now();
+    // The test runtime's Durable Object has no container binding: no executor can run here.
+    await new NodeBootstrap(state, f.local).alarm();
+    return {
+      before,
+      alarm: await state.storage.getAlarm(),
+      failures: await state.storage.get<number>("thinStorageFailures"),
+    };
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT lease_id,lease_revision FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first(),
+  ).toEqual({ lease_id: null, lease_revision: 0 });
+  expect(result.alarm).toBeGreaterThanOrEqual(result.before + 5000);
+  expect(result.failures).toBe(1);
+});
+
+it("asks for the node's next identity turn at once when a thin database is placed", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f, {
+    physical: {
+      ...f.authority.physical,
+      free_bytes: 80 * gib,
+      thin_pool: {
+        ...f.authority.physical.thin_pool!,
+        data_total_bytes: 16 * gib,
+      },
+    },
+  });
+  expect(await turnRequested(f)).toBe(false);
+  // Only an identity proof reads the new volume into its receipt, which the first token needs.
+  DatabaseWithOperation.parse(await (await f.create()).json());
+  expect(await turnRequested(f)).toBe(true);
+});
+
+it("asks for the node's next identity turn at once when a sleeping thin database resumes", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  const intent = await idleIntent(w);
+  await w.evidence({ generation: intent.generation, io: [] });
+  expect(await (await hibernated(w, intent)).json()).toEqual({ accepted: 1 });
+  await forgetTurns(w.f);
+  const resumed = await request(
+    `/v1/databases/${w.id}/resume`,
+    w.f.integrator,
+    "POST",
+    undefined,
+    crypto.randomUUID(),
+  );
+  expect(resumed.status).toBe(202);
+  expect(await turnRequested(w.f)).toBe(true);
 });
 
 it("a due identity turn moves a later alarm to now", async () => {

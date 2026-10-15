@@ -67,6 +67,15 @@ import {
   selectedStorageProfileSql,
   storageResizeAllowedSql,
 } from "./storage-capacity.ts";
+/** Best effort: the node's identity turn for thin databases that start on it. */
+export async function thinStorageTurnsFor(
+  env: Env,
+  ids: readonly string[],
+): Promise<void> {
+  const { requestThinStorageTurnsFor } =
+    await import("./node-thin-storage-execution.ts");
+  await requestThinStorageTurnsFor(env, ids).catch(() => undefined);
+}
 export function hint(c: ApiContext, regionId: string, ids: string[]): void {
   const stub = c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(regionId));
   // Hints are best effort; the periodic full desired-state pull remains authoritative.
@@ -340,8 +349,10 @@ export async function createDatabase(
           throw error;
         }
         if (result[0]!.meta.changes === 1) {
-          if (node !== null) hint(c, region.id, [id]);
-          else c.executionCtx.waitUntil(runNodeCapacity(c.env, region.id));
+          if (node !== null) {
+            hint(c, region.id, [id]);
+            c.executionCtx.waitUntil(thinStorageTurnsFor(c.env, [id]));
+          } else c.executionCtx.waitUntil(runNodeCapacity(c.env, region.id));
           return databaseOperationResponse(c, op);
         }
       }
