@@ -1225,3 +1225,168 @@ async fn a_large_frontend_write_reaches_a_slowly_reading_postgres_in_full() {
     client.close(None).await.unwrap();
     fixture.stop().await;
 }
+
+const CA_MATERIAL: &str = "public test certificate material";
+/// A v4 route: the revision, the verified Pod and the independent route revision Cloudflare admitted.
+fn admitted(id: usize, revision: u64, pod: &str, route_revision: u64) -> String {
+    let now = control::now() / 1000;
+    token(
+        wire("admissionRouteTokenPrefix"),
+        wire("admissionRouteSignatureDomain"),
+        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":revision,"pod":pod,"route_revision":route_revision}),
+        &[7; 32],
+    )
+}
+/// What the controller attested after a fast wake: the Pod's container and the TLS authority it
+/// verified together with PostgreSQL itself.
+fn attested_target() -> Value {
+    use sha2::Digest;
+    let ca = Sha256::digest(CA_MATERIAL.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    json!({"v":1,"generation":1,"route_revision":19,"admission_epoch":11,"pod_uid":cid(200),"container_id":"a".repeat(64),"ca_secret_uid":cid(210),"ca_secret_resource_version":"81","ca_sha256":ca,"tls_server_name":format!("database-rw.pgcf-db-{DATABASE}.svc")})
+}
+fn attested_fence() -> HashMap<String, Fence> {
+    HashMap::from([(
+        DATABASE.into(),
+        Fence {
+            admission_target: Some(serde_json::from_value(attested_target()).unwrap()),
+            ..fence("running", 1)
+        },
+    )])
+}
+fn ca_map() -> Value {
+    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{DATABASE}"),"namespace":"pgcf-system","uid":cid(209),"labels":{"pgcf.io/database-id":DATABASE},"annotations":{"pgcf.io/source-ca-secret-uid":cid(210),"pgcf.io/source-ca-secret-resource-version":"81"}},"data":{"ca.crt":CA_MATERIAL}})
+}
+fn running_pod(ready: bool) -> Value {
+    json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{DATABASE}"),"uid":cid(200),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":ready,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}})
+}
+/// The cluster right after a parked database's fast wake: the kubelet has reported neither the
+/// endpoint nor the container Ready. `attested` says whether the writer cache sees the target.
+async fn unready_wake(fixture: &Fixture, attested: bool) {
+    let mut writer = writer(&cid(200));
+    writer["endpoints"][0]["conditions"] =
+        json!({"ready":false,"serving":false,"terminating":false});
+    let mut maps = storage_maps();
+    if attested {
+        maps[1]["data"]["intent.json"] =
+            json!({"database":DATABASE,"operation":operation(),"revision":1,"mode":"running"})
+                .to_string()
+                .into();
+        maps[1]["data"]["admission_target"] = attested_target().to_string().into();
+    }
+    maps.push(ca_map());
+    let mut targets = fixture.gateway.targets.write().await;
+    targets.replace("endpointslices", &[writer], None).unwrap();
+    targets
+        .replace("pods", &[running_pod(false)], None)
+        .unwrap();
+    targets.replace("configmaps", &maps, None).unwrap();
+}
+#[tokio::test]
+async fn a_v4_route_reaches_the_attested_pod_before_its_ready_condition() {
+    let mut fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    let mut client = fixture
+        .upgrade(&admitted(980, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    fixture.login(&mut client).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    client.send(Message::Binary(query().into())).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    // The kubelet's reflection arrives while the session runs; it is the same writer.
+    {
+        let mut targets = fixture.gateway.targets.write().await;
+        targets
+            .replace("endpointslices", &[writer(&cid(200))], None)
+            .unwrap();
+        targets.replace("pods", &[running_pod(true)], None).unwrap();
+    }
+    client.send(Message::Binary(query().into())).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_legacy_route_cannot_vouch_for_a_pod_the_kubelet_has_not_reported_ready() {
+    let fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    // The route Cloudflare signs for the same revision and Pod without an admitted runtime.
+    for route in [routed(984, 1, &cid(200)), legacy_route_token(985)] {
+        assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn an_unready_pod_the_writer_cache_holds_no_attestation_for_is_not_dialled() {
+    let fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, false).await;
+    assert_eq!(
+        fixture
+            .upgrade(&admitted(981, 1, &cid(200), 19))
+            .await
+            .err(),
+        Some(503)
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn an_attested_unready_pod_is_routed_only_under_its_signed_thin_authority() {
+    let mut fixture = Fixture::with_fences(attested_fence()).await;
+    unready_wake(&fixture, true).await;
+    let issuer = StorageIssuer::new();
+    let now = control::now();
+    let mut thin = issuer.maps(now, now + 60000, 1);
+    thin[1]["data"]["admission_target"] = attested_target().to_string().into();
+    thin.push(ca_map());
+    // Without a valid signed authority for this Pod the attestation alone routes nothing.
+    let mut unsigned = thin.clone();
+    unsigned[0]["data"][wire("storageAuthorityLedgerKey")] = "not_a_signed_authority".into();
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("configmaps", &unsigned, Some(&issuer.trust))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .upgrade(&admitted(982, 1, &cid(200), 19))
+            .await
+            .err(),
+        Some(503)
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("configmaps", &thin, Some(&issuer.trust))
+        .unwrap();
+    let mut client = fixture
+        .upgrade(&admitted(983, 1, &cid(200), 19))
+        .await
+        .unwrap();
+    fixture.login(&mut client).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}

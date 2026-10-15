@@ -1707,4 +1707,258 @@ mod tests {
             "writer_identity_unavailable"
         );
     }
+
+    // The Pod a fast wake resumed is routed before the kubelet reports it Ready, on the
+    // controller's attestation and nothing weaker.
+    const WAKE: &str = "aaaaaaaaaaaaaaaaaaaa";
+    const WAKE_CA: &str = "public test certificate material";
+    fn wake_id(number: u32) -> String {
+        format!("00000000-0000-4000-8000-{number:012x}")
+    }
+    fn sha256_hex(text: &str) -> String {
+        Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+    /// A retained thick database whose parked Pod `wake_id(3)` was resumed: the fence runs at
+    /// revision 7 and carries the controller's target for that Pod's `postgres` container, and
+    /// the kubelet has reported neither the endpoint nor the container Ready.
+    struct Wake {
+        state: Targets,
+        slices: Vec<Value>,
+        pods: Vec<Value>,
+        maps: Vec<Value>,
+    }
+    impl Wake {
+        fn new() -> Self {
+            let id = wake_id;
+            let volume =
+                json!({"handle":format!("pvc-{}",id(5)),"claimUid":id(5),"volumeUid":id(6)});
+            let storage = json!({"node":"customer-us1","namespaceUid":id(7),"clusterUid":id(8)});
+            let cohort = json!([{"database_id":WAKE,"storage_uid":id(2),"namespace_uid":id(7),"cluster_uid":id(8),"physical_generation":1,"volume_identity":volume}]);
+            let labels = json!({"pgcf.io/database-id":WAKE});
+            let target = json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":id(3),"container_id":"a".repeat(64),"ca_secret_uid":id(21),"ca_secret_resource_version":"81","ca_sha256":sha256_hex(WAKE_CA),"tls_server_name":format!("database-rw.pgcf-db-{WAKE}.svc")});
+            let intent = json!({"database":WAKE,"operation":format!("op_{}","b".repeat(20)),"revision":7,"mode":"running"});
+            let mut writer = slice(&id(3), "10.0.0.7");
+            writer["endpoints"][0]["conditions"] =
+                json!({"ready":false,"serving":false,"terminating":false});
+            let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{WAKE}"),"uid":id(3),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}});
+            Self {
+                state: Targets::with_legacy(&cohort.to_string()).unwrap(),
+                slices: vec![writer],
+                pods: vec![pod],
+                maps: vec![
+                    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{WAKE}"),"namespace":"pgcf-system","uid":id(2),"labels":labels,"annotations":{"pgcf.io/volume-identity":volume.to_string()}},"data":{"state":storage.to_string()}}),
+                    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("gateway-fence-{WAKE}"),"namespace":"pgcf-system","uid":id(100),"labels":labels},"data":{"power.json":json!({"anchor":{"storageUid":id(2),"storageState":storage.to_string(),"volumeIdentity":volume.to_string(),"physicalGeneration":1}}).to_string(),"intent.json":intent.to_string(),"admission_target":target.to_string()}}),
+                    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{WAKE}"),"namespace":"pgcf-system","uid":id(20),"labels":labels,"annotations":{"pgcf.io/source-ca-secret-uid":id(21),"pgcf.io/source-ca-secret-resource-version":"81"}},"data":{"ca.crt":WAKE_CA}}),
+                ],
+            }
+        }
+        /// The fixture as the controller leaves it; it must route, so that a refusal below is
+        /// the doing of the one thing a test changes.
+        fn armed() -> Self {
+            let mut wake = Self::new();
+            wake.apply();
+            wake.route().expect("the attested Pod routes before Ready");
+            wake
+        }
+        fn apply(&mut self) {
+            let state = &mut self.state;
+            state.replace("endpointslices", &self.slices, None).unwrap();
+            state.replace("pods", &self.pods, None).unwrap();
+            state.replace("configmaps", &self.maps, None).unwrap();
+        }
+        fn route(&self) -> Result<TargetIdentity, TargetUnavailable> {
+            self.state.target(WAKE, control::now())
+        }
+        fn edit(&mut self, key: &str, change: impl FnOnce(&mut Value)) {
+            let mut value: Value =
+                serde_json::from_str(self.maps[1]["data"][key].as_str().unwrap()).unwrap();
+            change(&mut value);
+            self.maps[1]["data"][key] = value.to_string().into();
+        }
+    }
+    #[test]
+    fn an_attested_pod_is_routed_before_its_ready_condition_and_keeps_its_route_when_ready() {
+        let mut wake = Wake::new();
+        wake.apply();
+        let target = wake.route().unwrap();
+        assert_eq!(target.address.to_string(), "10.0.0.7");
+        assert_eq!(target.pod_uid, wake_id(3));
+        assert_eq!(target.container_id, Some("a".repeat(64)));
+        assert_eq!(target.ca.as_ref().unwrap().ca_sha256, sha256_hex(WAKE_CA));
+        assert!(wake.state.permits(WAKE, &target, control::now()));
+        // The kubelet's reflection arrives: the same writer, so the connection that triggered
+        // the wake is not interrupted by it.
+        wake.slices[0]["endpoints"][0]["conditions"] = json!({"ready":true});
+        wake.pods[0]["status"]["containerStatuses"][0]["ready"] = true.into();
+        wake.apply();
+        assert_eq!(wake.route().unwrap(), target);
+        assert!(wake.state.permits(WAKE, &target, control::now()));
+    }
+    #[test]
+    fn an_unready_pod_is_not_routed_without_an_attested_target() {
+        let mut wake = Wake::armed();
+        wake.maps[1]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("admission_target");
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn an_attested_target_never_routes_a_pod_with_another_uid() {
+        let mut wake = Wake::armed();
+        // A replacement Pod is not the attested one, whatever container it reports.
+        wake.slices[0]["endpoints"][0]["targetRef"]["uid"] = wake_id(4).into();
+        wake.pods[0]["metadata"]["uid"] = wake_id(4).into();
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn the_attested_pod_must_be_listed_for_this_database_by_its_own_service() {
+        let mut wake = Wake::armed();
+        wake.slices[0]["metadata"]["namespace"] = "pgcf-db-bbbbbbbbbbbbbbbbbbbb".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        let mut wake = Wake::armed();
+        wake.slices[0]["endpoints"][0]["targetRef"]["namespace"] =
+            "pgcf-db-bbbbbbbbbbbbbbbbbbbb".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        // Another Service's slice is not discovery for the writer at all.
+        let wake = Wake::armed();
+        let mut other = wake.slices[0].clone();
+        other["metadata"]["labels"]["kubernetes.io/service-name"] = "database-ro".into();
+        let mut state = Targets::default();
+        assert!(state.replace("endpointslices", &[other], None).is_err());
+    }
+    #[test]
+    fn a_terminating_attested_pod_is_never_routed() {
+        let mut wake = Wake::armed();
+        wake.slices[0]["endpoints"][0]["conditions"]["terminating"] = true.into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        let mut wake = Wake::armed();
+        wake.pods[0]["metadata"]["deletionTimestamp"] = "2026-10-15T10:00:00Z".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn two_candidate_writers_are_never_routed() {
+        // The attested Pod listed at a second address.
+        let mut wake = Wake::armed();
+        let mut second = wake.slices[0].clone();
+        second["metadata"]["uid"] = wake_id(30).into();
+        second["endpoints"][0]["addresses"] = json!(["10.0.0.8"]);
+        wake.slices.push(second);
+        wake.apply();
+        assert!(wake.route().is_err());
+        // The attested Pod beside another Pod the kubelet has not reported Ready either.
+        let mut wake = Wake::armed();
+        let mut stranger = wake.slices[0].clone();
+        stranger["metadata"]["uid"] = wake_id(30).into();
+        stranger["endpoints"][0]["addresses"] = json!(["10.0.0.9"]);
+        stranger["endpoints"][0]["targetRef"]["uid"] = wake_id(4).into();
+        wake.slices.push(stranger);
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn an_unready_container_must_be_the_attested_running_one() {
+        // A restarted container carries another ID.
+        let mut wake = Wake::armed();
+        wake.pods[0]["status"]["containerStatuses"][0]["containerID"] =
+            format!("containerd://{}", "b".repeat(64)).into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        // A container that is not running is not evidence of anything.
+        let mut wake = Wake::armed();
+        wake.pods[0]["status"]["containerStatuses"][0]["state"] =
+            json!({"terminated":{"exitCode":1}});
+        wake.apply();
+        assert!(wake.route().is_err());
+        // A Ready endpoint keeps what it always had: its container is evidence only once the
+        // kubelet reports it ready, unless it is the attested one.
+        let mut wake = Wake::armed();
+        wake.slices[0]["endpoints"][0]["conditions"] = json!({"ready":true});
+        wake.pods[0]["status"]["containerStatuses"][0]["containerID"] =
+            format!("containerd://{}", "b".repeat(64)).into();
+        wake.apply();
+        assert_eq!(wake.route().unwrap().container_id, None);
+    }
+    #[test]
+    fn an_attested_pod_is_routed_only_under_its_running_fence_at_its_revision() {
+        let mut wake = Wake::armed();
+        wake.edit("intent.json", |intent| intent["mode"] = "quiesce".into());
+        wake.apply();
+        assert!(wake.route().is_err());
+        let mut wake = Wake::armed();
+        wake.edit("intent.json", |intent| intent["mode"] = "retired".into());
+        wake.apply();
+        assert!(wake.route().is_err());
+        let mut wake = Wake::armed();
+        wake.maps[1]["metadata"]["deletionTimestamp"] = "2026-10-15T10:00:00Z".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        // The fence moved on to a revision the controller has not attested yet.
+        let mut wake = Wake::armed();
+        wake.edit("intent.json", |intent| intent["revision"] = 8.into());
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn an_attested_endpoint_needs_one_private_address() {
+        let mut wake = Wake::armed();
+        wake.slices[0]["endpoints"][0]["addresses"] = json!(["8.8.8.8"]);
+        wake.pods[0]["status"]["podIP"] = "8.8.8.8".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+        let mut wake = Wake::armed();
+        wake.slices[0]["endpoints"][0]["addresses"] = json!(["10.0.0.7", "10.0.0.8"]);
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn a_pool_holder_never_falls_back_to_an_attested_unready_writer() {
+        let database = "a".repeat(20);
+        let (mut state, mut maps, mut pool_pod, _, _) = pool_fixture();
+        // The CNPG Pod the holder replaced is still attested by the fence and not Ready.
+        let mut writer = slice(&wake_id(3), "10.0.0.7");
+        writer["endpoints"][0]["conditions"] = json!({"ready":false,"terminating":false});
+        let cnpg = json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{database}"),"uid":wake_id(3),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}});
+        let target = json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":wake_id(3),"container_id":"a".repeat(64),"ca_secret_uid":wake_id(21),"ca_secret_resource_version":"81","ca_sha256":sha256_hex(WAKE_CA),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")});
+        maps[1]["data"]["admission_target"] = target.to_string().into();
+        state.replace("endpointslices", &[writer], None).unwrap();
+        state.replace("pods", &[cnpg], None).unwrap();
+        state.replace("configmaps", &maps, None).unwrap();
+        let routed = state.target(&database, control::now()).unwrap();
+        assert_eq!(routed.address.to_string(), "10.0.0.9");
+        // The holder's runtime changes: nothing is routed, least of all the attested Pod.
+        pool_pod["status"]["containerStatuses"][0]["containerID"] =
+            format!("containerd://{}", "e".repeat(64)).into();
+        state.replace("poolpods", &[pool_pod], None).unwrap();
+        assert!(state.target(&database, control::now()).is_err());
+    }
+    #[test]
+    fn a_lost_pod_watch_withdraws_the_unready_route_it_was_built_on() {
+        let mut wake = Wake::armed();
+        let target = wake.route().unwrap();
+        wake.state.disconnect("pods");
+        assert!(wake.route().is_err());
+        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        // The watch comes back and shows the same container: the route returns.
+        wake.apply();
+        assert_eq!(wake.route().unwrap(), target);
+    }
+    #[test]
+    fn a_changed_tls_authority_withdraws_the_unready_route() {
+        let mut wake = Wake::armed();
+        wake.maps[2]["metadata"]["annotations"]["pgcf.io/source-ca-secret-resource-version"] =
+            "82".into();
+        wake.maps[2]["data"]["ca.crt"] = "refreshed public certificate material".into();
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
 }

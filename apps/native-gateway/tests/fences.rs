@@ -46,3 +46,30 @@ fn foreign_namespace_labels_deletion_or_duplicate_map_are_rejected() {
     value["items"][0]["metadata"]["labels"]["pgcf.io/database-id"] = json!("b".repeat(20));
     assert!(parse_snapshot(&value).is_err());
 }
+#[test]
+fn an_admitted_target_is_bound_to_the_fence_that_carries_it() {
+    let database = "a".repeat(20);
+    let pod = "01234567-89ab-4def-8123-0123456789ab";
+    let target = json!({"v":1,"generation":1,"route_revision":2,"admission_epoch":3,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"4","ca_sha256":"b".repeat(64),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")});
+    let with = |target: &Value| {
+        let mut value = snapshot();
+        value["items"][0]["data"]["admission_target"] = target.to_string().into();
+        value
+    };
+    let records = parse_snapshot(&with(&target)).unwrap();
+    assert_eq!(
+        records[&database]
+            .admission_target
+            .as_ref()
+            .unwrap()
+            .pod_uid,
+        pod
+    );
+    // Ahead of the revision of its own fence, or naming another database's TLS authority.
+    let mut ahead = target.clone();
+    ahead["generation"] = json!(2);
+    assert!(parse_snapshot(&with(&ahead)).is_err());
+    let mut foreign = target.clone();
+    foreign["tls_server_name"] = json!(format!("database-rw.pgcf-db-{}.svc", "b".repeat(20)));
+    assert!(parse_snapshot(&with(&foreign)).is_err());
+}
