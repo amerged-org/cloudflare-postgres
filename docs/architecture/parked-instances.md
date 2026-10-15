@@ -986,6 +986,47 @@ claim):
   releases the waiters itself. A failed readiness read no longer fails a waiter: it is read again
   with the next push or after the fallback interval, and every waiter keeps its own deadline.
 
+Items 3 to 10 are implemented in the native controller, measured in the in-process world (the
+controller's own code against doubles of the Kubernetes API, PostgreSQL and the gateways) as
+requests and as sequential round trips of a parked wake; the live effect is a measurement of the
+next run, not of this list:
+
+- Item 6: a PATCH or a Pod resize returns the server's answer after the identity checks the
+  read-back had; a write of the gateway fence was a PATCH, a read-back and a read of the fence and
+  the receipt (three rounds), and is one. A parked wake: 126 reads and 19 writes became 103 reads and
+  19 writes.
+- Item 7: the anchor reads its PersistentVolume and its LVMVolume by the handle the receipt
+  recorded, together with the Node of a thin database, instead of listing every PersistentVolume and
+  every LVMVolume of the cluster (four collection reads per wake, and per pass over an awake
+  database whose operation is still in the record, two without). The failure codes and their order
+  are unchanged and pinned.
+- Item 8: a pass reads the identity of the cluster once: 2 reads became 1.
+- Item 3: the thirteen manifests of a generation are read together before the first is written and
+  written in manifest order, the Cluster read when its turn comes. The apply pass of a new
+  generation (nine of thirteen patched): 31 sequential round trips became 12 with item 6.
+- Item 4: the check that the applied objects stayed as applied reads them and the TLS authority
+  together (14 sequential reads became two bounded waves), and the proof of the runtime reads its
+  eleven objects in three rounds (11 sequential reads became 3), every object still read again after
+  it was read.
+- Item 5: the session that proved PostgreSQL accepts on the resumed Pod is the maintenance session
+  of the attribute check and of the archive sample: maintenance logins of a parked wake 2 became 1
+  (3 became 1 with a role that has attributes). The roles log in on their own credentials, together,
+  on the Pod route as before; the ordinary CNPG wake keeps its sequential logins through the Service.
+- Item 10: the gateways, the fence and the receipt are read back together with the write of the
+  target, after every gateway acknowledged the release and not before: five requests in four rounds
+  became four requests in one. A parked wake with items 3 to 10: 126 reads and 19 writes became 101
+  reads and 19 writes; the pass over the awake database after it, 92 reads and 2 writes, became 84
+  reads and no write (with item 9).
+- Item 9: the version of every object the controller writes is remembered, and the watch event of
+  exactly that version hints no database; a pass over an unchanged awake database writes nothing.
+  Live, an awake database was reconciled 1.5 times a second as long as it stayed awake (89 requests
+  and one accepted observation per pass): each pass rewrote the gateway fence (the record back to
+  `Wake` and again to `Awake` with a new start, or `Awake` alone), which the watch delivered and
+  which made the database due again at once. In the in-process world a pass over an unchanged awake
+  database wrote the fence twice (once without the operation in the record) and now writes nothing; a
+  completed wake leaves no hint behind, and the next pass is the proof renewal or a change of
+  someone else.
+
 Optional, only if P0/P1 show the pull dominating: **speculative unfence on hint**. The existing
 principle (rt:264) says hints are not executable desired state; the unfence is idempotent,
 reversible and non-admitting (the gateway stays closed until the authoritative pull verifies), so
