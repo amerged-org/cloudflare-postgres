@@ -89,6 +89,39 @@ fn condition<'a>(v: &'a Value, name: &str) -> Option<&'a str> {
         .find(|c| text(c, "type") == name)?["status"]
         .as_str()
 }
+/// Whether CNPG holds the Cluster hibernated. Its condition is typed `cnpg.io/hibernation` and
+/// reports `Hibernated` as its reason; the annotation alone also asks for hibernation.
+fn hibernated(cluster: &Value) -> bool {
+    cluster["metadata"]["annotations"]["cnpg.io/hibernation"] == "on"
+        || cluster["status"]["conditions"]
+            .as_array()
+            .is_some_and(|all| {
+                all.iter().any(|c| {
+                    c["type"] == "cnpg.io/hibernation"
+                        && c["status"] == "True"
+                        && c["reason"] == "Hibernated"
+                })
+            })
+}
+/// Whether applying `db` to its Cluster starts PostgreSQL on the volume, which a thin volume
+/// admits only under a current Cloudflare startup hold: resuming a hibernated Cluster, a Cluster
+/// without a primary, and a change of image, resources or parameters that rolls the primary.
+fn starts_postgres(cluster: Option<&Value>, db: &Value, default_image: &str) -> bool {
+    let size = &db["size"];
+    let expected = json!({"requests":{"cpu":format!("{}m",optional_number(size,"cpu_request_millicores",number(size,"cpu_millicores"))),"memory":format!("{}Mi",optional_number(size,"memory_request_mib",number(size,"memory_mib")))},"limits":{"cpu":format!("{}m",number(size,"cpu_millicores")),"memory":format!("{}Mi",number(size,"memory_mib"))}});
+    cluster.is_none_or(|cluster| {
+        hibernated(cluster)
+            || text(&cluster["status"], "currentPrimary").is_empty()
+            || text(&cluster["spec"], "imageName")
+                != db["postgres"]["image"].as_str().unwrap_or(default_image)
+            || !contains(&cluster["spec"]["resources"], &expected, "resources")
+            || !contains(
+                &cluster["spec"]["postgresql"]["parameters"],
+                &manifests::parameters(db),
+                "",
+            )
+    })
+}
 fn credential_acknowledged(db: &Value, cluster: &Value, secret: &Value) -> bool {
     let name = text(&secret["metadata"], "name");
     let role = db["roles"].as_array().and_then(|roles| {
@@ -1134,30 +1167,15 @@ impl Reconciler {
         if state_name == "suspended" {
             return self.power.suspend(db).await;
         }
-        if !db["storage"].is_null() {
-            let size = &db["size"];
-            let expected = json!({"requests":{"cpu":format!("{}m",optional_number(size,"cpu_request_millicores",number(size,"cpu_millicores"))),"memory":format!("{}Mi",optional_number(size,"memory_request_mib",number(size,"memory_mib")))},"limits":{"cpu":format!("{}m",number(size,"cpu_millicores")),"memory":format!("{}Mi",number(size,"memory_mib"))}});
-            let needs_startup = prior_cluster.as_ref().is_none_or(|cluster| {
-                condition(cluster, "Hibernated") == Some("True")
-                    || text(&cluster["status"], "currentPrimary").is_empty()
-                    || text(&cluster["spec"], "imageName")
-                        != db["postgres"]["image"]
-                            .as_str()
-                            .unwrap_or(&self.postgres_image)
-                    || !contains(&cluster["spec"]["resources"], &expected, "resources")
-                    || !contains(
-                        &cluster["spec"]["postgresql"]["parameters"],
-                        &manifests::parameters(db),
-                        "",
-                    )
-            });
-            if needs_startup && !startup_valid(db) {
-                return Ok(Some(observation(
-                    db,
-                    "provisioning",
-                    Some("waiting for current Cloudflare startup admission"),
-                )));
-            }
+        if !db["storage"].is_null()
+            && starts_postgres(prior_cluster.as_ref(), db, &self.postgres_image)
+            && !startup_valid(db)
+        {
+            return Ok(Some(observation(
+                db,
+                "provisioning",
+                Some("waiting for current Cloudflare startup admission"),
+            )));
         }
         let intent = desired_power(db)?;
         let finalized = !db["recovery"].is_null()
@@ -2624,6 +2642,52 @@ mod tests {
             writes[0].2["metadata"],
             json!({"uid":uid(7),"resourceVersion":"1"})
         );
+    }
+    #[test]
+    fn a_cluster_held_down_starts_postgres_when_released() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/power-vectors.generated.json"
+        ))
+        .unwrap();
+        let db = vectors["intents"][0]["db"].clone();
+        let image = "registry.test/postgres@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let steady = json!({"metadata":{"annotations":{}},
+            "spec":{"imageName":image,"resources":{"requests":{"cpu":"25m","memory":"128Mi"},"limits":{"cpu":"250m","memory":"256Mi"}},"postgresql":{"parameters":manifests::parameters(&db)}},
+            "status":{"currentPrimary":"database-1"}});
+        assert!(
+            !starts_postgres(Some(&steady), &db, image),
+            "a steady Cluster starts nothing"
+        );
+        assert!(starts_postgres(None, &db, image));
+        let changed = |change: &dyn Fn(&mut Value)| {
+            let mut cluster = steady.clone();
+            change(&mut cluster);
+            starts_postgres(Some(&cluster), &db, image)
+        };
+        // CNPG reports hibernation as a condition of type `cnpg.io/hibernation` with the reason
+        // `Hibernated`; that condition alone, or the annotation alone, is a hibernated Cluster.
+        assert!(changed(&|c| {
+            c["status"]["conditions"] =
+                json!([{"type":"cnpg.io/hibernation","status":"True","reason":"Hibernated"}]);
+        }));
+        assert!(changed(&|c| {
+            c["metadata"]["annotations"]["cnpg.io/hibernation"] = "on".into();
+        }));
+        // A condition that is not CNPG's, or one that does not hold, says nothing.
+        assert!(!changed(&|c| {
+            c["status"]["conditions"] = json!([{"type":"Hibernated","status":"True"}]);
+        }));
+        assert!(!changed(&|c| {
+            c["status"]["conditions"] =
+                json!([{"type":"cnpg.io/hibernation","status":"False","reason":"Hibernated"}]);
+        }));
+        assert!(changed(&|c| c["status"]["currentPrimary"] = "".into()));
+        assert!(changed(
+            &|c| c["spec"]["imageName"] = "registry.test/other@sha256:1".into()
+        ));
+        assert!(changed(&|c| {
+            c["spec"]["resources"]["requests"]["memory"] = "64Mi".into();
+        }));
     }
     #[test]
     fn a_retained_volume_pinned_by_the_openebs_node_label_belongs_to_its_node() {
