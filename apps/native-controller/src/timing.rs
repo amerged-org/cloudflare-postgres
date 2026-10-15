@@ -23,7 +23,7 @@ fn elapsed_ms(started: Instant) -> f64 {
 pub fn waking(db: &Value) -> bool {
     db["desired_state"] == "running" && db["power"]["mode"] == "running"
 }
-fn emit(value: Value) {
+pub(crate) fn emit(value: Value) {
     eprintln!("{value}");
 }
 fn point_event(phase: &str, database_id: &str) -> Value {
@@ -54,11 +54,15 @@ pub struct Phase {
 impl Phase {
     /// Starts `phase` of the wake of `db`; nothing is emitted for a database that is not waking.
     pub fn begin(db: &Value, phase: &'static str) -> Self {
+        Self::begin_at(db, phase, Instant::now())
+    }
+    /// Like `begin` for a phase that is counted from `started`.
+    pub fn begin_at(db: &Value, phase: &'static str, started: Instant) -> Self {
         Self {
             event: waking(db).then(|| {
                 json!({"event":"wake_phase","phase":phase,"database_id":db["id"],"operation":db["power"]["operation"]})
             }),
-            started: Instant::now(),
+            started,
             extra: serde_json::Map::new(),
         }
     }
@@ -70,7 +74,7 @@ impl Phase {
         self.extra.insert(key.into(), value.into());
     }
     /// The event of this phase ending with `outcome`, once; `None` for a database not waking.
-    fn finish(&mut self, outcome: &str) -> Option<Value> {
+    pub(crate) fn finish(&mut self, outcome: &str) -> Option<Value> {
         let mut event = self.event.take()?;
         event["elapsedMs"] = elapsed_ms(self.started).into();
         event["outcome"] = outcome.into();

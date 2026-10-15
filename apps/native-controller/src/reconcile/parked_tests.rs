@@ -51,16 +51,39 @@ async fn an_idle_sleep_through_the_reconciler_parks_and_claims_the_fast_wake() {
     assert_eq!(annotations(&w)[HIBERNATION], "on");
 }
 
+/// The attested target the gateway routes to a Pod by, as the controller persisted it in the fence.
+fn admission_target(w: &World) -> Value {
+    let map = w
+        .server
+        .get(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("gateway-fence-{}", w.id),
+        )
+        .unwrap();
+    serde_json::from_str(text(&map["data"], "admission_target")).expect("a persisted target")
+}
+fn pod_ready(w: &World) -> bool {
+    let pod = w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
+    pod["status"]["conditions"].as_array().is_some_and(|all| {
+        all.iter()
+            .any(|c| c["type"] == "Ready" && c["status"] == "True")
+    })
+}
+fn released(w: &World) -> bool {
+    log(w).iter().any(|line| line.contains("GATEWAY release"))
+}
+
 #[tokio::test]
 async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     let mut w = World::parked().await;
+    w.admitted();
     w.wake(3);
     w.start_postgres().await;
     w.log.lock().unwrap().clear();
-    let _kubelet = w.kubelet_ready_after_unfence();
     let observed = reconcile(&w).await;
-    // One pass: the retained Pod's identity and PostgreSQL's own answer prove the wake, and the
-    // kubelet's Ready is awaited inside it because the gateway routes only to a Ready endpoint.
+    // One pass: the retained Pod's identity and PostgreSQL's own answer prove the wake; the
+    // kubelet is not asked for its Ready bit.
     assert_eq!(observed["state"], "ready", "{observed}");
     assert_eq!(observed["power"]["state"], "awake");
     assert_eq!(
@@ -69,8 +92,8 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
         "{observed}"
     );
     // Order: progress `Wake`, one patch lifting the fence and releasing hibernation, the Pod's
-    // requests returning, PostgreSQL's fresh postmaster, the kubelet's Ready, every role and the
-    // archive through the Pod, and only then the gateway release that admits clients.
+    // requests returning, PostgreSQL's fresh postmaster, every role and the archive through the
+    // Pod, and only then the gateway release that admits clients.
     let wake = at(&w, &["PATCH", "gateway-fence-", r#"\"phase\":\"wake\""#]);
     let unfence = at(
         &w,
@@ -86,13 +109,11 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     let roles = at(&w, &["SQL app role login"]);
     let archive = at(&w, &["SQL pgcf_maintenance archive"]);
     let release = at(&w, &["GATEWAY release"]);
-    let ready = at(&w, &["KUBELET ready"]);
     assert!(
         wake < unfence,
         "intent is persisted before the Cluster write"
     );
     assert!(unfence < accepting && resize < release);
-    assert!(ready < roles && ready < release, "{:#?}", log(&w));
     assert!(
         accepting < roles && roles < archive && archive < release,
         "{:#?}",
@@ -113,9 +134,65 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
 }
 
 #[tokio::test]
-async fn a_resumed_pod_is_published_only_once_the_kubelet_reports_it_ready() {
-    // Until the gateway can route to an attested Pod before its Ready condition, an attested
-    // `ready` before the kubelet's Ready would send the waking connection to no endpoint.
+async fn a_resumed_pod_is_attested_and_published_while_the_kubelet_reports_it_not_ready() {
+    // The gateway routes to the attested Pod before its Ready condition, so the controller does
+    // not wait for it: PostgreSQL's answer on the Pod's own address, the Pod's UID and container
+    // and the CA are the proof.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    assert!(!pod_ready(&w), "the kubelet never reported the Pod Ready");
+    assert_eq!(intent_mode(&w), "running");
+    let proof = &observed["runtime_attestation"];
+    assert_eq!(proof["v"], 2, "{observed}");
+    assert_eq!(proof["pod_uid"], pod_uid());
+    assert_eq!(proof["pod_ip"], POD_IP);
+    let container = POSTGRES_CONTAINER.strip_prefix("containerd://").unwrap();
+    assert_eq!(proof["container_id"], container);
+    // What the gateway checks the watched Pod and CA against.
+    let target = admission_target(&w);
+    assert_eq!(target["generation"], 3);
+    assert_eq!(target["pod_uid"], pod_uid());
+    assert_eq!(target["container_id"], container);
+    assert_eq!(target["ca_secret_uid"], proof["ca_secret_uid"]);
+    assert_eq!(target["ca_sha256"], proof["ca_sha256"]);
+    assert_eq!(
+        target["tls_server_name"],
+        format!("database-rw.{}.svc", w.ns)
+    );
+}
+
+#[tokio::test]
+async fn a_kubelet_that_reports_ready_while_the_chain_runs_does_not_cost_the_attestation() {
+    // With the Ready bit not awaited it arrives at any point of the chain, and CNPG writes the
+    // Cluster status after it: the attestation is read back against what the probe read last.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let ready = w.kubelet_ready_now();
+    w.sql.lock().unwrap().during.insert("archive", ready);
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    assert!(pod_ready(&w));
+    assert!(at(&w, &["KUBELET ready"]) < at(&w, &["GATEWAY release"]));
+    let proof = &observed["runtime_attestation"];
+    assert_eq!(proof["v"], 2, "{observed}");
+    let pod = w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
+    assert_eq!(
+        proof["observation"]["resource_versions"]["pod"],
+        pod["metadata"]["resourceVersion"]
+    );
+    assert_eq!(admission_target(&w)["pod_uid"], pod_uid());
+}
+
+#[tokio::test]
+async fn a_resumed_pod_that_cannot_be_attested_is_published_once_the_kubelet_reports_it_ready() {
+    // Without a v2 attestation the gateway cannot route to a Pod that is not Ready: publishing it
+    // would send the waking connection to no endpoint.
     let mut w = World::parked().await;
     w.quick();
     w.wake(3);
@@ -123,7 +200,7 @@ async fn a_resumed_pod_is_published_only_once_the_kubelet_reports_it_ready() {
     let first = reconcile(&w).await;
     assert_eq!(first["state"], "provisioning", "{first}");
     assert_eq!(intent_mode(&w), "quiesce");
-    assert!(log(&w).iter().all(|line| !line.contains("GATEWAY release")));
+    assert!(!released(&w));
     assert!(
         annotations(&w)[FENCE].is_null(),
         "the unfence is not undone"
@@ -133,6 +210,158 @@ async fn a_resumed_pod_is_published_only_once_the_kubelet_reports_it_ready() {
     let ready = reconcile(&w).await;
     assert_eq!(ready["state"], "ready", "{ready}");
     assert_eq!(intent_mode(&w), "running");
+}
+
+/// A woken, admitted database whose Pod the kubelet does not report Ready, PostgreSQL answering:
+/// the world each case below breaks one fact of.
+async fn woken() -> World {
+    let mut w = World::parked().await;
+    w.admitted();
+    w.quick();
+    w.wake(3);
+    w.start_postgres().await;
+    w
+}
+/// Nothing was published: no attestation, no gateway release, no target, the sleep's intent.
+fn unpublished(w: &World, observed: &Value, why: &str) {
+    assert_eq!(observed["state"], "provisioning", "{why}: {observed}");
+    assert!(observed["runtime_attestation"].is_null(), "{why}");
+    assert_eq!(intent_mode(w), "quiesce", "{why}");
+    assert!(!released(w), "{why}");
+    let map = w
+        .server
+        .get(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("gateway-fence-{}", w.id),
+        )
+        .unwrap();
+    assert!(map["data"]["admission_target"].is_null(), "{why}");
+}
+
+#[tokio::test]
+async fn a_resumed_pod_whose_container_does_not_run_is_not_published() {
+    let w = woken().await;
+    w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+        pod["status"]["containerStatuses"][0]["state"] =
+            json!({"waiting":{"reason":"CrashLoopBackOff"}});
+    });
+    let observed = reconcile(&w).await;
+    unpublished(&w, &observed, "container waiting");
+}
+
+#[tokio::test]
+async fn a_resumed_pod_whose_container_changed_while_postgres_answered_is_not_published() {
+    type Change = fn(&mut Value);
+    let changes: [(&str, Change); 3] = [
+        ("container id", |pod| {
+            pod["status"]["containerStatuses"][0]["containerID"] =
+                "containerd://3333333333333333333333333333333333333333333333333333333333333333"
+                    .into();
+        }),
+        ("restart count", |pod| {
+            pod["status"]["containerStatuses"][0]["restartCount"] = 1.into();
+        }),
+        ("terminated", |pod| {
+            pod["status"]["containerStatuses"][0]["state"] = json!({"terminated":{"exitCode":137}});
+        }),
+    ];
+    for (name, change) in changes {
+        let w = woken().await;
+        let changed = w.change_pod(change);
+        w.sql.lock().unwrap().during.insert("accepting", changed);
+        let observed = reconcile(&w).await;
+        unpublished(&w, &observed, name);
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_pod_is_not_published_on_an_answer_that_is_not_its_own() {
+    // PostgreSQL answers as a standby, or from another address than the Pod's.
+    let w = woken().await;
+    w.sql.lock().unwrap().recovery = true;
+    let observed = reconcile(&w).await;
+    unpublished(&w, &observed, "recovery");
+    let w = woken().await;
+    w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+        pod["status"]["podIP"] = "10.0.0.9".into();
+    });
+    let observed = reconcile(&w).await;
+    unpublished(&w, &observed, "address");
+}
+
+#[tokio::test]
+async fn a_resumed_pod_whose_postgres_does_not_answer_is_not_published() {
+    let w = woken().await;
+    w.stop_postgres();
+    let observed = reconcile(&w).await;
+    unpublished(&w, &observed, "no answer");
+    assert!(
+        annotations(&w)[FENCE].is_null(),
+        "the unfence is not undone"
+    );
+}
+
+#[tokio::test]
+async fn a_pod_cnpg_replaced_is_published_by_the_ordinary_chain_once_it_is_ready() {
+    // The retained Pod is another one: the fast wake's proof says nothing about it, and the
+    // ordinary wake of a running instance, which waits for the kubelet, applies. Its pass is the
+    // first of generation 3 to reach the end, and publishes the proof in that pass.
+    let w = woken().await;
+    w.pod(false);
+    w.server.edit("Pod", Some(&w.ns), "database-1", |pod| {
+        pod["metadata"]["uid"] = crate::test_server::uid(77).into();
+    });
+    let observed = reconcile(&w).await;
+    unpublished(&w, &observed, "replaced");
+    let ready = w.kubelet_ready_now();
+    ready();
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let proof = &observed["runtime_attestation"];
+    assert_eq!(proof["v"], 2, "{observed}");
+    assert_eq!(proof["pod_uid"], crate::test_server::uid(77));
+    assert_eq!(admission_target(&w)["pod_uid"], crate::test_server::uid(77));
+    // The completed generation is a write of the controller to the namespace the proof names: it
+    // is written before the proof, not after, or the first pass of every generation ends in an
+    // error and the next pass repeats the chain.
+    let namespace = w.server.get("Namespace", None, &w.ns).unwrap();
+    assert_eq!(
+        namespace["metadata"]["annotations"]["pgcf.io/generation"],
+        "3"
+    );
+    assert_eq!(
+        proof["observation"]["resource_versions"]["namespace"],
+        namespace["metadata"]["resourceVersion"]
+    );
+}
+
+#[tokio::test]
+async fn the_kubelet_ready_bit_a_wake_did_not_wait_for_is_measured_when_it_arrives() {
+    let w = woken().await;
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let power = &w.reconciler.power;
+    let pod = || w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
+    assert!(
+        power.kubelet_ready(&w.db, &pod()).is_none(),
+        "the bit is not set"
+    );
+    let ready = w.kubelet_ready_now();
+    ready();
+    let event = power
+        .kubelet_ready(&w.db, &pod())
+        .expect("the bit arrived after the wake");
+    assert_eq!(event["event"], "wake_phase");
+    assert_eq!(event["phase"], "kubelet_ready_observed");
+    assert_eq!(event["outcome"], "completed");
+    assert_eq!(event["database_id"], w.id);
+    assert_eq!(event["operation"], w.db["power"]["operation"]);
+    assert!(event["elapsedMs"].as_f64().is_some_and(|ms| ms > 0.0));
+    assert!(
+        power.kubelet_ready(&w.db, &pod()).is_none(),
+        "measured once"
+    );
 }
 
 /// Moves the start of the wake in flight back by `ms`.
@@ -155,10 +384,10 @@ fn wake_started_before(w: &World, ms: u64) {
 async fn a_resize_up_the_kubelet_cannot_allocate_holds_the_wake_and_then_demotes() {
     for reason in ["Deferred", "Infeasible"] {
         let mut w = World::parked().await;
+        w.admitted();
         w.quick();
         w.wake(3);
         w.start_postgres().await;
-        let _kubelet = w.kubelet_ready_after_unfence();
         w.server.state.lock().unwrap().resize_pending = Some(reason.into());
         // The Pod runs PostgreSQL under the requests it was parked with: it is not published.
         let first = reconcile(&w).await;
@@ -199,6 +428,7 @@ fn intent_mode(w: &World) -> String {
 #[tokio::test]
 async fn a_postmaster_older_than_the_unfence_is_not_proof_and_the_wake_continues_on_the_same_pod() {
     let mut w = World::parked().await;
+    w.admitted();
     w.quick();
     w.wake(3);
     w.start_postgres().await;
@@ -223,7 +453,8 @@ async fn a_postmaster_older_than_the_unfence_is_not_proof_and_the_wake_continues
         "the unfence is committed and is not undone"
     );
     assert_eq!(annotations(&w)[HIBERNATION], "off");
-    // Later passes continue on the same Pod under the kubelet's readiness, which is not yet there.
+    // Later passes continue on the same Pod under the ordinary chain, which waits for the
+    // kubelet's readiness, which is not yet there.
     w.sql.lock().unwrap().postmaster_age_ms = 5;
     let waiting = reconcile(&w).await;
     assert_eq!(waiting["state"], "provisioning", "{waiting}");
@@ -249,17 +480,14 @@ async fn a_postmaster_older_than_the_unfence_is_not_proof_and_the_wake_continues
     );
 }
 
-#[test]
-fn a_resumed_pod_is_current_only_while_it_is_the_same_running_pod() {
-    let db = json!({"node":"native-test-node"});
-    let context = json!({"computePool":null});
-    let cluster =
-        json!({"apiVersion":"postgresql.cnpg.io/v1","metadata":{"uid":crate::test_server::uid(3)}});
-    let wake = ParkedWake {
+/// The wake of the Pod `resumed_current` is judged against.
+fn resumed(restarts: Option<u64>) -> ParkedWake {
+    ParkedWake {
         pod_name: "database-1".into(),
         pod_uid: crate::test_server::uid(9),
         postgres_container_id: "containerd://a".into(),
         sidecar_container_id: "containerd://b".into(),
+        postgres_restarts: restarts,
         requests_before: crate::power::Requests {
             postgres: crate::power::ContainerRequests {
                 cpu: "25m".into(),
@@ -271,10 +499,19 @@ fn a_resumed_pod_is_current_only_while_it_is_the_same_running_pod() {
             },
         },
         started: std::time::Instant::now(),
-    };
+    }
+}
+
+#[test]
+fn a_resumed_pod_is_current_only_while_it_is_the_same_running_pod() {
+    let db = json!({"node":"native-test-node"});
+    let context = json!({"computePool":null});
+    let cluster =
+        json!({"apiVersion":"postgresql.cnpg.io/v1","metadata":{"uid":crate::test_server::uid(3)}});
+    let wake = resumed(Some(0));
     let pod = json!({"metadata":{"uid":crate::test_server::uid(9),"ownerReferences":[{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":crate::test_server::uid(3)}]},
         "spec":{"nodeName":"native-test-node"},
-        "status":{"phase":"Running","containerStatuses":[{"name":"postgres","containerID":"containerd://a"}],"initContainerStatuses":[{"name":"plugin-barman-cloud","containerID":"containerd://b"}]}});
+        "status":{"phase":"Running","containerStatuses":[{"name":"postgres","containerID":"containerd://a","restartCount":0,"state":{"running":{"startedAt":"2026-10-15T00:00:00Z"}}}],"initContainerStatuses":[{"name":"plugin-barman-cloud","containerID":"containerd://b"}]}});
     assert!(resumed_current(&pod, &cluster, &db, &context, &wake));
     let broken = |change: &dyn Fn(&mut Value)| {
         let mut changed = pod.clone();
@@ -298,10 +535,30 @@ fn a_resumed_pod_is_current_only_while_it_is_the_same_running_pod() {
     assert!(broken(
         &|p| p["metadata"]["deletionTimestamp"] = "2026-10-15T00:00:00Z".into()
     ));
+    // The container runs, and has not restarted since the fence was lifted.
+    assert!(broken(&|p| {
+        p["status"]["containerStatuses"][0]["state"] =
+            json!({"waiting":{"reason":"CrashLoopBackOff"}});
+    }));
+    assert!(broken(&|p| {
+        p["status"]["containerStatuses"][0]["state"] = json!({"terminated":{"exitCode":137}});
+    }));
+    assert!(broken(
+        &|p| p["status"]["containerStatuses"][0]["restartCount"] = 1.into()
+    ));
+    // A count that could not be read then is never equal to one read now.
+    assert!(!resumed_current(
+        &pod,
+        &cluster,
+        &db,
+        &context,
+        &resumed(None)
+    ));
     // The Ready bit is not read.
-    let mut ready = pod.clone();
-    ready["status"]["conditions"] = json!([{"type":"Ready","status":"False"}]);
-    assert!(resumed_current(&ready, &cluster, &db, &context, &wake));
+    let mut unready = pod.clone();
+    unready["status"]["conditions"] = json!([{"type":"Ready","status":"False"}]);
+    unready["status"]["containerStatuses"][0]["ready"] = false.into();
+    assert!(resumed_current(&unready, &cluster, &db, &context, &wake));
 }
 
 #[tokio::test]
@@ -334,15 +591,6 @@ async fn a_new_generation_is_published_with_its_proof_in_one_pass() {
         proof["observation"]["resource_versions"]["namespace"],
         namespace["metadata"]["resourceVersion"]
     );
-    let map = w
-        .server
-        .get(
-            "ConfigMap",
-            Some(SYSTEM),
-            &format!("gateway-fence-{}", w.id),
-        )
-        .unwrap();
-    let target: Value = serde_json::from_str(text(&map["data"], "admission_target")).unwrap();
-    assert_eq!(target["pod_uid"], crate::test_server::uid(77));
-    assert_eq!(target["generation"], 3);
+    assert_eq!(admission_target(&w)["pod_uid"], crate::test_server::uid(77));
+    assert_eq!(admission_target(&w)["generation"], 3);
 }

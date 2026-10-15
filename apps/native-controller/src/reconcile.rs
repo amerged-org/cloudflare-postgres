@@ -8,7 +8,10 @@ use crate::{
     health::{self, ArchiveSample, Health},
     kubernetes::{Kubernetes, bounded},
     manifests, postgres,
-    power::{Basis, ParkedWake, PowerCoordinator, PrepareRunning, Sleep, desired_power, fenced},
+    power::{
+        Basis, ParkedWake, PowerCoordinator, PrepareRunning, Sleep, desired_power, fenced,
+        runs_wake,
+    },
     timing,
 };
 use base64::{
@@ -33,12 +36,20 @@ const SWITCH: &str = "pgcf.io/runtime-switch";
 const PRESTARTED: &str = "pgcf-prestarted";
 const PROFILE: &str = "pgcf.io/compute-profile";
 const ADMISSION: &str = "pgcf-cnpg-prestarted";
-/// Longest a fast wake polls for PostgreSQL after the unfence, and then for the kubelet's Ready
-/// and the Pod's requests; later passes continue on the same Pod.
+/// Longest a fast wake polls for PostgreSQL after the unfence, and then for the kubelet to
+/// actuate the Pod's requests; later passes continue on the same Pod.
 const ACCEPT_BUDGET: Duration = Duration::from_secs(5);
 /// Longest the controller waits for its own watch to deliver a write of its own before it reads
 /// the runtime proof back.
 const WATCH_LAG: Duration = Duration::from_millis(500);
+/// What an archive probe found, with the Cluster and the Pod it read last and found still bound
+/// to the ones it was given.
+struct Probed {
+    archive: Value,
+    alarm: bool,
+    cluster: Value,
+    pod: Value,
+}
 struct RuntimeResources<'a> {
     namespace: &'a Value,
     cluster: &'a Value,
@@ -54,7 +65,7 @@ pub struct Reconciler {
     postgres_image: String,
     pub(crate) http: reqwest::Client,
     /// How long a resumed Pod is polled for a fresh, accepting postmaster, and then for its
-    /// Ready and its requests, before the pass ends.
+    /// requests to be actuated, before the pass ends.
     pub(crate) accept_budget: Duration,
     pool: Option<crate::pool::Runtime>,
 }
@@ -91,6 +102,12 @@ fn owned(v: &Value, db: &Value, name: &str, ns: Option<&str>) -> Result<(), Erro
         }
     }
     Ok(())
+}
+/// The `postgres` container's status of a Pod.
+fn postgres_status(pod: &Value) -> Option<&Value> {
+    pod["status"]["containerStatuses"]
+        .as_array()
+        .and_then(|all| all.iter().find(|c| text(c, "name") == "postgres"))
 }
 fn condition<'a>(v: &'a Value, name: &str) -> Option<&'a str> {
     v["status"]["conditions"]
@@ -227,7 +244,8 @@ pub(crate) struct RetainedManifests {
     pub(crate) runtime_class: &'static str,
 }
 /// The Pod a fast wake resumed is the primary only while it is still that Pod: the same UID and
-/// containers, Running on its node under the selected runtime. Its Ready bit is not read.
+/// containers, `postgres` running and not restarted, on its node under the selected runtime. Its
+/// Ready bit is not read.
 fn resumed_current(
     pod: &Value,
     cluster: &Value,
@@ -235,26 +253,12 @@ fn resumed_current(
     context: &Value,
     wake: &ParkedWake,
 ) -> bool {
-    let container = |statuses: &Value, name: &str| {
-        statuses
-            .as_array()
-            .and_then(|all| all.iter().find(|c| text(c, "name") == name))
-            .map(|c| text(c, "containerID").to_string())
-    };
     cluster_owned(pod, cluster)
-        && pod["metadata"]["uid"] == wake.pod_uid.as_str()
         && pod["metadata"]["deletionTimestamp"].is_null()
         && text(&pod["status"], "phase") == "Running"
         && pod["spec"]["nodeName"] == db["node"]
         && text(&pod["spec"], "runtimeClassName") == runtime_class(context)
-        && container(&pod["status"]["containerStatuses"], "postgres").as_deref()
-            == Some(wake.postgres_container_id.as_str())
-        && container(
-            &pod["status"]["initContainerStatuses"],
-            "plugin-barman-cloud",
-        )
-        .as_deref()
-            == Some(wake.sidecar_container_id.as_str())
+        && runs_wake(pod, wake)
 }
 pub(crate) fn cluster_owned(v: &Value, cluster: &Value) -> bool {
     v["metadata"]["ownerReferences"]
@@ -767,7 +771,8 @@ impl Reconciler {
         Ok(Some(identity))
     }
     /// `at_pod` dials the Pod's own address, as a resumed Pod's sessions do, instead of the
-    /// Service, whose endpoints may lag the Pod's Ready.
+    /// Service, whose endpoints may lag the Pod's Ready, and does not require the kubelet's Ready
+    /// bit either: the caller judges that Pod by what it runs.
     async fn archive(
         &self,
         db: &Value,
@@ -775,7 +780,7 @@ impl Reconciler {
         pod: &Value,
         ca: &[u8],
         at_pod: bool,
-    ) -> Result<(Value, bool), Error> {
+    ) -> Result<Probed, Error> {
         let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
         let ns = namespace(db);
         let maintenance = self
@@ -861,14 +866,21 @@ impl Reconciler {
             || fresh_cluster["status"]["currentPrimary"] != pod["metadata"]["name"]
             || fresh_pod["metadata"]["uid"] != pod["metadata"]["uid"]
             || fresh_pod["status"]["podIP"] != pod["status"]["podIP"]
-            || condition(&fresh_pod, "Ready") != Some("True")
+            || (!at_pod && condition(&fresh_pod, "Ready") != Some("True"))
             || !contains(&fresh_cluster["spec"], &cluster["spec"], "")
             || !contains(&cluster["spec"], &fresh_cluster["spec"], "")
             || !fresh_pod["metadata"]["deletionTimestamp"].is_null()
         {
             return Err("archive binding changed during probe".into());
         }
-        health::archive_health(&self.k8s, db, &fresh_cluster, sample).await
+        let (archive, alarm) =
+            health::archive_health(&self.k8s, db, &fresh_cluster, sample).await?;
+        Ok(Probed {
+            archive,
+            alarm,
+            cluster: fresh_cluster,
+            pod: fresh_pod,
+        })
     }
     /// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster: the
     /// maintenance role connects to the Pod's own address under the tenant's TLS name and finds
@@ -1493,6 +1505,7 @@ impl Reconciler {
         let Some(pod) = self.k8s.read("Pod", Some(&ns), primary).await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
+        self.power.kubelet_ready(db, &pod);
         let current = match &parked {
             Some(wake) => resumed_current(&pod, &cluster, db, &context, wake),
             None => primary_current(&pod, &cluster, db, &context),
@@ -1500,10 +1513,10 @@ impl Reconciler {
         if !current {
             return Ok(Some(observation(db, "provisioning", None)));
         }
-        // A resumed Pod is published only once the kubelet reports it Ready with its requests
-        // back: until the gateway can route to an attested Pod before its Ready condition, it
-        // routes only to a Ready endpoint. The Pod and the Cluster read after that are the ones
-        // the attestation is read back against.
+        // A resumed Pod is published once PostgreSQL answers on it with the right identity and the
+        // kubelet has actuated its requests, without waiting for the kubelet's Ready bit: the
+        // gateway routes to the Pod by its attestation. The Pod and the Cluster read after that
+        // are the ones the chain below starts from.
         let (pod, cluster) = match &parked {
             Some(wake) => {
                 if !self.pg_accepting(db, &ca, &pod, wake).await? {
@@ -1532,8 +1545,10 @@ impl Reconciler {
             .and_then(|v| v.iter().find(|c| text(c, "name") == "postgres"))
             .ok_or("postgres runtime proof missing")?;
         let image_id = text(status, "imageID");
+        // The container's ready bit is the kubelet's probe; a resumed Pod's container is judged
+        // by running under the identity the wake proved.
         if postgres_container["image"] != expected_image
-            || status["ready"] != true
+            || (parked.is_none() && status["ready"] != true)
             || status["state"]["running"].is_null()
             || !image_id.ends_with(
                 expected_image
@@ -1626,10 +1641,31 @@ impl Reconciler {
         }
         unchanged.completed();
         let metrics = timing::Phase::begin(db, "archive_metrics");
-        let (archive, archive_alarm) = self
+        let probed = self
             .archive(db, &cluster, &pod, &ca, parked.is_some())
             .await?;
         metrics.completed();
+        let Probed {
+            archive,
+            alarm: archive_alarm,
+            cluster: probed_cluster,
+            pod: probed_pod,
+        } = probed;
+        // The kubelet reports a resumed Pod Ready, and CNPG its status, while this chain runs: the
+        // attestation is read back against the Pod and the Cluster the probe read last, not
+        // against the ones read before PostgreSQL answered. Neither says the Pod is another one;
+        // that it is still the Pod that answered is checked again here.
+        let (pod_now, cluster_now) = match &parked {
+            Some(wake) => {
+                if !resumed_current(&probed_pod, &probed_cluster, db, &context, wake) {
+                    return Ok(Some(observation(db, "provisioning", None)));
+                }
+                (&probed_pod, &probed_cluster)
+            }
+            None => (&pod, &cluster),
+        };
+        let status = postgres_status(pod_now).ok_or("postgres runtime proof missing")?;
+        self.power.kubelet_ready(db, pod_now);
         let established =
             db["creation"]["ever_ready"] == true || db["recovery"]["ever_ready"] == true;
 
@@ -1652,7 +1688,7 @@ impl Reconciler {
                 None
             },
         );
-        result["backup"] = self.health.backup(db, &namespace_value, &cluster);
+        result["backup"] = self.health.backup(db, &namespace_value, cluster_now);
         result["archive"] = archive;
         result["postgres"] = json!({"image":expected_image,"image_id":image_id});
         if finalized {
@@ -1684,7 +1720,7 @@ impl Reconciler {
                 .strip_prefix("containerd://")
                 .unwrap_or("");
             let boot = text(&node_observed["status"]["nodeInfo"], "bootID");
-            let mut proof = json!({"v":1,"database_id":db["id"],"generation":db["generation"],"storage_generation":optional_number(db,"storage_generation",1),"node_uid":node_observed["metadata"]["uid"],"boot_id":boot,"cluster_uid":self.cluster_uid,"namespace_uid":final_ns["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":fence.as_ref().ok_or("runtime storage receipt absent")?["metadata"]["uid"],"pvc_uid":volume_identity["claimUid"],"pv_uid":volume_identity["volumeUid"],"pod_uid":pod["metadata"]["uid"],"container_id":cid,"postgres_image_sha256":expected_image.rsplit("@sha256:").next().ok_or("runtime image digest absent")?,"memory_request_bytes":quantity(&postgres_container["resources"]["requests"]["memory"]),"memory_limit_bytes":quantity(&postgres_container["resources"]["limits"]["memory"]),"observed_at":u64::try_from(now()).map_err(|_|"runtime clock invalid")?,"configuration_fingerprint":crate::contracts::configuration_fingerprint(db,&self.postgres_image)?});
+            let mut proof = json!({"v":1,"database_id":db["id"],"generation":db["generation"],"storage_generation":optional_number(db,"storage_generation",1),"node_uid":node_observed["metadata"]["uid"],"boot_id":boot,"cluster_uid":self.cluster_uid,"namespace_uid":final_ns["metadata"]["uid"],"cnpg_cluster_uid":cluster_now["metadata"]["uid"],"storage_uid":fence.as_ref().ok_or("runtime storage receipt absent")?["metadata"]["uid"],"pvc_uid":volume_identity["claimUid"],"pv_uid":volume_identity["volumeUid"],"pod_uid":pod_now["metadata"]["uid"],"container_id":cid,"postgres_image_sha256":expected_image.rsplit("@sha256:").next().ok_or("runtime image digest absent")?,"memory_request_bytes":quantity(&postgres_container["resources"]["requests"]["memory"]),"memory_limit_bytes":quantity(&postgres_container["resources"]["limits"]["memory"]),"observed_at":u64::try_from(now()).map_err(|_|"runtime clock invalid")?,"configuration_fingerprint":crate::contracts::configuration_fingerprint(db,&self.postgres_image)?});
             if !db["admission"].is_null() {
                 if let Some(start) = proof_continuity {
                     if let Some(mut continuity) = self
@@ -1693,8 +1729,8 @@ impl Reconciler {
                             &start,
                             &RuntimeResources {
                                 namespace: &final_ns,
-                                cluster: &cluster,
-                                pod: &pod,
+                                cluster: cluster_now,
+                                pod: pod_now,
                                 ca: &current_ca,
                                 node: &node_observed,
                             },
@@ -1721,7 +1757,7 @@ impl Reconciler {
                             .map(|byte| format!("{byte:02x}"))
                             .collect::<String>()
                             .into();
-                        proof["pod_ip"] = pod["status"]["podIP"].clone();
+                        proof["pod_ip"] = pod_now["status"]["podIP"].clone();
                         proof["postgres_port"] = 5432.into();
                         let verified = proof["observed_at"]
                             .as_u64()
@@ -1743,6 +1779,16 @@ impl Reconciler {
             if crate::contracts::schema_valid("DatabaseRuntimeAttestation", &proof) {
                 result["runtime_attestation"] = proof;
             }
+        }
+        // The gateway routes to a Pod whose kubelet has not reported it Ready only by its
+        // attestation: a resumed Pod that cannot be attested is published once the kubelet
+        // reports it, and not before.
+        if parked.is_some()
+            && result["state"] == "ready"
+            && result["runtime_attestation"]["v"] != 2
+            && condition(pod_now, "Ready") != Some("True")
+        {
+            return Ok(Some(observation(db, "provisioning", None)));
         }
         let release = timing::Phase::begin(db, "fence_release");
         let result = if let Some(intent) = intent {

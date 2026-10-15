@@ -199,6 +199,28 @@ fn bound(pod: &Value, park: &Park) -> bool {
             postgres == park.postgres_container_id && sidecar == park.sidecar_container_id
         })
 }
+/// Whether `pod` is the Pod a fast wake resumed and still runs what it ran: the same UID, the
+/// `postgres` and sidecar containers under the same IDs, `postgres` running and not restarted
+/// since the fence was lifted. The kubelet's Ready bit is not read.
+pub(crate) fn runs_wake(pod: &Value, wake: &ParkedWake) -> bool {
+    pod["metadata"]["uid"] == wake.pod_uid.as_str()
+        && container_ids(pod).is_some_and(|(postgres, sidecar)| {
+            postgres == wake.postgres_container_id && sidecar == wake.sidecar_container_id
+        })
+        && named(&pod["status"]["containerStatuses"], POSTGRES).is_some_and(|status| {
+            status["state"]["running"].is_object()
+                && wake
+                    .postgres_restarts
+                    .is_some_and(|restarts| status["restartCount"].as_u64() == Some(restarts))
+        })
+}
+/// Whether the kubelet reports the Pod Ready.
+fn kubelet_ready_bit(pod: &Value) -> bool {
+    pod["status"]["conditions"].as_array().is_some_and(|all| {
+        all.iter()
+            .any(|c| c["type"] == "Ready" && c["status"] == "True")
+    })
+}
 /// `cnpg_collector_fencing_on 1`: the instance manager reports itself fenced.
 fn fencing_on(metrics: &str) -> bool {
     metrics.lines().any(|line| {
@@ -263,6 +285,14 @@ pub(super) enum Resumed {
     Waiting,
     /// No retained Pod stands in the way: the ordinary CNPG wake applies.
     Ordinary,
+}
+/// The kubelet's Ready bit of a resumed Pod, which its wake does not wait for: the phase
+/// `kubelet_ready_observed`, counted from the answer of PostgreSQL and ended by the first later
+/// read of the Pod that finds the bit set. It only shows what waiting for the kubelet would have
+/// cost.
+pub(super) struct KubeletWait {
+    pod_uid: String,
+    phase: timing::Phase,
 }
 
 impl PowerCoordinator {
@@ -1067,6 +1097,10 @@ impl PowerCoordinator {
             .k8s
             .read("Pod", Some(&namespace(db)), &park.pod_name)
             .await?;
+        let postgres_restarts = pod
+            .as_ref()
+            .and_then(|pod| named(&pod["status"]["containerStatuses"], POSTGRES))
+            .and_then(|status| status["restartCount"].as_u64());
         let (unfenced, resized) =
             tokio::join!(self.lift_and_release(db, intent, &cluster), async {
                 match pod {
@@ -1096,6 +1130,7 @@ impl PowerCoordinator {
                 pod_uid: park.pod_uid,
                 postgres_container_id: park.postgres_container_id,
                 sidecar_container_id: park.sidecar_container_id,
+                postgres_restarts,
                 requests_before: park.requests_before,
                 started,
             })),
@@ -1208,11 +1243,13 @@ impl PowerCoordinator {
             None => Restore::Pending("in_progress"),
         }
     }
-    /// After PostgreSQL accepts on the resumed Pod, the kubelet must report the Pod Ready and its
-    /// `postgres` container ready, because the gateway routes only to such an endpoint, and must
-    /// have actuated the requests the Pod was resized back to. Polls within the pass, then reads
-    /// the Pod and the Cluster once more: the attestation is read back against those. `None`
-    /// means not within `budget`; the next pass of the wake continues on the same Pod.
+    /// After PostgreSQL accepts on the resumed Pod, the Pod must still be the one the wake resumed
+    /// (the same containers, `postgres` running and not restarted) and the kubelet must have
+    /// actuated the requests the Pod was resized back to. The kubelet's Ready bit is not awaited:
+    /// the controller's attestation names the Pod, its container and its CA, and the gateway
+    /// routes by it. Polls within the pass, then reads the Pod and the Cluster once more: the
+    /// attestation is read back against those. `None` means not within `budget`; the next pass of
+    /// the wake continues on the same Pod.
     pub(crate) async fn resumed_settled(
         &self,
         db: &Value,
@@ -1221,9 +1258,9 @@ impl PowerCoordinator {
         budget: Duration,
     ) -> std::result::Result<Option<(Value, Value)>, Error> {
         let ns = namespace(db);
-        let mut ready = Some(timing::Phase::begin(db, "pod_ready"));
+        let started = Instant::now();
         let mut actuated = Some(timing::Phase::begin(db, "resize_actuated"));
-        let deadline = Instant::now() + budget;
+        let deadline = started + budget;
         let mut polls = 0_u64;
         loop {
             polls += 1;
@@ -1231,29 +1268,10 @@ impl PowerCoordinator {
                 .k8s
                 .read("Pod", Some(&ns), &wake.pod_name)
                 .await?
-                .filter(|pod| {
-                    pod["metadata"]["uid"] == wake.pod_uid.as_str()
-                        && container_ids(pod).is_some_and(|(postgres, sidecar)| {
-                            postgres == wake.postgres_container_id
-                                && sidecar == wake.sidecar_container_id
-                        })
-                })
+                .filter(|pod| runs_wake(pod, wake))
             else {
                 return Ok(None);
             };
-            let postgres_ready = named(&pod["status"]["containerStatuses"], POSTGRES)
-                .is_some_and(|c| c["ready"] == true);
-            let pod_ready = pod["status"]["conditions"].as_array().is_some_and(|all| {
-                all.iter()
-                    .any(|c| c["type"] == "Ready" && c["status"] == "True")
-            });
-            if pod_ready
-                && postgres_ready
-                && let Some(mut phase) = ready.take()
-            {
-                phase.note("polls", polls);
-                phase.completed();
-            }
             let restore = if Self::requested(&pod, &wake.requests_before) {
                 Self::restored(&pod, &wake.requests_before)
             } else {
@@ -1272,9 +1290,6 @@ impl PowerCoordinator {
                         phase.note("reason", why);
                         phase.pending();
                     }
-                    if let Some(phase) = ready.take() {
-                        phase.pending();
-                    }
                     return Ok(None);
                 }
                 Restore::Pending(why) => {
@@ -1283,19 +1298,17 @@ impl PowerCoordinator {
                     }
                 }
             }
-            if ready.is_none() && actuated.is_none() {
+            if actuated.is_none() {
                 let current = self
                     .k8s
                     .read("Cluster", Some(&ns), "database")
                     .await?
                     .filter(|current| current["metadata"]["uid"] == cluster["metadata"]["uid"])
                     .ok_or("Cluster identity changed during the wake")?;
+                self.await_kubelet(db, &pod, started);
                 return Ok(Some((pod, current)));
             }
             if Instant::now() >= deadline {
-                if let Some(phase) = ready.take() {
-                    phase.pending();
-                }
                 if let Some(phase) = actuated.take() {
                     phase.pending();
                 }
@@ -1303,6 +1316,45 @@ impl PowerCoordinator {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+    /// Starts the measurement of the kubelet's Ready bit of the Pod a wake resumed, which the
+    /// wake does not wait for; it ends here if the bit is set already.
+    fn await_kubelet(&self, db: &Value, pod: &Value, started: Instant) {
+        let phase = timing::Phase::begin_at(db, "kubelet_ready_observed", started);
+        if kubelet_ready_bit(pod) {
+            phase.completed();
+            return;
+        }
+        let wait = KubeletWait {
+            pod_uid: text(&pod["metadata"], "uid").into(),
+            phase,
+        };
+        if let Some(replaced) = self
+            .kubelet
+            .lock()
+            .unwrap()
+            .insert(text(db, "id").into(), wait)
+        {
+            replaced.phase.pending();
+        }
+    }
+    /// Ends the measurement of a resumed Pod's Ready bit, if one waits for it, when `pod` shows the
+    /// bit set. The event is emitted and returned. A measurement of another Pod ends unobserved.
+    pub(crate) fn kubelet_ready(&self, db: &Value, pod: &Value) -> Option<Value> {
+        let mut waits = self.kubelet.lock().unwrap();
+        let id = text(db, "id");
+        if waits.get(id)?.pod_uid != text(&pod["metadata"], "uid") {
+            waits.remove(id)?.phase.pending();
+            return None;
+        }
+        if !kubelet_ready_bit(pod) {
+            return None;
+        }
+        let event = waits.remove(id)?.phase.finish("completed");
+        if let Some(event) = &event {
+            timing::emit(event.clone());
+        }
+        event
     }
     /// One CAS patch lifting the fence and setting hibernation off, retried across the Cluster
     /// status writes CNPG makes between the read and the write.

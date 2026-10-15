@@ -191,6 +191,10 @@ pub struct Sql {
     pub archived: bool,
     pub postmaster_age_ms: i64,
     pub recovery: bool,
+    /// What happens in the cluster while PostgreSQL answers a statement, by the statement's name in
+    /// the log (`accepting`, `role login`, `archive`): the change lands before the answer does, so
+    /// the controller's next read sees it.
+    pub during: HashMap<&'static str, Arc<dyn Fn() + Send + Sync>>,
 }
 impl Default for Sql {
     fn default() -> Self {
@@ -201,6 +205,7 @@ impl Default for Sql {
             archived: true,
             postmaster_age_ms: 5,
             recovery: false,
+            during: HashMap::new(),
         }
     }
 }
@@ -248,6 +253,9 @@ fn answers(
             sql.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
         };
         log.lock().unwrap().push(format!("SQL {user} {kind}"));
+        if let Some(during) = s.during.get(kind.as_str()) {
+            during();
+        }
         let text = |v: &str| Cell::Text(v.to_string());
         let name = |v: &str| Cell::Name(v.to_string());
         let one = |row: Vec<(&'static str, Cell)>| Answer::Rows(vec![row]);
@@ -376,14 +384,6 @@ fn answers(
             Answer::Error("0A000", "statement not served by the test double")
         }
     })
-}
-
-/// A running emulation of the kubelet's readiness probe; it stops with the test.
-pub struct KubeletProbe(tokio::task::JoinHandle<()>);
-impl Drop for KubeletProbe {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 pub struct World {
@@ -615,52 +615,54 @@ impl World {
             .await
             .unwrap()
     }
-    /// The kubelet's readiness probe after a wake: once the fence is gone, the Pod and its
-    /// `postgres` container are reported ready, and the log records when.
-    pub fn kubelet_ready_after_unfence(&self) -> KubeletProbe {
+    /// What the kubelet does to the instance Pod and CNPG to its Cluster once PostgreSQL runs: the
+    /// Pod and its `postgres` container report Ready, and the Cluster status is written again.
+    /// Each is a new version of the object, as every write is.
+    pub fn kubelet_ready_now(&self) -> Arc<dyn Fn() + Send + Sync> {
         let state = self.server.state.clone();
-        let log = self.log.clone();
-        let cluster = crate::test_server::path("Cluster", Some(&self.ns), "database");
         let pod = crate::test_server::path("Pod", Some(&self.ns), "database-1");
-        KubeletProbe(tokio::spawn(async move {
-            loop {
-                let unfenced = state
-                    .lock()
-                    .unwrap()
-                    .objects
-                    .get(&cluster)
-                    .is_some_and(|c| {
-                        c["metadata"]["annotations"]
-                            .get("cnpg.io/fencedInstances")
-                            .is_none()
-                    });
-                if unfenced {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let cluster = crate::test_server::path("Cluster", Some(&self.ns), "database");
+        let log = self.log.clone();
+        Arc::new(move || {
+            let mut state = state.lock().unwrap();
+            let bump = |value: &mut Value| {
+                let version: u64 = value["metadata"]["resourceVersion"]
+                    .as_str()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                value["metadata"]["resourceVersion"] = (version + 1).to_string().into();
+            };
+            if let Some(pod) = state.objects.get_mut(&pod) {
+                pod["status"]["conditions"] = json!([{"type":"Ready","status":"True"}]);
+                pod["status"]["containerStatuses"][0]["ready"] = true.into();
+                bump(pod);
             }
-            // A probe period, shortened.
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            if let Some(cluster) = state.objects.get_mut(&cluster) {
+                bump(cluster);
+            }
+            state.sync();
+            log.lock().unwrap().push("KUBELET ready".into());
+        })
+    }
+    /// Changes the instance Pod the way `change` says, as a new version of it.
+    pub fn change_pod(
+        &self,
+        change: impl Fn(&mut Value) + Send + Sync + 'static,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        let state = self.server.state.clone();
+        let pod = crate::test_server::path("Pod", Some(&self.ns), "database-1");
+        Arc::new(move || {
             let mut state = state.lock().unwrap();
             if let Some(pod) = state.objects.get_mut(&pod) {
-                let mut conditions: Vec<Value> = pod["status"]["conditions"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|c| c["type"] != "Ready")
-                    .collect();
-                conditions.push(json!({"type":"Ready","status":"True"}));
-                pod["status"]["conditions"] = conditions.into();
-                pod["status"]["containerStatuses"][0]["ready"] = true.into();
+                change(pod);
                 let version: u64 = pod["metadata"]["resourceVersion"]
                     .as_str()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1);
                 pod["metadata"]["resourceVersion"] = (version + 1).to_string().into();
             }
-            log.lock().unwrap().push("KUBELET ready".into());
-        }))
+            state.sync();
+        })
     }
     /// A rolling update replaced the gateway Pod: same name, new identity.
     pub fn replace_gateway(&self) {

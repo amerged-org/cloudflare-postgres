@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 const SYSTEM: &str = "pgcf-system";
@@ -40,8 +40,8 @@ const CLOCK_SKEW: u64 = 5_000;
 const STOP_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 mod parked;
-pub(crate) use parked::fenced;
 use parked::{Resumed, Retained};
+pub(crate) use parked::{fenced, runs_wake};
 #[derive(Debug)]
 enum Fault {
     Stale,
@@ -359,6 +359,9 @@ pub struct ParkedWake {
     pub pod_uid: String,
     pub postgres_container_id: String,
     pub sidecar_container_id: String,
+    /// The `postgres` container's restarts when the fence was lifted; `None` if the Pod could not
+    /// be read then, which no later read can equal.
+    pub postgres_restarts: Option<u64>,
     /// The requests the Pod is resized back to; the wake is verified only once they are actuated.
     pub(crate) requests_before: Requests,
     /// Taken before the unfence was sent: a postmaster older than this did not start for it.
@@ -382,6 +385,9 @@ pub struct PowerCoordinator {
     /// How long a sleep waits for PostgreSQL to be seen stopped after it fenced the instance.
     pub(crate) stop_budget: Duration,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The kubelet's Ready bit of a database's resumed Pod, which its wake did not wait for, by
+    /// database id: the measurement that ends when a later pass finds the bit set.
+    kubelet: Mutex<HashMap<String, parked::KubeletWait>>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -735,6 +741,7 @@ impl PowerCoordinator {
             postgres: None,
             stop_budget: STOP_BUDGET,
             clock,
+            kubelet: Mutex::default(),
         })
     }
     fn now(&self) -> u64 {
