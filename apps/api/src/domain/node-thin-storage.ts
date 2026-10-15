@@ -385,14 +385,45 @@ async function signStorageWriter(
 }
 
 /**
+ * The one instance Pod the node's own latest reading evidences on this volume: exactly one Pod
+ * with io.max inside the profile's limits, on the receipt's volume, not frozen, read at a
+ * generation no newer than the row's (a sleep or a D1-only resize bumps the row first). The proof
+ * counts every non-terminal instance Pod as a writer, whatever its desired state.
+ */
+function evidencedWriter(
+  database: DatabaseRow,
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+  authority: NodeThinStorageAuthority,
+): string | undefined {
+  const volumes = authority.volumes.filter(
+    (volume) =>
+      volume.database_id === database.id &&
+      volume.storage_generation === receipt.storage_generation &&
+      volume.generation <= database.generation,
+  );
+  const volume = volumes.length === 1 ? volumes[0] : undefined;
+  const io = volume?.io[0];
+  if (
+    !volume ||
+    volume.quiesced ||
+    !volumeMatchesReceipt(volume, storage, receipt) ||
+    volume.io.length !== 1 ||
+    !io ||
+    io.write_bytes_per_second > storage.write_bytes_per_second ||
+    io.write_iops_per_second > storage.write_iops_per_second
+  )
+    return undefined;
+  return io.pod_uid;
+}
+
+/**
  * The Pod a parked database still holds, when the controller's word and the node's own reading
- * agree: the controller's fresh report names it and the latest identity proof measured exactly
- * that one Pod's io.max on this volume (the proof counts every non-terminal instance Pod as a
- * writer, whatever its desired state). No other source names a Pod for a suspended database, so
- * no token can exist for a Pod that was not both attested and evidenced.
+ * agree: the controller's fresh report names it and the node evidences exactly that one Pod. No
+ * other source names a Pod for a parked database, so no token can exist for a Pod that was not both
+ * attested and evidenced.
  * It serves two moments: while the database sleeps parked, and while its wake of exactly the
- * current generation reuses the Pod. The generation of the reading may be older than the row: a
- * sleep or a D1-only resize bumps it.
+ * current generation reuses the Pod.
  */
 async function parkedHolder(
   env: Pick<Env, "DB">,
@@ -433,26 +464,10 @@ async function parkedHolder(
     )
       return undefined;
   } else return undefined;
-  const volumes = authority.volumes.filter(
-    (volume) =>
-      volume.database_id === database.id &&
-      volume.storage_generation === receipt.storage_generation &&
-      volume.generation <= database.generation,
-  );
-  const volume = volumes.length === 1 ? volumes[0] : undefined;
-  const io = volume?.io[0];
-  if (
-    !volume ||
-    volume.quiesced ||
-    !volumeMatchesReceipt(volume, storage, receipt) ||
-    volume.io.length !== 1 ||
-    !io ||
-    io.pod_uid !== parked.pod_uid ||
-    io.write_bytes_per_second > storage.write_bytes_per_second ||
-    io.write_iops_per_second > storage.write_iops_per_second
-  )
-    return undefined;
-  return parked.pod_uid;
+  return evidencedWriter(database, storage, receipt, authority) ===
+    parked.pod_uid
+    ? parked.pod_uid
+    : undefined;
 }
 
 export async function storageWriteAuthorityForDatabase(
@@ -509,6 +524,38 @@ export async function storageWriteAuthorityForDatabase(
       current!.row.qualification_json,
     )) ??
     (await parkedHolder(env, database, storage, receipt, authority, now));
+  if (!pod) return undefined;
+  return signStorageWriter(
+    env,
+    database,
+    storage,
+    receipt,
+    authority,
+    pod,
+    now,
+  );
+}
+
+/**
+ * For the host lease only: the writer token of a database whose sleep is being carried out. The
+ * desired state is already "suspended" while the controller still has to stop PostgreSQL
+ * gracefully in the instance Pod (its sleep proof, then the stop). The guard freezes the volume and
+ * kills the tasks of a Pod without a running entry and a token naming it, which would cut that stop
+ * short, so until the stop operation of this generation leaves pending or running the Pod the node
+ * evidences stays the running writer. The caller has checked the operation and excluded every
+ * unresolved pool holder.
+ */
+async function stoppingStorageWriteAuthority(
+  env: Env,
+  database: DatabaseRow,
+  now: number,
+  snapshot: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
+): Promise<string | undefined> {
+  if (database.desired_state !== "suspended") return undefined;
+  const context = await currentWriterContext(env, database, now, snapshot);
+  if (!context) return undefined;
+  const { storage, receipt, authority } = context;
+  const pod = evidencedWriter(database, storage, receipt, authority);
   if (!pod) return undefined;
   return signStorageWriter(
     env,
@@ -920,7 +967,7 @@ export async function hostStorageLease(
   const current = await readCurrentNodeThinStorage(c.env, id, now);
   const rows = await c.env.DB.prepare(
     `SELECT d.*,COUNT(*) OVER() host_snapshot_count,s.storage_gib,a.node_uid startup_node_uid,a.storage_budget_bytes,a.operation_id startup_operation,
- (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
+ (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation,'status',stop.status) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
  FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.node_uid=? AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation) WHERE d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR d.storage_profile_json IS NOT NULL) ORDER BY d.id`,
   )
     .bind(node.node_uid, id, region.id)
@@ -1027,10 +1074,9 @@ export async function hostStorageLease(
     // A parked database (D1: suspended, idle, hibernated) still holds its own Pod with PostgreSQL
     // stopped. The host guard stops the tasks and freezes the volume of any Pod whose entry is not
     // running with a valid token naming it, and it retires the previous holder when the next
-    // generation starts without one. So this entry is the one place where the lease says "running"
-    // for a database whose desired state is "suspended": no write can happen (no postmaster, the
-    // gateway refuses), and the token exists only while the controller's report is fresh and the
-    // node's own reading evidences exactly that Pod.
+    // generation starts without one. So the lease says "running" for this suspended database: no
+    // write can happen (no postmaster, the gateway refuses), and the token exists only while the
+    // controller's report is fresh and the node's own reading evidences exactly that Pod.
     const parkedAuthority =
       poolMayWrite &&
       !unresolvedPool &&
@@ -1038,8 +1084,29 @@ export async function hostStorageLease(
       row.parked_json
         ? await parkedStorageWriteAuthority(c.env, row, now, current)
         : undefined;
+    const stop = row.stop_operation
+      ? (JSON.parse(row.stop_operation) as {
+          operation_id: string;
+          kind: "database.suspend" | "database.hibernate" | "database.delete";
+          generation: number;
+          status: string;
+        })
+      : undefined;
+    // The same holds while a sleep is being carried out: until its stop operation of this
+    // generation is no longer pending or running, the Pod stopping PostgreSQL is the writer.
+    const stoppingAuthority =
+      parkedAuthority === undefined &&
+      poolMayWrite &&
+      !unresolvedPool &&
+      stop !== undefined &&
+      stop.kind !== "database.delete" &&
+      stop.generation === row.generation &&
+      (stop.status === "pending" || stop.status === "running")
+        ? await stoppingStorageWriteAuthority(c.env, row, now, current)
+        : undefined;
+    const presentedRunning = parkedAuthority ?? stoppingAuthority;
     const runtimeAuthority =
-      parkedAuthority ??
+      presentedRunning ??
       (poolMayWrite
         ? await storageWriteAuthorityForDatabase(c.env, row, now, current)
         : undefined);
@@ -1066,19 +1133,14 @@ export async function hostStorageLease(
     let drain:
       import("@pgcf/contracts/node-thin-storage").HostStorageDrain | null =
       null;
+    // A sleep needs no drain: its Pod keeps writing under the token above until the stop ends.
     if (
-      row.stop_operation &&
-      parkedAuthority === undefined &&
+      stop?.kind === "database.delete" &&
       !unresolvedPool &&
       receipt &&
       current?.row.current_qualified === 1 &&
       authority
     ) {
-      const stop = JSON.parse(row.stop_operation) as {
-        operation_id: string;
-        kind: "database.suspend" | "database.hibernate" | "database.delete";
-        generation: number;
-      };
       await storageDrainReservationStatement(c.env.DB, {
         databaseId: row.id,
         operationId: stop.operation_id,
@@ -1107,7 +1169,9 @@ export async function hostStorageLease(
         }) !== null
       ) {
         drain = {
-          ...stop,
+          operation_id: stop.operation_id,
+          kind: stop.kind,
+          generation: stop.generation,
           authority_revision: authority.revision,
           expires_at: Math.min(
             Date.parse(authority.expires_at),
@@ -1132,7 +1196,7 @@ export async function hostStorageLease(
               !current ||
               current.row.error_code !== null ||
               current.row.status === "blocked",
-      desired_state: parkedAuthority ? "running" : row.desired_state,
+      desired_state: presentedRunning ? "running" : row.desired_state,
       node_uid: storage.node_uid,
       volume_group_uuid: storage.volume_group_uuid,
       pool_uuid: storage.pool_uuid,

@@ -1221,7 +1221,7 @@ it("unknown or different-LV old holds cannot share a new startup or overwrite th
   ).toBe(1);
 });
 
-it("a protected4GiB tenant can drain a real suspend/delete intent with zero additional RAM and no startup grant", async () => {
+it("a protected 4 GiB tenant drains a real delete intent with zero additional RAM and no startup grant, and a suspend never drains", async () => {
   const f = await thinFixture(8 * gib, 8 * gib);
   await env.DB.prepare("UPDATE size_classes SET memory_mib=4096 WHERE id=?")
     .bind(f.size)
@@ -1283,17 +1283,15 @@ it("a protected4GiB tenant can drain a real suspend/delete intent with zero addi
       }[];
     };
   };
+  // A sleep never drains: its Pod stays the writer until the stop ends (here the frozen volume is a
+  // protective stop, so not even that), and no storage hold is reserved for it.
   const value = (await host()).databases[0]!;
   expect(value).toMatchObject({
     database_id: created.database.id,
     desired_state: "suspended",
     startup_operation_id: null,
     runtime_authority: null,
-    drain: {
-      operation_id: stop.operation.id,
-      kind: "database.suspend",
-      budget_bytes: 5 * gib,
-    },
+    drain: null,
   });
   expect(
     await env.DB.prepare(
@@ -1304,11 +1302,11 @@ it("a protected4GiB tenant can drain a real suspend/delete intent with zero addi
   ).toBe(memoryBefore);
   expect(
     await env.DB.prepare(
-      "SELECT budget_bytes,storage_budget_bytes FROM database_start_admissions WHERE operation_id=?",
+      "SELECT 1 FROM database_start_admissions WHERE operation_id=?",
     )
       .bind(stop.operation.id)
       .first(),
-  ).toEqual({ budget_bytes: 0, storage_budget_bytes: 5 * gib });
+  ).toBeNull();
   const desired = DesiredResponse.parse(
     await (await request("/agent/v1/desired", f.agent)).json(),
   );
@@ -1329,7 +1327,7 @@ it("a protected4GiB tenant can drain a real suspend/delete intent with zero addi
     )
       .bind(created.database.id)
       .first("n"),
-  ).toBe(2);
+  ).toBe(1);
   const wrong = NodeThinStorageAuthority.parse({
     ...a,
     revision: 4,
@@ -1401,7 +1399,7 @@ it("a protected4GiB tenant can drain a real suspend/delete intent with zero addi
     )
       .bind(created.database.id)
       .first("n"),
-  ).toBe(3);
+  ).toBe(2);
 });
 
 it("the existing hold-ledger migration preserves uncertain and acknowledged RAM rows while zero RAM is stop-only", async () => {

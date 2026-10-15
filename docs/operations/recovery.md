@@ -299,6 +299,15 @@ limits are measured, but a later identity read without those limits ends both it
 grant. A controller rollback withdraws sampling capability; it never relabels a fast sample as an
 inventory proof.
 
+While a thin database's sleep (idle or manual) is under way, the host lease keeps its instance Pod
+the running writer: until the sleep's stop operation of that generation leaves pending or running,
+the entry is `running` with a write token for the one Pod the latest identity proof evidences on the
+volume, and carries no startup grant and no drain. The controller stops PostgreSQL in that Pod; once
+it reports the sleep the entry becomes `suspended` (a parked Pod keeps its token) and the guard may
+freeze the volume the stopped Pod left. Without that evidence or a current write-allowed reading,
+or after the stop timed out, the guard freezes the volume and stops the Pod. Only a deletion still
+drains.
+
 A release that carries the receipt requires current thin write authority from every member that
 takes databases and from every member that already has a selection. Until then that member stays
 Pending, its patch storage check repeats and operation-owned placement stays closed. A
