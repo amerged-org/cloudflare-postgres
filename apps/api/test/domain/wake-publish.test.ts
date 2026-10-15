@@ -33,6 +33,29 @@ afterEach(async () => {
       .bind(id)
       .run();
 });
+/** Posts an observation without waiting for the work it leaves in the execution context. */
+async function observe(
+  agent: string,
+  body: unknown,
+  context: ExecutionContext,
+): Promise<Response> {
+  return createApp().fetch(
+    new Request(
+      `https://${["api", "invalid"].join(".")}/agent/v1/observations`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${agent}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+    ),
+    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join(".") },
+    context,
+  );
+}
+
 /**
  * Holds every execution of the admission snapshot read (the publish's first D1 read) until
  * `release`, on every D1 binding of the isolate (the API request's and the Actor's alike).
@@ -144,21 +167,7 @@ it("the push releases a waiting connection while the admission publish is still 
   const hold = holdSnapshotReads();
   hold.arm();
   const context = createExecutionContext();
-  const response = createApp().fetch(
-    new Request(
-      `https://${["api", "invalid"].join(".")}/agent/v1/observations`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${f.agent}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(readyBody(f, row.power_operation)),
-      },
-    ),
-    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join(".") },
-    context,
-  );
+  const response = observe(f.agent, readyBody(f, row.power_operation), context);
   // The ready state is committed and the snapshot read is held: the Actor's readiness read alone
   // (this region has no snapshot cache) releases the connection, and it needs only the push.
   const released = await Promise.race([
@@ -186,21 +195,7 @@ it("a ready observation is answered while its admission publish is still running
   const hold = holdSnapshotReads();
   hold.arm();
   const context = createExecutionContext();
-  const response = createApp().fetch(
-    new Request(
-      `https://${["api", "invalid"].join(".")}/agent/v1/observations`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${f.agent}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(readyBody(f, row.power_operation)),
-      },
-    ),
-    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join(".") },
-    context,
-  );
+  const response = observe(f.agent, readyBody(f, row.power_operation), context);
   const answered = await Promise.race([
     response.then((value) => value.status),
     sleep(3000).then(() => "stalled"),

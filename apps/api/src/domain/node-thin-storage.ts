@@ -193,7 +193,7 @@ export async function readRegionThinStorage(
   const nodes: NodeThinStorageAuthority[] = [],
     snapshots = new Map<string, (typeof readings)[number]>();
   rows.results.forEach((row, index) => {
-    const current = readings[index];
+    const current = readings[index] ?? null;
     snapshots.set(row.node_id, current);
     const proof = current?.authority ?? current?.reclamation;
     if (proof && (samplingCapable || proof.inventory_observed_at === undefined))
