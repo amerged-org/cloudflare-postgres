@@ -707,15 +707,23 @@ measurement is fresh and below the threshold.
 | `regional_node_cap_reached` | allocated nodes reach `max_nodes` | `cap_warning_enabled` = off |
 | `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed |
 | `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 or etcd backup fails, or none completed for 36 h | fixed |
+| `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed (from the release with migration `0052`) |
+| `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count | fixed (same release) |
+| `thin_storage_blocked` | a node's Thin storage is `blocked`, with its `thin_storage_*` `error_code` or none | fixed (same release) |
+| `database_storage_protected` | a running database has been stopped by storage write protection for 5 minutes | fixed (same release) |
+| `control_cron_stalled`, `control_cron_step_failing` | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs | fixed (same release) |
 
 Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
 disables) set with `PUT /v1/regions/{id}/capacity-policy`. The minute cron evaluates the first
-four regions that have a policy.
+four regions that have a policy; the fixed-rule kinds are evaluated for every region.
 
-The alert kinds cover infrastructure only. There is no alert for one database's failing archive,
-a stale base backup of one database, a Thin `blocked` state or a protective stop (the Go-live
-path's *Alerts* step lists them as open), and an earlier failure in the minute cron silently skips
-alerting.
+Every event carries a short runbook action in `action`. The database kinds are per database but
+one episode per region and kind lists up to 64 databases. Each minute-cron step runs in its own
+failure boundary, so one failing step is logged and counted and alerting still runs; the cron's
+own heartbeat is judged by a Durable Object alarm that does not depend on the cron
+([operator runbook](infrastructure-backups.md#minute-cron-heartbeat-and-watchdog)). Before that
+release there is no alert for one database's archive or base backup, a Thin `blocked` state or a
+protective stop, and an earlier failure in the minute cron silently skips alerting.
 
 The control plane itself is protected by a daily encrypted D1 export and one etcd snapshot per
 region in R2, read back in full ([infrastructure backups](infrastructure-backups.md)); restoring
@@ -913,7 +921,7 @@ outcome and are not replayed.
 | PostgreSQL cluster, backup schedule, retention, `pg_hba` | `apps/native-controller/src/manifests.rs`, `infra/postgres/README.md`, `infra/platform/versions.lock.json` |
 | Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, [README](../../README.md) |
 | Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/native-controller/src/measurements.rs` |
-| Alerts, health | `apps/api/src/domain/{operational-health,infrastructure-alerts}.ts`, `docs/operations/infrastructure-backups.md` |
+| Alerts, health | `apps/api/src/domain/{operational-health,infrastructure-alerts,cron-health}.ts`, `apps/api/src/{cron,cron-watchdog}.ts`, `docs/operations/infrastructure-backups.md` |
 | Recovery, maintenance | `docs/operations/recovery.md`, `docs/operations/fleet-patches.md` |
 | Measured numbers and open steps | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) |
 | Region policy, Thin profile, alert thresholds (installation values) | `GET /v1/regions/{id}/capacity-policy` and `GET /v1/nodes/{id}/storage-profile` of the live installation, not the repository |

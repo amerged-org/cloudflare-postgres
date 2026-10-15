@@ -41,6 +41,21 @@ pins. Missing or changed authority fails the daily run rather than choosing an
 unverified source. Backups use the existing administrator relay capability; this
 change grants no new regional Kubernetes RBAC or Talos credentials to Pods.
 
+Apply migration `0052_cron_heartbeat_and_alert_kinds.sql` with the Worker that
+introduces it, and keep the `CRON_WATCHDOG` Durable Object binding and its migration
+(`new_sqlite_classes: ["CronWatchdog"]`, tag `v4` in `apps/api/wrangler.example.jsonc`;
+use the next unused tag of the deployed configuration) in every deployed configuration:
+the [cron watchdog](#minute-cron-heartbeat-and-watchdog) reports a stopped or failing
+cron from that class's alarm. A Worker without the binding keeps running and logs
+`cron_watchdog_unavailable` once per run; a Worker without the table logs
+`cron_heartbeat_failed` and still runs every step. After the deploy, read
+`GET /v1/operational-health?scope=regions`: `cron.last_completed_at` must advance each
+minute and `cron.watchdog_checked_at` must follow. The watchdog is armed by the first cron
+run after the deploy, so a cron that never runs again after it is not reported. Rolling the
+Worker back below this release first needs
+`DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','database_storage_protected','control_cron_stalled','control_cron_step_failing')`,
+because the earlier release's health route does not parse those kinds.
+
 Use the administrator API, replacing every placeholder with this installation's
 actual values:
 
@@ -63,9 +78,12 @@ Content-Type: application/json
 `GET /v1/infrastructure-backups` returns the latest attempt of the latest UTC day
 with its per-artifact hashes/byte counts, R2 object keys and error codes, and current
 backup freshness. It returns no private client configuration, signed export URL or
-encryption key. Earlier attempts of that day stay in D1 only. Changing the
-configuration revision or disabling backups revokes an unfinished run's capability.
-The existing operator Kubernetes API still requires administrator authorization.
+encryption key. Earlier attempts of that day stay in D1 only. Disabling backups, or
+changing the D1 account, database or archive region, revokes an unfinished run's
+capability. Changing only the alert sender or recipient never does: the update carries
+every valid pending or running run to the new revision in the same transaction, and a
+run the cron creates while the update is in flight takes the revision in the statement
+that inserts it. The existing operator Kubernetes API still requires administrator authorization.
 The internal backup WebSocket instead accepts only an expiring capability bound to
 one current run, artifact, node UID, cluster UID and custody revision. Both paths
 recheck current Cloudflare authority and the operator checks actual Kubernetes,
@@ -270,6 +288,130 @@ UUID and payload. Recovering clears the episode; a new failure creates a new UUI
 Webhook receivers must deduplicate this identifier durably. Email delivery follows
 Resend's idempotency retention; an unresolved delivery must be investigated through
 the API and the operator's mail account.
+
+## Alert kinds and runbook actions
+
+One durable episode exists per region and kind. Every event's `action` field carries the
+action below (`INFRA_ALERT_ACTIONS` in `packages/contracts`), and
+`GET /v1/operational-health?scope=regions` lists each region's episodes and the cron
+heartbeat. An unknown measurement never starts an episode and never clears an active
+one: a missing or stale sample, an unknown archive or backup state and a node that has not
+reported keep things as they are. A new episode is delivered once and retried with the
+same event ID while it stays active; a cleared episode sends nothing.
+
+| Kind | Fires when | Rule | Action |
+| --- | --- | --- | --- |
+| `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
+| `regional_node_cap_reached` | allocated nodes reached `max_nodes` | `cap_warning_enabled` with a finite `max_nodes` | Raise `max_nodes` in the capacity policy or free a slot |
+| `regional_node_ram_warning` | a node's ten-minute RAM average reaches the threshold | `node_ram_warning_threshold_ppm` | Reduce awake databases on the listed node or add capacity |
+| `regional_node_cpu_warning` | a node's ten-minute CPU average reaches the threshold | `node_cpu_warning_threshold_ppm`; unknown without the native controller's CPU samples | Reduce awake databases on the listed node or add capacity |
+| `regional_node_storage_warning` | the node's thin-pool data or metadata fill, otherwise its volume-group allocation, reaches the threshold | `node_storage_warning_threshold_ppm` | Grow the pool or free space; see Thin storage admission in [recovery](recovery.md) |
+| `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed; never-observed nodes are ignored | Check the server and its regional controller; if it is gone follow the lost-node runbook |
+| `infrastructure_backup_failed` | the latest daily D1 or etcd attempt failed | fixed | Read `GET /v1/infrastructure-backups` for the artifact's `error_code`; same-day retries run by themselves |
+| `infrastructure_backup_stale` | no complete daily backup for 36 h | fixed | Read the same route and the cron heartbeat; fix the cause before the next 00:00Z run |
+| `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability, archive credentials and the backup plugin; WAL accumulates on the volume meanwhile |
+| `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
+| `thin_storage_blocked` | a node's Thin storage status is `blocked` | fixed | With a `thin_storage_*` code, repeat the node's storage-profile PUT with the current `expected_revision` after the lease expires; without one, free pool headroom |
+| `database_storage_protected` | a running database has been stopped by storage write protection for at least 5 minutes | fixed | PGCF resumes it once Thin write authority is current; look at `thin_storage_blocked` and the node's storage if it persists |
+| `control_cron_stalled` | no run of the minute cron completed for 300 s | fixed | Check the Worker's cron trigger and logs; see the cron heartbeat below |
+| `control_cron_step_failing` | a cron step failed in each of its last 5 completed runs | fixed | Read the Worker logs for `cron_step_failed` with the step named in `cron.failing_steps` |
+
+Rules of the database and Thin storage kinds:
+
+- **WAL archive.** Only a database that is running, awake and `ready` is judged; its
+  `health.archiving` must be `failing` (the controller reports that for a stalled queue,
+  a backlog of 32 or more segments, or CNPG's `ContinuousArchiving` false). `unknown` and
+  `ok` never fire. A database that is hibernated, suspended or deleted cannot archive
+  and is left out.
+- **Base backup.** The 36 h count starts at the latest of the last completed base backup,
+  the database's placement (`created`) and its last wake (`woke`, written by every resume
+  and wake). A `ready` event is not a wake: any generation bump, such as a role change or a
+  resize, writes one. The daily 03:00 UTC backup skips a hibernated cluster, so a database
+  that slept through it is not reported until it has been awake 36 h without a backup. The
+  agent's backup report must be fresh (at most 180 s old) and `ok` with a completion time,
+  or `failing`; a hibernated database and an unknown report are excluded.
+- **Thin storage.** `blocked` with a `thin_storage_*` `error_code` needs an operator
+  (identity or qualification refused); `blocked` with `error_code: null` means write
+  authority is withheld for pool headroom and returns by itself when headroom does. A
+  node that is selected or qualifying again keeps the episode until it is `ready`.
+- **Protective stop.** `storage_protected_at` is set for the current generation and at
+  least 5 minutes old. The episode ends when the named databases are no longer protected.
+- **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
+  16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the
+  episode with a new event that lists the current subjects (this also holds for
+  `regional_node_stale`, so a lost node does not hide a node that goes stale later); a
+  listed subject that recovers and fails again adds none.
+- **Unknown backup health.** `infrastructure_backup_failed` and
+  `infrastructure_backup_stale` keep an active episode while an artifact's health is
+  unknown (for example its custody could not be read) and while the backup health cannot
+  be read at all.
+
+## Minute cron heartbeat and watchdog
+
+The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
+`infrastructure_backup_dispatch`, then `admission_recovery`, `pool_role_recovery`,
+`resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `idempotency_purge`,
+`region_hints`, `database_actors`, `usage`, `node_capacity`, `retained_archives`,
+`fleet_updates` and `fleet_rollouts`. Alerting needs only D1 and a bounded send, so it
+leads, and the daily backup dispatch follows ahead of the steps that call out to other
+systems: a step that fails, is slow or exhausts the invocation's D1 statement budget cannot
+starve them. A step that hangs still holds back the steps after it in that run; the stall
+alarm reports it.
+
+Each step runs in its own failure boundary. A step that throws is logged as
+`cron_step_failed` (`step`, `error_code` and a redacted `message`; the heartbeat and the
+alerts carry the code only), counted in the heartbeat and returned in the run's
+`step_failures`, and the steps after it still run. A region whose capacity decision or
+alert evaluation fails does not stop the other regions, and one kind that fails to evaluate
+does not stop the other kinds of its region. A run spends at most 20 s sending
+notifications; the rest stay unclaimed, are logged as `infrastructure_alert_deferred` and
+are sent by the next run. The Worker's own cron outcome stays successful when steps fail:
+read `cron` in the health route and the alarms, not the cron trigger's error rate.
+
+The run records its heartbeat in D1 (`cron_heartbeat`, one row): `started_at` when it
+begins and `completed_at` once every step was attempted, with each failing step's
+consecutive failed runs. `cron` in `GET /v1/operational-health?scope=regions` shows it
+with a `status`:
+
+| `status` | Meaning |
+| --- | --- |
+| `ok` | a run completed within 300 s and no step failed in each of its last 5 runs |
+| `failing` | a step failed in each of its last 5 completed runs (`failing_steps`) |
+| `stalled` | no run completed for more than 300 s |
+| `unknown` | no run has been recorded yet |
+
+The `CronWatchdog` Durable Object judges that heartbeat once a minute from its own alarm
+and raises `control_cron_stalled` and `control_cron_step_failing` in every region. It is
+independent of the cron because the cron does not schedule it: the cron only arms the
+alarm (idempotently, at the start of each run), and every alarm schedules the next one
+before it evaluates anything. It therefore keeps firing when the Worker's cron trigger is
+removed by a deployment, when a step hangs and runs never complete, and when every step
+fails. It does not cover the Worker being undeployed or D1 being unreachable. Its
+evaluations are visible as `watchdog_checked_at`; a value that stops advancing means the
+alarm chain is not running (check the `CRON_WATCHDOG` binding and its `v4` migration).
+While the cron is stalled its step counters are those of its last completed run, so a
+`control_cron_step_failing` episode is kept and neither started nor cleared.
+
+Reading a stall: `last_started_at` recent with `last_completed_at` old means runs begin
+but do not finish (a step hangs; the invocation's trace shows which call is pending, and
+alerting and backup dispatch keep running because they come first), both old means no run
+starts (the cron trigger or the deployment).
+
+## Proving delivery
+
+The notification path is proven by one real alarm rather than a test endpoint. Set
+`RESEND_API_KEY` as a Worker secret, `notification_sender` on a domain verified in the
+Resend account and `notification_recipient` through `PUT /v1/infrastructure-backups/config`
+(this does not touch a running backup), then let any episode arm: an existing active
+undelivered one is sent by the next minute run, or read a region's complete policy with
+`GET /v1/regions/{id}/capacity-policy`, send it back with `node_ram_warning_threshold_ppm`
+set to `1`, wait for the email and send the original object back (a PUT resets omitted
+fields that have a default). `delivered_at` in
+`GET /v1/operational-health?scope=regions` then shows the Resend API's 2xx acceptance. A refused or timed-out attempt is logged as
+`infrastructure_alert_delivery_failed` with the HTTP status or a `timeout`/`transport`
+reason: 401 is usually an invalid API key, 403 or 422 a sender that is not on a verified
+domain or is malformed, and 429 Resend's rate limit; the episode is retried with the same
+event ID at least 60 s later.
 
 ## Offline recovery custody
 

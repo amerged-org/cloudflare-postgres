@@ -244,6 +244,18 @@ while a listed node still exceeds; otherwise the crossing replaces the episode w
 The episode clears only after every listed node is fresh and below the threshold, or lost; a
 missing measurement keeps it.
 
+Fixed-rule alarms need no threshold and are evaluated for every region: a stale or lost node, a
+failing or stale daily infrastructure backup, a running database whose WAL archive is failing
+(`database_archive_failing`), an awake database with no completed base backup within 36 hours of
+awake time (`database_base_backup_stale`; hibernated databases are excluded), a blocked Thin
+storage node (`thin_storage_blocked`) and a database held in a protective stop for five minutes
+(`database_storage_protected`). Each minute-cron step runs in its own failure boundary, and the
+`CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) judges the cron's heartbeat from its own
+alarm, independently of the cron trigger, raising `control_cron_stalled` and
+`control_cron_step_failing`. Every event carries a short runbook `action`; the
+[alert runbook](docs/operations/infrastructure-backups.md#alert-kinds-and-runbook-actions)
+lists each kind's rule and action.
+
 Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
 `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.
 The adopter's receiving service verifies the bearer token and durably deduplicates the
