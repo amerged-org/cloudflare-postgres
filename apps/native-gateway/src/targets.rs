@@ -27,9 +27,10 @@ pub struct TargetIdentity {
     pub container_id: Option<String>,
     pub ca: Option<CaIdentity>,
     pub pool: Option<PoolIdentity>,
-    /// The writer is the controller's attested Pod before the kubelet reports it Ready. It is
-    /// evidence of how the writer was chosen, never part of its identity: a session started on
-    /// it continues when the kubelet's report arrives.
+    /// The writer is admitted on the controller's attestation instead of the kubelet's report:
+    /// its endpoint, or its `postgres` container, is not yet reported Ready. It is evidence of
+    /// how the writer was chosen, never part of its identity: a session started on it continues
+    /// when the kubelet's report arrives.
     pub unready: bool,
 }
 /// The immutable Cloudflare holder scope. Current CA and route revision live in the admission
@@ -96,6 +97,50 @@ pub struct LegacyStorageBinding {
     pub physical_generation: u64,
     pub volume_identity: Value,
 }
+/// How long the controller's attestation may stand in for the kubelet's report, counted from the
+/// first time this gateway relied on it for a Pod and container. It is the bound a connection has
+/// to complete its startup: a Pod the kubelet has not reported Ready within the time a
+/// connection is given to start is routed as a Ready endpoint only. The bound is needed because
+/// the report cannot always have been seen: a Pod that never becomes Ready, or one that went not
+/// Ready before this gateway started, leaves no Ready for the attestation to be spent on.
+const ATTESTED_ROUTE_BOUND: Duration = crate::transport::STARTUP_BOUND;
+
+/// What this gateway has itself seen of the controller's current attestation of one database's
+/// Pod, kept per Pod, container and revision: an attestation of any other starts again. It is the
+/// gateway's own memory and part of no identity, the controller publishes nothing for it.
+struct Witness {
+    pod_uid: String,
+    container_id: String,
+    generation: u64,
+    /// The first time an identity rested on the attestation instead of the kubelet's report.
+    relied_since: Option<Instant>,
+    /// The kubelet reported that Pod's endpoint and `postgres` container Ready. The attestation
+    /// was for the wake: from then on only the ordinary rules apply to that Pod and container.
+    ready_seen: bool,
+}
+impl Witness {
+    fn of(target: &AdmissionTarget) -> Self {
+        Self {
+            pod_uid: target.pod_uid.clone(),
+            container_id: target.container_id.clone(),
+            generation: target.generation,
+            relied_since: None,
+            ready_seen: false,
+        }
+    }
+    fn is(&self, target: &AdmissionTarget) -> bool {
+        self.pod_uid == target.pod_uid
+            && self.container_id == target.container_id
+            && self.generation == target.generation
+    }
+    /// Whether the attestation may still stand in for the kubelet's report.
+    fn open(&self, now: Instant) -> bool {
+        !self.ready_seen
+            && self
+                .relied_since
+                .is_none_or(|since| now.saturating_duration_since(since) < ATTESTED_ROUTE_BOUND)
+    }
+}
 #[derive(Default)]
 pub struct Targets {
     pool_enabled: bool,
@@ -108,6 +153,7 @@ pub struct Targets {
     pool_history: HashMap<String, Value>,
     maps: HashMap<String, Value>,
     gates: HashMap<String, StorageGate>,
+    witnesses: HashMap<String, Witness>,
     // The existing gate clears its current claims when verification fails. Retain only the
     // finite reason from that same evaluation, never an additional authorization decision.
     authority_refusals: HashMap<String, TargetUnavailable>,
@@ -250,10 +296,7 @@ impl Targets {
         node: &str,
         attested: Option<&str>,
     ) -> Option<String> {
-        if !self
-            .pods_observed
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
-        {
+        if !self.pods_synchronized() {
             return None;
         }
         let pod = self.pods.get(pod_uid)?;
@@ -329,6 +372,42 @@ impl Targets {
         let target = admission_target(&fence["data"], &intent).ok()??;
         (target.generation == intent.revision).then_some(target)
     }
+    /// Whether the attestation may still stand in for the kubelet's report of its Pod: not once
+    /// this gateway has seen that Pod and container Ready at that revision, and not after the
+    /// bound. A new Pod, container or revision is a new attestation.
+    fn may_stand_in(&self, database: &str, target: &AdmissionTarget) -> bool {
+        self.witnesses
+            .get(database)
+            .is_none_or(|seen| !seen.is(target) || seen.open(Instant::now()))
+    }
+    /// Notes in the witness what the identity just derived shows of the attestation the fence
+    /// publishes: that the kubelet reported its Pod and container Ready, or that the
+    /// attestation stood in for the report.
+    fn witness(
+        &mut self,
+        database: &str,
+        published: &AdmissionTarget,
+        identity: Option<&TargetIdentity>,
+    ) {
+        let seen = self
+            .witnesses
+            .entry(database.into())
+            .or_insert_with(|| Witness::of(published));
+        if !seen.is(published) {
+            *seen = Witness::of(published);
+        }
+        let Some(identity) = identity.filter(|identity| {
+            identity.pod_uid == published.pod_uid
+                && identity.container_id.as_deref() == Some(published.container_id.as_str())
+        }) else {
+            return;
+        };
+        if identity.unready {
+            seen.relied_since.get_or_insert_with(Instant::now);
+        } else {
+            seen.ready_seen = true;
+        }
+    }
     /// Whether this Pod runs, in the watched cluster state, the container and TLS authority the
     /// controller attested: nothing else is accepted before the kubelet reports it Ready.
     fn runs_attested(
@@ -352,6 +431,12 @@ impl Targets {
         [self.slices_observed, self.maps_observed]
             .iter()
             .all(|at| at.is_some_and(|at| at.elapsed() < Duration::from_secs(70)))
+    }
+    /// Whether the Pod watch is current. A container the kubelet has not reported ready, and so
+    /// any v4 route, rests on it: a gateway without it cannot admit the connection of a wake.
+    pub fn pods_synchronized(&self) -> bool {
+        self.pods_observed
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
     }
     pub fn replace(
         &mut self,
@@ -516,9 +601,14 @@ impl Targets {
         }
     }
     /// The writer's address, Pod UID and node, and whether its endpoint is Ready. A Pod the
-    /// kubelet has not reported Ready is the writer only when it is the one the controller
-    /// attested, nothing else is a candidate, and it runs the attested container.
-    fn endpoint(&self, database: &str) -> Result<(IpAddr, String, String, bool), &'static str> {
+    /// kubelet has not reported Ready is the writer only when it is the Pod of `attested` (the
+    /// attestation that may stand in for the report), nothing else is a candidate, and it runs
+    /// the attested container.
+    fn endpoint(
+        &self,
+        database: &str,
+        attested: Option<&AdmissionTarget>,
+    ) -> Result<(IpAddr, String, String, bool), &'static str> {
         // A pool holder is distinct from CNPG. Disabled, malformed or non-serving pool authority
         // never admits the CNPG Pod that may still have a stale Ready EndpointSlice.
         if self
@@ -540,7 +630,6 @@ impl Targets {
             return Err("pool holder disappeared");
         }
         let namespace = format!("pgcf-db-{database}");
-        let attested = self.attested(database);
         let mut endpoints = BTreeMap::new();
         // The attested Pod while not Ready, and the other endpoints not Ready either.
         let mut waiting = BTreeMap::new();
@@ -566,7 +655,7 @@ impl Targets {
                 let reference = &endpoint["targetRef"];
                 let ready = endpoint["conditions"]["ready"] == true;
                 if !ready
-                    && !attested.as_ref().is_some_and(|target| {
+                    && !attested.is_some_and(|target| {
                         reference["kind"] == "Pod"
                             && reference["namespace"] == namespace
                             && reference["uid"] == target.pod_uid
@@ -615,7 +704,7 @@ impl Targets {
             let mut waiting = waiting.into_keys();
             return match (attested, waiting.next(), waiting.next(), others) {
                 (Some(attested), Some((uid, node, address)), None, 0)
-                    if self.runs_attested(database, &attested, &uid, address, &node) =>
+                    if self.runs_attested(database, attested, &uid, address, &node) =>
                 {
                     Ok((address, uid, node, false))
                 }
@@ -1012,9 +1101,54 @@ impl Targets {
             self.maps.contains_key(&format!("storage-{database}"))
                 || self.maps.contains_key(&format!("gateway-fence-{database}"))
         });
+        self.witnesses.retain(|database, _| {
+            self.maps.contains_key(&format!("storage-{database}"))
+                || self.maps.contains_key(&format!("gateway-fence-{database}"))
+        });
         for database in names {
             self.refresh_gate(&database, trust);
         }
+    }
+    /// The CNPG writer: the Pod of the Ready endpoint, or the controller's attested Pod while the
+    /// kubelet has not reported it. What the identity shows of the attestation is kept in the
+    /// witness, which is what ends the attestation's standing in for the report.
+    fn writer_identity(&mut self, database: &str) -> Result<TargetIdentity, &'static str> {
+        let published = self.attested(database);
+        let usable = published
+            .as_ref()
+            .filter(|target| self.may_stand_in(database, target));
+        let identity =
+            self.endpoint(database, usable)
+                .and_then(|(address, pod_uid, node, ready)| {
+                    // The attestation of this Pod alone can vouch for its container.
+                    let attested = usable.filter(|target| target.pod_uid == pod_uid);
+                    let reported = self.runtime_container(&pod_uid, address, &node, None);
+                    let container_id = match attested {
+                        Some(target) => self.runtime_container(
+                            &pod_uid,
+                            address,
+                            &node,
+                            Some(&target.container_id),
+                        ),
+                        None => reported.clone(),
+                    };
+                    Ok(TargetIdentity {
+                        address,
+                        // Not reported Ready by the kubelet: its endpoint, or a container that only
+                        // the attestation accepts.
+                        unready: !ready || container_id != reported,
+                        container_id,
+                        ca: self.current_ca(database),
+                        storage: self.binding(database, &pod_uid, &node)?,
+                        pod_uid,
+                        node,
+                        pool: None,
+                    })
+                });
+        if let Some(published) = &published {
+            self.witness(database, published, identity.as_ref().ok());
+        }
+        identity
     }
     fn refresh_gate(&mut self, database: &str, trust: Option<&StorageTrust>) {
         let now = control::now();
@@ -1027,28 +1161,7 @@ impl Targets {
         let identity = match record {
             Ok(Some(record)) => self.pool_identity(database, &record),
             Err(error) => Err(error),
-            Ok(None) => self
-                .endpoint(database)
-                .and_then(|(address, pod_uid, node, ready)| {
-                    let attested = self
-                        .attested(database)
-                        .filter(|target| target.pod_uid == pod_uid);
-                    Ok(TargetIdentity {
-                        address,
-                        container_id: self.runtime_container(
-                            &pod_uid,
-                            address,
-                            &node,
-                            attested.as_ref().map(|target| target.container_id.as_str()),
-                        ),
-                        ca: self.current_ca(database),
-                        storage: self.binding(database, &pod_uid, &node)?,
-                        pod_uid,
-                        node,
-                        pool: None,
-                        unready: !ready,
-                    })
-                }),
+            Ok(None) => self.writer_identity(database),
         };
         if !self.maps.contains_key(&format!("storage-{database}"))
             && !self.maps.contains_key(&format!("gateway-fence-{database}"))
@@ -1056,6 +1169,7 @@ impl Targets {
             self.identities.remove(database);
             self.gates.remove(database);
             self.authority_refusals.remove(database);
+            self.witnesses.remove(database);
             return;
         }
         if self.gates.len() >= 4000 && !self.gates.contains_key(database) {
@@ -1128,6 +1242,17 @@ impl Targets {
         } else if !self.synchronized() {
             return Err(TargetUnavailable::DiscoveryUnavailable);
         }
+        // The attestation ends with the kubelet's report or with its bound, and no event of the
+        // cluster marks the bound: it is read here, for every admission and every check of a
+        // session.
+        if target.unready
+            && !self
+                .witnesses
+                .get(database)
+                .is_some_and(|seen| seen.open(Instant::now()))
+        {
+            return Err(TargetUnavailable::WriterIdentityUnavailable);
+        }
         if target.storage.as_ref().is_some_and(|binding| {
             !self
                 .gates
@@ -1185,10 +1310,7 @@ impl Targets {
             }
             return Ok(target);
         }
-        if !self
-            .pods_observed
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
-        {
+        if !self.pods_synchronized() {
             // The Pod watch is what recognized a writer the kubelet has not reported Ready.
             if target.unready {
                 return Err(TargetUnavailable::WriterIdentityUnavailable);
@@ -1229,10 +1351,7 @@ impl Targets {
             || current.node != target.node
             || (target.container_id.is_some()
                 && (current.container_id != target.container_id
-                    || (current.pool.is_none()
-                        && !self
-                            .pods_observed
-                            .is_some_and(|at| at.elapsed() < Duration::from_secs(70)))))
+                    || (current.pool.is_none() && !self.pods_synchronized())))
             || (target.pool.is_none() && target.ca.is_some() && current.ca != target.ca)
             || current.pool != target.pool
         {
@@ -1510,7 +1629,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state
-                .endpoint("aaaaaaaaaaaaaaaaaaaa")
+                .endpoint("aaaaaaaaaaaaaaaaaaaa", None)
                 .unwrap()
                 .0
                 .to_string(),
@@ -1520,14 +1639,14 @@ mod tests {
         state
             .replace("endpointslices", &[object.clone()], None)
             .unwrap();
-        assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa").is_err());
+        assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
         object["endpoints"][0]["conditions"]["ready"] = true.into();
         let mut replacement = slice("33333333-3333-4333-8333-333333333333", "10.0.0.8");
         replacement["metadata"]["uid"] = "44444444-4444-4444-8444-444444444444".into();
         state
             .replace("endpointslices", &[object, replacement], None)
             .unwrap();
-        assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa").is_err());
+        assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
     }
     #[test]
     fn endpoint_identity_cannot_be_inferred_from_a_certificate_or_claim() {
@@ -1535,7 +1654,7 @@ mod tests {
         let mut object = slice("22222222-2222-4222-8222-222222222222", "10.0.0.7");
         object["endpoints"][0]["targetRef"]["uid"] = Value::Null;
         state.replace("endpointslices", &[object], None).unwrap();
-        assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa").is_err());
+        assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
     }
     #[test]
     fn public_or_loopback_writer_addresses_are_never_dialed() {
@@ -1548,7 +1667,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa").is_err());
+            assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
         }
     }
     #[test]
@@ -2186,7 +2305,8 @@ mod tests {
     }
     #[test]
     fn an_established_unready_target_fails_permits_on_every_withdrawal() {
-        let withdrawals: [(&str, fn(&mut Wake)); 5] = [
+        type Withdrawal = (&'static str, fn(&mut Wake));
+        let withdrawals: [Withdrawal; 5] = [
             ("the fence quiesces at the next revision", |wake| {
                 wake.edit("intent.json", |intent| {
                     intent["mode"] = "quiesce".into();
@@ -2223,5 +2343,73 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+    /// The controller's attestation of the wake fixture's Pod, as the fence carries it.
+    fn wake_target() -> AdmissionTarget {
+        serde_json::from_value(json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":wake_id(3),"container_id":"a".repeat(64),"ca_secret_uid":wake_id(21),"ca_secret_resource_version":"81","ca_sha256":sha256_hex(WAKE_CA),"tls_server_name":format!("database-rw.pgcf-db-{WAKE}.svc")})).unwrap()
+    }
+    #[test]
+    fn the_attestation_stands_in_until_ready_is_seen_or_the_bound_since_its_first_use() {
+        let start = Instant::now();
+        let mut seen = Witness::of(&wake_target());
+        assert!(seen.is(&wake_target()));
+        let mut next = wake_target();
+        next.generation = 8;
+        assert!(!seen.is(&next));
+        // Nothing counts before an identity rested on it.
+        assert!(seen.open(start + Duration::from_secs(3600)));
+        seen.relied_since = Some(start);
+        assert!(seen.open(start + ATTESTED_ROUTE_BOUND - Duration::from_millis(1)));
+        assert!(!seen.open(start + ATTESTED_ROUTE_BOUND));
+        // The kubelet's report spends it at once, whatever the time.
+        seen.relied_since = None;
+        seen.ready_seen = true;
+        assert!(!seen.open(start));
+    }
+    #[test]
+    fn an_attestation_the_kubelet_never_confirms_stops_routing_after_the_bound() {
+        let mut wake = Wake::armed();
+        let target = wake.route().unwrap();
+        assert!(target.unready);
+        assert!(wake.state.permits(WAKE, &target, control::now()));
+        // This gateway has relied on the attestation for as long as a connection has to start,
+        // and no event of the cluster marks that moment.
+        wake.state.witnesses.get_mut(WAKE).unwrap().relied_since =
+            Instant::now().checked_sub(ATTESTED_ROUTE_BOUND + Duration::from_millis(1));
+        assert!(wake.state.witnesses[WAKE].relied_since.is_some());
+        assert!(wake.route().is_err());
+        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        // A list, an event of the Pod or a flap of the report does not count it again.
+        wake.apply();
+        assert!(wake.route().is_err());
+        let pod = wake.pods[0].clone();
+        wake.state
+            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .unwrap();
+        assert!(wake.route().is_err());
+        // The kubelet's report routes the Pod as any Ready endpoint, whatever the attestation.
+        wake.kubelet(true);
+        wake.apply();
+        let ready = wake.route().unwrap();
+        assert!(!ready.unready);
+        assert!(wake.state.permits(WAKE, &ready, control::now()));
+        // ... and it is not an unready writer again for the attestation it was spent on.
+        wake.kubelet(false);
+        wake.apply();
+        assert!(wake.route().is_err());
+    }
+    #[test]
+    fn the_next_attestation_of_the_same_pod_starts_its_own_bound() {
+        let mut wake = Wake::armed();
+        wake.state.witnesses.get_mut(WAKE).unwrap().relied_since =
+            Instant::now().checked_sub(ATTESTED_ROUTE_BOUND + Duration::from_millis(1));
+        wake.apply();
+        assert!(wake.route().is_err());
+        wake.edit("intent.json", |intent| intent["revision"] = 8.into());
+        wake.edit("admission_target", |target| target["generation"] = 8.into());
+        wake.apply();
+        let target = wake.route().unwrap();
+        assert!(target.unready);
+        assert!(wake.state.permits(WAKE, &target, control::now()));
     }
 }

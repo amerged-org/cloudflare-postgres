@@ -42,6 +42,8 @@ use tokio_tungstenite::{
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type WebSocket = WebSocketStream<BudgetedStream>;
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
+/// The time a connection has to send its StartupMessage and have its writer dialled.
+pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
 pub struct Config {
     pub region: String,
     pub keyring: Keyring,
@@ -424,7 +426,7 @@ pub async fn serve_socket(
     stages.accepted = Some(Instant::now());
     drop(handshake_permit);
     let result = tokio::select! {
-        result=timeout(Duration::from_secs(10),startup(&mut websocket,&claims,&session,epoch,&mut stages))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        result=timeout(STARTUP_BOUND,startup(&mut websocket,&claims,&session,epoch,&mut stages))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
         _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
