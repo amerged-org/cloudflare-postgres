@@ -505,13 +505,21 @@ pub(crate) const DEPENDENCIES_QUERY: &str = "SELECT count(*) FROM pg_catalog.pg_
 pub(crate) const TERMINATE_QUERY: &str = "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1 AND pid <> pg_catalog.pg_backend_pid()";
 /// The sessions of a role that are still there.
 pub(crate) const SESSIONS_QUERY: &str = "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE usename = $1 AND pid <> pg_catalog.pg_backend_pid()";
+/// The data directory a postmaster runs on: the system identifier of its `pg_control` (fixed by
+/// `initdb`, the same for a clone of the cluster) and the timeline of its latest checkpoint. Both
+/// functions answer any role.
+pub const SERVER_IDENTITY_QUERY: &str = "SELECT (SELECT system_identifier FROM pg_catalog.pg_control_system())::pg_catalog.text AS system_identifier,
+ (SELECT timeline_id FROM pg_catalog.pg_control_checkpoint())::pg_catalog.int4 AS timeline";
 /// The readiness of a resumed Pod by SQL: its database and TLS, whether it is a primary, which
-/// Pod answers, and how long ago its postmaster started on the server's own clock.
+/// Pod answers, how long ago its postmaster started on the server's own clock, and the data
+/// directory it runs on (see `SERVER_IDENTITY_QUERY`).
 pub const ACCEPTING_QUERY: &str = "SELECT pg_catalog.current_database() AS database,
  pg_catalog.pg_is_in_recovery() AS recovery,
  (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,
  pg_catalog.host(pg_catalog.inet_server_addr()) AS server_address,
- (pg_catalog.date_part('epoch', pg_catalog.clock_timestamp() - pg_catalog.pg_postmaster_start_time()) * 1000)::pg_catalog.int8 AS postmaster_age_ms";
+ (pg_catalog.date_part('epoch', pg_catalog.clock_timestamp() - pg_catalog.pg_postmaster_start_time()) * 1000)::pg_catalog.int8 AS postmaster_age_ms,
+ (SELECT system_identifier FROM pg_catalog.pg_control_system())::pg_catalog.text AS system_identifier,
+ (SELECT timeline_id FROM pg_catalog.pg_control_checkpoint())::pg_catalog.int4 AS timeline";
 
 #[cfg(test)]
 mod tests {

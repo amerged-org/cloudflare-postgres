@@ -10,8 +10,8 @@ use crate::{
     kubernetes::{Kubernetes, bounded},
     manifests, postgres,
     power::{
-        Basis, ParkedWake, PowerCoordinator, PrepareRunning, Sleep, desired_power, fenced,
-        runs_wake,
+        Basis, ParkedWake, PowerCoordinator, PrepareRunning, Sleep, SystemIdentity, desired_power,
+        fenced, runs_wake,
     },
     timing,
 };
@@ -582,14 +582,16 @@ fn ca_bytes(secret: &Value, cluster: &Value) -> Result<Vec<u8>, Error> {
 }
 /// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster: the maintenance
 /// role connects to the Pod's own address under the tenant's TLS name and finds the right
-/// database, a primary, TLS, this Pod, and a postmaster that started after the unfence was sent
-/// (`started`). Polls until `started` plus `budget`; `None` means not within the window, and the
-/// answer is the session that proved it: the checks that follow ask their questions in it.
+/// database, a primary, TLS, this Pod, the data directory the Pod was parked with (`system`), and
+/// a postmaster that started after the unfence was sent (`started`). Polls until `started` plus
+/// `budget`; `None` means not within the window, and the answer is the session that proved it:
+/// the checks that follow ask their questions in it.
 async fn accepting(
     db: &Value,
     ca: &[u8],
     ip: &str,
     socket: std::net::SocketAddr,
+    system: &SystemIdentity,
     started: std::time::Instant,
     budget: Duration,
 ) -> Result<Option<postgres::Session>, Error> {
@@ -626,6 +628,7 @@ async fn accepting(
                 && !row.try_get::<_, bool>("recovery")?
                 && row.try_get::<_, bool>("tls")?
                 && row.try_get::<_, String>("server_address")? == ip
+                && SystemIdentity::of(row).as_ref() == Some(system)
                 && (0..=since.saturating_add(250)).contains(&age);
             Ok(current.then_some(session))
         };
@@ -1029,7 +1032,16 @@ impl Reconciler {
             return Ok(Some(session));
         }
         let socket = self.power.pod_socket(ip)?;
-        accepting(db, ca, ip, socket, wake.started, self.accept_budget).await
+        accepting(
+            db,
+            ca,
+            ip,
+            socket,
+            &wake.system,
+            wake.started,
+            self.accept_budget,
+        )
+        .await
     }
     /// Starts the poll of PostgreSQL of the resumed Pod where the unfence was sent, concurrently
     /// with everything the pass does meanwhile. The authority of the Cluster and the address of
@@ -1048,7 +1060,7 @@ impl Reconciler {
             return None;
         }
         let (k8s, db, ns) = (self.k8s.clone(), db.clone(), namespace(db));
-        let (started, budget) = (wake.started, self.accept_budget);
+        let (system, started, budget) = (wake.system.clone(), wake.started, self.accept_budget);
         let socket = self.power.pod_socket(&ip).ok()?;
         Some(Accepting(tokio::spawn(async move {
             let secret = k8s
@@ -1056,7 +1068,7 @@ impl Reconciler {
                 .await?
                 .ok_or("CNPG CA secret disappeared")?;
             let ca = ca_bytes(&secret, &cluster)?;
-            Ok(accepting(&db, &ca, &ip, socket, started, budget)
+            Ok(accepting(&db, &ca, &ip, socket, &system, started, budget)
                 .await?
                 .map(|session| (session, ca, ip)))
         })))

@@ -293,6 +293,29 @@ async fn a_resumed_pod_is_not_published_on_an_answer_that_is_not_its_own() {
 }
 
 #[tokio::test]
+async fn a_postmaster_of_another_data_directory_is_not_proof_whatever_address_it_answers_at() {
+    // `inet_server_addr()` is the address that was dialled, so the Pod's address says nothing of
+    // the data directory the postmaster runs on. The sleep recorded the system identifier and the
+    // timeline of `pg_control`; the postmaster that answers must have the same.
+    for (what, change) in [
+        ("system identifier", "7999999999999999999"),
+        ("timeline", "2"),
+    ] {
+        let w = woken().await;
+        {
+            let mut sql = w.sql.lock().unwrap();
+            if what == "timeline" {
+                sql.timeline = change.parse().unwrap();
+            } else {
+                sql.system_identifier = change.into();
+            }
+        }
+        let observed = reconcile(&w).await;
+        unpublished(&w, &observed, what);
+    }
+}
+
+#[tokio::test]
 async fn a_resumed_pod_whose_postgres_does_not_answer_is_not_published() {
     let w = woken().await;
     w.stop_postgres();
@@ -704,6 +727,10 @@ fn resumed(restarts: Option<u64>) -> ParkedWake {
         sidecar_container_id: "containerd://b".into(),
         postgres_restarts: restarts,
         pod_ip: None,
+        system: crate::power::SystemIdentity {
+            identifier: "7430000000000000001".into(),
+            timeline: 1,
+        },
         requests_before: crate::power::Requests {
             postgres: crate::power::ContainerRequests {
                 cpu: "25m".into(),

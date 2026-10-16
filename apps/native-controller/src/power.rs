@@ -187,8 +187,37 @@ struct Progress {
     /// The retained instance Pod of a parked database, from `Parking` until its demotion ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     park: Option<Park>,
+    /// The data directory the proof of the sleep found PostgreSQL running on; `None` if it could
+    /// not be read, which only keeps the Pod from being parked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<SystemIdentity>,
     #[serde(flatten)]
     extra: Map<String, Value>,
+}
+/// The data directory a postmaster runs on: the system identifier of its `pg_control` and the
+/// timeline of its latest checkpoint (see `postgres::SERVER_IDENTITY_QUERY`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SystemIdentity {
+    pub(crate) identifier: String,
+    pub(crate) timeline: i32,
+}
+impl SystemIdentity {
+    /// What a row of `SERVER_IDENTITY_QUERY` or of `ACCEPTING_QUERY` says; `None` if it says none.
+    pub(crate) fn of(row: &tokio_postgres::Row) -> Option<Self> {
+        let identifier = row.try_get::<_, String>("system_identifier").ok()?;
+        let timeline = row.try_get::<_, i32>("timeline").ok()?;
+        Self::valid(&identifier, timeline).then_some(Self {
+            identifier,
+            timeline,
+        })
+    }
+    /// An identifier is the 64-bit number `initdb` drew, in decimal; timelines count from 1.
+    fn valid(identifier: &str, timeline: i32) -> bool {
+        (1..=20).contains(&identifier.len())
+            && identifier.bytes().all(|b| b.is_ascii_digit())
+            && timeline >= 1
+    }
 }
 impl Progress {
     fn new(target: PowerIntent, phase: Phase, anchor: Anchor, now: u64) -> Self {
@@ -204,6 +233,7 @@ impl Progress {
             key_version: None,
             segment: None,
             park: None,
+            system: None,
             extra: Map::new(),
         }
     }
@@ -238,9 +268,24 @@ struct Park {
     requests_before: Requests,
     requests_parked: Requests,
     parked_at: u64,
+    /// The data directory PostgreSQL ran on when the sleep was proved: the postmaster a wake starts
+    /// must answer with the same. A record without them is never resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline: Option<i32>,
     /// PostgreSQL was seen stopped and fenced: nothing can have been written since, whatever
     /// gateway Pods came and went. Set when the Pod is parked, not while it is being parked.
     stopped: bool,
+}
+impl Park {
+    /// The data directory the Pod was parked with, if the record has one.
+    fn system(&self) -> Option<SystemIdentity> {
+        Some(SystemIdentity {
+            identifier: self.system_identifier.clone()?,
+            timeline: self.timeline?,
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -329,6 +374,8 @@ pub struct ParkedWake {
     pub postgres_restarts: Option<u64>,
     /// The Pod's address as the inspection read it before the fence was lifted.
     pub pod_ip: Option<String>,
+    /// The data directory the Pod was parked with: the postmaster that answers must run on it.
+    pub(crate) system: SystemIdentity,
     /// The requests the Pod is resized back to; the wake is verified only once they are actuated.
     pub(crate) requests_before: Requests,
     /// Taken before the unfence was sent: a postmaster older than this did not start for it.
@@ -606,6 +653,10 @@ fn progress_from(map: &Value, now: u64) -> Result<Option<Progress>> {
                 required(text, 4096)?;
             }
             if !valid_pattern("uuid", &park.pod_uid)
+                || park.system_identifier.is_some() != park.timeline.is_some()
+                || park.system().is_some_and(|system| {
+                    !SystemIdentity::valid(&system.identifier, system.timeline)
+                })
                 || park.parked_at > now.saturating_add(CLOCK_SKEW)
                 || park.parked_at > MAX_SAFE
                 || park.assignment_revision > MAX_SAFE
@@ -1428,6 +1479,23 @@ impl PowerCoordinator {
             if let Some(reason) = self.safety(&session).await? {
                 return Ok(Some(reason));
             }
+            // The data directory the postmaster runs on, while it runs, for the wake of a parked
+            // Pod to compare. A statement that does not answer only keeps the Pod from being
+            // parked; a second proof pass that finds another data directory is not a sleep.
+            let system = session
+                .query(postgres::SERVER_IDENTITY_QUERY, &[])
+                .await
+                .ok()
+                .and_then(|rows| match rows.as_slice() {
+                    [row] => SystemIdentity::of(row),
+                    _ => None,
+                });
+            if progress.system.is_some() && system.is_some() && progress.system != system {
+                return Ok(Some("system_identity_changed"));
+            }
+            if system.is_some() {
+                progress.system = system;
+            }
             self.verify(db, intent, map, progress, snapshot).await?;
             if progress.segment.is_none() {
                 // Switching was durably recorded before entering this method. A lost query
@@ -1717,7 +1785,9 @@ impl PowerCoordinator {
             }
             // Step S5: a proved idle sleep keeps the Pod when the region's tier admits it. Any
             // read that fails here only means the ordinary hibernation.
-            if let Ok(Some(park)) = self.park_plan(db, intent, &cluster, sleep).await {
+            if let Some(system) = p.system.clone()
+                && let Ok(Some(park)) = self.park_plan(db, intent, &cluster, sleep, &system).await
+            {
                 // Step S6: the record is persisted before the Cluster is written (S7).
                 p.phase = Phase::Parking;
                 p.park = Some(park);

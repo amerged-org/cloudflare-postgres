@@ -247,6 +247,10 @@ pub struct Sql {
     pub segment: String,
     pub archived: bool,
     pub postmaster_age_ms: i64,
+    /// `pg_control_system().system_identifier` of the data directory the postmaster runs on.
+    pub system_identifier: String,
+    /// `pg_control_checkpoint().timeline_id`.
+    pub timeline: i32,
     pub recovery: bool,
     /// What happens in the cluster while PostgreSQL answers a statement, by the statement's name in
     /// the log (`accepting`, `role login`, `archive`): the change lands before the answer does, so
@@ -270,6 +274,8 @@ impl Default for Sql {
             segment: "0000000100000000000000A7".into(),
             archived: true,
             postmaster_age_ms: 5,
+            system_identifier: "7430000000000000001".into(),
+            timeline: 1,
             recovery: false,
             during: HashMap::new(),
             roles: BTreeMap::new(),
@@ -317,6 +323,8 @@ fn answers(
         let role = parameters.first().map(String::as_str);
         let kind = if sql.contains("pg_postmaster_start_time") {
             "accepting".to_string()
+        } else if sql.contains("pg_control_system") {
+            "server identity".to_string()
         } else if sql.contains("current_setting('server_version')") {
             "role login".to_string()
         } else if sql.contains("pg_stat_archiver") {
@@ -441,6 +449,13 @@ fn answers(
                 ("tls", Cell::Bool(true)),
                 ("server_address", server_address(sql, POD_IP)),
                 ("postmaster_age_ms", Cell::Int8(s.postmaster_age_ms)),
+                ("system_identifier", text(&s.system_identifier)),
+                ("timeline", Cell::Int4(s.timeline)),
+            ])
+        } else if sql.contains("pg_control_system") {
+            one(vec![
+                ("system_identifier", text(&s.system_identifier)),
+                ("timeline", Cell::Int4(s.timeline)),
             ])
         } else if sql.contains("AS server_address") {
             one(vec![
@@ -1112,7 +1127,14 @@ mod wire_tests {
                     ("tls", Type::BOOL),
                     ("server_address", Type::TEXT),
                     ("postmaster_age_ms", Type::INT8),
+                    ("system_identifier", Type::TEXT),
+                    ("timeline", Type::INT4),
                 ],
+            ),
+            (
+                postgres::SERVER_IDENTITY_QUERY,
+                None,
+                vec![("system_identifier", Type::TEXT), ("timeline", Type::INT4)],
             ),
             // The role lifecycle: a role's row by name (NULL expiry for none), and the counts
             // that decide whether it can be dropped and whether sessions remain.

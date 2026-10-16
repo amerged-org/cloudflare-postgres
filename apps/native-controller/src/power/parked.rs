@@ -363,6 +363,7 @@ impl PowerCoordinator {
         intent: &PowerIntent,
         cluster: &Value,
         sleep: &Sleep<'_>,
+        system: &SystemIdentity,
     ) -> Result<Option<Park>> {
         let Some(policy) = policy(sleep.parking) else {
             return Ok(None);
@@ -431,6 +432,8 @@ impl PowerCoordinator {
             requests_before: Requests { postgres, sidecar },
             requests_parked: parked,
             parked_at: self.now(),
+            system_identifier: Some(system.identifier.clone()),
+            timeline: Some(system.timeline),
             stopped: false,
         };
         // A Pod the desired state would change on its next wake is not worth retaining.
@@ -1135,6 +1138,7 @@ impl PowerCoordinator {
         }
         let map = written?;
         unfenced?;
+        let system = park.system().ok_or(Fault::Recovery("power_park_invalid"))?;
         Ok((
             Resumed::Fast(Box::new(ParkedWake {
                 pod_name: park.pod_name,
@@ -1143,6 +1147,7 @@ impl PowerCoordinator {
                 sidecar_container_id: park.sidecar_container_id,
                 postgres_restarts,
                 pod_ip,
+                system,
                 requests_before: park.requests_before,
                 started,
             })),
@@ -1505,30 +1510,32 @@ impl PowerCoordinator {
             .iter()
             .find(|m| text(m, "kind") == "Cluster")
             .map(|m| text(&m["spec"], "imageName"));
-        let pod_verdict =
-            if boot_id(basis.node).is_empty() || boot_id(basis.node) != park.node_boot_id {
-                Some("boot_changed")
-            } else if cluster["status"]["currentPrimary"] != park.pod_name.as_str() {
-                Some("pod_changed")
-            } else {
-                match &pod {
-                    None => Some("pod_missing"),
-                    Some(pod) if !bound(pod, park) || !instance_live(pod, cluster, db) => {
-                        Some("pod_changed")
-                    }
-                    Some(pod) if text(&pod["spec"], "runtimeClassName") != basis.runtime_class => {
-                        Some("runtime_changed")
-                    }
-                    Some(pod)
-                        if image
-                            != named(&pod["spec"]["containers"], POSTGRES)
-                                .map(|c| text(c, "image")) =>
-                    {
-                        Some("image_changed")
-                    }
-                    Some(_) => None,
+        let pod_verdict = if park.system().is_none() {
+            // Nothing a postmaster could answer with is the data directory this Pod was parked on.
+            Some("identity_unrecorded")
+        } else if boot_id(basis.node).is_empty() || boot_id(basis.node) != park.node_boot_id {
+            Some("boot_changed")
+        } else if cluster["status"]["currentPrimary"] != park.pod_name.as_str() {
+            Some("pod_changed")
+        } else {
+            match &pod {
+                None => Some("pod_missing"),
+                Some(pod) if !bound(pod, park) || !instance_live(pod, cluster, db) => {
+                    Some("pod_changed")
                 }
-            };
+                Some(pod) if text(&pod["spec"], "runtimeClassName") != basis.runtime_class => {
+                    Some("runtime_changed")
+                }
+                Some(pod)
+                    if image
+                        != named(&pod["spec"]["containers"], POSTGRES)
+                            .map(|c| text(c, "image")) =>
+                {
+                    Some("image_changed")
+                }
+                Some(_) => None,
+            }
+        };
         Ok(Inspection {
             fits,
             pod: pod_verdict,

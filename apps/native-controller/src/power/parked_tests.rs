@@ -1549,3 +1549,77 @@ async fn a_wake_judges_the_retained_pod_by_reads_from_the_watch_cache() {
     // The fence is the object the wake writes next, under its resourceVersion.
     assert_eq!(split_of(&made, &fence_path(&w)).0, 0, "{made:?}");
 }
+
+#[tokio::test]
+async fn the_data_directory_the_sleep_proved_is_recorded_with_the_parked_pod() {
+    // The sleep's own maintenance session asks which data directory the postmaster runs on, while
+    // the postmaster still runs: `system_identifier` and the timeline of `pg_control`. The wake
+    // compares them with what the postmaster that starts answers.
+    let w = parked().await;
+    let park = progress(&w)["park"].clone();
+    assert_eq!(park["systemIdentifier"], "7430000000000000001", "{park}");
+    assert_eq!(park["timeline"], 1);
+}
+
+#[tokio::test]
+async fn a_pod_parked_without_the_identity_of_its_data_directory_is_demoted_not_claimed() {
+    // A record of a controller that did not take the identity cannot be compared with anything
+    // a wake finds: the fast wake is not claimed, and the Pod is demoted while it sleeps.
+    let mut w = parked().await;
+    quick(&mut w);
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+        |map| {
+            let mut record: Value = serde_json::from_str(text(&map["data"], "power.json")).unwrap();
+            record["park"]
+                .as_object_mut()
+                .unwrap()
+                .remove("systemIdentifier");
+            record["park"].as_object_mut().unwrap().remove("timeline");
+            map["data"]["power.json"] = record.to_string().into();
+        },
+    );
+    let observed = sleep_pass(&w).await;
+    assert!(
+        observed.is_none_or(|value| value["power"]["parked"]["wake"].is_null()),
+        "the fast wake is not claimed"
+    );
+    assert_eq!(annotations(&w)[HIBERNATION], "on", "the Pod is demoted");
+}
+
+#[tokio::test]
+async fn a_sleep_that_cannot_read_the_data_directory_hibernates_instead_of_parking() {
+    // A Pod nothing could be compared against at its wake is not worth keeping.
+    let mut w = World::awake().await;
+    quick(&mut w);
+    w.sql.lock().unwrap().system_identifier = String::new();
+    assert!(sleep_pass(&w).await.is_none());
+    assert_eq!(progress(&w)["phase"], "hibernating");
+    assert!(progress(&w)["park"].is_null());
+    assert_eq!(annotations(&w)[HIBERNATION], "on");
+    assert!(annotations(&w)[FENCE].is_null());
+}
+
+#[tokio::test]
+async fn a_sleep_whose_second_proof_finds_another_data_directory_is_refused() {
+    // The identity is recorded with the closed segment. A proof that resumes after it must find
+    // the same data directory under the same postmaster, or the sleep is not proved.
+    let mut w = World::awake().await;
+    quick(&mut w);
+    w.sql.lock().unwrap().archived = false;
+    assert!(sleep_pass(&w).await.is_none());
+    assert_eq!(progress(&w)["phase"], "archive");
+    assert_eq!(progress(&w)["system"]["identifier"], "7430000000000000001");
+    {
+        let mut sql = w.sql.lock().unwrap();
+        sql.archived = true;
+        sql.system_identifier = "7999999999999999999".into();
+    }
+    let refused = sleep_pass(&w).await.expect("a refusal");
+    assert_eq!(refused["state"], "error");
+    assert_eq!(progress(&w)["phase"], "refused");
+    assert!(annotations(&w)[FENCE].is_null());
+    assert!(annotations(&w)[HIBERNATION].is_null());
+}
