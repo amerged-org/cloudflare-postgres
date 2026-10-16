@@ -297,6 +297,9 @@ pub async fn serve_socket(
             let physical = gateway.targets.read().await;
             state.synchronized()
                 && physical.synchronized()
+                // A writer the kubelet has not reported Ready is recognized only by the Pod
+                // watch, and a woken database is published on the attestation alone.
+                && physical.pods_synchronized()
                 && !gateway.draining.load(Ordering::Acquire)
         };
         return control::reply_text(
