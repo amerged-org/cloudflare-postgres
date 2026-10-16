@@ -18,6 +18,7 @@ import {
   parseQualificationArguments,
   validateDockerfile,
   runtimeChecks,
+  rustArtifactPaths,
   validateRuntimeResult,
   validateProfileProvenance,
   verifyRustAssembly,
@@ -1635,4 +1636,11 @@ test("public recipe profile verifies its canonical source inputs and cannot clai
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("the native-controller image qualifies its controller and its node attach agent", () => {
+  assert.deepEqual(rustArtifactPaths("native-controller"), [
+    "pgcf-native-controller",
+    "pgcf-attach",
+  ]);
 });

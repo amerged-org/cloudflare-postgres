@@ -1078,7 +1078,8 @@ export async function verifyStorageAssembly(
 
 export function rustArtifactPaths(profile: ImageProfile) {
   if (profile === "rust-gateway") return ["pgcf-native-gateway"];
-  if (profile === "native-controller") return ["pgcf-native-controller"];
+  if (profile === "native-controller")
+    return ["pgcf-native-controller", "pgcf-attach"];
   if (profile === "rust-bootstrap-relay")
     return ["pgcf-native-bootstrap-relay"];
   const prefix = profile === "sandbox-extension" ? "rootfs/" : "";
