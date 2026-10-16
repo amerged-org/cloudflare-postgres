@@ -232,6 +232,13 @@ split `desired_pull` into network and Worker time with the API's `desired_page.e
 hint carries only IDs today; a thin database also needs the startup hold and storage budget from the
 row, so a speculative unfence from an ID alone is not safe, the row on the hint is.
 
+Status (branch `golive/w2-hint-row`, tested locally, not deployed or measured live): the Actor builds
+the page of the claimed wake's one database with the pull's own builder right after the claim commit
+and sends it on the hint (`desired`, only while its row is the claimed revision and operation and the
+message fits the link's 64 KiB); the controller takes it like a targeted pull begun on arrival when it
+moves a held database to a newer generation, and pulls otherwise. To measure: `desired_from_hint` in
+place of `desired_pull`, hint to `fence_release`, and `page_ms` in `actor_claim`.
+
 ### 4.4 W3 local admission (Edge + API + gateway; needs an owner review of the invariant)
 
 Today the Edge waits for the Actor's release, which waits for the accepted `ready` observation (D1
