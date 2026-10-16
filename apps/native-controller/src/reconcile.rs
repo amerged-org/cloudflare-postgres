@@ -1469,10 +1469,13 @@ impl Reconciler {
         let mut applied = vec![];
         let apply_phase = timing::Phase::begin(db, "desired_apply");
         // The objects the pass is about to bring to the desired state are read together before the
-        // first of them is written, and written in the order of the manifests (the policies and
-        // quotas before the Cluster whose Pod they bind). The Cluster is read when its turn comes:
-        // CNPG writes its status continually, and a patch over a version read ahead of the writes
-        // before it would conflict.
+        // first of them is written. What binds the Pod the Cluster creates (the quota, the limits,
+        // the policies, the archive: everything before the Cluster in the manifests) is written
+        // together when all of it exists, and all of it is written before the Cluster is. When
+        // something has to be created, the objects are written one after another in the order of
+        // the manifests, as the Cluster's Pod may only start under what it is bound by. The Cluster
+        // is read when its turn comes: CNPG writes its status continually, and a patch over a
+        // version read ahead of the writes before it would conflict.
         let identity = |manifest: &Value| {
             (
                 text(manifest, "kind").to_string(),
@@ -1482,8 +1485,12 @@ impl Reconciler {
                 text(&manifest["metadata"], "name").to_string(),
             )
         };
+        let cluster_at = manifests
+            .iter()
+            .position(|manifest| text(manifest, "kind") == "Cluster")
+            .unwrap_or(manifests.len());
         let ahead: Vec<usize> = (0..manifests.len())
-            .filter(|index| text(&manifests[*index], "kind") != "Cluster")
+            .filter(|index| *index != cluster_at)
             .collect();
         let named: Vec<_> = ahead
             .iter()
@@ -1497,7 +1504,28 @@ impl Reconciler {
             .into_iter()
             .zip(self.k8s.read_all(&refs).await?)
             .collect();
-        for (index, manifest) in manifests.iter().enumerate() {
+        let binding: Vec<Option<Value>> = (0..cluster_at)
+            .map(|index| current.remove(&index).flatten())
+            .collect();
+        if binding.len() > 1 && binding.iter().all(Option::is_some) {
+            // All of them are awaited, so that no write is dropped half sent when one fails; the
+            // first failure in the order of the manifests is the one reported.
+            let written = futures_util::future::join_all(
+                manifests[..cluster_at]
+                    .iter()
+                    .zip(binding)
+                    .map(|(manifest, read)| self.apply_to(db, manifest, read)),
+            )
+            .await;
+            for actual in written {
+                applied.push(actual?);
+            }
+        } else {
+            for (manifest, read) in manifests[..cluster_at].iter().zip(binding) {
+                applied.push(self.apply_to(db, manifest, read).await?);
+            }
+        }
+        for (index, manifest) in manifests.iter().enumerate().skip(cluster_at) {
             let read = match current.remove(&index) {
                 Some(read) => read,
                 None => {

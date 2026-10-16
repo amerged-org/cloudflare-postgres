@@ -809,12 +809,14 @@ fn made_since(w: &World, from: usize) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_generation_is_applied_by_reading_its_objects_together_and_writing_them_in_order() {
+async fn a_generation_is_applied_by_reading_its_objects_together_and_writing_what_binds_the_pod_first()
+ {
     // A pass that brings a new generation to the cluster reads the objects it is about to write
-    // before it writes the first, a few at a time, and writes them in the order of the manifests:
-    // the policies and quotas before the Cluster that creates the Pod they bind. The Cluster is
-    // read when its turn comes, because CNPG writes its status continually and a patch over a
-    // version read ahead of the others' writes would conflict.
+    // before it writes the first, a few at a time. What binds the Pod the Cluster creates (the
+    // quota, the limits, the policies, the archive) is written together, and all of it before the
+    // Cluster is, which follows alone with the scheduled backup after it. The Cluster is read
+    // when its turn comes, because CNPG writes its status continually and a patch over a version
+    // read ahead of the others' writes would conflict.
     let w = World::running().await;
     let names = [
         ("ResourceQuota", "database-resources"),
@@ -847,32 +849,85 @@ async fn a_generation_is_applied_by_reading_its_objects_together_and_writing_the
         "the objects were not read together, by the apply pass and by the check after it"
     );
     let made = made_since(&w, at);
+    let cluster = path("Cluster", Some(&w.ns), "database");
+    let backup = path("ScheduledBackup", Some(&w.ns), "daily-backup");
     let patched: Vec<&str> = made
         .iter()
-        .filter(|request| request.starts_with("PATCH "))
-        .map(|request| request.trim_start_matches("PATCH "))
-        .filter(|at| {
-            objects.iter().any(|object| object == at)
-                || *at == path("Cluster", Some(&w.ns), "database")
-        })
+        .filter_map(|request| request.strip_prefix("PATCH "))
+        .filter(|at| objects.iter().any(|object| object == at) || *at == cluster)
         .collect();
-    let mut wanted: Vec<String> = objects.clone();
-    wanted.insert(7, path("Cluster", Some(&w.ns), "database"));
-    assert_eq!(
-        patched, wanted,
-        "the writes are in the order of the manifests"
+    // Seven objects in any order, then the Cluster, then the scheduled backup.
+    assert_eq!(patched.len(), 9, "{patched:?}");
+    let mut binding: Vec<&str> = patched[..7].to_vec();
+    binding.sort_unstable();
+    let mut wanted: Vec<&str> = objects[..7].iter().map(String::as_str).collect();
+    wanted.sort_unstable();
+    assert_eq!(binding, wanted);
+    assert_eq!(patched[7], cluster);
+    assert_eq!(patched[8], backup);
+    // The Cluster is read right before it is written, after everything that binds its Pod.
+    let position = made
+        .iter()
+        .position(|request| *request == format!("PATCH {cluster}"))
+        .unwrap();
+    assert_eq!(made[position - 1], format!("GET {cluster}"));
+    assert!(made[position - 2].starts_with("PATCH "));
+}
+
+#[tokio::test]
+async fn what_binds_the_pod_is_written_together_when_it_all_exists() {
+    let w = World::running().await;
+    let binding: Vec<String> = [
+        ("ResourceQuota", "database-resources"),
+        ("LimitRange", "container-defaults"),
+        ("NetworkPolicy", "default-deny"),
+        ("NetworkPolicy", "gateway-ingress"),
+        ("NetworkPolicy", "agent-management-ingress"),
+        ("CiliumNetworkPolicy", "database-boundaries"),
+        ("ObjectStore", "archive"),
+    ]
+    .iter()
+    .map(|(kind, name)| path(kind, Some(&w.ns), name))
+    .collect();
+    // All seven patches are in flight at once, or none is held.
+    w.server.state.lock().unwrap().gate = Some(
+        Gate::new(7, move |method, at| {
+            method == "PATCH" && binding.iter().any(|object| object == at)
+        })
+        .once(),
     );
-    // The Cluster is read right before it is written, after the object written before it.
-    let cluster = format!("PATCH {}", path("Cluster", Some(&w.ns), "database"));
-    let position = made.iter().position(|request| *request == cluster).unwrap();
-    assert_eq!(
-        made[position - 1],
-        format!("GET {}", path("Cluster", Some(&w.ns), "database"))
-    );
-    assert_eq!(
-        made[position - 2],
-        format!("PATCH {}", path("ObjectStore", Some(&w.ns), "archive"))
-    );
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let gate = w.server.state.lock().unwrap().gate.take().unwrap();
+    assert_eq!((gate.rounds, gate.gave_up), (1, 0));
+}
+
+#[tokio::test]
+async fn a_missing_object_is_created_after_the_ones_before_it_as_always() {
+    // Nothing exists yet but the namespace: the objects are created one after another in the
+    // order of the manifests, the policies before the Cluster.
+    let w = World::running().await;
+    let quota = path("ResourceQuota", Some(&w.ns), "database-resources");
+    w.server.state.lock().unwrap().objects.remove(&quota);
+    let at = w.server.state.lock().unwrap().requests.len();
+    let _ = reconcile(&w).await;
+    let made = made_since(&w, at);
+    let created = made
+        .iter()
+        .position(|request| request.starts_with("POST ") && request.ends_with("/resourcequotas"))
+        .expect("the quota is created");
+    let cluster_patch = made
+        .iter()
+        .position(|request| {
+            *request == format!("PATCH {}", path("Cluster", Some(&w.ns), "database"))
+        })
+        .expect("the Cluster is patched");
+    let limits = made
+        .iter()
+        .position(|request| request.starts_with("PATCH ") && request.contains("/limitranges/"))
+        .expect("the limits are patched");
+    assert!(created < limits, "the quota is first, as in the manifests");
+    assert!(limits < cluster_patch);
 }
 
 #[tokio::test]
@@ -1293,5 +1348,49 @@ async fn the_resumed_pod_is_read_while_the_wake_is_recorded() {
     );
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn the_wake_reads_the_anchor_with_the_fence_it_looks_at() {
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let cluster = w.server.get("Cluster", Some(&w.ns), "database");
+    let mut context = w
+        .reconciler
+        .context(&w.db, &w.snapshot, false)
+        .await
+        .unwrap();
+    context["droppingRoles"] = removal::cluster_drops(&w.db, cluster.as_ref());
+    let built = manifests::build(&w.db, &context);
+    let basis = Basis {
+        node: &w.node,
+        release: &w.snapshot.fleet_release,
+        manifests: built.as_ref().ok().map(Vec::as_slice),
+        runtime_class: runtime_class(&context),
+    };
+    // The fence, and the namespace, the Cluster and the receipt the anchor is made of.
+    let wanted = [
+        fence_path(&w),
+        path("Namespace", None, &w.ns),
+        cluster_object(&w),
+        storage_path(&w),
+    ];
+    hold(
+        &w,
+        Gate::new(4, move |method, at| {
+            method == "GET" && wanted.iter().any(|object| object == at)
+        })
+        .once(),
+    );
+    let prepared = w
+        .reconciler
+        .power
+        .prepare_running(&w.db, &basis)
+        .await
+        .unwrap();
+    assert!(matches!(prepared, PrepareRunning::Parked(_)));
     assert_eq!(held(&w), (1, 0));
 }

@@ -2331,8 +2331,15 @@ impl PowerCoordinator {
         let intent = desired_power(db)?.ok_or("wake intent missing")?;
         let phase = timing::Phase::begin(db, "wake_prepare");
         let result = tokio::time::timeout(Duration::from_secs(10), async {
-            let map = self.fence(db).await?;
-            let protected = self.storage_protection_for_running(db, &intent).await?;
+            // The anchor is read while the fence and the thin receipt are, and looked at only
+            // if this wake is not the creation's own (which has no anchor yet).
+            let (map, protected, anchored) = tokio::join!(
+                self.fence(db),
+                self.storage_protection_for_running(db, &intent),
+                self.anchor(db)
+            );
+            let map = map?;
+            let protected = protected?;
             if map.is_none()
                 && db["creation"]["ever_ready"] == false
                 && number(&db["creation"], "generation") <= number(db, "generation")
@@ -2340,7 +2347,7 @@ impl PowerCoordinator {
             {
                 return Ok(PrepareRunning::Proceed);
             }
-            let (physical, mut cluster) = self.anchor(db).await?;
+            let (physical, mut cluster) = anchored?;
             let mut map = map;
             let mut previous = map
                 .as_ref()
