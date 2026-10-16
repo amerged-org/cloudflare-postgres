@@ -831,11 +831,35 @@ export const LinkWelcome = z.strictObject({
 });
 export type LinkWelcome = z.infer<typeof LinkWelcome>;
 
-/** Hint: pull desired state now (optionally only these databases changed). */
-export const LinkDesiredHint = z.strictObject({
-  type: z.literal("desired"),
-  ids: z.array(DatabaseId).max(DESIRED_PAGE_LIMIT_MAX).optional(),
-});
+/** The largest link message either end accepts; a hint's page is carried only within it. */
+export const LINK_MESSAGE_MAX_BYTES = 64 * 1024;
+
+/**
+ * Hint: pull desired state now (optionally only these databases changed). A wake's hint may carry
+ * `desired`, the desired page of its one database as a targeted pull of it reads it right after
+ * the claim committed; the region may apply it in place of that pull. Without it, or when the
+ * region does not take it, the region pulls.
+ */
+export const LinkDesiredHint = z
+  .strictObject({
+    type: z.literal("desired"),
+    ids: z.array(DatabaseId).max(DESIRED_PAGE_LIMIT_MAX).optional(),
+    desired: DesiredResponse.optional(),
+  })
+  .superRefine((hint, ctx) => {
+    if (
+      hint.desired &&
+      (hint.ids?.length !== 1 ||
+        hint.desired.databases.length !== 1 ||
+        hint.desired.databases[0]!.id !== hint.ids[0] ||
+        hint.desired.next !== null)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["desired"],
+        message: "A hint's page carries exactly the one database it names",
+      });
+  });
 export type LinkDesiredHint = z.infer<typeof LinkDesiredHint>;
 
 export const AgentLinkMessage = z.discriminatedUnion("type", [LinkHello]);

@@ -21,6 +21,7 @@ import {
   OWNER_ROLE_NAME,
   NodeObservation,
   MAINTENANCE_ROLE,
+  LINK_MESSAGE_MAX_BYTES,
 } from "../src/index.ts";
 
 const id = newDatabaseId();
@@ -1072,6 +1073,33 @@ describe("link messages", () => {
       ServerLinkMessage.safeParse({ type: "desired", ids: [id] }).success,
     ).toBe(true);
     expect(ServerLinkMessage.safeParse({ type: "apply" }).success).toBe(false);
+  });
+  it("a wake's hint carries the desired page of exactly the one database it names", () => {
+    const page = {
+      region: {
+        id: "eu-1",
+        backup: {
+          bucket: "pgcf-backups",
+          endpoint_url: backupEndpoint,
+          region: "auto",
+        },
+      },
+      databases: [desired()],
+      next: null,
+    };
+    const hint = { type: "desired", ids: [id], desired: page };
+    expect(ServerLinkMessage.safeParse(hint).success).toBe(true);
+    for (const refused of [
+      { ...hint, ids: undefined },
+      { ...hint, ids: [newDatabaseId()] },
+      { ...hint, ids: [id, newDatabaseId()] },
+      { ...hint, desired: { ...page, databases: [] } },
+      { ...hint, desired: { ...page, next: id } },
+      { ...hint, desired: { ...page, region: { ...page.region, id: "us-1" } } },
+    ])
+      expect(ServerLinkMessage.safeParse(refused).success).toBe(false);
+    // Both ends of the link refuse a larger message, so a page is carried only within it.
+    expect(LINK_MESSAGE_MAX_BYTES).toBe(64 * 1024);
   });
 });
 
