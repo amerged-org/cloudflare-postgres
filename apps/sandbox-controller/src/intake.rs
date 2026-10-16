@@ -24,6 +24,8 @@ pub const FETCH_PERIOD: Duration = Duration::from_secs(1);
 /// Fetches in flight at once. The client gives up on a request after five seconds; the next one
 /// must not wait for that.
 pub const IN_FLIGHT: usize = 3;
+/// A request or a record write slower than this is reported, so that a stall names its cause.
+const SLOW: Duration = Duration::from_millis(1500);
 
 /// The durable private owner records that retain each Pod's signed physical scope.
 pub trait ScopeRecords: Clone + Send + Sync + 'static {
@@ -139,21 +141,33 @@ pub async fn poll<F, Fut>(
         tokio::select! {
             _ = ticker.tick() => {
                 if flights.len() < limit {
-                    flights.spawn(fetch());
+                    let started = Instant::now();
+                    let request = fetch();
+                    flights.spawn(async move { (request.await, started.elapsed()) });
                 }
             }
             Some(finished) = flights.join_next() => {
-                let outcome = finished
-                    .unwrap_or_else(|_| Err(Status::internal("storage_guard_fetch_task_failed")));
+                let (outcome, elapsed) = finished.unwrap_or_else(|_| {
+                    (
+                        Err(Status::internal("storage_guard_fetch_task_failed")),
+                        Duration::ZERO,
+                    )
+                });
+                if elapsed > SLOW && reported.due("storage_guard_fetch_slow") {
+                    eprintln!("storage_guard_fetch_slow {} ms", elapsed.as_millis());
+                }
                 match outcome {
                     // A slow request can finish after a newer one; the guard has moved on.
                     Ok(lease) if lease.issued_at < newest => {}
                     Ok(lease) => {
-                        newest = lease.issued_at;
-                        if let Err(error) = deliver(&guard, &pending, lease).await
-                            && reported.due(error.message())
-                        {
-                            eprintln!("{}", error.message());
+                        let issued_at = lease.issued_at;
+                        match deliver(&guard, &pending, lease).await {
+                            Ok(()) => newest = issued_at,
+                            Err(error) => {
+                                if reported.due(error.message()) {
+                                    eprintln!("{}", error.message());
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -264,7 +278,15 @@ pub async fn persist<R: ScopeRecords>(records: R, trust: StorageTrust, pending: 
             {
                 continue;
             }
-            match records.remember(&pod_uid, &scope.token).await {
+            let started = Instant::now();
+            let recorded = records.remember(&pod_uid, &scope.token).await;
+            if started.elapsed() > SLOW && reported.due("storage_scope_record_slow") {
+                eprintln!(
+                    "storage_scope_record_slow {} ms {pod_uid}",
+                    started.elapsed().as_millis()
+                );
+            }
+            match recorded {
                 Ok(()) => {
                     unassigned.remove(&pod_uid);
                     retire_superseded(&records, &trust, &scope).await;

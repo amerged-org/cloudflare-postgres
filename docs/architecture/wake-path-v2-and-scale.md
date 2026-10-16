@@ -394,17 +394,20 @@ experiment (it removes a known 6.2 statements/s per node).
   token hole fixed by migration 0055. Until the extension is rebuilt, a 6 s stall of the guard kills
   every thin Pod; this raises the priority of the next host release (H1 delete the reclaim poller and
   its fsync, per-entry accept, tolerate unassigned Pods, an fsync-free fetch loop). Reading the code
-  found the mechanism: the fetcher handed each lease to a one-slot channel whose reader first wrote
-  the owner record of every token (fsync under the pool lock, once per Pod and second), so one
-  stalled write behind a parked Pod's flush stopped the fetches within two leases; the fetch loop is
-  now a thread of its own that accepts first and records afterwards (`sc/intake.rs`, source on
-  branch `golive/host-guard-r3`; effective with the next host extension release and a new thin
-  qualification). The reclaim poller and its 250 ms fsynced publication are deleted from that source
-  (the snapshot had no reader).
+  found two paths that produce exactly this stall, neither measured yet: the fetcher handed each lease
+  to a one-slot channel whose reader first wrote the owner record of every token (fsync under the
+  pool lock, once per renewed token of each Pod, about every 2 s), so one stalled write, plausibly behind the flush of a Pod being
+  parked, stopped the fetches within two leases; and a request that hangs to the client's 5 s timeout
+  delayed the next fetch by that long, with no journal line. The fetch loop is now a thread of its own
+  that starts a fetch every second whatever the earlier ones do, accepts first and records afterwards
+  (`sc/intake.rs`; effective with the next host extension release and a new thin qualification), and
+  journals a fetch or a record write slower than 1.5 s, which names the cause on the next occurrence.
+  The reclaim poller and its 250 ms publication to `/run` (a tmpfs, so its fsync cost nothing, but its
+  pool-lock, container-list and `/proc` walks ran on the controller's runtime about three times a second) are
+  deleted from the source; the snapshot had no reader.
 - Host guard fixes that need an extension release: one bad lease entry must not refuse every entry
-  (`accept` is all-or-nothing), a sticky `stopped` per Pod UID. Done in source on branch
-  `golive/host-guard-r3`: a token for a Pod not yet assigned no longer starves every other database's
-  renewals (it is accepted, reported once per Pod and never retained as the scope), fetch errors are
+  (`accept` is all-or-nothing), a sticky `stopped` per Pod UID. Done in source: a token for a Pod not
+  yet assigned no longer starves every other database's renewals (it is accepted, reported once per Pod and never retained as the scope), fetch errors are
   logged, and a retained scope that a minute of leases did not name is forgotten once its device is
   absent (it used to be retried ten times a second for ever).
 
