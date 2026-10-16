@@ -198,10 +198,13 @@ NodeBootstrap alarm to now instead of waiting for the cadence.
   with the function the fast sample's token loop and the desired page use: the Worker's local D1
   harness counts six statements in four round trips for a node with three live databases and for
   one with forty live and a hundred deleted ones (570 statements before), five once the region's
-  row is cached (an isolate keeps it for 5 s; `agentRegion`). Each
-  lease and each accepted sample logs its own time (`storage_guard_served` with `elapsed_ms`, the
-  entry and tombstone counts and one compact line per live entry; `handler_ms` on
-  `thin_storage_sample_accepted`).
+  row is cached (an isolate keeps it for 5 s; `agentRegion`). Each lease and each accepted sample
+  logs its own time (`storage_guard_served` with `elapsed_ms`, the entry and tombstone counts and
+  one compact line per live entry; `handler_ms` on `thin_storage_sample_accepted`). Those two lines
+  are written for one request in thirty per node and event, counted in the isolate, and for the
+  first after ten quiet seconds; a lease that blocks a live database, a sample that withholds
+  write permission and a sample that fails after its compare-and-set are always written
+  (`log-sampling.ts`).
 - **Deleted databases leave the lease.** The guard forgets a retained signed scope only from an
   accepted lease that names its database deleted, writable and without a volume
   (`retirement_scope`, sc/storage.rs@e4b8873:500-529), and acts on it within its next 100 ms tick; it

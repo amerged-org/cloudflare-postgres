@@ -27,6 +27,7 @@ import {
   readCurrentNodeThinStorage,
   runningWriterTokens,
 } from "./node-thin-storage.ts";
+import { hotLogDue } from "./log-sampling.ts";
 import {
   composeThinStorageAuthority,
   minimumHeadroom,
@@ -480,6 +481,7 @@ async function productSample(
     d1_update_total_attempts: timing.attempts,
   };
   let tokens: NodeStorageHeadroomResponse["tokens"];
+  let failed = false;
   try {
     // The node as the compare-and-set left it: the row read above with exactly the columns the
     // update wrote, and the qualification its predicate has just held. Reading the row back would
@@ -506,10 +508,20 @@ async function productSample(
       )
     )
       await requestThinStorageTurn(env, nodeId).catch(() => undefined);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    console.log(
-      JSON.stringify({ ...accepted, handler_ms: Date.now() - startedAt }),
-    );
+    // One accepted sample in thirty per node and the first after a silence; every one that ends in
+    // an error or that withholds write permission, so the protective stops stay readable.
+    if (
+      hotLogDue("thin_storage_sample_accepted", nodeId) ||
+      failed ||
+      !authority.write_allowed
+    )
+      console.log(
+        JSON.stringify({ ...accepted, handler_ms: Date.now() - startedAt }),
+      );
   }
   return {
     accepted: true,

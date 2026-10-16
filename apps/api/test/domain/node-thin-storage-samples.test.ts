@@ -28,6 +28,7 @@ import {
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   await cleanupFixtures();
   for (const id of releases.splice(0))
@@ -479,7 +480,10 @@ it("decides write_allowed on the fresh reading with today's headroom rule and as
     acceptedObservations(log, f.node).map((event) => event.write_allowed),
   ).toEqual([false]);
   expect(await turnRequested(f)).toBe(true);
-  // The larger pool after growth renews with writes allowed again.
+  // The larger pool after growth renews with writes allowed again. The next accepted line of the
+  // node is written for being the first after ten quiet seconds.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.now() + 11_000);
   const grown = NodeStorageHeadroomResponse.parse(
     (
       await post(

@@ -18,6 +18,7 @@ import type { Env } from "../../src/env.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   await cleanupFixtures();
   for (const id of releases.splice(0))
@@ -424,5 +425,87 @@ it("reads the node once for a sample and signs its tokens from the row its own w
   // What reading the written row back signs is what the sample signed.
   expect(response.tokens).toEqual(
     await runningWriterTokens(env as Env, f.node, f.region, Date.now()),
+  );
+}, 60_000);
+
+function guardLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
+  return servedLines(log, nodeId);
+}
+
+it("writes one lease line in thirty per node and the first after a silence", async () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const { node } = await crowdedNode(2, 0);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  for (let i = 0; i < 65; i++) {
+    await node.lease();
+    vi.setSystemTime(Date.now() + 100);
+  }
+  // The 1st, 31st and 61st lease.
+  expect(guardLines(log, node.f.node)).toHaveLength(3);
+  // Quiet for longer than ten seconds: the next lease is written whatever the count says.
+  vi.setSystemTime(Date.now() + 10_001);
+  await node.lease();
+  expect(guardLines(log, node.f.node)).toHaveLength(4);
+  await node.lease();
+  expect(guardLines(log, node.f.node)).toHaveLength(4);
+}, 60_000);
+
+it("writes every lease that blocks a live database", async () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  await node.add({ kind: "live" });
+  await node.add({ kind: "blocked" });
+  await node.commit();
+  for (let i = 0; i < 5; i++) await node.lease();
+  expect(guardLines(log, node.f.node)).toHaveLength(5);
+}, 60_000);
+
+function acceptedLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
+  return log.mock.calls.flatMap(([value]) => {
+    if (typeof value !== "string") return [];
+    const event = JSON.parse(value) as Record<string, unknown>;
+    return event.event === "thin_storage_sample_accepted" &&
+      event.node_id === nodeId
+      ? [event]
+      : [];
+  });
+}
+
+it("writes one accepted-sample line in thirty per node, and every one that withholds writes or fails", async () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const { node, proof } = await crowdedNode(2, 0),
+    f = node.f;
+  let next = await nonce(f);
+  const accept = async (usedBytes = gib) => {
+    const answer = NodeStorageHeadroomResponse.parse(
+      (await post(f, roomySample(f, proof, next, usedBytes))).body,
+    );
+    expect(answer.accepted).toBe(true);
+    next = answer.nonce;
+    return answer;
+  };
+  vi.useFakeTimers({ toFake: ["Date"] });
+  for (let i = 0; i < 61; i++) {
+    await accept();
+    vi.setSystemTime(Date.now() + 100);
+  }
+  // The 1st, 31st and 61st accepted sample.
+  expect(acceptedLines(log, f.node)).toHaveLength(3);
+  // A sample that leaves the node without room is always written.
+  const blocked = await accept(16 * gib - mib);
+  expect(blocked.authority!.write_allowed).toBe(false);
+  expect(acceptedLines(log, f.node)).toHaveLength(4);
+  // One that fails after its compare-and-set is written, and its fields are the same.
+  await accept();
+  expect(acceptedLines(log, f.node)).toHaveLength(4);
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
+  vi.spyOn(prototype, "batch").mockRejectedValueOnce(
+    new Error("d1_unavailable"),
+  );
+  expect((await post(f, roomySample(f, proof, next))).status).toBe(500);
+  const lines = acceptedLines(log, f.node);
+  expect(lines).toHaveLength(5);
+  expect(Object.keys(lines.at(-1)!).sort()).toEqual(
+    Object.keys(lines[0]!).sort(),
   );
 }, 60_000);

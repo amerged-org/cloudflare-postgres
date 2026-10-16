@@ -16,6 +16,7 @@ import type { Env } from "../env.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
 import { thinStorageSamplingCapable } from "./fleet-releases.ts";
+import { hotLogDue } from "./log-sampling.ts";
 import { parkedRecordFresh, readParkedRecord } from "./parked-tier.ts";
 import {
   currentStartHoldSql,
@@ -1190,36 +1191,43 @@ export async function hostStorageLease(
     databases,
   });
   const served = Date.now();
-  const parked = new Set(
-    rows.filter((row) => row.parked_json).map((row) => row.id),
-  );
   const live = lease.databases.filter(
     (entry) => entry.desired_state !== "deleted",
   );
-  console.log(
-    JSON.stringify({
-      event: "storage_guard_served",
-      node_id: id,
-      entries: lease.databases.length,
-      tombstones: lease.databases.length - live.length,
-      elapsed_ms: served - started,
-      live: live.slice(0, LEASE_LOG_LIVE_ENTRIES).map((entry) => {
-        const token = tokenSummary(entry.runtime_authority, served);
-        return {
-          id: entry.database_id.slice(0, 6),
-          generation: entry.generation,
-          revision: entry.authority_revision,
-          write_blocked: entry.write_blocked,
-          token: entry.runtime_authority !== null,
-          token_life_s: token.life,
-          token_pod: token.pod,
-          startup_valid:
-            entry.startup_expires_at !== null &&
-            entry.startup_expires_at > served,
-          parked: parked.has(entry.database_id),
-        };
+  // One lease in thirty per node, the first after a silence, and every lease that blocks a live
+  // database: the lines a stop of the guard is read against are never the ones left out.
+  if (
+    hotLogDue("storage_guard_served", id, served) ||
+    live.some((entry) => entry.write_blocked)
+  ) {
+    const parked = new Set(
+      rows.filter((row) => row.parked_json).map((row) => row.id),
+    );
+    console.log(
+      JSON.stringify({
+        event: "storage_guard_served",
+        node_id: id,
+        entries: lease.databases.length,
+        tombstones: lease.databases.length - live.length,
+        elapsed_ms: served - started,
+        live: live.slice(0, LEASE_LOG_LIVE_ENTRIES).map((entry) => {
+          const token = tokenSummary(entry.runtime_authority, served);
+          return {
+            id: entry.database_id.slice(0, 6),
+            generation: entry.generation,
+            revision: entry.authority_revision,
+            write_blocked: entry.write_blocked,
+            token: entry.runtime_authority !== null,
+            token_life_s: token.life,
+            token_pod: token.pod,
+            startup_valid:
+              entry.startup_expires_at !== null &&
+              entry.startup_expires_at > served,
+            parked: parked.has(entry.database_id),
+          };
+        }),
       }),
-    }),
-  );
+    );
+  }
   return c.json(lease, 200);
 }
