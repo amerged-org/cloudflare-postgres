@@ -415,6 +415,43 @@ async fn a_resize_up_the_kubelet_cannot_allocate_holds_the_wake_and_then_demotes
     }
 }
 
+#[tokio::test]
+async fn a_resumed_pod_whose_requests_the_kubelet_is_still_actuating_is_published_without_waiting()
+{
+    // The resize changes requests only: no limit, no cgroup limit, no memory the Pod may not use.
+    // The wake used to poll the Pod every 25 ms until the kubelet reported them actuated, which
+    // the first query of the client did not need.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.quick();
+    w.wake(3);
+    w.start_postgres().await;
+    w.server.state.lock().unwrap().resize_in_progress = true;
+    let at = w.mark();
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let pod = w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
+    assert_eq!(
+        pod["spec"]["containers"][0]["resources"]["requests"],
+        json!({"cpu":"25m","memory":"128Mi"}),
+        "the Pod was asked for its requests"
+    );
+    assert_eq!(
+        pod["status"]["containerStatuses"][0]["resources"]["requests"],
+        json!({"cpu":"10m","memory":"96Mi"}),
+        "and the kubelet still reports the requests it parked the Pod under"
+    );
+    assert_eq!(intent_mode(&w), "running");
+    // The wake reads the Pod where its chain does (seven times), not once every 25 ms until the
+    // kubelet is done.
+    let reads = w
+        .made(at)
+        .into_iter()
+        .filter(|(method, path, _)| *method == "GET" && *path == primary(&w))
+        .count();
+    assert!(reads <= 10, "{reads} reads of the Pod");
+}
+
 fn intent_mode(w: &World) -> String {
     let map = w
         .server

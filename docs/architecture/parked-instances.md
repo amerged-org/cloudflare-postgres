@@ -380,7 +380,10 @@ the attestation the controller persists (`admission_target`: Pod UID, container 
 2. The Pod is the parked one: same UID, `postgres` and sidecar containers under the recorded IDs,
    `postgres` running and not restarted since the fence was lifted. This is read before PostgreSQL
    answers, after it, and once more at the end of the archive probe.
-3. The kubelet has actuated the requests the Pod was resized back to.
+3. The kubelet has not held the requests the Pod was resized back to: a resize it deferred or
+   found infeasible, or one the API server refused, holds the wake (the next pass asks again or
+   gives the Pod up before any client was admitted); one it is still actuating does not, because the
+   resize changes requests alone, no limit and no cgroup limit.
 4. Roles, archive identity, volume identity and thin authority, the CA and the applied objects are
    verified exactly as for any wake.
 5. The attestation is a v2 proof read back against the Pod and the Cluster the archive probe read

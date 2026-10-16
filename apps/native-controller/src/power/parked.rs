@@ -1247,78 +1247,59 @@ impl PowerCoordinator {
         }
     }
     /// After PostgreSQL accepts on the resumed Pod, the Pod must still be the one the wake resumed
-    /// (the same containers, `postgres` running and not restarted) and the kubelet must have
-    /// actuated the requests the Pod was resized back to. The kubelet's Ready bit is not awaited:
-    /// the controller's attestation names the Pod, its container and its CA, and the gateway
-    /// routes by it. Polls within the pass, then reads the Pod and the Cluster once more: the
-    /// attestation is read back against those. `None` means not within `budget`; the next pass of
-    /// the wake continues on the same Pod.
+    /// (the same containers, `postgres` running and not restarted) and its requests must not be
+    /// held back. The kubelet's Ready bit is not awaited: the controller's attestation names the
+    /// Pod, its container and its CA, and the gateway routes by it. Nor is the kubelet's actuation
+    /// of the requests the Pod was resized back to: the resize changes requests alone, no limit and
+    /// no cgroup limit, so what it guards is the accounting of the node, not the first query. What
+    /// the kubelet has already decided against the resize does hold the wake: a resize it deferred
+    /// or found infeasible, or one the API server refused, is judged by the next pass, which asks
+    /// again or gives the Pod up before any client was admitted.
+    ///
+    /// The Pod and the Cluster are read together, once, as they are now: they are the barrier the
+    /// attestation is read back against. `None` means the Pod is not what the wake resumed or its
+    /// requests are held back; the next pass of the wake continues on the same Pod.
     pub(crate) async fn resumed_settled(
         &self,
         db: &Value,
         wake: &ParkedWake,
         cluster: &Value,
-        budget: Duration,
     ) -> std::result::Result<Option<(Value, Value)>, Error> {
         let ns = namespace(db);
         let started = Instant::now();
-        let mut actuated = Some(timing::Phase::begin(db, "resize_actuated"));
-        let deadline = started + budget;
-        let mut polls = 0_u64;
-        loop {
-            polls += 1;
-            let Some(pod) = self
-                .k8s
-                .read("Pod", Some(&ns), &wake.pod_name)
-                .await?
-                .filter(|pod| runs_wake(pod, wake))
-            else {
-                return Ok(None);
-            };
-            let restore = if Self::requested(&pod, &wake.requests_before) {
-                Self::restored(&pod, &wake.requests_before)
-            } else {
-                Restore::Rejected("refused")
-            };
-            match restore {
-                Restore::Done | Restore::Replaced => {
-                    if let Some(mut phase) = actuated.take() {
-                        phase.note("polls", polls);
-                        phase.completed();
-                    }
-                }
-                Restore::Rejected(why) => {
-                    // The next pass of the wake asks again, or gives the Pod up.
-                    if let Some(mut phase) = actuated.take() {
-                        phase.note("reason", why);
-                        phase.pending();
-                    }
-                    return Ok(None);
-                }
-                Restore::Pending(why) => {
-                    if let Some(phase) = actuated.as_mut() {
-                        phase.note("reason", why);
-                    }
-                }
+        let mut actuated = timing::Phase::begin(db, "resize_actuated");
+        let (pod, current) = tokio::try_join!(
+            self.k8s.read("Pod", Some(&ns), &wake.pod_name),
+            self.k8s.read("Cluster", Some(&ns), "database"),
+        )?;
+        let Some(pod) = pod.filter(|pod| runs_wake(pod, wake)) else {
+            actuated.note("reason", "pod_changed");
+            actuated.pending();
+            return Ok(None);
+        };
+        let restore = if Self::requested(&pod, &wake.requests_before) {
+            Self::restored(&pod, &wake.requests_before)
+        } else {
+            Restore::Rejected("refused")
+        };
+        match restore {
+            Restore::Done | Restore::Replaced => actuated.completed(),
+            // The kubelet accepted the resize and is on it: the wake does not wait for it.
+            Restore::Pending("in_progress") => {
+                actuated.note("reason", "in_progress");
+                actuated.pending();
             }
-            if actuated.is_none() {
-                let current = self
-                    .k8s
-                    .read("Cluster", Some(&ns), "database")
-                    .await?
-                    .filter(|current| current["metadata"]["uid"] == cluster["metadata"]["uid"])
-                    .ok_or("Cluster identity changed during the wake")?;
-                self.await_kubelet(db, &pod, started);
-                return Ok(Some((pod, current)));
-            }
-            if Instant::now() >= deadline {
-                if let Some(phase) = actuated.take() {
-                    phase.pending();
-                }
+            Restore::Pending(why) | Restore::Rejected(why) => {
+                actuated.note("reason", why);
+                actuated.pending();
                 return Ok(None);
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let current = current
+            .filter(|current| current["metadata"]["uid"] == cluster["metadata"]["uid"])
+            .ok_or("Cluster identity changed during the wake")?;
+        self.await_kubelet(db, &pod, started);
+        Ok(Some((pod, current)))
     }
     /// Starts the measurement of the kubelet's Ready bit of the Pod a wake resumed, which the
     /// wake does not wait for; it ends here if the bit is set already.

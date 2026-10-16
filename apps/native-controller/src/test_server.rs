@@ -92,6 +92,9 @@ pub struct State {
     /// The kubelet leaves an accepted Pod resize pending with this reason (`Deferred` or
     /// `Infeasible`) instead of actuating it.
     pub resize_pending: Option<String>,
+    /// The kubelet accepted a Pod resize and is still actuating it: the containers keep reporting
+    /// the requests they had, under a `PodResizeInProgress` condition.
+    pub resize_in_progress: bool,
     /// Every committed write as one line, appended to a log other doubles also write to, so a
     /// test can assert the order of effects across the cluster, the gateway and PostgreSQL.
     pub log: Option<Arc<Mutex<Vec<String>>>>,
@@ -320,8 +323,18 @@ fn handle(
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|c| c["type"] != "PodResizePending")
+                .filter(|c| c["type"] != "PodResizePending" && c["type"] != "PodResizeInProgress")
                 .collect();
+            if state.resize_in_progress {
+                // The spec changed and the kubelet is on it: the statuses report what is still
+                // actuated.
+                conditions.push(json!({"type":"PodResizeInProgress","status":"True"}));
+                current["status"]["conditions"] = conditions.into();
+                advance(&mut current);
+                state.objects.insert(target.into(), current.clone());
+                queue_event(state, "MODIFIED", &current);
+                return committed(state, method, path, patch, &current);
+            }
             if let Some(reason) = state.resize_pending.clone() {
                 // The kubelet cannot allocate the new requests: the spec changed, the statuses
                 // report what is still actuated, and the Pod says why.

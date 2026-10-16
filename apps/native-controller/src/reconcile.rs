@@ -39,8 +39,8 @@ const SWITCH: &str = "pgcf.io/runtime-switch";
 const PRESTARTED: &str = "pgcf-prestarted";
 const PROFILE: &str = "pgcf.io/compute-profile";
 const ADMISSION: &str = "pgcf-cnpg-prestarted";
-/// Longest a fast wake polls for PostgreSQL after the unfence, and then for the kubelet to
-/// actuate the Pod's requests; later passes continue on the same Pod.
+/// Longest a fast wake polls for PostgreSQL after the unfence; later passes continue on the same
+/// Pod.
 const ACCEPT_BUDGET: Duration = Duration::from_secs(5);
 /// Longest the controller waits for its own watch to deliver a write of its own before it reads
 /// the runtime proof back.
@@ -67,8 +67,7 @@ pub struct Reconciler {
     pub cluster_uid: String,
     postgres_image: String,
     pub(crate) http: reqwest::Client,
-    /// How long a resumed Pod is polled for a fresh, accepting postmaster, and then for its
-    /// requests to be actuated, before the pass ends.
+    /// How long a resumed Pod is polled for a fresh, accepting postmaster before the pass ends.
     pub(crate) accept_budget: Duration,
 }
 fn uid(v: &Value) -> Result<&str, Error> {
@@ -1593,11 +1592,7 @@ impl Reconciler {
                 let Some(held) = self.pg_accepting(db, &ca, &pod, wake).await? else {
                     return Ok(Some(observation(db, "provisioning", None)));
                 };
-                match self
-                    .power
-                    .resumed_settled(db, wake, &cluster, self.accept_budget)
-                    .await?
-                {
+                match self.power.resumed_settled(db, wake, &cluster).await? {
                     Some((pod, cluster)) => (pod, cluster, Some(held)),
                     None => return Ok(Some(observation(db, "provisioning", None))),
                 }
