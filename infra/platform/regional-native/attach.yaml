@@ -1,0 +1,134 @@
+# The node attach agent (pool design 2026-10-16): one privileged hostPID Pod per node mounts a
+# sleeping database's LV into a fenced pool slot when the native controller asks. It never calls
+# Kubernetes, so it has no RBAC and no service-account token; only the controller reaches it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgcf-attach
+  labels:
+    # hostPID, privileged mount namespace entry and /dev for device-mapper status.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    kustomize.toolkit.fluxcd.io/prune: disabled
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcf-attach
+  namespace: pgcf-attach
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pgcf-attach
+  namespace: pgcf-attach
+  labels:
+    app.kubernetes.io/name: pgcf-attach
+    app.kubernetes.io/part-of: pgcf
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-attach
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgcf-attach
+        app.kubernetes.io/part-of: pgcf
+    spec:
+      serviceAccountName: pgcf-attach
+      automountServiceAccountToken: false
+      hostPID: true
+      enableServiceLinks: false
+      tolerations:
+        - key: pgcf.io/quarantine
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: attach
+          image: pgcf-native-controller
+          command: [/pgcf-attach]
+          ports:
+            - name: attach
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PGCF_ATTACH_KEYS_FILE
+              value: /etc/pgcf-attach/PGCF_ATTACH_KEYS
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          readinessProbe:
+            tcpSocket:
+              port: attach
+            periodSeconds: 5
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: holders
+              mountPath: /var/lib/pgcf-attach
+            - name: keys
+              mountPath: /etc/pgcf-attach
+              readOnly: true
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: holders
+          hostPath:
+            path: /var/lib/pgcf-attach
+            type: DirectoryOrCreate
+        - name: keys
+          secret:
+            # Written by the native controller from the regional route keyring.
+            secretName: pgcf-attach-key
+            optional: true
+            defaultMode: 0400
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: pgcf-attach
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Ingress only from the native controller on the attach port; no egress.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pgcf-attach
+  namespace: pgcf-attach
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-attach
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pgcf-system
+            app.kubernetes.io/name: pgcf-agent
+      toPorts:
+        - ports:
+            - port: "8081"
+              protocol: TCP

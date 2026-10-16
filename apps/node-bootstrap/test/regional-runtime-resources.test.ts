@@ -130,6 +130,62 @@ test("real Kustomize composition selects all three native entrypoints and exact 
         65532,
       );
     }
+    // The node attach agent runs from the controller image on every node, privileged, without
+    // Kubernetes credentials, reachable only from the controller.
+    const attach = native.find(
+        (value) =>
+          value.kind === "DaemonSet" &&
+          object(value.metadata).name === "pgcf-attach",
+      )!,
+      attachPod = pod(attach),
+      attachContainer = (attachPod.containers as Json[])[0]!;
+    assert.equal(
+      attachContainer.image,
+      `registry.example/pgcf-regional@sha256:${"1".repeat(64)}`,
+    );
+    assert.deepEqual(attachContainer.command, ["/pgcf-attach"]);
+    assert.equal(attachPod.hostPID, true);
+    assert.equal(attachPod.automountServiceAccountToken, false);
+    assert.equal(object(attachContainer.securityContext).privileged, true);
+    assert.ok(
+      !native.some(
+        (value) =>
+          String(value.kind).endsWith("RoleBinding") &&
+          (value.subjects as Json[]).some(
+            (subject) => subject.namespace === "pgcf-attach",
+          ),
+      ),
+    );
+    const policy = (name: string) =>
+      native.find(
+        (value) =>
+          value.kind === "CiliumNetworkPolicy" &&
+          object(value.metadata).namespace === "pgcf-system" &&
+          object(value.metadata).name === name,
+      )!;
+    const egressTo = (name: string, key: string) =>
+      (object(policy(name).spec).egress as Json[]).filter((rule) =>
+        ((rule.toEndpoints as Json[] | undefined) ?? []).some(
+          (endpoint) =>
+            ((endpoint.matchExpressions as Json[] | undefined) ?? []).some(
+              (expression) => expression.key === key,
+            ) || key in object(endpoint.matchLabels ?? {}),
+        ),
+      );
+    const slotKey = "k8s:io.cilium.k8s.namespace.labels.pgcf.io/slot";
+    assert.equal(egressTo("pgcf-agent", slotKey).length, 1);
+    assert.equal(egressTo("pgcf-gateway", slotKey).length, 1);
+    assert.deepEqual(
+      object(
+        egressTo("pgcf-agent", "k8s:io.kubernetes.pod.namespace").find(
+          (rule) =>
+            object((rule.toEndpoints as Json[])[0]!.matchLabels)[
+              "k8s:io.kubernetes.pod.namespace"
+            ] === "pgcf-attach",
+        )!,
+      ).toPorts,
+      [{ ports: [{ port: "8081", protocol: "TCP" }] }],
+    );
     const agent = container(deployment(native, "pgcf-agent"), "agent"),
       gateway = container(deployment(native, "pgcf-gateway"), "gateway"),
       transport = container(deployment(relay, "pgcf-bootstrap-relay"), "relay");

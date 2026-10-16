@@ -1,0 +1,30 @@
+# The native controller reaches pool slots (CNPG Pods in namespaces labelled pgcf.io/slot, never
+# pgcf.io/database-id) and the node attach agents.
+- op: add
+  path: /spec/egress/-
+  value:
+    toEndpoints:
+      - matchLabels:
+          cnpg.io/cluster: database
+        matchExpressions:
+          - key: k8s:io.kubernetes.pod.namespace
+            operator: Exists
+          - key: k8s:io.cilium.k8s.namespace.labels.pgcf.io/slot
+            operator: Exists
+    toPorts:
+      - ports:
+          - port: "5432"
+            protocol: TCP
+          - port: "9187"
+            protocol: TCP
+- op: add
+  path: /spec/egress/-
+  value:
+    toEndpoints:
+      - matchLabels:
+          k8s:io.kubernetes.pod.namespace: pgcf-attach
+          app.kubernetes.io/name: pgcf-attach
+    toPorts:
+      - ports:
+          - port: "8081"
+            protocol: TCP
