@@ -8,7 +8,7 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
-import { recordUsageSample } from "./usage.ts";
+import { recordUsageSamples } from "./usage.ts";
 
 interface MeasurementTarget {
   id: string;
@@ -116,40 +116,34 @@ export async function ingestAgentUsage(c: ApiContext, raw: unknown) {
   const parsed = AgentUsageRequest.safeParse(raw);
   if (!parsed.success)
     throw new ApiError("invalid_request", "Invalid usage measurements");
-  await liveTargets(
-    c,
-    region.id,
-    parsed.data.samples.map((sample) => sample.database_id),
+  const outcomes = await recordUsageSamples(
+    c.env.DB,
+    parsed.data.samples.map((sample) => ({
+      principal: { region_id: region.id, source: sample.source },
+      sample,
+    })),
+    { live: true },
   );
   let recorded = 0,
     duplicates = 0,
     refused = 0;
-  for (const sample of parsed.data.samples) {
-    let result: "recorded" | "duplicate";
-    try {
-      result = await recordUsageSample(
-        c.env.DB,
-        { region_id: region.id, source: sample.source },
-        sample,
-      );
-    } catch (error) {
+  parsed.data.samples.forEach((sample, index) => {
+    const outcome = outcomes[index]!;
+    if (outcome === "recorded") recorded++;
+    else if (outcome === "duplicate") duplicates++;
+    else {
       // A conflict is final for this sample (finalized hour, overlap, input bound, reused identity).
       // Acknowledging it lets the producer's ordered outbox drain instead of replaying it forever.
-      if (!(error instanceof ApiError) || error.code !== "conflict")
-        throw error;
       console.warn(
         JSON.stringify({
           event: "usage_sample_refused",
           database_id: sample.database_id,
           source: sample.source,
-          reason: error.message,
+          reason: outcome.message,
         }),
       );
       refused++;
-      continue;
     }
-    if (result === "recorded") recorded++;
-    else duplicates++;
-  }
+  });
   return c.json({ recorded, duplicates, refused }, 200);
 }

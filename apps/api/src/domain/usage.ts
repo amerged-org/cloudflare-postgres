@@ -46,15 +46,25 @@ export interface BackupUsageIdentity {
   backup_bucket: string;
   deleted_at: string | null;
 }
-export async function recordUsageSample(
-  db: D1Database,
-  principalInput: UsageRecorderPrincipal,
-  input: UsageSample,
-  now = Date.now(),
+/** The raw samples one database keeps for one UTC hour; a producer past it is refused. */
+const USAGE_HOUR_SAMPLE_LIMIT = 10_000;
+export type UsageOutcome = "recorded" | "duplicate" | ApiError;
+interface PreparedSample {
+  principal: UsageRecorderPrincipal;
+  sample: UsageSample;
+  payload: string;
+  start: string;
+  end: string;
+  hour: string;
+  hourEnd: string;
+}
+function prepareUsageSample(
+  entry: { principal: UsageRecorderPrincipal; sample: UsageSample },
+  now: number,
   backupIdentity?: BackupUsageIdentity,
-): Promise<"recorded" | "duplicate"> {
-  const principal = UsageRecorderPrincipal.parse(principalInput),
-    parsed = UsageSample.parse(input);
+): PreparedSample {
+  const principal = UsageRecorderPrincipal.parse(entry.principal),
+    parsed = UsageSample.parse(entry.sample);
   const sample: UsageSample =
     parsed.source === "gateway"
       ? {
@@ -71,16 +81,8 @@ export async function recordUsageSample(
     sample.source === "gateway" ? sample.interval_start : sample.observed_at;
   const end =
     sample.source === "gateway" ? sample.interval_end : sample.observed_at;
-  const hour = new Date(
-    Math.floor(Date.parse(start) / USAGE_HOUR_MS) * USAGE_HOUR_MS,
-  ).toISOString();
-  const payload = JSON.stringify(sample);
-  const identity = [
-    sample.database_id,
-    sample.source,
-    sample.producer_id,
-    sample.sequence,
-  ] as const;
+  const hourStart =
+    Math.floor(Date.parse(start) / USAGE_HOUR_MS) * USAGE_HOUR_MS;
   if (
     backupIdentity &&
     (sample.source !== "backup" ||
@@ -90,94 +92,236 @@ export async function recordUsageSample(
       "invalid_request",
       "Backup identity is restricted to the authenticated backup recorder",
     );
-  const database = await db
-    .prepare(
-      backupIdentity
-        ? "SELECT d.region_id,d.archive_path,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=?"
-        : "SELECT region_id FROM databases WHERE id=?",
-    )
-    .bind(sample.database_id)
-    .first<{
-      region_id: string;
-      archive_path?: string;
-      deleted_at?: string | null;
-      backup_bucket?: string;
-    }>();
-  if (!database || database.region_id !== principal.region_id)
-    throw new ApiError("not_found", "Metered database not found");
-  if (
-    backupIdentity &&
-    (database.archive_path !== backupIdentity.archive_path ||
-      database.deleted_at !== backupIdentity.deleted_at ||
-      database.backup_bucket !== backupIdentity.backup_bucket)
-  )
-    throw new ApiError(
-      "conflict",
-      "Backup archive identity changed during measurement",
-    );
-  const duplicate = await db
-    .prepare(
-      "SELECT payload FROM usage_samples WHERE database_id=? AND source=? AND producer_id=? AND sequence=?",
-    )
-    .bind(...identity)
-    .first<{ payload: string }>();
-  if (duplicate) {
-    if (duplicate.payload !== payload)
-      throw new ApiError(
-        "conflict",
-        "Usage sample identity was reused with different measurements",
-      );
-    return "duplicate";
-  }
-  const result = await db
+  return {
+    principal,
+    sample,
+    payload: JSON.stringify(sample),
+    start,
+    end,
+    hour: new Date(hourStart).toISOString(),
+    hourEnd: new Date(hourStart + USAGE_HOUR_MS).toISOString(),
+  };
+}
+const identityOf = (p: PreparedSample) =>
+  [
+    p.sample.database_id,
+    p.sample.source,
+    p.sample.producer_id,
+    p.sample.sequence,
+  ] as const;
+const SAMPLE_PAYLOAD_SQL =
+  "SELECT payload FROM usage_samples WHERE database_id=? AND source=? AND producer_id=? AND sequence=?";
+/**
+ * One sample's insert. Every acceptance rule is in the statement, so it holds atomically against
+ * whatever else writes: the database is in the recorder's region, its hour is not final, a gateway
+ * interval does not overlap one of the same producer, and a backup sample still names the archive
+ * it measured. `bounded` adds the hour's input limit; a caller that knows the limit cannot be
+ * reached leaves it out and saves the count.
+ */
+function insertUsageSample(
+  db: D1Database,
+  p: PreparedSample,
+  bounded: boolean,
+  backupIdentity?: BackupUsageIdentity,
+) {
+  const { sample, principal } = p;
+  return db
     .prepare(
       `INSERT OR IGNORE INTO usage_samples(database_id,source,producer_id,sequence,interval_start,interval_end,observed_at,payload)
     SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM databases WHERE id=? AND region_id=?)
     AND NOT EXISTS(SELECT 1 FROM usage_hourly WHERE database_id=? AND hour=? AND final=1)
-    AND (SELECT count(*) FROM usage_samples WHERE database_id=? AND interval_start>=? AND interval_start<?)<10000
+    ${bounded ? `AND (SELECT count(*) FROM usage_samples WHERE database_id=? AND interval_start>=? AND interval_start<?)<${USAGE_HOUR_SAMPLE_LIMIT}` : ""}
     AND (? <> 'gateway' OR NOT EXISTS(SELECT 1 FROM usage_samples WHERE database_id=? AND source='gateway' AND producer_id=? AND interval_start<? AND interval_end>?))
     AND (?=0 OR EXISTS(SELECT 1 FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=? AND d.region_id=? AND d.archive_path=? AND d.deleted_at IS ? AND r.backup_bucket=?))`,
     )
     .bind(
-      ...identity,
-      start,
-      end,
+      ...identityOf(p),
+      p.start,
+      p.end,
       sample.observed_at,
-      payload,
+      p.payload,
       sample.database_id,
       principal.region_id,
       sample.database_id,
-      hour,
-      sample.database_id,
-      hour,
-      new Date(Date.parse(hour) + USAGE_HOUR_MS).toISOString(),
+      p.hour,
+      ...(bounded ? [sample.database_id, p.hour, p.hourEnd] : []),
       sample.source,
       sample.database_id,
       sample.producer_id,
-      end,
-      start,
+      p.end,
+      p.start,
       backupIdentity ? 1 : 0,
       sample.database_id,
       backupIdentity?.region_id ?? null,
       backupIdentity?.archive_path ?? null,
       backupIdentity?.deleted_at ?? null,
       backupIdentity?.backup_bucket ?? null,
-    )
-    .run();
-  if (result.meta.changes === 0) {
-    const persisted = await db
-      .prepare(
-        "SELECT payload FROM usage_samples WHERE database_id=? AND source=? AND producer_id=? AND sequence=?",
-      )
-      .bind(...identity)
-      .first<{ payload: string }>();
-    if (persisted?.payload === payload) return "duplicate";
-    throw new ApiError(
-      "conflict",
-      "Usage interval overlaps, is finalized, exceeds its input bound, or has conflicting identity",
     );
+}
+/**
+ * Records samples in the order given, with the outcome of each. Two D1 round trips: one batch
+ * that reads the databases and, once per database and hour, how many samples the hour holds, and
+ * one batch of the inserts; a third only for samples the insert did not take, to tell a replay
+ * from a conflict. A sample whose hour cannot reach the input limit with this request alone is
+ * inserted without counting; one that can keeps the count in its statement, which is exact. The
+ * uncounted ones rely on the count read before them: another request writing the same hour in
+ * between can take it past the limit by at most its own samples, which is slack in a ceiling that
+ * only stops a runaway producer.
+ *
+ * `live` is the measurement route's rule: every database must be live in its recorder's region, or
+ * the whole request is refused before anything is recorded. An invalid sample ends the list; the
+ * ones before it are recorded and its error is raised, as recording them one at a time did.
+ */
+export async function recordUsageSamples(
+  db: D1Database,
+  entries: ReadonlyArray<{
+    principal: UsageRecorderPrincipal;
+    sample: UsageSample;
+  }>,
+  options: {
+    now?: number;
+    backupIdentity?: BackupUsageIdentity;
+    live?: boolean;
+  } = {},
+): Promise<UsageOutcome[]> {
+  const now = options.now ?? Date.now(),
+    { backupIdentity, live } = options;
+  const planned: PreparedSample[] = [];
+  let invalid: unknown;
+  for (const entry of entries) {
+    try {
+      planned.push(prepareUsageSample(entry, now, backupIdentity));
+    } catch (error) {
+      invalid = error;
+      break;
+    }
   }
-  return "recorded";
+  if (planned.length === 0) {
+    if (invalid) throw invalid;
+    return [];
+  }
+  const ids = [...new Set(planned.map((p) => p.sample.database_id))];
+  const hours = new Map<
+    string,
+    { database_id: string; hour: string; hourEnd: string; samples: number }
+  >();
+  for (const p of planned) {
+    const key = `${p.sample.database_id}|${p.hour}`,
+      known = hours.get(key);
+    if (known) known.samples++;
+    else
+      hours.set(key, {
+        database_id: p.sample.database_id,
+        hour: p.hour,
+        hourEnd: p.hourEnd,
+        samples: 1,
+      });
+  }
+  const [found, counted] = (await db.batch([
+    db
+      .prepare(
+        backupIdentity
+          ? "SELECT d.id,d.region_id,d.archive_path,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id IN(SELECT value FROM json_each(?))"
+          : live
+            ? "SELECT d.id,d.region_id FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.id IN(SELECT value FROM json_each(?))"
+            : "SELECT id,region_id FROM databases WHERE id IN(SELECT value FROM json_each(?))",
+      )
+      .bind(JSON.stringify(ids)),
+    db
+      .prepare(
+        `SELECT g.database_id,g.hour,(SELECT count(*) FROM usage_samples u WHERE u.database_id=g.database_id AND u.interval_start>=g.hour AND u.interval_start<g.hour_end) n
+      FROM (SELECT json_extract(value,'$[0]') database_id,json_extract(value,'$[1]') hour,json_extract(value,'$[2]') hour_end FROM json_each(?)) g`,
+      )
+      .bind(
+        JSON.stringify(
+          [...hours.values()].map((h) => [h.database_id, h.hour, h.hourEnd]),
+        ),
+      ),
+  ])) as [
+    D1Result<{
+      id: string;
+      region_id: string;
+      archive_path?: string;
+      deleted_at?: string | null;
+      backup_bucket?: string;
+    }>,
+    D1Result<{ database_id: string; hour: string; n: number }>,
+  ];
+  const databases = new Map(found.results.map((row) => [row.id, row]));
+  for (const p of planned) {
+    const database = databases.get(p.sample.database_id);
+    if (!database || database.region_id !== p.principal.region_id)
+      throw new ApiError(
+        "not_found",
+        live ? "Measured database not found" : "Metered database not found",
+      );
+    if (
+      backupIdentity &&
+      (database.archive_path !== backupIdentity.archive_path ||
+        database.deleted_at !== backupIdentity.deleted_at ||
+        database.backup_bucket !== backupIdentity.backup_bucket)
+    )
+      throw new ApiError(
+        "conflict",
+        "Backup archive identity changed during measurement",
+      );
+  }
+  const held = new Map(
+    counted.results.map((row) => [`${row.database_id}|${row.hour}`, row.n]),
+  );
+  const inserted = await db.batch(
+    planned.map((p) => {
+      const key = `${p.sample.database_id}|${p.hour}`;
+      // Whether this request alone can take the hour past its limit; if not, no count is needed.
+      const bounded =
+        (held.get(key) ?? 0) + hours.get(key)!.samples >
+        USAGE_HOUR_SAMPLE_LIMIT;
+      return insertUsageSample(db, p, bounded, backupIdentity);
+    }),
+  );
+  const outcomes: UsageOutcome[] = new Array(planned.length);
+  const missed: number[] = [];
+  inserted.forEach((result, index) => {
+    if (result.meta.changes > 0) outcomes[index] = "recorded";
+    else missed.push(index);
+  });
+  if (missed.length > 0) {
+    const persisted = await db.batch<{ payload: string }>(
+      missed.map((index) =>
+        db.prepare(SAMPLE_PAYLOAD_SQL).bind(...identityOf(planned[index]!)),
+      ),
+    );
+    missed.forEach((index, at) => {
+      const stored = persisted[at]!.results[0];
+      outcomes[index] =
+        stored?.payload === planned[index]!.payload
+          ? "duplicate"
+          : new ApiError(
+              "conflict",
+              stored
+                ? "Usage sample identity was reused with different measurements"
+                : "Usage interval overlaps, is finalized, exceeds its input bound, or has conflicting identity",
+            );
+    });
+  }
+  if (invalid) throw invalid;
+  return outcomes;
+}
+
+export async function recordUsageSample(
+  db: D1Database,
+  principalInput: UsageRecorderPrincipal,
+  input: UsageSample,
+  now = Date.now(),
+  backupIdentity?: BackupUsageIdentity,
+): Promise<"recorded" | "duplicate"> {
+  const [outcome] = await recordUsageSamples(
+    db,
+    [{ principal: principalInput, sample: input }],
+    { now, backupIdentity },
+  );
+  if (outcome instanceof ApiError) throw outcome;
+  return outcome!;
 }
 
 interface QueryPeriod {

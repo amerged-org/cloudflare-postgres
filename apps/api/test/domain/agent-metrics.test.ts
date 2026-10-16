@@ -11,6 +11,7 @@ import {
 } from "@pgcf/contracts/gateway-activity";
 import { afterEach, expect, it, vi } from "vitest";
 import { runUsageCron } from "../../src/domain/usage-cron.ts";
+import { countStatements } from "./d1-statements.ts";
 import {
   cleanupFixtures,
   fixture,
@@ -618,4 +619,150 @@ it("an authenticated held transaction remains idle-active despite an old client-
     active_connections: 2,
   });
   expect(await generation(f.id)).toBe(1);
+});
+
+// A usage request costs two round trips whatever its size: one that reads the databases and the
+// hour counts, one that inserts every sample. Nothing is read per sample.
+async function liveDatabase(
+  f: Awaited<ReturnType<typeof ready>>,
+  name: string,
+) {
+  return DatabaseWithOperation.parse(await (await f.create(name)).json())
+    .database.id;
+}
+const inserts = (sql: string[]) =>
+  sql.filter((text) => text.startsWith("INSERT OR IGNORE INTO usage_samples"));
+const uniqueSamples = (id: string, count: number, from = 1) =>
+  Array.from({ length: count }, (_, index) => ({
+    ...storageSample(id),
+    sequence: from + index,
+  }));
+
+it("records the samples of many databases with one read batch and one insert batch", async () => {
+  const f = await ready();
+  const ids = [f.id, await liveDatabase(f, "b"), await liveDatabase(f, "c")];
+  const samples = ids.flatMap((id) => uniqueSamples(id, 3));
+  // The region's row is cached after its first request, which is not what is measured here.
+  expect((await sendUsage(f, [storageSample(f.id)])).status).toBe(200);
+  const counted = await countStatements(() => sendUsage(f, samples));
+  expect(await counted.result.json()).toEqual({
+    recorded: 9,
+    duplicates: 0,
+    refused: 0,
+  });
+  expect(counted.statements).toBe(samples.length + 2);
+  expect(counted.roundTrips).toBe(2);
+  // Far from the hour's limit, no insert counts the hour's samples.
+  expect(inserts(counted.sql)).toHaveLength(9);
+  expect(inserts(counted.sql).some((text) => text.includes("count(*)"))).toBe(
+    false,
+  );
+});
+
+it("tells a replay, a reused identity and a finalized hour apart in one request", async () => {
+  const f = await ready(),
+    previous = Math.floor(Date.now() / 3600000) * 3600000 - 3600000,
+    [kept, replayed, reused] = uniqueSamples(f.id, 3);
+  await sendUsage(f, [replayed!, reused!]);
+  await env.DB.prepare(
+    "INSERT INTO usage_hourly(database_id,hour,metrics,gaps,final,computed_at) VALUES(?,?,'{}','[]',1,?)",
+  )
+    .bind(f.id, new Date(previous).toISOString(), new Date().toISOString())
+    .run();
+  const late = {
+    ...storageSample(f.id),
+    observed_at: new Date(previous + 1000).toISOString(),
+  };
+  const counted = await countStatements(() =>
+    sendUsage(f, [
+      kept!,
+      replayed!,
+      { ...reused!, storage_used_bytes: 7 },
+      late,
+    ]),
+  );
+  expect(await counted.result.json()).toEqual({
+    recorded: 1,
+    duplicates: 1,
+    refused: 2,
+  });
+  // The three the insert did not take are looked up together, once.
+  expect(counted.roundTrips).toBe(3);
+  expect(
+    (
+      await env.DB.prepare(
+        "SELECT count(*) n FROM usage_samples WHERE database_id=?",
+      )
+        .bind(f.id)
+        .first<{ n: number }>()
+    )?.n,
+  ).toBe(3);
+});
+
+it("keeps the hour's input limit exact where a request could reach it", async () => {
+  const f = await ready(),
+    hour = Math.floor(Date.now() / 3600000) * 3600000 - 3600000,
+    at = (offset: number) => new Date(hour + offset).toISOString();
+  // 9,998 raw samples already stand in the hour.
+  await env.DB.prepare(
+    `INSERT INTO usage_samples(database_id,source,producer_id,sequence,interval_start,interval_end,observed_at,payload)
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<9998)
+    SELECT ?,'agent','bulk',i,?,?,?,'{}' FROM n`,
+  )
+    .bind(f.id, at(1000), at(1000), at(1000))
+    .run();
+  const sample = (sequence: number, observedAt = at(2000)) => ({
+    ...storageSample(f.id),
+    sequence,
+    observed_at: observedAt,
+  });
+  const [first, second, third] = [sample(1), sample(2), sample(3)];
+  const counted = await countStatements(() =>
+    sendUsage(f, [first, second, third, sample(4, at(3_600_000 + 2000))]),
+  );
+  // Two fit under the limit and the third is refused; a sample of the next hour is not counted
+  // against it.
+  expect(await counted.result.json()).toEqual({
+    recorded: 3,
+    duplicates: 0,
+    refused: 1,
+  });
+  expect(
+    inserts(counted.sql).filter((text) => text.includes("count(*)")),
+  ).toHaveLength(3);
+  // At the limit a replay of a recorded sample is still a replay, not a refusal.
+  expect(await (await sendUsage(f, [second])).json()).toEqual({
+    recorded: 0,
+    duplicates: 1,
+    refused: 0,
+  });
+});
+
+it("refuses the whole request before recording when one database is not live, and ends at an invalid sample", async () => {
+  const f = await ready(),
+    other = await liveDatabase(f, "other");
+  await request(`/v1/databases/${other}`, f.integrator, "DELETE");
+  expect(
+    (await sendUsage(f, [storageSample(f.id), storageSample(other)])).status,
+  ).toBe(404);
+  const count = async () =>
+    (await env.DB.prepare("SELECT count(*) n FROM usage_samples").first<{
+      n: number;
+    }>())!.n;
+  const before = await count();
+  // An observation from the future ends the list: what precedes it is recorded and it is refused.
+  const future = {
+    ...storageSample(f.id),
+    observed_at: new Date(Date.now() + 120_000).toISOString(),
+  };
+  const [early, late] = [storageSample(f.id), storageSample(f.id)];
+  expect((await sendUsage(f, [early, future, late])).status).toBe(400);
+  expect(await count()).toBe(before + 1);
+  expect(
+    await env.DB.prepare(
+      "SELECT producer_id FROM usage_samples WHERE database_id=? ORDER BY rowid DESC LIMIT 1",
+    )
+      .bind(f.id)
+      .first<string>("producer_id"),
+  ).toBe(early.producer_id);
 });

@@ -216,44 +216,66 @@ it("ignores unrelated configuration revisions while preserving exact immutable s
 it("checks source deletion atomically in the actual recorder INSERT after the outer identity recheck", async () => {
   const f = await setup();
   await put(f.prefix, "fixture", 29);
-  const prepare = env.DB.prepare.bind(env.DB);
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
+  const prepare = prototype.prepare,
+    batch = prototype.batch;
+  const real = new WeakMap<object, D1PreparedStatement>(),
+    recorder = new WeakSet<object>();
   let injected = false;
-  const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
-    new Proxy(statement, {
+  const wrap = (
+    statement: D1PreparedStatement,
+    insert: boolean,
+  ): D1PreparedStatement => {
+    const proxy: D1PreparedStatement = new Proxy(statement, {
       get(target, property) {
         if (property === "bind")
-          return (...values: unknown[]) => wrap(target.bind(...values));
-        if (property === "run")
-          return async () => {
-            if (!injected) {
-              injected = true;
-              await prepare(
-                "UPDATE databases SET desired_state='deleted',deleted_at=? WHERE id=?",
-              )
-                .bind(new Date().toISOString(), f.id)
-                .run();
-            }
-            return target.run();
-          };
+          return (...values: unknown[]) => wrap(target.bind(...values), insert);
         const value = Reflect.get(target, property);
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-  vi.spyOn(Object.getPrototypeOf(env.DB), "prepare").mockImplementation(
-    (...args: unknown[]) => {
-      const sql = String(args[0]),
-        statement = prepare(sql);
-      return sql.includes("INSERT OR IGNORE INTO usage_samples")
-        ? wrap(statement)
-        : statement;
-    },
-  );
+    real.set(proxy, statement);
+    if (insert) recorder.add(proxy);
+    return proxy;
+  };
+  vi.spyOn(prototype, "prepare").mockImplementation(function (
+    this: D1Database,
+    sql: string,
+  ) {
+    return wrap(
+      prepare.call(this, sql),
+      sql.includes("INSERT OR IGNORE INTO usage_samples"),
+    );
+  });
+  // The source is deleted after the recorder's identity recheck and before its insert runs.
+  vi.spyOn(prototype, "batch").mockImplementation(async function (
+    this: D1Database,
+    statements: D1PreparedStatement[],
+  ) {
+    if (!injected && statements.some((statement) => recorder.has(statement))) {
+      injected = true;
+      await prepare
+        .call(
+          this,
+          "UPDATE databases SET desired_state='deleted',deleted_at=? WHERE id=?",
+        )
+        .bind(new Date().toISOString(), f.id)
+        .run();
+    }
+    return batch.call(
+      this,
+      statements.map((statement) => real.get(statement) ?? statement),
+    );
+  });
   const result = await measureBackupUsage(env, f.id);
   expect(injected).toBe(true);
   expect(result.status).toBe("unavailable");
   expect(result.sample).toBeUndefined();
+  vi.restoreAllMocks();
   expect(
-    await prepare("SELECT payload FROM usage_samples WHERE database_id=?")
+    await env.DB.prepare(
+      "SELECT payload FROM usage_samples WHERE database_id=?",
+    )
       .bind(f.id)
       .first(),
   ).toBeNull();
