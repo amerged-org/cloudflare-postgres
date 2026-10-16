@@ -6,7 +6,7 @@ use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     path::PathBuf,
     sync::Mutex,
@@ -93,6 +93,11 @@ pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
 /// How long the version of this controller's own write is remembered for the event of the watch
 /// that is still to come; a watch that restarted past it never delivers it.
 const OWN_WRITE_MEMORY: Duration = Duration::from_secs(120);
+/// How long a change of an object that is not known to be this controller's own is held back
+/// before it hints: the API server tells its watches of a write about as it answers the writer, and
+/// which of the two reaches this controller first is not up to it. An event that comes first names
+/// a version that is only known to be the controller's own once the answer has been read.
+const OWN_WRITE_SETTLE: Duration = Duration::from_millis(25);
 /// How many reads of one group are in flight at once: the group of a pass is a dozen objects and
 /// the API server answers each in a few milliseconds.
 const READ_FANOUT: usize = 8;
@@ -126,6 +131,15 @@ fn shape(metadata: &Value) -> [u8; 32] {
     ]);
     Sha256::digest(shape.to_string().as_bytes()).into()
 }
+/// A change that hints a database unless the version it names turns out to be one this
+/// controller wrote itself, once the answers of its writes in flight are in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub(crate) trigger: Trigger,
+    kind: String,
+    namespace: String,
+    version: String,
+}
 #[derive(Debug)]
 struct WatchContinuity {
     controller_epoch: String,
@@ -136,6 +150,8 @@ struct WatchContinuity {
     /// not arrived yet, by (kind, namespace, name): the pass that wrote one holds the object as
     /// written, so its event is not a change someone else made.
     written: HashMap<(String, String, String), Vec<(String, Instant)>>,
+    /// How long a change is held back before it hints (`OWN_WRITE_SETTLE`).
+    settle: Duration,
 }
 impl Default for WatchContinuity {
     fn default() -> Self {
@@ -158,6 +174,7 @@ impl Default for WatchContinuity {
             kinds: HashMap::new(),
             objects: HashMap::new(),
             written: HashMap::new(),
+            settle: OWN_WRITE_SETTLE,
         }
     }
 }
@@ -262,12 +279,15 @@ impl WatchContinuity {
     /// Whether `object` is a version this controller wrote itself; its event ends the memory of it.
     fn own(&mut self, kind: &str, object: &Value) -> bool {
         let meta = &object["metadata"];
-        let key = (
-            kind.to_string(),
-            text(meta, "namespace").to_string(),
-            text(meta, "name").to_string(),
-        );
-        let version = text(meta, "resourceVersion");
+        self.own_version(
+            kind,
+            text(meta, "namespace"),
+            text(meta, "name"),
+            text(meta, "resourceVersion"),
+        )
+    }
+    fn own_version(&mut self, kind: &str, namespace: &str, name: &str, version: &str) -> bool {
+        let key = (kind.to_string(), namespace.to_string(), name.to_string());
         let Some(versions) = self.written.get_mut(&key) else {
             return false;
         };
@@ -284,7 +304,7 @@ impl WatchContinuity {
     /// the database it hints for reconciliation. The event of a version this controller wrote
     /// itself hints no database: the pass that wrote it holds the object as written, and a change
     /// someone else makes has a version of its own.
-    fn event(&mut self, kind: &str, event: &Value) -> Result<(String, Option<Trigger>), Error> {
+    fn event(&mut self, kind: &str, event: &Value) -> Result<(String, Option<Candidate>), Error> {
         let event_type = text(event, "type");
         if event_type == "ERROR" {
             return Err("Kubernetes watch history gap".into());
@@ -337,9 +357,14 @@ impl WatchContinuity {
             && !own_record
             && !status_of_cnpg
             && !self.own(kind, object))
-        .then(|| Trigger {
-            database: id.to_string(),
-            name: text(meta, "name").to_string(),
+        .then(|| Candidate {
+            trigger: Trigger {
+                database: id.to_string(),
+                name: text(meta, "name").to_string(),
+            },
+            kind: kind.to_string(),
+            namespace: text(meta, "namespace").to_string(),
+            version: version.to_string(),
         });
         Ok((version.to_string(), hint))
     }
@@ -486,8 +511,24 @@ impl Kubernetes {
         &self,
         kind: &str,
         event: &Value,
-    ) -> Result<(String, Option<Trigger>), Error> {
+    ) -> Result<(String, Option<Candidate>), Error> {
         self.continuity.lock().unwrap().event(kind, event)
+    }
+    /// Whether `candidate` still hints its database: not once the answer of the write it belongs to
+    /// has been read and its version is known to be this controller's own.
+    pub(crate) fn still_a_hint(&self, candidate: &Candidate) -> bool {
+        !self.continuity.lock().unwrap().own_version(
+            &candidate.kind,
+            &candidate.namespace,
+            &candidate.trigger.name,
+            &candidate.version,
+        )
+    }
+    /// How long a change is held back before it hints, for a test that makes the answer of a write
+    /// trail its event by a time of its own.
+    #[cfg(test)]
+    pub(crate) fn settle_within(&self, settle: Duration) {
+        self.continuity.lock().unwrap().settle = settle;
     }
     pub fn runtime_resource_current(&self, resource: &Value) -> bool {
         self.continuity
@@ -707,6 +748,7 @@ impl Kubernetes {
             .await?
             .error_for_status()?;
         let initial: Value = serde_json::from_slice(&bounded(response, 2 * 1024 * 1024).await?)?;
+        let mut held: VecDeque<(Instant, Candidate)> = VecDeque::new();
         let mut version = text(&initial["metadata"], "resourceVersion").to_string();
         let items = initial["items"]
             .as_array()
@@ -751,35 +793,74 @@ impl Kubernetes {
             }
             self.continuity.lock().unwrap().connected(kind, &version);
             let mut stream = response.bytes_stream();
-            let mut pending = Vec::new();
-            while let Some(bytes) = stream.next().await {
+            let mut frame = Vec::new();
+            loop {
+                // A change is held for the settle window and judged again at its end, when the
+                // answer of the write it may belong to has been read.
+                let release_at = held.front().map(|(at, _)| *at);
+                let bytes = tokio::select! {
+                    bytes = stream.next() => bytes,
+                    () = async {
+                        match release_at {
+                            Some(at) => tokio::time::sleep_until(at.into()).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.release(&mut held, &events, false)?;
+                        continue;
+                    }
+                };
+                let Some(bytes) = bytes else {
+                    break;
+                };
                 let bytes = bytes?;
-                if bytes.len() > 1024 * 1024 - pending.len() {
+                if bytes.len() > 1024 * 1024 - frame.len() {
                     return Err("Kubernetes watch frame exceeds bound".into());
                 }
-                pending.extend_from_slice(&bytes);
-                while let Some(end) = pending.iter().position(|b| *b == b'\n') {
-                    let line: Vec<_> = pending.drain(..=end).collect();
+                frame.extend_from_slice(&bytes);
+                while let Some(end) = frame.iter().position(|b| *b == b'\n') {
+                    let line: Vec<_> = frame.drain(..=end).collect();
                     if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
                     let event: Value = serde_json::from_slice(&line)?;
-                    let (next, hint) = self.watch_event(kind, &event)?;
+                    let (next, candidate) = self.watch_event(kind, &event)?;
                     version = next;
-                    if let Some(hint) = hint {
-                        events
-                            .try_send(hint)
-                            .map_err(|_| "controller hint queue exhausted")?;
+                    if let Some(candidate) = candidate {
+                        let settle = self.continuity.lock().unwrap().settle;
+                        held.push_back((Instant::now() + settle, candidate));
                     }
                 }
             }
-            if !pending.is_empty() {
+            self.release(&mut held, &events, true)?;
+            if !frame.is_empty() {
                 return Err("Kubernetes watch frame was interrupted".into());
             }
             if let Some(kind) = self.continuity.lock().unwrap().kinds.get_mut(kind) {
                 kind.2 = false;
             }
         }
+    }
+    /// Sends the hints of the changes whose settle window is over (all of them when `all`), but for
+    /// the ones whose version turned out to be this controller's own.
+    fn release(
+        &self,
+        held: &mut VecDeque<(Instant, Candidate)>,
+        events: &tokio::sync::mpsc::Sender<Trigger>,
+        all: bool,
+    ) -> Result<(), Error> {
+        let now = Instant::now();
+        while held.front().is_some_and(|(at, _)| all || *at <= now) {
+            let Some((_, candidate)) = held.pop_front() else {
+                break;
+            };
+            if self.still_a_hint(&candidate) {
+                events
+                    .try_send(candidate.trigger)
+                    .map_err(|_| "controller hint queue exhausted")?;
+            }
+        }
+        Ok(())
     }
     pub async fn in_cluster() -> Result<Self, Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1467,6 +1548,84 @@ mod tests {
         assert!(state.event("Pod", &pod("20")).unwrap().1.is_some());
         assert!(state.event("Pod", &pod("21")).unwrap().1.is_some());
     }
+    /// Opens the metadata watch of `kind` on the double and waits until it is established.
+    async fn watching(
+        server: &crate::test_server::Server,
+        kind: &'static str,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Trigger>,
+        tokio::task::JoinHandle<Result<(), Error>>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let k8s = server.k8s.clone();
+        let task = tokio::spawn(async move {
+            k8s.watch_database_ids(kind, sender)
+                .await
+                .map_err(|error| Error::from(error.to_string()))
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while server.state.lock().unwrap().streams.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the watch is established");
+        (receiver, task)
+    }
+    #[tokio::test]
+    async fn an_event_that_arrives_before_the_answer_of_its_own_write_hints_nothing() {
+        // The API server tells its watches of a write about as it answers the writer, and which
+        // of the two reaches this controller first is not up to it. When the event comes first,
+        // the version it names is not yet known to be the controller's own: live, that was a
+        // hint, and a pass, for the writes the sampler makes every two seconds.
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        let id = "dbbbbbbbbbbbbbbbbbbb";
+        let namespace = format!("pgcf-db-{id}");
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"maintenance-credentials","namespace":namespace,"uid":uid(1),"labels":{"pgcf.io/database-id":id}},"data":{"password":"1"}}));
+        let (mut hints, watch) = watching(&server, "Secret").await;
+        // The answer of the write trails its event by far more than the window of production, so
+        // the window is the test's.
+        server.k8s.settle_within(Duration::from_millis(250));
+        server.state.lock().unwrap().write_reply_delay = Some(Duration::from_millis(100));
+        let current = server
+            .k8s
+            .read("Secret", Some(&namespace), "maintenance-credentials")
+            .await
+            .unwrap()
+            .unwrap();
+        server
+            .k8s
+            .patch(&current, &serde_json::json!({"data":{"password":"2"}}))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            hints.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "the controller's own write hinted its database"
+        );
+        // The same object written by someone else is news, and is not held back for long.
+        server.state.lock().unwrap().write_reply_delay = None;
+        server.external_write(
+            "Secret",
+            Some(&namespace),
+            "maintenance-credentials",
+            |secret| secret["data"]["password"] = "3".into(),
+        );
+        let hint = tokio::time::timeout(Duration::from_secs(3), hints.recv())
+            .await
+            .expect("a change by someone else hints")
+            .unwrap();
+        assert_eq!(
+            hint,
+            Trigger {
+                database: id.into(),
+                name: "maintenance-credentials".into()
+            }
+        );
+        watch.abort();
+    }
     #[tokio::test]
     async fn a_cached_read_and_a_cached_list_ask_the_watch_cache_and_the_plain_ones_ask_etcd() {
         use crate::test_server::{Server, uid};
@@ -1556,12 +1715,18 @@ mod tests {
             database: id.to_string(),
             name: name.clone(),
         };
+        let (version, candidate) = server.k8s.watch_event("Secret", &other).unwrap();
         assert_eq!(
-            server.k8s.watch_event("Secret", &other).unwrap(),
+            (version, candidate.map(|candidate| candidate.trigger)),
             ("9".to_string(), Some(trigger.clone()))
         );
         assert_eq!(
-            server.k8s.watch_event("Secret", &events[0].1).unwrap().1,
+            server
+                .k8s
+                .watch_event("Secret", &events[0].1)
+                .unwrap()
+                .1
+                .map(|candidate| candidate.trigger),
             Some(trigger)
         );
         // A write that changed nothing answers the version it was made over, leaves no event

@@ -10,7 +10,7 @@ use crate::{
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -105,6 +105,11 @@ pub struct State {
     /// The controller's watch cache, kept equal to `objects` after every change when set (a watch
     /// without lag): the runtime proof of an admitted database needs complete watch coverage.
     pub watch: Option<Kubernetes>,
+    /// How long the server holds the answer of a write after it committed it, and queued its
+    /// event to the watches: the answer trails the event, as it may on a real API server.
+    pub write_reply_delay: Option<Duration>,
+    /// The open metadata watches: the collection each is of and the events it has yet to send.
+    pub streams: Vec<(String, VecDeque<Value>)>,
     serial: u64,
 }
 impl State {
@@ -215,7 +220,20 @@ fn strategic_merge(value: &mut Value, patch: &Value) {
         }
     }
 }
-fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
+/// The value of the query parameter `name`, as the controller writes it (no escapes needed for
+/// the numbers and tokens the double reads).
+fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .find_map(|part| part.strip_prefix(name)?.strip_prefix('='))
+}
+fn handle(
+    state: &mut State,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> Option<(u16, Vec<u8>)> {
     let reply = |status: u16, value: &Value| Some((status, serde_json::to_vec(value).unwrap()));
     if matches!(method, "POST" | "PATCH" | "DELETE") {
         let sent: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -252,9 +270,22 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
                         value
                     })
                     .collect();
+                // A list is paged as the API server pages it: `limit` items from where the
+                // `continue` token (here the offset) says, and the token of the next page.
+                let from: usize = parameter(query, "continue")
+                    .and_then(|token| token.parse().ok())
+                    .unwrap_or(0);
+                let limit: usize = parameter(query, "limit")
+                    .and_then(|limit| limit.parse().ok())
+                    .unwrap_or(usize::MAX);
+                let end = from.saturating_add(limit).min(items.len());
+                let mut metadata = json!({"resourceVersion":"1"});
+                if end < items.len() {
+                    metadata["continue"] = end.to_string().into();
+                }
                 return reply(
                     200,
-                    &json!({"kind":"List","metadata":{"resourceVersion":"1"},"items":items}),
+                    &json!({"kind":"List","metadata":metadata,"items":items[from.min(items.len())..end]}),
                 );
             }
             reply(404, &json!({}))
@@ -371,6 +402,14 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
 fn queue_event(state: &mut State, kind: &str, object: &Value) {
     let event = json!({"type":kind,"object":{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata","metadata":object["metadata"].clone()}});
     let kind = object["kind"].as_str().unwrap_or_default().to_string();
+    if let Some(name) = object["metadata"]["name"].as_str() {
+        let at = path(&kind, object["metadata"]["namespace"].as_str(), name);
+        for (collection, queue) in &mut state.streams {
+            if listed(&at, collection) {
+                queue.push_back(event.clone());
+            }
+        }
+    }
     state.events.push((kind, event));
 }
 fn advance(value: &mut Value) {
@@ -479,6 +518,43 @@ impl Server {
                         .unwrap_or_default();
                     let mut body = vec![0; length];
                     tls.read_exact(&mut body).await.unwrap();
+                    // A watch is answered with the events of the writes that come, as they come.
+                    if method == "GET" && parameter(&query, "watch") == Some("true") {
+                        let stream = {
+                            let mut state = state.lock().unwrap();
+                            state.requests.push((method.clone(), path.clone()));
+                            state.queries.push(query.clone());
+                            state.streams.push((path.clone(), VecDeque::new()));
+                            state.streams.len() - 1
+                        };
+                        let lifetime = Duration::from_secs(
+                            parameter(&query, "timeoutSeconds")
+                                .and_then(|seconds| seconds.parse().ok())
+                                .unwrap_or(60),
+                        );
+                        let _ = tls
+                            .write_all(
+                                b"HTTP/1.1 200 Test\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\n\r\n",
+                            )
+                            .await;
+                        let ends = Instant::now() + lifetime;
+                        'serving: while Instant::now() < ends {
+                            let events: Vec<Value> =
+                                state.lock().unwrap().streams[stream].1.drain(..).collect();
+                            for event in events {
+                                let line = format!("{event}\n");
+                                let chunk = format!("{:x}\r\n{line}\r\n", line.len());
+                                if tls.write_all(chunk.as_bytes()).await.is_err() {
+                                    break 'serving;
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        state.lock().unwrap().streams[stream].0 = String::new();
+                        let _ = tls.write_all(b"0\r\n\r\n").await;
+                        let _ = tls.shutdown().await;
+                        return;
+                    }
                     // A request the gate matches waits for the others of its group.
                     let mut held = None;
                     {
@@ -521,22 +597,28 @@ impl Server {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                     }
-                    let response = {
+                    let (response, delay) = {
                         let mut state = state.lock().unwrap();
                         state.requests.push((method.clone(), path.clone()));
-                        state.queries.push(query);
+                        state.queries.push(query.clone());
                         if method == "PATCH" {
                             state.patch_types.push((path.clone(), content_type));
                         }
-                        let response = handle(&mut state, &method, &path, &body);
-                        if method != "GET" {
+                        let response = handle(&mut state, &method, &path, &query, &body);
+                        let delay = if method == "GET" {
+                            None
+                        } else {
                             state.sync();
-                        }
-                        response
+                            state.write_reply_delay
+                        };
+                        (response, delay)
                     };
                     let Some((status, body)) = response else {
                         return;
                     };
+                    if let Some(delay) = delay {
+                        tokio::time::sleep(delay).await;
+                    }
                     tls.write_all(
                         format!(
                             "HTTP/1.1 {status} Test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -577,6 +659,24 @@ impl Server {
     pub fn watch(&self) {
         let mut state = self.state.lock().unwrap();
         state.watch = Some(self.k8s.clone());
+        state.sync();
+    }
+    /// A write by someone else than the controller: `edit` changes the object, which gets the
+    /// next version and a watch event, and nothing the controller wrote is remembered for it.
+    pub fn external_write(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        edit: impl FnOnce(&mut Value),
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let at = path(kind, namespace, name);
+        let mut object = state.objects.get(&at).cloned().unwrap();
+        edit(&mut object);
+        advance(&mut object);
+        state.objects.insert(at, object.clone());
+        queue_event(&mut state, "MODIFIED", &object);
         state.sync();
     }
     pub fn get(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<Value> {

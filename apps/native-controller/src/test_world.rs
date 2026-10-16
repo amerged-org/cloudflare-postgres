@@ -895,7 +895,7 @@ impl World {
                     .watch_event(kind, event)
                     .unwrap()
                     .1
-                    .map(|trigger| trigger.database)
+                    .map(|candidate| candidate.trigger.database)
             })
             .collect();
         self.server.state.lock().unwrap().sync();
