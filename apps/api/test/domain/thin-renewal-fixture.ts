@@ -134,6 +134,19 @@ export async function turnRequested(f: Fixture) {
   );
 }
 
+/** Forget every turn the node's executor was asked for, as a fresh Durable Object would. */
+export async function forgetTurns(f: Fixture) {
+  await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`thin-storage:${f.node}`),
+    ),
+    async (_instance, state) => {
+      await state.storage.deleteAlarm();
+      await state.storage.deleteAll();
+    },
+  );
+}
+
 /** The executor's slow report for the current lease, as runThinStorage builds it. */
 export async function report(
   f: Fixture,

@@ -11,6 +11,7 @@ import {
 } from "@pgcf/contracts";
 import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 import * as samplesDomain from "../../src/domain/node-thin-storage-samples.ts";
+import { readCurrentNodeThinStorage } from "../../src/domain/node-thin-storage.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
@@ -18,6 +19,7 @@ import {
   identityProof,
   iso,
   lvs,
+  forgetTurns,
   mib,
   nonce,
   post,
@@ -25,6 +27,7 @@ import {
   sample,
   turnRequested,
 } from "./thin-renewal-fixture.ts";
+import { storageHolds } from "../../src/domain/node-thin-storage-execution.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -517,6 +520,52 @@ it("decides write_allowed on the fresh reading with today's headroom rule and as
   expect(
     acceptedObservations(log, f.node).map((event) => event.write_allowed),
   ).toEqual([false, true]);
+});
+
+it("asks for an identity turn at every sample while a start's hold waits for a proof, and stops when the start is released or old", async () => {
+  const f = await thinExecutionFixture(releases);
+  const physical = {
+    ...f.authority.physical,
+    free_bytes: 80 * gib,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_total_bytes: 16 * gib,
+      data_used_bytes_upper_bound: 64 * mib,
+      metadata_used_bytes_upper_bound: mib,
+    },
+  };
+  await identityProof(f, { physical });
+  DatabaseWithOperation.parse(await (await f.create()).json());
+  // The placement asked for its own turn; a sample is what asks while the start still waits.
+  await forgetTurns(f);
+  const accepted = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, await nonce(f), { physical }))).body,
+  );
+  expect(accepted.accepted).toBe(true);
+  expect(await turnRequested(f)).toBe(true);
+  // A start older than two minutes is a stuck one, not a wait for the next proof.
+  const identity = (await readCurrentNodeThinStorage(f.local, f.node))!
+    .authority;
+  expect((await storageHolds(f.local, f.node, f.uid, identity)).waiting).toBe(
+    1,
+  );
+  expect(
+    (await storageHolds(f.local, f.node, f.uid, identity, Date.now() + 121_000))
+      .waiting,
+  ).toBe(0);
+  // The proof that evidences the Pod releases the hold.
+  await env.DB.prepare(
+    "UPDATE database_start_admissions SET ready_at=?,ready_sample_observed_at=? WHERE node_id=?",
+  )
+    .bind(iso(Date.now()), iso(Date.now()), f.node)
+    .run();
+  await forgetTurns(f);
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, accepted.nonce, { physical }))).body,
+    ).accepted,
+  ).toBe(true);
+  expect(await turnRequested(f)).toBe(false);
 });
 
 it("returns the renewed token of every thin database on the node", async () => {

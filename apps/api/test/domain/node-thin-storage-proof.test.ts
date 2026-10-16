@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
@@ -42,6 +42,7 @@ import {
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   await cleanupFixtures();
   for (const id of releases.splice(0))
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
@@ -135,6 +136,29 @@ it("records a slow report as an identity proof valid 300 s, even when the author
     inventory_revision: 4,
     inventory_observed_at: next!.lease.issued_at,
   });
+});
+
+it("logs how long an accepted identity turn took, from its lease to its acceptance", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await prepareThinStorageLease(f.local, f.node);
+  await leaseIssuedAgo(f, 30_000);
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  expect(await report(f)).toMatchObject({ accepted: true });
+  const events = log.mock.calls.flatMap(([value]) => {
+    if (typeof value !== "string") return [];
+    const event = JSON.parse(value) as Record<string, unknown>;
+    return event.event === "thin_storage_turn_accepted" ? [event] : [];
+  });
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    node_id: f.node,
+    authority_revision: (await row(f)).authority_revision,
+    volumes: 0,
+    write_allowed: true,
+    action: null,
+  });
+  expect(Number(events[0]!.turn_ms)).toBeGreaterThanOrEqual(30_000);
+  expect(Number(events[0]!.turn_ms)).toBeLessThan(40_000);
 });
 
 it("keeps a fast reading taken after the identity lease was issued", async () => {

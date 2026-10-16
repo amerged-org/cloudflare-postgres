@@ -15,6 +15,7 @@ import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { awakeWriter, hibernated, idleIntent } from "./parked-tier-fixture.ts";
 import {
   type Fixture,
+  forgetTurns,
   gib,
   identityProof,
   turnRequested,
@@ -519,12 +520,35 @@ it("keeps transient backoff when another headroom sample requests a turn", async
   expect(alarm).toBe(failed.alarm);
 });
 
-it("starts the next turn immediately for demand received during a successful identity turn", async () => {
+it("starts the next turn for demand received during a successful identity turn as soon as 10 s have passed since that turn started", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
   const done = await turn(f, { state: "succeeded" }, true);
   expect(done.error).toBeNull();
-  expect(done.alarm).toBeGreaterThanOrEqual(done.started);
-  expect(done.alarm).toBeLessThanOrEqual(Date.now());
+  expect(done.alarm).toBeGreaterThanOrEqual(done.started + 10_000);
+  expect(done.alarm).toBeLessThanOrEqual(Date.now() + 10_000);
+});
+
+it("a requested turn starts no sooner than 10 s after the previous turn started, a quiet node at once", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const done = await turn(f, { state: "succeeded" });
+  const requested = await runInDurableObject(
+    stub(f),
+    async (_instance, state) => {
+      await new NodeBootstrap(state, f.local).thinStorageDue(f.node);
+      return state.storage.getAlarm();
+    },
+  );
+  expect(requested).toBeGreaterThanOrEqual(done.started + 10_000);
+  // Sooner than the identity cadence, which the request replaces.
+  expect(requested).toBeLessThan(done.alarm!);
+  const quiet = await runInDurableObject(stub(f), async (_instance, state) => {
+    await state.storage.put("thinStorageStartedAt", Date.now() - 20_000);
+    const before = Date.now();
+    await new NodeBootstrap(state, f.local).thinStorageDue(f.node);
+    return { before, alarm: await state.storage.getAlarm() };
+  });
+  expect(quiet.alarm === null || quiet.alarm <= Date.now()).toBe(true);
+  expect(quiet.alarm === null || quiet.alarm >= quiet.before - 1000).toBe(true);
 });
 
 it("retains demand received during a failed turn while applying its backoff", async () => {
@@ -544,14 +568,6 @@ it("retains demand received during a failed turn while applying its backoff", as
   );
   expect(requested).toBe(true);
 });
-
-/** Forget every turn the node's executor was asked for, as a fresh Durable Object would. */
-async function forgetTurns(f: Fixture) {
-  await runInDurableObject(stub(f), async (_instance, state) => {
-    await state.storage.deleteAlarm();
-    await state.storage.deleteAll();
-  });
-}
 
 it("asks for an identity turn at once when a thin database is ready without a receipt", async () => {
   const f = await thinExecutionFixture(releases);
