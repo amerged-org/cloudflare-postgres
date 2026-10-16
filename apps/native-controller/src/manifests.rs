@@ -371,7 +371,7 @@ pub fn slot(spec: &SlotSpec, ctx: &Value) -> Result<Vec<Value>, Error> {
         "postgresql.cnpg.io/v1",
         "Cluster",
         cluster_meta,
-        json!({"instances":1,"probes":probes(),"imageName":spec.image,"inheritedMetadata":{"labels":labels},"enableSuperuserAccess":false,"bootstrap":{"initdb":{"database":"slot","owner":"slot"}},"affinity":{"nodeSelector":{"kubernetes.io/hostname":spec.node}},"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":format!("{cpu}m"),"memory":format!("{memory}Mi")}},"seccompProfile":{"type":"RuntimeDefault"},"storage":{"storageClass":"pgcf-lvm","size":"1Gi"},"postgresql":{"parameters":parameters(&shape),"pg_hba":["hostnossl all all all reject"]},"managed":{"roles":[]},"plugins":[{"name":"barman-cloud.cloudnative-pg.io","enabled":true,"isWALArchiver":true,"parameters":{"barmanObjectName":"archive","serverName":"database"}}],"stopDelay":30,"smartShutdownTimeout":0}),
+        json!({"instances":1,"probes":probes(),"imageName":spec.image,"inheritedMetadata":{"labels":labels},"enableSuperuserAccess":false,"bootstrap":{"initdb":{"database":"slot","owner":"slot"}},"affinity":{"nodeSelector":{"kubernetes.io/hostname":spec.node}},"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":format!("{cpu}m"),"memory":format!("{memory}Mi")}},"seccompProfile":{"type":"RuntimeDefault"},"storage":{"storageClass":"pgcf-slot","size":"1Gi"},"postgresql":{"parameters":parameters(&shape),"pg_hba":["hostnossl all all all reject"]},"managed":{"roles":[]},"plugins":[{"name":"barman-cloud.cloudnative-pg.io","enabled":true,"isWALArchiver":true,"parameters":{"barmanObjectName":"archive","serverName":"database"}}],"stopDelay":30,"smartShutdownTimeout":0}),
     ));
     Ok(result)
 }
@@ -731,7 +731,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no {kind}"))
     }
     #[test]
-    fn the_slot_is_fenced_tenant_free_pinned_to_its_node_with_a_1gi_pgcf_lvm_placeholder() {
+    fn the_slot_is_fenced_tenant_free_pinned_to_its_node_with_a_1gi_placeholder_whose_class_deletes_it() {
         let ctx = vector("entry-request-limit-split")["ctx"].clone();
         let slot = slot(&slot_spec(), &ctx).unwrap();
         let ns = "pgcf-slot-0a1b2c3d";
@@ -783,7 +783,7 @@ mod tests {
         );
         assert_eq!(
             spec["storage"],
-            json!({"storageClass":"pgcf-lvm","size":"1Gi"})
+            json!({"storageClass":"pgcf-slot","size":"1Gi"})
         );
         assert_eq!(
             spec["affinity"],
