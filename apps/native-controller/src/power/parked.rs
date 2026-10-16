@@ -192,6 +192,38 @@ fn assignment(release: &Value, node: &str) -> Option<u64> {
 fn boot_id(node: &Value) -> &str {
     text(&node["status"]["nodeInfo"], "bootID")
 }
+/// What of a parked Pod's identity no longer holds, by its first cause: the Pod it was parked as,
+/// the node and release it was parked under, and the fence on its Cluster. `None` while all hold.
+pub(super) fn identity_gap(
+    pod: Option<&Value>,
+    park: &Park,
+    cluster: &Value,
+    db: &Value,
+    sleep: &Sleep<'_>,
+) -> Option<&'static str> {
+    let Some(pod) = pod else {
+        return Some("pod_absent");
+    };
+    if !bound(pod, park) {
+        Some("pod_changed")
+    } else if !instance_live(pod, cluster, db) {
+        Some("instance_not_live")
+    } else if boot_id(sleep.basis.node) != park.node_boot_id {
+        Some("boot_id")
+    } else if sleep.basis.release["release"]["id"] != park.release_id.as_str() {
+        Some("release_id")
+    } else if sleep.basis.release["release"]["spec_sha256"] != park.spec_sha256.as_str() {
+        Some("spec_sha256")
+    } else if assignment(sleep.basis.release, text(db, "node")) != Some(park.assignment_revision) {
+        Some("assignment")
+    } else if !fenced(cluster) {
+        Some("not_fenced")
+    } else if hibernation_on(cluster) {
+        Some("hibernation_on")
+    } else {
+        None
+    }
+}
 /// Whether the Pod is still the one the record bound, by identity alone.
 fn bound(pod: &Value, park: &Park) -> bool {
     pod["metadata"]["uid"] == park.pod_uid.as_str()
@@ -764,16 +796,7 @@ impl PowerCoordinator {
             .k8s
             .read("Pod", Some(&namespace(db)), &park.pod_name)
             .await?;
-        let identity = pod.as_ref().is_some_and(|pod| {
-            bound(pod, &park)
-                && instance_live(pod, &cluster, db)
-                && boot_id(sleep.basis.node) == park.node_boot_id
-                && sleep.basis.release["release"]["id"] == park.release_id.as_str()
-                && sleep.basis.release["release"]["spec_sha256"] == park.spec_sha256.as_str()
-                && assignment(sleep.basis.release, text(db, "node"))
-                    == Some(park.assignment_revision)
-        }) && fenced(&cluster)
-            && !hibernation_on(&cluster);
+        let gap = identity_gap(pod.as_ref(), &park, &cluster, db, sleep);
         let reason = if policy.is_none() {
             Some("policy_off")
         } else if self.now().saturating_sub(park.parked_at)
@@ -782,13 +805,13 @@ impl PowerCoordinator {
             Some("ttl")
         } else if self.over_cap(db, &park, policy.as_ref()).await? {
             Some("cap")
-        } else if !identity {
+        } else if gap.is_some() {
             Some("identity")
         } else {
             None
         };
         if let Some(reason) = reason {
-            self.demotion_event(db, intent, reason, None);
+            self.demotion_event(db, intent, reason, gap);
             return Ok(Retained::Observed(
                 self.demote_pass(db, intent, map, p, cluster).await?,
             ));

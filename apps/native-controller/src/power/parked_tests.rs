@@ -1370,6 +1370,57 @@ async fn the_fence_is_removed_when_hibernation_completes_and_on_every_wake() {
 }
 
 #[test]
+fn a_parked_pods_identity_gap_names_its_first_cause() {
+    // A parked Pod that was demoted for its identity gave no hint which of its facts failed: the
+    // Pod, the node's boot, the release, the assignment or the fence.
+    let park: Park = serde_json::from_value(json!({"podName":"database-1","podUid":uid(9),"postgresContainerId":"containerd://a","sidecarContainerId":"containerd://b","nodeBootId":"boot","releaseId":"r1","specSha256":"b".repeat(64),"assignmentRevision":3,
+        "requestsBefore":{"postgres":{"cpu":"25m","memory":"128Mi"},"sidecar":{"cpu":"100m","memory":"128Mi"}},
+        "requestsParked":{"postgres":{"cpu":"10m","memory":"96Mi"},"sidecar":{"cpu":"5m","memory":"64Mi"}},"parkedAt":90_000,"stopped":true})).unwrap();
+    let pod = json!({"metadata":{"uid":uid(9),"ownerReferences":[{"uid":"cluster","kind":"Cluster","name":"database","apiVersion":"postgresql.cnpg.io/v1"}]},
+        "spec":{"nodeName":"n1"},
+        "status":{"phase":"Running","containerStatuses":[{"name":"postgres","containerID":"containerd://a"}],"initContainerStatuses":[{"name":"plugin-barman-cloud","containerID":"containerd://b"}]}});
+    let cluster = json!({"apiVersion":"postgresql.cnpg.io/v1","metadata":{"uid":"cluster","annotations":{FENCE:"[\"*\"]"}}});
+    let db = json!({"node":"n1"});
+    let node = json!({"status":{"nodeInfo":{"bootID":"boot"}}});
+    let release = json!({"release":{"id":"r1","spec_sha256":"b".repeat(64)},"nodes":[{"k8s_node_name":"n1","revision":3}]});
+    let gap = |pod: Option<&Value>, cluster: &Value, node: &Value, release: &Value| {
+        let sleep = Sleep {
+            parking: &NOTHING,
+            basis: Basis {
+                node,
+                release,
+                manifests: None,
+                runtime_class: "",
+            },
+        };
+        parked::identity_gap(pod, &park, cluster, &db, &sleep)
+    };
+    assert_eq!(gap(Some(&pod), &cluster, &node, &release), None);
+    assert_eq!(gap(None, &cluster, &node, &release), Some("pod_absent"));
+    let mut replaced = pod.clone();
+    replaced["metadata"]["uid"] = uid(8).into();
+    assert_eq!(
+        gap(Some(&replaced), &cluster, &node, &release),
+        Some("pod_changed")
+    );
+    let mut rebooted = node.clone();
+    rebooted["status"]["nodeInfo"]["bootID"] = "other".into();
+    assert_eq!(
+        gap(Some(&pod), &cluster, &rebooted, &release),
+        Some("boot_id")
+    );
+    let mut moved = release.clone();
+    moved["nodes"][0]["revision"] = 4.into();
+    assert_eq!(gap(Some(&pod), &cluster, &node, &moved), Some("assignment"));
+    let mut unfenced = cluster.clone();
+    unfenced["metadata"]["annotations"] = json!({});
+    assert_eq!(
+        gap(Some(&pod), &unfenced, &node, &release),
+        Some("not_fenced")
+    );
+}
+
+#[test]
 fn parked_progress_roundtrips_and_an_unknown_phase_is_a_recovery_error() {
     let vectors: Value = serde_json::from_str(include_str!(
         "../../../../packages/contracts/native/power-vectors.generated.json"
