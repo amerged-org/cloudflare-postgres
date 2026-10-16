@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
+    hold::WakeQueue,
     kubernetes::{FenceState, retirement_ready},
     sessions::{Action, SharedSessions},
     telemetry::GatewayMeasurements,
     transport::Config,
 };
-use pgcf_native_protocol::{scoped_tokens, wire};
+use pgcf_native_protocol::{
+    scoped_tokens,
+    wake::{self, WakePoll, WakeResult},
+    wire,
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -175,8 +180,11 @@ pub struct Control {
     pub fences: Arc<RwLock<FenceState>>,
     pub sessions: SharedSessions,
     pub measurements: Arc<Mutex<GatewayMeasurements>>,
+    pub wakes: Arc<WakeQueue>,
     control_capacity: Semaphore,
     activity_capacity: Semaphore,
+    /// The controller's wake long-polls, apart from the short control requests.
+    poll_capacity: Semaphore,
     activity_replay: Mutex<HashMap<String, u64>>,
 }
 impl Control {
@@ -186,6 +194,7 @@ impl Control {
         fences: Arc<RwLock<FenceState>>,
         sessions: SharedSessions,
         measurements: Arc<Mutex<GatewayMeasurements>>,
+        wakes: Arc<WakeQueue>,
     ) -> Self {
         Self {
             config,
@@ -193,14 +202,24 @@ impl Control {
             fences,
             sessions,
             measurements,
+            wakes,
             control_capacity: Semaphore::new(32),
             activity_capacity: Semaphore::new(32),
+            poll_capacity: Semaphore::new(4),
             activity_replay: Mutex::new(HashMap::new()),
         }
     }
-    pub async fn handle(&self, head: &HttpHead) -> Option<(u16, Value)> {
+    /// The answer to a control-port request, or none for a request that is not one. Only a wake
+    /// result has a body; it is read from `stream`.
+    pub async fn handle(&self, head: &HttpHead, stream: &mut TcpStream) -> Option<(u16, Value)> {
         if head.path == wire("activityPath") {
             return Some(self.activity(head).await);
+        }
+        if head.path == wake::POLL_PATH {
+            return Some(self.wakes_poll(head).await);
+        }
+        if head.path == wake::RESULT_PATH {
+            return Some(self.wake_result(head, stream).await);
         }
         let action = head.path.strip_prefix(wire("controlPathPrefix"))?;
         if !["begin", "status", "close", "release", "retire"].contains(&action) {
@@ -311,6 +330,94 @@ impl Control {
             200,
             json!({"database":database,"operation":intent.operation,"revision":intent.revision,"mode":intent.mode,"pod":self.pod,"status":status,"connections":counts.connections,"busyConnections":counts.busy,"pendingDials":counts.pending_dials}),
         )
+    }
+    fn wake_token(&self, head: &HttpHead, action: &str) -> bool {
+        wake::verify_poll(
+            head.one(wake::POLL_HEADER),
+            &self.config.keyring.keys,
+            &self.config.region,
+            &self.pod,
+            action,
+            now(),
+        )
+        .is_some()
+    }
+    /// The controller's long-poll: the queued wakes as soon as there are any, or none after
+    /// `POLL_HOLD_MS`.
+    async fn wakes_poll(&self, head: &HttpHead) -> (u16, Value) {
+        if head.method != "POST" {
+            return (405, json!({"error":"wake_method"}));
+        }
+        if head.body_forbidden() {
+            return (400, json!({"error":"wake_body_forbidden"}));
+        }
+        if !head.has(wake::POLL_HEADER) {
+            return (401, json!({"error":"wake_denied"}));
+        }
+        let Ok(_permit) = self.poll_capacity.try_acquire() else {
+            return (503, json!({"error":"wake_poll_capacity"}));
+        };
+        if !self.wake_token(head, wake::POLL_ACTION) {
+            return (401, json!({"error":"wake_denied"}));
+        }
+        let wakes = self
+            .wakes
+            .poll(Duration::from_millis(wake::POLL_HOLD_MS))
+            .await;
+        (
+            200,
+            json!(WakePoll {
+                pod: self.pod.clone(),
+                wakes
+            }),
+        )
+    }
+    /// The controller's result for a wake it took: a label, or the refusal of its connections.
+    async fn wake_result(&self, head: &HttpHead, stream: &mut TcpStream) -> (u16, Value) {
+        if head.method != "POST" {
+            return (405, json!({"error":"wake_method"}));
+        }
+        let Some(length) = head
+            .one("content-length")
+            .filter(|_| !head.has("transfer-encoding"))
+            .and_then(|length| length.parse::<usize>().ok())
+            .filter(|length| *length <= wake::RESULT_MAX_BYTES)
+        else {
+            return (400, json!({"error":"wake_result_invalid"}));
+        };
+        if !head.has(wake::POLL_HEADER) {
+            return (401, json!({"error":"wake_denied"}));
+        }
+        let Ok(_permit) = self.control_capacity.try_acquire() else {
+            return (503, json!({"error":"control_unavailable"}));
+        };
+        if !self.wake_token(head, wake::RESULT_ACTION) {
+            return (401, json!({"error":"wake_denied"}));
+        }
+        let mut body = head.prefix[head.end..].to_vec();
+        if body.len() > length {
+            return (400, json!({"error":"wake_result_invalid"}));
+        }
+        let mut chunk = [0; 1024];
+        while body.len() < length {
+            match timeout(Duration::from_secs(5), stream.read(&mut chunk)).await {
+                Ok(Ok(read)) if read > 0 && body.len() + read <= length => {
+                    body.extend_from_slice(&chunk[..read]);
+                }
+                _ => return (400, json!({"error":"wake_result_invalid"})),
+            }
+        }
+        let Some(result) = serde_json::from_slice::<WakeResult>(&body)
+            .ok()
+            .filter(WakeResult::valid)
+        else {
+            return (400, json!({"error":"wake_result_invalid"}));
+        };
+        if self.wakes.result(&result) {
+            (200, json!({}))
+        } else {
+            (404, json!({"error":"wake_unknown"}))
+        }
     }
     async fn activity(&self, head: &HttpHead) -> (u16, Value) {
         if head.method != "POST" {

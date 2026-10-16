@@ -9,7 +9,7 @@ use pgcf_native_gateway::{
     sessions::Action,
     transport::{self, Config, DatabaseTarget, Gateway, PostgresDial},
 };
-use pgcf_native_protocol::{route::Keyring, wire};
+use pgcf_native_protocol::{route::Keyring, wake, wire};
 use rcgen::generate_simple_self_signed;
 use rustls::{
     ServerConfig,
@@ -157,6 +157,7 @@ struct TestDial {
     address: std::net::SocketAddr,
     ca: Vec<u8>,
     calls: Arc<AtomicUsize>,
+    dialled: Arc<std::sync::Mutex<Vec<DatabaseTarget>>>,
     send_buffer: Option<u32>,
 }
 impl PostgresDial for TestDial {
@@ -166,10 +167,16 @@ impl PostgresDial for TestDial {
     ) -> BoxFuture<'a, Result<TlsStream<TcpStream>, Failure>> {
         Box::pin(async move {
             assert_eq!(target.database, DATABASE);
-            assert_eq!(target.host, format!("database-rw.pgcf-db-{DATABASE}.svc"));
+            // The database's own writer, or the pool slot a wake was released to.
+            if target.host == wake::slot_tls_name(SLOT) {
+                assert_eq!(target.pod_uid, cid(300));
+            } else {
+                assert_eq!(target.host, format!("database-rw.pgcf-db-{DATABASE}.svc"));
+                assert_eq!(target.pod_uid, cid(200));
+            }
             assert_eq!(target.port, 5432);
             assert_eq!(target.address.to_string(), "10.0.0.7");
-            assert_eq!(target.pod_uid, cid(200));
+            self.dialled.lock().unwrap().push(target.clone());
             self.calls.fetch_add(1, Ordering::SeqCst);
             let socket = TcpSocket::new_v4()?;
             if let Some(size) = self.send_buffer {
@@ -184,6 +191,8 @@ struct Fixture {
     gateway: Arc<Gateway>,
     port: u16,
     calls: Arc<AtomicUsize>,
+    /// Every target the gateway dialled, in order.
+    dialled: Arc<std::sync::Mutex<Vec<DatabaseTarget>>>,
     /// A second handle on every socket the gateway accepts once `observe` is set, to read what it
     /// set on them. A second handle keeps the connection open after the gateway closes its own,
     /// so it is held only by a test that asks for it.
@@ -212,9 +221,11 @@ impl Fixture {
         Self::build(fences, false).await
     }
     async fn build(fences: HashMap<String, Fence>, congested: bool) -> Self {
-        let identity =
-            generate_simple_self_signed(vec![format!("database-rw.pgcf-db-{DATABASE}.svc")])
-                .unwrap();
+        let identity = generate_simple_self_signed(vec![
+            format!("database-rw.pgcf-db-{DATABASE}.svc"),
+            wake::slot_tls_name(SLOT),
+        ])
+        .unwrap();
         let ca = identity.cert.pem().into_bytes();
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -234,6 +245,7 @@ impl Fixture {
         let upstream = upstream.listen(128).unwrap();
         let address = upstream.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let dialled = Arc::default();
         let gateway = Gateway::new(
             Arc::new(Config {
                 region: REGION.into(),
@@ -249,6 +261,7 @@ impl Fixture {
                 address,
                 ca,
                 calls: calls.clone(),
+                dialled: Arc::clone(&dialled),
                 send_buffer: congested.then_some(4096),
             }),
         );
@@ -307,6 +320,7 @@ impl Fixture {
             gateway,
             port,
             calls,
+            dialled,
             accepted,
             observe,
             upstream: received,
@@ -347,6 +361,43 @@ impl Fixture {
             .send(Message::Binary(startup("app").into()))
             .await
             .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(10), self.upstream.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            startup("app")
+        );
+        let challenge = timeout(Duration::from_secs(10), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data();
+        assert_eq!(&challenge[..], [b'R', 0, 0, 0, 8, 0, 0, 0, 10]);
+        client
+            .send(Message::Binary(b"p\0\0\0\x0aopaque".to_vec().into()))
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        while received.len() < 15 {
+            received.extend(
+                timeout(Duration::from_secs(10), client.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .into_data(),
+            );
+        }
+        assert_eq!(
+            received,
+            [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I']
+        );
+    }
+    /// Completes the double's password exchange for a client whose StartupMessage was already
+    /// sent (a held wake connection).
+    async fn login_sent(&mut self, client: &mut Client) {
         assert_eq!(
             timeout(Duration::from_secs(10), self.upstream.recv())
                 .await
@@ -1246,6 +1297,7 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
                 "session_ms",
                 "startup_ms",
                 "upgrade_ms",
+                "wake_path",
             ];
             if line["outcome"] == "target_unavailable" {
                 keys.push("target_reason");
@@ -1721,5 +1773,673 @@ async fn readyz_requires_the_pod_watch() {
     fixture.gateway.targets.write().await.disconnect("pods");
     assert_eq!(get(&fixture, "/readyz").await.0, 503);
     assert_eq!(get(&fixture, "/healthz").await.0, 200);
+    fixture.stop().await;
+}
+
+// Pool wake (route token v5): the gateway holds a sleeping database's connection, queues its wake
+// for the controller's long-poll and releases it when the fence shows the woken writer.
+const SLOT: &str = "pgcf-slot-0a1b2c3d";
+const ROLE_HASH: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+fn wake_operation() -> String {
+    format!("op_{}", "w".repeat(20))
+}
+/// The wake ticket the Edge signs for a database whose Actor snapshot sits at `generation - 1`.
+fn wake_token(id: usize, generation: u64) -> String {
+    wake_ticket(id, generation, &wake_operation(), REGION)
+}
+fn wake_ticket(id: usize, generation: u64, operation: &str, region: &str) -> String {
+    let now = control::now() / 1000;
+    token(
+        wake::ROUTE_PREFIX,
+        wake::ROUTE_DOMAIN,
+        json!({"v":5,"db":DATABASE,"user":"app","cid":cid(id),"rg":region,"kid":"test","iat":now,"exp":now+30,"op":operation,"gen":generation,"route_revision":19,"rh":ROLE_HASH}),
+        &[7; 32],
+    )
+}
+/// The controller's `gw1` token for this gateway Pod's wake long-poll or wake result.
+fn poll_token(action: &str, pod: &str, region: &str) -> String {
+    let now = control::now() / 1000;
+    let key = hmac(&[7; 32], wake::POLL_KEY_PURPOSE.as_bytes());
+    token(
+        wake::POLL_PREFIX,
+        wake::POLL_SIGNING_PURPOSE,
+        json!({"v":1,"region":region,"pod":pod,"action":action,"kid":"test","iat":now,"exp":now+30}),
+        &key,
+    )
+}
+/// The database asleep: its fence quiesced at the revision of the sleep.
+fn sleeping() -> HashMap<String, Fence> {
+    HashMap::from([(DATABASE.into(), fence("quiesce", 1))])
+}
+fn wake_target(generation: u64, slot: bool) -> Value {
+    use sha2::Digest;
+    let ca = Sha256::digest(CA_MATERIAL.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let (pod, name) = if slot {
+        (cid(300), wake::slot_tls_name(SLOT))
+    } else {
+        (cid(200), format!("database-rw.pgcf-db-{DATABASE}.svc"))
+    };
+    json!({"v":1,"generation":generation,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":cid(210),"ca_secret_resource_version":"81","ca_sha256":ca,"tls_server_name":name})
+}
+/// What the controller publishes when it releases a wake: the fence running at the claimed
+/// generation and operation with its admission target (a pool slot or the database's own Pod),
+/// and the writer as the watches show it before the kubelet reports it Ready.
+async fn release(fixture: &Fixture, generation: u64, slot: bool) {
+    let target = wake_target(generation, slot);
+    let intent = json!({"database":DATABASE,"operation":wake_operation(),"revision":generation,"mode":"running"});
+    let namespace = if slot {
+        SLOT.to_string()
+    } else {
+        format!("pgcf-db-{DATABASE}")
+    };
+    let pod_uid = if slot { cid(300) } else { cid(200) };
+    let mut slice = writer(&pod_uid);
+    slice["metadata"]["namespace"] = namespace.clone().into();
+    slice["endpoints"][0]["targetRef"]["namespace"] = namespace.clone().into();
+    slice["endpoints"][0]["conditions"] =
+        json!({"ready":false,"serving":false,"terminating":false});
+    let mut pod = running_pod(false);
+    pod["metadata"]["namespace"] = namespace.into();
+    pod["metadata"]["uid"] = pod_uid.into();
+    let mut maps = storage_maps();
+    maps[1]["data"]["intent.json"] = intent.to_string().into();
+    maps[1]["data"]["admission_target"] = target.to_string().into();
+    maps.push(ca_map());
+    {
+        let mut targets = fixture.gateway.targets.write().await;
+        targets.replace("endpointslices", &[slice], None).unwrap();
+        targets.replace("pods", &[pod], None).unwrap();
+        targets.replace("configmaps", &maps, None).unwrap();
+    }
+    fixture
+        .gateway
+        .fences
+        .write()
+        .await
+        .replace(HashMap::from([(
+            DATABASE.into(),
+            Fence {
+                admission_target: Some(serde_json::from_value(target).unwrap()),
+                intent: Intent {
+                    database: DATABASE.into(),
+                    operation: wake_operation(),
+                    revision: generation,
+                    mode: "running".into(),
+                },
+                ..fence("running", generation)
+            },
+        )]))
+        .unwrap();
+}
+/// One request to the control port with a body, waiting up to `wait` for the answer.
+async fn post(
+    fixture: &Fixture,
+    path: &str,
+    token: &str,
+    body: &str,
+    wait: Duration,
+) -> (u16, Value) {
+    let mut stream = TcpStream::connect(("127.0.0.1", fixture.port))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{}: {token}\r\n\r\n{body}",
+                body.len(),
+                wake::POLL_HEADER
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    timeout(wait, stream.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let split = bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
+    let header = std::str::from_utf8(&bytes[..split]).unwrap();
+    let status = header.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, serde_json::from_slice(&bytes[split..]).unwrap())
+}
+/// The controller's long-poll of this gateway.
+async fn poll(fixture: &Fixture, wait: Duration) -> (u16, Value) {
+    post(
+        fixture,
+        wake::POLL_PATH,
+        &poll_token(wake::POLL_ACTION, POD, REGION),
+        "",
+        wait,
+    )
+    .await
+}
+async fn wake_result(fixture: &Fixture, result: Value) -> (u16, Value) {
+    post(
+        fixture,
+        wake::RESULT_PATH,
+        &poll_token(wake::RESULT_ACTION, POD, REGION),
+        &result.to_string(),
+        Duration::from_secs(10),
+    )
+    .await
+}
+/// The FATAL ErrorResponse a held connection ends with, and then the end of the socket.
+async fn fatal(client: &mut Client, wait: Duration) -> String {
+    let message = timeout(wait, client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert_eq!(message[0], b'E', "not an ErrorResponse: {message:?}");
+    String::from_utf8_lossy(&message).into_owned()
+}
+/// Nothing reached PostgreSQL and nothing was dialled.
+async fn untouched(fixture: &mut Fixture) {
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "bytes of a held connection reached PostgreSQL"
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+async fn held_count(fixture: &Fixture, expected: usize) {
+    timeout(Duration::from_secs(5), async {
+        while fixture.gateway.wakes.held(DATABASE) != expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn a_v5_ticket_is_upgraded_at_once_and_its_startup_is_held_until_the_fence_releases_it() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let started = std::time::Instant::now();
+    let mut client = fixture.upgrade(&wake_token(1000, 2)).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(fixture.gateway.wakes.held(DATABASE), 1);
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    untouched(&mut fixture).await;
+    release(&fixture, 2, false).await;
+    fixture.login_sent(&mut client).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    held_count(&fixture, 0).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn the_held_startup_reaches_postgres_unchanged_after_release_and_never_before() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut client = fixture.upgrade(&wake_token(1001, 2)).await.unwrap();
+    // An SSLRequest is answered while held, then the StartupMessage and a pipelined password.
+    client
+        .send(Message::Binary(vec![0, 0, 0, 8, 4, 210, 22, 47].into()))
+        .await
+        .unwrap();
+    let answer = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert_eq!(&answer[..], b"N");
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    client
+        .send(Message::Binary(b"p\0\0\0\x0aopaque".to_vec().into()))
+        .await
+        .unwrap();
+    untouched(&mut fixture).await;
+    release(&fixture, 2, false).await;
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    // The double reads the pipelined password before it answers: the client's bytes arrived in
+    // order and in full.
+    let mut received = Vec::new();
+    while received.len() < 24 {
+        received.extend(
+            timeout(Duration::from_secs(10), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_data(),
+        );
+    }
+    assert_eq!(
+        received,
+        [
+            b'R', 0, 0, 0, 8, 0, 0, 0, 10, b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'
+        ]
+    );
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn one_wake_per_database_is_queued_and_a_second_connection_coalesces() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut first = fixture.upgrade(&wake_token(1010, 2)).await.unwrap();
+    let mut second = fixture.upgrade(&wake_token(1011, 2)).await.unwrap();
+    assert_eq!(fixture.gateway.wakes.held(DATABASE), 2);
+    let (status, answer) = poll(&fixture, Duration::from_secs(2)).await;
+    assert_eq!(status, 200);
+    assert_eq!(answer["pod"], POD);
+    let wakes = answer["wakes"].as_array().unwrap();
+    assert_eq!(wakes.len(), 1, "{answer}");
+    assert_eq!(wakes[0]["database"], DATABASE);
+    assert_eq!(wakes[0]["operation"], wake_operation());
+    assert_eq!(wakes[0]["generation"], 2);
+    assert_eq!(wakes[0]["route_revision"], 19);
+    assert_eq!(wakes[0]["role_revision_hash"], ROLE_HASH);
+    assert!(wakes[0]["queued_at_ms"].as_u64().unwrap() > 0);
+    for client in [&mut first, &mut second] {
+        client
+            .send(Message::Binary(startup("app").into()))
+            .await
+            .unwrap();
+    }
+    release(&fixture, 2, false).await;
+    for client in [&mut first, &mut second] {
+        fixture.login_sent(client).await;
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn the_wakes_poll_answers_queued_wakes_at_once_and_an_empty_list_after_the_hold() {
+    let fixture = Fixture::with_fences(sleeping()).await;
+    let _client = fixture.upgrade(&wake_token(1020, 2)).await.unwrap();
+    let started = std::time::Instant::now();
+    let (status, answer) = poll(&fixture, Duration::from_secs(2)).await;
+    assert_eq!(status, 200);
+    assert_eq!(answer["wakes"].as_array().unwrap().len(), 1);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // The controller answered: the ticket is not delivered again.
+    let (status, answer) = wake_result(
+        &fixture,
+        json!({"database":DATABASE,"operation":wake_operation(),"generation":2,"outcome":"miss","reason":"no_free_slot"}),
+    )
+    .await;
+    assert_eq!((status, answer), (200, json!({})));
+    let started = std::time::Instant::now();
+    let (status, answer) = poll(&fixture, Duration::from_secs(30)).await;
+    assert_eq!((status, answer), (200, json!({"pod":POD,"wakes":[]})));
+    assert!(started.elapsed() >= Duration::from_millis(wake::POLL_HOLD_MS - 100));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_wake_without_result_is_delivered_again_after_3_s() {
+    let fixture = Fixture::with_fences(sleeping()).await;
+    let _client = fixture.upgrade(&wake_token(1030, 2)).await.unwrap();
+    let (_, first) = poll(&fixture, Duration::from_secs(2)).await;
+    let started = std::time::Instant::now();
+    let (status, again) = poll(&fixture, Duration::from_secs(10)).await;
+    assert_eq!(status, 200);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(wake::REDELIVER_MS - 100),
+        "{waited:?}"
+    );
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+    assert_eq!(first["wakes"], again["wakes"]);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_refused_result_answers_57p03_to_every_held_connection_of_that_ticket() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut first = fixture.upgrade(&wake_token(1040, 2)).await.unwrap();
+    let mut second = fixture.upgrade(&wake_token(1041, 2)).await.unwrap();
+    first
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    poll(&fixture, Duration::from_secs(2)).await;
+    let (status, _) = wake_result(
+        &fixture,
+        json!({"database":DATABASE,"operation":wake_operation(),"generation":2,"outcome":"refused","reason":"deleted"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    for client in [&mut first, &mut second] {
+        assert!(
+            fatal(client, Duration::from_secs(5))
+                .await
+                .contains("57P03")
+        );
+    }
+    untouched(&mut fixture).await;
+    held_count(&fixture, 0).await;
+    // A result for a ticket the gateway does not hold is unknown.
+    let (status, answer) = wake_result(
+        &fixture,
+        json!({"database":DATABASE,"operation":wake_operation(),"generation":3,"outcome":"hit"}),
+    )
+    .await;
+    assert_eq!((status, answer), (404, json!({"error":"wake_unknown"})));
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_connection_past_25_s_answers_57p03_and_leaves_the_queue() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let started = std::time::Instant::now();
+    let mut client = fixture.upgrade(&wake_token(1050, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    assert!(
+        fatal(&mut client, Duration::from_secs(30))
+            .await
+            .contains("57P03")
+    );
+    assert!(started.elapsed() >= Duration::from_millis(wake::WAKE_BOUND_MS - 100));
+    held_count(&fixture, 0).await;
+    assert!(fixture.gateway.wakes.ticket(DATABASE).is_none());
+    untouched(&mut fixture).await;
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_fence_that_moves_past_the_ticket_generation_answers_57p03() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut client = fixture.upgrade(&wake_token(1060, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    fixture.intent("quiesce", 3, false).await;
+    assert!(
+        fatal(&mut client, Duration::from_secs(5))
+            .await
+            .contains("57P03")
+    );
+    untouched(&mut fixture).await;
+    // A ticket the fence has already moved past is not held at all.
+    assert_eq!(fixture.upgrade(&wake_token(1061, 2)).await.err(), Some(503));
+    held_count(&fixture, 0).await;
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_v5_ticket_already_released_at_its_generation_is_routed_at_once_as_warm() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    release(&fixture, 2, false).await;
+    let mut client = fixture.upgrade(&wake_token(1070, 2)).await.unwrap();
+    assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
+    assert!(fixture.gateway.wakes.ticket(DATABASE).is_none());
+    fixture.login(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_released_slot_target_is_dialled_with_the_slot_tls_name_and_pinned_ca() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut client = fixture.upgrade(&wake_token(1080, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    untouched(&mut fixture).await;
+    release(&fixture, 2, true).await;
+    fixture.login_sent(&mut client).await;
+    let dialled = fixture.dialled.lock().unwrap().clone();
+    assert_eq!(dialled.len(), 1);
+    assert_eq!(dialled[0].host, wake::slot_tls_name(SLOT));
+    assert_eq!(dialled[0].pod_uid, cid(300));
+    assert_eq!(
+        dialled[0].ca_sha256.as_deref(),
+        wake_target(2, true)["ca_sha256"].as_str()
+    );
+    // The session keeps running on the slot.
+    client.send(Message::Binary(query().into())).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn held_connections_beyond_32_per_database_are_refused_before_the_upgrade() {
+    let fixture = Fixture::with_fences(sleeping()).await;
+    let mut held = Vec::new();
+    for id in 0..wake::MAX_HELD_PER_DATABASE {
+        held.push(fixture.upgrade(&wake_token(1100 + id, 2)).await.unwrap());
+    }
+    assert_eq!(
+        fixture
+            .upgrade(&wake_token(1100 + wake::MAX_HELD_PER_DATABASE, 2))
+            .await
+            .err(),
+        Some(429)
+    );
+    assert_eq!(
+        fixture.gateway.wakes.held(DATABASE),
+        wake::MAX_HELD_PER_DATABASE
+    );
+    drop(held);
+    held_count(&fixture, 0).await;
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_replayed_v5_cid_is_refused() {
+    let fixture = Fixture::with_fences(sleeping()).await;
+    let ticket = wake_token(1200, 2);
+    let _client = fixture.upgrade(&ticket).await.unwrap();
+    assert_eq!(fixture.upgrade(&ticket).await.err(), Some(403));
+    assert_eq!(fixture.gateway.wakes.held(DATABASE), 1);
+    // A ticket for another region is not this gateway's.
+    assert_eq!(
+        fixture
+            .upgrade(&wake_ticket(1201, 2, &wake_operation(), "eu-other"))
+            .await
+            .err(),
+        Some(403)
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn wakes_and_wake_result_refuse_a_token_for_another_pod_action_or_region() {
+    let fixture = Fixture::with_fences(sleeping()).await;
+    let _client = fixture.upgrade(&wake_token(1300, 2)).await.unwrap();
+    let result = json!({"database":DATABASE,"operation":wake_operation(),"generation":2,"outcome":"refused","reason":"deleted"}).to_string();
+    let other_pod = cid(301);
+    for (path, token) in [
+        (
+            wake::POLL_PATH,
+            poll_token(wake::POLL_ACTION, &other_pod, REGION),
+        ),
+        (
+            wake::POLL_PATH,
+            poll_token(wake::RESULT_ACTION, POD, REGION),
+        ),
+        (
+            wake::POLL_PATH,
+            poll_token(wake::POLL_ACTION, POD, "eu-other"),
+        ),
+        (
+            wake::RESULT_PATH,
+            poll_token(wake::RESULT_ACTION, &other_pod, REGION),
+        ),
+        (
+            wake::RESULT_PATH,
+            poll_token(wake::POLL_ACTION, POD, REGION),
+        ),
+        (
+            wake::RESULT_PATH,
+            poll_token(wake::RESULT_ACTION, POD, "eu-other"),
+        ),
+        (wake::RESULT_PATH, control_token("release", 1)),
+    ] {
+        let body = if path == wake::RESULT_PATH {
+            result.as_str()
+        } else {
+            ""
+        };
+        assert_eq!(
+            post(&fixture, path, &token, body, Duration::from_secs(5)).await,
+            (401, json!({"error":"wake_denied"})),
+            "{path}"
+        );
+    }
+    // Nothing was delivered or answered by the refused requests.
+    let (_, answer) = poll(&fixture, Duration::from_secs(2)).await;
+    assert_eq!(answer["wakes"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture.gateway.wakes.held(DATABASE), 1);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn conn_stages_names_warm_pool_hit_and_pool_miss_with_wait_and_reason() {
+    if std::env::var_os("PGCF_WAKE_STAGES_CHILD").is_none() {
+        // The gateway logs to stdout, so a child test process runs the connections below.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conn_stages_names_warm_pool_hit_and_pool_miss_with_wait_and_reason",
+                "--nocapture",
+            ])
+            .env("PGCF_WAKE_STAGES_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<Value> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(&line[line.find('{')?..]).ok())
+            .filter(|line: &Value| line["event"] == "conn_stages")
+            .collect();
+        assert_eq!(lines.len(), 4, "{stdout}");
+        // A route Cloudflare admitted at a running revision.
+        assert_eq!(lines[0]["wake_path"], "warm");
+        assert!(lines[0].get("held_outcome").is_none(), "{}", lines[0]);
+        assert!(lines[0].get("wake_wait_ms").is_none(), "{}", lines[0]);
+        // Held, the controller missed the pool, the database's own Pod was released.
+        assert_eq!(lines[1]["wake_path"], "pool_miss", "{}", lines[1]);
+        assert_eq!(lines[1]["held_outcome"], "released");
+        assert_eq!(lines[1]["miss_reason"], "no_free_slot");
+        assert_eq!(lines[1]["controller_ms"], json!({"decide":3}));
+        assert!(
+            lines[1]["wake_wait_ms"].as_u64().unwrap() >= 40,
+            "{}",
+            lines[1]
+        );
+        assert_eq!(lines[1]["outcome"], "client_closed");
+        // Held and released to a pool slot; the controller's hit came after the release.
+        assert_eq!(lines[2]["wake_path"], "pool_hit", "{}", lines[2]);
+        assert_eq!(lines[2]["held_outcome"], "released");
+        assert!(lines[2].get("miss_reason").is_none(), "{}", lines[2]);
+        assert_eq!(lines[2]["controller_ms"], json!({"attach":5,"total":40}));
+        assert!(lines[2]["wake_wait_ms"].is_u64());
+        // Held and refused.
+        assert_eq!(lines[3]["wake_path"], "pool_miss", "{}", lines[3]);
+        assert_eq!(lines[3]["held_outcome"], "refused");
+        assert_eq!(lines[3]["miss_reason"], "deleted");
+        assert!(lines[3]["dial_ms"].is_null());
+        for line in &lines {
+            assert_eq!(line["database"], DATABASE);
+            for key in line.as_object().unwrap().keys() {
+                assert!(
+                    [
+                        "controller_ms",
+                        "database",
+                        "dial_ms",
+                        "event",
+                        "first_backend_ms",
+                        "held_outcome",
+                        "miss_reason",
+                        "outcome",
+                        "route",
+                        "session_ms",
+                        "startup_ms",
+                        "upgrade_ms",
+                        "wake_path",
+                        "wake_wait_ms",
+                    ]
+                    .contains(&key.as_str()),
+                    "{key}"
+                );
+            }
+        }
+        return;
+    }
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.authenticate(1400).await;
+    client.close(None).await.unwrap();
+    fixture.ended().await;
+    // The database sleeps at revision 2; the pool has no free slot, so the CNPG path wakes it.
+    fixture.intent("quiesce", 2, false).await;
+    let mut client = fixture.upgrade(&wake_token(1401, 3)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    poll(&fixture, Duration::from_secs(2)).await;
+    let miss = json!({"database":DATABASE,"operation":wake_operation(),"generation":3,"outcome":"miss","reason":"no_free_slot","steps_ms":{"decide":3}});
+    assert_eq!(wake_result(&fixture, miss).await.0, 200);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    release(&fixture, 3, false).await;
+    fixture.login_sent(&mut client).await;
+    client.close(None).await.unwrap();
+    fixture.ended().await;
+    // It sleeps again at revision 4 and the next wake is a pool hit. The fence keeps the target
+    // it last published beside the new intent.
+    fixture
+        .gateway
+        .fences
+        .write()
+        .await
+        .replace(HashMap::from([(
+            DATABASE.into(),
+            Fence {
+                admission_target: Some(serde_json::from_value(wake_target(3, false)).unwrap()),
+                ..fence("quiesce", 4)
+            },
+        )]))
+        .unwrap();
+    let mut client = fixture.upgrade(&wake_token(1402, 5)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    poll(&fixture, Duration::from_secs(2)).await;
+    release(&fixture, 5, true).await;
+    fixture.login_sent(&mut client).await;
+    let hit = json!({"database":DATABASE,"operation":wake_operation(),"generation":5,"outcome":"hit","steps_ms":{"attach":5,"total":40}});
+    assert_eq!(wake_result(&fixture, hit).await.0, 200);
+    client.close(None).await.unwrap();
+    fixture.ended().await;
+    // A wake the controller refuses.
+    let mut client = fixture.upgrade(&wake_token(1403, 7)).await.unwrap();
+    poll(&fixture, Duration::from_secs(2)).await;
+    let refused = json!({"database":DATABASE,"operation":wake_operation(),"generation":7,"outcome":"refused","reason":"deleted"});
+    assert_eq!(wake_result(&fixture, refused).await.0, 200);
+    assert!(
+        fatal(&mut client, Duration::from_secs(5))
+            .await
+            .contains("57P03")
+    );
+    held_count(&fixture, 0).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     fixture.stop().await;
 }

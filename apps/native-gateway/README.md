@@ -36,7 +36,10 @@ Every connection that passes route verification logs one `conn_stages` JSON line
 it ends: the database ID, a fixed `outcome` class, the fixed `route` class of the writer it was
 admitted on (`ready` for a Ready endpoint, `attested` for the controller's attested Pod before the
 kubelet's report; null before a writer was chosen) and monotonic milliseconds `upgrade_ms`,
-`startup_ms`, `dial_ms`, `first_backend_ms` and `session_ms`, null when a stage was not reached.
+`startup_ms`, `dial_ms`, `first_backend_ms` and `session_ms`, null when a stage was not reached,
+and `wake_path` (`warm`, or for a held wake `pool_hit` when it was released to a pool slot and
+`pool_miss` otherwise). A held wake adds `held_outcome`, `wake_wait_ms` (upgrade to release), and
+the controller's `miss_reason` and `controller_ms` once its result arrived.
 Roles, addresses, tokens and payload bytes are never logged.
 
 `packages/contracts/native/generate.ts` derives native schemas, wire constants and deterministic
@@ -80,6 +83,28 @@ Ready endpoint again. A new attestation (another Pod, container or revision) sta
 session admitted on the attestation is closed, not drained, when the fence leaves `running` or
 the container is restarted before the kubelet's report. `/readyz` requires the Pod watch, the
 one that recognizes such a writer, beside the fence, EndpointSlice and ConfigMap watches.
+
+A v5 route is the Edge's wake ticket for a sleeping database: the operation and generation the
+wake claims, the admission route revision and the hash of the role revisions. The gateway checks
+its `cid` against the replay cache, answers the upgrade at once, answers SSLRequest, and reads and
+checks the StartupMessage, which it holds with whatever the client sends behind it; nothing is
+dialled. It keeps one ticket per database (a higher generation replaces it), at most 32 held
+connections per database and 512 in total, refused with HTTP 429 or 503 before the upgrade. The
+controller takes the tickets with `POST /_pgcf/gateway/wakes`, signed for this Pod (`x-pgcf-wake`,
+`gw1`), answered at once or with an empty list after 20 s, at most four polls at a time; a ticket
+without a result is delivered again after 3 s. It answers each with `POST
+/_pgcf/gateway/wake-result`: `hit` and `miss` label the connections, `refused` ends them. The
+release is the fence: running at the ticket's generation and operation with an admission target
+of that generation and route revision whose Pod is the writer. The connection is then routed as
+the v4 route of that target; a ticket the fence has already released is routed at once. A
+refusal, 25 s without release, or a fence that moves past the ticket answer FATAL 57P03; a
+draining gateway and a failed dial answer 08006.
+
+The admission target may name the Service of a pool slot, `database-rw.pgcf-slot-<8 hex>.svc`. The
+writer is then that slot's Pod in its own namespace, under the same attestation rules and without
+a storage binding: the controller holds the database's volume for the slot. A slot no fence names
+belongs to no database. A gateway release older than the pool fails its discovery on slot Pods, so
+rolling the gateway back requires deleting every `pgcf-slot-*` namespace first.
 
 The gateway accepts thin write authority only from the public-key map pinned by
 `PGCF_STORAGE_AUTHORITY_KEYS` and its canonical SHA-256 in
