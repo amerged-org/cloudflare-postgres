@@ -23,7 +23,12 @@ export interface FleetPostgresProgress {
   errors: { database_id: string; code: string }[];
 }
 
-/** One bounded turn; replay keeps the persisted generation and existing resize operation. */
+/**
+ * One bounded turn; replay keeps the persisted generation and existing resize operation.
+ * A database is current when it runs the release's PostgreSQL pin: image, version and
+ * configuration schema. `desired_postgres_release_id` records the release that last changed the
+ * pin, so a release that changes none of them restarts and renumbers no database.
+ */
 export async function reconcileFleetPostgresRelease(
   env: Env,
   regionId: string,
@@ -68,13 +73,12 @@ export async function reconcileFleetPostgresRelease(
   const rows = await env.DB.prepare(
     `SELECT * FROM databases WHERE region_id=? AND deleted_at IS NULL AND desired_state IN('running','suspended')
     AND (node_id IS NULL OR node_id=?)
-    AND (desired_postgres_release_id IS NOT ? OR desired_postgres_image IS NOT ? OR desired_postgres_version IS NOT ? OR desired_postgres_schema_revision IS NOT ?)
+    AND (desired_postgres_image IS NOT ? OR desired_postgres_version IS NOT ? OR desired_postgres_schema_revision IS NOT ?)
     ORDER BY id LIMIT 20`,
   )
     .bind(
       regionId,
       patch.node_id,
-      releaseId,
       pin.data.image,
       pin.data.version,
       pin.data.configuration_schema_revision,
@@ -149,17 +153,15 @@ export async function reconcileFleetPostgresRelease(
   await assertFleetPatchAuthority(env, patch);
   const counts = await env.DB.prepare(
     `SELECT count(*) total,
-    COALESCE(sum(CASE WHEN d.desired_postgres_release_id=? AND d.desired_postgres_image=?
+    COALESCE(sum(CASE WHEN d.desired_postgres_image=?
       AND d.observed_generation=d.generation AND d.desired_state='running' AND d.observed_state='ready'
       AND d.observed_postgres_image=d.desired_postgres_image AND substr(d.observed_postgres_image_id,-71)=? THEN 1 ELSE 0 END),0) applied,
-    COALESCE(sum(CASE WHEN d.desired_postgres_release_id=? AND d.desired_postgres_image=? AND ${databaseCpuChargeSql("d", "s")}=0 THEN 1 ELSE 0 END),0) deferred_cold
+    COALESCE(sum(CASE WHEN d.desired_postgres_image=? AND ${databaseCpuChargeSql("d", "s")}=0 THEN 1 ELSE 0 END),0) deferred_cold
     FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.region_id=? AND d.node_id=? AND d.deleted_at IS NULL AND d.desired_state IN('running','suspended')`,
   )
     .bind(
-      releaseId,
       pin.data.image,
       pin.data.image.slice(-71),
-      releaseId,
       pin.data.image,
       regionId,
       patch.node_id,
@@ -167,10 +169,9 @@ export async function reconcileFleetPostgresRelease(
     .first<{ total: number; applied: number; deferred_cold: number }>();
   if (!counts) throw new Error("PostgreSQL patch progress unavailable");
   const queued = await env.DB.prepare(
-    `SELECT count(*) n,COALESCE(sum(CASE WHEN desired_postgres_release_id IS NOT ? OR desired_postgres_image IS NOT ? OR desired_postgres_version IS NOT ? OR desired_postgres_schema_revision IS NOT ? THEN 1 ELSE 0 END),0) pending FROM databases WHERE region_id=? AND node_id IS NULL AND deleted_at IS NULL AND desired_state='running'`,
+    `SELECT count(*) n,COALESCE(sum(CASE WHEN desired_postgres_image IS NOT ? OR desired_postgres_version IS NOT ? OR desired_postgres_schema_revision IS NOT ? THEN 1 ELSE 0 END),0) pending FROM databases WHERE region_id=? AND node_id IS NULL AND deleted_at IS NULL AND desired_state='running'`,
   )
     .bind(
-      releaseId,
       pin.data.image,
       pin.data.version,
       pin.data.configuration_schema_revision,

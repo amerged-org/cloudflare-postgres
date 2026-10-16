@@ -219,6 +219,106 @@ it("persists a generation-bound image, resumes without repeated resize and requi
       .first("desired_postgres_image"),
   ).toBe(f.image);
 });
+it("confirms the stage without a resize or a generation when the release changes only its id", async () => {
+  const f = await setup();
+  await env.DB.prepare("UPDATE size_classes SET enabled=0 WHERE id=?")
+    .bind(f.size)
+    .run();
+  await f.run();
+  await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    observedBody([
+      {
+        ...observation(f.id, 2),
+        postgres: {
+          image: f.image,
+          image_id: `containerd://sha256:${"e".repeat(64)}`,
+        },
+      },
+    ]),
+  );
+  expect(await f.run()).toMatchObject({ pending: 0, applied: 1 });
+  // The next release pins the same PostgreSQL and moves only its own id: another API digest.
+  const spec = JSON.parse(
+      (await env.DB.prepare("SELECT spec_json FROM fleet_releases WHERE id=?")
+        .bind(f.releaseId)
+        .first<string>("spec_json"))!,
+    ),
+    next = `pg-${crypto.randomUUID()}`,
+    nextPatch = newOperationId(),
+    now = new Date().toISOString();
+  spec.components.find((c: { name: string }) => c.name === "api").sha256 =
+    "f".repeat(64);
+  releases.push(next);
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(next, JSON.stringify(spec), await installationHash(spec), now),
+    env.DB.prepare(
+      "UPDATE fleet_region_releases SET release_id=?,revision=2 WHERE region_id=?",
+    ).bind(next, f.region),
+    env.DB.prepare(
+      "UPDATE fleet_node_releases SET release_id=?,revision=2 WHERE node_id=?",
+    ).bind(next, f.node),
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='complete',state='confirmed' WHERE operation_id=?",
+    ).bind(f.patchId),
+    env.DB.prepare(
+      "UPDATE nodes SET database_placement_closed_at=? WHERE id=?",
+    ).bind(now, f.node),
+    env.DB.prepare(
+      `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
+      SELECT ?,node_id,region_id,node_uid,cluster_uid,?,?,2,2,material_revision,address,?,0,'postgres','pending',?,?,deadline_at FROM fleet_patch_operations WHERE operation_id=?`,
+    ).bind(
+      nextPatch,
+      next,
+      await installationHash(spec),
+      JSON.stringify([
+        {
+          node_id: f.node,
+          node_uid: await env.DB.prepare(
+            "SELECT node_uid FROM nodes WHERE id=?",
+          )
+            .bind(f.node)
+            .first<string>("node_uid"),
+          assignment_revision: 2,
+        },
+      ]),
+      now,
+      now,
+      f.patchId,
+    ),
+  ]);
+  const before = await env.DB.prepare(
+    "SELECT generation,desired_postgres_release_id FROM databases WHERE id=?",
+  )
+    .bind(f.id)
+    .first();
+  expect(
+    await reconcileFleetPostgresRelease(
+      env as never,
+      f.region,
+      next,
+      nextPatch,
+    ),
+  ).toMatchObject({ total: 1, pending: 0, applied: 1, errors: [] });
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,desired_postgres_release_id FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual(before);
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM operations WHERE database_id=? AND kind='database.resize'",
+    )
+      .bind(f.id)
+      .first("n"),
+  ).toBe(1);
+});
 it("keeps confirmed cold databases cold and defers image application until an admitted wake", async () => {
   const f = await setup(true);
   expect(await f.run()).toMatchObject({
