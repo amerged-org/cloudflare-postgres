@@ -313,6 +313,9 @@ configuration fails explicitly. Unit tests do not replace the live acceptance re
   runtime architecture, verified routing and the cold-start design.
 - [Parked sleep tier](docs/architecture/parked-instances.md): the idle sleep that keeps the
   instance Pod and stops only PostgreSQL.
+- [Wake path v2 and control-plane scale](docs/architecture/wake-path-v2-and-scale.md): what the
+  field does (Neon, Xata), where PGCF's wake time goes, the work packages that take it below one
+  second, and how the API load scales with nodes.
 - [Integrator handover](docs/operations/integrator-handover.md): the model, lifecycle API, client
   behaviour, limits, metering and recovery for an integrator that creates databases on PGCF.
 - [Source-backed diagrams](docs/architecture/mermaider/README.md): declared Cloudflare resources,
