@@ -185,10 +185,17 @@ The gateway holds the client for up to 25 s; misses are labelled and alerted on 
   - a replacement slot is ready in about 10 s
   - **No lost commits:** afterwards the tenant woke through CNPG's normal path and held all 21 inserts and 21 updates
     of the pool runs.
+- **Archive binding verified (same day):**
+  - A slot created with the Barman Cloud plugin archived to a placeholder path. Before the claim, its ObjectStore was
+    patched to the tenant path and the plugin's `serverName` to the tenant; the Pod did not restart.
+  - The claim mounted the volume into both the PostgreSQL container and the archiver sidecar (a native sidecar init
+    container). The first SaaS statement answered 332 ms after t0.
+  - A forced WAL switch archived the tenant's segment (same `system_identifier`) under the tenant's R2 path with no
+    failures, and nothing reached the placeholder path. The fence then archived the shutdown segment and stopped
+    cleanly in 1.0 s. The lab objects were deleted from R2 afterwards.
 - **Not yet covered by the lab:**
-  - binding WAL archiving to the tenant's R2 prefix at the claim (the lab slots had no backup plugin)
   - a thin volume (the lab used thick volumes)
-  - the Pod lookup and the instance manager's reaction to the fence patch, which the controller can shorten
+  - the shorter Pod lookup and fence reaction the controller can achieve
 - **Worker-to-Edge measurement (same day):** an awake database's first query from the probe Worker through the public
   hostname took 213–756 ms (median 392 ms). Opening the WebSocket alone took 0.19–0.73 s, and the query 17–29 ms.
   - The public hop therefore costs about as much as the whole node path.
