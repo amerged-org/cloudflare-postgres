@@ -73,3 +73,17 @@ fn an_admitted_target_is_bound_to_the_fence_that_carries_it() {
     foreign["tls_server_name"] = json!(format!("database-rw.pgcf-db-{}.svc", "b".repeat(20)));
     assert!(parse_snapshot(&with(&foreign)).is_err());
 }
+#[tokio::test]
+async fn every_applied_fence_change_wakes_the_connections_waiting_on_it() {
+    // A held wake connection is released by the fence the controller writes; it waits on this
+    // signal instead of polling the fence.
+    let mut state = FenceState::default();
+    let changed = state.changed.clone();
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    state.replace(parse_snapshot(&snapshot()).unwrap()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .unwrap();
+}
