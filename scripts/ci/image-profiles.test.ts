@@ -250,6 +250,7 @@ test("storage scanning requires its authored modification notice", () => {
 test("scratch runtime selection scans all outputs and requires its executable and first-party license", () => {
   const input = files(
     "pgcf-native-controller",
+    "pgcf-attach",
     "licenses/pgcf/LICENSE",
     "licenses/provenance/controller.generated.json",
     "unexpected-output",
@@ -267,6 +268,24 @@ test("scratch runtime selection scans all outputs and requires its executable an
       ),
     /First-party image output missing/,
   );
+});
+
+test("native-controller requires pgcf-native-controller, pgcf-attach and the license", () => {
+  const input = files(
+    "pgcf-native-controller",
+    "pgcf-attach",
+    "licenses/pgcf/LICENSE",
+  );
+  assert.deepEqual(selectOwnedFiles(input, "native-controller"), input);
+  for (const missing of ["pgcf-native-controller", "pgcf-attach"])
+    assert.throws(
+      () =>
+        selectOwnedFiles(
+          input.filter((file) => file.path !== missing),
+          "native-controller",
+        ),
+      new RegExp(`First-party image output missing: ${missing}$`),
+    );
 });
 
 test("sandbox extension selection keeps both binaries and its service and CRI configuration in scan scope", () => {

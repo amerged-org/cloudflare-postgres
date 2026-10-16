@@ -183,12 +183,13 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
         : ["licenses/pgcf/LICENSE"]),
     ];
   }
+  if (profile === "native-controller")
+    // One image carries the controller and the node attach agent.
+    return ["pgcf-native-controller", "pgcf-attach", "licenses/pgcf/LICENSE"];
   const binary =
     profile === "rust-gateway"
       ? "pgcf-native-gateway"
-      : profile === "native-controller"
-        ? "pgcf-native-controller"
-        : "pgcf-native-bootstrap-relay";
+      : "pgcf-native-bootstrap-relay";
   return [binary, "licenses/pgcf/LICENSE"];
 }
 

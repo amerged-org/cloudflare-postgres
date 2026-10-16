@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Always supply nativeRuntime.testBuilderImage and rustVersion from versions.lock.json.
-# The immutable compiler produces one static controller, with no runtime OS packages.
+# The immutable compiler produces the static controller and node attach agent, with no runtime OS
+# packages.
 ARG RUST_BUILDER
 FROM ${RUST_BUILDER} AS build
 ARG RUST_VERSION
@@ -25,7 +26,7 @@ RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && export PGCF_CARGO_LOCK_SHA256="$(sha256sum Cargo.lock | cut -d ' ' -f 1)" \
  && export PGCF_PROTOCOL_SHA256="$(sha256sum packages/contracts/native/protocol.generated.json | cut -d ' ' -f 1)" \
  && export PGCF_CONTROLLER_CONTRACT_SHA256="$(sha256sum packages/contracts/native/controller.generated.json | cut -d ' ' -f 1)" \
- && cargo build --release --locked -p pgcf-native-controller \
+ && cargo build --release --locked -p pgcf-native-controller --bins \
  && cargo metadata --locked --offline --no-deps --format-version 1 > /licenses/workspace-metadata.json \
  && mkdir -p /licenses/provenance \
  && cp Cargo.lock /licenses/provenance/Cargo.lock \
@@ -38,6 +39,8 @@ RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && sh apps/native-gateway/license-bundle.sh
 FROM scratch
 COPY --from=build /workspace/target/release/pgcf-native-controller /pgcf-native-controller
+# The node attach agent DaemonSet runs this image with command /pgcf-attach.
+COPY --from=build /workspace/target/release/pgcf-attach /pgcf-attach
 COPY --from=build /licenses /licenses
 USER 65532:65532
 ENTRYPOINT ["/pgcf-native-controller"]
