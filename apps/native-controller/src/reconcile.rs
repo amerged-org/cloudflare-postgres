@@ -544,6 +544,105 @@ fn native_lvm_owned(db: &Value, receipt: &Value, lvm: &Value) -> bool {
         && lvm["spec"]["ownerNodeID"] == db["node"]
         && lvm["status"]["state"] == "Ready"
 }
+/// The poll of PostgreSQL of a resumed Pod that began where the unfence was sent: its answer is
+/// the session that proved PostgreSQL accepts, with the authority and the address it asked with.
+struct Accepting(tokio::task::JoinHandle<Answered>);
+/// What the poll answered: the session, the authority it asked with and the address it asked at.
+type Answered = Result<Option<(postgres::Session, Vec<u8>, String)>, Error>;
+impl Accepting {
+    async fn answer(mut self) -> Answered {
+        match (&mut self.0).await {
+            Ok(answer) => answer,
+            Err(_) => Err("PostgreSQL poll ended".into()),
+        }
+    }
+}
+impl Drop for Accepting {
+    /// A pass that ends, or is cut off, takes its poll with it.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+/// The TLS authority a Cluster's server CA Secret holds.
+fn ca_bytes(secret: &Value, cluster: &Value) -> Result<Vec<u8>, Error> {
+    if !cluster_owned(secret, cluster)
+        || text(&secret["metadata"], "uid").is_empty()
+        || text(&secret["metadata"], "resourceVersion").is_empty()
+        || !secret["metadata"]["deletionTimestamp"].is_null()
+    {
+        return Err("CNPG CA secret is deleting".into());
+    }
+    let encoded = text(&secret["data"], "ca.crt");
+    if encoded.len() > 128 * 1024 {
+        return Err("CNPG CA exceeds bound".into());
+    }
+    let ca = STANDARD.decode(encoded)?;
+    postgres::validate_ca(&ca)?;
+    Ok(ca)
+}
+/// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster: the maintenance
+/// role connects to the Pod's own address under the tenant's TLS name and finds the right
+/// database, a primary, TLS, this Pod, and a postmaster that started after the unfence was sent
+/// (`started`). Polls until `started` plus `budget`; `None` means not within the window, and the
+/// answer is the session that proved it: the checks that follow ask their questions in it.
+async fn accepting(
+    db: &Value,
+    ca: &[u8],
+    ip: &str,
+    socket: std::net::SocketAddr,
+    started: std::time::Instant,
+    budget: Duration,
+) -> Result<Option<postgres::Session>, Error> {
+    let mut phase = timing::Phase::begin(db, "pg_accepting");
+    let role = text(&db["maintenance"], "role");
+    if db["maintenance"].is_null() {
+        phase.failed();
+        return Err("maintenance authority absent".into());
+    }
+    let deadline = started + budget;
+    let mut polls = 0_u64;
+    loop {
+        polls += 1;
+        let attempt = async {
+            let session = postgres::connect_via(
+                db,
+                ca,
+                role,
+                text(&db["maintenance"], "password"),
+                text(db, "id"),
+                Some(socket),
+            )
+            .await?;
+            let rows = session.query(postgres::ACCEPTING_QUERY, &[]).await?;
+            let [row] = rows.as_slice() else {
+                return Ok::<Option<postgres::Session>, Error>(None);
+            };
+            // The server's own clock measures the postmaster's age; the controller's monotonic
+            // clock measures the time since the unfence was sent. A postmaster older than that
+            // did not start for this wake.
+            let age: i64 = row.try_get("postmaster_age_ms")?;
+            let since = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let current = row.try_get::<_, String>("database")? == text(db, "id")
+                && !row.try_get::<_, bool>("recovery")?
+                && row.try_get::<_, bool>("tls")?
+                && row.try_get::<_, String>("server_address")? == ip
+                && (0..=since.saturating_add(250)).contains(&age);
+            Ok(current.then_some(session))
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Ok(Ok(Some(session))) = tokio::time::timeout(remaining, attempt).await {
+            phase.note("polls", polls);
+            phase.completed();
+            return Ok(Some(session));
+        }
+        if std::time::Instant::now() >= deadline {
+            phase.note("polls", polls);
+            phase.pending();
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 impl Reconciler {
     /// Native has already bound this thin volume. Pin that physical custody before Ready;
     /// the separate Ready path still requires this Pod's measured IO limits and write token.
@@ -910,69 +1009,57 @@ impl Reconciler {
             pod: fresh_pod,
         })
     }
-    /// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster: the
-    /// maintenance role connects to the Pod's own address under the tenant's TLS name and finds
-    /// the right database, a primary, TLS, this Pod, and a postmaster that started after the
-    /// unfence was sent. Polls inside the pass; `None` means not within the window, and the
-    /// answer is the session that proved it: the checks that follow ask their questions in it.
+    /// Whether PostgreSQL of a resumed Pod accepts connections as a fresh postmaster, asked from the
+    /// Pod this pass read (see `accepting`). If the poll that began with the unfence already
+    /// answered, for this authority and this address, its session is the answer.
     async fn pg_accepting(
         &self,
         db: &Value,
         ca: &[u8],
         pod: &Value,
         wake: &ParkedWake,
+        early: Option<Accepting>,
     ) -> Result<Option<postgres::Session>, Error> {
-        let mut phase = timing::Phase::begin(db, "pg_accepting");
         let ip = text(&pod["status"], "podIP");
+        if let Some(early) = early
+            && let Ok(Some((session, used, at))) = early.answer().await
+            && used == ca
+            && at == ip
+        {
+            return Ok(Some(session));
+        }
         let socket = self.power.pod_socket(ip)?;
-        let role = text(&db["maintenance"], "role");
-        if db["maintenance"].is_null() {
-            phase.failed();
-            return Err("maintenance authority absent".into());
+        accepting(db, ca, ip, socket, wake.started, self.accept_budget).await
+    }
+    /// Starts the poll of PostgreSQL of the resumed Pod where the unfence was sent, concurrently
+    /// with everything the pass does meanwhile. The authority of the Cluster and the address of
+    /// the Pod the wake began from are what it asks with; the pass uses its answer only if they
+    /// are those it reads itself afterwards.
+    fn start_accepting(
+        &self,
+        db: &Value,
+        wake: &ParkedWake,
+        cluster: Option<&Value>,
+    ) -> Option<Accepting> {
+        let cluster = cluster?.clone();
+        let name = text(&cluster["status"]["certificates"], "serverCASecret").to_string();
+        let ip = wake.pod_ip.clone()?;
+        if name.is_empty() || db["maintenance"].is_null() {
+            return None;
         }
-        let deadline = wake.started + self.accept_budget;
-        let mut polls = 0_u64;
-        loop {
-            polls += 1;
-            let attempt = async {
-                let session = postgres::connect_via(
-                    db,
-                    ca,
-                    role,
-                    text(&db["maintenance"], "password"),
-                    text(db, "id"),
-                    Some(socket),
-                )
-                .await?;
-                let rows = session.query(postgres::ACCEPTING_QUERY, &[]).await?;
-                let [row] = rows.as_slice() else {
-                    return Ok::<Option<postgres::Session>, Error>(None);
-                };
-                // The server's own clock measures the postmaster's age; the controller's
-                // monotonic clock measures the time since the unfence was sent. A postmaster
-                // older than that did not start for this wake.
-                let age: i64 = row.try_get("postmaster_age_ms")?;
-                let since = i64::try_from(wake.started.elapsed().as_millis()).unwrap_or(i64::MAX);
-                let current = row.try_get::<_, String>("database")? == text(db, "id")
-                    && !row.try_get::<_, bool>("recovery")?
-                    && row.try_get::<_, bool>("tls")?
-                    && row.try_get::<_, String>("server_address")? == ip
-                    && (0..=since.saturating_add(250)).contains(&age);
-                Ok(current.then_some(session))
-            };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if let Ok(Ok(Some(session))) = tokio::time::timeout(remaining, attempt).await {
-                phase.note("polls", polls);
-                phase.completed();
-                return Ok(Some(session));
-            }
-            if std::time::Instant::now() >= deadline {
-                phase.note("polls", polls);
-                phase.pending();
-                return Ok(None);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let (k8s, db, ns) = (self.k8s.clone(), db.clone(), namespace(db));
+        let (started, budget) = (wake.started, self.accept_budget);
+        let socket = self.power.pod_socket(&ip).ok()?;
+        Some(Accepting(tokio::spawn(async move {
+            let secret = k8s
+                .read("Secret", Some(&ns), &name)
+                .await?
+                .ok_or("CNPG CA secret disappeared")?;
+            let ca = ca_bytes(&secret, &cluster)?;
+            Ok(accepting(&db, &ca, &ip, socket, started, budget)
+                .await?
+                .map(|session| (session, ca, ip)))
+        })))
     }
     /// Writes the database's token into its ledger, never over a newer one; `decided` is the
     /// revision of the node authority under which the token (or its absence) was decided.
@@ -1344,6 +1431,7 @@ impl Reconciler {
         // Built here for a retained Pod's eligibility; a build failure surfaces where it always did.
         let built = manifests::build(db, &context);
         let mut parked: Option<ParkedWake> = None;
+        let mut accepting: Option<Accepting> = None;
         if intent.is_some() {
             // CNPG creates the woken primary as soon as hibernation is released, and admission
             // matches the namespace label at that moment, so the runtime is selected first.
@@ -1363,7 +1451,12 @@ impl Reconciler {
                 PrepareRunning::Pending => return Ok(Some(observation(db, "provisioning", None))),
                 PrepareRunning::Observation(v) => return Ok(Some(v)),
                 PrepareRunning::Proceed => {}
-                PrepareRunning::Parked(resumed) => parked = Some(resumed),
+                PrepareRunning::Parked(resumed) => {
+                    // PostgreSQL starts a tenth of a second after the unfence, and the pass has
+                    // seven rounds of requests to make meanwhile: it asks from the start.
+                    accepting = self.start_accepting(db, &resumed, prior_cluster.as_ref());
+                    parked = Some(*resumed);
+                }
             }
         }
         if fence.is_none() && !db["storage"].is_null() {
@@ -1589,7 +1682,10 @@ impl Reconciler {
         // check and the archive sample ask their questions in.
         let (pod, cluster, held) = match &parked {
             Some(wake) => {
-                let Some(held) = self.pg_accepting(db, &ca, &pod, wake).await? else {
+                let Some(held) = self
+                    .pg_accepting(db, &ca, &pod, wake, accepting.take())
+                    .await?
+                else {
                     return Ok(Some(observation(db, "provisioning", None)));
                 };
                 match self.power.resumed_settled(db, wake, &cluster).await? {
@@ -2267,19 +2363,7 @@ impl Reconciler {
             self.k8s.read("ConfigMap", Some(SYSTEM), &published_name)
         )?;
         let secret = secret.ok_or("CNPG CA secret disappeared")?;
-        if !cluster_owned(&secret, cluster)
-            || text(&secret["metadata"], "uid").is_empty()
-            || text(&secret["metadata"], "resourceVersion").is_empty()
-            || !secret["metadata"]["deletionTimestamp"].is_null()
-        {
-            return Err("CNPG CA secret is deleting".into());
-        }
-        let encoded = text(&secret["data"], "ca.crt");
-        if encoded.len() > 128 * 1024 {
-            return Err("CNPG CA exceeds bound".into());
-        }
-        let ca = STANDARD.decode(encoded)?;
-        postgres::validate_ca(&ca)?;
+        let ca = ca_bytes(&secret, cluster)?;
         let mut manifest = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{}",text(db,"id")),"namespace":SYSTEM,"labels":{LABEL:db["id"]}},"data":{"ca.crt":String::from_utf8(ca.clone())?}});
         if !db["admission"].is_null() {
             manifest["metadata"]["annotations"] = json!({"pgcf.io/source-ca-secret-uid":secret["metadata"]["uid"],"pgcf.io/source-ca-secret-resource-version":secret["metadata"]["resourceVersion"]});

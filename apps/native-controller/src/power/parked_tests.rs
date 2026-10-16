@@ -774,22 +774,27 @@ async fn a_parked_wake_unfences_resizes_and_resumes_the_same_pod() {
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(resumed.pod_uid, pod_uid());
     assert_eq!(resumed.pod_name, "database-1");
-    // Progress `Wake` is written before the single Cluster patch, which removes the fence and
-    // sets hibernation off together; the resize up follows or accompanies it.
+    // Progress `Wake` is written with the single Cluster patch, which removes the fence and
+    // sets hibernation off together, and with the resize up: one wave of three writes.
     assert_eq!(progress(&w)["phase"], "wake");
-    let wake = position(&w, &fence_path(&w), |b| {
-        b["data"]["power.json"]
-            .as_str()
-            .is_some_and(|raw| raw.contains("\"phase\":\"wake\""))
-    })
-    .unwrap();
-    let unfence = position(&w, &cluster_path(&w), |b| {
-        b["metadata"]["annotations"][FENCE].is_null()
-            && b["metadata"]["annotations"].get(FENCE).is_some()
-            && b["metadata"]["annotations"][HIBERNATION] == "off"
-    })
-    .expect("one patch removes the fence and sets hibernation off");
-    assert!(wake < unfence);
+    assert!(
+        position(&w, &fence_path(&w), |b| {
+            b["data"]["power.json"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("\"phase\":\"wake\""))
+        })
+        .is_some(),
+        "the record of the wake was written"
+    );
+    assert!(
+        position(&w, &cluster_path(&w), |b| {
+            b["metadata"]["annotations"][FENCE].is_null()
+                && b["metadata"]["annotations"].get(FENCE).is_some()
+                && b["metadata"]["annotations"][HIBERNATION] == "off"
+        })
+        .is_some(),
+        "one patch removes the fence and sets hibernation off"
+    );
     assert!(annotations(&w)[FENCE].is_null());
     assert_eq!(annotations(&w)[HIBERNATION], "off");
     let resized = patches(&w, &resize_path(&w));

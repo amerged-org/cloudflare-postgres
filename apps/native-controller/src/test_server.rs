@@ -113,6 +113,13 @@ pub struct State {
     pub write_reply_delay: Option<Duration>,
     /// The open metadata watches: the collection each is of and the events it has yet to send.
     pub streams: Vec<(String, VecDeque<Value>)>,
+    /// Every request is answered this long after it arrived, so that requests issued together are
+    /// answered together and requests that wait for an answer are counted as rounds.
+    pub latency: Option<Duration>,
+    /// The number of sequential rounds the requests made so far needed: a request arrives one
+    /// round after the deepest request that had been answered before it arrived. Requests that
+    /// were in flight together are one round.
+    pub rounds: u64,
     serial: u64,
 }
 impl State {
@@ -568,6 +575,12 @@ impl Server {
                         let _ = tls.shutdown().await;
                         return;
                     }
+                    // The round this request is in: one more than the deepest request answered
+                    // before it arrived.
+                    let (round, latency) = {
+                        let state = state.lock().unwrap();
+                        (state.rounds + 1, state.latency)
+                    };
                     // A request the gate matches waits for the others of its group.
                     let mut held = None;
                     {
@@ -629,8 +642,15 @@ impl Server {
                     let Some((status, body)) = response else {
                         return;
                     };
+                    if let Some(latency) = latency {
+                        tokio::time::sleep(latency).await;
+                    }
                     if let Some(delay) = delay {
                         tokio::time::sleep(delay).await;
+                    }
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.rounds = state.rounds.max(round);
                     }
                     tls.write_all(
                         format!(

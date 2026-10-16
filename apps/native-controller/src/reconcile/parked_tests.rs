@@ -94,9 +94,9 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
         pod_uid(),
         "{observed}"
     );
-    // Order: progress `Wake`, one patch lifting the fence and releasing hibernation, the Pod's
-    // requests returning, PostgreSQL's fresh postmaster, every role and the archive through the
-    // Pod, and only then the gateway release that admits clients.
+    // Order: progress `Wake`, one patch lifting the fence and releasing hibernation and the Pod's
+    // requests returning (one wave of three writes), PostgreSQL's fresh postmaster, every role
+    // and the archive through the Pod, and only then the gateway release that admits clients.
     let wake = at(&w, &["PATCH", "gateway-fence-", r#"\"phase\":\"wake\""#]);
     let unfence = at(
         &w,
@@ -113,10 +113,9 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     let archive = at(&w, &["SQL pgcf_maintenance archive"]);
     let release = at(&w, &["GATEWAY release"]);
     assert!(
-        wake < unfence,
-        "intent is persisted before the Cluster write"
+        wake < accepting && unfence < accepting && resize < release,
+        "the first wave is written before PostgreSQL answers"
     );
-    assert!(unfence < accepting && resize < release);
     assert!(
         accepting < roles && roles < archive && archive < release,
         "{:#?}",
@@ -416,6 +415,111 @@ async fn a_resize_up_the_kubelet_cannot_allocate_holds_the_wake_and_then_demotes
 }
 
 #[tokio::test]
+async fn a_wake_whose_unfence_landed_before_its_record_continues_on_the_same_pod() {
+    // The first wave is three writes at once, so a crash can leave the Cluster written and the
+    // record of the wake not: the fence is lifted under a record that still says `Parked`. The
+    // next pass finds the fence gone, records the wake, and continues on the Pod it retained.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    w.server
+        .edit("Cluster", Some(&w.ns), "database", |cluster| {
+            cluster["metadata"]["annotations"][FENCE] = Value::Null;
+            cluster["metadata"]["annotations"][HIBERNATION] = "off".into();
+            cluster["metadata"]["annotations"]["pgcf.io/power-revision"] = "3".into();
+            cluster["metadata"]["annotations"]["pgcf.io/power-operation"] =
+                w.db["power"]["operation"].clone();
+            cluster["metadata"]["annotations"]
+                .as_object_mut()
+                .unwrap()
+                .remove(FENCE);
+        });
+    let progress = |w: &World| -> Value {
+        let map = w
+            .server
+            .get(
+                "ConfigMap",
+                Some(SYSTEM),
+                &format!("gateway-fence-{}", w.id),
+            )
+            .unwrap();
+        serde_json::from_str(text(&map["data"], "power.json")).unwrap()
+    };
+    assert_eq!(progress(&w)["phase"], "parked");
+    // PostgreSQL started when the unfence landed, and the kubelet has not reported the Pod ready
+    // (it is not published before it is: this pass is not the fast one).
+    let first = reconcile(&w).await;
+    assert_eq!(first["state"], "provisioning", "{first}");
+    assert_eq!(progress(&w)["phase"], "wake");
+    assert!(annotations(&w)[FENCE].is_null());
+    w.pod(true);
+    let ready = reconcile(&w).await;
+    assert_eq!(ready["state"], "ready", "{ready}");
+    let hibernations = w
+        .server
+        .state
+        .lock()
+        .unwrap()
+        .writes
+        .iter()
+        .filter(|(_, path, body)| {
+            *path == cluster_path(&w) && body["metadata"]["annotations"][HIBERNATION] == "on"
+        })
+        .count();
+    assert_eq!(
+        hibernations, 0,
+        "the Pod that was parked is the one that woke"
+    );
+}
+
+#[tokio::test]
+async fn a_wake_whose_record_landed_before_its_unfence_unfences_in_the_next_pass() {
+    // The other half of the window: the record of `Wake` is written and the Cluster write was
+    // refused. The fence is still in place, no postmaster runs, and the next pass begins the wake
+    // again over the same record.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let cluster = cluster_path(&w);
+    w.server.state.lock().unwrap().refuse =
+        Some(Box::new(move |at, _| (at == cluster).then_some(500)));
+    let first = reconcile_pass(&w).await;
+    assert!(
+        first.as_ref().is_none_or(|value| value["state"] != "ready"),
+        "{first:?}"
+    );
+    assert_eq!(
+        annotations(&w)[FENCE],
+        "[\"*\"]",
+        "the Cluster write was refused: the fence stands"
+    );
+    let record = |w: &World| -> Value {
+        let map = w
+            .server
+            .get(
+                "ConfigMap",
+                Some(SYSTEM),
+                &format!("gateway-fence-{}", w.id),
+            )
+            .unwrap();
+        serde_json::from_str(text(&map["data"], "power.json")).unwrap()
+    };
+    let begun = record(&w);
+    assert_eq!(begun["phase"], "wake");
+    w.server.state.lock().unwrap().refuse = None;
+    let ready = reconcile(&w).await;
+    assert_eq!(ready["state"], "ready", "{ready}");
+    assert!(annotations(&w)[FENCE].is_null());
+    assert_eq!(
+        record(&w)["phase"],
+        "awake",
+        "the wake that began over the record completed"
+    );
+}
+
+#[tokio::test]
 async fn a_release_a_gateway_has_not_yet_seen_the_intent_for_is_asked_again_within_the_pass() {
     // The gateway answers 409 until its own watch has delivered the intent the controller wrote
     // just before. The pass used to end there, and the wake waited the second of its retry.
@@ -599,6 +703,7 @@ fn resumed(restarts: Option<u64>) -> ParkedWake {
         postgres_container_id: "containerd://a".into(),
         sidecar_container_id: "containerd://b".into(),
         postgres_restarts: restarts,
+        pod_ip: None,
         requests_before: crate::power::Requests {
             postgres: crate::power::ContainerRequests {
                 cpu: "25m".into(),
@@ -797,6 +902,41 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
     assert_eq!(requests_since(&w, at), (83, 0), "the pass after it");
+}
+
+/// The sequential rounds of Kubernetes requests the controller made since the double's counter
+/// was last cleared, with every request answered after the same delay.
+fn rounds_of(w: &World) -> u64 {
+    w.server.state.lock().unwrap().rounds
+}
+
+#[tokio::test]
+async fn a_parked_wake_makes_this_many_requests_in_this_many_rounds() {
+    // The model of the wake: every request of the in-process cluster is answered after the same
+    // time, so that the requests of one wave are one round and the rest follow one another. Its
+    // numbers are the ones the plan records for the controller's share of a wake; the time of a
+    // round is the unknown of a live run.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    {
+        let mut state = w.server.state.lock().unwrap();
+        state.latency = Some(Duration::from_millis(100));
+        state.rounds = 0;
+    }
+    w.reconciler.accept_budget = Duration::from_secs(60);
+    let at = w.mark();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let (reads, writes) = requests_since(&w, at);
+    let rounds = rounds_of(&w);
+    eprintln!("a parked wake: {reads} reads, {writes} writes, {rounds} sequential rounds");
+    assert_eq!(
+        (reads, writes, rounds),
+        (100, 19, 41),
+        "reads, writes, rounds"
+    );
 }
 
 #[tokio::test]
@@ -1417,26 +1557,53 @@ async fn the_authority_is_read_while_its_published_copy_is() {
 }
 
 #[tokio::test]
-async fn the_resumed_pod_is_read_while_the_wake_is_recorded() {
-    // The record of the wake is written before the Cluster is, and the Pod's restarts are read
-    // before the fence is lifted: neither waits for the other.
+async fn the_record_of_the_wake_the_unfence_and_the_resize_are_issued_together() {
+    // The three writes of the wake's first wave touch three objects and depend on nothing the
+    // others return: the record of the wake in the fence (a crash after the Cluster write is
+    // met by the pass that finds the fence lifted under a record that says Parked), the Cluster
+    // under its resourceVersion, and the Pod's requests. The Pod's restarts are the ones the
+    // inspection read.
     let mut w = World::parked().await;
     w.admitted();
     w.wake(3);
     w.start_postgres().await;
     let fence = fence_path(&w);
-    let pod = primary(&w);
+    let cluster = cluster_object(&w);
+    let resize = format!("{}/resize", primary(&w));
     hold(
         &w,
-        Gate::new(2, move |method, at| {
-            (method == "GET" && at == pod) || (method == "PATCH" && at == fence)
+        Gate::new(3, move |method, at| {
+            method == "PATCH" && (at == fence || at == cluster || at == resize)
         })
-        .after(1)
         .once(),
     );
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
     assert_eq!(held(&w), (1, 0));
+}
+
+#[tokio::test]
+async fn postgresql_is_asked_from_the_unfence_on_and_not_after_the_apply_pass() {
+    // The apply pass is seven rounds of requests, and PostgreSQL starts a tenth of a second after
+    // the unfence. The first login of the poll is made while the apply pass runs, not after its
+    // last write.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    w.log.lock().unwrap().clear();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let login = at(&w, &["LOGIN pgcf_maintenance"]);
+    let last_write_of_the_apply_pass = at(&w, &["PATCH", "/scheduledbackups/daily-backup"]);
+    assert!(
+        login < last_write_of_the_apply_pass,
+        "{:#?}",
+        log(&w)
+            .iter()
+            .map(|line| line.chars().take(90).collect::<String>())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

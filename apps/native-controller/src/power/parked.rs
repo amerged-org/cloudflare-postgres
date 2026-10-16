@@ -257,6 +257,8 @@ enum Restore {
 struct Inspection {
     fits: Option<&'static str>,
     pod: Option<&'static str>,
+    /// The Pod as the inspection read it, if it read it.
+    read: Option<Value>,
 }
 /// A Pod that changed only its identity: replaced, restarted or on a rebooted node.
 fn identity_only(reason: &str) -> bool {
@@ -1059,6 +1061,7 @@ impl PowerCoordinator {
             Inspection {
                 fits: Some("demotion_in_progress"),
                 pod: None,
+                read: None,
             }
         };
         match (inspection.fits, inspection.pod) {
@@ -1085,34 +1088,38 @@ impl PowerCoordinator {
         }
         decision.note("reason", Value::Null);
         decision.completed();
-        // The fast path. Progress `Wake` is persisted first; then one patch lifts the fence and
-        // releases hibernation while the Pod's requests return.
+        // The fast path, in one wave of three writes that depend on nothing the others return: the
+        // record of the wake, one patch that lifts the fence and releases hibernation, and the
+        // Pod's requests returning. A crash between them is met by the next pass: the fence
+        // lifted under a record that says `Parked` is `resume_unfenced`, the record of `Wake`
+        // under a fence still in place is a wake that was not begun. The Pod's restarts are those
+        // the inspection read, a few milliseconds before the fence is lifted; a restart after
+        // that is met by the identity of the containers once PostgreSQL answers.
         let started = Instant::now();
         let progress = self.wake_progress(&prior, intent);
-        // The record of the wake is written before the Cluster is, and the Pod's restarts are read
-        // before the fence is lifted: neither waits for the other.
-        let ns = namespace(db);
-        let (written, pod) = tokio::join!(
-            self.write(db, Some(&map), None, &progress),
-            self.k8s.read("Pod", Some(&ns), &park.pod_name)
-        );
-        let map = written?;
-        let pod = pod?;
+        let pod = inspection.read;
         let lift = timing::Phase::begin(db, "unfence_patch");
         let mut resize = timing::Phase::begin(db, "resize_up");
         let postgres_restarts = pod
             .as_ref()
             .and_then(|pod| named(&pod["status"]["containerStatuses"], POSTGRES))
             .and_then(|status| status["restartCount"].as_u64());
-        let (unfenced, resized) =
-            tokio::join!(self.lift_and_release(db, intent, &cluster), async {
+        let pod_ip = pod
+            .as_ref()
+            .map(|pod| text(&pod["status"], "podIP").to_string())
+            .filter(|ip| !ip.is_empty());
+        let (written, unfenced, resized) = tokio::join!(
+            self.write(db, Some(&map), None, &progress),
+            self.lift_and_release(db, intent, &cluster),
+            async {
                 match pod {
                     Some(pod) if !Self::requested(&pod, &park.requests_before) => {
                         self.resize(&pod, &park.requests_before).await.map(|_| ())
                     }
                     _ => Ok(()),
                 }
-            });
+            }
+        );
         match &unfenced {
             Ok(()) => lift.completed(),
             Err(_) => lift.failed(),
@@ -1126,6 +1133,7 @@ impl PowerCoordinator {
                 resize.failed();
             }
         }
+        let map = written?;
         unfenced?;
         Ok((
             Resumed::Fast(Box::new(ParkedWake {
@@ -1134,6 +1142,7 @@ impl PowerCoordinator {
                 postgres_container_id: park.postgres_container_id,
                 sidecar_container_id: park.sidecar_container_id,
                 postgres_restarts,
+                pod_ip,
                 requests_before: park.requests_before,
                 started,
             })),
@@ -1445,6 +1454,7 @@ impl PowerCoordinator {
                     "manifests_unavailable"
                 }),
                 pod: None,
+                read: None,
             });
         };
         let ns = namespace(db);
@@ -1495,29 +1505,34 @@ impl PowerCoordinator {
             .iter()
             .find(|m| text(m, "kind") == "Cluster")
             .map(|m| text(&m["spec"], "imageName"));
-        let pod = if boot_id(basis.node).is_empty() || boot_id(basis.node) != park.node_boot_id {
-            Some("boot_changed")
-        } else if cluster["status"]["currentPrimary"] != park.pod_name.as_str() {
-            Some("pod_changed")
-        } else {
-            match &pod {
-                None => Some("pod_missing"),
-                Some(pod) if !bound(pod, park) || !instance_live(pod, cluster, db) => {
-                    Some("pod_changed")
+        let pod_verdict =
+            if boot_id(basis.node).is_empty() || boot_id(basis.node) != park.node_boot_id {
+                Some("boot_changed")
+            } else if cluster["status"]["currentPrimary"] != park.pod_name.as_str() {
+                Some("pod_changed")
+            } else {
+                match &pod {
+                    None => Some("pod_missing"),
+                    Some(pod) if !bound(pod, park) || !instance_live(pod, cluster, db) => {
+                        Some("pod_changed")
+                    }
+                    Some(pod) if text(&pod["spec"], "runtimeClassName") != basis.runtime_class => {
+                        Some("runtime_changed")
+                    }
+                    Some(pod)
+                        if image
+                            != named(&pod["spec"]["containers"], POSTGRES)
+                                .map(|c| text(c, "image")) =>
+                    {
+                        Some("image_changed")
+                    }
+                    Some(_) => None,
                 }
-                Some(pod) if text(&pod["spec"], "runtimeClassName") != basis.runtime_class => {
-                    Some("runtime_changed")
-                }
-                Some(pod)
-                    if image
-                        != named(&pod["spec"]["containers"], POSTGRES)
-                            .map(|c| text(c, "image")) =>
-                {
-                    Some("image_changed")
-                }
-                Some(_) => None,
-            }
-        };
-        Ok(Inspection { fits, pod })
+            };
+        Ok(Inspection {
+            fits,
+            pod: pod_verdict,
+            read: pod,
+        })
     }
 }

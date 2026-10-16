@@ -327,6 +327,8 @@ pub struct ParkedWake {
     /// The `postgres` container's restarts when the fence was lifted; `None` if the Pod could not
     /// be read then, which no later read can equal.
     pub postgres_restarts: Option<u64>,
+    /// The Pod's address as the inspection read it before the fence was lifted.
+    pub pod_ip: Option<String>,
     /// The requests the Pod is resized back to; the wake is verified only once they are actuated.
     pub(crate) requests_before: Requests,
     /// Taken before the unfence was sent: a postmaster older than this did not start for it.
@@ -337,7 +339,7 @@ pub enum PrepareRunning {
     Pending,
     Observation(Value),
     /// The fence was lifted on the retained Pod: PostgreSQL starts on it.
-    Parked(ParkedWake),
+    Parked(Box<ParkedWake>),
 }
 pub struct PowerCoordinator {
     k8s: Kubernetes,
@@ -1980,7 +1982,7 @@ impl PowerCoordinator {
                     .await
                 {
                     Ok((Resumed::Fast(resumed), ..)) => {
-                        return Ok(PrepareRunning::Parked(*resumed));
+                        return Ok(PrepareRunning::Parked(resumed));
                     }
                     Ok((Resumed::Waiting, ..)) => return Ok(PrepareRunning::Pending),
                     Ok((Resumed::Ordinary, next_map, next_progress, next_cluster)) => {
