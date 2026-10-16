@@ -469,103 +469,161 @@ test("a failed turn keeps only its safe executor code in the container's record"
   }
 });
 
-test(
-  "a cancel ends only the running read-only identity turn it names, and the next turn runs after it",
-  { timeout: 5000 },
-  async () => {
-    const { BootstrapError } = await import("../src/bootstrap.ts");
-    const bearer = randomBytes(32).toString("base64url");
-    const turns: { signal: AbortSignal | undefined; release: () => void }[] =
-      [];
-    const runtime = createBootstrapServer(bearer, {
-      thinStorage: async (_input, options = {}) => {
-        await new Promise<void>((resolve, reject) => {
-          turns.push({ signal: options.signal, release: resolve });
-          // As every command of a turn ends on its signal.
-          options.signal?.addEventListener(
-            "abort",
-            () => reject(new BootstrapError("job_cancelled")),
-            { once: true },
-          );
-        });
-        return {};
-      },
-    });
-    runtime.server.listen(0, LOOPBACK);
-    await once(runtime.server, "listening");
-    const address = runtime.server.address();
-    assert.ok(address && typeof address !== "string");
-    const url = `http://${LOOPBACK}:${address.port}`,
-      headers = {
-        authorization: `Bearer ${bearer}`,
-        "content-type": "application/json",
-      };
-    const lease = (revision: number, action: object | null) => ({
-      operation_id: `op_${"c".repeat(20)}`,
-      revision,
-      action,
-    });
-    const start = async (value: ReturnType<typeof lease>) => {
+/** A container whose thin identity turns are `run`; `cancel` names a turn of operation `op_ccc…`. */
+async function cancelServer(
+  run: NonNullable<Parameters<typeof createBootstrapServer>[1]>["thinStorage"],
+) {
+  const bearer = randomBytes(32).toString("base64url");
+  const runtime = createBootstrapServer(bearer, { thinStorage: run });
+  runtime.server.listen(0, LOOPBACK);
+  await once(runtime.server, "listening");
+  const address = runtime.server.address();
+  assert.ok(address && typeof address !== "string");
+  const url = `http://${LOOPBACK}:${address.port}`,
+    headers = {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+    },
+    operation = `op_${"c".repeat(20)}`;
+  return {
+    runtime,
+    start: async (revision: number, action: object | null) => {
       const accepted = await fetch(`${url}/v1/thin-storage`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ lease: value }),
+        body: JSON.stringify({
+          lease: { operation_id: operation, revision, action },
+        }),
       });
       assert.equal(accepted.status, 202);
       await accepted.body?.cancel();
-    };
-    const cancel = async (revision: number) => {
+    },
+    cancel: async (
+      revision: number,
+      named: { kind?: string; operation_id?: string } = {},
+    ) => {
       const answer = await fetch(`${url}/v1/turn/cancel`, {
         method: "POST",
         headers,
         body: JSON.stringify({
           kind: "thin_storage",
-          operation_id: `op_${"c".repeat(20)}`,
+          operation_id: operation,
           revision,
+          ...named,
         }),
       });
       assert.equal(answer.status, 200);
       return (await answer.json()) as unknown;
-    };
-    const record = async () =>
-      (await (await fetch(`${url}/v1/turn`, { headers })).json()) as unknown;
-    const state = (revision: number, value: string, error_code = null) => ({
+    },
+    record: async () =>
+      (await (await fetch(`${url}/v1/turn`, { headers })).json()) as unknown,
+    state: (
+      revision: number,
+      value: string,
+      error_code: string | null = null,
+    ) => ({
       state: value,
       kind: "thin_storage",
-      operation_id: `op_${"c".repeat(20)}`,
+      operation_id: operation,
       revision,
       error_code,
+    }),
+    stop: () => {
+      runtime.stop();
+      runtime.server.closeAllConnections();
+    },
+  };
+}
+
+test(
+  "a cancel ends only the running read-only identity turn it names, and the next turn runs after it",
+  { timeout: 5000 },
+  async () => {
+    const { BootstrapError } = await import("../src/bootstrap.ts");
+    const turns: { signal: AbortSignal | undefined; release: () => void }[] =
+      [];
+    const container = await cancelServer(async (_input, options = {}) => {
+      await new Promise<void>((resolve, reject) => {
+        turns.push({ signal: options.signal, release: resolve });
+        // As a turn's session ends on its cancel.
+        options.signal?.addEventListener(
+          "abort",
+          () => reject(new BootstrapError("thin_storage_turn_cancelled")),
+          { once: true },
+        );
+      });
+      return {};
     });
+    const { start, cancel, record, state } = container;
     try {
       // An idle container has nothing to end.
       assert.deepEqual(await cancel(1), { state: "idle" });
       // A turn with a pool action is never ended early.
-      await start(lease(1, { kind: "grow" }));
+      await start(1, { kind: "grow" });
       assert.deepEqual(await cancel(1), state(1, "running"));
       assert.equal(turns[0]!.signal, undefined);
       turns[0]!.release();
       await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(await record(), state(1, "succeeded"));
       // A read-only turn ends on a cancel that names it, and only then; the answer is its outcome.
-      await start(lease(2, null));
+      await start(2, null);
       assert.deepEqual(await cancel(3), state(2, "running"));
+      assert.deepEqual(
+        await cancel(2, { operation_id: `op_${"d".repeat(20)}` }),
+        state(2, "running"),
+      );
+      assert.deepEqual(
+        await cancel(2, { kind: "thin_qualification" }),
+        state(2, "running"),
+      );
       assert.equal(turns[1]!.signal?.aborted, false);
-      const ended = state(2, "failed");
-      (ended as { error_code: string | null }).error_code =
-        "thin_storage_turn_cancelled";
+      const ended = state(2, "failed", "thin_storage_turn_cancelled");
       assert.deepEqual(await cancel(2), ended);
       assert.equal(turns[1]!.signal?.aborted, true);
       assert.deepEqual(await record(), ended);
       // The container takes the next turn at once.
-      await start(lease(4, null));
+      await start(4, null);
       assert.deepEqual(await record(), state(4, "running"));
       turns[2]!.release();
       await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(await record(), state(4, "succeeded"));
     } finally {
       for (const value of turns) value.release();
-      runtime.stop();
-      runtime.server.closeAllConnections();
+      container.stop();
+    }
+  },
+);
+
+test(
+  "a cancel that reaches a turn after it failed on its own keeps the turn's own failure",
+  { timeout: 5000 },
+  async () => {
+    const { BootstrapError } = await import("../src/bootstrap.ts");
+    let cleaning!: () => void;
+    const cleanup = new Promise<void>((resolve) => {
+      cleaning = resolve;
+    });
+    // The turn has raised a blocking failure and is still closing its relay session.
+    const container = await cancelServer(async () => {
+      try {
+        throw new BootstrapError("thin_storage_physical_identity_changed");
+      } finally {
+        cleaning();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    });
+    try {
+      await container.start(1, null);
+      await cleanup;
+      const failed = container.state(
+        1,
+        "failed",
+        "thin_storage_physical_identity_changed",
+      );
+      assert.deepEqual(await container.cancel(1), failed);
+      assert.deepEqual(await container.record(), failed);
+    } finally {
+      container.stop();
     }
   },
 );

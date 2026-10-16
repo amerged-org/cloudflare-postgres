@@ -329,9 +329,7 @@ export function createBootstrapServer(
               },
               (error: unknown) => {
                 const prefix = executor.kind === "patch" ? "patch_" : undefined,
-                  code = abort?.signal.aborted
-                    ? "thin_storage_turn_cancelled"
-                    : failureCode(error, prefix).prefixed;
+                  code = failureCode(error, prefix).prefixed;
                 turn = {
                   state: "failed",
                   ...identity,
@@ -361,11 +359,10 @@ export function createBootstrapServer(
         return;
       }
       if (request.method === "POST" && path === "/v1/turn/cancel") {
-        // Only the running turn named here ends, and only one that may end early. The answer, after
-        // it ended, is the record as it then stands.
+        // Only the turn named here ends, and only one that may end early; the turn itself records how
+        // it ended. The answer, after it ended, is the record as it then stands.
         const named = NodeExecutorTurn.parse(await body(request));
         if (
-          turn?.state === "running" &&
           cancellable &&
           cancellable.identity.kind === named.kind &&
           cancellable.identity.operation_id === named.operation_id &&

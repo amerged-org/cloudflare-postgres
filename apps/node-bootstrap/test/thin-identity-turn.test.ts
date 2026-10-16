@@ -6,7 +6,11 @@ import type {
   NodeThinStorageReport,
 } from "@pgcf/contracts/node-thin-storage";
 import { BootstrapError } from "../src/bootstrap.ts";
-import { openThinSession, readThinIdentityCycle } from "../src/thin-storage.ts";
+import {
+  openThinSession,
+  readThinIdentityCycle,
+  runThinStorage,
+} from "../src/thin-storage.ts";
 import golden from "./thin-identity-turn.golden.json" with { type: "json" };
 import {
   identityTurn,
@@ -241,4 +245,120 @@ test("a node that rebooted during the turn is a changed driver identity", async 
     identityTurn(world),
     failedWith("thin_storage_driver_identity_changed"),
   );
+});
+
+/** One turn of the world under a cancel the test controls: `status` and `report` answer those calls
+ * (as fetch does, a call whose signal aborts fails), `close` runs while the session is cleaned up. */
+async function cancellableTurn(
+  world: IdentityWorld,
+  cancel: AbortController,
+  hooks: {
+    status?: (current: object) => object;
+    report?: () => Promise<void>;
+    close?: () => Promise<void>;
+  } = {},
+) {
+  const input = world.input(),
+    reports: unknown[] = [];
+  const request: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    const answer = async () => {
+      if (body.kind === "status") {
+        const current = {
+          operation_id: input.lease.operation_id,
+          revision: input.lease.revision,
+          node_uid: input.lease.node_uid,
+          release_id: input.lease.release_id,
+          spec_sha256: input.lease.spec_sha256,
+          assignment_revision: input.lease.assignment_revision,
+          region_revision: input.lease.region_revision,
+        };
+        return Response.json(hooks.status?.(current) ?? current);
+      }
+      if (body.kind === "report") {
+        await hooks.report?.();
+        reports.push(body.report);
+      }
+      return Response.json({ accepted: true });
+    };
+    const response = await answer();
+    init?.signal?.throwIfAborted();
+    return response;
+  };
+  const outcome = runThinStorage(input, {
+    run: (command) => world.command(command),
+    request,
+    proxy: async () => ({
+      url: "http://127.0.0.1:1",
+      close: hooks.close ?? (async () => {}),
+    }),
+    signal: cancel.signal,
+  });
+  return { outcome, reports };
+}
+
+test("a cancelled turn ends as cancelled, whatever its interrupted read raised", async () => {
+  const world = identityWorld(),
+    cancel = new AbortController();
+  const { outcome, reports } = await cancellableTurn(world, cancel, {
+    status: (current) => {
+      cancel.abort();
+      return current;
+    },
+  });
+  await assert.rejects(outcome, failedWith("thin_storage_turn_cancelled"));
+  assert.deepEqual(reports, []);
+});
+
+test("a failure the turn raised before a cancel keeps its own code, even when the cancel arrives during cleanup", async () => {
+  const world = identityWorld(),
+    cancel = new AbortController();
+  const { outcome } = await cancellableTurn(world, cancel, {
+    status: (current) => ({ ...current, revision: 99 }),
+    close: async () => {
+      cancel.abort();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    },
+  });
+  await assert.rejects(outcome, failedWith("thin_storage_lease_changed"));
+});
+
+test("a read that finished before a cancel keeps the failure it proves", async () => {
+  const world = identityWorld(),
+    cancel = new AbortController();
+  world.outputs.set(
+    "sha256sum",
+    `${"0".repeat(64)}  /usr/local/bin/lvm-driver\n${"0".repeat(64)}  /sbin/lvm\n${"0".repeat(64)}  /usr/sbin/pdata_tools\n`,
+  );
+  // The cancel arrives as the first driver read returns; that read proves a changed driver.
+  world.afterScript = (count) => {
+    if (count === 1) cancel.abort();
+  };
+  const { outcome } = await cancellableTurn(world, cancel);
+  await assert.rejects(outcome, failedWith("thin_storage_driver_unqualified"));
+});
+
+test("a cancel before the report is sent ends the turn without it", async () => {
+  const world = identityWorld(),
+    cancel = new AbortController();
+  // The last driver read is the closing one: the cancel arrives as it returns.
+  world.afterScript = (count) => {
+    if (count === 2) cancel.abort();
+  };
+  const { outcome, reports } = await cancellableTurn(world, cancel);
+  await assert.rejects(outcome, failedWith("thin_storage_turn_cancelled"));
+  assert.deepEqual(reports, []);
+});
+
+test("the report is the turn's point of no return: a cancel during it waits for Cloudflare's answer", async () => {
+  const world = identityWorld(),
+    cancel = new AbortController();
+  const { outcome, reports } = await cancellableTurn(world, cancel, {
+    report: async () => {
+      cancel.abort();
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  assert.deepEqual(await outcome, { accepted: true });
+  assert.equal(reports.length, 1);
 });

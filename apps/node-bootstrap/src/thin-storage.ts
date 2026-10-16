@@ -706,7 +706,9 @@ export function thinLvmReadCommands(lvFields = THIN_LV_FIELDS): string[][] {
 
 export interface ThinSession {
   signal: AbortSignal;
-  call(body: unknown): Promise<unknown>;
+  /** A `final` call is the turn's point of no return: it is not sent once the turn is cancelled, and
+   * once sent only the turn's deadline ends it, so Cloudflare's answer to it is never lost. */
+  call(body: unknown, final?: boolean): Promise<unknown>;
   command(
     executable: string,
     args: string[],
@@ -735,7 +737,8 @@ export async function openThinSession<T>(
     kubeconfig: string;
     address: string;
     budget_ms: number;
-    /** Only a normal thin identity turn treats its own deadline as a transient timeout. */
+    /** Only a normal thin identity turn treats its own deadline as a transient timeout and the end
+     * of its `signal` as a cancel. */
     deadline_code?: "thin_storage_turn_timeout";
     prefix: string;
   },
@@ -756,7 +759,8 @@ export async function openThinSession<T>(
   ]);
   const directory = await mkdtemp(join(tmpdir(), scope.prefix));
   await chmod(directory, 0o700);
-  const call = async (body: unknown) => {
+  const call = async (body: unknown, final = false) => {
+    if (final) signal.throwIfAborted();
     const response = await request(scope.callback.url, {
       method: "POST",
       headers: {
@@ -764,7 +768,10 @@ export async function openThinSession<T>(
         "content-type": "application/json",
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+      signal: AbortSignal.any([
+        final ? deadline : signal,
+        AbortSignal.timeout(10000),
+      ]),
       redirect: "error",
     });
     if (!response.ok) {
@@ -924,6 +931,19 @@ export async function openThinSession<T>(
           error.cause === deadline.reason))
     )
       throw new BootstrapError(scope.deadline_code);
+    // Only what the cancel itself raised is a cancel: a failure the turn raised before it keeps its
+    // code, even when the cancel arrives while the session is cleaned up.
+    if (
+      scope.deadline_code &&
+      options.signal?.aborted &&
+      signal.reason === options.signal.reason &&
+      (error === options.signal.reason ||
+        (error instanceof BootstrapError && error.code === "job_cancelled") ||
+        (error instanceof Error &&
+          error.name === "AbortError" &&
+          error.cause === options.signal.reason))
+    )
+      throw new BootstrapError("thin_storage_turn_cancelled");
     throw error;
   } finally {
     grants.clear();
@@ -1969,7 +1989,7 @@ export async function runThinStorage(
           facts.pool_tags.find((v) => v.startsWith("pgcf.node.")) ?? null,
         action_applied: actionApplied,
       });
-      return await call({ kind: "report", report });
+      return await call({ kind: "report", report }, true);
     },
   );
 }
