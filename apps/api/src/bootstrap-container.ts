@@ -546,8 +546,11 @@ export class NodeBootstrap extends DurableObject<Env> {
     ).finally(() => {
       this.#thinTurn = undefined;
     });
+    // Only a turn this instance could supersede ends as superseded; any other cancel is uncertain.
     const cancelled =
-      outcome.state === "failed" && outcome.error_code === THIN_TURN_CANCELLED;
+      superseded !== undefined &&
+      outcome.state === "failed" &&
+      outcome.error_code === THIN_TURN_CANCELLED;
     if (outcome.state === "failed" && !cancelled)
       console.warn(
         JSON.stringify({
@@ -666,14 +669,14 @@ export class NodeBootstrap extends DurableObject<Env> {
   /** Cloudflare needs an identity proof now: a refused sample, a needed growth, a ready thin
    * database without a receipt or a start whose hold waits for one. The next turn starts now, but no
    * sooner than 10 s after the previous one started. A running turn keeps running, except a read-only
-   * one whose input has a waiting start's database at an older generation or not at all: its report
-   * could never be accepted, so it is superseded and the next turn starts at once. */
+   * one that read a waiting start's database at an older generation: its report could never be
+   * accepted, so it is superseded and the next turn starts at once. A database the turn never read
+   * (placed after its input) supersedes nothing: its proof may still be accepted. */
   async thinStorageDue(
     nodeId: string,
     waiting: readonly { database_id: string; generation: number }[] = [],
   ) {
     NodeId.parse(nodeId);
-    const starts = WaitingThinStarts.parse(waiting);
     if (
       !this.ctx.id.equals(
         this.env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
@@ -702,14 +705,17 @@ export class NodeBootstrap extends DurableObject<Env> {
       );
       if (alarm === null || alarm !== dueAt) await storage.setAlarm(dueAt);
     });
-    // After the demand is recorded, so the superseded turn's own alarm comes last.
-    const running = this.#thinTurn;
+    // After the demand is recorded, so the superseded turn's own alarm comes last, and an unreadable
+    // list of starts costs only the supersede.
+    const running = this.#thinTurn,
+      starts = WaitingThinStarts.safeParse(waiting);
     if (
       running &&
-      starts.some(
-        (start) =>
-          (running.generations.get(start.database_id) ?? 0) < start.generation,
-      )
+      starts.success &&
+      starts.data.some((start) => {
+        const read = running.generations.get(start.database_id);
+        return read !== undefined && read < start.generation;
+      })
     )
       running.supersede();
   }

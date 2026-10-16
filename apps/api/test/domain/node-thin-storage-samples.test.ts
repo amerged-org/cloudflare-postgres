@@ -28,6 +28,7 @@ import {
   turnRequested,
 } from "./thin-renewal-fixture.ts";
 import { storageHolds } from "../../src/domain/node-thin-storage-execution.ts";
+import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -540,11 +541,16 @@ it("asks for an identity turn at every sample while a start waits for a proof, a
   ).database;
   // The placement asked for its own turn; a sample is what asks while the start still waits.
   await forgetTurns(f);
+  const due = vi.spyOn(NodeBootstrap.prototype, "thinStorageDue");
   const accepted = NodeStorageHeadroomResponse.parse(
     (await post(f, sample(f, await nonce(f), { physical }))).body,
   );
   expect(accepted.accepted).toBe(true);
   expect(await turnRequested(f)).toBe(true);
+  // The request names the waiting start, so a running turn that cannot serve it ends.
+  expect(due).toHaveBeenCalledWith(f.node, [
+    { database_id: created.id, generation: created.generation },
+  ]);
   // A start older than two minutes is a stuck one, not a wait for the next proof.
   const identity = (await readCurrentNodeThinStorage(f.local, f.node))!
     .authority;
