@@ -223,6 +223,20 @@ sleep is a miss). Fixed while integrating:
 One end-to-end test drives a hit and a miss through the real gateway, the controller's pool and the node agent double.
 Every Rust and TypeScript suite passes. Next is step 5.
 
+Fixed after the review of the integrated build (2026-10-16), each with a test that reproduced it first:
+- **Single writer while the agent restarts:** the miss path's hold and the CNPG sleep's release wait while no agent is
+  Ready on the node. Before, the miss path skipped the holder during an agent restart or rollout.
+- **Slots retired until their holder is released:** an undo after the attach that does not end (a conflicting re-fence,
+  a release timeout, no Ready agent), a slot found with a restarted container and a slot loaded but never claimed before
+  a controller restart all stay registered to be retired. The database stays the pool's until the holder is released.
+  Before, such a slot left its holder behind and the database could not wake until the controller restarted.
+- **Release stands once the fence is written:** a refused release control (a lagging gateway watch) no longer retires a
+  slot that gateways already route held clients to.
+- **Starting databases wait:** `admitWake` hands a database that is neither admissible nor an idle sleeper to
+  `ensureAwake`, which waits for a resume or a create in progress, instead of answering 57P03.
+- **No list on the request path:** the decision and the attach read Pod memory requests, agents, gateways and keys from
+  the pool's 1 s refresh.
+
 **Order of work.**
 1. Lab plus the Worker-to-Edge measurement.
 2. Node: agent, `pool.rs`, slot builder, sleep record, miss path.
