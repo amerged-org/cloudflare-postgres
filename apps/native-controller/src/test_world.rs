@@ -106,7 +106,13 @@ pub struct AgentDouble {
     pub boot_id: String,
     /// Every request, as `<action> <answer>`.
     pub calls: Vec<String>,
+    /// How many releases answer `release_timeout` first, as while a slot Pod's teardown takes
+    /// longer than the release waits.
+    pub release_timeouts: u32,
+    /// What happens to the API objects right after a successful attach (once).
+    pub after_attach: Option<AfterAttach>,
 }
+pub type AfterAttach = Box<dyn FnOnce(&mut crate::test_server::State) + Send>;
 fn agent_answer(
     agent: &Arc<Mutex<AgentDouble>>,
     objects: &Arc<Mutex<crate::test_server::State>>,
@@ -182,6 +188,9 @@ fn agent_answer(
             let Ok(request) = serde_json::from_slice::<attach::AttachRequest>(body) else {
                 return refuse("invalid");
             };
+            if !request.valid() {
+                return refuse("invalid");
+            }
             let lv = request.volume.lv_uuid.clone();
             let Some(device) = agent.devices.get(&lv).cloned() else {
                 return refuse("volume_missing");
@@ -265,6 +274,10 @@ fn agent_answer(
             if held != request.holder.record(&boot) {
                 return refuse("holder_mismatch");
             }
+            if agent.release_timeouts > 0 {
+                agent.release_timeouts -= 1;
+                return refuse("release_timeout");
+            }
             if agent.devices.get(&lv).is_some_and(|d| open_count(d) != 0) {
                 return refuse("release_timeout");
             }
@@ -278,6 +291,15 @@ fn agent_answer(
             let Ok(request) = serde_json::from_slice::<attach::InspectRequest>(body) else {
                 return refuse("invalid");
             };
+            // The agent refuses a container ID that is not 64 lowercase hexadecimal digits.
+            if request.postgres_container.as_deref().is_some_and(|id| {
+                id.len() != 64
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }) {
+                return refuse("invalid");
+            }
             let lv = request.volume.lv_uuid.clone();
             let Some(device) = agent.devices.get(&lv) else {
                 return (
@@ -429,6 +451,12 @@ impl Gateway {
                         });
                         let (status, answer) =
                             agent_answer(&attaching, &objects, &action, token.as_deref(), &body);
+                        if action == "attach" && status == 200 {
+                            let after = attaching.lock().unwrap().after_attach.take();
+                            if let Some(after) = after {
+                                after(&mut objects.lock().unwrap());
+                            }
+                        }
                         let line = format!(
                             "AGENT {action} {}",
                             answer["error"].as_str().unwrap_or("ok")

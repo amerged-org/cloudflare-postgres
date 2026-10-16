@@ -1247,21 +1247,20 @@ impl PowerCoordinator {
         Ok(result?)
     }
     /// Takes the volume's holder for the database's own CNPG Pod. A database without thin
-    /// storage, without a recorded LV or on a node without an agent takes none.
+    /// storage or without a recorded LV takes none. Every node runs the agent: while none is
+    /// Ready on the database's node (a restart or a rollout of it) the pass waits.
     async fn hold_cnpg(&self, db: &Value, identity: &str) -> Result<()> {
         use crate::attach_protocol::{Action, HoldRequest, HoldResponse, Holder};
         let Some(volume) = crate::pool::volume_of(db, identity) else {
             return Ok(());
         };
         let busy = Fault::Unavailable("volume_holder_busy");
-        let Some(agent) = self
+        let agent = self
             .attach
             .agent(text(db, "node"))
             .await
             .map_err(|_| Fault::Unavailable("volume_holder_busy"))?
-        else {
-            return Ok(());
-        };
+            .ok_or(Fault::Unavailable("volume_holder_busy"))?;
         let keys = self
             .attach_keys()
             .await
@@ -1287,7 +1286,8 @@ impl PowerCoordinator {
             .map_err(|_| busy)
     }
     /// Records the clean sleep of a database's own CNPG Pod on its storage receipt, and releases
-    /// the holder its Pod had once the volume is closed. Thick databases record nothing.
+    /// the holder its Pod had once the volume is closed; while no agent is Ready on the node the
+    /// sleep waits for it. Thick databases record nothing.
     async fn record_sleep(
         &self,
         db: &Value,
@@ -1318,14 +1318,12 @@ impl PowerCoordinator {
             return Ok(());
         };
         let unavailable = || Fault::Unavailable("volume_holder_busy");
-        let Some(agent) = self
+        let agent = self
             .attach
             .agent(text(db, "node"))
             .await
             .map_err(|_| unavailable())?
-        else {
-            return Ok(());
-        };
+            .ok_or_else(unavailable)?;
         let keys = self.attach_keys().await.map_err(|_| unavailable())?;
         let request = ReleaseRequest {
             volume: volume.clone(),

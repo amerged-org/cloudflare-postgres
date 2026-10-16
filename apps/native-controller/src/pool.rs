@@ -8,8 +8,8 @@ use crate::{
     api::DesiredSnapshot,
     attach_protocol::{
         self, Action, Agent, AttachRequest, AttachResponse, CallError, Control, Holder,
-        HoldersRequest, HoldersResponse, InspectRequest, InspectResponse, Keys, ReleaseRequest,
-        ReleaseResponse, Volume,
+        HolderEntry, HoldersRequest, HoldersResponse, InspectRequest, InspectResponse, Keys,
+        ReleaseRequest, ReleaseResponse, Volume,
     },
     contracts::{configuration_fingerprint, number, optional_number, text},
     intake::Intake,
@@ -675,6 +675,18 @@ fn random_hex() -> Result<String, Error> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retire {
     pub reason: &'static str,
+    /// The sleep is recorded from the data directory once PostgreSQL is seen shut down there.
+    /// Without it the record stays as it is: PostgreSQL never ran on the tenant data, or ran on
+    /// data that is not the recorded one.
+    pub inspect: bool,
+}
+impl Retire {
+    fn of(reason: &'static str) -> Self {
+        Self {
+            reason,
+            inspect: true,
+        }
+    }
 }
 /// A slot that serves a database.
 #[derive(Clone, Debug)]
@@ -763,10 +775,22 @@ impl Timer {
     }
 }
 /// A claim between its decision and the slot's registration as serving. Dropped while it is
-/// pending, as when the pass that makes it is cut off, it registers the slot to be retired.
+/// pending, as when the pass that makes it is cut off or its undo did not end, it registers the
+/// slot to be retired: the database is the pool's until its slot is gone and its holder released.
 struct Claiming<'a> {
     pool: &'a Pool,
     pending: Option<(String, Serving)>,
+}
+impl Claiming<'_> {
+    /// The undo of the claim ended (`Ok(true)` of `retire`): nothing is left to retire. Otherwise
+    /// the slot is registered to be retired again, by `retire`.
+    fn undone(&mut self, ended: Result<bool, Error>, retire: Retire) {
+        if matches!(ended, Ok(true)) {
+            self.pending = None;
+        } else if let Some((_, serving)) = self.pending.as_mut() {
+            serving.retire = Some(retire);
+        }
+    }
 }
 impl Drop for Claiming<'_> {
     fn drop(&mut self) {
@@ -833,7 +857,7 @@ impl Pool {
     /// Asks for the slot serving `id` to be retired.
     pub fn unwind_later(&self, id: &str, reason: &'static str) {
         if let Some(serving) = self.state.lock().unwrap().serving.get_mut(id) {
-            serving.retire.get_or_insert(Retire { reason });
+            serving.retire.get_or_insert(Retire::of(reason));
         }
     }
     /// Remembers that `pod` delivered `wake`: its result goes there.
@@ -1220,9 +1244,7 @@ impl Pool {
             pending: Some((
                 id.clone(),
                 Serving {
-                    retire: Some(Retire {
-                        reason: "interrupted",
-                    }),
+                    retire: Some(Retire::of("interrupted")),
                     ..serving.clone()
                 },
             )),
@@ -1270,11 +1292,17 @@ impl Pool {
             }
             Some(Err(error)) => {
                 // The agent undid what it did, or it is not known what it did: the slot is not
-                // given out again.
-                let _ = self
+                // given out again, and stays to be retired until its holder is released.
+                let ended = self
                     .retire(rec, &slot, &pod, &choice.volume, &id, None)
                     .await;
-                claiming.pending = None;
+                claiming.undone(
+                    ended,
+                    Retire {
+                        reason: "attach_failed",
+                        inspect: false,
+                    },
+                );
                 return Err(match error {
                     CallError::Refused(code) => REASONS
                         .into_iter()
@@ -1290,10 +1318,11 @@ impl Pool {
         };
         timer.agent_us = attached.steps_us.clone();
         // A failure from here on retires the slot: with `inspect`, the sleep is recorded from
-        // the data directory once PostgreSQL is seen shut down there.
+        // the data directory once PostgreSQL is seen shut down there. An undo that does not end
+        // leaves the slot registered to be retired, and the database the pool's until then.
         macro_rules! undo {
             ($reason:expr, $inspect:expr) => {{
-                let _ = self
+                let ended = self
                     .retire(
                         rec,
                         &slot,
@@ -1303,7 +1332,13 @@ impl Pool {
                         $inspect.then_some(Some(&view)),
                     )
                     .await;
-                claiming.pending = None;
+                claiming.undone(
+                    ended,
+                    Retire {
+                        reason: $reason,
+                        inspect: $inspect,
+                    },
+                );
                 return Err($reason);
             }};
         }
@@ -1375,9 +1410,7 @@ impl Pool {
             timer.lap("release");
             // Whether the fence write committed is not known: the slot is retired.
             if let Some(serving) = self.state.lock().unwrap().serving.get_mut(&id) {
-                serving.retire = Some(Retire {
-                    reason: "release_failed",
-                });
+                serving.retire = Some(Retire::of("release_failed"));
             }
             let _ = self.unwind(rec, &id, Some(&view)).await;
             return Err("release_failed");
@@ -1576,7 +1609,11 @@ impl Pool {
         }
         self.k8s.index_slot(&ns, None);
         // The holder goes once the kernel reports the device closed: the slot's Pod is gone.
-        if let Some(agent) = rec.power.attach.agent(&slot.node).await? {
+        // Without a Ready agent on the node (a restart or a rollout of it) it is not yet.
+        let Some(agent) = rec.power.attach.agent(&slot.node).await? else {
+            return Ok(false);
+        };
+        {
             let keys = rec.power.attach_keys().await?;
             let request = ReleaseRequest {
                 volume: volume.clone(),
@@ -1626,6 +1663,10 @@ impl Pool {
         volume: &Volume,
         pod: &SlotPod,
     ) -> Result<Option<Option<Control>>, Error> {
+        // A slot found after a restart of its container has none the volume was moved into.
+        if pod.postgres.is_empty() {
+            return Ok(Some(None));
+        }
         let Some(agent) = rec.power.attach.agent(node).await? else {
             return Ok(None);
         };
@@ -1739,8 +1780,16 @@ impl Pool {
                 pod: Some(serving.pod.clone()),
                 created: Instant::now(),
             });
+        let inspect = serving.retire.is_none_or(|retire| retire.inspect);
         if !self
-            .retire(rec, &slot, &serving.pod, &serving.volume, id, Some(db))
+            .retire(
+                rec,
+                &slot,
+                &serving.pod,
+                &serving.volume,
+                id,
+                inspect.then_some(db),
+            )
             .await?
         {
             return Ok(false);
@@ -1780,13 +1829,11 @@ impl Pool {
                 .unwrap_or(u64::MAX),
             ));
             if outcome != TicketOutcome::Confirmed {
-                serving.retire = Some(Retire {
-                    reason: if outcome == TicketOutcome::Refuted {
-                        "refuted"
-                    } else {
-                        "expired"
-                    },
-                });
+                serving.retire = Some(Retire::of(if outcome == TicketOutcome::Refuted {
+                    "refuted"
+                } else {
+                    "expired"
+                }));
             }
             serving.ticket = None;
             decided.push((id.clone(), outcome));
@@ -2192,7 +2239,8 @@ impl Pool {
     }
     /// The slot and serving facts a controller that starts finds (rule 6.1): free and created
     /// slots, slots that serve a database whose release is in its fence, and claims that never
-    /// were released, which are retired. Holders of slot Pods that no longer exist are released.
+    /// were released, which are retired; so is a slot without a claim whose Pod holds a volume (an
+    /// attach the claim never followed). Holders of slot Pods that no longer exist are released.
     /// Answers the databases whose slots are to be retired.
     pub async fn rediscover(&self, rec: &Reconciler) -> Result<Vec<String>, Error> {
         let namespaces = self.k8s.list("Namespace", None, Some(SLOT_LABEL)).await?;
@@ -2213,6 +2261,39 @@ impl Pool {
                         volume,
                     )
                 })
+            })
+        };
+        // What every Ready agent holds, read before any slot is judged free.
+        let keys = rec.power.attach_keys().await?;
+        let mut holders: Vec<(Agent, HolderEntry)> = vec![];
+        for agent in rec.power.attach.agents().await? {
+            let Ok(held) = rec
+                .power
+                .attach
+                .call::<_, HoldersResponse>(
+                    &keys,
+                    &agent,
+                    Action::Holders,
+                    "",
+                    &HoldersRequest {},
+                    Duration::from_secs(2),
+                    now_ms(),
+                )
+                .await
+            else {
+                continue;
+            };
+            holders.extend(held.holders.into_iter().map(|entry| (agent.clone(), entry)));
+        }
+        let slot_holder = |pod_uid: &str| {
+            holders.iter().find_map(|(_, entry)| {
+                (entry
+                    .holder
+                    .strip_prefix("slot:")
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(uid, _)| uid)
+                    == Some(pod_uid))
+                .then_some(&entry.lv_uuid)
             })
         };
         let mut retiring = vec![];
@@ -2267,6 +2348,42 @@ impl Pool {
                 .as_str()
                 .and_then(|raw| serde_json::from_str::<Claim>(raw).ok());
             let Some(claim) = claim else {
+                // An attach the claim never followed: the slot holds a database's volume, still
+                // fenced. It is retired, and that database is the pool's until then.
+                let loaded = pod
+                    .as_ref()
+                    .and_then(|pod| slot_holder(text(&pod["metadata"], "uid")))
+                    .and_then(|lv_uuid| volume_of_lv(lv_uuid));
+                if let (Some(pod), Some((id, volume))) = (&pod, loaded) {
+                    slot.state = SlotState::Discarding;
+                    let serving = Serving {
+                        slot: hex.into(),
+                        node: node.into(),
+                        generation: 0,
+                        operation: String::new(),
+                        ticket: None,
+                        pod: current.clone().unwrap_or_else(|| SlotPod {
+                            uid: text(&pod["metadata"], "uid").into(),
+                            ip: text(&pod["status"], "podIP").into(),
+                            postgres: String::new(),
+                            sidecar: String::new(),
+                        }),
+                        volume,
+                        structure: String::new(),
+                        configuration: String::new(),
+                        retire: Some(Retire {
+                            reason: "unclaimed",
+                            inspect: false,
+                        }),
+                    };
+                    let mut state = self.state.lock().unwrap();
+                    state.slots.insert(hex.into(), slot);
+                    if !state.serving.contains_key(&id) {
+                        state.serving.insert(id.clone(), serving);
+                        retiring.push(id);
+                    }
+                    continue;
+                }
                 if let Some(pod) = &pod
                     && slot_free(namespace, &cluster, pod, ca.as_ref(), &slot.image)
                 {
@@ -2343,9 +2460,7 @@ impl Pool {
                 // the desired row and hands over on any difference.
                 structure: String::new(),
                 configuration: String::new(),
-                retire: (!released).then_some(Retire {
-                    reason: "unreleased",
-                }),
+                retire: (!released).then_some(Retire::of("unreleased")),
             };
             if !released {
                 retiring.push(id.clone());
@@ -2355,25 +2470,8 @@ impl Pool {
             state.serving.insert(id, serving);
         }
         // Holders of slot Pods that are gone: their Pod's mounts went with it.
-        for agent in rec.power.attach.agents().await? {
-            let keys = rec.power.attach_keys().await?;
-            let Ok(held) = rec
-                .power
-                .attach
-                .call::<_, HoldersResponse>(
-                    &keys,
-                    &agent,
-                    Action::Holders,
-                    "",
-                    &HoldersRequest {},
-                    Duration::from_secs(2),
-                    now_ms(),
-                )
-                .await
-            else {
-                continue;
-            };
-            for entry in held.holders {
+        for (agent, entry) in holders {
+            {
                 let Some(pod_uid) = entry
                     .holder
                     .strip_prefix("slot:")

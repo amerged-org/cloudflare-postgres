@@ -715,6 +715,14 @@ mod world {
             .get(LV_UUID)
             .cloned()
     }
+    /// The node agent's Pod turns Ready or not, as in a restart or a rollout of the agent.
+    fn agent_ready(w: &World, ready: bool) {
+        w.server
+            .edit("Pod", Some("pgcf-attach"), "pgcf-attach-x", |pod| {
+                pod["status"]["conditions"] =
+                    json!([{"type":"Ready","status":if ready {"True"} else {"False"}}]);
+            });
+    }
     async fn eventually(what: &str, check: impl Fn() -> bool) {
         for _ in 0..200 {
             if check() {
@@ -1019,6 +1027,99 @@ mod world {
     }
 
     #[tokio::test]
+    async fn a_refence_refused_after_the_fence_was_lifted_keeps_the_slot_until_it_is_retired() {
+        let mut w = World::pooled().await;
+        let record_before = record(&w);
+        w.sql.lock().unwrap().system_identifier = "7430000000000000009".into();
+        // CNPG wrote the slot Cluster meanwhile: the first fence write of the undo conflicts.
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let once = refused.clone();
+        let slot_cluster = format!(
+            "/apis/postgresql.cnpg.io/v1/namespaces/{}/clusters/database",
+            slot_ns()
+        );
+        w.server.state.lock().unwrap().refuse = Some(Box::new(move |path, body| {
+            (path == slot_cluster
+                && body["metadata"]["annotations"]["cnpg.io/fencedInstances"] == "[\"*\"]"
+                && !once.swap(true, std::sync::atomic::Ordering::SeqCst))
+            .then_some(409)
+        }));
+        let wake = delivered_wake(&mut w).await;
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+        eventually("the miss", || {
+            result_of(&w, "miss").is_some_and(|r| r["reason"] == "sql_identity_mismatch")
+        })
+        .await;
+        // The slot still runs on the volume: it stays the pool's, to be retired.
+        assert!(
+            cluster(&w, &slot_ns())["metadata"]["annotations"]["cnpg.io/fencedInstances"].is_null()
+        );
+        assert!(w.reconciler.pool.serves(&w.id));
+        assert_eq!(w.reconciler.pool.unwinding(), vec![w.id.clone()]);
+        assert_eq!(
+            holder(&w),
+            Some(format!("slot:{}:{BOOT_ID}", slot_pod_uid()))
+        );
+        // Cloudflare's claim reaches the controller: its pass retires the slot before anything
+        // starts on the volume, and only the pass after it takes the database's own Cluster.
+        w.claimed(&wake);
+        w.fresh_authority();
+        let from = w.log_len();
+        assert!(w.reconciler.reconcile(&w.db, &w.snapshot).await.is_err());
+        let lines = w.since(from);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("\"cnpg.io/hibernation\":\"off\""))
+        );
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert_eq!(holder(&w), None);
+        assert_eq!(record(&w), record_before);
+        assert!(!w.reconciler.pool.serves(&w.id));
+        let from = w.log_len();
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+        let lines = w.since(from);
+        let lifted = lines
+            .iter()
+            .position(|line| line.contains("\"cnpg.io/hibernation\":\"off\""))
+            .expect("hibernation lifted");
+        assert!(at(&lines, "AGENT hold ok") < lifted);
+    }
+
+    #[tokio::test]
+    async fn an_undo_whose_release_times_out_is_retried_until_the_holder_is_released() {
+        let mut w = World::pooled().await;
+        {
+            let mut agent = w.gateway.agent.lock().unwrap();
+            agent.devices.get_mut(LV_UUID).unwrap().control.timeline = 2;
+            agent.release_timeouts = 1;
+        }
+        delivered_wake(&mut w).await;
+        eventually("the miss", || {
+            result_of(&w, "miss").is_some_and(|r| r["reason"] == "identity_mismatch")
+        })
+        .await;
+        assert!(has(
+            &w.gateway.agent.lock().unwrap().calls,
+            "release release_timeout"
+        ));
+        assert_eq!(
+            holder(&w),
+            Some(format!("slot:{}:{BOOT_ID}", slot_pod_uid()))
+        );
+        assert_eq!(w.reconciler.pool.unwinding(), vec![w.id.clone()]);
+        assert!(
+            w.reconciler
+                .pool
+                .unwind(&w.reconciler, &w.id, Some(&w.db))
+                .await
+                .unwrap()
+        );
+        assert_eq!(holder(&w), None);
+        assert!(!w.reconciler.pool.serves(&w.id));
+    }
+
+    #[tokio::test]
     async fn an_unconfirmed_ticket_is_unwound_after_10_s_and_the_slot_namespace_deleted() {
         let mut w = World::pooled().await;
         let wake = delivered_wake(&mut w).await;
@@ -1310,6 +1411,141 @@ mod world {
     }
 
     #[tokio::test]
+    async fn the_miss_path_waits_for_the_holder_while_the_node_agent_is_not_ready() {
+        let mut w = World::pooled().await;
+        w.reconciler.pool.discard(SLOT_HEX).await.unwrap();
+        let wake = w.wake_request();
+        w.claimed(&wake);
+        // A slot still has the volume, and the node's agent restarts: no holder can be taken.
+        w.gateway
+            .agent
+            .lock()
+            .unwrap()
+            .holders
+            .insert(LV_UUID.into(), format!("slot:{}:{BOOT_ID}", uid(77)));
+        agent_ready(&w, false);
+        w.fresh_authority();
+        let from = w.log_len();
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed["state"], "provisioning", "{observed}");
+        assert!(
+            !w.since(from)
+                .iter()
+                .any(|line| line.contains("\"cnpg.io/hibernation\":\"off\""))
+        );
+        // Ready again, with the slot's holder gone: the pass takes the holder, then lifts.
+        agent_ready(&w, true);
+        w.gateway.agent.lock().unwrap().holders.clear();
+        let from = w.log_len();
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+        let lines = w.since(from);
+        let lifted = lines
+            .iter()
+            .position(|line| line.contains("\"cnpg.io/hibernation\":\"off\""))
+            .expect("hibernation lifted");
+        assert!(at(&lines, "AGENT hold ok") < lifted);
+    }
+
+    #[tokio::test]
+    async fn the_cnpg_sleep_waits_for_the_holder_release_while_the_node_agent_is_not_ready() {
+        let mut w = World::awake().await;
+        w.quick();
+        w.reconciler.power.attach.client =
+            crate::attach_protocol::Client::new(w.gateway.client.clone());
+        w.thin();
+        w.snapshot.region["parking"] = Value::Null;
+        w.gateway
+            .agent
+            .lock()
+            .unwrap()
+            .holders
+            .insert(LV_UUID.into(), format!("cnpg:{}", w.id));
+        assert!(w.sleep_pass().await.is_none());
+        w.hibernated_by_cnpg();
+        agent_ready(&w, false);
+        let sleep = crate::power::Sleep {
+            parking: &Value::Null,
+            basis: crate::power::Basis {
+                node: &w.node,
+                release: &w.snapshot.fleet_release,
+                manifests: None,
+                runtime_class: "",
+            },
+            slot: None,
+        };
+        let observed = w.reconciler.power.suspend(&w.db, &sleep).await;
+        assert!(
+            !observed
+                .as_ref()
+                .is_ok_and(|o| o.as_ref().is_some_and(|o| o["state"] == "hibernated")),
+            "{observed:?}"
+        );
+        assert_eq!(holder(&w), Some(format!("cnpg:{}", w.id)));
+        agent_ready(&w, true);
+        let observed = w.sleep_pass().await.unwrap();
+        assert_eq!(observed["state"], "hibernated");
+        assert_eq!(holder(&w), None);
+    }
+
+    #[tokio::test]
+    async fn an_undo_while_the_node_agent_is_not_ready_keeps_the_slot_until_its_holder_is_released()
+    {
+        let mut w = World::pooled().await;
+        // The volume's checkpoint is not the recorded one, and the agent restarts right after
+        // the attach.
+        {
+            let mut agent = w.gateway.agent.lock().unwrap();
+            agent.devices.get_mut(LV_UUID).unwrap().control.timeline = 2;
+            agent.after_attach = Some(Box::new(|objects| {
+                let pod = objects
+                    .objects
+                    .get_mut(&crate::test_server::path(
+                        "Pod",
+                        Some("pgcf-attach"),
+                        "pgcf-attach-x",
+                    ))
+                    .unwrap();
+                pod["status"]["conditions"] = json!([{"type":"Ready","status":"False"}]);
+            }));
+        }
+        delivered_wake(&mut w).await;
+        eventually("the miss", || {
+            result_of(&w, "miss").is_some_and(|r| r["reason"] == "identity_mismatch")
+        })
+        .await;
+        // Nothing released the holder: the slot stays to be retired, and the database is the
+        // pool's until then.
+        assert_eq!(
+            holder(&w),
+            Some(format!("slot:{}:{BOOT_ID}", slot_pod_uid()))
+        );
+        assert!(w.reconciler.pool.serves(&w.id));
+        assert_eq!(w.reconciler.pool.unwinding(), vec![w.id.clone()]);
+        agent_ready(&w, true);
+        let record_before = record(&w);
+        assert!(
+            w.reconciler
+                .pool
+                .unwind(&w.reconciler, &w.id, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(holder(&w), None);
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert!(!w.reconciler.pool.serves(&w.id));
+        assert_eq!(
+            record(&w),
+            record_before,
+            "PostgreSQL never ran in the slot"
+        );
+    }
+
+    #[tokio::test]
     async fn the_cnpg_sleep_writes_the_sleep_record_and_releases_the_holder_after_the_pod_is_gone()
     {
         let mut w = World::awake().await;
@@ -1569,6 +1805,72 @@ mod world {
         );
         assert!(w2.server.get("Namespace", None, &slot_ns()).is_none());
         assert_eq!(holder(&w2), None);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_slot_container_found_at_restart_is_retired_without_its_container() {
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        // The node rebooted, or the slot's postgres container restarted, and so did the
+        // controller.
+        w.server.edit("Pod", Some(&slot_ns()), "database-1", |pod| {
+            pod["status"]["containerStatuses"][0]["restartCount"] = 1.into();
+            pod["status"]["containerStatuses"][0]["containerID"] =
+                format!("containerd://{}", "5".repeat(64)).into();
+        });
+        let restarted = fresh_reconciler(&w);
+        assert_eq!(
+            restarted.pool.rediscover(&restarted).await.unwrap(),
+            vec![w.id.clone()]
+        );
+        assert!(
+            restarted
+                .pool
+                .unwind(&restarted, &w.id, Some(&w.db))
+                .await
+                .unwrap()
+        );
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert_eq!(holder(&w), None);
+        // What the data directory holds is unknown: the next wake is the own Cluster's.
+        assert_eq!(record(&w), None);
+        assert!(!restarted.pool.serves(&w.id));
+    }
+
+    #[tokio::test]
+    async fn a_slot_loaded_but_never_claimed_before_a_restart_is_retired_not_given_out() {
+        let w = World::pooled().await;
+        let record_before = record(&w);
+        // The controller stopped right after the attach, before the claim was written.
+        {
+            let mut agent = w.gateway.agent.lock().unwrap();
+            agent
+                .holders
+                .insert(LV_UUID.into(), format!("slot:{}:{BOOT_ID}", slot_pod_uid()));
+            agent.devices.get_mut(LV_UUID).unwrap().attached = Some((
+                slot_ns(),
+                vec![SLOT_POSTGRES.to_string(), SLOT_SIDECAR.to_string()],
+            ));
+        }
+        let restarted = fresh_reconciler(&w);
+        assert_eq!(
+            restarted.pool.rediscover(&restarted).await.unwrap(),
+            vec![w.id.clone()]
+        );
+        assert_eq!(restarted.pool.states().get(NODE).map(|s| s.0), Some(0));
+        assert!(restarted.pool.serves(&w.id));
+        assert!(
+            restarted
+                .pool
+                .unwind(&restarted, &w.id, Some(&w.db))
+                .await
+                .unwrap()
+        );
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert_eq!(holder(&w), None);
+        // The fence was never lifted: the sleep record still describes the volume.
+        assert_eq!(record(&w), record_before);
+        assert!(!restarted.pool.serves(&w.id));
     }
 
     #[tokio::test]
