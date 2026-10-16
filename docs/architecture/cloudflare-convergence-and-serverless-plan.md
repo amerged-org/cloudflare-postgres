@@ -188,9 +188,21 @@ about 4 s, longer as D1 grows), then D1's single thread near 12–19 nodes.
 | D | delete the reclaim poller, lease over a WebSocket, server hints | host extension (expensive) | 34 / 313 |
 | E | per-node authority actor with D1 write-behind | API, safety review | n/a / 128 |
 
-Stage A is branch `golive/scale-a` (in progress). Stage D rides on the next host-extension release that is needed
-anyway (guard fixes: one bad entry must not refuse every entry, `remember_storage_authority` must
-tolerate unassigned Pods), because each host release rebinds the thin qualification receipt and reboots.
+Stage A is implemented test-first on branch `golive/scale-a` and not deployed. A Worker isolate holds
+the region's agent row for 5 s, so a rotated key is refused everywhere within that bound. An
+unqualified node's reclaim poll is answered from memory after a 3.5 s hold (one request per 3.75 s
+instead of 3 to 4 per second; a qualification is never cached). Usage ingestion is one read batch and
+one insert batch per request with the hour's limit still exact, a sample reads its node once, and the
+lease and accepted-sample lines are written one in thirty per node. D1 statements per request on the
+local harness: reclaim poll 2 to 0, a usage request of 25 samples over 10 databases 86 to 27 (77 round
+trips to 2), thin sample 13 to 10 (11 round trips to 8), lease 6 to 5. To measure after the deploy:
+requests per second per route and node (Workers Logs), D1 `readQueries` and `queryBatchTimeMs` per
+second, and `handler_ms` and `d1_update_sql_milliseconds` of `thin_storage_sample_accepted` (now
+sampled; filter `write_allowed` true).
+
+Stage D rides on the next host-extension release that is needed anyway (guard fixes: one bad entry must
+not refuse every entry, `remember_storage_authority` must tolerate unassigned Pods), because each host
+release rebinds the thin qualification receipt and reboots.
 
 **Laptop path.** The same parked wake takes 1.79–3.16 s (p50 2.5 s) from a laptop through the CLI
 proxy against 0.41–0.54 s awake: the server-side wake adds about 1.2 s and the PostgreSQL handshake
