@@ -29,7 +29,7 @@ function inventoryExpiresSql(authorityAlias = "t") {
   return `COALESCE(json_extract(${authority}.authority_json,'$.inventory_expires_at'),json_extract(${authority}.authority_json,'$.expires_at'))`;
 }
 
-function boundStorageVolumeSql(
+export function boundStorageVolumeSql(
   databaseAlias: string,
   authorityAlias: string,
   requireGeneration = true,

@@ -47,6 +47,12 @@ import {
 } from "./domain/admission-state.ts";
 import { withAdmissionMutation } from "./domain/admission-mutations.ts";
 import { readDatabaseAdmissionSnapshot } from "./domain/database-admission-snapshot.ts";
+import {
+  readWakeGuard,
+  wakeGuardBlocks,
+  wakeGuardFacts,
+  wakeGuardVerdict,
+} from "./domain/wake-guard.ts";
 const PersistedAdmissionMutationIntent = AdmissionMutationIntent.extend({
   started_at: z.number().int().nonnegative().default(0),
 });
@@ -1032,6 +1038,47 @@ export class DatabaseActor extends DurableObject<Env> {
     }
     return true;
   }
+  /**
+   * A wake claim refused with its row unmoved: the transition's other predicates are read part by
+   * part, once, and logged. Only for the log; a read that fails changes nothing.
+   */
+  private async diagnoseRefusal(
+    id: string,
+    user: string,
+    revision: number,
+    attempt: number,
+  ): Promise<void> {
+    try {
+      const reading = await readWakeGuard(this.env.DB, id, user);
+      const blocks = reading ? wakeGuardBlocks(reading) : [];
+      const verdict = wakeGuardVerdict(reading, blocks);
+      console.log(
+        JSON.stringify({
+          event: "actor_claim_refused",
+          database_id: id,
+          revision,
+          attempt,
+          at_ms: Date.now(),
+          verdict,
+          blocked_by: blocks.map((block) => block.reason),
+          ...reading,
+          ...(reading ? wakeGuardFacts(reading) : {}),
+        }),
+      );
+    } catch (error) {
+      console.warn(
+        JSON.stringify({
+          event: "actor_claim_refused",
+          database_id: id,
+          revision,
+          attempt,
+          at_ms: Date.now(),
+          verdict: "unread",
+          error: error instanceof Error ? error.name : "error",
+        }),
+      );
+    }
+  }
   private async claimWake(
     id: string,
     user: string,
@@ -1056,8 +1103,11 @@ export class DatabaseActor extends DurableObject<Env> {
           ]);
           if ("ok" in authorized) return undefined;
           if (!row) return undefined;
-          if (lost !== undefined && JSON.stringify(row) === lost)
+          if (lost !== undefined && JSON.stringify(row) === lost) {
+            // Refused with nothing moved: another predicate of the transition holds it back.
+            await this.diagnoseRefusal(id, user, row.generation + 1, attempt);
             return undefined;
+          }
           if (
             row.desired_state === "suspended" &&
             row.suspension_reason === "idle" &&
