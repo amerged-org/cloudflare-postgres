@@ -359,6 +359,37 @@ it("a snapshot without wakeable falls back to ensureAwake", async () => {
   expect(await ticket(f.id)).toEqual([]);
 });
 
+it("a running database at a generation not yet observed waits through ensureAwake", async () => {
+  // Resumed, created or restarted: desired running, the controller has not reported it ready.
+  const f = await admissionSnapshotFixture();
+  await env.DB.prepare(
+    "UPDATE databases SET generation=generation+1 WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  const snapshot = (await readDatabaseAdmissionSnapshot(env, f.id))!.snapshot;
+  expect(snapshot.admissible).toBe(false);
+  expect(snapshot.wakeable).toBe(false);
+  const calls: unknown[][] = [];
+  await runInDurableObject(actor(f.id), (instance) => {
+    Reflect.set(instance, "ensureAwake", async (...args: unknown[]) => {
+      calls.push(args);
+      return { ok: false, sqlstate: "08006" };
+    });
+  });
+  const options = {
+    deadline: Date.now() + 1000,
+    waiterId: crypto.randomUUID(),
+  };
+  expect(await actor(f.id).admitWake(f.id, "app", options)).toEqual({
+    ok: false,
+    sqlstate: "08006",
+  });
+  expect(calls).toEqual([[f.id, "app", options]]);
+  expect(await ticket(f.id)).toEqual([]);
+});
+
 it("a deleted database answers 3D000 and an unknown role 28P01", async () => {
   const unknown = newDatabaseId();
   expect(await actor(unknown).admitWake(unknown, "app")).toEqual({

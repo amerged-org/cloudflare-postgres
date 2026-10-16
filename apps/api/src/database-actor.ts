@@ -931,7 +931,8 @@ export class DatabaseActor extends DurableObject<Env> {
    * The Edge's admission (pool design 2026-10-16). It reads only this Actor's own state: an
    * admissible snapshot answers its verified target, and an idle sleeper answers a wake ticket
    * whose D1 claim runs after the answer, in the background. A snapshot that cannot say whether
-   * the database is wakeable takes ensureAwake, today's authoritative path.
+   * the database is wakeable, or one that is neither admissible nor wakeable, takes ensureAwake,
+   * today's authoritative path.
    */
   async admitWake(
     databaseId: unknown,
@@ -976,7 +977,11 @@ export class DatabaseActor extends DurableObject<Env> {
           current.wakeable === true) ||
           (ticket.generation === current.generation && !current.admissible));
       if (!reused) {
-        if (!current.wakeable) return { ok: false, sqlstate: "57P03" };
+        // Not an idle sleeper and not admissible yet: resuming, being created, restarting at a
+        // generation the controller has not reported, or suspended by hand. ensureAwake waits
+        // for a start in progress and refuses the rest, as before the pool.
+        if (!current.wakeable)
+          return await this.ensureAwake(id.data, role.data, options);
         ticket = {
           operation: newOperationId(),
           generation: current.generation + 1,
