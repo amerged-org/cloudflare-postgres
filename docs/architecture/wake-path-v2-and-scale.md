@@ -338,6 +338,17 @@ experiment (it removes a known 6.2 statements/s per node).
 - Re-creating a deleted thin selection row restarts its revision counter and deadlocks pool creation
   (holds of deleted databases are covered only while their profile revision is at most the row's):
   restore the saved row.
+- After the lease deploy (API `699e685`) the API side of the guard is healthy: lease handler 50–100 ms
+  (was 1.9 s), token life at serve 6–8 s of 10 s, fetch period 1.07 s, samples every 2 s. A kill still
+  happened with a valid token: on 2026-10-16 at 02:00:57Z both containers of a freshly parked Pod were
+  SIGKILLed (exit 137, `Container created` twice, then `park_demotion` with reason `identity`) while no
+  lease request from EU1 reached the API between 02:00:52 and 02:00:57, although the controller's samples
+  arrived every 2 s and the control node's guard kept fetching. The stall is inside the host extension
+  (suspects: the fsynced `publish_public("tasks")` every 250 ms, the persistence of each accepted lease,
+  one runtime); an earlier kill at 01:50:15Z, nine seconds after a database became ready, was the
+  token hole fixed by migration 0055. Until the extension is rebuilt, a 6 s stall of the guard kills
+  every thin Pod; this raises the priority of the next host release (H1 delete the reclaim poller and
+  its fsync, per-entry accept, tolerate unassigned Pods, an fsync-free fetch loop).
 - Host guard fixes that need an extension release: one bad lease entry must not refuse every entry
   (`accept` is all-or-nothing), `remember_storage_authority` must tolerate Pods not yet assigned (one such
   token starves every other database's renewals), a sticky `stopped` per Pod UID, fetch errors are silent.
