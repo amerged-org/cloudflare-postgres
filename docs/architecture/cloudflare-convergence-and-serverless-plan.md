@@ -57,7 +57,7 @@ running, free PostgreSQL instances and executed there. This replaces the earlier
    PostgreSQL not started, archiving suspended); a wake claims one, a node agent mounts the tenant volume on the slot path
    that propagates into the running Pod, and a patched instance manager that checks for the data directory every 30 ms
    starts PostgreSQL. About 1 s on a hit, 6–10 s on a miss.
-6. **PGCF design.** A pool of free CNPG slots on each node with PostgreSQL not started; a wake attaches the database's
+6. **PGCF design** ([details](#pool-design)). A pool of free CNPG slots on each node with PostgreSQL not started; a wake attaches the database's
    local thin volume to a free slot and starts PostgreSQL on it; the slot then is that database until it sleeps and is
    discarded afterwards (never reused for another customer); the node refills the pool in the background. A pool miss
    falls back to today's start and is counted separately.
@@ -72,6 +72,127 @@ running, free PostgreSQL instances and executed there. This replaces the earlier
 10. **Focus.** Until item 1 is met live: no density or heavy-load runs, no parked-tier tuning, no identity-turn work, no
     new features; only fixes for live failures. The design is grounded in Neon's and Xata's code and blogs, re-verified on
     2026-10-16; a deviation from them needs a reason from PGCF's local disks.
+
+<a id="pool-design"></a>
+### Pool design (2026-10-16)
+
+Derived from Neon's and Xata's code and blogs (re-verified 2026-10-16) and PGCF's code. Neon hands a running, tenant-free
+compute a spec and starts PostgreSQL (server side about 0.26 s, end to end p50 about 0.5–0.57 s). Xata, like PGCF on
+CloudNativePG, claims a pre-created Cluster whose Pod is Ready with PostgreSQL stopped and mounts the tenant volume into
+it (about 1 s, with a CNPG fork). PGCF needs no fork: stock CNPG 1.30.1 keeps a fenced instance's Pod running with
+PostgreSQL stopped and passes its startup probe, and lifting the fence starts PostgreSQL on whatever data directory is
+mounted.
+
+**Request path and budget (client in a Worker).**
+
+| # | Step | Budget |
+| --- | --- | --- |
+| 1 | Client Worker to Edge (TLS, WebSocket) | 100 ms |
+| 2 | Edge: both limiters and `DatabaseActor.admitWake` in parallel; Durable Object state only, no D1 | 40 ms |
+| 3 | Edge signs the route token (wake flag, operation, expected generation) and opens the gateway socket: the one message to the node | 20 ms |
+| 4 | Gateway answers the upgrade at once, holds the StartupMessage and hands the wake to the controller | 2 ms |
+| 5 | Controller claims a free slot on this node from memory and checks local memory headroom | 1 ms |
+| 6 | Attach agent: holder rule, mount the database volume, check `pg_control` is "shut down", move the mount into the slot's containers | 25 ms |
+| 7 | Controller binds the slot to the tenant (archive Secret, ObjectStore, one Cluster patch that lifts the fence) | 30 ms |
+| 8 | CNPG instance manager starts PostgreSQL on the tenant data | 120 ms |
+| 9 | Controller checks `system_identifier` and timeline against the sleep record and releases the gateway with the slot target | 70 ms |
+| 10 | Gateway connects to the slot, forwards the held startup, authenticates | 60 ms |
+| 11 | First SaaS statement on cold caches | 50 ms |
+| 12 | After the answer, off the path: D1 claim, observation, usage, in-place resize, backups, slot refill | 0 ms |
+
+The sum is about 0.52 s, which leaves about 0.48 s for the p95 tail. **Largest risk:** the Worker-to-Edge hop through the
+public hostname is estimated (not measured) at about 0.45 s, and an awake database already takes 0.74–0.84 s from a
+Worker. If measurement confirms it, Worker clients reach the Edge through a service binding.
+
+**Pool slot.** One stock CNPG Cluster with one instance per slot, in its own namespace, pinned to the node:
+- the same image, probes, sidecar and network policy as a database
+- fenced from creation, its own small initdb placeholder volume
+- requests of 100m CPU and 128 MiB; limits of the class
+- holds no tenant byte, label or credential while free; about 0.1 GiB RSS (fenced instance manager about 62 MB plus
+  the sidecar)
+
+EU1 keeps 4 free slots, set later from the miss counter. A slot serves one database until it sleeps; then it is
+deleted, never reused for another customer, and the node creates a replacement in the background (about 10 s).
+
+**Volume attach and the single-writer rule.** A privileged node agent (a second binary in the native-controller image,
+running as a DaemonSet) does the attach. Database volumes stay active from boot, so activation is not on the path.
+1. It mounts `/dev/mapper/<lv>` as a detached mount (`fsopen`, `fsmount`).
+2. It checks through that mount that `pg_control` says "shut down".
+3. It joins the mount namespaces of the slot's PostgreSQL and backup containers and moves the mount onto the data path
+   (`setns`, `move_mount`).
+4. It writes the device's `io.max` into the slot cgroup.
+
+Deleting the slot Pod drops the mount. One rule replaces the node identity proof turn, start holds and per-start tokens
+on the path: a volume has at most one holder file, created with `O_EXCL` only after the kernel reports the device's
+open count as 0; it is removed only when the count is 0 again. The pool-miss path takes the same holder. Before any
+client is released, the controller's SQL check (`system_identifier` and timeline equal the sleep record) refuses a
+wrong volume.
+
+**What changes.**
+- **CNPG:** nothing.
+- **Native controller:** `pool.rs` (slots, claim, refill, single-use delete, hit and miss counters), the slot builder,
+  the wake intake from the gateway, the sleep record (system identifier, timeline, role revision) and the miss path
+  behind the holder rule.
+- **Node agent:** a new binary of about 300 lines.
+- **Gateway:** answers the upgrade early, holds the startup, gets the release with the slot target, has a 25 s wake
+  bound under the Edge's 60 s, and labels each connection `warm`, `pool_hit` or `pool_miss`.
+- **Route token:** v5.
+- **DatabaseActor:** answers from Durable Object state and writes D1 after the answer.
+- **Edge:** limiters and the actor run in parallel.
+
+**What is deleted.**
+- the parked tier
+- the node identity proof turn, start holds and `volume_current` on every start path (the 60 s turn stays as an audit
+  for create, delete and pool growth)
+- the Actor's wait machinery
+- the desired pull, observation POST and hint as steps on the request path
+- the prepared containerd sandbox runtime and compute-pool policy
+
+**What stays for safety.**
+- WAL archiving and base backups to R2, bound to the tenant before the fence lifts
+- a clean sleep (archived WAL plus "shut down") before a slot is discarded
+- the SQL identity check before release
+- the route token and admission revocation, D1 as the generation authority, and the node-wide write authority checked
+  before every claim
+- the host guard, per-start tokens and thin gates on the miss path
+
+**Pool miss.** No free slot, no headroom, a busy holder, an unclean volume or a changed image use today's CNPG start
+behind the same holder rule, without the identity turn. That is Pod recreation, measured at 4.1–5.2 s, plus the chain.
+The gateway holds the client for up to 25 s; misses are labelled and alerted on their rate.
+
+**Lab on EU1 (by hand, before product code).**
+- **Setup:** namespace `pgcf-lab-pool`, plain (thick) LVM volumes on a lab storage class so thin authority and the
+  databases on EU1 are untouched. A lab database is loaded with the SaaS dataset (509 MB) and hibernated by CNPG, so its
+  Pod is gone and it is cleanly shut down. Four fenced slot Clusters exist. A privileged lab Pod holds the attach agent
+  and a `psql` runner.
+- **Each run:**
+  1. flush the volume's cached blocks;
+  2. at t0: holder, mount, attach into the slot, `pg_control` check;
+  3. lift the fence;
+  4. the runner connects every 5 ms and runs one SaaS page request (session lookup with joins, a 50-row list, counts by
+     status, an update and an insert in one transaction), timed by the server clock;
+  5. fence again, delete the slot, check the volume's open count is back to 0, refill.
+- **Pass:** over 20 runs, p95 from t0 to the first statement's result at most 500 ms on the node, PostgreSQL accepting
+  within 350 ms, the tenant's `system_identifier` in every run, and "shut down" at every end.
+- **First run (2026-10-16 16:11Z, slot CPU limit 500m), times from t0:**
+  - volume mounted 62 ms (the ext4 mount itself 47 ms)
+  - attached inside the slot 137 ms (including a 67 ms Kubernetes Pod lookup that the controller avoids)
+  - fence lifted 168 ms
+  - PostgreSQL started 383 ms
+  - **first SaaS statement answered 526 ms**
+  - **whole page request committed 626 ms**
+  - the tenant's `system_identifier` was served
+  - the fence afterwards stopped PostgreSQL cleanly ("shut down")
+  - the volume was free again within 6 ms of the slot's deletion
+
+**Order of work.**
+1. Lab plus the Worker-to-Edge measurement.
+2. Node: agent, `pool.rs`, slot builder, sleep record, miss path.
+3. Gateway and token v5.
+4. Cloudflare: Actor and Edge.
+5. One release on EU1, live acceptance with `saas_bench2` from a Worker and a laptop on databases idle at least 1 h
+   (some at least a day), plus one forced-miss round.
+6. Delete the parked tier, the Actor wait code and the start-path identity and hold code.
 
 ## Delivery architecture
 
