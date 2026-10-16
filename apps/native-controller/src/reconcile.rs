@@ -60,9 +60,23 @@ struct RuntimeResources<'a> {
     ca: &'a Value,
     node: &'a Value,
 }
+/// What a runtime attestation is formed from: the resources it names, the `postgres`
+/// container's spec, the TLS authority and the storage receipt and volume of the database.
+struct Attesting<'a> {
+    resources: RuntimeResources<'a>,
+    container: &'a Value,
+    ca: &'a [u8],
+    storage: &'a Value,
+    volume: &'a Value,
+    lean: bool,
+    tls_server_name: String,
+    continuity: Option<(String, u64)>,
+}
 pub struct Reconciler {
     pub k8s: Kubernetes,
     pub power: PowerCoordinator,
+    /// The pool of free PostgreSQL instances (pool design 2026-10-16).
+    pub pool: crate::pool::Pool,
     pub health: Health,
     pub cluster_uid: String,
     postgres_image: String,
@@ -227,7 +241,7 @@ fn primary_current(pod: &Value, cluster: &Value, db: &Value, context: &Value) ->
 }
 /// The desired record of a sleeping database as its wake will receive it: the API states the
 /// power of a sleeping database as a sleep and leaves out the regional scheduling request.
-fn awake(db: &Value, scheduling: &Value) -> Value {
+pub(crate) fn awake(db: &Value, scheduling: &Value) -> Value {
     let mut awake = db.clone();
     awake["desired_state"] = "running".into();
     if awake["power"].is_object() {
@@ -1320,6 +1334,28 @@ impl Reconciler {
         // The identity of the cluster is read once by a pass: everything the pass goes on to
         // read, it reads from this cluster.
         self.k8s.assert_cluster(&self.cluster_uid).await?;
+        // A database a pool slot serves is the pool's until its slot is retired; a wake of a
+        // sleeping one is decided by the pool first (rule 6.2).
+        if let Some(serving) = self.pool.serving(id) {
+            match state_name {
+                "running" => match self.pool.serve_pass(self, db, snapshot, serving).await? {
+                    crate::pool::Served::Observed(observed) => return Ok(observed),
+                    crate::pool::Served::HandedOver => {}
+                },
+                "suspended" => return self.pool.sleep(self, db, snapshot, serving).await,
+                _ => {
+                    self.pool.unwind_later(id, "deleted");
+                    if !self.pool.unwind(self, id, None).await? {
+                        return Err("pool slot retirement pending".into());
+                    }
+                }
+            }
+        } else if state_name == "running"
+            && timing::waking(db)
+            && let Some(observed) = self.pool.desired(self, db, snapshot).await?
+        {
+            return Ok(Some(observed));
+        }
         if state_name == "deleted" {
             return self
                 .power
@@ -1346,7 +1382,7 @@ impl Reconciler {
             }
             Err(error) => {
                 if state_name == "running" && !db["storage"].is_null() {
-                    return self.power.protect_storage(db).await;
+                    return self.protect_storage(db).await;
                 }
                 return Err(error);
             }
@@ -1446,6 +1482,7 @@ impl Reconciler {
                             manifests: retained.manifests.as_deref(),
                             runtime_class: retained.runtime_class,
                         },
+                        slot: None,
                     },
                 )
                 .await;
@@ -1921,7 +1958,7 @@ impl Reconciler {
             }
             None => (&pod, &cluster),
         };
-        let status = postgres_status(pod_now).ok_or("postgres runtime proof missing")?;
+        postgres_status(pod_now).ok_or("postgres runtime proof missing")?;
         self.power.kubelet_ready(db, pod_now);
         if !db["storage"].is_null() && db["storage_authority"].as_str().is_none() {
             return Ok(Some(observation(db, "provisioning", None)));
@@ -1972,68 +2009,30 @@ impl Reconciler {
             // Completed ahead of the proof; the proof is read back against a watch that has it.
             self.k8s.observed(&final_ns, WATCH_LAG).await;
         }
-        if is_ready {
-            let cid = text(status, "containerID")
-                .strip_prefix("containerd://")
-                .unwrap_or("");
-            let boot = text(&node_observed["status"]["nodeInfo"], "bootID");
-            let mut proof = json!({"v":1,"database_id":db["id"],"generation":db["generation"],"storage_generation":optional_number(db,"storage_generation",1),"node_uid":node_observed["metadata"]["uid"],"boot_id":boot,"cluster_uid":self.cluster_uid,"namespace_uid":final_ns["metadata"]["uid"],"cnpg_cluster_uid":cluster_now["metadata"]["uid"],"storage_uid":fence.as_ref().ok_or("runtime storage receipt absent")?["metadata"]["uid"],"pvc_uid":volume_identity["claimUid"],"pv_uid":volume_identity["volumeUid"],"pod_uid":pod_now["metadata"]["uid"],"container_id":cid,"postgres_image_sha256":expected_image.rsplit("@sha256:").next().ok_or("runtime image digest absent")?,"memory_request_bytes":quantity(&postgres_container["resources"]["requests"]["memory"]),"memory_limit_bytes":quantity(&postgres_container["resources"]["limits"]["memory"]),"observed_at":u64::try_from(now()).map_err(|_|"runtime clock invalid")?,"configuration_fingerprint":crate::contracts::configuration_fingerprint(db,&self.postgres_image)?});
-            if !db["admission"].is_null() {
-                if let Some(start) = proof_continuity {
-                    if let Some(mut continuity) = self
-                        .runtime_readback(
-                            db,
-                            &start,
-                            &RuntimeResources {
-                                namespace: &final_ns,
-                                cluster: cluster_now,
-                                pod: pod_now,
-                                ca: &current_ca,
-                                node: &node_observed,
-                            },
-                            &volume_identity,
-                            lean,
-                        )
-                        .await?
-                    {
-                        proof["v"] = 2.into();
-                        proof["region_id"] = self.power.region().into();
-                        proof["route_revision"] = db["admission"]["route_revision"].clone();
-                        proof["admission_epoch"] = db["admission"]["admission_epoch"].clone();
-                        proof["applied_role_revisions"] = applied_role_revisions(db)
-                            .ok_or("runtime role set missing")?
-                            .into();
-                        proof["tls_server_name"] = format!("database-rw.{ns}.svc").into();
-                        proof["ca_secret_uid"] = current_ca["metadata"]["uid"].clone();
-                        proof["ca_secret_resource_version"] =
-                            current_ca["metadata"]["resourceVersion"].clone();
-                        proof["ca_sha256"] = Sha256::digest(&ca)
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect::<String>()
-                            .into();
-                        proof["pod_ip"] = pod_now["status"]["podIP"].clone();
-                        proof["postgres_port"] = 5432.into();
-                        let verified = proof["observed_at"]
-                            .as_u64()
-                            .ok_or("runtime clock missing")?;
-                        continuity["verified_at"] = verified.into();
-                        continuity["expires_at"] = (verified
-                            + constant("DATABASE_RUNTIME_PROOF_MAX_AGE_MS")
-                                .as_u64()
-                                .ok_or("runtime proof lifetime missing")?)
-                        .into();
-                        proof["observation"] = continuity;
-                    } else {
-                        proof = Value::Null;
-                    }
-                } else {
-                    proof = Value::Null;
-                }
-            }
-            if crate::contracts::schema_valid("DatabaseRuntimeAttestation", &proof) {
-                result["runtime_attestation"] = proof;
-            }
+        if is_ready
+            && let Some(proof) = self
+                .attestation(
+                    db,
+                    &Attesting {
+                        resources: RuntimeResources {
+                            namespace: &final_ns,
+                            cluster: cluster_now,
+                            pod: pod_now,
+                            ca: &current_ca,
+                            node: &node_observed,
+                        },
+                        container: postgres_container,
+                        ca: &ca,
+                        storage: fence.as_ref().ok_or("runtime storage receipt absent")?,
+                        volume: &volume_identity,
+                        lean,
+                        tls_server_name: format!("database-rw.{ns}.svc"),
+                        continuity: proof_continuity,
+                    },
+                )
+                .await?
+        {
+            result["runtime_attestation"] = proof;
         }
         // A database published on the barrier is published on its proof: without one, the pass
         // that makes the whole chain takes it from here.
@@ -2053,9 +2052,11 @@ impl Reconciler {
         let release = timing::Phase::begin(db, "fence_release");
         let mut result = if let Some(intent) = intent {
             let intent = serde_json::to_value(intent)?;
-            self.power.finish_running(db, result, Some(&intent)).await?
+            self.power
+                .finish_running(db, result, Some(&intent), false)
+                .await?
         } else {
-            self.power.publish_ready_fence(db, result).await?
+            self.power.publish_ready_fence(db, result, false).await?
         };
         if result.as_ref().is_some_and(|v| v["state"] == "ready") {
             release.completed();
@@ -2080,6 +2081,152 @@ impl Reconciler {
             if let Some(roles) = self.advance_removals(db, &context, &ca, socket).await {
                 value["roles"] = roles;
             }
+        }
+        Ok(result)
+    }
+    /// The runtime attestation of a ready database's PostgreSQL: v1 for a database Cloudflare has
+    /// not admitted, v2 with the watch's read-back for one it has; `None` when the watch cannot
+    /// vouch for the resources it names.
+    async fn attestation(&self, db: &Value, a: &Attesting<'_>) -> Result<Option<Value>, Error> {
+        let RuntimeResources {
+            namespace,
+            cluster,
+            pod,
+            ca: ca_secret,
+            node,
+        } = &a.resources;
+        let status = postgres_status(pod).ok_or("postgres runtime proof missing")?;
+        let expected_image = db["postgres"]["image"]
+            .as_str()
+            .unwrap_or(&self.postgres_image);
+        let cid = text(status, "containerID")
+            .strip_prefix("containerd://")
+            .unwrap_or("");
+        let boot = text(&node["status"]["nodeInfo"], "bootID");
+        let mut proof = json!({"v":1,"database_id":db["id"],"generation":db["generation"],"storage_generation":optional_number(db,"storage_generation",1),"node_uid":node["metadata"]["uid"],"boot_id":boot,"cluster_uid":self.cluster_uid,"namespace_uid":namespace["metadata"]["uid"],"cnpg_cluster_uid":cluster["metadata"]["uid"],"storage_uid":a.storage["metadata"]["uid"],"pvc_uid":a.volume["claimUid"],"pv_uid":a.volume["volumeUid"],"pod_uid":pod["metadata"]["uid"],"container_id":cid,"postgres_image_sha256":expected_image.rsplit("@sha256:").next().ok_or("runtime image digest absent")?,"memory_request_bytes":quantity(&a.container["resources"]["requests"]["memory"]),"memory_limit_bytes":quantity(&a.container["resources"]["limits"]["memory"]),"observed_at":u64::try_from(now()).map_err(|_|"runtime clock invalid")?,"configuration_fingerprint":crate::contracts::configuration_fingerprint(db,&self.postgres_image)?});
+        if !db["admission"].is_null() {
+            if let Some(start) = &a.continuity {
+                if let Some(mut continuity) = self
+                    .runtime_readback(db, start, &a.resources, a.volume, a.lean)
+                    .await?
+                {
+                    proof["v"] = 2.into();
+                    proof["region_id"] = self.power.region().into();
+                    proof["route_revision"] = db["admission"]["route_revision"].clone();
+                    proof["admission_epoch"] = db["admission"]["admission_epoch"].clone();
+                    proof["applied_role_revisions"] = applied_role_revisions(db)
+                        .ok_or("runtime role set missing")?
+                        .into();
+                    proof["tls_server_name"] = a.tls_server_name.as_str().into();
+                    proof["ca_secret_uid"] = ca_secret["metadata"]["uid"].clone();
+                    proof["ca_secret_resource_version"] =
+                        ca_secret["metadata"]["resourceVersion"].clone();
+                    proof["ca_sha256"] = Sha256::digest(a.ca)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                        .into();
+                    proof["pod_ip"] = pod["status"]["podIP"].clone();
+                    proof["postgres_port"] = 5432.into();
+                    let verified = proof["observed_at"]
+                        .as_u64()
+                        .ok_or("runtime clock missing")?;
+                    continuity["verified_at"] = verified.into();
+                    continuity["expires_at"] = (verified
+                        + constant("DATABASE_RUNTIME_PROOF_MAX_AGE_MS")
+                            .as_u64()
+                            .ok_or("runtime proof lifetime missing")?)
+                    .into();
+                    proof["observation"] = continuity;
+                } else {
+                    proof = Value::Null;
+                }
+            } else {
+                proof = Value::Null;
+            }
+        }
+        Ok(crate::contracts::schema_valid("DatabaseRuntimeAttestation", &proof).then_some(proof))
+    }
+    /// The ready observation of a database a pool slot serves, with the attestation of the slot's
+    /// Pod (under the slot's own service name) for the gateway to route by.
+    pub(crate) async fn slot_observation(
+        &self,
+        db: &Value,
+        ns: &str,
+        serving: &crate::pool::Serving,
+    ) -> Result<Value, Error> {
+        let id = text(db, "id");
+        let continuity = self.k8s.runtime_continuity();
+        let storage_name = format!("storage-{id}");
+        let (namespace_value, cluster, pod, ca_secret, node, storage) = tokio::try_join!(
+            self.k8s.read_known("Namespace", None, ns),
+            self.k8s.read_known("Cluster", Some(ns), "database"),
+            self.k8s.read_known("Pod", Some(ns), "database-1"),
+            self.k8s.read_known("Secret", Some(ns), "database-ca"),
+            self.k8s.read_known("Node", None, text(db, "node")),
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &storage_name),
+        )?;
+        let (
+            Some(namespace_value),
+            Some(cluster),
+            Some(pod),
+            Some(ca_secret),
+            Some(node),
+            Some(storage),
+        ) = (namespace_value, cluster, pod, ca_secret, node, storage)
+        else {
+            return Err("pool slot runtime missing".into());
+        };
+        if pod["metadata"]["uid"] != serving.pod.uid.as_str() {
+            return Err("pool slot Pod replaced".into());
+        }
+        // The claim wrote the Cluster and resized the Pod a moment ago: the proof is read back
+        // against a watch that has delivered them.
+        if continuity.is_some() {
+            tokio::join!(
+                self.k8s.observed(&cluster, WATCH_LAG),
+                self.k8s.observed(&pod, WATCH_LAG)
+            );
+        }
+        let ca = ca_bytes(&ca_secret, &cluster)?;
+        let volume: Value =
+            serde_json::from_str(text(&storage["metadata"]["annotations"], VOLUME))?;
+        let container = pod["spec"]["containers"]
+            .as_array()
+            .and_then(|v| v.iter().find(|c| text(c, "name") == "postgres"))
+            .ok_or("postgres container missing")?
+            .clone();
+        let status = postgres_status(&pod).ok_or("postgres runtime proof missing")?;
+        let expected_image = db["postgres"]["image"]
+            .as_str()
+            .unwrap_or(&self.postgres_image);
+        let mut result = observation(db, "ready", None);
+        result["postgres"] = json!({"image":expected_image,"image_id":text(status,"imageID")});
+        result["backup"] = self.health.backup(db, &namespace_value, &cluster);
+        if let Some(proof) = self
+            .attestation(
+                db,
+                &Attesting {
+                    resources: RuntimeResources {
+                        namespace: &namespace_value,
+                        cluster: &cluster,
+                        pod: &pod,
+                        ca: &ca_secret,
+                        node: &node,
+                    },
+                    container: &container,
+                    ca: &ca,
+                    storage: &storage,
+                    volume: &volume,
+                    lean: false,
+                    tls_server_name: pgcf_native_protocol::wake::slot_tls_name(ns),
+                    continuity,
+                },
+            )
+            .await?
+        {
+            result["runtime_attestation"] = proof;
         }
         Ok(result)
     }
@@ -2206,9 +2353,11 @@ impl Reconciler {
             return Err("sealed runtime identity required".into());
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let power = PowerCoordinator::new(k8s.clone(), region, replicas)?;
+        let mut power = PowerCoordinator::new(k8s.clone(), region, replicas)?;
+        power.postgres_image = postgres_image.clone();
         let http = crate::cluster_http(Duration::from_secs(5))?;
         Ok(Self {
+            pool: crate::pool::Pool::new(k8s.clone(), postgres_image.clone())?,
             k8s,
             power,
             health: Health::default(),
@@ -2223,6 +2372,33 @@ impl Reconciler {
     /// it did: the caller schedules the pass.
     pub fn take_followup(&self, id: &str) -> bool {
         self.followups.lock().unwrap().remove(id)
+    }
+    /// The protective stop of a database whose node write authority lapsed. A database a pool
+    /// slot serves also has its slot retired once the marker is written (rule 6.7).
+    pub async fn protect_storage(&self, db: &Value) -> Result<Option<Value>, Error> {
+        let observed = self.power.protect_storage(db).await?;
+        let id = text(db, "id");
+        if self.pool.serves(id) {
+            self.pool.unwind_later(id, "protected");
+            self.pool.unwind(self, id, None).await?;
+        }
+        Ok(observed)
+    }
+    /// Whether the node-wide Cloudflare write authority of the database's node is current for a
+    /// pool claim (check 4.3 #1): the snapshot's (or a newer renewal's) authority of `node`, the
+    /// Node as the watch holds it.
+    pub(crate) fn write_authority(
+        &self,
+        db: &Value,
+        snapshot: &DesiredSnapshot,
+        node: &Value,
+    ) -> bool {
+        snapshot.region["storage_nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|n| n["name"] == db["node"]))
+            .is_some_and(|authority| {
+                storage_guard(db, node, authority, &self.cluster_uid, true, now()).is_ok()
+            })
     }
     /// The Node and the host authority the database stands on. The pass has asserted the identity
     /// of the cluster before it asks.
@@ -2391,12 +2567,40 @@ impl Reconciler {
             runtime_class: runtime_class(&context),
         }
     }
+    /// The context a pool slot is rendered in: the region's backup, the cluster's selectors and
+    /// the standard runtime.
+    pub(crate) async fn slot_context(&self, snapshot: &DesiredSnapshot) -> Result<Value, Error> {
+        let mut context = self.base_context(snapshot).await?;
+        context["recoveryFinalized"] = false.into();
+        context["computePool"] = Value::Null;
+        Ok(context)
+    }
     pub(crate) async fn context(
         &self,
         db: &Value,
         snapshot: &DesiredSnapshot,
         finalized: bool,
     ) -> Result<Value, Error> {
+        let (mut context, pool) = tokio::try_join!(
+            self.base_context(snapshot),
+            self.admitted_pool(db, &snapshot.region["compute_pool"])
+        )?;
+        context["recoveryFinalized"] = finalized.into();
+        context["computePool"] = pool;
+        if !db["recovery"]["source_archive"].is_null() {
+            let source = snapshot.region["recovery_sources"]
+                [text(&db["recovery"]["source_archive"], "region_id")]
+            .clone();
+            if source["bucket"] != db["recovery"]["source_archive"]["bucket"]
+                || source["endpoint_url"] != db["recovery"]["source_archive"]["endpoint_url"]
+            {
+                return Err("recovery source read custody changed".into());
+            }
+            context["recoverySource"] = json!({"bucket":source["bucket"],"endpointUrl":source["endpoint_url"],"region":"auto","credentials":{"accessKeyId":source["access_key_id"],"secretAccessKey":source["secret_access_key"]}});
+        }
+        Ok(context)
+    }
+    async fn base_context(&self, snapshot: &DesiredSnapshot) -> Result<Value, Error> {
         // The shared backup credential is written by no pass of the controller.
         let secret = self
             .k8s
@@ -2418,22 +2622,9 @@ impl Reconciler {
             }
             Ok(value)
         };
-        let pool = self
-            .admitted_pool(db, &snapshot.region["compute_pool"])
-            .await?;
-        let mut context = json!({"backup":{"bucket":snapshot.region["backup"]["bucket"],"endpointUrl":snapshot.region["backup"]["endpoint_url"],"region":"auto","credentials":{"accessKeyId":decode("AWS_ACCESS_KEY_ID")?,"secretAccessKey":decode("AWS_SECRET_ACCESS_KEY")?}},"postgresImage":self.postgres_image,"systemNamespace":SYSTEM,"cnpgNamespace":"cnpg-system","storageClass":"pgcf-lvm","gatewaySelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-gateway"}},"agentSelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-agent"}},"recoveryFinalized":finalized,"computePool":pool});
-        if !db["recovery"]["source_archive"].is_null() {
-            let source = snapshot.region["recovery_sources"]
-                [text(&db["recovery"]["source_archive"], "region_id")]
-            .clone();
-            if source["bucket"] != db["recovery"]["source_archive"]["bucket"]
-                || source["endpoint_url"] != db["recovery"]["source_archive"]["endpoint_url"]
-            {
-                return Err("recovery source read custody changed".into());
-            }
-            context["recoverySource"] = json!({"bucket":source["bucket"],"endpointUrl":source["endpoint_url"],"region":"auto","credentials":{"accessKeyId":source["access_key_id"],"secretAccessKey":source["secret_access_key"]}});
-        }
-        Ok(context)
+        Ok(
+            json!({"backup":{"bucket":snapshot.region["backup"]["bucket"],"endpointUrl":snapshot.region["backup"]["endpoint_url"],"region":"auto","credentials":{"accessKeyId":decode("AWS_ACCESS_KEY_ID")?,"secretAccessKey":decode("AWS_SECRET_ACCESS_KEY")?}},"postgresImage":self.postgres_image,"systemNamespace":SYSTEM,"cnpgNamespace":"cnpg-system","storageClass":"pgcf-lvm","gatewaySelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-gateway"}},"agentSelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-agent"}}}),
+        )
     }
     /// The region pool applies to a database only once node-bootstrap has admitted a compute
     /// profile on this cluster: RuntimeClass, MutatingAdmissionPolicy and its binding stamped with

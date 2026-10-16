@@ -122,6 +122,39 @@ async fn connect_at(
     }
     open(&config, ca).await
 }
+/// A session with a pool slot that serves `db`: TLS verifies the slot's own service name
+/// (`database-rw.pgcf-slot-<hex>.svc`), dialled at the slot Pod's address.
+pub async fn connect_slot(
+    db: &Value,
+    pod: SocketAddr,
+    tls_name: &str,
+    ca: &[u8],
+    role: &str,
+    password: &str,
+) -> Result<Session, Error> {
+    let role_allowed = pgcf_native_protocol::valid_role(role)
+        || Some(role) == constant("MAINTENANCE_ROLE").as_str();
+    if !database_valid(db)
+        || !role_allowed
+        || password.is_empty()
+        || pgcf_native_protocol::wake::slot_namespace_of_tls_name(tls_name).is_none()
+    {
+        return Err("PostgreSQL slot probe authority invalid".into());
+    }
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(tls_name)
+        .hostaddr(pod.ip())
+        .port(pod.port())
+        .user(role)
+        .password(password)
+        .dbname(text(db, "id"))
+        .application_name("pgcf-readiness")
+        .options("-c statement_timeout=5000")
+        .connect_timeout(Duration::from_secs(5))
+        .ssl_mode(SslMode::Require);
+    open(&config, ca).await
+}
 /// Opens a session whose TLS is verified against `ca`; `connect` checks the probe authority.
 async fn open(config: &tokio_postgres::Config, ca: &[u8]) -> Result<Session, Error> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -715,6 +748,65 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+    /// A slot that serves a database is dialled at its Pod and verified under the slot's own
+    /// service name, never under the tenant's.
+    #[tokio::test]
+    async fn a_slot_session_verifies_the_slot_tls_name_at_the_slot_address() {
+        use crate::test_postgres::{Answer, Authority, Cell, Postgres};
+        let db = crate::test_world::World::awake().await.db;
+        let authority = Authority::new();
+        let answer: crate::test_postgres::Handler =
+            Arc::new(|_, _, _| Answer::Rows(vec![vec![("value", Cell::Text("slot".into()))]]));
+        let slot = "database-rw.pgcf-slot-0a1b2c3d.svc";
+        let server = Postgres::start(&authority, slot, None, answer.clone()).await;
+        let role = text(&db["maintenance"], "role");
+        let password = text(&db["maintenance"], "password");
+        let session = connect_slot(
+            &db,
+            server.address,
+            slot,
+            authority.pem.as_bytes(),
+            role,
+            password,
+        )
+        .await
+        .unwrap();
+        let rows = session.query("SELECT 1", &[]).await.unwrap();
+        assert_eq!(rows[0].try_get::<_, String>(0).unwrap(), "slot");
+        // A server that presents another name is not the slot.
+        let tenant = Postgres::start(&authority, HOST, None, answer).await;
+        assert!(
+            connect_slot(
+                &db,
+                tenant.address,
+                slot,
+                authority.pem.as_bytes(),
+                role,
+                password
+            )
+            .await
+            .is_err()
+        );
+        // Only a slot's service name, and only a role the probe may use.
+        for (name, user) in [
+            (format!("database-rw.{}.svc", namespace(&db)), role),
+            (slot.to_string(), "postgres"),
+        ] {
+            assert!(
+                connect_slot(
+                    &db,
+                    server.address,
+                    &name,
+                    authority.pem.as_bytes(),
+                    user,
+                    password
+                )
+                .await
+                .is_err(),
+                "{name} {user}"
+            );
+        }
     }
     /// The role a statement concerns is bound, never part of its text, whatever the role is called.
     #[test]
