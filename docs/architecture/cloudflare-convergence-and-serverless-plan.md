@@ -158,8 +158,19 @@ second for its first minute). And the new `wake_path` event says why the wake ne
 declare only `route_token_version: 3`; route token v4, runtime attestation v2 and the admission snapshot
 (`docs/operations/operator-installation.md`, Route tokens) have never been active live, so the controller's
 barrier publication and the Actor's verified-target admission are untested outside the in-process world.
-The next release declares them (`route_token_version: 4`, `runtime_attestation_version: 2`,
-`admission_snapshot_version: 1`).
+R2.17 declared them (`route_token_version: 4`, `runtime_attestation_version: 2`,
+`admission_snapshot_version: 1`) and broke on first contact: a new database was ready after 83 s (21 s
+before) and its first connection was refused (`FATAL: gateway connection failed`, the gateway's `conn_stages`
+said `route_stale`), a cold wake finished its controller chain at 20.9 s and was refused at 20.5 s. R2.18
+rolled the region back to route token v3. Root cause (found by reading the path and reproduced in the
+in-process world): the controller built the `ca-<db>` ConfigMap with the annotations that name its source
+Secret (`pgcf.io/source-ca-secret-uid` and `-resource-version`) but `apply_to` replaced every annotation
+with the generation stamp, so the gateway never found a CA for the target and refused every v4 route
+(fixed in `cd63a0b`). Not explained yet: the extra 60 s of the creation (one pass is certainly redone after
+`bind_fence` writes the storage ConfigMap that the runtime proof names). Three v4 hazards to accept or fix
+before the markers go live again: a controller restart or watch gap gives every ready database a new
+route revision (57P03 until it is attested again), a rewrite of the CA Secret is two writes (CA map, then
+target), and gateways do not acknowledge a new target before the report goes out.
 Tried and reverted: constraining the NodeBootstrap container to `WEUR` (`containers[].constraints.regions`)
 made the identity turn slower (20.9 to 22.3 s, 7 turns, against 17.9 to 18.8 s in the default placement), so
 the 18 s is not distance to the container; the floor of a turn is its four sequential relay steps.
