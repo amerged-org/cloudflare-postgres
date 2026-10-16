@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { DatabaseAdmission } from "@pgcf/contracts";
-export type { DatabaseAdmission } from "@pgcf/contracts";
+import type { DatabaseWakeAdmission } from "@pgcf/contracts";
+export type { DatabaseWakeAdmission } from "@pgcf/contracts";
 
 export interface DatabaseActorNamespace {
   idFromName(name: string): DurableObjectId;
   get(id: DurableObjectId): {
-    ensureAwake(
+    admitWake(
       databaseId: string,
       user: string,
       options: { deadline: number; waiterId: string },
-    ): Promise<DatabaseAdmission>;
+    ): Promise<DatabaseWakeAdmission>;
     cancelWakeWaiter(databaseId: string, waiterId: string): Promise<boolean>;
   };
 }

@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 export { ADMISSION_DEADLINE_MS } from "@pgcf/contracts";
 
-/** IPv4 admission is per address; IPv6 admission is per canonical /64. */
+/**
+ * IPv4 admission is per address; IPv6 admission is per canonical /64. A caller without
+ * CF-Connecting-IP arrives through a service binding and is limited under a key of its own; a
+ * present but malformed address is refused (null).
+ */
 export function connectionRateKey(ip: string | null): string | null {
-  if (ip === null || ip.length > 45 || ip.length < 2) return null;
+  if (ip === null) return "binding";
+  if (ip.length > 45 || ip.length < 2) return null;
   if (!ip.includes(":")) {
     const octets = ipv4Octets(ip);
     return octets ? `ipv4:${octets.join(".")}` : null;

@@ -23,13 +23,14 @@ import {
   parseRouteKeyring,
   verifyRouteToken,
 } from "@pgcf/contracts/route-token";
+import type { DatabaseWakeTicket } from "@pgcf/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
 import {
   connectionRateKey,
   ADMISSION_DEADLINE_MS,
 } from "../src/session-policy.ts";
-import type { Env, DatabaseAdmission } from "../src/env.ts";
+import type { Env, DatabaseWakeAdmission } from "../src/env.ts";
 import {
   seedKnownDatabase,
   publishPowerObservation,
@@ -448,7 +449,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   });
 
-  it("a known hint flood is refused by the actual actor before D1, wake or the Edge database bucket", async () => {
+  it("a known hint flood is refused by the actual actor before D1 or wake", async () => {
     vi.spyOn(Date, "now").mockReturnValue(Date.now());
     const actor = testEnv.DATABASE_ACTOR.get(
       testEnv.DATABASE_ACTOR.idFromName(database),
@@ -480,7 +481,6 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       ),
     ).toBe("53300");
     expect(queries).not.toHaveBeenCalled();
-    expect(databaseLimiter.limit).not.toHaveBeenCalled();
     expect(await stats()).toHaveLength(0);
   });
 
@@ -518,7 +518,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   });
 
-  it("actual actor D1 failure returns a generic error without consuming the database limiter or contacting Gateway", async () => {
+  it("actual actor D1 failure returns a generic error without contacting Gateway", async () => {
     const canary = crypto.randomUUID();
     const queries = vi
       .spyOn(Object.getPrototypeOf(testEnv.DB), "prepare")
@@ -536,7 +536,6 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     });
     expect(await errorCode(connection)).toBe("08006");
     expect(queries).toHaveBeenCalledTimes(1);
-    expect(databaseLimiter.limit).not.toHaveBeenCalled();
     expect(await stats()).toHaveLength(0);
     expect(new TextDecoder().decode(connection.messages[0])).not.toContain(
       canary,
@@ -549,7 +548,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const actor = {
       idFromName: (name: string) => testEnv.DATABASE_ACTOR.idFromName(name),
       get: () => ({
-        ensureAwake: async (): Promise<DatabaseAdmission> => {
+        admitWake: async (): Promise<DatabaseWakeAdmission> => {
           throw new Error(canary);
         },
         cancelWakeWaiter: async () => false,
@@ -679,53 +678,6 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .run();
     const deletedRole = await open();
     expect(await errorCode(deletedRole)).toBe("28P01");
-    expect(await stats()).toHaveLength(0);
-  });
-
-  it("unknown users cannot exhaust the database bucket before a valid role is admitted", async () => {
-    let consumed = 0;
-    const databaseLimiter = {
-      limit: vi.fn(async ({ key }: { key: string }) => {
-        expect(key).toBe(database);
-        return { success: ++consumed <= 2 };
-      }),
-    } as RateLimit;
-    const bindings = {
-      ...testEnv,
-      DATABASE_CONNECTION_RATE_LIMITER: databaseLimiter,
-    };
-    for (let index = 0; index < 2; index++) {
-      const user = `r${crypto.randomUUID().replaceAll("-", "")}`;
-      const unknown = await open({ bindings, user });
-      expect(await errorCode(unknown)).toBe("28P01");
-    }
-    const valid = await open({ bindings });
-    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
-      "accepted",
-    );
-    expect(await stats()).toHaveLength(1);
-    expect(databaseLimiter.limit).toHaveBeenCalledTimes(1);
-    valid.socket.send(encodeStartup({ user: "app", database }));
-    await expect
-      .poll(async () => (await stats())[0]?.bytes)
-      .toEqual([...encodeStartup({ user: "app", database })]);
-  });
-
-  it("unknown database and role hints never consume a database bucket or contact the gateway", async () => {
-    const databaseLimiter = {
-      limit: vi.fn(async () => ({ success: true })),
-    } as RateLimit;
-    const bindings = {
-      ...testEnv,
-      DATABASE_CONNECTION_RATE_LIMITER: databaseLimiter,
-    };
-    expect(
-      await errorCode(await open({ bindings, database: newDatabaseId() })),
-    ).toBe("28P01");
-    expect(await errorCode(await open({ bindings, user: "missing" }))).toBe(
-      "28P01",
-    );
-    expect(databaseLimiter.limit).not.toHaveBeenCalled();
     expect(await stats()).toHaveLength(0);
   });
 
@@ -990,12 +942,12 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       get(id: DurableObjectId) {
         const stub = testEnv.DATABASE_ACTOR.get(id);
         return {
-          async ensureAwake(
+          async admitWake(
             databaseId: string,
             user: string,
             options: { deadline: number; waiterId: string },
           ) {
-            const row = await stub.ensureAwake(databaseId, user, options);
+            const row = await stub.admitWake(databaseId, user, options);
             expect(row.ok).toBe(true);
             queried();
             await resume;
@@ -1091,9 +1043,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(verified.claims.db).toBe(database);
   });
 
-  it("fails connection admission closed without an IP and applies a real rate limit", async () => {
-    const missingIp = await open({ ip: null });
-    expect(await errorCode(missingIp)).toBe("53300");
+  it("applies a real rate limit", async () => {
     // Real Workers binding, separate limit-one namespace configured in the pool.
     const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
       .TEST_RATE_LIMITER;
@@ -1283,7 +1233,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     );
   });
 
-  it("rejects malformed or oversized client IPs before a gateway connection", async () => {
+  it("a malformed CF-Connecting-IP still answers 53300", async () => {
     for (const ip of [
       "not-an-address",
       "1".repeat(4096),
@@ -1523,6 +1473,218 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     });
   });
 
+  it("both limiters and admitWake are called before any of them resolves", async () => {
+    const called: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const limiter = (name: string) =>
+      ({
+        limit: vi.fn(async () => {
+          called.push(name);
+          await held;
+          return { success: true };
+        }),
+      }) as unknown as RateLimit;
+    const admitWake = vi.fn(
+      async (
+        id: string,
+        user: string,
+        options: { deadline: number; waiterId: string },
+      ) => {
+        called.push("actor");
+        await held;
+        return testEnv.DATABASE_ACTOR.get(
+          testEnv.DATABASE_ACTOR.idFromName(id),
+        ).admitWake(id, user, options);
+      },
+    );
+    const pending = open({
+      bindings: {
+        ...testEnv,
+        CONNECTION_RATE_LIMITER: limiter("connection"),
+        DATABASE_CONNECTION_RATE_LIMITER: limiter("database"),
+        DATABASE_ACTOR: {
+          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+          get: () => ({ admitWake, cancelWakeWaiter: async () => false }),
+        },
+      },
+    });
+    await expect.poll(() => called.length).toBe(3);
+    expect(new Set(called)).toEqual(
+      new Set(["connection", "database", "actor"]),
+    );
+    release();
+    const connection = await pending;
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log.outcome).toBe("accepted");
+    expect(log.limiters_ms).toBeGreaterThanOrEqual(0);
+    expect(log.admit_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a caller without CF-Connecting-IP is limited under the binding key and admitted", async () => {
+    expect(connectionRateKey(null)).toBe("binding");
+    const limit = vi.fn(async (options: { key: string }) => ({
+      success: options.key.length > 0,
+    }));
+    const connection = await open({
+      ip: null,
+      bindings: {
+        ...testEnv,
+        CONNECTION_RATE_LIMITER: { limit } as unknown as RateLimit,
+      },
+    });
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
+      "accepted",
+    );
+    expect(limit).toHaveBeenCalledExactlyOnceWith({
+      key: JSON.stringify([database, "app", "binding"]),
+    });
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+  });
+
+  it("a wake admission is signed v5 and opens the gateway once", async () => {
+    const wake: DatabaseWakeTicket = {
+      operation: newOperationId(),
+      generation: 3,
+      route_revision: 7,
+      role_revision_hash: "a".repeat(64),
+    };
+    const admitWake = vi.fn(async (): Promise<DatabaseWakeAdmission> => ({
+      ok: true,
+      region: {
+        id: region,
+        gateway_url: `${gatewayOrigin}/pg`,
+        gateway_binding: "GATEWAY",
+      },
+      wake,
+    }));
+    const connection = await open({
+      bindings: {
+        ...testEnv,
+        DATABASE_ACTOR: {
+          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+          get: () => ({ admitWake, cancelWakeWaiter: async () => false }),
+        },
+      },
+    });
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+    expect(await stats()).toHaveLength(1);
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    const token = (await stats())[0]!.token;
+    expect(token.startsWith("v5.")).toBe(true);
+    expect(
+      await verifyRouteToken(token, { region, keys: keyring.keys }),
+    ).toMatchObject({
+      ok: true,
+      claims: {
+        v: 5,
+        db: database,
+        user: "app",
+        rg: region,
+        op: wake.operation,
+        gen: 3,
+        route_revision: 7,
+        rh: wake.role_revision_hash,
+      },
+    });
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).route).toBe("v5");
+    expect(admitWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("an awake admission is signed v4 and a legacy one v2", async () => {
+    const pod = crypto.randomUUID();
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    const routeRegion = {
+      id: region,
+      gateway_url: `${gatewayOrigin}/pg`,
+      gateway_binding: "GATEWAY",
+    };
+    for (const [index, admission, claims, route] of [
+      [
+        0,
+        {
+          ok: true,
+          region: routeRegion,
+          target: { revision: 2, pod_uid: pod, route_revision: 5 },
+        },
+        { v: 4, rev: 2, pod, route_revision: 5 },
+        "v4",
+      ],
+      [1, { ok: true, region: routeRegion }, { v: 2 }, "v2"],
+    ] as const) {
+      const connection = await open({
+        bindings: {
+          ...testEnv,
+          DATABASE_ACTOR: {
+            idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+            get: () => ({
+              admitWake: async () => admission,
+              cancelWakeWaiter: async () => false,
+            }),
+          },
+        },
+      });
+      connection.socket.send(encodeStartup({ user: "app", database }));
+      await expect.poll(async () => (await stats()).length).toBe(index + 1);
+      expect(
+        await verifyRouteToken((await stats())[index]!.token, {
+          region,
+          keys: keyring.keys,
+        }),
+      ).toMatchObject({ ok: true, claims: { ...claims, db: database } });
+      expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).route).toBe(
+        route,
+      );
+    }
+  });
+
+  it("a refused limiter answers 53300 even when the actor admitted", async () => {
+    const admitWake = vi.fn(
+      (
+        id: string,
+        user: string,
+        options: { deadline: number; waiterId: string },
+      ) =>
+        testEnv.DATABASE_ACTOR.get(
+          testEnv.DATABASE_ACTOR.idFromName(id),
+        ).admitWake(id, user, options),
+    );
+    const connection = await open({
+      bindings: {
+        ...testEnv,
+        DATABASE_CONNECTION_RATE_LIMITER: {
+          limit: async () => ({ success: false }),
+        } as unknown as RateLimit,
+        DATABASE_ACTOR: {
+          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+          get: () => ({ admitWake, cancelWakeWaiter: async () => false }),
+        },
+      },
+    });
+    expect(await errorCode(connection)).toBe("53300");
+    expect(admitWake).toHaveBeenCalledTimes(1);
+    expect((await admitWake.mock.results[0]!.value).ok).toBe(true);
+    expect(await stats()).toHaveLength(0);
+  });
+
   it("returns a generic PostgreSQL error for gateway failure without replaying", async () => {
     await setGatewayMode("reject");
     const connection = await open();
@@ -1658,13 +1820,13 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.duration_ms).toBeGreaterThanOrEqual(0);
     // Every stage that ran reports its milliseconds, so a slow admission can be located.
     for (const stage of [
-      "limiter_ms",
-      "ensure_awake_ms",
-      "database_limiter_ms",
+      "limiters_ms",
+      "admit_ms",
       "token_ms",
       "gateway_connect_ms",
     ])
       expect(log[stage]).toBeGreaterThanOrEqual(0);
+    expect(log.route).toBe("v2");
     expect(Object.keys(log)).not.toContain("password");
     expect(Object.keys(log)).not.toContain("ingress_bytes");
     expect(Object.keys(log)).not.toContain("egress_bytes");
@@ -1810,7 +1972,7 @@ it("passes the connection cid and one absolute 60-second deadline to wake and ca
     ) => {
       const response = await testEnv.DATABASE_ACTOR.get(
         testEnv.DATABASE_ACTOR.idFromName(id),
-      ).ensureAwake(id, user, options);
+      ).admitWake(id, user, options);
       reached();
       await held;
       return response;
@@ -1819,7 +1981,7 @@ it("passes the connection cid and one absolute 60-second deadline to wake and ca
   const cancel = vi.fn(async () => true);
   const actor = {
     idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
-    get: () => ({ ensureAwake: ensure, cancelWakeWaiter: cancel }),
+    get: () => ({ admitWake: ensure, cancelWakeWaiter: cancel }),
   };
   const controller = new AbortController();
   const before = Date.now();
@@ -1871,7 +2033,7 @@ it("a wake timeout cancels the waiter once, never forwards late success and keep
   const cancel = vi.fn(async () => true);
   const actor = {
     idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
-    get: () => ({ ensureAwake: ensure, cancelWakeWaiter: cancel }),
+    get: () => ({ admitWake: ensure, cancelWakeWaiter: cancel }),
   };
   vi.useFakeTimers();
   const pending = open({ bindings: { ...testEnv, DATABASE_ACTOR: actor } });

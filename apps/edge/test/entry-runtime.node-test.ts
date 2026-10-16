@@ -61,6 +61,11 @@ test("the actual pg default SCRAM client receives wrong-password failure from an
               namespace_id: "1",
               simple: { limit: 1000, period: 60 },
             },
+            {
+              name: "DATABASE_CONNECTION_RATE_LIMITER",
+              namespace_id: "3",
+              simple: { limit: 1000, period: 60 },
+            },
           ],
         },
       },
