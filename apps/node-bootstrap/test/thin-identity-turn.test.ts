@@ -364,3 +364,142 @@ test("the report is the turn's point of no return: a cancel during it waits for 
   assert.deepEqual(await outcome, { accepted: true });
   assert.equal(reports.length, 1);
 });
+
+// The cancel meets the turn's own aborts within milliseconds: whichever fired first, the turn ends
+// with a code the DO retries. A raw abort code would block the node.
+function raceScope() {
+  const input = identityWorld().input();
+  return {
+    callback: input.callback,
+    cluster_endpoint: input.cluster_endpoint,
+    talos_admin_config: input.talos_admin_config,
+    kubeconfig: input.kubeconfig,
+    address: input.lease.address,
+    budget_ms: 200,
+    deadline_code: "thin_storage_turn_timeout" as const,
+    prefix: "pgcf-race-",
+  };
+}
+const raceProxy = async () => ({
+  url: "http://127.0.0.1:1",
+  close: async () => {},
+});
+const endedWith = (run: Promise<unknown>) =>
+  run.then(
+    () => "succeeded",
+    (error) => (error instanceof BootstrapError ? error.code : String(error)),
+  );
+
+test("a deadline that fires before the cancel ends as the deadline, although the killed command closes after the cancel", async () => {
+  const cancel = new AbortController();
+  const outcome = await endedWith(
+    openThinSession(
+      raceScope(),
+      {
+        run: (command) =>
+          new Promise((_resolve, reject) => {
+            command.signal.addEventListener(
+              "abort",
+              () => {
+                setTimeout(
+                  () =>
+                    cancel.abort(
+                      new BootstrapError("thin_storage_turn_cancelled"),
+                    ),
+                  5,
+                );
+                setTimeout(
+                  () => reject(new BootstrapError("job_cancelled")),
+                  30,
+                );
+              },
+              { once: true },
+            );
+          }),
+        proxy: raceProxy,
+        signal: cancel.signal,
+      },
+      async (session) => await session.command("kubectl", ["get", "pods"]),
+    ),
+  );
+  assert.equal(outcome, "thin_storage_turn_timeout");
+});
+
+test("a cancel during the report, then the deadline cutting the report, ends as the deadline", async () => {
+  const cancel = new AbortController();
+  const outcome = await endedWith(
+    openThinSession(
+      raceScope(),
+      {
+        run: async () => ({ exit_code: 0, stdout: "" }),
+        request: (async (_url: unknown, init?: RequestInit) => {
+          cancel.abort(new BootstrapError("thin_storage_turn_cancelled"));
+          return await new Promise<Response>((_resolve, reject) => {
+            init!.signal!.addEventListener(
+              "abort",
+              () => reject(init!.signal!.reason),
+              { once: true },
+            );
+          });
+        }) as typeof fetch,
+        proxy: raceProxy,
+        signal: cancel.signal,
+      },
+      async (session) => await session.call({ kind: "report" }, true),
+    ),
+  );
+  assert.equal(outcome, "thin_storage_turn_timeout");
+});
+
+test("a read's own command timeout that meets the cancel ends as cancelled", async () => {
+  const cancel = new AbortController();
+  const outcome = await endedWith(
+    openThinSession(
+      { ...raceScope(), budget_ms: 60_000 },
+      {
+        // runCommand's own timer killed the process; the cancel lands before the close, which
+        // rejects with the first failure.
+        run: () =>
+          new Promise((_resolve, reject) => {
+            setTimeout(
+              () =>
+                cancel.abort(new BootstrapError("thin_storage_turn_cancelled")),
+              10,
+            );
+            setTimeout(() => reject(new BootstrapError("command_timeout")), 30);
+          }),
+        proxy: raceProxy,
+        signal: cancel.signal,
+      },
+      async (session) => await session.talos(["read", "/proc/modules"]),
+    ),
+  );
+  assert.equal(outcome, "thin_storage_turn_cancelled");
+});
+
+test("an external abort that is not the turn's cancel stays what it raised, even when the deadline fires too", async () => {
+  const external = new AbortController();
+  const outcome = await endedWith(
+    openThinSession(
+      raceScope(),
+      {
+        run: (command) =>
+          new Promise((_resolve, reject) => {
+            command.signal.addEventListener(
+              "abort",
+              () => reject(new BootstrapError("job_cancelled")),
+              { once: true },
+            );
+            setTimeout(
+              () => external.abort(new BootstrapError("job_cancelled")),
+              5,
+            );
+          }),
+        proxy: raceProxy,
+        signal: external.signal,
+      },
+      async (session) => await session.command("kubectl", ["get", "pods"]),
+    ),
+  );
+  assert.equal(outcome, "job_cancelled");
+});

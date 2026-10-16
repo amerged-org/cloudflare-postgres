@@ -707,7 +707,8 @@ export function thinLvmReadCommands(lvFields = THIN_LV_FIELDS): string[][] {
 export interface ThinSession {
   signal: AbortSignal;
   /** A `final` call is the turn's point of no return: it is not sent once the turn is cancelled, and
-   * once sent only the turn's deadline ends it, so Cloudflare's answer to it is never lost. */
+   * once sent only the turn's deadline or the call's own timeout ends it, so Cloudflare's answer to
+   * it is never lost. */
   call(body: unknown, final?: boolean): Promise<unknown>;
   command(
     executable: string,
@@ -919,16 +920,24 @@ export async function openThinSession<T>(
       );
     return await use({ signal, call, command, kube, get, list, talos });
   } catch (error) {
+    // The turn's cancel is the one external abort that may meet the deadline: whichever fired first,
+    // the turn's own deadline code is the failure it raised.
+    const turnCancelled =
+      options.signal?.aborted &&
+      options.signal.reason instanceof BootstrapError &&
+      options.signal.reason.code === "thin_storage_turn_cancelled";
+    const killedByAbort = (code: string) =>
+      code === "job_cancelled" || code === "command_timeout";
     if (
       scope.deadline_code &&
-      !options.signal?.aborted &&
+      (!options.signal?.aborted || turnCancelled) &&
       deadline.aborted &&
-      signal.reason === deadline.reason &&
       (error === deadline.reason ||
-        (error instanceof BootstrapError && error.code === "job_cancelled") ||
-        (error instanceof Error &&
-          error.name === "AbortError" &&
-          error.cause === deadline.reason))
+        (signal.reason === deadline.reason &&
+          ((error instanceof BootstrapError && killedByAbort(error.code)) ||
+            (error instanceof Error &&
+              error.name === "AbortError" &&
+              error.cause === deadline.reason))))
     )
       throw new BootstrapError(scope.deadline_code);
     // Only the turn's cancel, an abort for that reason, and only what it raised is a cancel: a failure
@@ -941,7 +950,7 @@ export async function openThinSession<T>(
       cancel.code === "thin_storage_turn_cancelled" &&
       signal.reason === cancel &&
       (error === cancel ||
-        (error instanceof BootstrapError && error.code === "job_cancelled") ||
+        (error instanceof BootstrapError && killedByAbort(error.code)) ||
         (error instanceof Error &&
           error.name === "AbortError" &&
           error.cause === cancel))

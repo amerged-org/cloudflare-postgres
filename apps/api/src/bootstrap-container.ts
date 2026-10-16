@@ -315,12 +315,15 @@ async function statusIdentifierHash(value: string) {
   );
 }
 
+interface ThinTurn {
+  generations: ReadonlyMap<string, number>;
+  supersede: () => void;
+}
+
 export class NodeBootstrap extends DurableObject<Env> {
   /** The read-only identity turn this instance follows now: the generation of each database its input
    * was read with, and how to supersede it. Memory only: a restarted instance follows no turn. */
-  #thinTurn:
-    | { generations: ReadonlyMap<string, number>; supersede: () => void }
-    | undefined;
+  #thinTurn: ThinTurn | undefined;
   async rotateRegionAuthority(value: FleetRegionMaterialRotationInput) {
     const input = FleetRegionMaterialRotationInput.parse(value);
     if (
@@ -517,12 +520,14 @@ export class NodeBootstrap extends DurableObject<Env> {
     const current = await thinStorageInput(this.env, nodeId);
     if (current.lease.revision !== input.lease.revision)
       throw new Error("thin_storage_container_input_changed");
-    // Only a turn without a pool action may end early: its every command is a read, so ending it leaves
-    // no write whose outcome is uncertain. A turn with an action always runs to its own end.
+    // Only a turn without a pool action may end early: it reads, and a class creation it may run is
+    // read back by the next turn, so ending it leaves no write whose outcome is uncertain. A turn with
+    // an action always runs to its own end.
+    let mine: ThinTurn | undefined;
     const superseded =
       current.lease.action === null
         ? new Promise<void>((supersede) => {
-            this.#thinTurn = {
+            mine = this.#thinTurn = {
               generations: new Map(
                 current.lease.databases.map((d) => [d.id, d.generation]),
               ),
@@ -544,7 +549,7 @@ export class NodeBootstrap extends DurableObject<Env> {
       95_000,
       superseded,
     ).finally(() => {
-      this.#thinTurn = undefined;
+      if (this.#thinTurn === mine) this.#thinTurn = undefined;
     });
     // Only a turn this instance could supersede ends as superseded; any other cancel is uncertain.
     const cancelled =
