@@ -1204,6 +1204,11 @@ impl PowerCoordinator {
     /// `map` as it was read when the slot was claimed, with the running intent and the slot's
     /// admission target, then the release control of every gateway. The power record stays the
     /// sleep's until Cloudflare confirms the wake, so an unconfirmed claim can be undone.
+    ///
+    /// A gateway releases its held connections from the fence its watch delivers; the control is
+    /// its acknowledgement only. Once the write committed, the release is made: a refused control
+    /// (a watch that lags, a gateway that restarts) is asked again by the pass that publishes the
+    /// confirmed wake, and never undoes a release gateways may already route by.
     pub(crate) async fn release_slot(
         &self,
         db: &Value,
@@ -1240,7 +1245,9 @@ impl PowerCoordinator {
                 return Err(Fault::Unavailable("slot_release_unknown"));
             }
             self.bind_fence(db, &written).await?;
-            self.controls(intent, &snapshot?, "release").await?;
+            if let Ok(snapshot) = snapshot {
+                let _ = self.controls(intent, &snapshot, "release").await;
+            }
             Ok(written)
         }
         .await;

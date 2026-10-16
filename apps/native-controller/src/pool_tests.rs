@@ -1259,6 +1259,41 @@ mod world {
     }
 
     #[tokio::test]
+    async fn a_release_control_refused_after_the_fence_write_keeps_serving_the_released_slot() {
+        let mut w = World::pooled().await;
+        // A gateway whose watch lags answers the release control 409 throughout: the fence is
+        // what releases held connections, and it already names the slot.
+        *w.gateway.refuse_releases.lock().unwrap() = u32::MAX;
+        let wake = delivered_wake(&mut w).await;
+        let target: Value =
+            serde_json::from_str(fence(&w)["data"]["admission_target"].as_str().unwrap()).unwrap();
+        assert_eq!(target["pod_uid"], slot_pod_uid());
+        assert!(w.reconciler.pool.serves(&w.id));
+        assert!(w.reconciler.pool.unwinding().is_empty());
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_some());
+        assert!(
+            cluster(&w, &slot_ns())["metadata"]["annotations"]["cnpg.io/fencedInstances"].is_null()
+        );
+        eventually("the hit result", || result_of(&w, "hit").is_some()).await;
+        assert!(result_of(&w, "miss").is_none());
+        // The pass after Cloudflare's confirmation asks the release of every gateway again.
+        *w.gateway.refuse_releases.lock().unwrap() = 0;
+        w.claimed(&wake);
+        let db = w.db.clone();
+        w.reconciler
+            .pool
+            .confirm_tickets(|id| (id == db["id"]).then_some(&db), Instant::now());
+        w.fresh_authority();
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .expect("an observation");
+        assert_eq!(observed["state"], "ready", "{observed}");
+    }
+
+    #[tokio::test]
     async fn a_slot_served_sleep_proves_the_archived_segment_fences_records_deletes_and_releases() {
         let mut w = World::pooled().await;
         confirmed(&mut w).await;
