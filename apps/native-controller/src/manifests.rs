@@ -731,7 +731,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no {kind}"))
     }
     #[test]
-    fn the_slot_is_fenced_tenant_free_pinned_to_its_node_with_a_1gi_placeholder_whose_class_deletes_it() {
+    fn the_slot_is_fenced_tenant_free_pinned_to_its_node_with_a_1gi_placeholder_whose_class_deletes_it()
+     {
         let ctx = vector("entry-request-limit-split")["ctx"].clone();
         let slot = slot(&slot_spec(), &ctx).unwrap();
         let ns = "pgcf-slot-0a1b2c3d";
