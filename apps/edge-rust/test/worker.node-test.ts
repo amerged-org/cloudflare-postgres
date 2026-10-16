@@ -767,8 +767,9 @@ test(
             assert.equal(value.database, database);
             assert.equal(value.user, "app");
             assert.ok(
-              value.options.deadline >= started + 29000 &&
-                value.options.deadline <= Date.now() + 30000,
+              value.options.deadline >=
+                started + ADMISSION_DEADLINE_MS - 1000 &&
+                value.options.deadline <= Date.now() + ADMISSION_DEADLINE_MS,
             );
           }
           await DB.prepare(
