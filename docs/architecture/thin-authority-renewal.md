@@ -170,7 +170,7 @@ code, renews nothing and starts a slow turn at once (section 5).
 
 - The nonce is current. Node UID, cluster UID, boot ID, VG UUID, driver Pod UID and image digest
   equal the identity proof's. The identity proof is unexpired and the node `ready` and qualified
-  (`qualifiedThinStorageSql`, dom/node-thin-storage.ts:49-69).
+  (`qualifiedThinStorageSql` in its `continuing` mode, section 6.1).
 - `physical` parses as `NodePhysicalStorage` with a pool whose metadata size equals the profile's and
   whose data size lies between the identity proof's and the profile maximum.
 - Every linear LV is one of the identity proof's. Every thin LV is one of its thin LVs or one of at
@@ -308,6 +308,8 @@ dom/storage-capacity.ts:265-270, ct/database-storage.ts:353-379, nc/reconcile.rs
 | --- | --- |
 | Samples stop (controller down, exporter or API-server proxy failing) | Authority ends at the last nonce + guard. The gateway refuses further frontend bytes (gw/transport.rs:877-881); the host guard suspends the LV with `NOFLUSH` and `SKIP_LOCKFS` and stops the Pod's tasks (sc/storage.rs:806-838, sc/storage_dm.rs:193-204); the controller writes its protection marker and hibernates the Cluster with `stopDelay = drain_seconds` (nc/power.rs:2662-2689). The next slow proof records the protection, and once authority is current again the capacity turn resumes the database at a new generation (ops:314-319). Committed data survives; uncommitted work is dropped and never replayed (`resume_marker`, `noflush_quiescence`). |
 | Controller restart or rollout | The controller is one `Recreate` replica (infra/platform/regional/agent.yaml:10-13). A gap longer than the remaining validity acts as above on every awake thin database of the region. |
+| Fleet rollout that pins the same thin facts | Authority continues: section 6.1. |
+| Fleet rollout that changes a pinned fact | Samples are refused and the controller is given no sampling target from the assignment; the entry loses its token and the host guard acts as for stopped samples. Authority returns after the node's patch completed and one identity proof read the new assignment. |
 | Cloudflare API or D1 unavailable while the Edge still routes | As above, within one guard. Thick and standard-runtime databases are unaffected. |
 | A witness or the LV set differs from the identity proof | Sample refused with its code; slow turn at once; no renewal until a proof matches. |
 | Headroom below the minimum | Renewal with `write_allowed=false`: no tokens, protective stops as above, growth requested while the pool can grow. |
@@ -318,6 +320,32 @@ dom/storage-capacity.ts:265-270, ct/database-storage.ts:353-379, nc/reconcile.rs
 | Slow turns failing transiently | Identity stays valid until its expiry while turns retry; writes stop only if no proof succeeds within 300 s. |
 | A lease that is slow or fails (D1 queueing, a Worker restart, a request that hangs to the guard's 5 s timeout) | One request that hangs delays nothing: the next goes out one second later on a connection of its own. If none returns, the guard keeps its last accepted lease and each entry runs down to its own token's expiry, at most `guard_seconds` after the nonce it was signed from, minus the lease's age at receipt; then it stops the Pod's tasks and freezes the volume (sc/storage.rs@e4b8873:579-595, 764-877). Every thin database of the node is affected alike, and the controller stops one whose token its samples stopped renewing. The lease's cost does not depend on the number of databases. |
 | One entry of a lease the guard refuses | The guard accepts a lease whole or not at all (sc/storage.rs@e4b8873:182-365): a token that fails verification, names another Pod at the same or a lower generation than the one accepted before, or differs at an authority revision it already holds refuses every entry, and a token for a Pod the sandbox runtime has not assigned was dropped by the persistence step before acceptance (sc/storage.rs@e4b8873:701-708, sc/controller.rs@e4b8873:779-806). The other entries then run down as above. The persistence step no longer gates acceptance: such a token is accepted with its lease and reported once per Pod, but only a Pod the runtime has can become the database's retained scope. |
+
+### 6.1 Fleet rollouts
+
+A rollout assigns the region, every node and every pool policy a new release in one batch, and the
+patch of each node follows serially. The strict qualification binds a node to the assigned release
+by its label (release id, spec hash, assignment and region revision), so it would pause every
+thin node for the whole rollout. The facts the qualification depends on are not labels:
+
+- `continuing` qualification keeps the receipt's facts, the authority keys, the host configuration
+  sha, the boot id, node, cluster and material, and takes the completed patch from the assigned
+  release or from any release with the same `thinContinuitySql` text: the receipt, the authority
+  keys, the OS block of the node's role, and the pins that restart or reconfigure the node or a
+  database outside Cloudflare's start admission (`openebs-lvm`, `sandbox-controller`, `postgres`,
+  `barman`, `cloudnative-pg`, the role's Talos extensions). The controller observation of a new
+  assignment may take 300 s instead of 180 s to arrive.
+- It governs what renews or delivers the authority of a writer that already runs: the sample's
+  compare-and-set and target, the node entry and tokens of the desired page, the host lease, and the
+  lease and sealed host custody of the identity turn. The executor accepts custody sealed under an
+  earlier release: its keys, node bindings and bytes decide.
+- The strict predicate keeps governing placement, wake, resume, hold release, deletion proofs,
+  selection and qualification runs, and the end of a rollout (`complete` patch, placement reopening).
+- The sampling wire is withdrawn only for a member whose latest completed patch was of a release
+  without the protocol.
+- A changed extension, kernel, OS block, key, runtime image or PostgreSQL pin is strict from the
+  assignment; so is a host configuration rewritten with other content. A halted patch never loosens
+  a changed fact, and the boot id and node identity are compared in every sample.
 
 ## 7. Trust argument
 
@@ -460,6 +488,14 @@ produced EU1's receipt, and any change of kernel, driver image or host extension
    slow turn; the next proof releases its hold.
 9. **Transient relay failure.** Restart the relay during a slow turn: the turn retries, the node stays
    `ready` and writes continue.
+10. **Rollout that pins the same facts.** Roll out a release that changes only the controller, gateway
+    or API digest while awake thin databases write: the longest accepted-sample interval stays below
+    `guard/2` for the whole rollout except for the controller replacement of test 4, `storage_nodes`
+    and the database token stay in every desired page, and the observation age at the first
+    accepted sample after the assignment is recorded against the 300 s bound of section 6.1.
+11. **Rollout that changes a pinned fact.** Roll out a release with another host extension digest:
+    samples are refused from the assignment, the entry loses its token, the guard acts as in test 3,
+    and authority returns after the node's patch completed and one proof.
 
 ## 12. Rejected options
 

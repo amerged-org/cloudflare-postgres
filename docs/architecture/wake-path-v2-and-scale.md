@@ -463,28 +463,23 @@ experiment (it removes a known 6.2 statements/s per node).
   last sample 01:07:16Z, rollout start 01:07:19Z, sampling back at convergence about 01:45Z); awake thin
   databases lose their 10 s tokens and the host guard kills their Pods. Until authority continuity across
   patches that change no qualification fact exists, every rollout needs a maintenance window.
-- **Rollout-safe authority (design complete, not implemented).** Cause: two gates bind authority to
-  the release's labels (release id, spec hash, assignment and region revision) instead of to the facts
-  the qualification depends on. `createFleetRollout` moves every label in one batch, so every gate is
-  stale at once: `thinStorageSamplingSql` (no sampling target, no composed entry, 404 on the sample
-  route), `readThinStorageLeaseRow` (no identity lease; authority cannot outlive its proof of 300 s) and
-  `qualifiedThinStorageSql` (11 labels, one a hash that embeds the release id). Proposal: a
-  `continuing` qualification class that keeps the fact equalities (receipt facts, authority keys, OS and
-  pin block, host configuration sha, boot id) and drops the labels, evaluated by a `continuity(spec,
-  role)` SQL text; samples, tokens, desired page and identity turns continue through a rollout whose
-  patches change none of those facts; placement, wake, hold release, deletion, selection and
-  qualification runs stay strict; extension, kernel, OS or key changes stay strict from assignment. A
-  further hazard it exposes: each rollout resizes every database for a release-id-only stamp
-  (`postgres` stage), which strict admission refuses, so that stage must select by (image, version,
-  schema). Stages ship together (predicates, lease evidence, strict consumers, `postgres` selection);
-  17 failing tests are listed first (continuing: samples and tokens continue, desired page keeps the
-  target, lease keeps the boot, turn accepted under the new assignment, two rollouts in a row, halt at
-  `regional`, rollback; strict: other extension digest, installer only, host record rewritten, boot id,
-  halt at `host_config`, replacement node, strict admissions, wire capability, continuity text). Open:
-  a controller `Recreate` gap longer than the 10 s guard still stops awake databases (measure), the
-  age of the first revision-matching observation (up to 180 s today, 300 s proposed), whether Flux
-  restarts the OpenEBS driver on an unrelated release, and the owner's choice of which pins belong to
-  the continuity set. Prerequisite: the lease work (deployed 2026-10-16).
+- **Rollout-safe authority (implemented, not yet deployed or accepted live).** A `continuing`
+  qualification class keeps the fact equalities of `qualifiedThinStorageSql` (receipt facts, authority
+  keys, host configuration sha, boot id, node, cluster, material) and drops the release id, spec hash,
+  assignment and region revision. The node's completed patch may be that of any release whose
+  `thinContinuitySql` text equals the assigned release's: receipt, authority keys, OS block, and the
+  `openebs-lvm`, `sandbox-controller`, `postgres`, `barman`, `cloudnative-pg` and Talos extension pins.
+  Samples, the sampling target, the desired page's node entry and tokens, the host lease and the
+  identity turn (lease evidence by fact, host custody read sealed, the executor no longer compares the
+  custody's release label) continue through a rollout that changes none of them. The sampling wire
+  gate asks that the latest completed patch of every member declared the protocol; the `postgres`
+  stage selects by (image, version, schema). Placement, wake, hold release, deletion proofs,
+  selection and qualification runs stay on the strict predicate; a changed extension, kernel, OS,
+  key, runtime image or PostgreSQL pin is strict from the assignment. Open: live acceptance (sample
+  and token continuity across a rollout that changes only the controller digest, strict refusal after
+  an extension change), the controller `Recreate` gap against the 10 s guard, the observation age
+  bound of `continuing` (300 s), whether Flux restarts the OpenEBS driver on an unrelated release, and
+  the owner's choice of the pin set and of waking during a rollout.
 - A guard above about 11 s cannot qualify: a qualification sample counts only when its nonce was issued
   inside the gate's window and the next sample also arrives inside it, and `startup_bound`'s window is
   4.7 s on EU1; guard 30 s failed (`thin_qualification_startup_bound_failed`).

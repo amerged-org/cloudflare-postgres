@@ -272,7 +272,9 @@ receipt exists, so the release's own patch makes the module live. The region rel
 `thin_storage_sampling_version: 1` and its sampling controllers must have confirmed patches before
 selection or qualification is accepted (otherwise HTTP 409). The capability marker stays in
 Cloudflare; the desired fleet-release wire view omits it. Composed inventory authorities and
-sampling targets are withheld from controllers without this capability. Thin storage also requires the
+sampling targets are withheld from controllers without this capability: the region's release declares
+it and the latest completed patch of every member was of a release that declares it, so a rollout
+between two such releases does not withdraw it. Thin storage also requires the
 region capacity policy's `compute_pool`: activation and write authority bind the patch's runtime
 admission, which is recorded only while that policy is set. Once the node's current release patch
 has completed with its host configuration, a successful PUT starts the Native executor. Its one

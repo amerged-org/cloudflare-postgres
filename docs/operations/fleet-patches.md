@@ -39,11 +39,30 @@ Talos/Kubernetes transport without Contabo, Rescue, disk reinstallation or SSH.
    create another operation to bypass uncertainty.
 
 One active patch owns regional maintenance. New placement is closed on the current regional
-members; existing exclusions remain. Existing databases retain data and may experience visible
-maintenance downtime in this single-node topology. Completion restores only operation-owned
-closures with unchanged physical identities only after every member finishes its final pass.
-An operator closure change blocks authority. This
-maintenance rule is separate from continued placement while a76% capacity expansion is prepared.
+members; existing exclusions remain. Completion restores only operation-owned closures with
+unchanged physical identities only after every member finishes its final pass. An operator closure
+change blocks authority. This maintenance rule is separate from continued placement while a76%
+capacity expansion is prepared.
+
+Existing databases keep their data. What an awake thin database sees depends on the release:
+
+- A release that pins the same thin facts as the one the node was patched and proven with (it moves
+  only the API, Edge, bootstrap, controller, gateway, Flux, cert-manager, Cloudflared or Cilium pins
+  and the platform source) leaves thin write authority continuous in Cloudflare: samples, tokens, the
+  host guard's lease and the identity proofs continue through the rollout. Placement, wake, resume
+  and selection wait for the node's patch to complete and for one identity proof of the new
+  assignment. What a release restarts on the node is not decided here: the controller is one
+  `Recreate` replica, and its replacement, a restarted OpenEBS driver Pod or a restarted Kubernetes
+  API server can interrupt sampling for longer than the guard, which stops the awake databases and
+  resumes them when sampling returns.
+- A release that changes a pinned fact (host extension, kernel, Talos installer, schematic, version
+  or extensions, Kubernetes version or images, driver, thin profile, authority keys, sandbox runtime
+  image, `postgres`, `barman`, `cloudnative-pg`, or the host custody's content) pauses authority at
+  the assignment. The guard stops awake thin databases until the new patch completed and the node
+  was proven again: plan a maintenance window for it.
+
+The `postgres` stage restarts only databases whose PostgreSQL image, version or configuration schema
+differ from the release's; a release that changes none of them restarts none.
 
 ## Programmed stages and readbacks
 
