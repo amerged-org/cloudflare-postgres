@@ -34,7 +34,9 @@ are later work; removing a referenced key makes recovery impossible.
 `API_KEY_PEPPER` binds existing API and agent key hashes. Changing it requires a coordinated
 rehash of known retained keys and private custody; replacing the Worker secret alone is not a
 supported rotation. There is no agent-key rotation API in v1. Keep the current imported agent
-identity until that coordinated operation has been implemented and checked.
+identity until that coordinated operation has been implemented and checked. A Worker isolate keeps
+a region's agent key hash for 5 s (`AGENT_REGION_CACHE_MS`), so a change made in D1 itself stops
+authenticating the old key everywhere within that time and accepts the new key at once.
 
 ## R2, Tunnel and provider credentials
 

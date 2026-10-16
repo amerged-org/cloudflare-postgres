@@ -9,6 +9,7 @@ import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   // Existing fixture cleanup removes assigned rows through their node/region FKs.
   await cleanupFixtures();
@@ -238,6 +239,10 @@ it("compares the complete fresh component inventory and invalidates changed iden
   expect(
     await (await request(`/v1/nodes/${f.node}/release`, f.admin)).json(),
   ).toMatchObject({ state: "pending" });
+  // The rotation is out of band: an agent request is refused once the row an isolate cached
+  // before it has aged out, at most ten seconds on.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.now() + 10_000);
   expect(
     (
       await request(
@@ -248,6 +253,7 @@ it("compares the complete fresh component inventory and invalidates changed iden
       )
     ).status,
   ).toBe(401);
+  vi.useRealTimers();
   await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
     .bind(crypto.randomUUID(), f.node)
     .run();
