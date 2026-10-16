@@ -133,8 +133,11 @@ const OWN_WRITES_PER_OBJECT: usize = 16;
 /// name is for the log that says what made a database due; it never reaches a decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trigger {
+    /// Empty for an object of a free pool slot.
     pub database: String,
     pub name: String,
+    /// The pool slot whose object changed: the hex of its `pgcf-slot-<hex>` namespace.
+    pub slot: Option<String>,
 }
 /// What the watch holds of one object: its identity and version, and the shape of the rest of
 /// its metadata.
@@ -180,6 +183,8 @@ struct WatchContinuity {
     settle: Duration,
     /// What the controller last read or wrote of an object, as it was found.
     remembered: HashMap<(String, String, String), Remembered>,
+    /// The database each claimed pool slot namespace serves (pool design 2026-10-16).
+    slots: HashMap<String, String>,
     /// A test that pins how reads are made when the watch cannot vouch for what was read turns
     /// the memory off.
     #[cfg(test)]
@@ -215,6 +220,7 @@ impl Default for WatchContinuity {
             written: HashMap::new(),
             settle: OWN_WRITE_SETTLE,
             remembered: HashMap::new(),
+            slots: HashMap::new(),
             #[cfg(test)]
             recalling: true,
         }
@@ -284,6 +290,17 @@ impl WatchContinuity {
             (kind.to_string(), namespace.to_string(), name.to_string()),
             entry,
         );
+    }
+    /// Records which database a slot namespace serves, `None` for none.
+    fn index_slot(&mut self, namespace: &str, database: Option<&str>) {
+        match database {
+            Some(database) => {
+                self.slots.insert(namespace.into(), database.into());
+            }
+            None => {
+                self.slots.remove(namespace);
+            }
+        }
     }
     fn connected(&mut self, kind: &str, version: &str) {
         self.kinds
@@ -454,12 +471,27 @@ impl WatchContinuity {
             return Ok((version.to_string(), None));
         }
         let labelled = text(&meta["labels"], "pgcf.io/database-id");
-        let id = if labelled.is_empty() {
+        // An object of a pool slot names its slot, and the database while one is claimed.
+        let home = if kind == "Namespace" {
+            text(meta, "name")
+        } else {
+            text(meta, "namespace")
+        };
+        let slot = pgcf_native_protocol::wake::is_slot_namespace(home)
+            .then(|| home[pgcf_native_protocol::wake::SLOT_NAMESPACE_PREFIX.len()..].to_string());
+        let served = slot
+            .as_ref()
+            .and_then(|_| self.slots.get(home))
+            .cloned()
+            .unwrap_or_default();
+        let id = if !labelled.is_empty() {
+            labelled
+        } else if slot.is_some() {
+            served.as_str()
+        } else {
             text(meta, "namespace")
                 .strip_prefix("pgcf-db-")
                 .unwrap_or("")
-        } else {
-            labelled
         };
         // The records of pgcf-system are written by this controller alone, the sampler's ledger
         // every two seconds among them: a change of one is its own, and a deleted one is news.
@@ -469,14 +501,19 @@ impl WatchContinuity {
             && text(meta, "namespace") == "pgcf-system"
             && event_type != "DELETED";
         let status_of_cnpg = kind == "Cluster" && status_only;
-        let hint = (pgcf_native_protocol::valid_pattern("database", id)
+        let hint = ((pgcf_native_protocol::valid_pattern("database", id) || slot.is_some())
             && !own_record
             && !status_of_cnpg
             && !self.own(kind, object))
         .then(|| Candidate {
             trigger: Trigger {
-                database: id.to_string(),
+                database: if pgcf_native_protocol::valid_pattern("database", id) {
+                    id.to_string()
+                } else {
+                    String::new()
+                },
                 name: text(meta, "name").to_string(),
+                slot: slot.clone(),
             },
             kind: kind.to_string(),
             namespace: text(meta, "namespace").to_string(),
@@ -617,6 +654,14 @@ fn is_object(value: &Value, kind: &str, namespace: Option<&str>, name: &str) -> 
         && namespace.is_none_or(|ns| text(&value["metadata"], "namespace") == ns)
 }
 impl Kubernetes {
+    /// Records which database the slot namespace `namespace` serves (`None`: none), so that a
+    /// change of its objects hints that database.
+    pub fn index_slot(&self, namespace: &str, database: Option<&str>) {
+        self.continuity
+            .lock()
+            .unwrap()
+            .index_slot(namespace, database);
+    }
     pub fn runtime_continuity(&self) -> Option<(String, u64)> {
         self.continuity.lock().unwrap().snapshot()
     }
@@ -1767,6 +1812,75 @@ mod tests {
         assert!(state.event("Pod", &pod("20")).unwrap().1.is_some());
         assert!(state.event("Pod", &pod("21")).unwrap().1.is_some());
     }
+    #[test]
+    fn a_slot_object_hints_its_slot_and_the_database_that_claimed_it() {
+        let mut state = WatchContinuity::default();
+        let namespace = "pgcf-slot-0a1b2c3d";
+        let pod = |version: &str| {
+            meta_event(
+                "Pod",
+                "MODIFIED",
+                serde_json::json!({"name":"database-1","namespace":namespace,"uid":"u-1","resourceVersion":version,"labels":{"pgcf.io/slot":"0a1b2c3d"}}),
+            )
+        };
+        // A free slot is no database's: its objects hint the slot alone.
+        let free = state.event("Pod", &pod("1")).unwrap().1.unwrap().trigger;
+        assert_eq!(
+            free,
+            Trigger {
+                database: String::new(),
+                name: "database-1".into(),
+                slot: Some("0a1b2c3d".into())
+            }
+        );
+        // Claimed, they hint the database it serves as well.
+        state.index_slot(namespace, Some("dbbbbbbbbbbbbbbbbbbb"));
+        let claimed = state.event("Pod", &pod("2")).unwrap().1.unwrap().trigger;
+        assert_eq!(claimed.database, "dbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(claimed.slot.as_deref(), Some("0a1b2c3d"));
+        // The slot namespace itself names its slot.
+        let deleted = meta_event(
+            "Namespace",
+            "DELETED",
+            serde_json::json!({"name":namespace,"uid":"u-2","resourceVersion":"3","labels":{"pgcf.io/slot":"0a1b2c3d"}}),
+        );
+        let gone = state
+            .event("Namespace", &deleted)
+            .unwrap()
+            .1
+            .unwrap()
+            .trigger;
+        assert_eq!(gone.slot.as_deref(), Some("0a1b2c3d"));
+        assert_eq!(gone.database, "dbbbbbbbbbbbbbbbbbbb");
+        state.index_slot(namespace, None);
+        assert_eq!(
+            state
+                .event("Pod", &pod("4"))
+                .unwrap()
+                .1
+                .unwrap()
+                .trigger
+                .database,
+            ""
+        );
+        // A namespace that only looks like one is not a slot.
+        let other = meta_event(
+            "Pod",
+            "MODIFIED",
+            serde_json::json!({"name":"x","namespace":"pgcf-slot-0A1B2C3D","uid":"u-3","resourceVersion":"5"}),
+        );
+        assert_eq!(state.event("Pod", &other).unwrap().1, None);
+        // A database's own objects carry no slot.
+        let tenant = meta_event(
+            "Pod",
+            "MODIFIED",
+            serde_json::json!({"name":"database-1","namespace":"pgcf-db-dbbbbbbbbbbbbbbbbbbb","uid":"u-4","resourceVersion":"6"}),
+        );
+        assert_eq!(
+            state.event("Pod", &tenant).unwrap().1.unwrap().trigger.slot,
+            None
+        );
+    }
     /// Opens the metadata watch of `kind` on the double and waits until it is established.
     async fn watching(
         server: &crate::test_server::Server,
@@ -1898,7 +2012,8 @@ mod tests {
             hint,
             Trigger {
                 database: id.into(),
-                name: "maintenance-credentials".into()
+                name: "maintenance-credentials".into(),
+                slot: None
             }
         );
         watch.abort();
@@ -2096,6 +2211,7 @@ mod tests {
         let trigger = Trigger {
             database: id.to_string(),
             name: name.clone(),
+            slot: None,
         };
         let (version, candidate) = server.k8s.watch_event("Secret", &other).unwrap();
         assert_eq!(

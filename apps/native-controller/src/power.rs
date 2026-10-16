@@ -1151,6 +1151,18 @@ impl PowerCoordinator {
             rv(&secret)?.into(),
         ))
     }
+    /// The gateway Pods controls and wake polls go to.
+    pub(crate) async fn gateway_pods(&self) -> std::result::Result<Vec<GatewayPod>, Error> {
+        Ok(self.gateways().await?)
+    }
+    /// The regional keyring the controller signs gateway and agent tokens with: its active key
+    /// ID and every key.
+    pub(crate) async fn regional_keys(
+        &self,
+    ) -> std::result::Result<(String, HashMap<String, Vec<u8>>), Error> {
+        let (active, keys, _, _) = self.keyring().await?;
+        Ok((active, keys))
+    }
     pub async fn gateway_snapshot(&self) -> std::result::Result<GatewaySnapshot, Error> {
         Ok(tokio::time::timeout(Duration::from_secs(3), self.snapshot()).await??)
     }

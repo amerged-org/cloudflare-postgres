@@ -76,7 +76,23 @@ pub struct Gateway {
     /// How many releases the endpoint still refuses with 409 `control_intent_mismatch`, as a
     /// gateway does until its watch has seen the intent the controller wrote.
     pub refuse_releases: Arc<Mutex<u32>>,
+    /// The wake long-poll and the wake results of the gateways (pool design 2026-10-16).
+    pub wake: Arc<Mutex<WakeDouble>>,
     task: tokio::task::JoinHandle<()>,
+}
+/// What the gateways' wake endpoints hold and received.
+#[derive(Default)]
+pub struct WakeDouble {
+    /// The gateway Pod UID by address; an address not here answers for `Gateway::pod`.
+    pub pods: HashMap<String, String>,
+    /// Wakes queued per gateway address, delivered by its next poll.
+    pub queued: HashMap<String, Vec<pgcf_native_protocol::wake::WakeRequest>>,
+    /// Addresses whose gateway predates the wake poll: it answers 404.
+    pub old: std::collections::HashSet<String>,
+    /// Every accepted poll, as (address, gateway Pod UID).
+    pub polls: Vec<(String, String)>,
+    /// Every wake result, as (address, body).
+    pub results: Vec<(String, Value)>,
 }
 impl Drop for Gateway {
     fn drop(&mut self) {
@@ -101,16 +117,19 @@ impl Gateway {
         let current = pod.clone();
         let refuse_releases: Arc<Mutex<u32>> = Arc::default();
         let refusing = refuse_releases.clone();
+        let wake: Arc<Mutex<WakeDouble>> = Arc::default();
+        let waking = wake.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (served, log, current, refusing) = (
+                let (served, log, current, refusing, waking) = (
                     served.clone(),
                     log.clone(),
                     current.clone(),
                     refusing.clone(),
+                    waking.clone(),
                 );
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
@@ -122,17 +141,131 @@ impl Gateway {
                         bytes.push(byte[0]);
                     }
                     let header = String::from_utf8(bytes).unwrap();
-                    let action = header
+                    let target = header
                         .lines()
                         .next()
                         .unwrap()
                         .split_whitespace()
                         .nth(1)
                         .unwrap()
-                        .rsplit('/')
-                        .next()
-                        .unwrap()
                         .to_string();
+                    let action = target.rsplit('/').next().unwrap().to_string();
+                    // The proxy request names the address it is for: `http://<ip>:<port>/<path>`.
+                    let address = target
+                        .strip_prefix("http://")
+                        .and_then(|rest| rest.rsplit_once(':').map(|(host, _)| host))
+                        .unwrap_or("")
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .to_string();
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0; length];
+                    if socket.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let reply = |status: u16, body: String| {
+                        format!(
+                            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    if action == "wakes" || action == "wake-result" {
+                        let (pod, old) = {
+                            let state = waking.lock().unwrap();
+                            (
+                                state
+                                    .pods
+                                    .get(&address)
+                                    .cloned()
+                                    .unwrap_or_else(|| current.lock().unwrap().clone()),
+                                state.old.contains(&address),
+                            )
+                        };
+                        if old {
+                            let _ = socket
+                                .write_all(
+                                    reply(404, "{\"error\":\"unknown_action\"}".into()).as_bytes(),
+                                )
+                                .await;
+                            return;
+                        }
+                        let token = header.lines().find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| {
+                                    name.eq_ignore_ascii_case(
+                                        pgcf_native_protocol::wake::POLL_HEADER,
+                                    )
+                                })
+                                .map(|(_, value)| value.trim().to_string())
+                        });
+                        let keys = HashMap::from([("local".to_string(), vec![7_u8; 32])]);
+                        if pgcf_native_protocol::wake::verify_poll(
+                            token.as_deref(),
+                            &keys,
+                            "eu-test",
+                            &pod,
+                            &action,
+                            now_ms(),
+                        )
+                        .is_none()
+                        {
+                            let _ = socket
+                                .write_all(
+                                    reply(401, "{\"error\":\"wake_denied\"}".into()).as_bytes(),
+                                )
+                                .await;
+                            return;
+                        }
+                        if action == "wake-result" {
+                            let result: Value = serde_json::from_slice(&body).unwrap();
+                            log.lock().unwrap().push(
+                                format!(
+                                    "GATEWAY wake-result {} {}",
+                                    result["outcome"].as_str().unwrap_or(""),
+                                    result["reason"].as_str().unwrap_or("")
+                                )
+                                .trim_end()
+                                .to_string(),
+                            );
+                            waking.lock().unwrap().results.push((address, result));
+                            let _ = socket.write_all(reply(200, "{}".into()).as_bytes()).await;
+                            return;
+                        }
+                        assert!(body.is_empty(), "a wake poll has no body");
+                        // An empty poll is held a moment, as the gateway holds it until a wake.
+                        let mut held = 0;
+                        waking
+                            .lock()
+                            .unwrap()
+                            .polls
+                            .push((address.clone(), pod.clone()));
+                        let wakes = loop {
+                            let wakes = waking
+                                .lock()
+                                .unwrap()
+                                .queued
+                                .remove(&address)
+                                .unwrap_or_default();
+                            if !wakes.is_empty() || held >= 5 {
+                                break wakes;
+                            }
+                            held += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        };
+                        let answer = pgcf_native_protocol::wake::WakePoll { pod, wakes };
+                        let _ = socket
+                            .write_all(
+                                reply(200, serde_json::to_string(&answer).unwrap()).as_bytes(),
+                            )
+                            .await;
+                        return;
+                    }
                     if action == "metrics" {
                         let body = served.lock().unwrap().clone();
                         let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
@@ -193,6 +326,7 @@ impl Gateway {
             metrics,
             pod,
             refuse_releases,
+            wake,
             task,
         }
     }
