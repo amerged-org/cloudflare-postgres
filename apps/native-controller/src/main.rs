@@ -2218,6 +2218,49 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_wake_is_due_again_when_its_proof_renews_and_not_before() {
+        // The pass of the wake met no change of anyone else: the cell was not hinted while it
+        // ran, so the pass settles at the marker it started at. Nothing is due then until the
+        // attestation has to be renewed, which is inside its lifetime.
+        let start = Instant::now();
+        let wall = clock_ms();
+        let ttl = pgcf_native_controller::contracts::constant("DATABASE_RUNTIME_PROOF_MAX_AGE_MS")
+            .as_u64()
+            .unwrap();
+        let mut entry = cell(wake("db", &operation(1)), start, false);
+        let marker = entry.hints;
+        settle(
+            &mut entry,
+            start,
+            Some(
+                &json!({"state":"ready","runtime_attestation":{"v":2,"observation":{"expires_at":u64::try_from(wall).unwrap()+ttl}}}),
+            ),
+            marker,
+        );
+        assert!(entry.ready);
+        let cells = HashMap::from([("db".to_owned(), entry)]);
+        let due = |second: u64| {
+            schedule(
+                &cells,
+                &Renewals::default(),
+                &HashMap::new(),
+                start + Duration::from_secs(second),
+                wall + i128::from(second * 1000),
+                true,
+            )
+        };
+        let renews = ttl / 1000 / 2;
+        for second in [0, 1, renews / 2, renews - 1] {
+            assert!(due(second).is_empty(), "due at {second} s");
+        }
+        assert_eq!(
+            due(renews + 1),
+            vec![("db".to_owned(), Class::Routine)],
+            "the attestation is renewed before it expires"
+        );
+        assert!(renews + 1 < ttl / 1000);
+    }
+    #[test]
     fn v2_verification_expires_unless_continuous_token_renewals_leave_reconcile_due() {
         let start = Instant::now();
         let wall = clock_ms();
