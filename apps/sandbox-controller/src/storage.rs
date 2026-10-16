@@ -111,6 +111,9 @@ pub struct Guard {
     // Bound thick IDs cannot become thin in place. Only a fresh CF snapshot changes this cohort.
     legacy: BTreeSet<String>,
     highest: BTreeMap<String, VerifiedStorageAuthority>,
+    /// The Pods the sandbox runtime has: assigned, or removed with a retained scope. `None` until
+    /// the controller says (unit tests, and callers that have no runtime).
+    known_pods: Option<BTreeSet<String>>,
 }
 fn invalid() -> Status {
     Status::failed_precondition("storage_host_authority_invalid")
@@ -187,6 +190,7 @@ impl Guard {
             entries: BTreeMap::new(),
             legacy: config.legacy_database_ids.into_iter().collect(),
             highest: BTreeMap::new(),
+            known_pods: None,
         })
     }
     pub fn accept(&mut self, lease: HostStorageLease, now: u64) -> Result<(), Status> {
@@ -325,6 +329,15 @@ impl Guard {
         }
         for (id, accepted) in &entries {
             if let Some(runtime) = &accepted.runtime {
+                // A token for a Pod the runtime does not have grants nothing here and is never
+                // stopped, so as the retained scope it would only block the database's next writer.
+                if self
+                    .known_pods
+                    .as_ref()
+                    .is_some_and(|known| !known.contains(&runtime.claims().pod_uid))
+                {
+                    continue;
+                }
                 // A new CF-owned running generation is a new actual task lifetime, even when
                 // Kubernetes reuses the same Pod UID. Ordinary lease renewals keep old stop facts.
                 if self
@@ -381,6 +394,16 @@ impl Guard {
     }
     pub fn trust(&self) -> StorageTrust {
         self.trust.clone()
+    }
+    /// Replace the Pods the sandbox runtime has. See `known_pods`.
+    pub fn set_known_pods(&mut self, pods: impl IntoIterator<Item = String>) {
+        self.known_pods = Some(pods.into_iter().collect());
+    }
+    /// A sandbox was just assigned; its first token may arrive before the next refresh.
+    pub fn note_known_pod(&mut self, pod_uid: &str) {
+        if let Some(known) = &mut self.known_pods {
+            known.insert(pod_uid.to_owned());
+        }
     }
     pub fn rebind_material_revision(&mut self, next: u64, legacy: &[String]) -> Result<(), Status> {
         if next < self.material_revision
@@ -714,9 +737,13 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
             .protective_pods()
             .into_iter()
             .collect::<BTreeMap<_, _>>();
-        if let Ok(assigned) =
-            tokio::time::timeout(Duration::from_millis(50), controller.assigned_pods()).await
+        if let Ok((assigned, retired)) =
+            tokio::time::timeout(Duration::from_millis(50), controller.pods()).await
         {
+            guard
+                .lock()
+                .await
+                .set_known_pods(assigned.iter().map(|(uid, _)| uid.clone()).chain(retired));
             for (uid, namespace) in assigned {
                 pods.entry(uid).or_insert(namespace);
             }
@@ -1295,6 +1322,38 @@ mod tests {
         guard.accept(value, 1000).unwrap();
         assert!(guard.permits("pgcf-db-abcdefghijklmnopqrst", "pod", 999999));
         assert!(!guard.permits("pgcf-db-bcdefghijklmnopqrstu1", "pod", 999999));
+    }
+    #[test]
+    fn a_token_for_a_pod_the_runtime_does_not_have_is_accepted_but_never_retained() {
+        use super::test_support::{Issuer, claims, database, guard, lease, pod, running};
+        let issuer = Issuer::new();
+        let mut state = guard(&issuer);
+        state.set_known_pods([pod(1)]);
+        let clock = now();
+        let entries = vec![
+            running(&issuer, &claims(&database(1), &pod(1), 1, 1, clock)),
+            running(&issuer, &claims(&database(2), &pod(2), 1, 1, clock)),
+        ];
+        state.accept(lease(entries, clock), clock).unwrap();
+        // Both entries govern their Pods ...
+        assert!(state.permits(&format!("pgcf-db-{}", database(1)), &pod(1), clock));
+        assert!(state.permits(&format!("pgcf-db-{}", database(2)), &pod(2), clock));
+        // ... but only the Pod the runtime has can become the database's retained scope: a scope
+        // for a Pod that never existed here is never stopped, and would block the next real writer.
+        assert_eq!(
+            state.protective_pods(),
+            vec![(pod(1), format!("pgcf-db-{}", database(1)))]
+        );
+        // Its token still reaches the record writer, which reports the Pod once.
+        assert_eq!(state.runtime_scopes().len(), 2);
+        // The runtime then assigns it: the next renewal retains the scope.
+        state.note_known_pod(&pod(2));
+        let renewed = vec![
+            running(&issuer, &claims(&database(1), &pod(1), 1, 2, clock)),
+            running(&issuer, &claims(&database(2), &pod(2), 1, 2, clock)),
+        ];
+        state.accept(lease(renewed, clock + 1), clock + 1).unwrap();
+        assert_eq!(state.protective_pods().len(), 2);
     }
     #[test]
     fn a_pod_removed_before_the_record_writer_reached_it_still_has_its_accepted_token() {

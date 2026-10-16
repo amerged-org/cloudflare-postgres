@@ -425,6 +425,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pod_the_runtime_does_not_have_does_not_hold_back_the_records_of_the_others() {
+        let issuer = Issuer::new();
+        let pending = Arc::new(Pending::default());
+        let state = guard(&issuer);
+        let records = Records {
+            unassigned: BTreeSet::from([pod(2)]),
+            ..Records::default()
+        };
+        let remembered = records.remembered.clone();
+        tokio::spawn(persist(records, state.trust(), pending.clone()));
+        let now = clock();
+        let scope = |n: u8| {
+            let claims = claims(&database(n), &pod(n), 1, 1, now);
+            RuntimeScope {
+                pod_uid: pod(n),
+                token: issuer.token(&claims),
+                authority: state.trust().verify(&issuer.token(&claims), now).unwrap(),
+            }
+        };
+        pending.offer(vec![scope(1), scope(2), scope(3)]);
+        eventually("the records of the other Pods were held back", async || {
+            remembered.lock().unwrap().len() == 2
+        })
+        .await;
+        let recorded: BTreeSet<String> = remembered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(pod, _)| pod.clone())
+            .collect();
+        assert_eq!(recorded, BTreeSet::from([pod(1), pod(3)]));
+    }
+
+    #[tokio::test]
     async fn a_guard_thread_that_dies_is_reported_so_that_the_service_restarts() {
         let (stopped, mut stops) = mpsc::unbounded_channel();
         spawn_isolated("pgcf-guard-test", stopped, async {

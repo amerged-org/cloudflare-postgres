@@ -473,6 +473,13 @@ impl SandboxController {
                     guard.retain_protective(&entry.owner.pod_uid, token)?;
                     guard.note_stopped(&entry.owner.pod_uid);
                 }
+                guard.set_known_pods(
+                    assigned.values().map(|entry| entry.pod.uid.clone()).chain(
+                        retired_storage
+                            .values()
+                            .map(|entry| entry.owner.pod_uid.clone()),
+                    ),
+                );
                 Ok::<_, Status>(Arc::new(Mutex::new(guard)))
             })
             .transpose()?;
@@ -588,12 +595,20 @@ impl SandboxController {
     pub fn storage_guard(&self) -> Option<Arc<Mutex<crate::storage::Guard>>> {
         self.storage_guard.clone()
     }
-    pub async fn assigned_pods(&self) -> Vec<(String, String)> {
+    /// The Pods the sandbox runtime has: those assigned now with their namespaces, and the UIDs of
+    /// those removed with a retained physical scope.
+    pub async fn pods(&self) -> (Vec<(String, String)>, Vec<String>) {
         let pool = self.pool.lock().await;
-        pool.assigned
-            .values()
-            .map(|value| (value.pod.uid.clone(), value.pod.namespace.clone()))
-            .collect()
+        (
+            pool.assigned
+                .values()
+                .map(|value| (value.pod.uid.clone(), value.pod.namespace.clone()))
+                .collect(),
+            pool.retired_storage
+                .values()
+                .map(|entry| entry.owner.pod_uid.clone())
+                .collect(),
+        )
     }
     pub async fn rebind_material_revision(&self, revision: u32) -> Result<(), Status> {
         let mut pool = self.pool.lock().await;
@@ -1088,6 +1103,12 @@ impl controller_server::Controller for SandboxController {
             },
         );
         pool.claiming.remove(&id);
+        if let Some(guard) = &self.storage_guard {
+            guard
+                .lock()
+                .await
+                .note_known_pod(&pool.assigned[&id].pod.uid);
+        }
         assignment?;
         if let Err(error) = save_owner(&id, pool.assigned.get(&id).unwrap()) {
             let entry = pool.assigned.get_mut(&id).unwrap();
@@ -1478,10 +1499,11 @@ mod tests {
         issuer: &crate::storage::test_support::Issuer,
     ) -> (SandboxController, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
+        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let directory = std::path::PathBuf::from(format!(
             "/tmp/pg-{}-{}",
             std::process::id(),
-            crate::policy::now_ms().rem_euclid(1_000_000_000)
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1519,6 +1541,43 @@ mod tests {
             SandboxController::prepare(settings).await.unwrap(),
             directory,
         )
+    }
+    #[tokio::test]
+    async fn tokens_naming_pods_the_runtime_does_not_have_do_not_stop_the_lease_or_become_scopes() {
+        use crate::storage::test_support::{Issuer, claims, database, lease, pod, running};
+        let issuer = Issuer::new();
+        // An empty node: the sandbox runtime has no Pod at all.
+        let (controller, directory) = guarded(&issuer).await;
+        let guard = controller.storage_guard().unwrap();
+        let (leases, rx) = tokio::sync::mpsc::channel(1);
+        let supervisor = tokio::spawn(crate::storage::supervise_bound(controller.clone(), rx));
+        let clock = crate::policy::now_ms() as u64;
+        let entries = vec![
+            running(&issuer, &claims(&database(1), &pod(1), 1, 1, clock)),
+            running(&issuer, &claims(&database(2), &pod(2), 1, 1, clock)),
+        ];
+        leases.send(lease(entries, clock)).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let state = guard.lock().await;
+            let now = u64::try_from(crate::policy::now_ms()).unwrap();
+            if state.permits(&format!("pgcf-db-{}", database(1)), &pod(1), now)
+                && state.permits(&format!("pgcf-db-{}", database(2)), &pod(2), now)
+            {
+                break;
+            }
+            drop(state);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tokens of Pods the runtime does not have kept the lease from being accepted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Nothing is retained for a Pod that never existed here, so nothing can wait for it.
+        assert!(guard.lock().await.protective_pods().is_empty());
+        supervisor.abort();
+        drop(controller);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]
     async fn a_stalled_owner_record_write_cannot_stall_the_fetcher_or_the_acceptance_of_a_lease() {

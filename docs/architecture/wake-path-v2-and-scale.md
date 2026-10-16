@@ -402,8 +402,10 @@ experiment (it removes a known 6.2 statements/s per node).
   qualification). The reclaim poller and its 250 ms fsynced publication are deleted from that source
   (the snapshot had no reader).
 - Host guard fixes that need an extension release: one bad lease entry must not refuse every entry
-  (`accept` is all-or-nothing), `remember_storage_authority` must tolerate Pods not yet assigned (one such
-  token starves every other database's renewals), a sticky `stopped` per Pod UID, fetch errors are silent.
+  (`accept` is all-or-nothing), a sticky `stopped` per Pod UID. Done in source on branch
+  `golive/host-guard-r3`: a token for a Pod not yet assigned no longer starves every other database's
+  renewals (it is accepted, reported once per Pod and never retained as the scope), fetch errors are
+  logged.
 
 ## 8. Experiments, in order
 
