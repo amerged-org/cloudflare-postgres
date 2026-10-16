@@ -551,22 +551,32 @@ it("a requested turn starts no sooner than 10 s after the previous turn started,
   expect(quiet.alarm === null || quiet.alarm >= quiet.before - 1000).toBe(true);
 });
 
-it("retains demand received during a failed turn while applying its backoff", async () => {
+it("retries the first failed turn at the spacing when a start was waiting for it, then backs off", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const failed = await turn(
-    f,
-    {
-      state: "failed",
-      error_code: "thin_storage_command_failed",
-    },
-    true,
-  );
-  expect(failed.error).toBeNull();
-  expect(failed.alarm).toBeGreaterThanOrEqual(failed.started + 5000);
+  const fail = () =>
+    turn(
+      f,
+      { state: "failed", error_code: "thin_storage_authority_refused" },
+      true,
+    );
+  // A hold appeared while the turn ran: its proof cannot serve that start, so the next turn follows
+  // as soon as the spacing allows instead of after the 5 s backoff.
+  const first = await fail();
+  expect(first.error).toBeNull();
+  expect(first.failures).toBe(1);
+  expect(first.alarm).toBeGreaterThanOrEqual(first.started + 10_000);
+  expect(first.alarm).toBeLessThanOrEqual(Date.now() + 10_000);
   const requested = await runInDurableObject(stub(f), (_instance, state) =>
     state.storage.get<boolean>("thinStorageDue"),
   );
   expect(requested).toBe(true);
+  // A turn that keeps failing is not hammered: the backoff doubles as before.
+  const second = await fail();
+  expect(second.failures).toBe(2);
+  expect(second.alarm).toBeGreaterThanOrEqual(second.started + 10_000);
+  const third = await fail();
+  expect(third.failures).toBe(3);
+  expect(third.alarm).toBeGreaterThanOrEqual(third.started + 20_000);
 });
 
 it("asks for an identity turn at once when a thin database is ready without a receipt", async () => {

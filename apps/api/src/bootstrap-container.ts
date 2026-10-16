@@ -582,12 +582,25 @@ export class NodeBootstrap extends DurableObject<Env> {
       );
     });
   }
-  /** A failed turn retains demand and its durable pool action; only its retry timer changes. */
+  /** A failed turn retains demand and its durable pool action; only its retry timer changes. The
+   * first failure of a turn that a start was waiting for retries as soon as the spacing allows: the
+   * hold that arrived during the turn is what made it fail, not a broken relay, and the start waits
+   * for the next proof. Later failures back off. */
   async #retryThinStorageTurn() {
     return await this.ctx.storage.transaction(async (storage) => {
       const failures =
           ((await storage.get<number>("thinStorageFailures")) ?? 0) + 1,
-        retryAt = Date.now() + thinStorageRetryMilliseconds(failures);
+        demanded =
+          failures === 1 &&
+          (await storage.get<boolean>("thinStorageDue")) === true,
+        now = Date.now(),
+        retryAt = demanded
+          ? Math.max(
+              now,
+              ((await storage.get<number>("thinStorageStartedAt")) ?? 0) +
+                THIN_TURN_SPACING_MS,
+            )
+          : now + thinStorageRetryMilliseconds(failures);
       await storage.put({
         thinStorageFailures: failures,
         thinStorageRetryAt: retryAt,
