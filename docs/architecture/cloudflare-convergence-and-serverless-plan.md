@@ -186,6 +186,11 @@ node takes 0.19 s. What is left of the wake is Cloudflare time: the Edge's `ensu
 and hint 0.49 s, pull 0.2–0.5 s, the controller's chain, the observation POST 0.3 s) and 0.6–1.2 s before the
 hint reaches the controller (Worker start, TLS and upgrade). W2 (the desired row on the hint) takes the pull
 off the path; W3 (local admission) the POST.
+A cold Thin wake (database asleep past the parked TTL) answers the first query in 21.8 s from the same
+Worker (it was 44 s at R2.14 and then a failure at the Edge's 30 s deadline): the identity turn is requested
+0.5 s after the hint and takes 18–19 s, the controller polls each second and finishes 0.1 s after the proof
+is read. Its floor is the turn's four sequential relay steps; below it only an identity read inside the
+cluster (owner review of what the control plane then trusts) or a longer parked TTL changes the cold case.
 
 **Language.** It is not what limits the wake. A parked wake issues about 100–145 Kubernetes requests,
 which cost 11–14 ms of CPU in Rust, 22 ms in Go and 28 ms in Node on a laptop (at most 3–5 % of
