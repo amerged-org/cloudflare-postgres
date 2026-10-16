@@ -14,7 +14,6 @@ import {
   newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 import {
   cleanupFixtures,
   observation,
@@ -28,6 +27,7 @@ import {
   databaseRow,
   leaseEntry,
   parkedWriter,
+  renewal,
 } from "./parked-tier-fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
@@ -38,15 +38,7 @@ import {
   storageHolds,
   thinStorageInput,
 } from "../../src/domain/node-thin-storage-execution.ts";
-import {
-  gib,
-  identityProof,
-  lvs,
-  mib,
-  nonce,
-  post,
-  sample,
-} from "./thin-renewal-fixture.ts";
+import { gib, identityProof, lvs } from "./thin-renewal-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -123,17 +115,7 @@ function unattestedReady(w: AwakeWriter, generation: number, power?: string) {
 
 /** The tokens of one accepted fast sample, the gateway's source. */
 async function sampled(w: AwakeWriter) {
-  const physical = {
-    ...w.physical,
-    thin_pool: {
-      ...w.physical.thin_pool!,
-      data_used_bytes_upper_bound: 64 * mib,
-      metadata_used_bytes_upper_bound: mib,
-    },
-  };
-  const response = NodeStorageHeadroomResponse.parse(
-    (await post(w.f, sample(w.f, await nonce(w.f), { physical }))).body,
-  );
+  const response = await renewal(w);
   expect(response.accepted).toBe(true);
   return response.tokens;
 }

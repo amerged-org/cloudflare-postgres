@@ -137,17 +137,20 @@ async function authority(
     storageAuthority,
   };
 }
+/** `sealed`: the custody may have been sealed under an earlier release; its content decides. */
 function same(
   source: Awaited<ReturnType<typeof authority>>,
   stored: HostStatus,
+  sealed = false,
 ) {
   return (
     source.node_uid === stored.node_uid &&
     source.region_id === stored.region_id &&
     source.cluster_uid === stored.cluster_uid &&
     source.material_revision === stored.material_revision &&
-    source.release_id === stored.release_id &&
-    source.profile_sha256 === stored.profile_sha256
+    (sealed ||
+      (source.release_id === stored.release_id &&
+        source.profile_sha256 === stored.profile_sha256))
   );
 }
 /** Internal patch caller may omit expected_revision; administration always supplies its reviewed CAS. */
@@ -277,7 +280,13 @@ export async function ensureNodeHostConfiguration(
     { kind: "region", id: candidate.status.region_id },
   );
 }
-/** Private leaf, callable only after the fleet patch's independent operation authority check. */
+/**
+ * Private leaf, callable only after the fleet patch's independent operation authority check.
+ * `sealed` is for the thin identity turn: it reads the custody the node was patched with, even
+ * while a rollout has assigned a release whose patch has not rewritten it. Its own bytes must
+ * still be the ones Cloudflare would write today (keys, image, agent key, legacy storage), so the
+ * release and profile labels are the only checks it leaves out.
+ */
 export async function loadNodeHostConfiguration(
   env: Env,
   binding: Pick<
@@ -289,6 +298,7 @@ export async function loadNodeHostConfiguration(
     | "revision"
     | "sha256"
   >,
+  options: { sealed?: boolean } = {},
 ) {
   const stored = await row(env, binding.node_id);
   if (
@@ -299,7 +309,7 @@ export async function loadNodeHostConfiguration(
   )
     return closed();
   const source = await authority(env, stored.node_id, stored.node_uid, false);
-  if (!same(source, stored)) return closed();
+  if (!same(source, stored, options.sealed)) return closed();
   const payload = NodeHostConfigurationPrivate.parse(
     JSON.parse(
       await decryptCustodyDocument(env.CREDENTIAL_KEYS, scope(stored), {
@@ -346,7 +356,11 @@ export async function loadNodeHostConfiguration(
   )
     return closed();
   if (
-    !same(await authority(env, stored.node_id, stored.node_uid, false), stored)
+    !same(
+      await authority(env, stored.node_id, stored.node_uid, false),
+      stored,
+      options.sealed,
+    )
   )
     return closed();
   return payload;

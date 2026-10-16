@@ -41,6 +41,7 @@ import type { Env, ApiContext } from "../env.ts";
 import { bearer } from "../middleware/auth.ts";
 import {
   readCurrentNodeThinStorage,
+  thinContinuitySql,
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import {
@@ -71,12 +72,22 @@ const closed = (): never => {
 export const THIN_STORAGE_LEASE_SECONDS = 95;
 const iso = (ms: number) => new Date(ms).toISOString();
 export const thinStorageAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id WHERE n.id=node_thin_storage.node_id AND n.node_uid=node_thin_storage.node_uid AND n.ready=1 AND n.lost_at IS NULL AND a.node_uid=n.node_uid AND a.release_id=f.release_id AND r.bootstrap_material_revision=node_thin_storage.material_revision AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.node_id=n.id AND j.admitted=0 AND (j.authorized<>1 OR j.cancelled<>0 OR j.admission_authorized<>1)) AND NOT EXISTS(SELECT 1 FROM node_additions original WHERE original.node_id=n.id AND original.status IN('failed','cancelled')) AND EXISTS(SELECT 1 FROM json_each(s.spec_json,'$.components') component WHERE json_extract(component.value,'$.name')='openebs-lvm' AND json_extract(component.value,'$.kind')='image' AND json_extract(component.value,'$.reference')=node_thin_storage.qualified_driver_image))`;
+/**
+ * The node's lease row and the evidence an identity turn may run under: the sealed host custody
+ * and the boot of the node's own completed patch. The patch is that of the assigned release,
+ * preferred, or else the newest of any release that pins the same thin facts (thinContinuitySql):
+ * a rollout that moves none of them does not stop the identity loop, and with it the authority
+ * the loop's proofs bound to 300 s. The custody must be the one the evidence patched and the boot
+ * the one the node was proven on.
+ */
 export async function readThinStorageLeaseRow(env: Env, nodeId: string) {
   const row = await env.DB.prepare(
     `SELECT t.*,n.region_id,n.k8s_node_name,n.provider_instance_id,a.release_id,a.revision assignment_revision,f.revision region_revision,s.spec_json,s.spec_sha256,h.revision host_revision,h.sha256 host_sha256,
     json_extract(p.observed_json,'$.boot_id') boot_id,json_extract(p.observed_json,'$.kubernetes_configuration_boot_id') configuration_boot_id
-    FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id LEFT JOIN node_host_configurations h ON h.node_id=n.id AND h.node_uid=n.node_uid AND h.release_id=a.release_id AND h.material_revision=t.material_revision
-    LEFT JOIN fleet_patch_operations p ON p.operation_id=(SELECT q.operation_id FROM fleet_patch_operations q WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.release_id=a.release_id AND q.assignment_revision=a.revision AND q.region_revision=f.revision AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND q.host_configuration_revision=h.revision AND q.host_configuration_sha256=h.sha256 ORDER BY q.updated_at DESC LIMIT 1)
+    FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id LEFT JOIN node_host_configurations h ON h.node_id=n.id AND h.node_uid=n.node_uid AND h.cluster_uid=t.cluster_uid AND h.material_revision=t.material_revision
+    LEFT JOIN fleet_patch_operations p ON p.operation_id=COALESCE(
+      (SELECT q.operation_id FROM fleet_patch_operations q WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.release_id=a.release_id AND q.assignment_revision=a.revision AND q.region_revision=f.revision AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND h.release_id=a.release_id AND q.host_configuration_revision=h.revision AND q.host_configuration_sha256=h.sha256 ORDER BY q.updated_at DESC LIMIT 1),
+      (SELECT q.operation_id FROM fleet_patch_operations q JOIN fleet_releases qs ON qs.id=q.release_id WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.cluster_uid=t.cluster_uid AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND q.host_configuration_sha256=h.sha256 AND json_extract(q.observed_json,'$.host_configuration_sha256')=h.sha256 AND json_extract(q.observed_json,'$.node_ready')=1 AND json_extract(q.observed_json,'$.boot_id')=json_extract(t.qualification_json,'$.boot_id') AND ${thinContinuitySql("qs.spec_json", "a.role")}=${thinContinuitySql("s.spec_json", "a.role")} ORDER BY q.updated_at DESC,q.rowid DESC LIMIT 1))
     WHERE t.node_id=? AND ${thinStorageAuthoritySql.replaceAll("node_thin_storage.", "t.")}`,
   )
     .bind(nodeId)
@@ -366,7 +377,12 @@ export async function reserveThinStorageLease(
   nodeId: string,
   allowPoolActions = true,
 ) {
-  const current = await readCurrentNodeThinStorage(env, nodeId);
+  const current = await readCurrentNodeThinStorage(
+    env,
+    nodeId,
+    Date.now(),
+    "continuing",
+  );
   if (!current) return closed();
   const row = await readThinStorageLeaseRow(env, nodeId);
   if (row.error_code) return null;
@@ -548,7 +564,12 @@ async function buildThinStorageInput(
   row: Awaited<ReturnType<typeof readThinStorageLeaseRow>>,
   required?: { data: number; metadata: number },
 ): Promise<NodeThinStorageInput> {
-  const current = await readCurrentNodeThinStorage(env, nodeId);
+  const current = await readCurrentNodeThinStorage(
+    env,
+    nodeId,
+    Date.now(),
+    "continuing",
+  );
   if (
     !current ||
     !row.lease_id ||
@@ -576,14 +597,19 @@ async function buildThinStorageInput(
     !row.boot_id
   )
     return closed();
-  const host = await loadNodeHostConfiguration(env, {
-    node_id: nodeId,
-    node_uid: row.node_uid,
-    cluster_uid: row.cluster_uid,
-    material_revision: row.material_revision,
-    revision: row.host_revision,
-    sha256: row.host_sha256,
-  });
+  // The custody is sealed under the release the node was patched at; its content is checked.
+  const host = await loadNodeHostConfiguration(
+    env,
+    {
+      node_id: nodeId,
+      node_uid: row.node_uid,
+      cluster_uid: row.cluster_uid,
+      material_revision: row.material_revision,
+      revision: row.host_revision,
+      sha256: row.host_sha256,
+    },
+    { sealed: true },
+  );
   const records = await env.DB.prepare(
     `SELECT d.*,h.operation_id startup_operation,h.node_uid startup_uid,h.storage_budget_bytes,(SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation FROM databases d LEFT JOIN database_start_admissions h ON h.database_id=d.id AND h.generation=(SELECT MAX(x.generation) FROM database_start_admissions x WHERE x.database_id=d.id AND x.generation<=d.generation AND x.storage_budget_bytes>0 AND x.budget_bytes>0) AND h.storage_budget_bytes>0 AND h.budget_bytes>0 WHERE d.node_id=? AND d.region_id=? ORDER BY d.id`,
   )

@@ -15,7 +15,7 @@ import {
 import type { Env } from "../env.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
-import { thinStorageSamplingCapable } from "./fleet-releases.ts";
+import { thinStorageSamplingProtocolCapable } from "./fleet-releases.ts";
 import { hotLogDue } from "./log-sampling.ts";
 import { parkedRecordFresh, readParkedRecord } from "./parked-tier.ts";
 import {
@@ -25,6 +25,9 @@ import {
   nodeThinStorageHeadroomSql,
   knownStorageHoldVolume,
 } from "./storage-capacity.ts";
+
+/** How tightly a node's authority is bound to the assigned release: see qualifiedThinStorageSql. */
+export type ThinQualification = "strict" | "continuing";
 
 export interface NodeThinStorageRow {
   node_id: string;
@@ -60,27 +63,157 @@ export interface NodeThinStorageRow {
   updated_at: string;
 }
 
-/** One current release/material/host/boot predicate shared by reads and atomic capacity admission. */
-export function qualifiedThinStorageSql(alias = "t") {
+/**
+ * The facts of a release that a node's authority cannot outlive: what the receipt qualified, what
+ * the guard trusts, what boots and restarts on the node and what restarts a database outside
+ * Cloudflare's start admission. Two releases with the same text pin the same facts; the release
+ * id, the spec hash and the controller, gateway, API and platform pins are not among them.
+ * `spec` is the SQL expression of a release's spec_json, `role` that of the node's role.
+ */
+export function thinContinuitySql(spec: string, role: string) {
+  if (
+    !/^[a-z][a-z0-9_]*\.spec_json$/.test(spec) ||
+    !/^(?:[a-z][a-z0-9_]*\.role|'(?:customer|control_relay)')$/.test(role)
+  )
+    throw new Error("invalid_thin_continuity_operand");
+  const roles = (field: string) =>
+      `json_extract(${spec},'$.roles.'||${role}||'.${field}')`,
+    qualification = (field: string) =>
+      `json_extract(${spec},'$.thin_storage_qualification.${field}')`;
+  return `json_object(
+    'receipt',json_object('profile_sha256',${qualification("profile_sha256")},'driver_image',${qualification("driver_image")},'host_extension_image',${qualification("host_extension_image")},'kernel_version',${qualification("kernel_version")}),
+    'keys',json_extract(${spec},'$.storage_authority_keys_sha256'),
+    'schema',json_extract(${spec},'$.configuration_schema_revision'),
+    'os',json_object('talos_version',${roles("talos_version")},'talos_installer',${roles("talos_installer")},'talos_schematic_sha256',${roles("talos_schematic_sha256")},'talos_extensions',${roles("talos_extensions")},'kubernetes_version',${roles("kubernetes_version")},'kubernetes_images',${roles("kubernetes_images")},'host_configuration_required',${roles("host_configuration_required")}),
+    'pins',(SELECT json_group_array(json_object('n',json_extract(c.value,'$.name'),'v',json_extract(c.value,'$.version'),'r',json_extract(c.value,'$.reference'),'s',json_extract(c.value,'$.sha256')))
+      FROM (SELECT value FROM json_each(${spec},'$.components') ORDER BY json_extract(value,'$.name')) c
+      WHERE json_extract(c.value,'$.name') IN('openebs-lvm','sandbox-controller','postgres','barman','cloudnative-pg')
+        OR json_extract(c.value,'$.name') IN(SELECT value FROM json_each(${spec},'$.roles.'||${role}||'.talos_extensions'))))`;
+}
+
+/**
+ * Whether a node's authority names the release, host custody and boot it was proven with.
+ *
+ * `strict` binds the proof, the controller's observation and the node's own completed patch to the
+ * assigned release by label: its id, spec hash, assignment revision and region revision. Placement,
+ * wake, hold release, deletion proofs and qualification admit new Pods or confirm absences, and
+ * stay behind it.
+ *
+ * `continuing` keeps every fact the labels stood for (the receipt's facts, the authority keys, the
+ * host custody, the boot, the node, the cluster and the material) and drops the labels: the node's
+ * completed patch is that of the assigned release or of one that pins the same thin facts
+ * (thinContinuitySql). It renews and delivers the authority of a writer that already runs, and is
+ * implied by `strict`: a rollout that changes a pinned fact is strict from its assignment.
+ */
+export function qualifiedThinStorageSql(
+  alias = "t",
+  mode: ThinQualification = "strict",
+) {
   if (!/^[a-z][a-z0-9_]*$/.test(alias))
     throw new Error("invalid_thin_authority_alias");
-  return `EXISTS(SELECT 1 FROM nodes qn JOIN regions qr ON qr.id=qn.region_id JOIN fleet_node_releases qa ON qa.node_id=qn.id JOIN fleet_region_releases qf ON qf.region_id=qn.region_id JOIN fleet_releases qs ON qs.id=qa.release_id JOIN node_host_configurations qh ON qh.node_id=qn.id AND qh.node_uid=qn.node_uid JOIN fleet_node_release_observations qo ON qo.node_id=qn.id AND qo.node_uid=qn.node_uid AND qo.assignment_revision=qa.revision AND qo.agent_key_hash=qr.agent_key_hash JOIN fleet_patch_operations qp ON qp.node_id=qn.id JOIN json_each(qs.spec_json,'$.components') qverifier ON json_extract(qverifier.value,'$.name')='native-gateway' AND json_extract(qverifier.value,'$.kind')='image' JOIN json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole ON qgatewayrole.value='native-gateway'
-    WHERE (
-      (((qn.id=${alias}.node_id AND qn.node_uid=${alias}.node_uid) AND (qn.ready=1 AND qn.lost_at IS NULL))
-        AND (qa.node_uid=qn.node_uid AND (qa.release_id=qf.release_id AND qr.bootstrap_material_revision=${alias}.material_revision)))
-      AND ((length(json_extract(qs.spec_json,'$.storage_authority_keys_sha256'))=64 AND json_extract(qs.spec_json,'$.storage_authority_keys_sha256') NOT GLOB '*[^0-9a-f]*')
-        AND ((qh.release_id=qs.id AND qh.cluster_uid=${alias}.cluster_uid) AND (qh.material_revision=${alias}.material_revision AND json_extract(qo.facts_json,'$.boot_id')=json_extract(${alias}.qualification_json,'$.boot_id'))))
-    ) AND (
-      (((julianday(qo.observed_at)>=julianday('now','-180 seconds') AND julianday(qo.observed_at)<=julianday('now','+5 seconds')) AND (julianday(qo.received_at)>=julianday('now','-180 seconds') AND julianday(qo.received_at)<=julianday('now','+5 seconds')))
-        AND ((json_extract(${alias}.qualification_json,'$.profile_revision')=${alias}.profile_revision AND json_extract(${alias}.qualification_json,'$.profile_sha256')=json_extract(qs.spec_json,'$.thin_storage_qualification.profile_sha256')) AND (json_extract(${alias}.qualification_json,'$.release_id')=qs.id AND json_extract(${alias}.qualification_json,'$.spec_sha256')=qs.spec_sha256)))
-      AND ((json_extract(${alias}.qualification_json,'$.assignment_revision')=qa.revision AND (json_extract(${alias}.qualification_json,'$.region_revision')=qf.revision AND json_extract(qs.spec_json,'$.thin_storage_qualification.driver_image')=${alias}.qualified_driver_image))
-        AND (json_extract(qs.spec_json,'$.thin_storage_qualification.host_extension_image')=json_extract(${alias}.qualification_json,'$.software.host_extension_image') AND (json_extract(qs.spec_json,'$.thin_storage_qualification.kernel_version')=json_extract(${alias}.qualification_json,'$.software.kernel_version') AND json_extract(${alias}.qualification_json,'$.software.host_configuration_sha256')=qh.sha256)))
-    ) AND (
-      (((qp.node_id=qn.id AND qp.node_uid=qn.node_uid) AND (qp.cluster_uid=${alias}.cluster_uid AND qp.release_id=qs.id))
-        AND ((qp.spec_sha256=qs.spec_sha256 AND qp.assignment_revision=qa.revision) AND (qp.region_revision=qf.revision AND qp.material_revision=${alias}.material_revision)))
-      AND (((qp.stage='complete' AND qp.state='confirmed') AND (qp.error_code IS NULL AND (qp.host_configuration_revision=qh.revision AND qp.host_configuration_sha256=qh.sha256)))
-        AND ((json_extract(qp.observed_json,'$.host_configuration_sha256')=qh.sha256 AND json_extract(qp.observed_json,'$.runtime_admission_sha256')=qh.profile_sha256) AND (json_extract(qp.observed_json,'$.node_ready')=1 AND json_extract(qp.observed_json,'$.boot_id')=json_extract(${alias}.qualification_json,'$.boot_id'))))
-    ))`;
+  const strict = mode === "strict",
+    // The controller observes a new assignment up to two periods after it is made.
+    seconds = strict ? 180 : 300,
+    proof = (field: string) =>
+      `json_extract(${alias}.qualification_json,'$.${field}')`,
+    receipt = (field: string) =>
+      `json_extract(qs.spec_json,'$.thin_storage_qualification.${field}')`,
+    keys = "json_extract(qs.spec_json,'$.storage_authority_keys_sha256')";
+  const conjuncts = [
+    // The tables are one row each: the node, its assignment, the custody and the controller's view.
+    "qr.id=qn.region_id",
+    "qa.node_id=qn.id",
+    "qf.region_id=qn.region_id",
+    "qs.id=qa.release_id",
+    "qh.node_id=qn.id",
+    "qh.node_uid=qn.node_uid",
+    "qo.node_id=qn.id",
+    "qo.node_uid=qn.node_uid",
+    ...(strict ? ["qo.assignment_revision=qa.revision"] : []),
+    "qo.agent_key_hash=qr.agent_key_hash",
+    ...(strict ? [] : ["qps.id=qp.release_id"]),
+    "json_extract(qverifier.value,'$.name')='native-gateway'",
+    "json_extract(qverifier.value,'$.kind')='image'",
+    "qgatewayrole.value='native-gateway'",
+    // The node, its assignment and the material it was proven under.
+    `qn.id=${alias}.node_id`,
+    `qn.node_uid=${alias}.node_uid`,
+    "qn.ready=1",
+    "qn.lost_at IS NULL",
+    "qa.node_uid=qn.node_uid",
+    "qa.release_id=qf.release_id",
+    `qr.bootstrap_material_revision=${alias}.material_revision`,
+    `length(${keys})=64`,
+    `${keys} NOT GLOB '*[^0-9a-f]*'`,
+    // The host custody and the boot the controller sees.
+    ...(strict ? ["qh.release_id=qs.id"] : []),
+    `qh.cluster_uid=${alias}.cluster_uid`,
+    `qh.material_revision=${alias}.material_revision`,
+    `json_extract(qo.facts_json,'$.boot_id')=${proof("boot_id")}`,
+    `julianday(qo.observed_at)>=julianday('now','-${seconds} seconds')`,
+    "julianday(qo.observed_at)<=julianday('now','+5 seconds')",
+    `julianday(qo.received_at)>=julianday('now','-${seconds} seconds')`,
+    "julianday(qo.received_at)<=julianday('now','+5 seconds')",
+    // The proof names the profile and the receipt's software.
+    `${proof("profile_revision")}=${alias}.profile_revision`,
+    `${proof("profile_sha256")}=${receipt("profile_sha256")}`,
+    ...(strict
+      ? [
+          `${proof("release_id")}=qs.id`,
+          `${proof("spec_sha256")}=qs.spec_sha256`,
+          `${proof("assignment_revision")}=qa.revision`,
+          `${proof("region_revision")}=qf.revision`,
+        ]
+      : []),
+    `${receipt("driver_image")}=${alias}.qualified_driver_image`,
+    `${receipt("host_extension_image")}=${proof("software.host_extension_image")}`,
+    `${receipt("kernel_version")}=${proof("software.kernel_version")}`,
+    `${proof("software.host_configuration_sha256")}=qh.sha256`,
+    // The node's own completed patch, at the assigned release or at one that pins the same facts.
+    "qp.node_id=qn.id",
+    "qp.node_uid=qn.node_uid",
+    `qp.cluster_uid=${alias}.cluster_uid`,
+    `qp.material_revision=${alias}.material_revision`,
+    ...(strict
+      ? [
+          "qp.release_id=qs.id",
+          "qp.spec_sha256=qs.spec_sha256",
+          "qp.assignment_revision=qa.revision",
+          "qp.region_revision=qf.revision",
+          "qp.host_configuration_revision=qh.revision",
+        ]
+      : []),
+    "qp.stage='complete'",
+    "qp.state='confirmed'",
+    "qp.error_code IS NULL",
+    "qp.host_configuration_sha256=qh.sha256",
+    "json_extract(qp.observed_json,'$.host_configuration_sha256')=qh.sha256",
+    ...(strict
+      ? [
+          "json_extract(qp.observed_json,'$.runtime_admission_sha256')=qh.profile_sha256",
+        ]
+      : []),
+    "json_extract(qp.observed_json,'$.node_ready')=1",
+    `json_extract(qp.observed_json,'$.boot_id')=${proof("boot_id")}`,
+    // Last: comparing two releases reads both of their specs, once per patch that passed the rest.
+    ...(strict
+      ? []
+      : [
+          `(qp.release_id=qs.id OR ${thinContinuitySql("qps.spec_json", "qa.role")}=${thinContinuitySql("qs.spec_json", "qa.role")})`,
+        ]),
+  ];
+  // Inner joins only. Their terms sit in the one balanced tree below: SQLite chains the terms of
+  // a join list into one left-deep expression, and this predicate is embedded in statements that
+  // already nest deeply.
+  return `EXISTS(SELECT 1 FROM nodes qn,regions qr,fleet_node_releases qa,fleet_region_releases qf,fleet_releases qs,node_host_configurations qh,fleet_node_release_observations qo,fleet_patch_operations qp${strict ? "" : ",fleet_releases qps"},json_each(qs.spec_json,'$.components') qverifier,json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole
+    WHERE ${balanced(conjuncts)})`;
+}
+/** An AND tree of logarithmic depth: SQLite refuses an expression tree deeper than 100, and this
+ * predicate is embedded in statements that already nest. */
+function balanced(conjuncts: string[]): string {
+  if (conjuncts.length === 1) return conjuncts[0]!;
+  const middle = Math.ceil(conjuncts.length / 2);
+  return `(${balanced(conjuncts.slice(0, middle))} AND ${balanced(conjuncts.slice(middle))})`;
 }
 
 /** A node's thin storage row as one read returns it, with what the node itself says about it. */
@@ -93,13 +226,19 @@ export type CurrentNodeThinStorageRow = NodeThinStorageRow & {
   current_qualified: number;
 };
 
+/**
+ * The node as it is now. `continuing` is for the callers that renew or deliver the authority of a
+ * writer that already runs; the default, `strict`, is for every caller that admits a Pod or reads
+ * the node as fully qualified for its assignment.
+ */
 export async function readCurrentNodeThinStorage(
   env: Pick<Env, "DB">,
   nodeId: string,
   now = Date.now(),
+  mode: ThinQualification = "strict",
 ) {
   const row = await env.DB.prepare(
-    `SELECT t.*,n.region_id,n.k8s_node_name,n.node_uid current_node_uid,n.ready,n.lost_at,CASE WHEN ${qualifiedThinStorageSql()} THEN 1 ELSE 0 END current_qualified FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE t.node_id=?`,
+    `SELECT t.*,n.region_id,n.k8s_node_name,n.node_uid current_node_uid,n.ready,n.lost_at,CASE WHEN ${qualifiedThinStorageSql("t", mode)} THEN 1 ELSE 0 END current_qualified FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE t.node_id=?`,
   )
     .bind(nodeId)
     .first<CurrentNodeThinStorageRow>();
@@ -179,7 +318,7 @@ export async function readRegionThinStorage(
   now = Date.now(),
 ) {
   const [samplingCapable, rows] = await Promise.all([
-    thinStorageSamplingCapable(env.DB, regionId),
+    thinStorageSamplingProtocolCapable(env.DB, regionId),
     env.DB.prepare(
       "SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE n.region_id=? ORDER BY n.id",
     )
@@ -188,7 +327,7 @@ export async function readRegionThinStorage(
   ]);
   const readings = await Promise.all(
     rows.results.map((row) =>
-      readCurrentNodeThinStorage(env, row.node_id, now),
+      readCurrentNodeThinStorage(env, row.node_id, now, "continuing"),
     ),
   );
   const nodes: NodeThinStorageAuthority[] = [],
@@ -197,8 +336,7 @@ export async function readRegionThinStorage(
     const current = readings[index] ?? null;
     snapshots.set(row.node_id, current);
     const proof = current?.authority ?? current?.reclamation;
-    if (proof && (samplingCapable || proof.inventory_observed_at === undefined))
-      nodes.push(proof);
+    if (proof && samplingCapable) nodes.push(proof);
   });
   return { nodes, snapshots };
 }
@@ -346,7 +484,7 @@ function writerContext(
       if (reading !== undefined) return Promise.resolve(reading);
       let read = readings.get(nodeId);
       if (!read) {
-        read = readCurrentNodeThinStorage(env, nodeId, now);
+        read = readCurrentNodeThinStorage(env, nodeId, now, "continuing");
         readings.set(nodeId, read);
       }
       return read;
@@ -870,7 +1008,7 @@ export async function runningWriterTokens(
   };
   const [current, read] = await Promise.all([
     reading === undefined
-      ? readCurrentNodeThinStorage(env, nodeId, now)
+      ? readCurrentNodeThinStorage(env, nodeId, now, "continuing")
       : reading,
     readWriterInputs<DatabaseRow>(
       env,
@@ -985,7 +1123,7 @@ export async function hostStorageLease(
   // node's reading, and one batch for its databases and their inputs.
   const scope = hostLeaseScope(id, region.id, now);
   const [current, read] = await Promise.all([
-    readCurrentNodeThinStorage(c.env, id, now),
+    readCurrentNodeThinStorage(c.env, id, now, "continuing"),
     readWriterInputs<LeaseRow>(
       c.env,
       scope,

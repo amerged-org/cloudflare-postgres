@@ -40,7 +40,8 @@ import {
   thinStorageWriteAllowed,
 } from "./node-thin-storage-execution.ts";
 import {
-  thinStorageSamplingCapable,
+  thinStorageSamplingProtocolCapable,
+  thinStorageSamplingProtocolSql,
   thinStorageSamplingSql,
 } from "./fleet-releases.ts";
 
@@ -85,22 +86,25 @@ const unsampled = (): never => {
   throw new ApiError("not_found", "No thin storage is sampled on this node");
 };
 
-/** Selected thin nodes that are not blocked by an identity or qualification failure, and the
- * nodes of scratch qualification runs between their setup and their cleanup. A node never has
- * both: a selection and a running qualification exclude each other. */
+/** Selected thin nodes that are not blocked by an identity or qualification failure and whose
+ * authority continues, and the nodes of scratch qualification runs between their setup and their
+ * cleanup. A node never has both: a selection and a running qualification exclude each other.
+ * A node whose authority does not continue is not sampled: the sample would only be refused. */
 export async function desiredRegionStorageSamples(
   env: Pick<Env, "DB">,
   regionId: string,
 ): Promise<ThinStorageSampleTarget[]> {
-  if (!(await thinStorageSamplingCapable(env.DB, regionId))) return [];
   const rows = await env.DB.prepare(
     `SELECT t.node_id,n.k8s_node_name name,t.node_uid,json_extract(t.profile_json,'$.guard_seconds') guard_seconds,NULL qualification_run
     FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
     WHERE n.region_id=? AND n.ready=1 AND n.lost_at IS NULL AND t.error_code IS NULL AND t.status IN('ready','blocked')
+      AND EXISTS(SELECT 1 FROM regions pr WHERE pr.id=n.region_id AND ${thinStorageSamplingProtocolSql("pr")})
+      AND ${qualifiedThinStorageSql("t", "continuing")}
     UNION ALL
     SELECT q.node_id,n.k8s_node_name name,q.node_uid,json_extract(q.profile_json,'$.guard_seconds') guard_seconds,q.id qualification_run
     FROM thin_storage_qualification_runs q JOIN nodes n ON n.id=q.node_id AND n.node_uid=q.node_uid AND n.region_id=q.region_id
     WHERE q.region_id=? AND q.status='running' AND q.setup_json IS NOT NULL AND q.step NOT IN('cleanup','complete') AND n.ready=1 AND n.lost_at IS NULL
+      AND EXISTS(SELECT 1 FROM regions sr WHERE sr.id=q.region_id AND ${thinStorageSamplingSql("sr")})
     ORDER BY 1`,
   )
     .bind(regionId, regionId)
@@ -290,7 +294,7 @@ async function productSample(
   startedAt: number,
 ): Promise<NodeStorageHeadroomResponse | "conflict"> {
   const now = Date.now(),
-    current = await readCurrentNodeThinStorage(env, nodeId, now);
+    current = await readCurrentNodeThinStorage(env, nodeId, now, "continuing");
   if (!current) return unsampled();
   const { row, profile } = current,
     guard = profile.guard_seconds,
@@ -445,8 +449,8 @@ async function productSample(
       .map((column) => `${column}=?`)
       .join(",")}
     WHERE node_id=? AND node_uid=? AND profile_revision=? AND authority_revision=? AND sample_nonce=? AND error_code IS NULL AND status IN('ready','blocked')
-      AND ${thinStorageAuthoritySql} AND ${qualifiedThinStorageSql("node_thin_storage")} AND ${storageHoldSnapshotSql}
-      AND EXISTS(SELECT 1 FROM nodes sg JOIN regions sr ON sr.id=sg.region_id WHERE sg.id=node_thin_storage.node_id AND ${thinStorageSamplingSql("sr")})`,
+      AND ${thinStorageAuthoritySql} AND ${qualifiedThinStorageSql("node_thin_storage", "continuing")} AND ${storageHoldSnapshotSql}
+      AND EXISTS(SELECT 1 FROM nodes sg JOIN regions sr ON sr.id=sg.region_id WHERE sg.id=node_thin_storage.node_id AND ${thinStorageSamplingProtocolSql("sr")})`,
   )
     .bind(
       ...Object.values(written),
@@ -565,7 +569,7 @@ export async function recordStorageHeadroomSample(
     .bind(nodeId, region.id)
     .first<{ node_uid: string | null }>();
   if (!node) return unsampled();
-  if (!(await thinStorageSamplingCapable(c.env.DB, region.id)))
+  if (!(await thinStorageSamplingProtocolCapable(c.env.DB, region.id)))
     return unsampled();
   const run = await c.env.DB.prepare(
     "SELECT id,node_uid,profile_json,setup_json,step,sample_nonce,sample_nonce_issued_at FROM thin_storage_qualification_runs WHERE node_id=? AND region_id=? AND status='running'",
@@ -589,7 +593,12 @@ export async function recordStorageHeadroomSample(
     if (result !== "conflict")
       return c.json(NodeStorageHeadroomResponse.parse(result), 200);
   }
-  const current = await readCurrentNodeThinStorage(c.env, nodeId);
+  const current = await readCurrentNodeThinStorage(
+    c.env,
+    nodeId,
+    Date.now(),
+    "continuing",
+  );
   if (!current) return unsampled();
   return c.json(
     NodeStorageHeadroomResponse.parse(

@@ -863,7 +863,11 @@ export function routeTokenV3Sql(region: string) {
         AND vp.assignment_revision=va.revision AND vp.region_revision=vf.revision AND vp.stage='complete' AND vp.state='confirmed')))`;
 }
 
-/** Strict desired schemas change only after every assigned regional controller has converged. */
+/**
+ * A qualification run or a thin selection needs the region at exactly the release it is made for:
+ * the region's release declares the sampling protocol and every assigned member confirmed a patch
+ * of that release at its assignment and the region revision.
+ */
 export function thinStorageSamplingSql(region: string) {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_sampling_region_alias");
@@ -883,6 +887,37 @@ export async function thinStorageSamplingCapable(
     await db
       .prepare(
         `SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")}`,
+      )
+      .bind(regionId)
+      .first(),
+  );
+}
+/**
+ * The strict desired schemas are served only to controllers that parse them: the region's release
+ * declares the sampling protocol and the latest completed patch of every assigned member was of a
+ * release that declares it. A rollout between two such releases changes no controller schema, so
+ * it does not close the wire; a member last patched at a release without the protocol does.
+ */
+export function thinStorageSamplingProtocolSql(region: string) {
+  if (!/^[a-z][a-z0-9_]*$/.test(region))
+    throw new Error("invalid_sampling_region_alias");
+  return `EXISTS(SELECT 1 FROM fleet_region_releases pf JOIN fleet_releases ps ON ps.id=pf.release_id
+    WHERE pf.region_id=${region}.id AND json_extract(ps.spec_json,'$.thin_storage_sampling_version')=1
+    AND EXISTS(SELECT 1 FROM nodes pn JOIN fleet_node_releases pa ON pa.node_id=pn.id WHERE pn.region_id=pf.region_id AND pn.lost_at IS NULL)
+    AND NOT EXISTS(SELECT 1 FROM nodes pn JOIN fleet_node_releases pa ON pa.node_id=pn.id WHERE pn.region_id=pf.region_id AND pn.lost_at IS NULL
+      AND (pa.node_uid<>pn.node_uid OR pa.release_id<>pf.release_id OR NOT EXISTS(SELECT 1 FROM fleet_patch_operations pp JOIN fleet_releases pr ON pr.id=pp.release_id
+        WHERE pp.operation_id=(SELECT x.operation_id FROM fleet_patch_operations x WHERE x.node_id=pn.id AND x.node_uid=pn.node_uid
+          AND x.stage='complete' AND x.state='confirmed' AND x.error_code IS NULL ORDER BY x.updated_at DESC,x.rowid DESC LIMIT 1)
+        AND json_extract(pr.spec_json,'$.thin_storage_sampling_version')=1))))`;
+}
+export async function thinStorageSamplingProtocolCapable(
+  db: D1Database,
+  regionId: string,
+) {
+  return Boolean(
+    await db
+      .prepare(
+        `SELECT 1 FROM regions pr WHERE pr.id=? AND ${thinStorageSamplingProtocolSql("pr")}`,
       )
       .bind(regionId)
       .first(),

@@ -11,7 +11,10 @@ import {
   newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
-import { HostStorageLease } from "@pgcf/contracts/node-thin-storage";
+import {
+  HostStorageLease,
+  NodeStorageHeadroomResponse,
+} from "@pgcf/contracts/node-thin-storage";
 import { observation, observedBody, request } from "./fixtures.ts";
 import {
   type Fixture,
@@ -19,6 +22,9 @@ import {
   identityProof,
   lvs,
   mib,
+  nonce,
+  post,
+  sample,
 } from "./thin-renewal-fixture.ts";
 import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
 import type { DatabaseRow } from "../../src/domain/rows.ts";
@@ -265,6 +271,24 @@ export async function parkedWriter(
   });
   expect(await response.json()).toEqual({ accepted: 1 });
   return intent;
+}
+/** One fast sample of the awake writer's node: what the controller posts and Cloudflare answers. */
+export async function renewal(w: AwakeWriter) {
+  const response = await post(
+    w.f,
+    sample(w.f, await nonce(w.f), {
+      physical: {
+        ...w.physical,
+        thin_pool: {
+          ...w.physical.thin_pool!,
+          data_used_bytes_upper_bound: 64 * mib,
+          metadata_used_bytes_upper_bound: mib,
+        },
+      },
+    }),
+  );
+  expect(response.status).toBe(200);
+  return NodeStorageHeadroomResponse.parse(response.body);
 }
 export async function leaseEntry(f: Fixture, id: string) {
   const response = await request(
