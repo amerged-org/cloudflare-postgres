@@ -32,6 +32,10 @@ pub fn waking(db: &Value) -> bool {
 pub(crate) fn emit(value: Value) {
     eprintln!("{value}");
 }
+/// Writes one event line to the controller's log.
+pub fn emit_event(value: Value) {
+    emit(value);
+}
 fn point_event(phase: &str, database_id: &str) -> Value {
     json!({"event":"wake_phase","phase":phase,"elapsedMs":0,"outcome":"completed","database_id":database_id,"at_ms":wall_clock_ms()})
 }

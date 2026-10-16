@@ -1643,4 +1643,38 @@ mod world {
         assert!(w.server.get("Namespace", None, &ns).is_none());
         assert_eq!(pool.states().get(NODE), Some(&(1, 0, 0)));
     }
+
+    #[tokio::test]
+    async fn a_hit_cut_off_before_it_serves_leaves_its_slot_to_be_retired() {
+        let mut w = World::pooled().await;
+        // PostgreSQL of the slot does not come up, and the pass is cut off meanwhile.
+        w.slot_postgres.as_ref().unwrap().stop();
+        w.fresh_authority();
+        let wake = w.wake_request();
+        let cut = tokio::time::timeout(
+            Duration::from_millis(400),
+            w.reconciler
+                .pool
+                .wake(&w.reconciler, Some((&w.db, &w.snapshot)), &wake, false),
+        )
+        .await;
+        assert!(cut.is_err(), "cut off");
+        assert_eq!(
+            holder(&w),
+            Some(format!("slot:{}:{BOOT_ID}", slot_pod_uid()))
+        );
+        assert_eq!(w.reconciler.pool.retiring(), vec![w.id.clone()]);
+        assert!(
+            w.reconciler
+                .pool
+                .retire_serving(&w.reconciler, &w.id, Some(&w.db))
+                .await
+                .unwrap()
+        );
+        assert_eq!(holder(&w), None);
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert!(!w.reconciler.pool.serves(&w.id));
+        // The fence never named the slot.
+        assert!(crate::power::sleep_completed(&fence(&w), now_ms()));
+    }
 }

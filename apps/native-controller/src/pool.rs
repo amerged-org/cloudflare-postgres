@@ -759,6 +759,21 @@ impl Timer {
         self.ms.insert("total".into(), millis(self.started));
     }
 }
+/// A claim between its decision and the slot's registration as serving. Dropped while it is
+/// pending, as when the pass that makes it is cut off, it registers the slot to be retired.
+struct Claiming<'a> {
+    pool: &'a Pool,
+    pending: Option<(String, Serving)>,
+}
+impl Drop for Claiming<'_> {
+    fn drop(&mut self) {
+        if let Some((id, serving)) = self.pending.take()
+            && let Ok(mut state) = self.pool.state.lock()
+        {
+            state.serving.entry(id).or_insert(serving);
+        }
+    }
+}
 /// The refusals of an agent that leave a slot as it was: nothing was mounted into it.
 const CLEAN_REFUSALS: [&str; 10] = [
     "denied",
@@ -1176,7 +1191,7 @@ impl Pool {
     }
     /// Steps 17-24 of a hit: the attach, the identity of the volume, the claim wave, the start
     /// of PostgreSQL, the SQL identity, the slot Pod and the release. A failure after the attach
-    /// retires the slot before the miss path may take the volume.
+    /// retires the slot before the miss path may take the volume; so does a hit that is cut off.
     async fn hit(
         &self,
         rec: &Reconciler,
@@ -1196,6 +1211,42 @@ impl Pool {
         let id = text(&view, "id").to_string();
         let ns = slot_namespace(&slot.hex);
         let node = slot.node.clone();
+        let claim = Claim {
+            v: 1,
+            database: id.clone(),
+            operation: text(&view["power"], "operation").into(),
+            generation: number(&view, "generation"),
+            claimed_at_ms: now_ms(),
+        };
+        let serving = Serving {
+            slot: slot.hex.clone(),
+            node: node.clone(),
+            generation: claim.generation,
+            operation: claim.operation.clone(),
+            ticket: None,
+            pod: pod.clone(),
+            volume: choice.volume.clone(),
+            target_before: fence["data"]["admission_target"]
+                .as_str()
+                .map(str::to_string),
+            structure: structure_fingerprint(&view, &self.image).unwrap_or_default(),
+            configuration: sleep_fingerprint(&view, &self.image).unwrap_or_default(),
+            retire: None,
+        };
+        // Cut off before it serves, the claim leaves its slot to be retired, its release undone.
+        let mut claiming = Claiming {
+            pool: self,
+            pending: Some((
+                id.clone(),
+                Serving {
+                    retire: Some(Retire {
+                        restore: true,
+                        reason: "interrupted",
+                    }),
+                    ..serving.clone()
+                },
+            )),
+        };
         // 17-18: the attach.
         let attached = async {
             let agent = rec.power.attach.agent(&node).await.ok().flatten()?;
@@ -1224,11 +1275,13 @@ impl Pool {
         timer.lap("attach");
         let attached = match attached {
             None => {
+                claiming.pending = None;
                 self.unclaim(&slot.hex);
                 return Err("agent_unavailable");
             }
             Some(Ok(attached)) => attached,
             Some(Err(CallError::Refused(code))) if CLEAN_REFUSALS.contains(&code.as_str()) => {
+                claiming.pending = None;
                 self.unclaim(&slot.hex);
                 return Err(REASONS
                     .into_iter()
@@ -1241,6 +1294,7 @@ impl Pool {
                 let _ = self
                     .retire(rec, &slot, &pod, &choice.volume, &id, None)
                     .await;
+                claiming.pending = None;
                 return Err(match error {
                     CallError::Refused(code) => REASONS
                         .into_iter()
@@ -1255,45 +1309,43 @@ impl Pool {
             }
         };
         timer.agent_us = attached.steps_us.clone();
-        // 19: the volume is the one that slept, and it slept cleanly.
-        if !attached.control.shut_down() || !record.matches(&attached.control) {
-            let _ = self
-                .retire(rec, &slot, &pod, &choice.volume, &id, None)
-                .await;
-            return Err(if attached.control.shut_down() {
-                "identity_mismatch"
-            } else {
-                "unclean"
-            });
-        }
-        let undo = |reason: &'static str, inspect: bool| {
-            let (slot, pod, volume, id, view) = (&slot, &pod, &choice.volume, &id, &view);
-            async move {
+        // A failure from here on retires the slot: with `inspect`, the sleep is recorded from
+        // the data directory once PostgreSQL is seen shut down there.
+        macro_rules! undo {
+            ($reason:expr, $inspect:expr) => {{
                 let _ = self
-                    .retire(rec, slot, pod, volume, id, inspect.then_some(Some(view)))
+                    .retire(
+                        rec,
+                        &slot,
+                        &pod,
+                        &choice.volume,
+                        &id,
+                        $inspect.then_some(Some(&view)),
+                    )
                     .await;
-                Err(reason)
-            }
-        };
+                claiming.pending = None;
+                return Err($reason);
+            }};
+        }
+        // 19: the volume is the one that slept, and it slept cleanly.
+        if !attached.control.shut_down() {
+            undo!("unclean", false);
+        }
+        if !record.matches(&attached.control) {
+            undo!("identity_mismatch", false);
+        }
         // 20: the claim wave.
-        let claim = Claim {
-            v: 1,
-            database: id.clone(),
-            operation: text(&view["power"], "operation").into(),
-            generation: number(&view, "generation"),
-            claimed_at_ms: now_ms(),
-        };
-        let Ok((ca, ca_secret)) = self.bind(rec, &view, snapshot, &slot, &claim).await else {
-            timer.lap("claim_wave");
-            return undo("bind_failed", true).await;
-        };
+        let bound = self.bind(rec, &view, snapshot, &slot, &claim).await;
         timer.lap("claim_wave");
-        // 21-22: PostgreSQL accepts on the tenant data, which is the data that slept.
-        let Some(session) = self.started(&view, &pod, &ns, &ca).await else {
-            timer.lap("start");
-            return undo("start_timeout", true).await;
+        let Ok((ca, ca_secret)) = bound else {
+            undo!("bind_failed", true);
         };
+        // 21-22: PostgreSQL accepts on the tenant data, which is the data that slept.
+        let session = self.started(&view, &pod, &ns, &ca).await;
         timer.lap("start");
+        let Some(session) = session else {
+            undo!("start_timeout", true);
+        };
         let identity = session
             .query(crate::postgres::SERVER_IDENTITY_QUERY, &[])
             .await
@@ -1308,7 +1360,7 @@ impl Pool {
             identity.identifier != record.system_identifier
                 || u32::try_from(identity.timeline).ok() != Some(record.timeline)
         }) {
-            return undo("sql_identity_mismatch", false).await;
+            undo!("sql_identity_mismatch", false);
         }
         // 23: the slot Pod is still the one the volume was moved into.
         let current = self
@@ -1318,38 +1370,22 @@ impl Pool {
             .ok()
             .flatten();
         if current.as_ref().and_then(slot_pod).as_ref() != Some(&pod) {
-            return undo("container_missing", true).await;
+            undo!("container_missing", true);
         }
         // 24: the release.
         let target = json!({"v":1,"generation":claim.generation,"route_revision":view["admission"]["route_revision"],"admission_epoch":view["admission"]["admission_epoch"],"pod_uid":pod.uid,"container_id":pod.postgres,"ca_secret_uid":ca_secret["metadata"]["uid"],"ca_secret_resource_version":ca_secret["metadata"]["resourceVersion"],"ca_sha256":hex_digest(&ca),"tls_server_name":slot_tls_name(&ns)});
-        let intent = PowerIntent {
-            database: id.clone(),
-            operation: claim.operation.clone(),
-            revision: claim.generation,
-            mode: "running".into(),
-        };
-        let serving = Serving {
-            slot: slot.hex.clone(),
-            node: node.clone(),
-            generation: claim.generation,
-            operation: claim.operation.clone(),
-            ticket: ticket
-                .map(|wake| Ticket::new(&id, &wake.operation, wake.generation, Instant::now())),
-            pod: pod.clone(),
-            volume: choice.volume.clone(),
-            target_before: fence["data"]["admission_target"]
-                .as_str()
-                .map(str::to_string),
-            structure: structure_fingerprint(&view, &self.image).unwrap_or_default(),
-            configuration: sleep_fingerprint(&view, &self.image).unwrap_or_default(),
-            retire: None,
-        };
+        let intent = serving.intent(&id);
         // Registered before the release: whatever its answer, the slot is retired from here on.
-        self.state
-            .lock()
-            .unwrap()
-            .serving
-            .insert(id.clone(), serving);
+        // A gateway's wake is served on a ticket Cloudflare has to confirm.
+        self.state.lock().unwrap().serving.insert(
+            id.clone(),
+            Serving {
+                ticket: ticket
+                    .map(|wake| Ticket::new(&id, &wake.operation, wake.generation, Instant::now())),
+                ..serving
+            },
+        );
+        claiming.pending = None;
         if rec
             .power
             .release_slot(&view, &fence, &intent, &target)

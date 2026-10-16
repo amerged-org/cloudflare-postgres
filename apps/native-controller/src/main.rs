@@ -8,6 +8,8 @@ use pgcf_native_controller::{
     kubernetes::Kubernetes,
     measurements::Measurements,
     node_storage::{Renewal, Sampler, driver_image, sample_node},
+    pool::{PoolWork, TicketOutcome},
+    power::GatewayPod,
     reconcile::{Reconciler, newer_token, storage_claims, storage_snapshot_expired},
     timing,
 };
@@ -34,6 +36,10 @@ enum Hint {
     Desired(String, DesiredSnapshot, Instant),
     /// A watched database object changed: its database ID, the object kind and the object's name.
     Kube(String, &'static str, String),
+    /// A gateway Pod delivered a wake its client waits on (pool design 2026-10-16).
+    Wake(GatewayPod, pgcf_native_protocol::wake::WakeRequest),
+    /// An object of a pool slot changed: the slot's hex.
+    Slot(String),
 }
 struct Cell {
     db: Value,
@@ -60,12 +66,25 @@ struct Cell {
     started: Option<Instant>,
     /// When the log last named what hinted the database.
     hint_logged: Option<Instant>,
+    /// A pool slot serves the database: only a lapse of its node's write authority protects it.
+    served: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
     Reconcile,
     Renew,
     Protect,
+    /// The decision about a wake a gateway delivered, and a hit's release.
+    Wake,
+    /// The retirement of a pool slot that served the database.
+    Unwind,
+}
+impl JobKind {
+    /// Whether a job of this kind runs to its end whatever changes meanwhile: a cut-off claim or
+    /// retirement of a pool slot would leave the slot to be retired again.
+    fn uninterrupted(self) -> bool {
+        matches!(self, Self::Wake | Self::Unwind)
+    }
 }
 type PullResult = (Option<Vec<String>>, Instant, Result<DesiredSnapshot, Error>);
 type JobResult = (
@@ -118,7 +137,7 @@ fn apply_snapshot(
         .map(|(id, _)| id.clone())
         .collect();
     for id in absent {
-        if let Some(job) = active.get(&id) {
+        if let Some(job) = active.get(&id).filter(|job| !job.kind.uninterrupted()) {
             job.abort.abort();
         }
         cells.remove(&id);
@@ -138,7 +157,7 @@ fn apply_snapshot(
             let host_changed = host_write_state(&cell.db, &cell.snapshot, renewals)
                 != host_write_state(db, &snapshot, renewals);
             if changed || host_changed {
-                if let Some(job) = active.get(&id) {
+                if let Some(job) = active.get(&id).filter(|job| !job.kind.uninterrupted()) {
                     job.abort.abort();
                 }
                 cell.ready = false;
@@ -177,6 +196,7 @@ fn apply_snapshot(
                     verification_due: None,
                     started: None,
                     hint_logged: None,
+                    served: false,
                 },
             );
         }
@@ -476,13 +496,35 @@ fn storage_protection_reason(
         Ok(_) => None,
     }
 }
+/// Whether the database is to be protected now. A database a pool slot serves is protected only
+/// when its node's write authority lapsed: start holds and write tokens are the miss path's, its
+/// own Pod's (rule 6.7).
 fn storage_protection_due(
     db: &Value,
     snapshot: &DesiredSnapshot,
     renewals: &Renewals,
     clock: i128,
+    served: bool,
 ) -> bool {
-    storage_protection_reason(db, snapshot, renewals, clock).is_some()
+    served_protection_reason(db, snapshot, renewals, clock, served).is_some()
+}
+fn served_protection_reason(
+    db: &Value,
+    snapshot: &DesiredSnapshot,
+    renewals: &Renewals,
+    clock: i128,
+    served: bool,
+) -> Option<StorageProtectionReason> {
+    storage_protection_reason(db, snapshot, renewals, clock).filter(|reason| {
+        !served
+            || matches!(
+                reason,
+                StorageProtectionReason::AuthorityMissing
+                    | StorageProtectionReason::AuthorityRevoked
+                    | StorageProtectionReason::AuthorityExpiryInvalid
+                    | StorageProtectionReason::AuthorityExpired
+            )
+    })
 }
 fn timestamp_millis(value: &Value) -> Option<i128> {
     time::OffsetDateTime::parse(
@@ -532,8 +574,11 @@ fn preempt_storage(
     renewals: &Renewals,
     clock: i128,
     kind: JobKind,
+    served: bool,
 ) -> bool {
-    kind != JobKind::Protect && storage_protection_due(db, snapshot, renewals, clock)
+    kind != JobKind::Protect
+        && !kind.uninterrupted()
+        && storage_protection_due(db, snapshot, renewals, clock, served)
 }
 /// Bounded reconciliation slots shared by every database.
 const SLOTS: usize = 4;
@@ -557,7 +602,7 @@ fn waking(cell: &Cell) -> bool {
             && cell.db["power"]["operation"].as_str() != cell.woke.as_deref())
 }
 fn class(cell: &Cell, renewals: &Renewals, clock: i128) -> Class {
-    if storage_protection_due(&cell.db, &cell.snapshot, renewals, clock)
+    if storage_protection_due(&cell.db, &cell.snapshot, renewals, clock, cell.served)
         || (cell.renew && cell.ready)
     {
         Class::Storage
@@ -690,7 +735,7 @@ fn proof_verification_deadline(observed: &Value, now: Instant, clock: i128) -> O
     )
 }
 fn next_kind(cell: &Cell, renewals: &Renewals, clock: i128, now: Instant) -> JobKind {
-    if storage_protection_due(&cell.db, &cell.snapshot, renewals, clock) {
+    if storage_protection_due(&cell.db, &cell.snapshot, renewals, clock, cell.served) {
         JobKind::Protect
     } else if cell.renew && cell.ready && !verification_due(cell, now) {
         JobKind::Renew
@@ -801,7 +846,8 @@ fn schedule(
     let mut candidates: Vec<_> = cells
         .iter()
         .filter(|(id, cell)| {
-            let protect = storage_protection_due(&cell.db, &cell.snapshot, renewals, clock);
+            let protect =
+                storage_protection_due(&cell.db, &cell.snapshot, renewals, clock, cell.served);
             (cell.due <= now || verification_due(cell, now) || (cell.ready && protect))
                 && (protect
                     || (control_healthy
@@ -809,7 +855,8 @@ fn schedule(
                 && !busy.contains_key(*id)
         })
         .map(|(id, cell)| {
-            let protect = storage_protection_due(&cell.db, &cell.snapshot, renewals, clock);
+            let protect =
+                storage_protection_due(&cell.db, &cell.snapshot, renewals, clock, cell.served);
             let priority = if !protect && verification_due(cell, now) {
                 Class::Routine
             } else {
@@ -1053,11 +1100,16 @@ async fn run() -> Result<(), Error> {
                     async move { kube.watch_database_ids(kind, events).await }
                 });
                 while let Some(trigger) = receive.recv().await {
-                    if hints
-                        .send(Hint::Kube(trigger.database, kind, trigger.name))
-                        .await
-                        .is_err()
-                    {
+                    let mut sent = Ok(());
+                    if let Some(slot) = trigger.slot {
+                        sent = hints.send(Hint::Slot(slot)).await;
+                    }
+                    if sent.is_ok() && !trigger.database.is_empty() {
+                        sent = hints
+                            .send(Hint::Kube(trigger.database, kind, trigger.name))
+                            .await;
+                    }
+                    if sent.is_err() {
                         task.abort();
                         return;
                     }
@@ -1083,6 +1135,42 @@ async fn run() -> Result<(), Error> {
             }
         });
     }
+    // The gateways' wakes reach the loop as hints (pool design 2026-10-16).
+    {
+        let (wakes, mut delivered) = mpsc::channel(256);
+        let controller = controller.clone();
+        tokio::task::spawn_local(async move {
+            controller.pool.intake.run(&controller.power, wakes).await;
+        });
+        let hints = hints.clone();
+        tokio::task::spawn_local(async move {
+            while let Some((pod, wake)) = delivered.recv().await {
+                if hints.send(Hint::Wake(pod, wake)).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    // The slots and serving facts of the cluster are known before anything is scheduled.
+    loop {
+        match controller.pool.rediscover(&controller).await {
+            Ok(_) => break,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    json!({"event":"pool_rediscovery_failed","error":error_code(&error)})
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    if controller.pool.publish_keys(&controller).await.is_err() {
+        eprintln!("{{\"event\":\"attach_keys_unpublished\"}}");
+    }
+    let mut pool_tasks: JoinSet<Option<String>> = JoinSet::new();
+    let mut refills: JoinSet<()> = JoinSet::new();
+    let mut pool_interval = tokio::time::interval(Duration::from_secs(1));
+    let mut retiring_after: HashMap<String, Instant> = HashMap::new();
     let mut cells: HashMap<String, Cell> = HashMap::new();
     let mut active: HashMap<String, Active> = HashMap::new();
     let mut jobs: JoinSet<JobResult> = JoinSet::new();
@@ -1125,6 +1213,18 @@ async fn run() -> Result<(), Error> {
                 if !matches!(result,Some(Ok(Ok(())))) {eprintln!("{{\"event\":\"measurement_cycle_unknown\"}}");}
             },
             _ = node_interval.tick() => {
+                {
+                    let controller = controller.clone();
+                    pool_tasks.spawn_local(async move {
+                        if controller.pool.publish_keys(&controller).await.is_err() {
+                            eprintln!("{{\"event\":\"attach_keys_unpublished\"}}");
+                        }
+                        for (node, (free, creating, serving)) in controller.pool.states() {
+                            timing::emit_event(timing::pool_state_event(&node, free, creating, serving));
+                        }
+                        None
+                    });
+                }
                 if control_healthy && have_full_snapshot && inventories.is_empty() {
                     let kube = kube.clone();
                     let api = api.clone();
@@ -1183,6 +1283,37 @@ async fn run() -> Result<(), Error> {
                     sync_samplers(&mut samplers, &mut sampling, snapshot, (&kube, &api, &mut renewals));
                 }
             },
+            _ = pool_interval.tick() => {
+                if control_healthy && have_full_snapshot && refills.is_empty()
+                    && let Some((_, snapshot)) = latest_snapshot.clone()
+                {
+                    let controller = controller.clone();
+                    let dbs: Vec<Value> = cells.values().map(|cell| cell.db.clone()).collect();
+                    refills.spawn_local(async move {
+                        let ready = match controller.power.gateway_snapshot().await {
+                            Ok(gateways) => controller.pool.intake.ready(&gateways.pods),
+                            Err(_) => false,
+                        };
+                        let work = controller.pool.refill_work(&dbs, ready, Instant::now().into_std());
+                        let done = futures_util::future::join_all(work.iter().map(|step| async {
+                            match step {
+                                PoolWork::Create(spec) => controller.pool.create_slot(&controller, &snapshot, spec).await,
+                                PoolWork::Discard(hex) => controller.pool.discard(hex).await,
+                            }
+                        })).await;
+                        if done.iter().any(Result::is_err) {
+                            eprintln!("{{\"event\":\"pool_refill_failed\"}}");
+                        }
+                    });
+                }
+            },
+            _ = refills.join_next(), if !refills.is_empty() => {},
+            result = pool_tasks.join_next(), if !pool_tasks.is_empty() => {
+                // A slot that serves a database and changed is retired by an Unwind job.
+                if let Some(Ok(Some(id))) = result {
+                    retiring_after.remove(&id);
+                }
+            },
             _ = full.tick() => {
                 if !pull_full {
                     pull_full = true;
@@ -1233,6 +1364,58 @@ async fn run() -> Result<(), Error> {
                                 eprintln!("{}", hint_line(&id, kind, &name));
                             }
                         } else { pull_ids.insert(id); }
+                    },
+                    Some(Hint::Slot(hex)) => {
+                        let controller = controller.clone();
+                        pool_tasks.spawn_local(async move {
+                            controller.pool.observe(&hex).await.ok().flatten()
+                        });
+                    },
+                    Some(Hint::Wake(pod, wake)) => {
+                        timing::point("wake_delivered", &wake.database);
+                        controller.pool.delivered(&pod, &wake);
+                        let id = wake.database.clone();
+                        // A routine pass gives way to the wake; a wake or a storage job of the
+                        // database already running is the wake in progress.
+                        let busy = match active.get(&id) {
+                            Some(job) if job.class == Class::Routine && job.kind == JobKind::Reconcile => {
+                                job.abort.abort();
+                                active.remove(&id);
+                                false
+                            }
+                            Some(_) => true,
+                            None => false,
+                        };
+                        let cell = cells.get_mut(&id);
+                        let known = cell.as_ref().map(|cell| {
+                            let (db, snapshot) = renewals.effective(&cell.db, &cell.snapshot);
+                            (db, snapshot, cell.hints)
+                        });
+                        let started = Instant::now();
+                        let controller = controller.clone();
+                        if busy || known.is_none() {
+                            // Decided at once, by no job of the database.
+                            pool_tasks.spawn_local(async move {
+                                let cell = known.as_ref().map(|(db, snapshot, _)| (db, snapshot.as_ref()));
+                                let _ = controller.pool.wake(&controller, cell, &wake, busy).await;
+                                None
+                            });
+                            continue;
+                        }
+                        if let Some(cell) = cell {
+                            cell.started = Some(started);
+                        }
+                        let (db, snapshot, marker) = known.unwrap();
+                        let generation = number(&db, "generation");
+                        let job_id = id.clone();
+                        let abort = jobs.spawn_local(async move {
+                            let result = controller
+                                .pool
+                                .wake(&controller, Some((&db, &snapshot)), &wake, false)
+                                .await;
+                            (job_id, generation, marker, started, JobKind::Wake, result)
+                        });
+                        active.insert(id, Active { task: abort.id(), abort, kind: JobKind::Wake, class: Class::Wake });
                     },
                     None => break
                 }
@@ -1312,6 +1495,52 @@ async fn run() -> Result<(), Error> {
             _ = cadence.tick() => {}
         }
         poll_renewals(&mut samplers, &mut renewals, clock_ms());
+        // What Cloudflare's rows say of the pool's tickets; a confirmed wake's row is due at once.
+        for (id, outcome) in controller.pool.confirm_tickets(
+            |id| cells.get(id).map(|cell| &cell.db),
+            Instant::now().into_std(),
+        ) {
+            if outcome == TicketOutcome::Confirmed
+                && let Some(cell) = cells.get_mut(&id)
+            {
+                cell.due = Instant::now();
+            }
+        }
+        for (id, cell) in cells.iter_mut() {
+            cell.served = controller.pool.serves(id);
+        }
+        // Slots to be retired, one Unwind job each, again a second after one that did not end it.
+        let now = Instant::now();
+        for id in controller.pool.retiring() {
+            if active.contains_key(&id) || retiring_after.get(&id).is_some_and(|after| *after > now)
+            {
+                continue;
+            }
+            retiring_after.insert(id.clone(), now + Duration::from_secs(1));
+            let cell = cells.get(&id);
+            let db = cell.map(|cell| cell.db.clone());
+            let generation = db.as_ref().map_or(0, |db| number(db, "generation"));
+            let marker = cell.map_or(0, |cell| cell.hints);
+            let controller = controller.clone();
+            let job_id = id.clone();
+            let abort = jobs.spawn_local(async move {
+                let result = controller
+                    .pool
+                    .retire_serving(&controller, &job_id, db.as_ref())
+                    .await
+                    .map(|_| None);
+                (job_id, generation, marker, now, JobKind::Unwind, result)
+            });
+            active.insert(
+                id,
+                Active {
+                    task: abort.id(),
+                    abort,
+                    kind: JobKind::Unwind,
+                    class: Class::Storage,
+                },
+            );
+        }
 
         let read_at = Instant::now();
         startup_reads.retain(|id, _| cells.contains_key(id));
@@ -1348,7 +1577,14 @@ async fn run() -> Result<(), Error> {
         }
         for (id, job) in &active {
             if cells.get(id).is_some_and(|cell| {
-                preempt_storage(&cell.db, &cell.snapshot, &renewals, clock_ms(), job.kind)
+                preempt_storage(
+                    &cell.db,
+                    &cell.snapshot,
+                    &renewals,
+                    clock_ms(),
+                    job.kind,
+                    cell.served,
+                )
             }) {
                 job.abort.abort();
             }
@@ -1376,8 +1612,13 @@ async fn run() -> Result<(), Error> {
                 let marker = cell.hints;
                 let controller = controller.clone();
                 let api = api.clone();
-                let protection =
-                    storage_protection_reason(&cell.db, &cell.snapshot, &renewals, clock_ms());
+                let protection = served_protection_reason(
+                    &cell.db,
+                    &cell.snapshot,
+                    &renewals,
+                    clock_ms(),
+                    cell.served,
+                );
                 let kind = next_kind(cell, &renewals, clock_ms(), Instant::now());
                 let started = Instant::now();
                 let begun = cells.get_mut(&id).unwrap();
@@ -1390,7 +1631,7 @@ async fn run() -> Result<(), Error> {
                     let result = async {
                         if kind == JobKind::Protect {
                             eprintln!("{}", json!({"event":"storage_protection_dispatched","database_id":job_id,"generation":generation,"protection_reason":protection.map(StorageProtectionReason::code)}));
-                            return controller.power.protect_storage(&db).await;
+                            return controller.protect_storage(&db).await;
                         }
                         if kind == JobKind::Renew {
                             tokio::time::timeout(
@@ -1482,6 +1723,7 @@ mod tests {
             verification_due: None,
             started: None,
             hint_logged: None,
+            served: false,
         }
     }
     fn wake(id: &str, operation: &str) -> Value {
@@ -1565,7 +1807,8 @@ mod tests {
             &state,
             &renewals,
             2000,
-            JobKind::Reconcile
+            JobKind::Reconcile,
+            false
         ));
         state.region["storage_nodes"][0]["write_allowed"] = false.into();
         assert!(preempt_storage(
@@ -1573,9 +1816,10 @@ mod tests {
             &state,
             &renewals,
             2000,
-            JobKind::Reconcile
+            JobKind::Reconcile,
+            false
         ));
-        if preempt_storage(&db, &state, &renewals, 2000, JobKind::Reconcile) {
+        if preempt_storage(&db, &state, &renewals, 2000, JobKind::Reconcile, false) {
             job.abort();
         }
         assert!(job.await.unwrap_err().is_cancelled());
@@ -1595,14 +1839,16 @@ mod tests {
             &state,
             &renewals,
             2000,
-            JobKind::Reconcile
+            JobKind::Reconcile,
+            false
         ));
         assert!(!preempt_storage(
             &db,
             &state,
             &renewals,
             2000,
-            JobKind::Protect
+            JobKind::Protect,
+            false
         ));
     }
     #[test]
@@ -1692,27 +1938,138 @@ mod tests {
             &db,
             &state,
             &Renewals::default(),
-            1000
+            1000,
+            false
         ));
         assert!(storage_protection_due(
             &db,
             &state,
             &Renewals::default(),
-            2000
+            2000,
+            false
         ));
         assert!(storage_protection_due(
             &db,
             &state,
             &Renewals::default(),
-            3000
+            3000,
+            false
         ));
         state.region["storage_nodes"][0]["write_allowed"] = false.into();
         assert!(storage_protection_due(
             &db,
             &state,
             &Renewals::default(),
-            1000
+            1000,
+            false
         ));
+    }
+    #[test]
+    fn a_slot_served_database_is_protected_only_for_node_authority_not_for_start_tokens() {
+        // A served database's slot holds the volume under the node's write authority; the
+        // startup hold and the write tokens are its own Pod's, on the miss path.
+        let mut db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_startup":{"generation":3,"node_uid":NODE,"expires_at":"1970-01-01T00:00:02.000Z"}});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":NODE,"write_allowed":true,"expires_at":"1970-01-01T00:00:03.000Z"}]});
+        let renewals = Renewals::default();
+        assert!(storage_protection_due(&db, &state, &renewals, 2000, false));
+        assert!(!storage_protection_due(&db, &state, &renewals, 2000, true));
+        db["storage_startup"] = Value::Null;
+        assert_eq!(
+            served_protection_reason(&db, &state, &renewals, 1000, false)
+                .map(StorageProtectionReason::code),
+            Some("startup_missing")
+        );
+        assert_eq!(
+            served_protection_reason(&db, &state, &renewals, 1000, true),
+            None
+        );
+        db["storage_authority"] = token(3, 1, 500).into();
+        assert!(!storage_protection_due(&db, &state, &renewals, 1000, true));
+        // The node's authority lapses or is revoked: served or not, the database is protected.
+        assert_eq!(
+            served_protection_reason(&db, &state, &renewals, 3000, true)
+                .map(StorageProtectionReason::code),
+            Some("authority_expired")
+        );
+        state.region["storage_nodes"][0]["write_allowed"] = false.into();
+        assert_eq!(
+            served_protection_reason(&db, &state, &renewals, 1000, true)
+                .map(StorageProtectionReason::code),
+            Some("authority_revoked")
+        );
+        state.region["storage_nodes"] = json!([]);
+        assert!(storage_protection_due(&db, &state, &renewals, 1000, true));
+        // A wake or a retirement of a slot runs to its end: a protection waits for it.
+        assert!(!preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            1000,
+            JobKind::Wake,
+            true
+        ));
+        assert!(!preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            1000,
+            JobKind::Unwind,
+            true
+        ));
+        assert!(preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            1000,
+            JobKind::Reconcile,
+            true
+        ));
+    }
+    #[tokio::test]
+    async fn a_changed_desired_row_does_not_cut_off_a_wake_or_a_slot_retirement() {
+        let now = Instant::now();
+        let mut cells = HashMap::new();
+        let db = json!({"id":"db","generation":3,"desired_state":"suspended","power":{"operation":operation(3),"revision":3,"mode":"quiesce","reason":"idle"}});
+        cells.insert("db".to_string(), cell(db.clone(), now, true));
+        let mut active = HashMap::new();
+        let mut tasks = JoinSet::new();
+        for kind in [JobKind::Wake, JobKind::Reconcile] {
+            let abort = tasks.spawn(std::future::pending::<()>());
+            active.insert(
+                "db".to_string(),
+                Active {
+                    task: abort.id(),
+                    abort: abort.clone(),
+                    kind,
+                    class: Class::Wake,
+                },
+            );
+            // Cloudflare's row of the wake arrives while the job runs.
+            let mut woken = db.clone();
+            woken["generation"] = 4.into();
+            woken["desired_state"] = "running".into();
+            woken["power"] =
+                json!({"operation":operation(4),"revision":4,"mode":"running","reason":null});
+            apply_snapshot(
+                &mut cells,
+                &active,
+                &Renewals::default(),
+                snapshot(vec![woken]),
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(
+                abort.is_finished(),
+                kind == JobKind::Reconcile,
+                "{}",
+                kind == JobKind::Wake
+            );
+            cells.insert("db".to_string(), cell(db.clone(), now, true));
+        }
+        tasks.abort_all();
     }
     #[test]
     fn protection_diagnostics_name_the_existing_stop_without_claims_or_payloads() {
@@ -2257,24 +2614,28 @@ mod tests {
         state.region = json!({"storage_nodes":[{"node_uid":NODE,"revision":2,"write_allowed":true,"expires_at":"1970-01-01T00:00:02.000Z"}]});
         let mut renewals = Renewals::default();
         // The 60 s snapshot's authority and token lapse long before the next pull.
-        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(storage_protection_due(&db, &state, &renewals, 5000, false));
         assert!(renewals.accept(
             renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
             0
         ));
-        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
-        assert!(storage_protection_due(&db, &state, &renewals, 10_000));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000, false));
+        assert!(storage_protection_due(
+            &db, &state, &renewals, 10_000, false
+        ));
         // An older renewal never replaces a newer one.
         assert!(!renewals.accept(renewal(3, false, "1970-01-01T00:00:20.000Z", &[]), 0));
-        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000, false));
         // A renewal's token of another generation never stands in for this one's.
         let mut woken = db.clone();
         woken["generation"] = 4.into();
         woken["storage_authority"] = Value::Null;
-        assert!(storage_protection_due(&woken, &state, &renewals, 5000));
+        assert!(storage_protection_due(
+            &woken, &state, &renewals, 5000, false
+        ));
         // A newer snapshot entry wins again: here Cloudflare stopped allowing writes.
         state.region["storage_nodes"][0] = json!({"node_uid":NODE,"revision":5,"write_allowed":false,"expires_at":"1970-01-01T00:00:20.000Z"});
-        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(storage_protection_due(&db, &state, &renewals, 5000, false));
     }
     #[test]
     fn writes_continue_while_the_newest_delivered_token_is_unexpired() {
@@ -2289,8 +2650,12 @@ mod tests {
         // A later renewal without this database's token keeps the one already delivered,
         // as its ledger does, until it expires.
         renewals.accept(renewal(5, true, "1970-01-01T00:00:12.000Z", &[]), 0);
-        assert!(!storage_protection_due(&db, &state, &renewals, 9_000));
-        assert!(storage_protection_due(&db, &state, &renewals, 10_000));
+        assert!(!storage_protection_due(
+            &db, &state, &renewals, 9_000, false
+        ));
+        assert!(storage_protection_due(
+            &db, &state, &renewals, 10_000, false
+        ));
         let (view, _) = renewals.effective(&db, &Arc::new(state));
         assert_eq!(view["storage_authority"], token(3, 4, 10_000));
         // Expired tokens leave the cache with the next renewal.
@@ -2310,12 +2675,12 @@ mod tests {
             renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
             0,
         );
-        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000, false));
         state.region["storage_nodes"] = json!([]);
         state.region["storage_samples"] = json!([]);
         renewals.sync_targets(&state, &sampler_targets(&state));
-        assert!(storage_protection_due(&db, &state, &renewals, 5000));
-        assert!(storage_protection_due(&db, &older, &renewals, 1000));
+        assert!(storage_protection_due(&db, &state, &renewals, 5000, false));
+        assert!(storage_protection_due(&db, &older, &renewals, 1000, false));
         assert!(renewals.nodes.is_empty());
         assert!(renewals.tokens.is_empty());
         let (_, effective) = renewals.effective(&db, &Arc::new(state));
@@ -2331,12 +2696,12 @@ mod tests {
         state.region["storage_samples"] = json!([sampling_target()]);
         let mut renewals = Renewals::default();
         renewals.sync_targets(&state, &sampler_targets(&state));
-        assert!(storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(storage_protection_due(&db, &state, &renewals, 5000, false));
         assert!(renewals.accept(
             renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
             5000,
         ));
-        assert!(!storage_protection_due(&db, &state, &renewals, 5000));
+        assert!(!storage_protection_due(&db, &state, &renewals, 5000, false));
         let (_, effective) = renewals.effective(&db, &Arc::new(state));
         assert_eq!(effective.region["storage_nodes"][0]["revision"], 4);
     }
