@@ -1858,20 +1858,51 @@ export async function readPostgresPoolBinding(
     ? binding
     : undefined;
 }
+/**
+ * The pool holders of every database that `scope` (a predicate over `databases d`) selects, in one
+ * statement: a row for each database with a binding or holder row that is not terminal
+ * (`hasNonterminalPoolHolderSql`), carrying the binding whose holder row agrees with it.
+ */
+export function postgresPoolHoldersStatement(
+  db: D1Database,
+  scope: { sql: string; bindings: unknown[] },
+) {
+  return db
+    .prepare(
+      `SELECT d.id database_id,b.scope_json,b.scope_sha256,b.holder_revision,b.state,b.created_at,b.updated_at,h.binding_id holder_binding
+    FROM databases d
+    LEFT JOIN pool_bindings b ON b.database_id=d.id AND b.state NOT IN('released','refused')
+    LEFT JOIN database_runtime_holders h ON h.binding_id=b.id AND h.database_id=b.database_id AND h.revision=b.holder_revision AND h.kind='pool' AND h.state=b.state
+    WHERE (${scope.sql}) AND ${hasNonterminalPoolHolderSql("d")}`,
+    )
+    .bind(...scope.bindings);
+}
+/** The result of `postgresPoolHoldersStatement`: which databases have an unresolved pool holder,
+ * and the binding of each whose holder row agrees and whose scope hash holds. */
+export async function readPostgresPoolHolders(
+  rows: readonly Record<string, unknown>[],
+) {
+  const bindings = new Map<string, PoolBinding>(),
+    unresolved = new Set<string>();
+  for (const row of rows) {
+    const id = row.database_id as string;
+    unresolved.add(id);
+    if (row.scope_json === null || row.holder_binding === null) continue;
+    const binding = bindingFrom(row);
+    if ((await poolBindingScopeHash(binding.scope)) === binding.scope_sha256)
+      bindings.set(id, binding);
+  }
+  return { bindings, unresolved };
+}
 export async function readPostgresPoolBindingForDatabase(
   env: Env,
   id: string,
 ): Promise<PoolBinding | undefined> {
-  const row = await env.DB.prepare(
-    "SELECT b.* FROM pool_bindings b JOIN database_runtime_holders h ON h.binding_id=b.id AND h.database_id=b.database_id AND h.revision=b.holder_revision AND h.kind='pool' WHERE b.database_id=? AND h.state=b.state AND b.state NOT IN('released','refused')",
-  )
-    .bind(id)
-    .first<Record<string, unknown>>();
-  if (!row) return undefined;
-  const binding = bindingFrom(row);
-  return (await poolBindingScopeHash(binding.scope)) === binding.scope_sha256
-    ? binding
-    : undefined;
+  const rows = await postgresPoolHoldersStatement(env.DB, {
+    sql: "d.id=?",
+    bindings: [id],
+  }).all<Record<string, unknown>>();
+  return (await readPostgresPoolHolders(rows.results)).bindings.get(id);
 }
 
 export interface PostgresPoolCleanupGrant {

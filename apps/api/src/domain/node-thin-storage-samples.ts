@@ -24,7 +24,7 @@ import { agentRegion } from "./agent-auth.ts";
 import {
   qualifiedThinStorageSql,
   readCurrentNodeThinStorage,
-  storageWriteAuthorityForDatabase,
+  runningWriterTokens,
 } from "./node-thin-storage.ts";
 import {
   composeThinStorageAuthority,
@@ -37,7 +37,6 @@ import {
   thinStorageAuthoritySql,
   thinStorageWriteAllowed,
 } from "./node-thin-storage-execution.ts";
-import type { DatabaseRow } from "./rows.ts";
 import {
   thinStorageSamplingCapable,
   thinStorageSamplingSql,
@@ -474,16 +473,8 @@ async function productSample(
       d1_update_total_attempts: timing.attempts,
     }),
   );
-  const databases = await env.DB.prepare(
-    "SELECT * FROM databases WHERE node_id=? AND region_id=? AND storage_profile_json IS NOT NULL AND storage_volume_json IS NOT NULL AND desired_state='running' AND deleted_at IS NULL ORDER BY id",
-  )
-    .bind(nodeId, row.region_id)
-    .all<DatabaseRow>();
-  const tokens: NodeStorageHeadroomResponse["tokens"] = [];
-  for (const database of databases.results) {
-    const token = await storageWriteAuthorityForDatabase(env, database, now);
-    if (token) tokens.push({ database_id: database.id, token });
-  }
+  const tokens: NodeStorageHeadroomResponse["tokens"] =
+    await runningWriterTokens(env, nodeId, row.region_id, now);
   if (
     thinPoolDataGrowthNeeded(
       profile,

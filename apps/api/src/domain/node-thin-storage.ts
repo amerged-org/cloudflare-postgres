@@ -227,12 +227,137 @@ function storageWriterProtected(
   );
 }
 
+/** A start admission's hold on a database's volume, as `heldWriterPod` reads it. */
+interface StartHold {
+  node_id: string;
+  node_uid: string;
+  storage_budget_bytes: number;
+  ready_at: string | null;
+  completed_at: string | null;
+}
+
+/**
+ * Everything a writer decision reads besides the database's own row and the node's reading, for
+ * every database one scope selects. One statement per kind serves a whole node, so what a lease or
+ * a sample costs does not depend on how many databases the node has held.
+ */
+export interface WriterInputs {
+  /** The non-terminal pool binding whose holder row agrees (readPostgresPoolBindingForDatabase). */
+  bindings: ReadonlyMap<string, PoolBinding>;
+  /** Databases with a pool binding or holder that is not terminal (hasNonterminalPoolHolderSql). */
+  unresolved: ReadonlySet<string>;
+  /** The startup holds that still debit storage, by `${database_id}:${generation}`. */
+  holds: ReadonlyMap<string, StartHold>;
+  /** The pending or running wake and resume operations, by operation id. */
+  wakes: ReadonlyMap<
+    string,
+    { database_id: string; project_id: string; generation: number }
+  >;
+}
+
+/** A predicate over `databases d` and the values it binds. */
+export interface DatabaseScope {
+  sql: string;
+  bindings: unknown[];
+}
+
+/**
+ * The inputs of every database `scope` selects, read in one D1 batch. `rows`, when given, rides in
+ * the same batch and its result is returned beside them.
+ */
+async function readWriterInputs<Row = never>(
+  env: Pick<Env, "DB">,
+  scope: DatabaseScope,
+  rows?: D1PreparedStatement,
+): Promise<{ rows: Row[]; inputs: WriterInputs }> {
+  const { postgresPoolHoldersStatement, readPostgresPoolHolders } =
+    await import("./postgres-pool.ts");
+  const results = await env.DB.batch([
+    ...(rows ? [rows] : []),
+    postgresPoolHoldersStatement(env.DB, scope),
+    env.DB.prepare(
+      `SELECT h.database_id,h.generation,h.node_id,h.node_uid,h.storage_budget_bytes,h.ready_at,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at
+      FROM databases d JOIN database_start_admissions h ON h.database_id=d.id JOIN operations o ON o.id=h.operation_id
+      WHERE (${scope.sql}) AND h.budget_bytes>0 AND h.storage_budget_bytes>0`,
+    ).bind(...scope.bindings),
+    env.DB.prepare(
+      `SELECT o.id,o.database_id,o.project_id,o.generation FROM databases d JOIN operations o ON o.id=d.power_operation
+      WHERE (${scope.sql}) AND o.kind IN('database.wake','database.resume') AND o.status IN('pending','running')`,
+    ).bind(...scope.bindings),
+  ]);
+  const [selected, holders, holds, wakes] = (
+    rows ? results : [undefined, ...results]
+  ) as [
+    D1Result<Row> | undefined,
+    D1Result<Record<string, unknown>>,
+    D1Result<StartHold & { database_id: string; generation: number }>,
+    D1Result<{
+      id: string;
+      database_id: string;
+      project_id: string;
+      generation: number;
+    }>,
+  ];
+  return {
+    rows: selected?.results ?? [],
+    inputs: {
+      ...(await readPostgresPoolHolders(holders.results)),
+      holds: new Map(
+        holds.results.map((hold) => [
+          `${hold.database_id}:${hold.generation}`,
+          hold,
+        ]),
+      ),
+      wakes: new Map(wakes.results.map((wake) => [wake.id, wake])),
+    },
+  };
+}
+
+type NodeReading = Awaited<ReturnType<typeof readCurrentNodeThinStorage>>;
+/** What one pass over a node's databases shares: the instant, the inputs, the node's reading and
+ * the signing key, each obtained once. */
+interface WriterContext {
+  env: Env;
+  now: number;
+  inputs: WriterInputs;
+  /** The reading the caller supplied; absent, it is read when a decision first needs it. */
+  snapshot: NodeReading | undefined;
+  node(nodeId: string): Promise<NodeReading>;
+  key(): ReturnType<typeof nodeProofSigningKey>;
+}
+/** `reading` is the node's reading when the caller has one (also an absent one: null). */
+function writerContext(
+  env: Env,
+  now: number,
+  inputs: WriterInputs,
+  reading?: NodeReading,
+): WriterContext {
+  const readings = new Map<string, Promise<NodeReading>>();
+  let key: ReturnType<typeof nodeProofSigningKey> | undefined;
+  return {
+    env,
+    now,
+    inputs,
+    snapshot: reading,
+    node(nodeId) {
+      if (reading !== undefined) return Promise.resolve(reading);
+      let read = readings.get(nodeId);
+      if (!read) {
+        read = readCurrentNodeThinStorage(env, nodeId, now);
+        readings.set(nodeId, read);
+      }
+      return read;
+    },
+    key: () => (key ??= nodeProofSigningKey(env)),
+  };
+}
+
 /** A new writer without IO evidence yet (section 8 of thin-authority-renewal.md): its current
  * startup hold of this generation debits at least the LV's virtual size until a later identity
  * proof shows the Pod's io.max, and the controller's runtime attestation of this generation names
  * the Pod together with the receipt's identities, the cluster and the identity proof's boot. */
-async function heldWriterPod(
-  env: Pick<Env, "DB">,
+function heldWriterPod(
+  inputs: WriterInputs,
   database: DatabaseRow,
   storage: DesiredDatabaseStorage,
   receipt: DatabaseStorageVolumeReceipt,
@@ -244,7 +369,7 @@ async function heldWriterPod(
       value.generation === database.generation &&
       value.storage_generation === receipt.storage_generation,
   ),
-): Promise<string | undefined> {
+): string | undefined {
   const lv = authority.physical_lvs.find(
       (value) => value.lv_uuid === receipt.lv_uuid && value.segtype === "thin",
     ),
@@ -274,18 +399,14 @@ async function heldWriterPod(
   )
     return undefined;
   const volume = reading;
-  const hold = await env.DB.prepare(
-    "SELECT h.ready_at,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at FROM database_start_admissions h JOIN operations o ON o.id=h.operation_id WHERE h.database_id=? AND h.generation=? AND h.node_id=? AND h.node_uid=? AND h.budget_bytes>0 AND h.storage_budget_bytes>=?",
+  const hold = inputs.holds.get(`${database.id}:${database.generation}`);
+  if (
+    !hold ||
+    hold.node_id !== database.node_id ||
+    hold.node_uid !== storage.node_uid ||
+    hold.storage_budget_bytes < lv.size_bytes
   )
-    .bind(
-      database.id,
-      database.generation,
-      database.node_id,
-      storage.node_uid,
-      lv.size_bytes,
-    )
-    .first<{ ready_at: string | null; completed_at: string | null }>();
-  if (!hold) return undefined;
+    return undefined;
   const readyAt = Math.min(
     runtime.observed_at,
     hold.ready_at ? Date.parse(hold.ready_at) : Infinity,
@@ -307,12 +428,7 @@ async function heldWriterPod(
 
 /** What every writer token of a retained thin volume stands on: the receipt, the profile and a
  * current, write-allowed physical reading of the node that has this very volume. */
-async function currentWriterContext(
-  env: Env,
-  database: DatabaseRow,
-  now: number,
-  snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
-) {
+async function currentWriterContext(c: WriterContext, database: DatabaseRow) {
   if (
     !database.node_id ||
     !database.storage_profile_json ||
@@ -326,13 +442,10 @@ async function currentWriterContext(
   const receipt = DatabaseStorageVolumeReceipt.parse(
     JSON.parse(database.storage_volume_json),
   );
-  const current =
-    snapshot === undefined
-      ? await readCurrentNodeThinStorage(env, database.node_id, now)
-      : snapshot;
+  const current = await c.node(database.node_id);
   const authority = current?.authority;
   if (
-    !thinStorageAuthorityMatches(storage, authority, undefined, now) ||
+    !thinStorageAuthorityMatches(storage, authority, undefined, c.now) ||
     !authority ||
     storageWriterProtected(database, authority) ||
     current?.row.node_id !== database.node_id ||
@@ -370,15 +483,14 @@ function volumeMatchesReceipt(
 /** Cloudflare's signature over one named writer. Stable within one accepted physical revision:
  * polling never extends a stale read's deadline. */
 async function signStorageWriter(
-  env: Env,
+  c: WriterContext,
   database: DatabaseRow,
   storage: DesiredDatabaseStorage,
   receipt: DatabaseStorageVolumeReceipt,
   authority: NodeThinStorageAuthority,
   pod: string,
-  now: number,
 ) {
-  const key = await nodeProofSigningKey(env);
+  const key = await c.key();
   const claims: StorageWriteClaims = {
     v: 1,
     kid: key.kid,
@@ -402,7 +514,7 @@ async function signStorageWriter(
     drain_seconds: storage.drain_seconds,
     write_allowed: true,
   };
-  return signStorageWriteAuthority(claims, key.privateKey, now);
+  return signStorageWriteAuthority(claims, key.privateKey, c.now);
 }
 
 /**
@@ -446,20 +558,19 @@ function evidencedWriter(
  * It serves two moments: while the database sleeps parked, and while a fast wake of the very next
  * generation reuses the Pod.
  */
-async function parkedHolder(
-  env: Pick<Env, "DB">,
+function parkedHolder(
+  c: WriterContext,
   database: DatabaseRow,
   storage: DesiredDatabaseStorage,
   receipt: DatabaseStorageVolumeReceipt,
   authority: NodeThinStorageAuthority,
-  now: number,
-): Promise<string | undefined> {
+): string | undefined {
   const parked = readParkedRecord(database.parked_json);
   if (
     !parked ||
     database.observed_power !== "hibernated" ||
     database.deleted_at !== null ||
-    !parkedRecordFresh(parked, now)
+    !parkedRecordFresh(parked, c.now)
   )
     return undefined;
   if (database.desired_state === "suspended") {
@@ -471,19 +582,14 @@ async function parkedHolder(
     // So the token only goes with the controller's claim that every predicate of the fast wake
     // holds, for the wake that directly follows the reported sleep. Any other wake is ordinary: no
     // token for the parked Pod, the guard retires it with the startup and the controller demotes.
+    const wake = c.inputs.wakes.get(database.power_operation ?? "");
     if (
       parked.wake !== "fast" ||
       database.generation !== parked.generation + 1 ||
-      !(await env.DB.prepare(
-        "SELECT 1 FROM operations o WHERE o.id=? AND o.database_id=? AND o.project_id=? AND o.generation=? AND o.kind IN('database.wake','database.resume') AND o.status IN('pending','running')",
-      )
-        .bind(
-          database.power_operation ?? "",
-          database.id,
-          database.project_id,
-          database.generation,
-        )
-        .first())
+      !wake ||
+      wake.database_id !== database.id ||
+      wake.project_id !== database.project_id ||
+      wake.generation !== database.generation
     )
       return undefined;
   } else return undefined;
@@ -493,27 +599,21 @@ async function parkedHolder(
     : undefined;
 }
 
-export async function storageWriteAuthorityForDatabase(
-  env: Env,
+/**
+ * The signed writer token of a database that is meant to be running, from the node's reading and
+ * the inputs of `c`. One computation serves the host lease, the fast sample's tokens and the
+ * desired page.
+ */
+async function runningWriterAuthority(
+  c: WriterContext,
   database: DatabaseRow,
-  now = Date.now(),
-  snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
 ): Promise<string | undefined> {
-  const { readPostgresPoolBindingForDatabase, hasNonterminalPoolHolderSql } =
-    await import("./postgres-pool.ts");
-  const pool = await readPostgresPoolBindingForDatabase(env, database.id);
+  const pool = c.inputs.bindings.get(database.id);
   if (pool && !["released", "refused"].includes(pool.state))
-    return issuePostgresPoolStorageAuthority(env, pool, now, snapshot);
-  if (
-    await env.DB.prepare(
-      `SELECT 1 FROM databases d WHERE d.id=? AND ${hasNonterminalPoolHolderSql("d")}`,
-    )
-      .bind(database.id)
-      .first()
-  )
-    return undefined;
+    return issuePostgresPoolStorageAuthority(c.env, pool, c.now, c.snapshot);
+  if (c.inputs.unresolved.has(database.id)) return undefined;
   if (database.desired_state !== "running") return undefined;
-  const context = await currentWriterContext(env, database, now, snapshot);
+  const context = await currentWriterContext(c, database);
   if (!context) return undefined;
   const { storage, receipt, authority, current } = context;
   const volume = authority.volumes.find(
@@ -538,24 +638,34 @@ export async function storageWriteAuthorityForDatabase(
   // or the parked Pod that a wake of this very generation reuses.
   const pod =
     io?.pod_uid ??
-    (await heldWriterPod(
-      env,
+    heldWriterPod(
+      c.inputs,
       database,
       storage,
       receipt,
       authority,
       current!.row.qualification_json,
-    )) ??
-    (await parkedHolder(env, database, storage, receipt, authority, now));
+    ) ??
+    parkedHolder(c, database, storage, receipt, authority);
   if (!pod) return undefined;
-  return signStorageWriter(
-    env,
+  return signStorageWriter(c, database, storage, receipt, authority, pod);
+}
+
+/** The signed writer of one database, read for it alone: the desired page and single decisions.
+ * `snapshot` is the node's reading when the caller has one. */
+export async function storageWriteAuthorityForDatabase(
+  env: Env,
+  database: DatabaseRow,
+  now = Date.now(),
+  snapshot?: NodeReading,
+): Promise<string | undefined> {
+  const { inputs } = await readWriterInputs(env, {
+    sql: "d.id=?",
+    bindings: [database.id],
+  });
+  return runningWriterAuthority(
+    writerContext(env, now, inputs, snapshot),
     database,
-    storage,
-    receipt,
-    authority,
-    pod,
-    now,
   );
 }
 
@@ -566,14 +676,14 @@ export async function storageWriteAuthorityForDatabase(
  * controller's attestation of that start. Both have to name the same Pod, and a frozen volume or a
  * second measured Pod names none.
  */
-async function stoppingWriter(
-  env: Pick<Env, "DB">,
+function stoppingWriter(
+  inputs: WriterInputs,
   database: DatabaseRow,
   storage: DesiredDatabaseStorage,
   receipt: DatabaseStorageVolumeReceipt,
   authority: NodeThinStorageAuthority,
   qualification: string | null,
-): Promise<string | undefined> {
+): string | undefined {
   const volumes = authority.volumes.filter(
     (volume) =>
       volume.database_id === database.id &&
@@ -598,8 +708,8 @@ async function stoppingWriter(
     return undefined;
   const held =
     database.observed_generation === database.generation - 1
-      ? await heldWriterPod(
-          env,
+      ? heldWriterPod(
+          inputs,
           { ...database, generation: database.observed_generation },
           storage,
           receipt,
@@ -622,17 +732,15 @@ async function stoppingWriter(
  * unresolved pool holder.
  */
 async function stoppingStorageWriteAuthority(
-  env: Env,
+  c: WriterContext,
   database: DatabaseRow,
-  now: number,
-  snapshot: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
 ): Promise<string | undefined> {
   if (database.desired_state !== "suspended") return undefined;
-  const context = await currentWriterContext(env, database, now, snapshot);
+  const context = await currentWriterContext(c, database);
   if (!context) return undefined;
   const { storage, receipt, authority, current } = context;
-  const pod = await stoppingWriter(
-    env,
+  const pod = stoppingWriter(
+    c.inputs,
     database,
     storage,
     receipt,
@@ -640,15 +748,7 @@ async function stoppingStorageWriteAuthority(
     current!.row.qualification_json,
   );
   if (!pod) return undefined;
-  return signStorageWriter(
-    env,
-    database,
-    storage,
-    receipt,
-    authority,
-    pod,
-    now,
-  );
+  return signStorageWriter(c, database, storage, receipt, authority, pod);
 }
 
 /**
@@ -659,34 +759,50 @@ async function stoppingStorageWriteAuthority(
  * The caller has excluded every unresolved pool holder.
  */
 async function parkedStorageWriteAuthority(
-  env: Env,
+  c: WriterContext,
   database: DatabaseRow,
-  now: number,
-  snapshot: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
 ): Promise<string | undefined> {
   if (database.desired_state !== "suspended" || !database.parked_json)
     return undefined;
-  const context = await currentWriterContext(env, database, now, snapshot);
+  const context = await currentWriterContext(c, database);
   if (!context) return undefined;
   const { storage, receipt, authority } = context;
-  const pod = await parkedHolder(
-    env,
-    database,
-    storage,
-    receipt,
-    authority,
-    now,
-  );
+  const pod = parkedHolder(c, database, storage, receipt, authority);
   if (!pod) return undefined;
-  return signStorageWriter(
-    env,
-    database,
-    storage,
-    receipt,
-    authority,
-    pod,
-    now,
-  );
+  return signStorageWriter(c, database, storage, receipt, authority, pod);
+}
+
+/**
+ * The writer token of every running thin database of a node: one reading of the node and one read
+ * per kind of input, whatever the number of databases. It is the fast sample's token loop.
+ */
+export async function runningWriterTokens(
+  env: Env,
+  nodeId: string,
+  regionId: string,
+  now: number,
+): Promise<{ database_id: string; token: string }[]> {
+  const scope: DatabaseScope = {
+    sql: "d.node_id=? AND d.region_id=? AND d.storage_profile_json IS NOT NULL AND d.storage_volume_json IS NOT NULL AND d.desired_state='running' AND d.deleted_at IS NULL",
+    bindings: [nodeId, regionId],
+  };
+  const [current, read] = await Promise.all([
+    readCurrentNodeThinStorage(env, nodeId, now),
+    readWriterInputs<DatabaseRow>(
+      env,
+      scope,
+      env.DB.prepare(
+        `SELECT d.* FROM databases d WHERE ${scope.sql} ORDER BY d.id`,
+      ).bind(...scope.bindings),
+    ),
+  ]);
+  const writers = writerContext(env, now, read.inputs, current),
+    tokens: { database_id: string; token: string }[] = [];
+  for (const database of read.rows) {
+    const token = await runningWriterAuthority(writers, database);
+    if (token) tokens.push({ database_id: database.id, token });
+  }
+  return tokens;
 }
 
 /** Real pre-grant cgroup/device custody can precede the mount. It is not PG readiness.
@@ -987,10 +1103,19 @@ export async function poolHostCustodyForDatabase(
   issueCleanup = false,
 ): Promise<PoolHostCustody | undefined> {
   if (!capable) return undefined;
-  const { readPostgresPoolBindingForDatabase, readPostgresPoolIoAttestation } =
+  const { readPostgresPoolBindingForDatabase } =
     await import("./postgres-pool.ts");
   const binding = await readPostgresPoolBindingForDatabase(env, id);
-  if (!binding) return undefined;
+  return binding ? poolHostCustody(env, binding, now, issueCleanup) : undefined;
+}
+/** The custody of a database's non-terminal pool holder, whose binding the caller has read. */
+async function poolHostCustody(
+  env: Env,
+  binding: PoolBinding,
+  now: number,
+  issueCleanup: boolean,
+): Promise<PoolHostCustody> {
+  const { readPostgresPoolIoAttestation } = await import("./postgres-pool.ts");
   const io = await readPostgresPoolIoAttestation(env, binding, now);
   const cleanupModule = await import("./postgres-pool-cleanup-authority.ts"),
     intent = await cleanupModule.readPostgresPoolCleanupIntent(env, binding);
@@ -1027,6 +1152,22 @@ export async function poolHostCustodyForDatabase(
     ...(intent ? { cleanup_intent: intent } : {}),
   });
 }
+/** The databases of a node the host guard is told about: every live one, and each deleted one it
+ * may still hold a protective scope for. */
+function hostLeaseScope(nodeId: string, regionId: string): DatabaseScope {
+  return {
+    sql: "d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR d.storage_profile_json IS NOT NULL)",
+    bindings: [nodeId, regionId],
+  };
+}
+type LeaseRow = DatabaseRow & {
+  storage_gib: number;
+  stop_operation: string | null;
+  host_snapshot_count: number;
+  startup_node_uid: string | null;
+  storage_budget_bytes: number | null;
+  startup_operation: string | null;
+};
 export async function hostStorageLease(
   c: import("../env.ts").ApiContext,
   id: string,
@@ -1047,26 +1188,27 @@ export async function hostStorageLease(
       "not_found",
       "Current physical storage host unavailable",
     );
-  const current = await readCurrentNodeThinStorage(c.env, id, now);
-  const rows = await c.env.DB.prepare(
-    `SELECT d.*,COUNT(*) OVER() host_snapshot_count,s.storage_gib,a.node_uid startup_node_uid,a.storage_budget_bytes,a.operation_id startup_operation,
+  // Every read the lease needs is independent of the others, and none is made per database: the
+  // node's reading, one batch for its databases and their inputs, and the pool capability.
+  const scope = hostLeaseScope(id, region.id);
+  const [current, read, poolCapable] = await Promise.all([
+    readCurrentNodeThinStorage(c.env, id, now),
+    readWriterInputs<LeaseRow>(
+      c.env,
+      scope,
+      c.env.DB.prepare(
+        `SELECT d.*,COUNT(*) OVER() host_snapshot_count,s.storage_gib,a.node_uid startup_node_uid,a.storage_budget_bytes,a.operation_id startup_operation,
  (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation,'status',stop.status) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
- FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.node_uid=? AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation) WHERE d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR d.storage_profile_json IS NOT NULL) ORDER BY d.id`,
-  )
-    .bind(node.node_uid, id, region.id)
-    .all<
-      DatabaseRow & {
-        storage_gib: number;
-        stop_operation: string | null;
-        host_snapshot_count: number;
-        startup_node_uid: string | null;
-        storage_budget_bytes: number | null;
-        startup_operation: string | null;
-      }
-    >();
-  if (
-    rows.results.some((row) => row.host_snapshot_count !== rows.results.length)
-  )
+ FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.node_uid=? AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation) WHERE ${scope.sql} ORDER BY d.id`,
+      ).bind(node.node_uid, ...scope.bindings),
+    ),
+    Promise.all([
+      postgresPoolCapable(c.env.DB, region.id),
+      postgresPoolQualificationCapable(c.env.DB, region.id),
+    ]).then(([normal, qualification]) => normal || qualification),
+  ]);
+  const rows = read.rows;
+  if (rows.some((row) => row.host_snapshot_count !== rows.length))
     throw new ApiError(
       "conflict",
       "Physical host database snapshot is incomplete",
@@ -1082,22 +1224,20 @@ export async function hostStorageLease(
     )
       .bind(id, node.node_uid)
       .first<string>("boot"));
-  const poolCapable =
-    (await postgresPoolCapable(c.env.DB, region.id)) ||
-    (await postgresPoolQualificationCapable(c.env.DB, region.id));
   const preparations = poolCapable
     ? await (
         await import("./postgres-pool-preparation.ts")
       ).readPostgresPoolPreparationContexts(c.env, id, now)
     : [];
-  if (!bootId && rows.results.some((row) => row.storage_profile_json))
+  if (!bootId && rows.some((row) => row.storage_profile_json))
     throw new ApiError(
       "conflict",
       "Current qualified physical boot unavailable",
     );
+  const writers = writerContext(c.env, now, read.inputs, current);
   const databases = [];
   const legacy = [];
-  for (const row of rows.results) {
+  for (const row of rows) {
     if (!row.storage_profile_json) {
       legacy.push({
         database_id: row.id,
@@ -1132,25 +1272,12 @@ export async function hostStorageLease(
       ),
     );
     const writerProtected = storageWriterProtected(row, authority);
-    const { readPostgresPoolBindingForDatabase, hasNonterminalPoolHolderSql } =
-      await import("./postgres-pool.ts");
-    const heldPool = await readPostgresPoolBindingForDatabase(c.env, row.id);
-    const unresolvedPool =
-      heldPool !== undefined ||
-      Boolean(
-        await c.env.DB.prepare(
-          `SELECT 1 FROM databases d WHERE d.id=? AND ${hasNonterminalPoolHolderSql("d")}`,
-        )
-          .bind(row.id)
-          .first(),
-      );
-    const pool = await poolHostCustodyForDatabase(
-      c.env,
-      row.id,
-      poolCapable,
-      now,
-      true,
-    );
+    const heldPool = read.inputs.bindings.get(row.id);
+    const unresolvedPool = read.inputs.unresolved.has(row.id);
+    const pool =
+      poolCapable && heldPool
+        ? await poolHostCustody(c.env, heldPool, now, true)
+        : undefined;
     const poolMayWrite =
       !unresolvedPool ||
       (pool !== undefined &&
@@ -1167,7 +1294,7 @@ export async function hostStorageLease(
       !unresolvedPool &&
       row.desired_state === "suspended" &&
       row.parked_json
-        ? await parkedStorageWriteAuthority(c.env, row, now, current)
+        ? await parkedStorageWriteAuthority(writers, row)
         : undefined;
     const stop = row.stop_operation
       ? (JSON.parse(row.stop_operation) as {
@@ -1187,14 +1314,12 @@ export async function hostStorageLease(
       stop.kind !== "database.delete" &&
       stop.generation === row.generation &&
       (stop.status === "pending" || stop.status === "running")
-        ? await stoppingStorageWriteAuthority(c.env, row, now, current)
+        ? await stoppingStorageWriteAuthority(writers, row)
         : undefined;
     const presentedRunning = parkedAuthority ?? stoppingAuthority;
     const runtimeAuthority =
       presentedRunning ??
-      (poolMayWrite
-        ? await storageWriteAuthorityForDatabase(c.env, row, now, current)
-        : undefined);
+      (poolMayWrite ? await runningWriterAuthority(writers, row) : undefined);
     // Startup authority cannot substitute forever for missing IO evidence of a Ready writer.
     const readyWithoutWriter =
       row.desired_state === "running" &&
