@@ -72,6 +72,8 @@ interface Pod {
   phase: "Pending" | "Running" | "Failed";
   /** Terminal state of its container once the kubelet reported it, as `status.containerStatuses`. */
   terminated?: { reason: string; exitCode: number };
+  /** The container's memory limit exactly as the manifest wrote it. */
+  memory: string;
   claim: string;
   /** The container script; a PostgreSQL Pod's start is checked against its data directory. */
   script: string;
@@ -121,6 +123,8 @@ export class ThinWorld {
   busy = new Map<string, number>();
   /** Writes, Pod execs and Talos calls other than identity reads, in order. */
   log: string[] = [];
+  /** Every burst a Pod started: the MiB it was told to write and the memory limit it runs under. */
+  bursts: { megabytes: number; memory: string }[] = [];
   /** Drain execs (stop the burst writer, then `sync -f`) the writer Pod received. */
   drains = 0;
   /** Pods whose `kubectl get` fails, as while the API server or the relay is unreachable. */
@@ -511,7 +515,10 @@ export class ThinWorld {
       resources?: { requests: { storage: string } };
       volumes?: { persistentVolumeClaim?: { claimName: string } }[];
       securityContext?: { fsGroup?: number; fsGroupChangePolicy?: string };
-      containers?: { command?: string[] }[];
+      containers?: {
+        command?: string[];
+        resources?: { limits?: { memory?: string } };
+      }[];
     };
   }): CommandResult {
     const name = manifest.metadata.name;
@@ -537,6 +544,7 @@ export class ThinWorld {
       rv: this.nextVersion(),
       created: new Date().toISOString(),
       phase: "Pending",
+      memory: manifest.spec.containers![0]!.resources!.limits!.memory!,
       claim: manifest.spec.volumes![0]!.persistentVolumeClaim!.claimName,
       script: manifest.spec.containers![0]!.command!.at(-1)!,
       fsGroupAlways:
@@ -718,6 +726,13 @@ export class ThinWorld {
       return ok(
         'psql:<stdin>:1: PANIC:  could not write to file "pg_wal/xlogtemp.88": No space left on device\npgcf-rc=2\n',
       );
+    }
+    if (command[0] === "/bin/bash" && command[2]?.includes("nohup dd")) {
+      this.bursts.push({
+        megabytes: Number(command[4]),
+        memory: target.memory,
+      });
+      return ok("");
     }
     if (command[0] === "/bin/bash" && command[2]?.includes("sync -f")) {
       return this.drain(++this.drains);
@@ -1135,6 +1150,7 @@ export function thinQualificationRun(
           rv: world.nextVersion(),
           created: new Date().toISOString(),
           phase: "Running",
+          memory: "1Gi",
           claim: name,
           script: "exec sleep infinity",
           fsGroupAlways: true,

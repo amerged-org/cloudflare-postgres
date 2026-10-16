@@ -1108,6 +1108,18 @@ describe("the noflush drain after the resume", { concurrency: true }, () => {
     assert.equal(run.world.drains, 0);
     assert.equal(resumes(run, lv).length, 0);
   });
+
+  test("the burst writer never dirties more than half of its Pod's memory limit and no less than the passing run did", async () => {
+    // On EU1 the writer, with a 1 GiB limit, held 715 MiB of dirty pages at suspension (174 MiB in the
+    // passing run) and the drain exec after the resume failed.
+    const { run } = noflushSuspended(["writer-start"]);
+    assert.deepEqual(await run.turn(), { kind: "report" });
+    const [burst] = run.world.bursts;
+    assert.equal(run.world.bursts.length, 1);
+    assert.equal(burst!.memory, "1Gi");
+    assert.ok(burst!.megabytes * MIB <= GIB / 2);
+    assert.ok(burst!.megabytes * MIB >= 182_456_320);
+  });
 });
 
 test("a fill that cannot outgrow the pool within the scheduler's room fails closed before any write", async (t) => {

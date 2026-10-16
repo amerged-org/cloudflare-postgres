@@ -434,12 +434,14 @@ identity and of an expired token, is verified after activation by the six live c
 
 **Failure and cleanup**
 - A failed gate or executor error records its code and moves straight to cleanup.
-- The `noflush_quiescence` drain names its failure. `thin_qualification_drain_sync_failed`: `sync -f`
-  ran and returned non-zero. `thin_qualification_writer_not_running`: the writer Pod no longer ran
-  when its exec failed. `thin_qualification_drain_exec_failed`: three execs against a running Pod did
-  not run the command; only these are repeated. The `noflush_quiescence:resume` journal entry holds
-  each attempt's exit codes, the last 200 characters of its stderr and the Pod's phase and
-  termination reason.
+- The `noflush_quiescence` drain names its failure. An exec that did not run the command is
+  repeated, at most three times and only while the writer Pod runs. Every other failure is final:
+  `thin_qualification_drain_sync_failed` (`sync -f` ran and returned non-zero),
+  `thin_qualification_writer_not_running` (the Pod no longer ran when its exec failed) and
+  `thin_qualification_drain_exec_failed` (three execs against a running Pod did not run the
+  command). The `noflush_quiescence:resume` journal entry holds each attempt's exit codes, the last
+  200 characters of its stderr and the Pod's phase and termination reason. The writer dirties at
+  most 512 MiB, half of its Pod's memory limit.
 - A turn whose executor stops answering keeps its lease until the lease expires. The Workflow waits
   for that lease before the next turn or a step deadline, so cleanup still gets all its turns.
 - Cleanup resumes any suspended scratch LV and removes everything the run created, also after a

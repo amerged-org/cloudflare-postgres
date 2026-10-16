@@ -53,6 +53,12 @@ const UNCOMMITTED = "pgcf-q-uncommitted";
 const REMOVE_ATTEMPTS = 4;
 /** Runs of the idempotent drain command; only an exec the transport lost is repeated. */
 const DRAIN_ATTEMPTS = 3;
+/**
+ * MiB the noflush writer dirties. A suspended LV cannot write dirty pages back, so the burst stays
+ * at half of the writer Pod's 1 GiB memory limit: uncapped, EU1 held 715 MiB dirty at 3 s (174 MiB
+ * in the passing run) and the drain exec failed.
+ */
+const NOFLUSH_BURST_MIB = 512;
 const QUALIFICATION_LV_FIELDS = `${THIN_LV_FIELDS},chunk_size,lv_health_status`;
 function fail(code: string): never {
   throw new BootstrapError(`thin_qualification_${code}`);
@@ -2438,7 +2444,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
         "-c",
         'nohup dd if=/dev/zero of=/data/burst bs=1M count="$1" >/work/dd.log 2>&1 & echo $! >/work/dd.pid',
         "pgcf",
-        String(Math.max(64, Math.min(4096, quota / MIB))),
+        String(NOFLUSH_BURST_MIB),
       ]);
       if (result.exit_code !== 0) fail("writer_start_failed");
       return { started: true };
