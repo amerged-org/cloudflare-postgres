@@ -9,7 +9,7 @@
   "files": [
     {
       "path": "docs/architecture/mermaider/add-node.md",
-      "sha256": "57eb1e71f8f6a6c29ff5d49daba18793d5c12c294252eb59b289b59c09d71ba3"
+      "sha256": "a11d8318db7a8a8d8ff6c492a3f498a1d64f0ae80958c24be8a0a0630f2fb843"
     },
     {
       "path": "docs/architecture/mermaider/add-node.mmd",
@@ -25,7 +25,7 @@
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
-      "sha256": "3bec532aeed7cee091c3b898d91d5309cf7d909069c8aa3e5b728fb3e7d5969d"
+      "sha256": "d17870e16c5e145c0e88d7f5feda761f780fd7864e7e1a929435b2f8b6ee6f06"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.mmd",
@@ -49,10 +49,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "fc3694ce6616492da2f1adab0d39f6c2d7286e81c760a1f3704ed822e56d1933"
+      "sha256": "0b624229a0d2b83153530af757cafb59fbc455541c4d154ed7adb27f6cdae8ef"
     }
   ],
-  "fingerprint": "3fec48f708fc2814c2428581528598df560c777d292b74f6711584f77c7a71c0",
+  "fingerprint": "1cfd54d19ec947ff0d6d8767dfa144e75133d1d896f11ba011fc8494ea21210b",
   "toolVersion": "0.1.1",
   "version": 1
 }
