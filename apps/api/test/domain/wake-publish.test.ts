@@ -397,7 +397,7 @@ async function gateIsOpen(id: string) {
     actor(id)
       .repairAdmissionMutation()
       .then(() => true),
-    sleep(600).then(() => false),
+    sleep(5_000).then(() => false),
   ]);
 }
 
@@ -409,10 +409,11 @@ it("recording an activity report does not hold the gate across its database read
   )
     .bind(f.id)
     .first<{ generation: number }>())!;
+  const at = new Date().toISOString();
   const recording = actor(f.id).recordActivity(f.id, {
     revision: row.generation,
-    observed_at: new Date().toISOString(),
-    last_activity_at: new Date().toISOString(),
+    observed_at: at,
+    last_activity_at: at,
     active_connections: 0,
   });
   for (let i = 0; i < 400 && read.held() === 0; i++) await sleep(5);
@@ -440,11 +441,12 @@ it("an idle probe that finds the database busy does not hold the gate across its
     ).status,
   ).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
+  const at = new Date().toISOString();
   expect(
     await actor(f.id).recordActivity(f.id, {
       revision: woken.generation,
-      observed_at: new Date().toISOString(),
-      last_activity_at: new Date().toISOString(),
+      observed_at: at,
+      last_activity_at: at,
       active_connections: 1,
     }),
   ).toBe(true);
