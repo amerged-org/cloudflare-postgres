@@ -466,14 +466,17 @@ experiment (it removes a known 6.2 statements/s per node).
 - **Rollout-safe authority (implemented, not yet deployed or accepted live).** A `continuing`
   qualification class keeps the fact equalities of `qualifiedThinStorageSql` (receipt facts, authority
   keys, host configuration sha, boot id, node, cluster, material) and drops the release id, spec hash,
-  assignment and region revision. The node's completed patch may be that of any release whose
-  `thinContinuitySql` text equals the assigned release's: receipt, authority keys, OS block, and the
-  `openebs-lvm`, `sandbox-controller`, `postgres`, `barman`, `cloudnative-pg` and Talos extension pins.
+  assignment and region revision. The node's completed patch and the release its proof was read
+  under must pin the assigned release's facts (`fleet_releases.thin_continuity`, stored per release
+  by migration 0057: receipt, authority keys, configuration schema, the OS block of both roles, and
+  the `openebs-lvm`, `sandbox-controller`, `postgres`, `barman`, `cloudnative-pg` and Talos
+  extension pins), and no later patch of the node, in any state, may pin others: a rollback after a
+  pin change pauses until its own patch completed.
   Samples, the sampling target, the desired page's node entry and tokens, the host lease and the
   identity turn (lease evidence by fact, host custody read sealed, the executor no longer compares the
   custody's release label) continue through a rollout that changes none of them. The sampling wire
-  gate asks that the latest completed patch of every member declared the protocol; the `postgres`
-  stage selects by (image, version, schema). Placement, wake, hold release, deletion proofs,
+  gate asks that the newest completed patch of every member declared the protocol and no later patch
+  did not; the `postgres` stage selects and counts by (image, version, schema). Placement, wake, hold release, deletion proofs,
   selection and qualification runs stay on the strict predicate; a changed extension, kernel, OS,
   key, runtime image or PostgreSQL pin is strict from the assignment. Open: live acceptance (sample
   and token continuity across a rollout that changes only the controller digest, strict refusal after

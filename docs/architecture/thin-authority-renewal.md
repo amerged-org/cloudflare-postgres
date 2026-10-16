@@ -329,23 +329,45 @@ by its label (release id, spec hash, assignment and region revision), so it woul
 thin node for the whole rollout. The facts the qualification depends on are not labels:
 
 - `continuing` qualification keeps the receipt's facts, the authority keys, the host configuration
-  sha, the boot id, node, cluster and material, and takes the completed patch from the assigned
-  release or from any release with the same `thinContinuitySql` text: the receipt, the authority
-  keys, the OS block of the node's role, and the pins that restart or reconfigure the node or a
-  database outside Cloudflare's start admission (`openebs-lvm`, `sandbox-controller`, `postgres`,
-  `barman`, `cloudnative-pg`, the role's Talos extensions). The controller observation of a new
-  assignment may take 300 s instead of 180 s to arrive.
+  sha, the boot id, node, cluster and material, and replaces the release labels by three
+  comparisons of the thin facts a release pins, stored once per release as
+  `fleet_releases.thin_continuity` (migration 0057): the patch that evidences the node is of a
+  release that pins the assigned release's facts, the release its identity proof was read under
+  does too, and no later patch of the node, in any state, pins others. A rollback after a release
+  that changed a pinned fact therefore pauses until the rollback's own patch completed, as does a
+  release with the node's facts that follows such a patch halted and superseded; and the proof read
+  before a pinned fact changed is not resumed on when the patch that changed it completes: one proof
+  of the new assignment is required. The controller observation of a new assignment may take 300 s
+  instead of 180 s to arrive.
+- The pinned facts are: the thin receipt (profile, driver image, host extension image, kernel), the
+  authority keys, the configuration schema revision, the OS block of both roles (Talos version,
+  installer, schematic, extensions, Kubernetes version and images, host configuration), and the
+  pins of `openebs-lvm`, `sandbox-controller`, `postgres`, `barman`, `cloudnative-pg` and the Talos
+  extensions. Outside them are the controller, gateway, API, Edge, bootstrap, Cloudflared, Flux,
+  cert-manager and Cilium pins, the CloudNativePG operator image (`image/cloudnative-pg/cloudnative-pg`),
+  the barman plugin chart and images (`chart/plugin-barman-cloud`, `image/plugin-barman-cloud/*`),
+  the OpenEBS chart and its other images (`image/openebs/*`) and `platform_source_commit`. A
+  HelmRelease value change in the platform source can therefore restart CloudNativePG or OpenEBS
+  Pods without changing any pinned fact: a restarted OpenEBS driver fails closed through its Pod
+  UID in every sample, and a restarted CloudNativePG instance relies on the host guard, which
+  refuses a Pod create at an unchanged generation.
 - It governs what renews or delivers the authority of a writer that already runs: the sample's
   compare-and-set and target, the node entry and tokens of the desired page, the host lease, and the
   lease and sealed host custody of the identity turn. The executor accepts custody sealed under an
-  earlier release: its keys, node bindings and bytes decide.
+  earlier release: its keys, node bindings and bytes decide, so the executor is deployed outside a
+  rollout.
 - The strict predicate keeps governing placement, wake, resume, hold release, deletion proofs,
   selection and qualification runs, and the end of a rollout (`complete` patch, placement reopening).
-- The sampling wire is withdrawn only for a member whose latest completed patch was of a release
-  without the protocol.
-- A changed extension, kernel, OS block, key, runtime image or PostgreSQL pin is strict from the
-  assignment; so is a host configuration rewritten with other content. A halted patch never loosens
-  a changed fact, and the boot id and node identity are compared in every sample.
+- The sampling wire is withdrawn for a member whose newest completed patch was of a release
+  without the protocol, or that has a later patch of one in any state: a patch halted after
+  `regional` installed its controller never completed, and that controller may run. A region
+  whose release does not declare the protocol is given no `storage_nodes` at all: the fallback that
+  served a node's raw proof without it was deleted.
+- A changed pinned fact is strict from the assignment; so is a host configuration rewritten with
+  other content. A halted patch never loosens a changed fact, and the boot id and node identity are
+  compared in every sample. A proof taken while a patch was in progress still satisfies the strict
+  predicate when that patch completes, because the strict predicate does not name the patch that
+  evidenced the proof; the samples that follow re-check every physical witness.
 
 ## 7. Trust argument
 
@@ -495,7 +517,7 @@ produced EU1's receipt, and any change of kernel, driver image or host extension
     accepted sample after the assignment is recorded against the 300 s bound of section 6.1.
 11. **Rollout that changes a pinned fact.** Roll out a release with another host extension digest:
     samples are refused from the assignment, the entry loses its token, the guard acts as in test 3,
-    and authority returns after the node's patch completed and one proof.
+    and authority returns after the node's patch completed and one proof read the node under it.
 
 ## 12. Rejected options
 

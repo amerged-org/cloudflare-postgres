@@ -55,11 +55,19 @@ Existing databases keep their data. What an awake thin database sees depends on 
   `Recreate` replica, and its replacement, a restarted OpenEBS driver Pod or a restarted Kubernetes
   API server can interrupt sampling for longer than the guard, which stops the awake databases and
   resumes them when sampling returns.
-- A release that changes a pinned fact (host extension, kernel, Talos installer, schematic, version
-  or extensions, Kubernetes version or images, driver, thin profile, authority keys, sandbox runtime
-  image, `postgres`, `barman`, `cloudnative-pg`, or the host custody's content) pauses authority at
-  the assignment. The guard stops awake thin databases until the new patch completed and the node
-  was proven again: plan a maintenance window for it.
+- A release that changes a pinned fact pauses authority at the assignment: the host extension,
+  kernel, Talos installer, schematic, version or extensions, Kubernetes version or images (of
+  either role), the driver, thin profile, authority keys, configuration schema revision, sandbox
+  runtime image, `postgres` (image or version), `barman`, `cloudnative-pg`, or the host custody's
+  content. So does a rollback to a release after one that changed such a fact: the node runs the
+  other facts until the rollback's own patch completed. The guard stops awake thin databases until
+  the new patch completed and the node was proven again: plan a maintenance window for it.
+- Not pinned, and so continuous, are the `image/cloudnative-pg/cloudnative-pg` operator image, the
+  barman plugin chart and images, the OpenEBS chart and its other images, Flux, Cilium and the
+  platform source commit. A HelmRelease value change in the platform source can restart
+  CloudNativePG or OpenEBS Pods under continuous authority: a restarted driver is caught by its
+  Pod UID, a restarted CloudNativePG instance by the host guard.
+- Deploy the API and the node-bootstrap executor together, outside a rollout.
 
 The `postgres` stage restarts only databases whose PostgreSQL image, version or configuration schema
 differ from the release's; a release that changes none of them restarts none.
