@@ -219,28 +219,13 @@ it("persists a generation-bound image, resumes without repeated resize and requi
       .first("desired_postgres_image"),
   ).toBe(f.image);
 });
-it("confirms the stage without a resize or a generation when the release changes only its id", async () => {
-  const f = await setup();
-  await env.DB.prepare("UPDATE size_classes SET enabled=0 WHERE id=?")
-    .bind(f.size)
-    .run();
-  await f.run();
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 2),
-        postgres: {
-          image: f.image,
-          image_id: `containerd://sha256:${"e".repeat(64)}`,
-        },
-      },
-    ]),
-  );
-  expect(await f.run()).toMatchObject({ pending: 0, applied: 1 });
-  // The next release pins the same PostgreSQL and moves only its own id: another API digest.
+/** The next release of the node's region, assigned, with its patch at the postgres stage. */
+async function nextRelease(
+  f: Awaited<ReturnType<typeof setup>>,
+  change: (spec: {
+    components: { name: string; sha256: string; version: string }[];
+  }) => void,
+) {
   const spec = JSON.parse(
       (await env.DB.prepare("SELECT spec_json FROM fleet_releases WHERE id=?")
         .bind(f.releaseId)
@@ -248,9 +233,11 @@ it("confirms the stage without a resize or a generation when the release changes
     ),
     next = `pg-${crypto.randomUUID()}`,
     nextPatch = newOperationId(),
-    now = new Date().toISOString();
-  spec.components.find((c: { name: string }) => c.name === "api").sha256 =
-    "f".repeat(64);
+    now = new Date().toISOString(),
+    uid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+      .bind(f.node)
+      .first<string>("node_uid");
+  change(spec);
   releases.push(next);
   await env.DB.batch([
     env.DB.prepare(
@@ -276,34 +263,55 @@ it("confirms the stage without a resize or a generation when the release changes
       next,
       await installationHash(spec),
       JSON.stringify([
-        {
-          node_id: f.node,
-          node_uid: await env.DB.prepare(
-            "SELECT node_uid FROM nodes WHERE id=?",
-          )
-            .bind(f.node)
-            .first<string>("node_uid"),
-          assignment_revision: 2,
-        },
+        { node_id: f.node, node_uid: uid, assignment_revision: 2 },
       ]),
       now,
       now,
       f.patchId,
     ),
   ]);
+  return {
+    release: next,
+    run: () =>
+      reconcileFleetPostgresRelease(env as never, f.region, next, nextPatch),
+  };
+}
+it("confirms the stage without a resize or a generation when the release changes only its id", async () => {
+  const f = await setup();
+  await env.DB.prepare("UPDATE size_classes SET enabled=0 WHERE id=?")
+    .bind(f.size)
+    .run();
+  await f.run();
+  await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    observedBody([
+      {
+        ...observation(f.id, 2),
+        postgres: {
+          image: f.image,
+          image_id: `containerd://sha256:${"e".repeat(64)}`,
+        },
+      },
+    ]),
+  );
+  expect(await f.run()).toMatchObject({ pending: 0, applied: 1 });
+  // The next release pins the same PostgreSQL and moves only its own id: another API digest.
+  const next = await nextRelease(f, (spec) => {
+    spec.components.find((c) => c.name === "api")!.sha256 = "f".repeat(64);
+  });
   const before = await env.DB.prepare(
     "SELECT generation,desired_postgres_release_id FROM databases WHERE id=?",
   )
     .bind(f.id)
     .first();
-  expect(
-    await reconcileFleetPostgresRelease(
-      env as never,
-      f.region,
-      next,
-      nextPatch,
-    ),
-  ).toMatchObject({ total: 1, pending: 0, applied: 1, errors: [] });
+  expect(await next.run()).toMatchObject({
+    total: 1,
+    pending: 0,
+    applied: 1,
+    errors: [],
+  });
   expect(
     await env.DB.prepare(
       "SELECT generation,desired_postgres_release_id FROM databases WHERE id=?",
@@ -318,6 +326,30 @@ it("confirms the stage without a resize or a generation when the release changes
       .bind(f.id)
       .first("n"),
   ).toBe(1);
+});
+it("counts a database the turn did not update as pending when the release changes only the PostgreSQL version", async () => {
+  const f = await setup(true);
+  await f.run();
+  const next = await nextRelease(f, (spec) => {
+    spec.components.find((c) => c.name === "postgres")!.version = "18.8";
+  });
+  // The turn selects the database and its update changes nothing: as for one beyond the twenty a
+  // turn reaches. It is on the old version, so it is not converged.
+  const trigger = `ignore_postgres_pin_${crypto.randomUUID().replaceAll("-", "")}`;
+  await env.DB.exec(
+    `CREATE TRIGGER ${trigger} BEFORE UPDATE ON databases WHEN NEW.id='${f.id}' BEGIN SELECT RAISE(IGNORE); END`,
+  );
+  try {
+    expect(await next.run()).toMatchObject({
+      total: 1,
+      applied: 0,
+      deferred_cold: 0,
+      pending: 1,
+      errors: [{ database_id: f.id, code: "conflict" }],
+    });
+  } finally {
+    await env.DB.exec(`DROP TRIGGER ${trigger}`);
+  }
 });
 it("keeps confirmed cold databases cold and defers image application until an admitted wake", async () => {
   const f = await setup(true);
