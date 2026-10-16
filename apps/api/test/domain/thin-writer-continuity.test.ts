@@ -8,6 +8,7 @@
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
 import {
+  DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
   DesiredResponse,
   thinStorageClass,
@@ -29,6 +30,12 @@ import {
 } from "./parked-tier-fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
+import { storageHoldVolumeStatements } from "../../src/domain/storage-capacity.ts";
+import {
+  prepareThinStorageLease,
+  storageHolds,
+  thinStorageInput,
+} from "../../src/domain/node-thin-storage-execution.ts";
 import {
   gib,
   identityProof,
@@ -395,4 +402,113 @@ it("does not let a role change release a protective stop", async () => {
   expect(
     (await sampled(w)).find((token) => token.database_id === w.id),
   ).toBeUndefined();
+}, 60_000);
+
+it("binds a start's hold to the volume the identity proof of a later generation names", async () => {
+  const f = await thinExecutionFixture(releases);
+  const node = await thinLeaseNode(f);
+  await node.commit();
+  const id = node.held.id;
+  // The Pod's volume is bound, then a role is created before any proof read it.
+  const receipt = DatabaseStorageVolumeReceipt.parse({
+    storage_generation: 1,
+    storage_uid: crypto.randomUUID(),
+    namespace_uid: crypto.randomUUID(),
+    cluster_uid: crypto.randomUUID(),
+    node_uid: f.uid,
+    volume_group_uuid: f.authority.volume_group_uuid,
+    pool_uuid: f.authority.pool_uuid,
+    volume_handle: `pvc-${crypto.randomUUID()}`,
+    lv_uuid: "VOLUMX-1234-1234-1234-1234-1234-ABCDEF",
+    pvc_uid: crypto.randomUUID(),
+    pv_uid: crypto.randomUUID(),
+  });
+  await env.DB.prepare("UPDATE databases SET storage_volume_json=? WHERE id=?")
+    .bind(JSON.stringify(receipt), id)
+    .run();
+  const created = await request(
+    `/v1/databases/${id}/roles`,
+    f.integrator,
+    "POST",
+    { name: "reader" },
+    crypto.randomUUID(),
+  );
+  expect(created.status).toBe(201);
+  const generation = (await databaseRow(id)).generation;
+  expect(generation).toBe(2);
+  const authority = await identityProof(f, {
+    physical_lvs: [
+      lvs.pool,
+      lvs.data,
+      lvs.meta,
+      {
+        name: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        size_bytes: 5 * gib,
+        segtype: "thin",
+      },
+    ],
+    active_lv_uuids: [receipt.lv_uuid],
+    volumes: [
+      {
+        database_id: id,
+        generation,
+        storage_generation: 1,
+        storage_uid: receipt.storage_uid,
+        namespace_uid: receipt.namespace_uid,
+        cluster_uid: receipt.cluster_uid,
+        volume_handle: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        pvc_uid: receipt.pvc_uid,
+        pv_uid: receipt.pv_uid,
+        storage_class: thinStorageClass(f.authority.profile_sha256),
+        volume_attributes_class: thinStorageClass(f.authority.profile_sha256),
+        io: [],
+      },
+    ],
+  });
+  await env.DB.batch(storageHoldVolumeStatements(env.DB, authority));
+  // The hold of the start is the one the volume belongs to: it is counted once, as that volume,
+  // not again as a start whose volume nobody knows.
+  const hold = await env.DB.prepare(
+    "SELECT generation,storage_volume_json IS NOT NULL bound FROM database_start_admissions WHERE database_id=?",
+  )
+    .bind(id)
+    .first<{ generation: number; bound: number }>();
+  expect(hold).toEqual({ generation: 1, bound: 1 });
+  const holds = await storageHolds(env, f.node, f.uid, authority);
+  expect(holds.newVolumes).toBe(0);
+  expect(
+    [...holds.exposures.keys()].some((key) => key.startsWith("unknown:")),
+  ).toBe(false);
+}, 60_000);
+
+it("keeps the start's hold in the identity lease the executor reads across a role change", async () => {
+  const f = await thinExecutionFixture(releases);
+  const node = await thinLeaseNode(f);
+  await node.commit();
+  const id = node.held.id;
+  // One reserved identity lease, read again as the executor would after each change.
+  expect(await prepareThinStorageLease(f.local, f.node, false)).not.toBeNull();
+  const startup = async () =>
+    (await thinStorageInput(f.local, f.node)).lease.databases.find(
+      (database) => database.id === id,
+    )!;
+  const before = await startup();
+  expect(before.startup).toMatchObject({ generation: 1 });
+  const created = await request(
+    `/v1/databases/${id}/roles`,
+    f.integrator,
+    "POST",
+    { name: "reader" },
+    crypto.randomUUID(),
+  );
+  expect(created.status).toBe(201);
+  // The executor tolerates an unstarted cgroup only under a hold of the generation it reads.
+  const after = await startup();
+  expect(after).toMatchObject({ generation: 2 });
+  expect(after.startup).toMatchObject({
+    operation_id: before.startup!.operation_id,
+    generation: 2,
+  });
 }, 60_000);

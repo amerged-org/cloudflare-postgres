@@ -596,14 +596,13 @@ async function buildThinStorageInput(
     sha256: row.host_sha256,
   });
   const records = await env.DB.prepare(
-    `SELECT d.*,h.operation_id startup_operation,h.generation startup_generation,h.node_uid startup_uid,h.storage_budget_bytes,(SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation FROM databases d LEFT JOIN database_start_admissions h ON h.database_id=d.id AND h.generation=d.generation AND h.storage_budget_bytes>0 AND h.budget_bytes>0 WHERE d.node_id=? AND d.region_id=? ORDER BY d.id`,
+    `SELECT d.*,h.operation_id startup_operation,h.node_uid startup_uid,h.storage_budget_bytes,(SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation FROM databases d LEFT JOIN database_start_admissions h ON h.database_id=d.id AND h.generation=(SELECT MAX(x.generation) FROM database_start_admissions x WHERE x.database_id=d.id AND x.generation<=d.generation AND x.storage_budget_bytes>0 AND x.budget_bytes>0) AND h.storage_budget_bytes>0 AND h.budget_bytes>0 WHERE d.node_id=? AND d.region_id=? ORDER BY d.id`,
   )
     .bind(nodeId, row.region_id)
     .all<
       DatabaseRow & {
         startup_operation: string | null;
         stop_operation: string | null;
-        startup_generation: number | null;
         startup_uid: string | null;
         storage_budget_bytes: number | null;
       }
@@ -697,7 +696,8 @@ async function buildThinStorageInput(
         startup: r.startup_operation
           ? {
               operation_id: r.startup_operation,
-              generation: r.startup_generation,
+              // The hold of the start under way, which role changes since have not ended.
+              generation: r.generation,
               node_uid: r.startup_uid,
               budget_bytes: r.storage_budget_bytes,
               expires_at: row.lease_expires_at,

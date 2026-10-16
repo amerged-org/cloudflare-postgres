@@ -369,7 +369,9 @@ reading of an earlier generation (exactly one Pod on the receipt's volume, insid
 limits, not frozen) still name the writer, and the token of the new generation is signed for it.
 The grant of a start under way follows the newest start at or below the row's generation in the
 same way, and so does the fast wake's token for a parked Pod, whose operation is the generation
-after the parked one. When the node's reading and the controller's attestation name different
+after the parked one. The hold's volume receipt is bound by the proof of the generation after the
+change, and the identity lease the executor reads names the hold under the row's generation, which
+it tolerates an unstarted cgroup under. When the node's reading and the controller's attestation name different
 Pods, or a protective stop's marker is set, nothing is carried: a protective stop is released only
 by a start of its own. The identity proof prepared at the new generation takes over unchanged.
 

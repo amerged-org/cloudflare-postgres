@@ -166,7 +166,7 @@ function knownHoldBindingSql(
  * the newest hold of the database at or below its generation, not ready yet. A role change advances
  * the row's generation while a start is under way and starts nothing, so the hold stays the
  * start's: a new start has a hold of its own, which is the newer one. A protective stop blocks a
- * hold only when its generation is not after the stop's.
+ * hold only when its generation is not before the hold's.
  */
 export function currentStartHoldSql(admission = "a", database = "d"): string {
   const a = identifier(admission),
@@ -514,13 +514,16 @@ export function storageHoldVolumeStatements(
     statements.push(
       db
         .prepare(
-          `UPDATE database_start_admissions AS h SET storage_volume_json=(SELECT d.storage_volume_json FROM databases d WHERE d.id=h.database_id) WHERE (h.database_id=? AND h.generation=? AND h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 AND h.storage_volume_json IS NULL) AND EXISTS(SELECT 1 FROM databases d JOIN operations o ON o.id=h.operation_id AND o.database_id=d.id AND o.project_id=d.project_id WHERE d.id=h.database_id AND d.generation=h.generation AND d.node_id=h.node_id AND d.storage_generation=? AND (${same}) AND (d.power_operation=h.operation_id OR substr(d.archive_path,-23)=h.operation_id OR (o.kind='database.resize' AND o.generation=d.generation))) AND EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.node_uid=? AND t.authority_revision=? AND t.authority_json=?)`,
+          // The hold is the newest start at or below the reading's generation: a role change
+          // advances the generation while a start is under way, and starts nothing.
+          `UPDATE database_start_admissions AS h SET storage_volume_json=(SELECT d.storage_volume_json FROM databases d WHERE d.id=h.database_id) WHERE (h.database_id=? AND h.generation=(SELECT MAX(x.generation) FROM database_start_admissions x WHERE x.database_id=h.database_id AND x.generation<=?) AND h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 AND h.storage_volume_json IS NULL) AND EXISTS(SELECT 1 FROM databases d JOIN operations o ON o.id=h.operation_id AND o.database_id=d.id AND o.project_id=d.project_id WHERE d.id=h.database_id AND d.generation=? AND d.node_id=h.node_id AND d.storage_generation=? AND (${same}) AND (d.power_operation=h.operation_id OR substr(d.archive_path,-23)=h.operation_id OR (o.kind='database.resize' AND o.generation=h.generation))) AND EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.node_uid=? AND t.authority_revision=? AND t.authority_json=?)`,
         )
         .bind(
           volume.database_id,
           volume.generation,
           authority.node_id,
           authority.node_uid,
+          volume.generation,
           volume.storage_generation,
           ...receiptFields.map((key) => value[key]),
           authority.node_id,
