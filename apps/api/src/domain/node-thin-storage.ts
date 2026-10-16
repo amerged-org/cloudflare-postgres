@@ -5,6 +5,7 @@ import {
   DesiredDatabaseStorage,
   NodeThinStorageAuthority,
   ThinStorageProfile,
+  base64urlToBytes,
   signStorageWriteAuthority,
   thinStorageAuthorityMatches,
   thinStorageInventory,
@@ -1200,10 +1201,28 @@ type LeaseRow = DatabaseRow & {
   storage_budget_bytes: number | null;
   startup_operation: string | null;
 };
+/** The seconds a signed writer token is still valid, to a tenth; null when it cannot be read. */
+function tokenLifeSeconds(token: string | null, now: number): number | null {
+  try {
+    const claims = JSON.parse(
+      new TextDecoder().decode(base64urlToBytes(token!.split(".")[1]!)!),
+    ) as { exp?: unknown };
+    return typeof claims.exp === "number"
+      ? Math.round((claims.exp - now) / 100) / 10
+      : null;
+  } catch {
+    return null;
+  }
+}
+/** What `storage_guard_served` tells about each live entry, so a persisted log can be lined up
+ * with the guard's actions second by second. No token or other secret is part of it. */
+const LEASE_LOG_LIVE_ENTRIES = 20;
+
 export async function hostStorageLease(
   c: import("../env.ts").ApiContext,
   id: string,
 ) {
+  const started = Date.now();
   const { agentRegion } = await import("./agent-auth.ts");
   const { HostStorageLease } =
     await import("@pgcf/contracts/node-thin-storage");
@@ -1452,18 +1471,43 @@ export async function hostStorageLease(
       ...(pool ? { pool } : {}),
     });
   }
-  return c.json(
-    HostStorageLease.parse({
-      purpose: "pgcf-storage-host/v1",
-      node_uid: node.node_uid,
-      boot_id: bootId ?? null,
-      material_revision: node.bootstrap_material_revision,
-      issued_at: now,
-      expires_at: now + 120000,
-      legacy,
-      databases,
-      ...(preparations.length > 0 ? { preparations } : {}),
-    }),
-    200,
+  const lease = HostStorageLease.parse({
+    purpose: "pgcf-storage-host/v1",
+    node_uid: node.node_uid,
+    boot_id: bootId ?? null,
+    material_revision: node.bootstrap_material_revision,
+    issued_at: now,
+    expires_at: now + 120000,
+    legacy,
+    databases,
+    ...(preparations.length > 0 ? { preparations } : {}),
+  });
+  const served = Date.now();
+  const parked = new Set(
+    rows.filter((row) => row.parked_json).map((row) => row.id),
   );
+  const live = lease.databases.filter(
+    (entry) => entry.desired_state !== "deleted",
+  );
+  console.log(
+    JSON.stringify({
+      event: "storage_guard_served",
+      node_id: id,
+      entries: lease.databases.length,
+      tombstones: lease.databases.length - live.length,
+      elapsed_ms: served - started,
+      live: live.slice(0, LEASE_LOG_LIVE_ENTRIES).map((entry) => ({
+        id: entry.database_id.slice(0, 6),
+        generation: entry.generation,
+        write_blocked: entry.write_blocked,
+        token: entry.runtime_authority !== null,
+        token_life_s: tokenLifeSeconds(entry.runtime_authority, served),
+        startup_valid:
+          entry.startup_expires_at !== null &&
+          entry.startup_expires_at > served,
+        parked: parked.has(entry.database_id),
+      })),
+    }),
+  );
+  return c.json(lease, 200);
 }

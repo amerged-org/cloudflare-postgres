@@ -276,3 +276,99 @@ it("keeps the lease to the live databases and the recent deletions however many 
     lease.databases.filter((entry) => entry.desired_state === "deleted"),
   ).toHaveLength(4);
 }, 60_000);
+
+function servedLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
+  return log.mock.calls.flatMap(([value]) => {
+    if (typeof value !== "string") return [];
+    const event = JSON.parse(value) as Record<string, unknown>;
+    return event.event === "storage_guard_served" && event.node_id === nodeId
+      ? [event]
+      : [];
+  });
+}
+
+it("logs what each lease served: the counts, its time and one compact line per live entry", async () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  const live = await node.add({ kind: "live" }),
+    blocked = await node.add({ kind: "blocked" }),
+    parked = await node.add({ kind: "parked" });
+  await node.add({ kind: "deleted", confirmed: true, confirmedAgo: 1000 });
+  await node.add({ kind: "deleted", confirmed: false });
+  await node.commit();
+  const lease = await node.lease();
+  const lines = servedLines(log, node.f.node);
+  expect(lines).toHaveLength(1);
+  const line = lines[0]!;
+  expect(Object.keys(line).sort()).toEqual([
+    "elapsed_ms",
+    "entries",
+    "event",
+    "live",
+    "node_id",
+    "tombstones",
+  ]);
+  expect(line).toMatchObject({
+    entries: lease.databases.length,
+    tombstones: 2,
+  });
+  expect(Number.isInteger(line.elapsed_ms)).toBe(true);
+  expect(Number(line.elapsed_ms)).toBeGreaterThanOrEqual(0);
+  const summary = new Map(
+    (line.live as Record<string, unknown>[]).map((entry) => [
+      entry.id as string,
+      entry,
+    ]),
+  );
+  // Live entries only, named by the first six characters of the database ID.
+  expect(summary.size).toBe(4);
+  const byId = new Map(
+    lease.databases.map((entry) => [entry.database_id, entry]),
+  );
+  const shown = (id: string) => summary.get(id.slice(0, 6))!;
+  expect(shown(node.held.id)).toEqual({
+    id: node.held.id.slice(0, 6),
+    generation: 1,
+    write_blocked: false,
+    token: false,
+    token_life_s: null,
+    startup_valid: true,
+    parked: false,
+  });
+  for (const member of [live, parked]) {
+    const entry = shown(member.id);
+    expect(entry).toMatchObject({
+      generation: byId.get(member.id)!.generation,
+      write_blocked: false,
+      token: true,
+      startup_valid: false,
+      parked: member === parked,
+    });
+    // The life of the token left when the line was written, to a tenth of a second.
+    expect(entry.token_life_s as number).toBeGreaterThan(0);
+    expect(entry.token_life_s as number).toBeLessThanOrEqual(120);
+  }
+  expect(shown(blocked.id)).toMatchObject({
+    write_blocked: true,
+    token: false,
+    token_life_s: null,
+    startup_valid: false,
+  });
+  // No token and no other secret is ever part of the line.
+  const text = JSON.stringify(line);
+  for (const entry of lease.databases)
+    if (entry.runtime_authority)
+      expect(text.includes(entry.runtime_authority)).toBe(false);
+  expect(text.includes(node.f.agent)).toBe(false);
+}, 60_000);
+
+it("logs at most twenty live entries and says how many there were", async () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  for (let i = 0; i < 24; i++) await node.add({ kind: "live" });
+  await node.commit();
+  await node.lease();
+  const line = servedLines(log, node.f.node)[0]!;
+  expect(line.entries).toBe(25);
+  expect((line.live as unknown[]).length).toBe(20);
+}, 60_000);

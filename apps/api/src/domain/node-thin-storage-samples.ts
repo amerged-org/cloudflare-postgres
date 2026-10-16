@@ -285,6 +285,7 @@ async function productSample(
   env: Env,
   nodeId: string,
   body: NodeStorageHeadroomSample,
+  startedAt: number,
 ): Promise<NodeStorageHeadroomResponse | "conflict"> {
   const now = Date.now(),
     current = await readCurrentNodeThinStorage(env, nodeId, now);
@@ -452,44 +453,49 @@ async function productSample(
     .run();
   if (result.meta.changes !== 1) return "conflict";
   const timing = thinStorageSampleSqlTiming(result.meta);
-  // This proves the authority CAS, even if a later token/read await or HTTP response fails.
-  // It does not prove token delivery or write permission; qualification never reaches this log.
-  console.log(
-    JSON.stringify({
-      event: "thin_storage_sample_accepted",
-      node_id: nodeId,
-      node_uid: row.node_uid,
-      authority_revision: authority.revision,
-      sample_observed_at: iso(issued),
-      authority_received_at: iso(now),
-      authority_expires_at: authority.expires_at,
-      write_allowed: authority.write_allowed,
-      period_milliseconds: period,
-      scrape_milliseconds: body.scrape_milliseconds,
-      d1_update_sql_milliseconds: timing.milliseconds,
-      d1_update_sql_timing_source: timing.source,
-      d1_update_sql_timing_scope:
-        timing.source === null ? null : "last_attempt",
-      d1_update_total_attempts: timing.attempts,
-    }),
-  );
-  const tokens: NodeStorageHeadroomResponse["tokens"] =
-    await runningWriterTokens(env, nodeId, row.region_id, now);
-  if (
-    thinPoolDataGrowthNeeded(
-      profile,
-      reading.physical.thin_pool!,
-      headroom,
-      await nextThinStartupBytes(
-        env,
-        nodeId,
-        row.region_id,
+  // This proves the authority CAS, even if a later token/read await or HTTP response fails: the line
+  // is written however the rest of the handler ends, and `handler_ms` is the whole handler's time
+  // until then. It does not prove token delivery or write permission; qualification never reaches
+  // this log.
+  const accepted = {
+    event: "thin_storage_sample_accepted",
+    node_id: nodeId,
+    node_uid: row.node_uid,
+    authority_revision: authority.revision,
+    sample_observed_at: iso(issued),
+    authority_received_at: iso(now),
+    authority_expires_at: authority.expires_at,
+    write_allowed: authority.write_allowed,
+    period_milliseconds: period,
+    scrape_milliseconds: body.scrape_milliseconds,
+    d1_update_sql_milliseconds: timing.milliseconds,
+    d1_update_sql_timing_source: timing.source,
+    d1_update_sql_timing_scope: timing.source === null ? null : "last_attempt",
+    d1_update_total_attempts: timing.attempts,
+  };
+  let tokens: NodeStorageHeadroomResponse["tokens"];
+  try {
+    tokens = await runningWriterTokens(env, nodeId, row.region_id, now);
+    if (
+      thinPoolDataGrowthNeeded(
         profile,
-        row.allow_new_databases,
-      ),
+        reading.physical.thin_pool!,
+        headroom,
+        await nextThinStartupBytes(
+          env,
+          nodeId,
+          row.region_id,
+          profile,
+          row.allow_new_databases,
+        ),
+      )
     )
-  )
-    await requestThinStorageTurn(env, nodeId).catch(() => undefined);
+      await requestThinStorageTurn(env, nodeId).catch(() => undefined);
+  } finally {
+    console.log(
+      JSON.stringify({ ...accepted, handler_ms: Date.now() - startedAt }),
+    );
+  }
   return {
     accepted: true,
     reason: null,
@@ -506,6 +512,7 @@ export async function recordStorageHeadroomSample(
   nodeId: string,
   raw: NodeStorageHeadroomSample,
 ) {
+  const startedAt = Date.now();
   NodeId.parse(nodeId);
   const body = NodeStorageHeadroomSample.parse(raw),
     region = await agentRegion(c);
@@ -535,7 +542,7 @@ export async function recordStorageHeadroomSample(
     );
   // A concurrent renewal or identity proof can win the compare-and-set; evaluate again a few times.
   for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await productSample(c.env, nodeId, body);
+    const result = await productSample(c.env, nodeId, body, startedAt);
     if (result !== "conflict")
       return c.json(NodeStorageHeadroomResponse.parse(result), 200);
   }

@@ -85,6 +85,7 @@ it("observes only a confirmed product CAS with CF clocks and selected SQL metada
     "d1_update_sql_timing_source",
     "d1_update_total_attempts",
     "event",
+    "handler_ms",
     "node_id",
     "node_uid",
     "period_milliseconds",
@@ -116,6 +117,9 @@ it("observes only a confirmed product CAS with CF clocks and selected SQL metada
   expect(["meta.duration", "meta.timings.sql_duration_ms"]).toContain(
     event.d1_update_sql_timing_source,
   );
+  // The handler's own time: at least what the update took, never negative, a whole number.
+  expect(Number.isInteger(event.handler_ms)).toBe(true);
+  expect(Number(event.handler_ms)).toBeGreaterThanOrEqual(0);
   expect(typeof event.d1_update_sql_milliseconds).toBe("number");
   expect(Number.isFinite(event.d1_update_sql_milliseconds)).toBe(true);
   expect(Number(event.d1_update_sql_milliseconds)).toBeGreaterThanOrEqual(0);
