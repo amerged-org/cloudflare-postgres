@@ -86,7 +86,7 @@ no region-wide maintenance lock; later acceptance uses dedicated test projects w
 | Thin database, first pass | Under R2.9 a new Thin database committed 1,000 rows through Cloudflare (its first start went through a protective sleep after a withdrawn startup authority), a manually started base backup and WAL reached R2, a restore returned the same digest and delete reclaimed both volumes. |
 | Daily infrastructure backup | D1 and EU etcd verified in R2; complete on 2026-10-13 (148.3 s) and 2026-10-15 (331.8 s). |
 | API reads | Database placement and conjunctive filters, node and region reads, paginated release and patch history verified live; the three OpenAPI documents (public 112, agent 13, internal 21) cover all 146 operations of the deployed Worker (`22c0164`). |
-| Shared warm pool | Owner approved alternative 8 (PGCF-supervised PostgreSQL in pre-created pool Pods) on 2026-10-12 and decided on 2026-10-15 that the parked tier replaces it. It was never live: no release, switch, namespace or deployed binary had it. Its supervisor crate and image profile, sandbox-controller modules, controller and gateway paths, API domain and routes, contracts and CI steps are deleted from main (git history is the archive); migration 0056 drops its 14 empty D1 tables. |
+| Shared warm pool | Owner approved alternative 8 (PGCF-supervised PostgreSQL in pre-created pool Pods) on 2026-10-12 and decided on 2026-10-15 that the parked tier replaces it. It was never live: no release, switch, namespace or deployed binary had it. Its supervisor crate and image profile, sandbox-controller modules, controller and gateway paths, API domain and routes, contracts and CI steps are deleted from main (API deployed 2026-10-16 with migration 0056 applied) (git history is the archive); migration 0056 drops its 14 empty D1 tables. |
 | Green main | CI on `2bc6e55` passed every job and published all images (2026-10-15 13:47–14:33Z) after six fixes: the kernel and IO fixtures of the pool supervisor, the storage image built in `check`, the sandbox proof and node-runtime test images, the Cilium values pin, a scanner finding from a fixture field name, and the exporter-only driver kept as the qualified one. |
 | Wake floor on EU1 | PostgreSQL 18.6 clean start reaches ready in 111–117 ms (first SQL 136–169 ms); CNPG fence/unfence reaches accepting connections 226–305 ms after the annotation, Pod recreation takes 4.1–5.2 s; a fenced instance manager holds about 62 MB; in-place resize of requests keeps the Pod. |
 
@@ -162,6 +162,7 @@ Cloudflare at least four times and learns readiness through an observation POST 
 | W4 | Placement and hops: `locationHint` for the Actor and RegionLink, D1 region, service bindings instead of public fetches, `TCP_NODELAY`, pipelined PostgreSQL startup in the CLI | API + Edge + gateway | unmeasured; first measure the 0.45 s client-to-Edge term, which the repo's own design table puts at 45–113 ms | measure first |
 | W5 | Hot idle tier: stop nothing, `memory.reclaim` into zswap while idle, request shrink in place; first query equals the awake path plus 5–50 ms page-in, no wake at all, 2–4x parked density | Talos host configuration + reclaim consumer | removes the transition for the common case | experiment E1 on EU1 (swap volume, zswap, kubelet `LimitedSwap`), needs a maintenance window |
 | W6 | Cold path (hibernated, 9–14 s): `fsGroupChangePolicy: OnRootMismatch`, relax the sidecar's 1 s startup gate, manager binary from an image volume | CNPG/pod spec | 9 s toward 4–6 s (estimate) | experiments on EU1 |
+| W8 | Client handshake after the wake: SSLRequest answered locally, startup + first SCRAM message in one flight, optional gateway-side cleartext auth (verifier custody is an owner decision) | CLI, driver, gateway | 0.3–0.5 s on a 100 ms path (laptop p50 2.5 s today, Worker 1.24 s) | to start |
 | W7 | Thin identity turn: batch the inventory commands (a turn takes about 47 s every 60 s), request a turn when a cold start waits for `volume_identity`, let a refused claim wait for the next inventory instead of 57P03 and log the refusing predicate | NodeBootstrap + API | cold thin wake 44 s to about 10 s; create and delete faster; removes the 57P03 class | to start |
 
 Not built: CRIU/container checkpoint (beta in 1.36, no native restore, no `criu` on Talos), microVM
@@ -190,11 +191,15 @@ Stage A is branch `golive/scale-a` (in progress). Stage D rides on the next host
 anyway (guard fixes: one bad entry must not refuse every entry, `remember_storage_authority` must
 tolerate unassigned Pods), because each host release rebinds the thin qualification receipt and reboots.
 
+**Laptop path.** The same parked wake takes 1.79–3.16 s (p50 2.5 s) from a laptop through the CLI
+proxy against 0.41–0.54 s awake: the server-side wake adds about 1.2 s and the PostgreSQL handshake
+after it costs about five client round trips; W8 pipelines it.
+
 **Operations finding.** A fleet rollout pauses thin write authority for the whole region from its start
 until every node confirmed: on 2026-10-16 the last accepted sample was 01:07:16Z, the rollout began
 01:07:19Z and sampling resumed at convergence (about 01:45Z). With thin databases awake their 10 s
 tokens expire and the host guard kills their Pods, so every rollout needs a maintenance window until
-authority continuity across patches that change no qualification fact exists (design in progress).
+authority continuity across patches that change no qualification fact exists. The design is complete (a `continuing` qualification class keyed on facts instead of release labels, 17 failing tests listed, stages shipped together; see [wake-path-v2-and-scale.md](wake-path-v2-and-scale.md) section 7); implementation is next after the identity-turn and claim work.
 
 ## After go-live
 

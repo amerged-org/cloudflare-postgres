@@ -43,7 +43,13 @@ Worker, parked tier, `dev-idle` class) [M]: first query after idle **1.24 s, 1.5
 1.16 s from socket creation to open: Edge, claim and hint to the controller 0.37 s; desired pull
 0.21 s; controller chain from unfence to fence release 0.30 s (PostgreSQL accepting 0.12 s after the
 unfence); observation POST 0.26 s; release to open 0.02 s. So the three Cloudflare terms (hint 0.37,
-pull 0.21, POST 0.26) are 0.84 s of 1.16 s and the node-side work is 0.30 s. Three further live
+pull 0.21, POST 0.26) are 0.84 s of 1.16 s and the node-side work is 0.30 s. From a laptop (the pgcf CLI proxy and psql, Germany, same database, five parked rounds): first query
+**1.79 s, 2.33 s, 2.50 s, 2.65 s, 3.16 s (p50 2.5 s)** against 0.41–0.54 s for the same statement on
+an awake database. The wake adds about the same 1.2 s on the server side; the rest is the PostgreSQL
+handshake paid after the wake over the client's round trips (SSLRequest, startup, two SCRAM
+round trips, query: about five round trips of 100 ms) plus process start. The 1–2 s goal therefore
+holds for a server-side client (a Worker, 1.24 s) and misses by 0.5–1 s for a client far from the Edge
+until the handshake is pipelined (W8). Three further live
 findings from the same run:
 
 1. **A claim is refused with 57P03 in two of five parked rounds** (0.4–0.6 s after the connect, no wake
@@ -235,7 +241,19 @@ of returning 57P03 at once, and logs which predicate refused; (d) raise the Edge
 deadline for a cold start only if (a) and (b) leave it above 20 s. Expected: cold wake 44 s to about
 10 s [E], create and delete several times faster.
 
-### 4.9 Small items from Xata and Neon
+### 4.9 W8 client handshake after the wake (CLI proxy, driver, gateway)
+
+Everything the client does after the socket opens is paid at the client's round-trip time. Neon's
+WebSocket path needs 4 round trips in total (TCP 1, TLS 1.3 1, upgrade 1, one pipelined flight with
+startup, cleartext password over TLS and the first query 1) against 9 in the baseline. For PGCF: answer
+SSLRequest with `N` locally in the CLI proxy and in the driver (no round trip), send startup and the
+first SCRAM message in one flight, and let the gateway authenticate the cleartext password over the
+TLS-protected WebSocket against the verifier and replay the SCRAM keys to PostgreSQL, hiding the
+authentication inside the wake instead of after it (the verifier custody and Cloudflare-side review are
+owner decisions; the pipelined SCRAM flight needs none). The gateway already tolerates
+`[SSLRequest][Startup][rest]` in one frame. Expected: 0.3–0.5 s less on a 100 ms path.
+
+### 4.10 Small items from Xata and Neon
 
 - Label every wake by path class (parked hit, hibernated, resize, demotion) and size, and record the
   gateway-boundary duration in fine buckets; size the parked TTL and cap from the idle-gap distribution.
@@ -245,7 +263,7 @@ deadline for a cold start only if (a) and (b) leave it above 20 s. Expected: col
   disconnect; audit slow wakes with the start held for 20 s and 45 s.
 - `pg_prewarm.autoprewarm` and a local file cache only help throughput after the first query.
 
-### 4.10 Not recommended
+### 4.11 Not recommended
 
 CRIU and Kubernetes container checkpoint (beta in 1.36 without native restore, no `criu` on Talos, restore
 2–6x slower than a clean start [E]); gVisor; Firecracker, Cloud Hypervisor, Kata, Unikraft snapshots (need
@@ -329,6 +347,28 @@ experiment (it removes a known 6.2 statements/s per node).
   last sample 01:07:16Z, rollout start 01:07:19Z, sampling back at convergence about 01:45Z); awake thin
   databases lose their 10 s tokens and the host guard kills their Pods. Until authority continuity across
   patches that change no qualification fact exists, every rollout needs a maintenance window.
+- **Rollout-safe authority (design complete, not implemented).** Cause: two gates bind authority to
+  the release's labels (release id, spec hash, assignment and region revision) instead of to the facts
+  the qualification depends on. `createFleetRollout` moves every label in one batch, so every gate is
+  stale at once: `thinStorageSamplingSql` (no sampling target, no composed entry, 404 on the sample
+  route), `readThinStorageLeaseRow` (no identity lease; authority cannot outlive its proof of 300 s) and
+  `qualifiedThinStorageSql` (11 labels, one a hash that embeds the release id). Proposal: a
+  `continuing` qualification class that keeps the fact equalities (receipt facts, authority keys, OS and
+  pin block, host configuration sha, boot id) and drops the labels, evaluated by a `continuity(spec,
+  role)` SQL text; samples, tokens, desired page and identity turns continue through a rollout whose
+  patches change none of those facts; placement, wake, hold release, deletion, selection and
+  qualification runs stay strict; extension, kernel, OS or key changes stay strict from assignment. A
+  further hazard it exposes: each rollout resizes every database for a release-id-only stamp
+  (`postgres` stage), which strict admission refuses, so that stage must select by (image, version,
+  schema). Stages ship together (predicates, lease evidence, strict consumers, `postgres` selection);
+  17 failing tests are listed first (continuing: samples and tokens continue, desired page keeps the
+  target, lease keeps the boot, turn accepted under the new assignment, two rollouts in a row, halt at
+  `regional`, rollback; strict: other extension digest, installer only, host record rewritten, boot id,
+  halt at `host_config`, replacement node, strict admissions, wire capability, continuity text). Open:
+  a controller `Recreate` gap longer than the 10 s guard still stops awake databases (measure), the
+  age of the first revision-matching observation (up to 180 s today, 300 s proposed), whether Flux
+  restarts the OpenEBS driver on an unrelated release, and the owner's choice of which pins belong to
+  the continuity set. Prerequisite: the lease work (deployed 2026-10-16).
 - A guard above about 11 s cannot qualify: a qualification sample counts only when its nonce was issued
   inside the gate's window and the next sample also arrives inside it, and `startup_bound`'s window is
   4.7 s on EU1; guard 30 s failed (`thin_qualification_startup_bound_failed`).
