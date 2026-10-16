@@ -401,7 +401,7 @@ pub fn storage_snapshot_expired(error: &Error) -> bool {
 }
 /// A job owns a snapshot; the main loop independently monitors the latest authority.
 /// Expiry alone asks for fresh work. Every physical/permission mismatch still protects.
-pub(crate) fn storage_guard(
+fn storage_guard(
     db: &Value,
     node: &Value,
     authority: &Value,
@@ -1344,8 +1344,8 @@ impl Reconciler {
                 },
                 "suspended" => return self.pool.sleep(self, db, snapshot, serving).await,
                 _ => {
-                    self.pool.retire_later(id, "deleted");
-                    if !self.pool.retire_serving(self, id, None).await? {
+                    self.pool.unwind_later(id, "deleted");
+                    if !self.pool.unwind(self, id, None).await? {
                         return Err("pool slot retirement pending".into());
                     }
                 }
@@ -2371,10 +2371,26 @@ impl Reconciler {
         let observed = self.power.protect_storage(db).await?;
         let id = text(db, "id");
         if self.pool.serves(id) {
-            self.pool.retire_later(id, "protected");
-            self.pool.retire_serving(self, id, None).await?;
+            self.pool.unwind_later(id, "protected");
+            self.pool.unwind(self, id, None).await?;
         }
         Ok(observed)
+    }
+    /// Whether the node-wide Cloudflare write authority of the database's node is current for a
+    /// pool claim (check 4.3 #1): the snapshot's (or a newer renewal's) authority of `node`, the
+    /// Node as the watch holds it.
+    pub(crate) fn write_authority(
+        &self,
+        db: &Value,
+        snapshot: &DesiredSnapshot,
+        node: &Value,
+    ) -> bool {
+        snapshot.region["storage_nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|n| n["name"] == db["node"]))
+            .is_some_and(|authority| {
+                storage_guard(db, node, authority, &self.cluster_uid, true, now()).is_ok()
+            })
     }
     /// The Node and the host authority the database stands on. The pass has asserted the identity
     /// of the cluster before it asks.

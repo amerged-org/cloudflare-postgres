@@ -817,7 +817,7 @@ impl Pool {
         self.state.lock().unwrap().serving.get(id).cloned()
     }
     /// The served databases whose slot is to be retired.
-    pub fn retiring(&self) -> Vec<String> {
+    pub fn unwinding(&self) -> Vec<String> {
         self.state
             .lock()
             .unwrap()
@@ -828,7 +828,7 @@ impl Pool {
             .collect()
     }
     /// Asks for the slot serving `id` to be retired.
-    pub fn retire_later(&self, id: &str, reason: &'static str) {
+    pub fn unwind_later(&self, id: &str, reason: &'static str) {
         if let Some(serving) = self.state.lock().unwrap().serving.get_mut(id) {
             let restore = serving.ticket.is_some();
             serving.retire.get_or_insert(Retire { restore, reason });
@@ -916,14 +916,6 @@ impl Pool {
             .cloned()
             .collect()
     }
-    /// A ticket of another wake is pending for `id`.
-    fn other_ticket(&self, id: &str, operation: &str, generation: u64) -> bool {
-        self.serving(id).is_some_and(|serving| {
-            serving.ticket.as_ref().is_some_and(|ticket| {
-                ticket.operation != operation || ticket.generation != generation
-            })
-        })
-    }
     fn emit(path: &crate::timing::WakePath) {
         crate::timing::emit(crate::timing::wake_path_event(path));
     }
@@ -949,7 +941,8 @@ impl Pool {
                 .await;
             return Ok(None);
         }
-        let busy = busy || self.other_ticket(&wake.database, &wake.operation, wake.generation);
+        // A slot that serves the database for another wake is that wake's.
+        let busy = busy || self.serves(&wake.database);
         let node = cell.map_or("", |(db, _)| text(db, "node")).to_string();
         let decided = match cell {
             Some((db, snapshot)) => {
@@ -1027,20 +1020,22 @@ impl Pool {
             Ok(plan) => {
                 let slot = plan.slot.hex.clone();
                 match self.hit(rec, plan, snapshot, None, &mut timer).await {
+                    // The pass that released the slot publishes its attestation as well.
                     Ok(()) => {
                         let served = match self.serving(id) {
-                            Some(serving) => self.serve_pass(rec, db, snapshot, serving).await?,
-                            None => Served::Observed(None),
+                            Some(serving) => self.serve_pass(rec, db, snapshot, serving).await,
+                            None => Ok(Served::Observed(None)),
                         };
-                        match served {
-                            Served::Observed(observed) => ("pool_hit", None, Some(slot), observed),
-                            Served::HandedOver => ("pool_hit", None, Some(slot), None),
-                        }
+                        let observed = served.map(|served| match served {
+                            Served::Observed(observed) => observed,
+                            Served::HandedOver => None,
+                        });
+                        ("pool_hit", None, Some(slot), observed)
                     }
-                    Err(reason) => ("pool_miss", Some(reason), Some(slot), None),
+                    Err(reason) => ("pool_miss", Some(reason), Some(slot), Ok(None)),
                 }
             }
-            Err((_, reason)) => ("pool_miss", Some(reason), None, None),
+            Err((_, reason)) => ("pool_miss", Some(reason), None, Ok(None)),
         };
         timer.total();
         Self::emit(&crate::timing::WakePath {
@@ -1055,7 +1050,7 @@ impl Pool {
             ms: &timer.ms,
             agent_us: &timer.agent_us,
         });
-        Ok(observed)
+        observed
     }
     /// Gathers what the decision reads (rows 1-16) and decides. A hit's slot is claimed in
     /// memory before the decision is answered.
@@ -1107,22 +1102,9 @@ impl Pool {
             .unwrap_or(&self.image)
             .to_string();
         let fingerprint = sleep_fingerprint(&view, &self.image).unwrap_or_default();
-        let authority = node.as_ref().is_some_and(|node| {
-            snapshot.region["storage_nodes"]
-                .as_array()
-                .and_then(|nodes| nodes.iter().find(|n| n["name"] == db["node"]))
-                .is_some_and(|authority| {
-                    crate::reconcile::storage_guard(
-                        &view,
-                        node,
-                        authority,
-                        &rec.cluster_uid,
-                        true,
-                        i128::from(now_ms()),
-                    )
-                    .is_ok()
-                })
-        });
+        let authority = node
+            .as_ref()
+            .is_some_and(|node| rec.write_authority(&view, snapshot, node));
         let slots = self.free_on(text(db, "node"));
         let facts = Facts {
             trigger,
@@ -1400,7 +1382,7 @@ impl Pool {
                     reason: "release_failed",
                 });
             }
-            let _ = self.retire_serving(rec, &id, Some(&view)).await;
+            let _ = self.unwind(rec, &id, Some(&view)).await;
             return Err("release_failed");
         }
         timer.lap("release");
@@ -1735,7 +1717,7 @@ impl Pool {
     /// Retires the slot that serves `id` (its `retire` says whether its release is undone first);
     /// `db` is the desired row the sleep record is written under. `true` once the slot is gone and
     /// the volume released.
-    pub async fn retire_serving(
+    pub async fn unwind(
         &self,
         rec: &Reconciler,
         id: &str,
@@ -1836,7 +1818,7 @@ impl Pool {
             return Ok(Served::Observed(None));
         }
         if serving.retire.is_some() {
-            self.retire_serving(rec, id, Some(db)).await?;
+            self.unwind(rec, id, Some(db)).await?;
             return Err("pool slot retired".into());
         }
         let ns = slot_namespace(&serving.slot);
@@ -1872,14 +1854,14 @@ impl Pool {
             Err(CallError::Unavailable) => return Err("slot agent unavailable".into()),
         };
         if !held || pod.as_ref().and_then(slot_pod).as_ref() != Some(&serving.pod) {
-            self.retire_later(id, "volume_authority_lost");
-            self.retire_serving(rec, id, Some(db)).await?;
+            self.unwind_later(id, "volume_authority_lost");
+            self.unwind(rec, id, Some(db)).await?;
             return Ok(Served::Observed(Some(lost("slot volume authority lost"))));
         }
         // Anything but a role changed: the database's own Cluster takes over.
         if structure_fingerprint(db, &self.image)? != serving.structure {
-            self.retire_later(id, "configuration_changed");
-            return if self.retire_serving(rec, id, Some(db)).await? {
+            self.unwind_later(id, "configuration_changed");
+            return if self.unwind(rec, id, Some(db)).await? {
                 Ok(Served::HandedOver)
             } else {
                 Ok(Served::Observed(None))
@@ -1997,9 +1979,9 @@ impl Pool {
             if rec.power.sleep_phase(db).await != Some("hibernating") {
                 return Ok(None);
             }
-            self.retire_later(id, "sleep");
+            self.unwind_later(id, "sleep");
         }
-        if !self.retire_serving(rec, id, Some(db)).await? {
+        if !self.unwind(rec, id, Some(db)).await? {
             return Ok(None);
         }
         rec.power.suspend(db, &sleep(true)).await
@@ -2158,7 +2140,7 @@ impl Pool {
                     .serving(id)
                     .is_some_and(|serving| current.as_ref() == Some(&serving.pod));
                 if !held {
-                    self.retire_later(id, "container_missing");
+                    self.unwind_later(id, "container_missing");
                     return Ok(Some(id.clone()));
                 }
                 Ok(None)

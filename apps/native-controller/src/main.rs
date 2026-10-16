@@ -1170,7 +1170,7 @@ async fn run() -> Result<(), Error> {
     let mut pool_tasks: JoinSet<Option<String>> = JoinSet::new();
     let mut refills: JoinSet<()> = JoinSet::new();
     let mut pool_interval = tokio::time::interval(Duration::from_secs(1));
-    let mut retiring_after: HashMap<String, Instant> = HashMap::new();
+    let mut unwinding_after: HashMap<String, Instant> = HashMap::new();
     let mut cells: HashMap<String, Cell> = HashMap::new();
     let mut active: HashMap<String, Active> = HashMap::new();
     let mut jobs: JoinSet<JobResult> = JoinSet::new();
@@ -1311,7 +1311,7 @@ async fn run() -> Result<(), Error> {
             result = pool_tasks.join_next(), if !pool_tasks.is_empty() => {
                 // A slot that serves a database and changed is retired by an Unwind job.
                 if let Some(Ok(Some(id))) = result {
-                    retiring_after.remove(&id);
+                    unwinding_after.remove(&id);
                 }
             },
             _ = full.tick() => {
@@ -1511,12 +1511,13 @@ async fn run() -> Result<(), Error> {
         }
         // Slots to be retired, one Unwind job each, again a second after one that did not end it.
         let now = Instant::now();
-        for id in controller.pool.retiring() {
-            if active.contains_key(&id) || retiring_after.get(&id).is_some_and(|after| *after > now)
+        for id in controller.pool.unwinding() {
+            if active.contains_key(&id)
+                || unwinding_after.get(&id).is_some_and(|after| *after > now)
             {
                 continue;
             }
-            retiring_after.insert(id.clone(), now + Duration::from_secs(1));
+            unwinding_after.insert(id.clone(), now + Duration::from_secs(1));
             let cell = cells.get(&id);
             let db = cell.map(|cell| cell.db.clone());
             let generation = db.as_ref().map_or(0, |db| number(db, "generation"));
@@ -1526,7 +1527,7 @@ async fn run() -> Result<(), Error> {
             let abort = jobs.spawn_local(async move {
                 let result = controller
                     .pool
-                    .retire_serving(&controller, &job_id, db.as_ref())
+                    .unwind(&controller, &job_id, db.as_ref())
                     .await
                     .map(|_| None);
                 (job_id, generation, marker, now, JobKind::Unwind, result)

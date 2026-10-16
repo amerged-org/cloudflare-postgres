@@ -1003,12 +1003,12 @@ mod world {
             w.reconciler.pool.confirm_tickets(cell, late),
             vec![(w.id.clone(), TicketOutcome::Expired)]
         );
-        assert_eq!(w.reconciler.pool.retiring(), vec![w.id.clone()]);
+        assert_eq!(w.reconciler.pool.unwinding(), vec![w.id.clone()]);
         let from = w.log_len();
         assert!(
             w.reconciler
                 .pool
-                .retire_serving(&w.reconciler, &w.id, Some(&w.db))
+                .unwind(&w.reconciler, &w.id, Some(&w.db))
                 .await
                 .unwrap()
         );
@@ -1392,12 +1392,12 @@ mod world {
         });
         let retired = w.reconciler.pool.observe(SLOT_HEX).await.unwrap();
         assert_eq!(retired.as_deref(), Some(w.id.as_str()));
-        assert_eq!(w.reconciler.pool.retiring(), vec![w.id.clone()]);
+        assert_eq!(w.reconciler.pool.unwinding(), vec![w.id.clone()]);
         let from = w.log_len();
         assert!(
             w.reconciler
                 .pool
-                .retire_serving(&w.reconciler, &w.id, Some(&w.db))
+                .unwind(&w.reconciler, &w.id, Some(&w.db))
                 .await
                 .unwrap()
         );
@@ -1500,7 +1500,7 @@ mod world {
         assert!(
             restarted
                 .pool
-                .retire_serving(&restarted, &w2.id, None)
+                .unwind(&restarted, &w2.id, None)
                 .await
                 .unwrap()
         );
@@ -1663,11 +1663,11 @@ mod world {
             holder(&w),
             Some(format!("slot:{}:{BOOT_ID}", slot_pod_uid()))
         );
-        assert_eq!(w.reconciler.pool.retiring(), vec![w.id.clone()]);
+        assert_eq!(w.reconciler.pool.unwinding(), vec![w.id.clone()]);
         assert!(
             w.reconciler
                 .pool
-                .retire_serving(&w.reconciler, &w.id, Some(&w.db))
+                .unwind(&w.reconciler, &w.id, Some(&w.db))
                 .await
                 .unwrap()
         );
