@@ -954,7 +954,10 @@ async fn run() -> Result<(), Error> {
     )?);
     let (hints, mut incoming) = mpsc::channel(512);
     tokio::task::spawn_local(link(api.clone(), hints.clone()));
-    for kind in pgcf_native_controller::kubernetes::RUNTIME_WATCH_KINDS {
+    for kind in pgcf_native_controller::kubernetes::RUNTIME_WATCH_KINDS
+        .into_iter()
+        .chain(pgcf_native_controller::kubernetes::PLAN_WATCH_KINDS)
+    {
         let kube = kube.clone();
         let hints = hints.clone();
         tokio::task::spawn_local(async move {
@@ -987,7 +990,12 @@ async fn run() -> Result<(), Error> {
                 } else {
                     failures.saturating_add(1)
                 };
-                let _ = hints.send(Hint::Pull(None)).await;
+                // The pull asks for the desired state of every database again, as a watch that
+                // hinted them may have missed something. The kinds that only keep versions hint
+                // nothing, and miss nothing a pull would find.
+                if pgcf_native_controller::kubernetes::RUNTIME_WATCH_KINDS.contains(&kind) {
+                    let _ = hints.send(Hint::Pull(None)).await;
+                }
                 tokio::time::sleep(watch_delay(failures)).await;
             }
         });

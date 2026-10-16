@@ -90,6 +90,26 @@ pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
     "Secret",
     "ConfigMap",
 ];
+/// The kinds the wake of a parked database proves unchanged without reading them: the manifests
+/// it applies that the runtime watches above do not cover, and the volume of the claim. Their
+/// watches only keep track of versions; no change of them hints a database, as none did before.
+pub const PLAN_WATCH_KINDS: [&str; 7] = [
+    "ResourceQuota",
+    "LimitRange",
+    "NetworkPolicy",
+    "CiliumNetworkPolicy",
+    "ObjectStore",
+    "ScheduledBackup",
+    "LVMVolume",
+];
+/// Whether a metadata watch follows `kind`.
+fn watched(kind: &str) -> bool {
+    RUNTIME_WATCH_KINDS.contains(&kind) || PLAN_WATCH_KINDS.contains(&kind)
+}
+/// How many objects the memory of reads holds before it drops those the watch no longer vouches
+/// for: a database is about twenty of them, and an object is a few kilobytes, so the bound on what
+/// the controller keeps of the cluster is some tens of MiB of the 384 it may use.
+const REMEMBERED_MAX: usize = 8_192;
 /// How many objects one page of a watch baseline holds: a page of metadata stays far below the
 /// bound a response is read with, whatever the annotations of the objects weigh.
 const BASELINE_PAGE: usize = 100;
@@ -158,6 +178,19 @@ struct WatchContinuity {
     written: HashMap<(String, String, String), Vec<(String, Instant)>>,
     /// How long a change is held back before it hints (`OWN_WRITE_SETTLE`).
     settle: Duration,
+    /// What the controller last read or wrote of an object, as it was found.
+    remembered: HashMap<(String, String, String), Remembered>,
+    /// A test that pins how reads are made when the watch cannot vouch for what was read turns
+    /// the memory off.
+    #[cfg(test)]
+    recalling: bool,
+}
+/// What a read of an object found. The watch says whether that is still the object's state: the
+/// object is the version it was read at, or it was not there and the watch still holds none.
+#[derive(Debug)]
+enum Remembered {
+    Absent,
+    Present(Value),
 }
 impl Default for WatchContinuity {
     fn default() -> Self {
@@ -181,10 +214,77 @@ impl Default for WatchContinuity {
             objects: HashMap::new(),
             written: HashMap::new(),
             settle: OWN_WRITE_SETTLE,
+            remembered: HashMap::new(),
+            #[cfg(test)]
+            recalling: true,
         }
     }
 }
 impl WatchContinuity {
+    /// Whether the watch of `kind` is established and has been heard from lately.
+    fn watching(&self, kind: &str) -> bool {
+        self.kinds
+            .get(kind)
+            .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
+    }
+    /// The state of an object as the last read or write of it found it, if the watch proves that
+    /// nothing has changed it since: the watch holds it at that very version, or holds none of it
+    /// as it did not when it was found absent. `None` when nothing can be said. The watch trails
+    /// the API server by the time an event takes, the lag every read of a cache has too.
+    fn recall(&self, kind: &str, namespace: &str, name: &str) -> Option<Option<Value>> {
+        #[cfg(test)]
+        if !self.recalling {
+            return None;
+        }
+        if !self.watching(kind) {
+            return None;
+        }
+        let key = (kind.to_string(), namespace.to_string(), name.to_string());
+        match (self.remembered.get(&key)?, self.objects.get(&key)) {
+            (Remembered::Absent, None) => Some(None),
+            (Remembered::Present(object), Some(held))
+                if text(&object["metadata"], "uid") == held.uid
+                    && text(&object["metadata"], "resourceVersion") == held.version =>
+            {
+                Some(Some(object.clone()))
+            }
+            _ => None,
+        }
+    }
+    /// Keeps what a read or a write of an object found, `None` for an object that was not there.
+    fn remember(&mut self, kind: &str, namespace: &str, name: &str, found: Option<&Value>) {
+        if !watched(kind) {
+            return;
+        }
+        let entry = match found {
+            None => Remembered::Absent,
+            Some(object)
+                if !text(&object["metadata"], "uid").is_empty()
+                    && !text(&object["metadata"], "resourceVersion").is_empty() =>
+            {
+                Remembered::Present(object.clone())
+            }
+            Some(_) => return,
+        };
+        if self.remembered.len() >= REMEMBERED_MAX {
+            let objects = &self.objects;
+            self.remembered
+                .retain(|key, entry| match (entry, objects.get(key)) {
+                    (Remembered::Absent, None) => true,
+                    (Remembered::Present(object), Some(held)) => {
+                        text(&object["metadata"], "resourceVersion") == held.version
+                    }
+                    _ => false,
+                });
+            if self.remembered.len() >= REMEMBERED_MAX {
+                self.remembered.clear();
+            }
+        }
+        self.remembered.insert(
+            (kind.to_string(), namespace.to_string(), name.to_string()),
+            entry,
+        );
+    }
     fn connected(&mut self, kind: &str, version: &str) {
         self.kinds
             .insert(kind.into(), (version.into(), Instant::now(), true));
@@ -206,6 +306,7 @@ impl WatchContinuity {
         let key = (kind.into(), text(metadata, "namespace").into(), name.into());
         if deleted {
             self.objects.remove(&key);
+            self.remembered.remove(&key);
         } else {
             if self.objects.len() >= MAX_TRACKED_OBJECTS && !self.objects.contains_key(&key) {
                 return false;
@@ -228,27 +329,26 @@ impl WatchContinuity {
             text(meta, "namespace").into(),
             text(meta, "name").into(),
         );
-        self.kinds
-            .get(kind)
-            .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
+        self.watching(kind)
             && self.objects.get(&key).is_some_and(|held| {
                 Some(held.uid.as_str()) == meta["uid"].as_str()
                     && Some(held.version.as_str()) == meta["resourceVersion"].as_str()
             })
     }
     fn gap(&mut self, kind: &str) {
-        self.epoch += 1;
+        // The epoch is the runtime proof's: a kind that is no part of it is no gap of it.
+        if RUNTIME_WATCH_KINDS.contains(&kind) {
+            self.epoch += 1;
+        }
         self.kinds.remove(kind);
         self.objects.retain(|(resource, _, _), _| resource != kind);
+        self.remembered
+            .retain(|(resource, _, _), _| resource != kind);
     }
     fn snapshot(&self) -> Option<(String, u64)> {
         RUNTIME_WATCH_KINDS
             .iter()
-            .all(|kind| {
-                self.kinds
-                    .get(*kind)
-                    .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
-            })
+            .all(|kind| self.watching(kind))
             .then(|| (self.controller_epoch.clone(), self.epoch))
     }
     /// Remembers that this controller wrote `object`, as the write answered, over the version
@@ -342,6 +442,9 @@ impl WatchContinuity {
                 .is_some_and(|held| held.uid == text(meta, "uid") && held.shape == shape(meta));
         if !self.observe(kind, object, event_type == "DELETED") {
             return Err("watch object metadata invalid".into());
+        }
+        if !RUNTIME_WATCH_KINDS.contains(&kind) {
+            return Ok((version.to_string(), None));
         }
         let labelled = text(&meta["labels"], "pgcf.io/database-id");
         let id = if labelled.is_empty() {
@@ -530,6 +633,17 @@ impl Kubernetes {
             &candidate.version,
         )
     }
+    /// The watch of `kind` ends, as one that was cut off does.
+    #[cfg(test)]
+    pub(crate) fn watch_ends(&self, kind: &str) {
+        self.continuity.lock().unwrap().gap(kind);
+    }
+    /// From now on no read is answered from memory: every read is made, as when the watch cannot
+    /// vouch for any object.
+    #[cfg(test)]
+    pub(crate) fn recall_nothing(&self) {
+        self.continuity.lock().unwrap().recalling = false;
+    }
     /// How long a change is held back before it hints, for a test that makes the answer of a write
     /// trail its event by a time of its own.
     #[cfg(test)]
@@ -589,14 +703,11 @@ impl Kubernetes {
     pub(crate) fn mirror<'a>(&self, objects: impl IntoIterator<Item = &'a Value>) {
         let mut state = self.continuity.lock().unwrap();
         state.objects.clear();
-        for kind in RUNTIME_WATCH_KINDS {
+        for kind in RUNTIME_WATCH_KINDS.into_iter().chain(PLAN_WATCH_KINDS) {
             state.connected(kind, "1");
         }
         for object in objects {
-            if let Some(kind) = object["kind"]
-                .as_str()
-                .filter(|kind| RUNTIME_WATCH_KINDS.contains(kind))
-            {
+            if let Some(kind) = object["kind"].as_str().filter(|kind| watched(kind)) {
                 state.observe(kind, object, false);
             }
         }
@@ -731,7 +842,7 @@ impl Kubernetes {
         kind: &str,
         events: tokio::sync::mpsc::Sender<Trigger>,
     ) -> Result<(), Error> {
-        if !RUNTIME_WATCH_KINDS.contains(&kind) {
+        if !watched(kind) {
             return Err("unsupported controller watch".into());
         }
         let _guard = WatchGuard {
@@ -1028,7 +1139,54 @@ impl Kubernetes {
         {
             return Err("Kubernetes read identity changed".into());
         }
+        self.continuity.lock().unwrap().remember(
+            kind,
+            namespace.unwrap_or(""),
+            name,
+            value.as_ref(),
+        );
         Ok(value)
+    }
+    /// Reads one object unless the watch proves it unchanged since the controller last read or
+    /// wrote it, and then answers that, without a request. For the objects a pass judges that the
+    /// watch follows (a version it still holds is the newest there is, up to the time an event
+    /// takes) and never for the read that proves a thing is still as it was at an instant: those
+    /// are `read`. A read that is made is as `read` makes it.
+    pub async fn read_known(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Value>, Error> {
+        self.known(kind, namespace, name, false).await
+    }
+    /// `read_known` whose read, if one is made, is as `read_cached` makes it.
+    pub async fn read_known_cached(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Value>, Error> {
+        self.known(kind, namespace, name, true).await
+    }
+    async fn known(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        cached: bool,
+    ) -> Result<Option<Value>, Error> {
+        named(kind, namespace, name)?;
+        let recalled = self
+            .continuity
+            .lock()
+            .unwrap()
+            .recall(kind, namespace.unwrap_or(""), name);
+        if let Some(found) = recalled {
+            crate::timing::count_hit();
+            return Ok(found);
+        }
+        self.read_with(kind, namespace, name, cached).await
     }
     /// Reads `objects` (kind, namespace, name) a few at a time and answers them in the order they
     /// were asked in. They are independent reads: the answers are as of the same moment only to
@@ -1037,23 +1195,43 @@ impl Kubernetes {
         &self,
         objects: &[(&str, Option<&str>, &str)],
     ) -> Result<Vec<Option<Value>>, Error> {
-        self.read_all_with(objects, false).await
+        self.read_all_with(objects, false, false).await
     }
     /// `read_all` from the watch cache, for objects as `read_cached` allows.
     pub async fn read_all_cached(
         &self,
         objects: &[(&str, Option<&str>, &str)],
     ) -> Result<Vec<Option<Value>>, Error> {
-        self.read_all_with(objects, true).await
+        self.read_all_with(objects, true, false).await
+    }
+    /// `read_all` of objects as `read_known` allows.
+    pub async fn read_all_known(
+        &self,
+        objects: &[(&str, Option<&str>, &str)],
+    ) -> Result<Vec<Option<Value>>, Error> {
+        self.read_all_with(objects, false, true).await
+    }
+    /// `read_all_known` whose reads are as `read_cached` makes them.
+    pub async fn read_all_known_cached(
+        &self,
+        objects: &[(&str, Option<&str>, &str)],
+    ) -> Result<Vec<Option<Value>>, Error> {
+        self.read_all_with(objects, true, true).await
     }
     async fn read_all_with(
         &self,
         objects: &[(&str, Option<&str>, &str)],
         cached: bool,
+        known: bool,
     ) -> Result<Vec<Option<Value>>, Error> {
         let mut answered: Vec<(usize, Option<Value>)> = stream::iter(objects.iter().enumerate())
             .map(|(index, (kind, namespace, name))| async move {
-                Ok::<_, Error>((index, self.read_with(kind, *namespace, name, cached).await?))
+                let object = if known {
+                    self.known(kind, *namespace, name, cached).await?
+                } else {
+                    self.read_with(kind, *namespace, name, cached).await?
+                };
+                Ok::<_, Error>((index, object))
             })
             .buffer_unordered(READ_FANOUT)
             .try_collect()
@@ -1217,7 +1395,11 @@ impl Kubernetes {
         {
             return Err("Kubernetes patched identity changed".into());
         }
-        self.continuity.lock().unwrap().wrote(kind, &result, rv);
+        {
+            let mut state = self.continuity.lock().unwrap();
+            state.wrote(kind, &result, rv);
+            state.remember(kind, ns.unwrap_or(""), name, Some(&result));
+        }
         Ok(result)
     }
     /// Resizes the requests of named containers of a running Pod in place, through the `resize`
@@ -1265,11 +1447,11 @@ impl Kubernetes {
         if text(&result["metadata"], "uid") != uid || !is_object(&result, "Pod", ns, name) {
             return Err("Kubernetes resized identity changed".into());
         }
-        self.continuity.lock().unwrap().wrote(
-            "Pod",
-            &result,
-            text(&pod["metadata"], "resourceVersion"),
-        );
+        {
+            let mut state = self.continuity.lock().unwrap();
+            state.wrote("Pod", &result, text(&pod["metadata"], "resourceVersion"));
+            state.remember("Pod", ns.unwrap_or(""), name, Some(&result));
+        }
         Ok(result)
     }
     pub async fn delete(&self, current: &Value, propagation: &str) -> Result<(), Error> {
@@ -1320,7 +1502,7 @@ impl Kubernetes {
     pub async fn assert_cluster(&self, uid: &str) -> Result<(), Error> {
         // The UID of a Namespace never changes: any version of it says which cluster this is.
         let cluster = self
-            .read_cached("Namespace", None, "kube-system")
+            .read_known_cached("Namespace", None, "kube-system")
             .await?
             .ok_or("cluster identity missing")?;
         if uid.is_empty() || text(&cluster["metadata"], "uid") != uid {
@@ -1766,6 +1948,111 @@ mod tests {
             "a cached list is the whole list of the cache: {}",
             queries[5]
         );
+    }
+    #[tokio::test]
+    async fn an_object_the_watch_holds_at_the_version_that_was_read_is_not_read_again() {
+        // What a pass read and the watch has not seen change since is the object as it stands: the
+        // watch delivers every change of it, so a version it still holds is the object's newest.
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"one","namespace":"pgcf-system","uid":uid(1)},"data":{"a":"1"}}));
+        server.watch();
+        let asked = |server: &Server| server.state.lock().unwrap().requests.len();
+        let from = asked(&server);
+        let first = server
+            .k8s
+            .read_known("ConfigMap", Some("pgcf-system"), "one")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asked(&server) - from, 1, "nothing was known of it yet");
+        let again = server
+            .k8s
+            .read_known_cached("ConfigMap", Some("pgcf-system"), "one")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(
+            asked(&server) - from,
+            1,
+            "the watch still holds that version"
+        );
+        // Someone else writes it: the watch holds another version, and the object is read.
+        server.external_write("ConfigMap", Some("pgcf-system"), "one", |map| {
+            map["data"]["a"] = "2".into();
+        });
+        let changed = server
+            .k8s
+            .read_known("ConfigMap", Some("pgcf-system"), "one")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed["data"]["a"], "2");
+        assert_eq!(asked(&server) - from, 2);
+        // A write of the controller's own leaves the object as the server answered it.
+        let written = server
+            .k8s
+            .patch(&changed, &serde_json::json!({"data":{"a":"3"}}))
+            .await
+            .unwrap();
+        let known = server
+            .k8s
+            .read_known("ConfigMap", Some("pgcf-system"), "one")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(known, written);
+        assert_eq!(asked(&server) - from, 3, "only the patch was asked");
+    }
+    #[tokio::test]
+    async fn an_object_is_read_whenever_the_watch_cannot_vouch_for_what_was_read() {
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"one","namespace":"pgcf-system","uid":uid(1)},"data":{}}));
+        let asked = |server: &Server| server.state.lock().unwrap().requests.len();
+        let read = |server: &Server| {
+            let k8s = server.k8s.clone();
+            async move {
+                k8s.read_known("ConfigMap", Some("pgcf-system"), "one")
+                    .await
+            }
+        };
+        // No watch: every read is a read.
+        let from = asked(&server);
+        read(&server).await.unwrap();
+        read(&server).await.unwrap();
+        assert_eq!(asked(&server) - from, 2);
+        // A watch that holds the kind vouches for what was read before it began, until it has a
+        // gap.
+        server.watch();
+        read(&server).await.unwrap();
+        read(&server).await.unwrap();
+        assert_eq!(asked(&server) - from, 2);
+        server.k8s.continuity.lock().unwrap().gap("ConfigMap");
+        read(&server).await.unwrap();
+        assert_eq!(
+            asked(&server) - from,
+            3,
+            "a kind without a live watch is read"
+        );
+        // What was found to be absent stays absent while the watch holds the kind and does not
+        // hold the object; the object appearing is a change like any other.
+        server.watch();
+        let missing = |server: &Server| {
+            let k8s = server.k8s.clone();
+            async move {
+                k8s.read_known("ConfigMap", Some("pgcf-system"), "two")
+                    .await
+            }
+        };
+        assert!(missing(&server).await.unwrap().is_none());
+        let before = asked(&server);
+        assert!(missing(&server).await.unwrap().is_none());
+        assert_eq!(asked(&server), before, "absence is remembered");
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"two","namespace":"pgcf-system","uid":uid(2)},"data":{}}));
+        assert!(missing(&server).await.unwrap().is_some());
+        assert_eq!(asked(&server), before + 1);
     }
     #[tokio::test]
     async fn the_event_of_a_version_the_controller_wrote_hints_nothing_and_any_other_does() {

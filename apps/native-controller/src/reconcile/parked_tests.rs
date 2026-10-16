@@ -901,6 +901,16 @@ async fn a_completed_wake_leaves_the_cluster_quiet_until_something_else_changes(
     }
 }
 
+/// The periodic pass over a parked database, as the controller makes it about once a minute: it
+/// judges the retained Pod and leaves in memory what it read for the wake to find.
+async fn periodic_pass(w: &World) {
+    let observed = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+    assert_eq!(
+        observed.expect("an observation")["power"]["parked"]["wake"],
+        "fast"
+    );
+}
+
 /// The requests the controller made since `from`, as (reads, writes).
 fn requests_since(w: &World, from: usize) -> (usize, usize) {
     let state = w.server.state.lock().unwrap();
@@ -917,18 +927,19 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     // sits there: a change that adds one changes these numbers.
     let mut w = World::parked().await;
     w.admitted();
+    periodic_pass(&w).await;
     w.wake(3);
     w.start_postgres().await;
     let at = w.server.state.lock().unwrap().requests.len();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
-    assert_eq!(requests_since(&w, at), (100, 19), "the wake");
+    assert_eq!(requests_since(&w, at), (12, 19), "the wake");
     let _ = w.watch_delivers();
     w.kubelet_ready_now()();
     let at = w.server.state.lock().unwrap().requests.len();
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
-    assert_eq!(requests_since(&w, at), (83, 0), "the pass after it");
+    assert_eq!(requests_since(&w, at), (11, 0), "the pass after it");
 }
 
 /// The sequential rounds of Kubernetes requests the controller made since the double's counter
@@ -945,6 +956,7 @@ async fn a_parked_wake_makes_this_many_requests_in_this_many_rounds() {
     // round is the unknown of a live run.
     let mut w = World::parked().await;
     w.admitted();
+    periodic_pass(&w).await;
     w.wake(3);
     w.start_postgres().await;
     {
@@ -961,9 +973,134 @@ async fn a_parked_wake_makes_this_many_requests_in_this_many_rounds() {
     eprintln!("a parked wake: {reads} reads, {writes} writes, {rounds} sequential rounds");
     assert_eq!(
         (reads, writes, rounds),
-        (100, 19, 41),
+        (12, 19, 16),
         "reads, writes, rounds"
     );
+}
+
+#[tokio::test]
+async fn a_wake_of_a_pod_and_manifests_the_watch_proves_unchanged_reads_nothing_before_the_unfence()
+{
+    // The parked passes of the sleep read the Pod and every object the wake judges it by; the
+    // watch has seen none of them change since. The wake does not read them again, and its first
+    // request is the wave of writes that starts PostgreSQL.
+    let mut w = World::parked().await;
+    w.admitted();
+    periodic_pass(&w).await;
+    w.wake(3);
+    w.start_postgres().await;
+    let at = w.mark();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let made = w.made(at);
+    let first_write = made
+        .iter()
+        .position(|(method, ..)| method != "GET")
+        .expect("the wake writes");
+    let before: Vec<_> = made[..first_write]
+        .iter()
+        .map(|(method, path, _)| format!("{method} {path}"))
+        .collect();
+    assert!(before.is_empty(), "read before the unfence: {before:#?}");
+    // And that first request is the Cluster's CAS patch that lifts the fence, in a wave with the
+    // record of the wake and the resize.
+    let wave: Vec<_> = made[..3].iter().map(|(_, path, _)| path.clone()).collect();
+    assert!(
+        wave.contains(&fence_path(&w)) && wave.contains(&cluster_path(&w)),
+        "{wave:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_object_that_changed_since_it_was_read_is_read_again_and_judged_as_before() {
+    // The role Secret was rotated while the database slept: the watch holds another version of it
+    // than the one the parked passes read, so it is read, and it no longer is what the Pod was
+    // parked with. That is the slow path, exactly as before.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    w.server
+        .external_write("Secret", Some(&w.ns), "role-app", |secret| {
+            secret["data"]["password"] = "cm90YXRlZA==".into();
+        });
+    let at = w.mark();
+    let observed = reconcile(&w).await;
+    let made = w.made(at);
+    assert!(
+        made.iter()
+            .any(|(method, path, _)| method == "GET" && path.ends_with("/secrets/role-app")),
+        "the changed Secret was not read: {made:?}"
+    );
+    assert_ne!(observed["state"], "ready", "{observed}");
+    let hibernated = w.server.get("Cluster", Some(&w.ns), "database").unwrap()["metadata"]["annotations"]
+        [HIBERNATION]
+        == "on";
+    assert!(hibernated, "the Pod was not demoted");
+}
+
+#[tokio::test]
+async fn a_watch_that_has_a_gap_is_no_reason_to_trust_what_was_read() {
+    // The watch of ConfigMaps ended; what the controller read of them says nothing of the cluster
+    // now. The receipt and the fence are read, and the wake goes on as it always did. (The double
+    // delivers a watch again at its next write, so only the reads before it are the point.)
+    let mut w = World::parked().await;
+    w.admitted();
+    periodic_pass(&w).await;
+    w.wake(3);
+    w.start_postgres().await;
+    w.server.k8s.watch_ends("ConfigMap");
+    let at = w.mark();
+    let observed = reconcile(&w).await;
+    assert_ne!(observed["state"], "error", "{observed}");
+    let made = w.made(at);
+    let reads: Vec<_> = made
+        .iter()
+        .filter(|(method, path, _)| method == "GET" && path.contains("/configmaps/"))
+        .map(|(_, path, _)| path.as_str())
+        .collect();
+    assert!(
+        reads
+            .iter()
+            .any(|path| path.ends_with(&format!("/storage-{}", w.id)))
+            && reads
+                .iter()
+                .any(|path| path.ends_with(&format!("/gateway-fence-{}", w.id))),
+        "{reads:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cluster_that_changed_where_the_watch_has_not_yet_seen_it_is_read_again_by_the_unfence() {
+    // The memory holds the Cluster as the watch last saw it; CNPG wrote its status a moment ago and
+    // the event is on its way. The patch carries the version it was made over, the API server
+    // refuses it, and the wake reads the Cluster once more and lifts the fence over what it finds.
+    let mut w = World::parked().await;
+    w.admitted();
+    periodic_pass(&w).await;
+    w.wake(3);
+    w.start_postgres().await;
+    w.server
+        .external_write_unseen("Cluster", Some(&w.ns), "database", |cluster| {
+            cluster["status"]["readyInstances"] = 0.into();
+        });
+    let at = w.mark();
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let made = w.made(at);
+    let cluster = cluster_path(&w);
+    let mine: Vec<_> = made
+        .iter()
+        .filter(|(_, path, _)| *path == cluster)
+        .map(|(method, ..)| method.as_str())
+        .take(3)
+        .collect();
+    assert_eq!(
+        mine,
+        ["PATCH", "GET", "PATCH"],
+        "refused, read again, lifted: {made:?}"
+    );
+    assert!(annotations(&w)["cnpg.io/fencedInstances"].is_null());
 }
 
 #[tokio::test]
@@ -972,6 +1109,7 @@ async fn the_volume_is_read_by_the_handle_its_receipt_recorded_and_never_listed(
     // LVMVolume of the cluster to find its own two.
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
     let at = w.server.state.lock().unwrap().requests.len();
@@ -1061,6 +1199,7 @@ async fn the_cluster_is_asserted_once_per_pass() {
     let cluster = path("Namespace", None, "kube-system");
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
     let at = w.server.state.lock().unwrap().requests.len();
@@ -1209,6 +1348,7 @@ async fn a_missing_object_is_created_after_the_ones_before_it_as_always() {
 async fn the_proof_reads_the_resources_it_names_back_together() {
     let mut w = World::running().await;
     w.admitted();
+    w.cold();
     let start = w.reconciler.k8s.runtime_continuity().expect("a watch");
     let get = |kind: &str, namespace: Option<&str>, name: &str| {
         w.server.get(kind, namespace, name).expect(name)
@@ -1283,6 +1423,7 @@ async fn the_target_is_published_after_every_gateway_acknowledged_and_with_the_r
     // target, needs nothing of the other and is issued together.
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
     let fence = path(
@@ -1351,6 +1492,7 @@ async fn a_database_without_an_origin_operation_still_has_its_new_target_publish
 async fn completed() -> (World, Value) {
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
     let woken = reconcile(&w).await;
@@ -1390,6 +1532,7 @@ async fn a_pass_reads_what_it_needs_of_the_database_together_before_it_judges_an
     // database: none depends on another, and the pass judges them in the order it always did.
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
     let wanted = [
@@ -1637,6 +1780,7 @@ async fn postgresql_is_asked_from_the_unfence_on_and_not_after_the_apply_pass() 
 async fn the_wake_reads_the_anchor_with_the_fence_it_looks_at() {
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
     let cluster = w.server.get("Cluster", Some(&w.ns), "database");

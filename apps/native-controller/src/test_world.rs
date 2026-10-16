@@ -664,6 +664,11 @@ impl World {
         world.suspend_idle();
         world
     }
+    /// The controller reads every object it needs, as it does when the watch cannot vouch for any
+    /// of them: for the tests that pin how those reads are made.
+    pub fn cold(&self) {
+        self.server.k8s.recall_nothing();
+    }
     /// How many requests the Kubernetes double has received so far: where `made` starts from.
     pub fn mark(&self) -> usize {
         self.server.state.lock().unwrap().requests.len()

@@ -770,9 +770,10 @@ impl PowerCoordinator {
         let ns = namespace(db);
         let storage_name = format!("storage-{id}");
         let (ns_value, cluster_value, storage_value) = tokio::try_join!(
-            self.k8s.read("Namespace", None, &ns),
-            self.k8s.read("Cluster", Some(&ns), "database"),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &storage_name),
+            self.k8s.read_known("Namespace", None, &ns),
+            self.k8s.read_known("Cluster", Some(&ns), "database"),
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &storage_name),
         )?;
         let ns_value = owned(ns_value, &ns, id, None, false)?;
         let cluster = owned(cluster_value, "database", id, Some(&ns), false)?;
@@ -816,13 +817,11 @@ impl PowerCoordinator {
         let (node, volume, lvm) = tokio::try_join!(
             async {
                 match &storage_profile {
-                    Some(_) => self.k8s.read_cached("Node", None, text(db, "node")).await,
-                    None => Ok(None),
-                }
-            },
-            async {
-                match &recorded {
-                    Some(handle) => self.k8s.read_cached("PersistentVolume", None, handle).await,
+                    Some(_) => {
+                        self.k8s
+                            .read_known_cached("Node", None, text(db, "node"))
+                            .await
+                    }
                     None => Ok(None),
                 }
             },
@@ -830,7 +829,17 @@ impl PowerCoordinator {
                 match &recorded {
                     Some(handle) => {
                         self.k8s
-                            .read_cached("LVMVolume", Some(OPENEBS), handle)
+                            .read_known_cached("PersistentVolume", None, handle)
+                            .await
+                    }
+                    None => Ok(None),
+                }
+            },
+            async {
+                match &recorded {
+                    Some(handle) => {
+                        self.k8s
+                            .read_known_cached("LVMVolume", Some(OPENEBS), handle)
                             .await
                     }
                     None => Ok(None),
@@ -881,7 +890,7 @@ impl PowerCoordinator {
         }
         let claim = self
             .k8s
-            .read_cached("PersistentVolumeClaim", Some(&ns), claim_name)
+            .read_known_cached("PersistentVolumeClaim", Some(&ns), claim_name)
             .await?
             .ok_or(Fault::Recovery("persistent_claim_missing_or_replaced"))?;
         if claim["metadata"]["uid"] != identity["claimUid"]
@@ -932,8 +941,9 @@ impl PowerCoordinator {
         let name = format!("gateway-fence-{id}");
         let storage_name = format!("storage-{id}");
         let (map, storage) = tokio::try_join!(
-            self.k8s.read("ConfigMap", Some(SYSTEM), &name),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &storage_name)
+            self.k8s.read_known("ConfigMap", Some(SYSTEM), &name),
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &storage_name)
         )?;
         if let Some(expected) = storage
             .as_ref()
@@ -1025,7 +1035,9 @@ impl PowerCoordinator {
         let id = text(db, "id");
         let name = format!("storage-{id}");
         let storage = owned(
-            self.k8s.read("ConfigMap", Some(SYSTEM), &name).await?,
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &name)
+                .await?,
             &name,
             id,
             Some(SYSTEM),
@@ -1106,7 +1118,7 @@ impl PowerCoordinator {
     async fn keyring(&self) -> Result<(String, HashMap<String, Vec<u8>>, String, String)> {
         let secret = self
             .k8s
-            .read("Secret", Some(SYSTEM), "pgcf-gateway")
+            .read_known("Secret", Some(SYSTEM), "pgcf-gateway")
             .await?
             .ok_or(Fault::Unavailable("regional_keyring_missing"))?;
         if secret["metadata"]["name"] != "pgcf-gateway"
@@ -3490,7 +3502,11 @@ impl PowerCoordinator {
         }
         let id = text(db, "id");
         let name = format!("storage-{id}");
-        let Some(storage) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+        let Some(storage) = self
+            .k8s
+            .read_known("ConfigMap", Some(SYSTEM), &name)
+            .await?
+        else {
             return Ok(false);
         };
         let storage = owned(Some(storage), &name, id, Some(SYSTEM), false)?;
@@ -3508,7 +3524,9 @@ impl PowerCoordinator {
         let id = text(db, "id");
         let name = format!("storage-{id}");
         let storage = owned(
-            self.k8s.read("ConfigMap", Some(SYSTEM), &name).await?,
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &name)
+                .await?,
             &name,
             id,
             Some(SYSTEM),

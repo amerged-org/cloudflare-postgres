@@ -8,10 +8,16 @@ use std::{cell::Cell, time::Instant};
 tokio::task_local! {
     /// Kubernetes calls of the reconcile pass running in this task.
     static CALLS: Cell<u64>;
+    /// Reads of the pass running in this task that the watch answered, without a call.
+    static HITS: Cell<u64>;
 }
 /// Counts one Kubernetes API call for the pass running in the current task, if any.
 pub(crate) fn count_call() {
     let _ = CALLS.try_with(|calls| calls.set(calls.get() + 1));
+}
+/// Counts one read answered from what the watch proves, for the pass running in the current task.
+pub(crate) fn count_hit() {
+    let _ = HITS.try_with(|hits| hits.set(hits.get() + 1));
 }
 fn wall_clock_ms() -> u64 {
     u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
@@ -108,16 +114,19 @@ impl Drop for Phase {
 /// summary event of a waking database.
 async fn counted<F: std::future::Future>(db: &Value, work: F) -> (F::Output, Option<Value>) {
     let started = Instant::now();
-    CALLS
-        .scope(Cell::new(0), async {
+    HITS.scope(
+        Cell::new(0),
+        CALLS.scope(Cell::new(0), async {
             let output = work.await;
             let summary = waking(db).then(|| {
                 let calls = CALLS.try_with(Cell::get).unwrap_or(0);
-                json!({"event":"reconcile_summary","database_id":db["id"],"operation":db["power"]["operation"],"calls":calls,"elapsedMs":elapsed_ms(started),"at_ms":wall_clock_ms()})
+                let hits = HITS.try_with(Cell::get).unwrap_or(0);
+                json!({"event":"reconcile_summary","database_id":db["id"],"operation":db["power"]["operation"],"calls":calls,"memo_hits":hits,"elapsedMs":elapsed_ms(started),"at_ms":wall_clock_ms()})
             });
             (output, summary)
-        })
-        .await
+        }),
+    )
+    .await
 }
 /// Runs one reconcile pass of `db`, counting its Kubernetes calls, and reports them with its
 /// duration when the database is waking.

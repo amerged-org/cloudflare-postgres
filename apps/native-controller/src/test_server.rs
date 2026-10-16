@@ -674,16 +674,25 @@ impl Server {
         }
     }
     /// Stores an object at the exact path the client derives from its kind, namespace and name.
+    /// The object that was there, if it is the same one (the same UID), is changed to the next
+    /// version, as every write changes it; another object starts at version 1.
     pub fn put(&self, mut value: Value) {
-        if value["metadata"]["resourceVersion"].is_null() {
-            value["metadata"]["resourceVersion"] = "1".into();
-        }
         let key = path(
             value["kind"].as_str().unwrap(),
             value["metadata"]["namespace"].as_str(),
             value["metadata"]["name"].as_str().unwrap(),
         );
         let mut state = self.state.lock().unwrap();
+        if value["metadata"]["resourceVersion"].is_null() {
+            match state.objects.get(&key) {
+                Some(before) if before["metadata"]["uid"] == value["metadata"]["uid"] => {
+                    value["metadata"]["resourceVersion"] =
+                        before["metadata"]["resourceVersion"].clone();
+                    advance(&mut value);
+                }
+                _ => value["metadata"]["resourceVersion"] = "1".into(),
+            }
+        }
         state.objects.insert(key, value);
         state.sync();
     }
@@ -712,6 +721,20 @@ impl Server {
         queue_event(&mut state, "MODIFIED", &object);
         state.sync();
     }
+    /// A write by someone else whose event the controller's watch has not delivered yet: the
+    /// object is at its next version, and the watch still holds the one before.
+    pub fn external_write_unseen(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        edit: impl FnOnce(&mut Value),
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let object = state.objects.get_mut(&path(kind, namespace, name)).unwrap();
+        edit(object);
+        advance(object);
+    }
     pub fn get(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<Value> {
         self.state
             .lock()
@@ -728,7 +751,9 @@ impl Server {
         edit: impl FnOnce(&mut Value),
     ) {
         let mut state = self.state.lock().unwrap();
-        edit(state.objects.get_mut(&path(kind, namespace, name)).unwrap());
+        let object = state.objects.get_mut(&path(kind, namespace, name)).unwrap();
+        edit(object);
+        advance(object);
         state.sync();
     }
 }

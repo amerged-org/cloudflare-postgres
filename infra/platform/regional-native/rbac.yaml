@@ -33,3 +33,43 @@
     apiGroups: [""]
     resources: [pods/resize]
     verbs: [patch]
+
+# The wake of a parked database proves the objects of its Pod unchanged by metadata-only watches
+# of them, as it does the runtime objects above, instead of reading each of them again. The base
+# role lists and reads these kinds already.
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [""]
+    resources: [resourcequotas, limitranges]
+    verbs: [watch]
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [watch]
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [cilium.io]
+    resources: [ciliumnetworkpolicies]
+    verbs: [watch]
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [postgresql.cnpg.io]
+    resources: [scheduledbackups]
+    verbs: [watch]
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores]
+    verbs: [watch]
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [local.openebs.io]
+    resources: [lvmvolumes]
+    verbs: [watch]

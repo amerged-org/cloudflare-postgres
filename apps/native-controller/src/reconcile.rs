@@ -514,7 +514,7 @@ pub async fn write_ledger(
     decided: Option<u64>,
 ) -> Result<bool, Error> {
     let name = format!("storage-{}", text(db, "id"));
-    let Some(map) = k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+    let Some(map) = k8s.read_known("ConfigMap", Some(SYSTEM), &name).await? else {
         return Ok(false);
     };
     owned(&map, db, &name, Some(SYSTEM))?;
@@ -745,7 +745,7 @@ impl Reconciler {
         // The volume is derived while the receipt it is recorded in is read.
         let (identity, current) = tokio::try_join!(
             self.volume(db, cluster, pod, authority),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &name)
+            self.k8s.read_known("ConfigMap", Some(SYSTEM), &name)
         )?;
         let Some(identity) = identity else {
             return Ok(None);
@@ -788,7 +788,7 @@ impl Reconciler {
         }
         let Some(claim) = self
             .k8s
-            .read("PersistentVolumeClaim", Some(&ns), claim_name)
+            .read_known("PersistentVolumeClaim", Some(&ns), claim_name)
             .await?
         else {
             return Ok(None);
@@ -810,7 +810,7 @@ impl Reconciler {
             return Ok(None);
         }
         let name = text(&claim["spec"], "volumeName");
-        let Some(pv) = self.k8s.read("PersistentVolume", None, name).await? else {
+        let Some(pv) = self.k8s.read_known("PersistentVolume", None, name).await? else {
             return Ok(None);
         };
         if pv["spec"]["claimRef"]["uid"] != claim["metadata"]["uid"]
@@ -1064,7 +1064,7 @@ impl Reconciler {
         let socket = self.power.pod_socket(&ip).ok()?;
         Some(Accepting(tokio::spawn(async move {
             let secret = k8s
-                .read("Secret", Some(&ns), &name)
+                .read_known("Secret", Some(&ns), &name)
                 .await?
                 .ok_or("CNPG CA secret disappeared")?;
             let ca = ca_bytes(&secret, &cluster)?;
@@ -1115,7 +1115,7 @@ impl Reconciler {
         // Pod does not depend on the label of its namespace.
         let (labelled, pod) = tokio::join!(self.runtime_label(db, context, namespace_uid), async {
             if dns_label(primary) {
-                self.k8s.read("Pod", Some(&ns), primary).await
+                self.k8s.read_known("Pod", Some(&ns), primary).await
             } else {
                 Ok(None)
             }
@@ -1188,7 +1188,7 @@ impl Reconciler {
         };
         let current = self
             .k8s
-            .read("Namespace", None, &ns)
+            .read_known("Namespace", None, &ns)
             .await?
             .ok_or("database namespace missing")?;
         owned(&current, db, &ns, None)?;
@@ -1310,10 +1310,10 @@ impl Reconciler {
         let deletion = format!("delete-{id}");
         let (guarded, retired, ns_read, fence_read, cluster_read) = tokio::join!(
             self.guard(db, snapshot, state_name == "running"),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &deletion),
-            self.k8s.read("Namespace", None, &ns),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &fence_name),
-            self.k8s.read("Cluster", Some(&ns), "database"),
+            self.k8s.read_known("ConfigMap", Some(SYSTEM), &deletion),
+            self.k8s.read_known("Namespace", None, &ns),
+            self.k8s.read_known("ConfigMap", Some(SYSTEM), &fence_name),
+            self.k8s.read_known("Cluster", Some(&ns), "database"),
         );
         let (authority, node_observed) = match guarded {
             Ok(value) => value,
@@ -1559,7 +1559,7 @@ impl Reconciler {
             .collect();
         let mut current: std::collections::HashMap<usize, Option<Value>> = ahead
             .into_iter()
-            .zip(self.k8s.read_all(&refs).await?)
+            .zip(self.k8s.read_all_known(&refs).await?)
             .collect();
         let binding: Vec<Option<Value>> = (0..cluster_at)
             .map(|index| current.remove(&index).flatten())
@@ -1587,7 +1587,9 @@ impl Reconciler {
                 Some(read) => read,
                 None => {
                     let (kind, namespace, name) = identity(manifest);
-                    self.k8s.read(&kind, namespace.as_deref(), &name).await?
+                    self.k8s
+                        .read_known(&kind, namespace.as_deref(), &name)
+                        .await?
                 }
             };
             let actual = self.apply_to(db, manifest, read).await?;
@@ -1605,7 +1607,11 @@ impl Reconciler {
         self.renew_storage_authority(db, integer(&authority, "revision").ok())
             .await?;
         apply_phase.completed();
-        let Some(cluster) = self.k8s.read("Cluster", Some(&ns), "database").await? else {
+        let Some(cluster) = self
+            .k8s
+            .read_known("Cluster", Some(&ns), "database")
+            .await?
+        else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
         owned(&cluster, db, "database", Some(&ns))?;
@@ -1675,7 +1681,7 @@ impl Reconciler {
         if primary.is_empty() {
             return Ok(Some(observation(db, "provisioning", None)));
         }
-        let Some(pod) = self.k8s.read("Pod", Some(&ns), primary).await? else {
+        let Some(pod) = self.k8s.read_known("Pod", Some(&ns), primary).await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
         self.power.kubelet_ready(db, &pod);
@@ -1793,7 +1799,7 @@ impl Reconciler {
             Some(ns.as_str()),
             text(&ca_secret["metadata"], "name"),
         ));
-        let mut fresh_all = self.k8s.read_all(&asked).await?;
+        let mut fresh_all = self.k8s.read_all_known(&asked).await?;
         let current_ca = fresh_all.pop().flatten();
         for (actual, fresh) in applied.iter().zip(fresh_all) {
             let Some(fresh) = fresh else {
@@ -1876,7 +1882,7 @@ impl Reconciler {
         }
         let mut final_ns = self
             .k8s
-            .read("Namespace", None, &ns)
+            .read_known("Namespace", None, &ns)
             .await?
             .ok_or("Namespace disappeared before readiness")?;
         if final_ns["metadata"]["uid"] != namespace_value["metadata"]["uid"]
@@ -1993,15 +1999,20 @@ impl Reconciler {
         }
         Ok(result)
     }
-    /// The object `resource` names, read again.
+    /// The object `resource` names, read again: from etcd for the Pod and the Cluster, whose
+    /// status changes while a proof is formed, and as the watch proves it for the objects that
+    /// only change when someone writes them.
     async fn reread(&self, resource: &Value) -> Result<Option<Value>, Error> {
-        self.k8s
-            .read(
-                text(resource, "kind"),
-                resource["metadata"]["namespace"].as_str(),
-                text(&resource["metadata"], "name"),
-            )
-            .await
+        let (kind, namespace, name) = (
+            text(resource, "kind"),
+            resource["metadata"]["namespace"].as_str(),
+            text(&resource["metadata"], "name"),
+        );
+        if matches!(kind, "Pod" | "Cluster") {
+            self.k8s.read(kind, namespace, name).await
+        } else {
+            self.k8s.read_known(kind, namespace, name).await
+        }
     }
     async fn runtime_readback(
         &self,
@@ -2025,8 +2036,9 @@ impl Reconciler {
         // once more; then that volume again. Each is read again after it was first read.
         let (claim, storage, namespace_now, cluster_now, pod_now, ca_now, node_now) = tokio::try_join!(
             self.k8s
-                .read("PersistentVolumeClaim", Some(&ns), claim_name),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &storage_name),
+                .read_known("PersistentVolumeClaim", Some(&ns), claim_name),
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &storage_name),
             self.reread(namespace),
             self.reread(cluster),
             self.reread(pod),
@@ -2037,7 +2049,7 @@ impl Reconciler {
         let storage = storage.ok_or("runtime storage receipt missing")?;
         let volume_name = text(&claim["spec"], "volumeName");
         let (pv, claim_now, storage_now) = tokio::try_join!(
-            self.k8s.read("PersistentVolume", None, volume_name),
+            self.k8s.read_known("PersistentVolume", None, volume_name),
             self.reread(&claim),
             self.reread(&storage),
         )?;
@@ -2124,7 +2136,7 @@ impl Reconciler {
             .ok_or("database node has no immutable fleet assignment")?;
         let node = self
             .k8s
-            .read("Node", None, text(db, "node"))
+            .read_known("Node", None, text(db, "node"))
             .await?
             .ok_or("database node disappeared")?;
         if text(assigned, "role") != "customer"
@@ -2269,7 +2281,7 @@ impl Reconciler {
         // The shared backup credential is written by no pass of the controller.
         let secret = self
             .k8s
-            .read_cached("Secret", Some(SYSTEM), "pgcf-backup-s3")
+            .read_known_cached("Secret", Some(SYSTEM), "pgcf-backup-s3")
             .await?
             .ok_or("regional backup credentials missing")?;
         let decode = |name: &str| -> Result<String, Error> {
@@ -2321,7 +2333,7 @@ impl Reconciler {
                 .read_cached("MutatingAdmissionPolicy", None, ADMISSION),
             self.k8s
                 .read_cached("MutatingAdmissionPolicyBinding", None, ADMISSION),
-            self.k8s.read_cached("Node", None, text(db, "node"))
+            self.k8s.read_known_cached("Node", None, text(db, "node"))
         )?;
         let profile = class.as_ref().map_or("", |class| {
             text(
@@ -2371,8 +2383,9 @@ impl Reconciler {
         // The authority is read while the ConfigMap it is published in is.
         let published_name = format!("ca-{}", text(db, "id"));
         let (secret, published) = tokio::try_join!(
-            self.k8s.read("Secret", Some(&ns), name),
-            self.k8s.read("ConfigMap", Some(SYSTEM), &published_name)
+            self.k8s.read_known("Secret", Some(&ns), name),
+            self.k8s
+                .read_known("ConfigMap", Some(SYSTEM), &published_name)
         )?;
         let secret = secret.ok_or("CNPG CA secret disappeared")?;
         let ca = ca_bytes(&secret, cluster)?;

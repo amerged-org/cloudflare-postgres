@@ -1466,12 +1466,12 @@ impl PowerCoordinator {
         // Nothing here is patched by the judgement, and the unfence that follows is a patch under
         // the Cluster's own resourceVersion: the watch cache's versions are enough.
         let (pod, current) = tokio::try_join!(
-            self.k8s.read_cached("Pod", Some(&ns), &park.pod_name),
+            self.k8s.read_known_cached("Pod", Some(&ns), &park.pod_name),
             try_join_all(
                 manifests
                     .iter()
                     .filter(|m| text(m, "kind") != "Namespace")
-                    .map(|m| self.k8s.read_cached(
+                    .map(|m| self.k8s.read_known_cached(
                         text(m, "kind"),
                         m["metadata"]["namespace"].as_str(),
                         text(&m["metadata"], "name"),
