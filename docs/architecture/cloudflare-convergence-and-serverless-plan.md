@@ -176,6 +176,17 @@ Tried and reverted: constraining the NodeBootstrap container to `WEUR` (`contain
 made the identity turn slower (20.9 to 22.3 s, 7 turns, against 17.9 to 18.8 s in the default placement), so
 the 18 s is not distance to the container; the floor of a turn is its four sequential relay steps.
 
+**Measured on R2.20 (2026-10-16, route token v4, runtime attestation v2 and the admission snapshot live for the first
+time, controller `cd63a0b`; parked Thin database from a Cloudflare Worker):** create to ready 145.9 s with the
+pool initialised (28 s with the pool present; the 83 s of R2.17 was the missing CA), first SQL 0.72 s, awake
+first query 0.74–0.84 s, base backup and WAL in R2. Parked first query in six rounds: 1.35 s, 1.73 s, 2.11 s,
+2.52 s, 2.54 s, 3.13 s (p50 2.5 s), no failure and no stall; `wake_path` now says `lean: true`, so a parked
+wake is published on the barrier without waiting for the kubelet; from the pull to the released fence the
+node takes 0.19 s. What is left of the wake is Cloudflare time: the Edge's `ensure_awake_ms` 1.4–1.6 s (claim
+and hint 0.49 s, pull 0.2–0.5 s, the controller's chain, the observation POST 0.3 s) and 0.6–1.2 s before the
+hint reaches the controller (Worker start, TLS and upgrade). W2 (the desired row on the hint) takes the pull
+off the path; W3 (local admission) the POST.
+
 **Language.** It is not what limits the wake. A parked wake issues about 100–145 Kubernetes requests,
 which cost 11–14 ms of CPU in Rust, 22 ms in Go and 28 ms in Node on a laptop (at most 3–5 % of
 0.8–1.9 s); Xata's Go gateway and operators show the same 1.1–1.25 s mode as PGCF's projection, and
