@@ -140,8 +140,13 @@ export async function thinLeaseNode(f: Fixture) {
               observed_at: iso(now),
             })
           : null,
+      // Deleted an hour before its absence was read, or a day before now when it was not.
       deleted_at: deleted
-        ? new Date(now - 60 * 60_000 * 24).toISOString()
+        ? new Date(
+            spec.confirmed
+              ? Date.parse(confirmedAt) - 60 * 60_000
+              : now - 24 * 60 * 60_000,
+          ).toISOString()
         : null,
       updated_at: deleted && spec.confirmed ? confirmedAt : iso(now),
     };

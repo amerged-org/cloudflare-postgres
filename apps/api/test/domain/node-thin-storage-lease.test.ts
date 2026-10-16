@@ -10,6 +10,7 @@ import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
 import { claimsOf } from "./parked-tier-fixture.ts";
 import { gib, mib, nonce, post, sample } from "./thin-renewal-fixture.ts";
+import { HOST_LEASE_TOMBSTONE_RETENTION_MS } from "../../src/domain/node-thin-storage.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -195,3 +196,83 @@ it("issues the tokens of forty databases with the statements of three", async ()
   expect(large.statements).toBeLessThanOrEqual(SAMPLE_STATEMENT_BOUND);
   expect(large.roundTrips).toBe(small.roundTrips);
 }, 120_000);
+
+it("names a deleted database only while a protective scope of it may still need the entry", async () => {
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  const minute = 60_000,
+    retention = HOST_LEASE_TOMBSTONE_RETENTION_MS;
+  // The volume was read absent just now and a while ago, and one read absent long ago.
+  const fresh = await node.add({
+      kind: "deleted",
+      confirmed: true,
+      confirmedAgo: minute,
+    }),
+    inside = await node.add({
+      kind: "deleted",
+      confirmed: true,
+      confirmedAgo: retention - 5 * minute,
+    }),
+    beyond = await node.add({
+      kind: "deleted",
+      confirmed: true,
+      confirmedAgo: retention + 5 * minute,
+    }),
+    ancient = await node.add({
+      kind: "deleted",
+      confirmed: true,
+      confirmedAgo: 400 * 24 * 60 * minute,
+    });
+  // A deletion the node has not read absent yet keeps its protection, however old it is.
+  const unconfirmed = await node.add({ kind: "deleted", confirmed: false });
+  // A database that never had a volume bound never had a token: no guard holds a scope for it.
+  const neverBound = await node.add({
+      kind: "deleted",
+      confirmed: false,
+      receipt: false,
+    }),
+    neverBoundConfirmed = await node.add({
+      kind: "deleted",
+      confirmed: true,
+      confirmedAgo: minute,
+      receipt: false,
+    });
+  const live = await node.add({ kind: "live" });
+  await node.commit();
+  const entries = await node.leaseEntries();
+  expect([...entries.keys()].sort()).toEqual(
+    [node.held.id, live.id, fresh.id, inside.id, unconfirmed.id].sort(),
+  );
+  // What stays is what the guard retires on: deleted, writable, without a volume.
+  for (const kept of [fresh, inside])
+    expect(entries.get(kept.id)).toMatchObject({
+      desired_state: "deleted",
+      write_blocked: false,
+      volume: null,
+    });
+  expect(entries.get(unconfirmed.id)).toMatchObject({
+    desired_state: "deleted",
+    write_blocked: true,
+    volume: unconfirmed.receipt,
+  });
+  for (const gone of [beyond, ancient, neverBound, neverBoundConfirmed])
+    expect(entries.has(gone.id)).toBe(false);
+}, 60_000);
+
+it("keeps the lease to the live databases and the recent deletions however many were deleted", async () => {
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  for (let i = 0; i < 30; i++) await node.add({ kind: "live" });
+  for (let i = 0; i < 100; i++)
+    await node.add({
+      kind: "deleted",
+      confirmed: true,
+      confirmedAgo: HOST_LEASE_TOMBSTONE_RETENTION_MS + 60_000,
+    });
+  for (let i = 0; i < 4; i++)
+    await node.add({ kind: "deleted", confirmed: true, confirmedAgo: 1000 });
+  await node.commit();
+  const lease = await node.lease();
+  expect(lease.databases).toHaveLength(1 + 30 + 4);
+  expect(
+    lease.databases.filter((entry) => entry.desired_state === "deleted"),
+  ).toHaveLength(4);
+}, 60_000);

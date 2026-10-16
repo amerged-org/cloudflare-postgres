@@ -1152,12 +1152,44 @@ async function poolHostCustody(
     ...(intent ? { cleanup_intent: intent } : {}),
   });
 }
-/** The databases of a node the host guard is told about: every live one, and each deleted one it
- * may still hold a protective scope for. */
-function hostLeaseScope(nodeId: string, regionId: string): DatabaseScope {
+/**
+ * How long a confirmed deletion stays in the lease, counted from the row's last change, which is
+ * the confirmation: the controller's deleted report is accepted only against a fresh absence read.
+ *
+ * The guard forgets a retained signed scope only from an accepted lease that names the database
+ * deleted, writable and without a volume (`retirement_scope`, sandbox-controller storage.rs:500-529)
+ * and acts on it in its next 100 ms supervise tick (storage.rs:878), once the Pod's tasks are
+ * recorded stopped, which `stop_pod_tasks` bounds to well under a second (controller.rs:1025-1080).
+ * It fetches the lease once per cycle of at most the client's 5 s timeout (policy.rs:487) plus a 1 s
+ * sleep (storage.rs:633), and keeps a lease for at most 120 s (storage.rs:196). A guard that is
+ * connected therefore retires on the first lease that says so, within seven seconds, and one that
+ * was cut off for up to a lease's life needs one fetch after it. A longer cut-off has stopped every
+ * Pod already, and when it ends the guard still needs the entry: Cloudflare cannot see the
+ * retirement, so the entry is served for an hour, long enough for a node reboot of a fleet patch and
+ * the confirmation of its new boot, and bounded by the deletions of that hour.
+ */
+export const HOST_LEASE_TOMBSTONE_RETENTION_MS = 60 * 60_000;
+
+/**
+ * The databases of a node the host guard is told about: every live one, and each deleted one a
+ * signed scope of the guard may still exist for. A scope exists only for a database a token was
+ * signed for, which needs a bound volume receipt (`currentWriterContext`), and it ends with the
+ * guard's retirement, which the retention above covers. A deleted database's entry also stays
+ * while its deletion is unconfirmed: it blocks writes and carries the delete drain.
+ */
+function hostLeaseScope(
+  nodeId: string,
+  regionId: string,
+  now: number,
+): DatabaseScope {
   return {
-    sql: "d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR d.storage_profile_json IS NOT NULL)",
-    bindings: [nodeId, regionId],
+    sql: `d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR (d.storage_profile_json IS NOT NULL AND d.storage_volume_json IS NOT NULL
+      AND NOT (d.observed_state='deleted' AND d.observed_generation=d.generation AND julianday(d.updated_at)<julianday(?))))`,
+    bindings: [
+      nodeId,
+      regionId,
+      new Date(now - HOST_LEASE_TOMBSTONE_RETENTION_MS).toISOString(),
+    ],
   };
 }
 type LeaseRow = DatabaseRow & {
@@ -1190,7 +1222,7 @@ export async function hostStorageLease(
     );
   // Every read the lease needs is independent of the others, and none is made per database: the
   // node's reading, one batch for its databases and their inputs, and the pool capability.
-  const scope = hostLeaseScope(id, region.id);
+  const scope = hostLeaseScope(id, region.id, now);
   const [current, read, poolCapable] = await Promise.all([
     readCurrentNodeThinStorage(c.env, id, now),
     readWriterInputs<LeaseRow>(
