@@ -30,8 +30,8 @@ use tokio_tungstenite::{
 
 enum Hint {
     Pull(Option<Vec<String>>),
-    /// A watched database object changed: its database ID and the object kind.
-    Kube(String, &'static str),
+    /// A watched database object changed: its database ID, the object kind and the object's name.
+    Kube(String, &'static str, String),
 }
 struct Cell {
     db: Value,
@@ -51,6 +51,11 @@ struct Cell {
     reattest: bool,
     /// Actual V2 proof expiry is independent of token-only ledger deliveries.
     verification_due: Option<Instant>,
+    /// When the latest pass of the database began: a change of its objects makes the next one due
+    /// no sooner than `HINT_SPACING` after it.
+    started: Option<Instant>,
+    /// When the log last named what hinted the database.
+    hint_logged: Option<Instant>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
@@ -164,6 +169,8 @@ fn apply_snapshot(
                     stalled: 0,
                     reattest: false,
                     verification_due: None,
+                    started: None,
+                    hint_logged: None,
                 },
             );
         }
@@ -527,9 +534,45 @@ fn not_ready_delay(stalled: u32) -> Duration {
 /// ready database may replace its attested primary within the revision; v3 routes to it are
 /// refused until the next ready result re-attests it, so that check is urgent.
 fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
-    cell.due = now;
+    cell.due = cell.due.min(after_change(cell.started, now));
     cell.hints = cell.hints.wrapping_add(1);
     cell.reattest |= kind == "Pod" && cell.ready;
+}
+/// How soon after a pass of a database began another begins because something it looks at
+/// changed. CNPG creating an instance changes the objects of a database a few times a second,
+/// every pass takes some tens of milliseconds, and a pass that follows each change finds nothing
+/// the one before it did not: live that was twenty full passes a second, 800 requests, for ten
+/// seconds. A change after a quiet time is still looked at at once.
+const HINT_SPACING: Duration = Duration::from_millis(500);
+/// The earliest time a change seen at `now` makes the database due, given when its latest pass
+/// `started`.
+fn after_change(started: Option<Instant>, now: Instant) -> Instant {
+    started.map_or(now, |started| (started + HINT_SPACING).max(now))
+}
+/// A pass that began at `started` ran while its database's objects changed, which `marker` was
+/// not yet aware of: it is looked at again, as soon as the spacing allows.
+fn rehint(cell: &mut Cell, started: Instant, marker: u64, now: Instant) {
+    if cell.hints != marker {
+        cell.due = cell.due.min(after_change(Some(started), now));
+    }
+}
+/// The log line of a change of an object of a database that made it due: what changed, by kind
+/// and name, and nothing of it. A database that is looked at again and again for no reason it
+/// shows is named by what keeps changing.
+fn hint_line(database: &str, kind: &str, name: &str) -> Value {
+    json!({"event":"database_hinted","database_id":database,"kind":kind,"name":name})
+}
+/// Whether this change is the one to name in the log: at most one a second of a database, so that
+/// a burst of changes is one line and a change every two seconds is each of them.
+fn hint_to_log(cell: &mut Cell, now: Instant) -> bool {
+    if cell
+        .hint_logged
+        .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
+    {
+        return false;
+    }
+    cell.hint_logged = Some(now);
+    true
 }
 /// The log line of a failed reconcile: the database, its generation and the failure's class. The
 /// failure's text is never logged (see `error_code`).
@@ -911,8 +954,12 @@ async fn run() -> Result<(), Error> {
                     let kube = kube.clone();
                     async move { kube.watch_database_ids(kind, events).await }
                 });
-                while let Some(id) = receive.recv().await {
-                    if hints.send(Hint::Kube(id, kind)).await.is_err() {
+                while let Some(trigger) = receive.recv().await {
+                    if hints
+                        .send(Hint::Kube(trigger.database, kind, trigger.name))
+                        .await
+                        .is_err()
+                    {
                         task.abort();
                         return;
                     }
@@ -1048,9 +1095,13 @@ async fn run() -> Result<(), Error> {
                         }
                         pull_ids.extend(ids);
                     },
-                    Some(Hint::Kube(id, kind)) => {
+                    Some(Hint::Kube(id, kind, name)) => {
                         if let Some(cell) = cells.get_mut(&id) {
-                            hinted(cell, kind, Instant::now());
+                            let now = Instant::now();
+                            hinted(cell, kind, now);
+                            if hint_to_log(cell, now) {
+                                eprintln!("{}", hint_line(&id, kind, &name));
+                            }
                         } else { pull_ids.insert(id); }
                     },
                     None => break
@@ -1111,7 +1162,7 @@ async fn run() -> Result<(), Error> {
                                     eprintln!("{}", reconcile_failed(&id, generation, &error));
                                 }
                             }
-                            if cell.hints != marker { cell.due = Instant::now(); }
+                            rehint(cell, started, marker, Instant::now());
                         }
                     },
                     Some(Err(error)) => {
@@ -1193,11 +1244,13 @@ async fn run() -> Result<(), Error> {
                 let protection =
                     storage_protection_reason(&cell.db, &cell.snapshot, &renewals, clock_ms());
                 let kind = next_kind(cell, &renewals, clock_ms(), Instant::now());
+                let started = Instant::now();
+                let begun = cells.get_mut(&id).unwrap();
+                begun.started = Some(started);
                 if kind == JobKind::Reconcile {
-                    cells.get_mut(&id).unwrap().verification_due = None;
+                    begun.verification_due = None;
                 }
                 let job_id = id.clone();
-                let started = Instant::now();
                 let abort = jobs.spawn_local(async move {
                     let result = async {
                         if kind == JobKind::Protect {
@@ -1291,6 +1344,8 @@ mod tests {
             stalled: 0,
             reattest: false,
             verification_due: None,
+            started: None,
+            hint_logged: None,
         }
     }
     fn wake(id: &str, operation: &str) -> Value {
@@ -1786,6 +1841,127 @@ mod tests {
         db.ready = false;
         hinted(db, "Pod", now);
         assert_eq!(class(db, &Renewals::default(), 0), Class::Routine);
+    }
+    /// How many passes of a database that does not come ready begin in `seconds` while one of its
+    /// objects changes every `every` milliseconds (`kind` of them) and a pass takes `pass`.
+    fn passes_while_objects_change(seconds: u64, every: u64, pass: u64, kind: &str) -> usize {
+        let start = Instant::now();
+        let mut entry = cell(wake("db", &operation(1)), start, false);
+        // (millisecond the running pass ends, hint marker it began at, when it began)
+        let mut running: Option<(u64, u64, Instant)> = None;
+        let mut passes = 0;
+        for ms in 0..seconds * 1000 {
+            let now = start + Duration::from_millis(ms);
+            if ms % every == 0 {
+                hinted(&mut entry, kind, now);
+            }
+            if let Some((ends, marker, began)) = running
+                && ms >= ends
+            {
+                settle(
+                    &mut entry,
+                    began,
+                    Some(&json!({"state":"provisioning"})),
+                    marker,
+                );
+                rehint(&mut entry, began, marker, now);
+                running = None;
+            }
+            if running.is_none() && entry.due <= now {
+                passes += 1;
+                entry.started = Some(now);
+                running = Some((ms + pass, entry.hints, now));
+            }
+        }
+        passes
+    }
+    #[test]
+    fn objects_that_change_all_the_time_do_not_make_a_database_pass_all_the_time() {
+        // CNPG creating the Pod of a hibernated database changes objects of it twenty times a
+        // second, and a pass takes a twentieth of one. Live, that was twenty full passes a second
+        // (800 requests) for ten seconds, none of them with anything new to find.
+        let passes = passes_while_objects_change(10, 50, 50, "Pod");
+        assert!(
+            passes <= 21,
+            "{passes} passes in ten seconds: at most one in each half second"
+        );
+        // A change is still looked at at once when the database was left alone before it, and
+        // the spacing counts from the pass that began last, not from the change.
+        let now = Instant::now();
+        let mut left_alone = cell(json!({"id":"db","generation":1}), now, true);
+        left_alone.due = now + Duration::from_secs(60);
+        left_alone.started = Some(now - Duration::from_secs(5));
+        hinted(&mut left_alone, "Cluster", now);
+        assert_eq!(left_alone.due, now);
+        let mut looked_at = cell(json!({"id":"db","generation":1}), now, true);
+        looked_at.due = now + Duration::from_secs(60);
+        looked_at.started = Some(now - Duration::from_millis(100));
+        hinted(&mut looked_at, "Cluster", now);
+        assert_eq!(looked_at.due, now + Duration::from_millis(400));
+        // A retry that is due sooner than the spacing is never put off by a change.
+        looked_at.due = now + Duration::from_millis(100);
+        hinted(&mut looked_at, "Cluster", now);
+        assert_eq!(looked_at.due, now + Duration::from_millis(100));
+        // And one that ran while the objects changed is due when the spacing ends, not at once.
+        let marker = looked_at.hints;
+        hinted(&mut looked_at, "Cluster", now);
+        looked_at.due = now + Duration::from_secs(60);
+        rehint(
+            &mut looked_at,
+            now - Duration::from_millis(100),
+            marker,
+            now,
+        );
+        assert_eq!(looked_at.due, now + Duration::from_millis(400));
+    }
+    #[test]
+    fn the_log_names_what_hinted_a_database_once_a_second_and_nothing_of_it() {
+        let line = hint_line(
+            "dbbbbbbbbbbbbbbbbbbb",
+            "ConfigMap",
+            "storage-dbbbbbbbbbbbbbbbbbbb",
+        );
+        assert_eq!(
+            line,
+            json!({"event":"database_hinted","database_id":"dbbbbbbbbbbbbbbbbbbb","kind":"ConfigMap","name":"storage-dbbbbbbbbbbbbbbbbbbb"})
+        );
+        let now = Instant::now();
+        let mut entry = cell(json!({"id":"db","generation":1}), now, true);
+        assert!(hint_to_log(&mut entry, now));
+        assert!(!hint_to_log(&mut entry, now + Duration::from_millis(900)));
+        assert!(hint_to_log(&mut entry, now + Duration::from_millis(2000)));
+    }
+    #[test]
+    fn a_wake_that_waits_for_a_proof_polls_with_backoff_and_not_busily() {
+        // The cold wake of a thin database waited 37 s for the node's next identity proof: no
+        // object changes, only the timer brings the next pass, and each is later than the one
+        // before it.
+        let start = Instant::now();
+        let mut entry = cell(wake("db", &operation(1)), start, false);
+        let mut began: Vec<Duration> = vec![];
+        let mut now = start;
+        while now < start + Duration::from_secs(37) {
+            if entry.due <= now {
+                began.push(now - start);
+                entry.started = Some(now);
+                let marker = entry.hints;
+                settle(
+                    &mut entry,
+                    now,
+                    Some(&json!({"state":"provisioning"})),
+                    marker,
+                );
+                rehint(&mut entry, now, marker, now);
+            }
+            now += Duration::from_millis(10);
+        }
+        assert!(began.len() <= 11, "{} passes: {began:?}", began.len());
+        let gaps: Vec<_> = began.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            gaps.windows(2)
+                .all(|pair| pair[1] + Duration::from_millis(20) >= pair[0]),
+            "{gaps:?}"
+        );
     }
     #[test]
     fn a_pod_change_during_an_in_flight_check_keeps_re_attestation_urgent() {

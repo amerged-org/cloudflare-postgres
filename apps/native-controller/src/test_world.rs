@@ -889,7 +889,14 @@ impl World {
         let hints = events
             .iter()
             .filter(|(kind, _)| crate::kubernetes::RUNTIME_WATCH_KINDS.contains(&kind.as_str()))
-            .filter_map(|(kind, event)| self.reconciler.k8s.watch_event(kind, event).unwrap().1)
+            .filter_map(|(kind, event)| {
+                self.reconciler
+                    .k8s
+                    .watch_event(kind, event)
+                    .unwrap()
+                    .1
+                    .map(|trigger| trigger.database)
+            })
             .collect();
         self.server.state.lock().unwrap().sync();
         hints

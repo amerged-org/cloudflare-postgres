@@ -98,6 +98,13 @@ const OWN_WRITE_MEMORY: Duration = Duration::from_secs(120);
 const READ_FANOUT: usize = 8;
 /// Versions remembered for one object: a pass writes one object a few times at most.
 const OWN_WRITES_PER_OBJECT: usize = 16;
+/// What a metadata watch hints: the database whose object changed, and the object's name. The
+/// name is for the log that says what made a database due; it never reaches a decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trigger {
+    pub database: String,
+    pub name: String,
+}
 #[derive(Debug)]
 struct WatchContinuity {
     controller_epoch: String,
@@ -249,7 +256,7 @@ impl WatchContinuity {
     /// the database it hints for reconciliation. The event of a version this controller wrote
     /// itself hints no database: the pass that wrote it holds the object as written, and a change
     /// someone else makes has a version of its own.
-    fn event(&mut self, kind: &str, event: &Value) -> Result<(String, Option<String>), Error> {
+    fn event(&mut self, kind: &str, event: &Value) -> Result<(String, Option<Trigger>), Error> {
         let event_type = text(event, "type");
         if event_type == "ERROR" {
             return Err("Kubernetes watch history gap".into());
@@ -279,7 +286,10 @@ impl WatchContinuity {
             labelled
         };
         let hint = (pgcf_native_protocol::valid_pattern("database", id) && !self.own(kind, object))
-            .then(|| id.to_string());
+            .then(|| Trigger {
+                database: id.to_string(),
+                name: text(meta, "name").to_string(),
+            });
         Ok((version.to_string(), hint))
     }
 }
@@ -425,7 +435,7 @@ impl Kubernetes {
         &self,
         kind: &str,
         event: &Value,
-    ) -> Result<(String, Option<String>), Error> {
+    ) -> Result<(String, Option<Trigger>), Error> {
         self.continuity.lock().unwrap().event(kind, event)
     }
     pub fn runtime_resource_current(&self, resource: &Value) -> bool {
@@ -624,7 +634,7 @@ impl Kubernetes {
     pub async fn watch_database_ids(
         &self,
         kind: &str,
-        events: tokio::sync::mpsc::Sender<String>,
+        events: tokio::sync::mpsc::Sender<Trigger>,
     ) -> Result<(), Error> {
         if !RUNTIME_WATCH_KINDS.contains(&kind) {
             return Err("unsupported controller watch".into());
@@ -1396,13 +1406,17 @@ mod tests {
         // memory of the controller's write ended with its event.
         let mut other = events[0].1.clone();
         other["object"]["metadata"]["resourceVersion"] = "9".into();
+        let trigger = Trigger {
+            database: id.to_string(),
+            name: name.clone(),
+        };
         assert_eq!(
             server.k8s.watch_event("ConfigMap", &other).unwrap(),
-            ("9".to_string(), Some(id.to_string()))
+            ("9".to_string(), Some(trigger.clone()))
         );
         assert_eq!(
             server.k8s.watch_event("ConfigMap", &events[0].1).unwrap().1,
-            Some(id.to_string())
+            Some(trigger)
         );
         // A write that changed nothing answers the version it was made over, leaves no event
         // and is not remembered.
