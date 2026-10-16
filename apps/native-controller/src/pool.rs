@@ -2439,5 +2439,8 @@ impl Pool {
 }
 
 #[cfg(test)]
+#[path = "pool_e2e_tests.rs"]
+mod end_to_end;
+#[cfg(test)]
 #[path = "pool_tests.rs"]
 mod tests;

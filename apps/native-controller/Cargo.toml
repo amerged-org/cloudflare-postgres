@@ -36,5 +36,6 @@ httparse = "=1.10.1"
 libc = "=0.2.190"
 
 [dev-dependencies]
+pgcf-native-gateway = { path = "../native-gateway" }
 tokio-rustls = {version="=0.26.6",default-features=false,features=["ring","tls12"]}
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }

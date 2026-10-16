@@ -1407,6 +1407,7 @@ dependencies = [
  "httparse",
  "jsonschema",
  "libc",
+ "pgcf-native-gateway",
  "pgcf-native-protocol",
  "rcgen",
  "reqwest",

@@ -69,6 +69,8 @@ pub const HANDLE: &str = "pvc-01234567-89ab-4def-8123-000000000006";
 /// The gateway Pod's control endpoint and the instance Pod's exporter, behind an HTTP proxy.
 pub struct Gateway {
     pub client: reqwest::Client,
+    /// The proxy every node and gateway request of `client` goes to.
+    pub address: std::net::SocketAddr,
     /// The text `GET /metrics` answers.
     pub metrics: Arc<Mutex<String>>,
     /// The UID of the gateway Pod the control endpoint answers for.
@@ -586,6 +588,7 @@ impl Gateway {
         });
         Self {
             client,
+            address,
             metrics,
             pod,
             refuse_releases,
