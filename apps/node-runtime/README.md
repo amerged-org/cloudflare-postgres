@@ -13,8 +13,6 @@ implementation.** A prepared namespace holder alone does not establish a first-r
 sandbox controller owns the containerd task endpoint association, cgroup accounting,
 release/profile selection, refill and tenant-runtime destruction; EU1 runs it as a Talos host
 extension service under the region's `compute_pool` policy and therefore executes this binary.
-The shared PostgreSQL pool built on these slots is deferred; its code is on main and not wired
-end to end.
 
 ## Runtime boundary
 

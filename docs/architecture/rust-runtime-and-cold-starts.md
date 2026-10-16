@@ -2,17 +2,17 @@
 
 Approved: **2026-10-05**. **The target architecture is approved. The native regional controller
 and gateway are implemented and deployed on the EU fleet; the Rust/Wasm Edge and the native
-bootstrap relay are built and not deployed, and the shared compute pool is deferred.**
+bootstrap relay are built and not deployed, and the shared pool of prestarted compute is not built.**
 
 Owner correction (2026-10-08): the [unified control/capacity/release plan](cloudflare-convergence-and-serverless-plan.md)
 requires the actual-use resource model and uniform automatic fleet patching as part of completion.
 Earlier clauses preserving full sleeping CPU and logical disk reservations are superseded below.
 
 The texts of 2026-10-05 and 2026-10-08 required Neon's **shared pool of prestarted, unassigned
-compute** before go-live. The go-live path now reaches a sub-second wake through the
-[parked sleep tier](parked-instances.md), which keeps the database's instance Pod and stops only
-PostgreSQL. The shared pool (alternative 8 of [warm-postgres-pool.md](warm-postgres-pool.md)) is
-deferred and not wired end to end; section 4 keeps its contract for the case that it is built.
+compute** before go-live. The owner decided on 2026-10-15 that the go-live path reaches a sub-second
+wake through the [parked sleep tier](parked-instances.md), which keeps the database's instance Pod
+and stops only PostgreSQL, and that the shared pool is deleted. Section 4 records why the pool is
+not built.
 
 The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) is the canonical delivery sequence and Done/Open status, linked from [PLAN.md](../../PLAN.md). This document describes the architecture and its migration boundaries; the table in section 3 states which component is deployed. Completed results belong in the ULTRA Done/Open tables.
 
@@ -26,8 +26,7 @@ Measurements validate this chosen architecture, establish its operating limits a
 
 The latency objective is **a first successful read below one second when a sleeping database
 is woken onto a runtime that already exists**, including ordinary client connection and
-authentication: its parked instance Pod or, if the shared pool is built, a prestarted unassigned
-compute. Already-running warm connections, optional warm reclaim and the ordinary wake of a fully
+authentication: its parked instance Pod. Already-running warm connections, optional warm reclaim and the ordinary wake of a fully
 hibernated database are separate measurements. An already-warm connection does not satisfy the
 target. This is a required Dev acceptance target, not an existing service guarantee.
 
@@ -71,149 +70,43 @@ The portable core is shared by native applications and the Wasm Edge. It contain
 
 Pin the Rust toolchain, dependency lockfile, build inputs and runtime-image digests when implementing the components. Retain upstream notices in THIRD_PARTY.md. Extend the existing single CI workflow with Rust build, conformance, tests and image qualification rather than introducing a second workflow or a language/load test matrix.
 
-## 4. Shared prestarted compute pool (deferred)
+## 4. Shared pool of prestarted compute (not built)
 
-**Status.** The pool is not on the go-live path. The [parked sleep tier](parked-instances.md) is
-the first sub-second tier; the shared pool, alternative 8 of
-[warm-postgres-pool.md](warm-postgres-pool.md), is the deeper tier below it. Its code is on main
-(supervisor, sandbox-controller pool modules, API pool domain) and is not wired end to end: no
-emitter sets its three runtime switches, only two of its ten qualification gates have producers
-and qualification mode has no client admission. The ULTRA plan decides it after the parked tier
-is measured and deletes it if it stays unused. The contract below applies if it is built.
+Neon starts unassigned compute before demand, applies configuration only when a connection needs
+it, and shortens routing and readiness work
+([Cold starts just got hot](https://neon.com/blog/cold-starts-just-got-hot)). PGCF answers the same
+question for a database that slept recently with the [parked sleep tier](parked-instances.md): the
+instance Pod, volume and sidecar stay and only PostgreSQL stops, so the next connection unfences a
+Pod that already exists. A database that is demoted, or that has been hibernated, takes the ordinary
+CNPG wake. The owner decided on 2026-10-15 that this replaces a shared pool of unassigned compute
+(alternative 8), whose code, tables and image were deleted; git history is the archive.
 
-The target follows the three mechanisms described in Neon's
-[Cold starts just got hot](https://neon.com/blog/cold-starts-just-got-hot): start unassigned
-compute before demand, apply configuration only when needed, and shorten routing/readiness work.
-Neon described a pool of empty computes receiving an endpoint configuration on assignment, with
-replenishment/recycling and slower on-demand fallback on a pool miss. Its historical latency
-results are reference measurements, not a guarantee for PGCF.
+The platform facts that made the pool expensive stay true and bound any later design:
 
-**A shared pool, if built, is this mechanism.** Keeping one PostgreSQL Pod alive for every idle
-database is the parked tier, a different tier. Neither an image cache, spare CPU, pre-pulled
-containers nor a pool of database client connections counts as a prestarted compute pool.
+- The pinned CNPG 1.30.1 and CNPG-I 0.6.0 have no operation that assigns an already running generic
+  Pod to a Cluster. Instance Pods are created with Cluster-derived names, namespace, environment
+  and the retained instance PVC, hibernation resume creates a new Pod, and the instance manager
+  starts with a fixed Cluster/Pod/namespace/PGDATA identity
+  ([pods.go](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/pods.go),
+  [cluster_create.go](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/cluster_create.go),
+  [instance manager](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/cmd/manager/instance/run/cmd.go)).
+  Kubernetes 1.36.5 waits for attachment and mounting before it invokes the container runtime, so
+  a generic Pod waiting for an unbound tenant PVC is not a running slot
+  ([kubelet.go](https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/kubelet.go#L2195-L2241)).
+- Prepared compute would therefore have to sit **below Pod identity**, at the CRI sandbox boundary.
+  VM-cache designs such as [Kata 3.32.0 QEMU VMCache](https://github.com/kata-containers/kata-containers/blob/3.32.0/docs/how-to/what-is-vm-cache-and-how-do-I-use-it.md)
+  need KVM. The 2026-10-08 observation found no `/dev/kvm` and no `vmx` or `svm` flag on the three
+  retained nodes, and Contabo's
+  [nested-virtualization policy](https://help.contabo.com/en/support/solutions/articles/103000271595-can-i-setup-nested-virtualization-on-my-server-)
+  excludes VPS, so a software-only factory or virtualization-capable hardware would be required.
+- containerd's RunPodSandbox path requires Pod metadata and generates a new sandbox ID, so it is
+  not a later-assignment operation
+  ([sandbox_run.go](https://github.com/containerd/containerd/blob/v2.3.5/internal/cri/server/sandbox_run.go#L52-L165)).
+  The region's `compute_pool` slots prepare only namespace holders and runc task services under
+  ordinary CNPG-created Pods; they never hold PostgreSQL data or a database identity.
 
-### Pool and assignment contract
-
-- Cloudflare owns desired ready-slot count, a hard maximum idle-pool resource budget, supported
-  resource/release profiles, maximum slot age, refill policy and observed inventory per region.
-  The regional Rust controller prepares actual isolated runtime environments before any customer
-  request. Each ready slot has an immutable identity and selected release, and is unassigned to
-  any customer or database. Pool size follows bounded regional demand, not the number of sleeping DBs.
-- On a request for an idle database, the existing Actor/lifecycle path atomically claims one
-  compatible ready slot and coalesces other requests for that database. The claim binds region,
-  node, runtime identity, database ID, storage generation, configuration revision and expiry.
-  An uncertain claim is reconciled; two databases cannot own one runtime or one writer volume.
-- The assigned runtime receives the current effective configuration and scoped credentials,
-  connects to the database's actual persistent storage, starts/activates its PostgreSQL instance,
-  and publishes readiness only after the existing storage, TLS, role and fence checks pass.
-  Pool readiness is distinct from database readiness. Unchanged persistent configuration is not
-  reapplied; a new runtime still receives and validates its own identity-bound configuration.
-- Refill happens outside the request's critical path. Empty old-release or aged slots are retired
-  and replaced automatically. Idle pool memory/CPU is real node usage, included in physical
-  capacity and76% calculations; it is not a permanent per-customer reservation.
-- After tenant use, destroy the tenant-bound execution instance before preparing a clean slot.
-  Never return a process with another tenant's memory, credentials, mounts or PostgreSQL state
-  to the unassigned pool. A VM/snapshot optimization may later be accepted only with equivalent
-  proven reset isolation. No shared customer PostgreSQL process is introduced by this requirement.
-- A pool miss follows the bounded ordinary start path and is explicitly measured as a miss.
-  Do not conceal miss rate, add a new VPS merely to fill an idle pool, or present its latency as
-  a pool hit. Explicit suspension continues to require an authorized resume.
-
-### Storage and CNPG integration work
-
-Neon's storage/compute separation is an enabling architecture, described in its
-[architecture decisions](https://neon.com/blog/architecture-decisions-in-neon). PGCF currently has
-unmodified PostgreSQL with CNPG-owned lifecycle and local PGDATA/PVCs. That is a real integration
-constraint to solve, not a reason to substitute per-database warm reclaim for the pool.
-
-The first implementation stage must produce a working late-binding contract between a prestarted,
-unassigned runtime and a retained database volume. With local data, candidate slots must be on
-nodes eligible to access that data; a regional pool can have node-affine subsets. A slot in
-another region can never use EU local storage. Do not hot-swap PGDATA beneath a running PostgreSQL process, attempt
-to mutate an already running Pod's volume specification, or create an empty replacement database. Kubernetes documents the
-[Pod update restrictions](https://kubernetes.io/docs/concepts/workloads/pods/#pod-update-and-replacement);
-CNPG documents its [instance-manager ownership](https://cloudnative-pg.io/docs/devel/instance_manager/).
-Verify the exact pinned versions during integration; these constraints cannot be waived by a pool label.
-
-Prove which runtime boundary can be prepared before assignment and how CNPG owns the resulting
-PostgreSQL process, Pod identity, storage, backup and recovery throughout that binding. Merely
-creating the ordinary database Pod after a cache hit is insufficient unless the claimed prepared
-runtime actually removes the expensive preparation and passes the pool-hit timing gate.
-
-Unmodified PostgreSQL, customer isolation, retained data, CNPG ownership and no EU reinstall remain
-constraints. If the current CNPG/local-volume integration cannot support the required assignment,
-record the concrete incompatibility and the required runtime/storage architecture change as
-blocking implementation work. Do not silently retain incompatible constraints while marking the
-pool complete, and do not replace the pool target with an easier warm-only benchmark. A wholesale
-Neon Pageserver/Safekeeper deployment is not presumed necessary or already authorized by this plan.
-
-### Pinned runtime-boundary findings
-
-The pinned CNPG1.30.1/[CNPG-I0.6.0](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/go.mod)
-integration has no supported operation that assigns an already running generic Pod to a Cluster.
-[Instance Pods](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/pods.go)
-are created with Cluster-derived names, namespace, environment and the retained instance PVC.
-[Hibernation resume](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/cluster_create.go)
-creates a new instance Pod; an existing name causes reconciliation rather than adoption.
-The [instance manager](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/cmd/manager/instance/run/cmd.go)
-starts with a fixed Cluster/Pod/namespace/PGDATA identity. CNPG-I's
-[operator lifecycle hook](https://github.com/cloudnative-pg/cnpg-i/blob/v0.6.0/proto/operator_lifecycle.proto)
-can patch a proposed Pod, including its RuntimeClass, before normal Kubernetes creation. It does
-not provide a late PVC-attachment or instance-manager rebinding RPC. Kubernetes1.36.5 also
-[waits for attachment and mounting before invoking its container runtime](https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/kubelet.go#L2195-L2241).
-A generic Pod waiting for an unbound tenant PVC therefore cannot be counted as a running slot.
-
-The smallest compatible candidate puts the prepared runtime **below Pod identity**, at the CRI
-sandbox/VM boundary. CNPG still creates the actual database Pod and owns its unchanged instance
-manager, PVC and backup sidecar. A qualified runtime would exclusively assign a previously
-booted, tenant-free sandbox to that Pod, then accept its exact mounts and configuration before
-starting PostgreSQL. [Kata3.32.0 QEMU VMCache](https://github.com/kata-containers/kata-containers/blob/3.32.0/docs/how-to/what-is-vm-cache-and-how-do-I-use-it.md)
-is an upstream example of this boundary; its
-[factory implementation](https://github.com/kata-containers/kata-containers/blob/3.32.0/src/runtime/virtcontainers/factory/factory_linux.go)
-resumes and assigns a blank VM and refills the cache separately. This is a candidate to qualify,
-not an accepted implementation or a latency result. Its empty-cache receive is blocking, so
-PGCF's bounded miss fallback and claim/slot observation contract still need implementation.
-
-The [Talos1.14.1 extension source](https://github.com/siderolabs/extensions/blob/515779a55c15b43088e89b17432181891115cbdf/container-runtime/kata-containers/pkg.yaml)
-provides `kata` and `kata-qemu` handlers, but installs the containerd shim rather than the
-`kata-runtime factory` executable and supervised cache service. A qualified data-preserving
-extension/configuration upgrade is required for that candidate. QEMU VMCache requires KVM;
-the newer Kata Rust runtime's feature support must be checked independently, rather than
-assuming the Go-runtime factory is present. First-party PGCF runtime components remain Rust.
-
-The bounded October8 capability observation found no `/dev/kvm` character device through verified
-host `/dev` mounts on any of the three retained nodes. A separate read of guest-visible
-`/proc/cpuinfo` in those existing node-driver containers found neither `vmx` nor `svm`; each reported
-four CPUs matching its Node capacity. Node/Cluster/driver/DaemonSet identities and template images
-remained stable before and after; no workload, host or provider write occurred. Contabo's
-[Cloud VPS documentation](https://docs.contabo.com/docs/servers-hosting/vps/) and
-[nested-virtualization support policy](https://help.contabo.com/en/support/solutions/articles/103000271595-can-i-setup-nested-virtualization-on-my-server-)
-explicitly exclude nested virtualization for VPS, including the Plus family. Installing a Talos
-extension therefore cannot make this KVM-based candidate work on the retained V159 fleet.
-
-Retaining those VPS requires a software-only prestarted sandbox factory below the CNPG Pod
-boundary, with an actual CRI/network/storage late-binding integration and the same isolation and
-latency proof. The pinned
-[containerd2.3.5 RunPodSandbox path](https://github.com/containerd/containerd/blob/v2.3.5/internal/cri/server/sandbox_run.go#L52-L165)
-requires Pod metadata, generates a new sandbox ID and persists that Pod configuration before
-starting the sandbox; calling it for placeholder Pods is not a later-assignment operation.
-The software-only factory is required research/implementation work, not an existing
-containerd/runc capability or an accepted design. The other direction requires a separately
-approved move to virtualization-capable hardware; the current V159 purchase authorization does
-not authorize it. Neither direction is on the go-live path. No pool state may be reported ready
-from these findings.
-
-### Pool acceptance (if built)
-
-Measure it like the sub-second wake step of the [ULTRA go-live path](cloudflare-convergence-and-serverless-plan.md#go-live-path).
-A real unassigned slot must exist before demand. Connect normally through Cloudflare to a sleeping
-database with no running tenant compute and measure connection through the first validated SQL
-result from the same start time. A pool hit must finish below one second, preserve committed data,
-bind the correct CNPG/volume/tenant identities and trigger refill. Label a miss as a miss.
-Existing exclusive-claim, isolation, exhaustion and uncertain-outcome behavior remains part of the
-implementation and focused regression tests. Fixed twenty-wake series and 30/120-minute idle soaks
-are no longer prerequisites. A same-Pod warm, parked or reclaim result is a different tier and is
-measured separately; it neither satisfies nor replaces this shared-pool result.
+A same-Pod parked, warm or reclaim result is the tier that is built; label it as such and never
+present it as a hit of a pool.
 
 ## 5. Runtime states and idle policy
 
@@ -223,8 +116,8 @@ measured separately; it neither satisfies nor replaces this shared-pool result.
 | Always warm | The same running runtime remains available during idle periods | Normal warm connection; no reclaim or automatic hard sleep |
 | `warm_idle` | The same PostgreSQL process and Pod run; selected cold memory pages may be reclaimed | Admission revokes further reclaim; the kernel brings back the pages actually needed |
 | Parked (public state `hibernated`, region policy `parked_tier`) | The database's instance Pod, volume, sidecar and Lease stay; CNPG's fence stops PostgreSQL and the Pod's requests are shrunk | Unfence and resize back; a database that is not eligible is demoted to `hibernated` and takes the ordinary wake |
-| `waking` | The parked Pod is being unfenced, or CNPG creates a new instance Pod (a pool slot is claimed only if the deferred shared pool is built) | Wait for the matching verified database-ready observation |
-| `hibernated` | No per-database compute runs; persistent volume/data remains | Ordinary CNPG wake: a new instance Pod starts on the retained volume (an eligible pool slot only if that pool is built) |
+| `waking` | The parked Pod is being unfenced, or CNPG creates a new instance Pod | Wait for the matching verified database-ready observation |
+| `hibernated` | No per-database compute runs; persistent volume/data remains | Ordinary CNPG wake: a new instance Pod starts on the retained volume |
 | Explicitly `suspended` | Integrator/owner admission block with real CNPG hibernation | Refuse connections until an explicit authorized resume |
 
 `warm_idle` is not a stopped database, a frozen process or zero resident memory. Kernel page-in on access is not restoration of a process snapshot. Host filesystem cache may survive real hibernation, but no cache-retention guarantee is made.
@@ -340,8 +233,7 @@ Successful proxy-side authentication cannot bypass PostgreSQL's authentication o
 
 **Status.** The API policy and the host publisher are implemented; the node reclaimer binary was deleted
 (2026-10-15), no node is qualified and no database carries a policy. This mode is additional to
-the parked tier and the deferred shared compute pool. It may optimize an already assigned idle
-runtime; it is not pool implementation or evidence for pool-hit latency.
+the parked tier. It may optimize an already assigned idle runtime.
 
 Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/zswap_config.go).
 
@@ -398,8 +290,6 @@ Report actual runtime activation separately from time between the user's applica
 
 The dependent runtime pieces below are delivered through R1/R2 of the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#delivery-architecture). Status:
 
-0. **Shared pool/storage integration:** deferred (section 4). The late-binding design and its code are
-   on main and not wired end to end.
 1. **Rust gateway:** implemented and deployed; it preserves the current contracts, authentication
    passthrough, protocol behavior and persisted fences.
 2. **Rust controller:** implemented and deployed; it replaced the full regional Node server
@@ -413,8 +303,7 @@ The dependent runtime pieces below are delivered through R1/R2 of the [ULTRA pla
    are implemented in the API; the Rust/Wasm Edge preserves real VPC HTTP/unopened-WebSocket
    forwarding, is built and is not deployed.
 5. **Sub-second wake acceptance:** the go-live acceptance is the parked tier's wake through the normal
-   Cloudflare path (go-live path: sub-second wake). Shared-pool Dev acceptance (section 4) is deferred
-   with the pool.
+   Cloudflare path (go-live path: sub-second wake).
 6. **Optional later warm reclaim:** evaluate separately; it is not a customer-readiness gate.
 7. **Later independent work:** proxy SCRAM, process/VM snapshot research and optional native CLI stream handling.
 
@@ -428,15 +317,13 @@ After each native replacement is accepted in Dev, remove its unused TypeScript s
 
 The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#node-acceptance) defines the six
 functional node checks. Its sub-second wake step requires a woken parked database's first SQL
-below one second through the normal Cloudflare path; a shared-pool hit with refill after
-assignment is measured the same way if that pool is built. Run these on Dev.
+below one second through the normal Cloudflare path. Run these on Dev.
 Focused regression tests cover changed authentication, TLS, fencing, claims, isolation and
 uncertain-write behavior. Reuse valid unchanged results; do not introduce a second live test matrix.
 
 Record the physical starting state and selected release. Measure `connect_ms` and `first_read_ms`
 from the same instant before connection; the latter includes the complete validated marker query.
-Label parked hits, pool hits (if built), demoted or hibernated misses and already-warm connections
-separately. Retain observed failures and unknowns. A slot-assignment duration alone is not SQL
+Label parked hits, demoted or hibernated misses and already-warm connections separately. Retain observed failures and unknowns. A slot-assignment duration alone is not SQL
 latency. No fixed repeated-cycle count,
 long laptop monitor or mandatory idle-soak series remains. If the target is missed, document the
 actual limiting stage and fix that observed class. Record completion in the ULTRA plan.
@@ -445,14 +332,11 @@ actual limiting stage and fix that observed class. Record completion in the ULTR
 
 Freezing a process, CRIU/container checkpoints and microVM snapshots are separate compute-lifecycle research. Warm reclaim does not require them and does not imply that their socket, storage, credential, WAL or runtime-restoration problems have been solved.
 
-The shared prestarted compute pool is deferred work in section 4, not later research. If it is
-built, its local storage/CNPG assignment constraints must be resolved as part of implementation. A
-complete Neon Pageserver/Safekeeper storage replacement, branching, a shared tenant PostgreSQL
-process and per-database automatic compute resizing are not implied by the pool requirement. Any
-additional architecture change required for correct late binding must be identified and resolved
-explicitly.
+A shared pool of prestarted unassigned compute is not built (section 4). A complete Neon
+Pageserver/Safekeeper storage replacement, branching, a shared tenant PostgreSQL process and
+per-database automatic compute resizing are not planned either; each would be a separate
+architecture decision.
 
 The approved target is a native Rust regional stack and full Rust/Wasm Edge, with cached verified
-routing and safe hibernation, a parked sleep tier for the first sub-second wake and, if built, a
-shared pool of prestarted unassigned compute with configuration-aware assignment. Warm reclaim
+routing and safe hibernation and a parked sleep tier for the first sub-second wake. Warm reclaim
 remains an additional optimization for an assigned runtime.

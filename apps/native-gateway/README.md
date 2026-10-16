@@ -66,7 +66,7 @@ the revision of that target and is not retiring or deleting; the endpoint's Pod 
 attested one, it is not terminating, it is the only candidate, and it has one private address;
 the watched Pod is on that node and address with its `postgres` container running under the
 attested container ID; the watched CA is the attested one. A Ready endpoint always takes
-precedence, a pool binding never falls through to it, and the route ends with the Pod watch.
+precedence, and the route ends with the Pod watch.
 Only a v4 route, which names the admitted runtime, may use such a writer; route token,
 storage binding and signed authority are checked exactly as for a Ready writer.
 

@@ -296,9 +296,6 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   the change reaches PostgreSQL with the database's next configuration pass. Wait until
   `observed_generation == generation` before connecting as the new role (earlier: `57P03`). A
   hibernated database applies it at its next wake.
-- A role change on a database that is bound to a shared pool Pod is deferred and answered with
-  `202` and an operation; poll it like any operation. No database is bound to a pool Pod: the
-  shared pool is deferred and not deployed.
 - The URI has no port and no `sslmode`; see [3.1](#31-driver-configuration) for how to use it.
 
 **Attributes at creation.** All are optional; a role created without them is the plain login role
@@ -366,8 +363,7 @@ pgcf -i -X DELETE "$PGCF_API/v1/databases/<database-id>/roles/report_a1b2c3" \
   generation. After a removal was confirmed the role is `404`.
 - **Refusals.** `400` for the owner `app` and `pgcf_maintenance`; `404` for an unknown role;
   `409` for a role that other live roles are `member_of` (`role_has_members`: delete the members
-  first), for a database bound to a shared pool and while another role change waits
-  (`pool_bound`, retryable). Deleting a database ends a pending removal with `superseded`.
+  first). Deleting a database ends a pending removal with `superseded`.
 
 ### 2.4 Suspend and resume
 
@@ -596,8 +592,7 @@ the database's instance Pod stays and only PostgreSQL stops, so the next connect
 Pod instead of creating a new one ([design](../architecture/parked-instances.md)). It is
 implemented and not measured (Go-live path: *Sub-second wake*); the design budgets 1.3 to 2.2 s
 for the first implementation and about 1.1 to 1.2 s with direct SQL readiness, so below 1 s needs
-further removals. A demoted (fully hibernated) database takes the 8.1–9.4 s wake. The shared
-prestarted pool is deferred. PGCF publishes the result only in the ULTRA plan's Done table, as the
+further removals. A demoted (fully hibernated) database takes the 8.1–9.4 s wake. PGCF publishes the result only in the ULTRA plan's Done table, as the
 first row measured stage by stage from one start, with every run labelled hit or miss (demoted,
 hibernated); update this section from that row when *Sub-second wake* closes.
 
@@ -676,22 +671,22 @@ quotas per tenant, compute autoscaling or branching in v1. The limits below are 
 | Placement mode | `actual_ram`: starts are admitted against fresh measured RAM, not reservations |
 | Per-database memory maximum | 4,096 MiB, steps of 256 |
 | Node (EU1) | 6 vCPU, 12 GB; the plan records 5,000 m CPU and 10,819 MiB allocatable |
-| Prestarted sandbox slots (region `compute_pool`, not the shared PostgreSQL pool) | one slot, 100 m and 64 MiB per slot; this overhead is charged to every database |
+| Prestarted sandbox slots (region `compute_pool`) | one slot, 100 m and 64 MiB per slot; this overhead is charged to every database |
 
 ### 4.2 Awake databases: CPU and RAM admission
 
 A database that is not confirmed hibernated is charged
 
-`CPU charge = cpu_request_millicores (or cpu_millicores) + 100 m (Barman sidecar request) + the pool slot allowance (100 m here)`
+`CPU charge = cpu_request_millicores (or cpu_millicores) + 100 m (Barman sidecar request) + the prestarted slot allowance (100 m here)`
 
-against `allocatable CPU - platform requests P - the charges of all awake databases - idle pool
-Pods`. A start is admitted only if its own charge still fits. A confirmed hibernated database
+against `allocatable CPU - platform requests P - the charges of all awake databases`. A start is
+admitted only if its own charge still fits. A confirmed hibernated database
 carries no charge; a parked database (region policy `parked_tier`) holds the parked requests of
 its Pod instead.
 
 Starts also need a memory sample of the node that is at most 90 s old and shows no
-`MemoryPressure`, with available RAM of `memory_mib + 512 MiB` (sidecar limit) plus the pool slot
-allowance (64 MiB here) plus the budgets of starts in flight. Running databases are not reserved:
+`MemoryPressure`, with available RAM of `memory_mib + 512 MiB` (sidecar limit) plus the prestarted
+slot allowance (64 MiB here) plus the budgets of starts in flight. Running databases are not reserved:
 their real memory shows in the measurement.
 
 Worked example from the plan's density section (5,000 m allocatable, P = 650 m at the first
@@ -768,7 +763,7 @@ pgcf -G "$PGCF_API/v1/usage" \
 | --- | --- |
 | `provisioned_seconds`, `awake_seconds` | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension |
 | `memory_mib_seconds`, `cpu_millicore_seconds` | the class's memory and CPU **limits** times awake seconds; not measured consumption |
-| `reserved_cpu_millicore_seconds` | request plus sidecar (plus pool overhead) times awake seconds; zero while confirmed hibernated, and the parked Pod's requests while the database is parked (region policy `parked_tier`) |
+| `reserved_cpu_millicore_seconds` | request plus sidecar (plus prestarted slot overhead) times awake seconds; zero while confirmed hibernated, and the parked Pod's requests while the database is parked (region policy `parked_tier`) |
 | `reserved_memory_mib_seconds` | class memory plus the 128 MiB sidecar request times **provisioned** seconds: sleeping time is included, because the hibernation snapshot does not reduce it |
 | `reserved_storage_byte_seconds` | quota times provisioned seconds; **null for Thin volumes** (their snapshot carries no physical allocation), with the gap named |
 | `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the agent's filesystem samples in the period (bytes used; PVC capacity) |
@@ -933,8 +928,7 @@ the operator supplies it at handover.** Send:
 
 ## 8. Not available yet
 
-- Sub-second first SQL after sleep (the parked sleep tier is implemented and not measured); the
-  shared prestarted pool is deferred.
+- Sub-second first SQL after sleep (the parked sleep tier is implemented and not measured).
 - A second customer node, redundancy and a measured recovery time; node drain and moving
   databases with their IDs kept (a restore always creates a new ID).
 - Alert delivery to a recipient; alert history, acknowledgement and test send.
@@ -962,7 +956,6 @@ confirmation. The state column says what is measured and what is derived or open
 | Parked hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | **not measured**: the parked tier is implemented; the hibernated wake is 8.1–9.4 s |
 | `57P03` meanings and retry rule | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee |
 | Connection limits | [3.6](#36-connection-limits) | stated; the deployed per-role and per-network values are not recorded in the repository |
-| Role-change deferral on pool-bound databases (a deletion is refused instead) | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code; the pool is deferred and not deployed |
 | Role deletion: unroutable at once, removal confirmed by PostgreSQL, hibernated database applies it at its next wake | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code and its tests; **not yet run against the live cluster** (live acceptance pending) |
 | Outage classes and maintenance windows | [7.1](#71-what-happens-in-each-situation) | classes stated; no window schedule and no announcement channel is defined |
 | New IDs after restore or node loss | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) | stated |
@@ -997,7 +990,6 @@ different resource first.
 | `mutation_in_progress` | retryable | another change to the same database holds it for the moment (a wake, an idle sleep or its compensation, a protective stop, a maintenance step) | 1 s |
 | `generation_changed` | retryable | the database, or what a create or restore was based on, changed between the read and the write ("Database changed; retry the request") | 1 s |
 | `not_ready` | retryable | the database has not applied its latest generation or is not running yet ("Database configuration is not ready") | 5 s |
-| `pool_bound` | retryable | the database is bound to a shared pool Pod, or a role change already waits for its release | 5 s |
 | `node_capacity` | retryable | the node lacks memory, CPU or storage for a resize, or for a resume ([2.4](#24-suspend-and-resume)) | 30 s |
 | `name_in_use` | terminal | a live database of the project already has this name (create, restore) | |
 | `database_deleted` | terminal | the database is deleted | |
@@ -1018,8 +1010,7 @@ there is.
 
 `database.create`, `database.restore`, `database.delete`, `database.resize`, `database.suspend`,
 `database.resume`, `database.role.delete` are started by you; `database.hibernate`,
-`database.wake` by PGCF; `database.role.create` and `database.role.reset_password` appear only
-when a role change is deferred behind a pool binding.
+`database.wake` by PGCF.
 
 ### A.3 Operation error codes
 
@@ -1028,7 +1019,6 @@ when a role change is deferred behind a pool binding.
 | `superseded` | a newer intent (resize, delete or power change) replaced it; not a platform fault |
 | `operation_timeout` | no progress for 20 minutes ("Regional operation exceeded 20 minutes") |
 | `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running |
-| `pool_holder_unproved` | a deferred role change could not apply to the pool holder |
 | `role_not_droppable` | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 
 ### A.4 SQLSTATE at connect time

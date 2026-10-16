@@ -8,7 +8,7 @@ the already running version-3 runc task endpoint. The ordinary containerd/CRI ch
 specification owns the PostgreSQL/Barman process, PGDATA mounts, credentials and cgroup limits.
 The holder never receives those data or executable commands.
 
-This is an implementation of the runtime boundary, not completed shared-pool acceptance.
+This is an implementation of the runtime boundary, not completed prestarted-slot acceptance.
 Cloudflare live policy delivery, CRI/Cilium/CNPG integration and the subsecond authenticated
 SQL first read remain unaccepted. The source consumes bounded Cloudflare policy, refills idle
 slots and recovers recorded assignments; these features still require real Dev acceptance.

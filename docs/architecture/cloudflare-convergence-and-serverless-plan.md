@@ -18,7 +18,7 @@ Talos 1.14.2 and Kubernetes 1.36.5. Its installer and raw image are privately di
 fully verified. Further Golden changes require an observed boot or data blocker; other work
 belongs to R2. Runtime/platform references are immutable release inputs from the verified lock.
 
-**Runtime.** Databases run on CloudNativePG. The native controller and gateway are deployed; EU's region switch (`compute_pool`) is on and EU1 keeps one prestarted sandbox slot. A measured first query below one second after idle through Cloudflare, delivered by the [parked sleep tier](parked-instances.md), is required **before go-live**. The shared warm PostgreSQL pool (alternative 8) is deleted once that is measured (owner decision 2026-10-15); the Rust/Wasm Edge and the native bootstrap relay follow after go-live.
+**Runtime.** Databases run on CloudNativePG. The native controller and gateway are deployed; EU's region switch (`compute_pool`) is on and EU1 keeps one prestarted sandbox slot. A measured first query below one second after idle through Cloudflare, delivered by the [parked sleep tier](parked-instances.md), is required **before go-live**. The parked tier replaces the shared warm PostgreSQL pool (alternative 8), which is deleted from the code (owner decision 2026-10-15); the Rust/Wasm Edge and the native bootstrap relay follow after go-live.
 
 **New nodes require thin storage**; there is no thick fallback for them. Retained thick volumes
 keep their backend and data. Thin activation needs a release-bound receipt from the
@@ -31,9 +31,9 @@ failure and density tests and material rotations then need the owner's go and an
 maintenance window, because a reboot of EU1 or control stops every awake database and the fleet has
 no region-wide maintenance lock; later acceptance uses dedicated test projects with stated limits.
 
-**Owner priority (2026-10-14):** deliver a sleeping Thin database's first SQL below one second through Cloudflare on a real shared-pool hit. Finish the required execution and data-preservation guards, deploy, and measure this path before broad acceptance repeats, density work or independent administrative features. Reuse valid completed checks; repeat tests only for relevant changes, concrete failures or required CI. A thick-only hit or an already-awake connection does not complete the goal. The full customer-ready scope remains required afterwards.
+**Owner priority (2026-10-14):** deliver a sleeping Thin database's first SQL below one second through Cloudflare on a runtime that already exists (a parked Pod; the shared pool this text first named is deleted). Finish the required execution and data-preservation guards, deploy, and measure this path before broad acceptance repeats, density work or independent administrative features. Reuse valid completed checks; repeat tests only for relevant changes, concrete failures or required CI. A thick-only hit or an already-awake connection does not complete the goal. The full customer-ready scope remains required afterwards.
 
-**Owner priority update (2026-10-15):** the first query after idle must answer in 1–2 s, measured live and tested; this is the most important goal for going live. The parked sleep tier is the vehicle (a sleeping database keeps its Pod warm), the shared pool code is deleted if it does not serve that goal, and the parked capacity per server is measured and reported.
+**Owner priority update (2026-10-15):** the first query after idle must answer in 1–2 s, measured live and tested; this is the most important goal for going live. The parked sleep tier is the vehicle (a sleeping database keeps its Pod warm), the shared pool code is deleted, and the parked capacity per server is measured and reported.
 
 ## Delivery architecture
 
@@ -86,7 +86,7 @@ no region-wide maintenance lock; later acceptance uses dedicated test projects w
 | Thin database, first pass | Under R2.9 a new Thin database committed 1,000 rows through Cloudflare (its first start went through a protective sleep after a withdrawn startup authority), a manually started base backup and WAL reached R2, a restore returned the same digest and delete reclaimed both volumes. |
 | Daily infrastructure backup | D1 and EU etcd verified in R2; complete on 2026-10-13 (148.3 s) and 2026-10-15 (331.8 s). |
 | API reads | Database placement and conjunctive filters, node and region reads, paginated release and patch history verified live; the three OpenAPI documents (public 112, agent 13, internal 21) cover all 146 operations of the deployed Worker (`22c0164`). |
-| Warm pool design | Owner approved [alternative 8](warm-postgres-pool.md) (PGCF-supervised PostgreSQL in pre-created pool Pods) on 2026-10-12. Its code is on main but not wired end to end (no emitter of its three runtime switches, producers only for two of ten qualification gates, no client admission in qualification mode); it is not on the go-live path. |
+| Shared warm pool | Owner approved alternative 8 (PGCF-supervised PostgreSQL in pre-created pool Pods) on 2026-10-12 and decided on 2026-10-15 that the parked tier replaces it. It was never live: no release, switch, namespace or deployed binary had it. Its supervisor crate and image profile, sandbox-controller modules, controller and gateway paths, API domain and routes, contracts and CI steps are deleted from main (git history is the archive); migration 0056 drops its 14 empty D1 tables. |
 | Green main | CI on `2bc6e55` passed every job and published all images (2026-10-15 13:47–14:33Z) after six fixes: the kernel and IO fixtures of the pool supervisor, the storage image built in `check`, the sandbox proof and node-runtime test images, the Cilium values pin, a scanner finding from a fixture field name, and the exporter-only driver kept as the qualified one. |
 | Wake floor on EU1 | PostgreSQL 18.6 clean start reaches ready in 111–117 ms (first SQL 136–169 ms); CNPG fence/unfence reaches accepting connections 226–305 ms after the annotation, Pod recreation takes 4.1–5.2 s; a fenced instance manager holds about 62 MB; in-place resize of requests keeps the Pod. |
 
@@ -120,12 +120,6 @@ Not gating go-live; ordered by expected need.
 - **Account separation (owner decision):** the Cloudflare account that holds PGCF's D1 and R2 is
   shared with unrelated projects; moving PGCF to its own account, or at least listing and pruning
   every token with D1, R2 or Workers write scope, removes that exposure.
-- **Shared warm pool (alternative 8):** the zero-RAM deep tier below the parked tier; needs the three
-  runtime switch emitters, the observation and sleep-record producers (branch `golive/obs-producer`
-  holds the first), five of the ten qualification gates (the gate analysis recommends reducing the
-  list to `host_mount_context`, `finite_creator_fence`, `single_writer`, `wal_archive`, `clean_stop`),
-  client admission for its first hit, host-extension changes with a reboot of both servers and a
-  thin requalification. Owner decision 2026-10-15: delete it once the parked tier's first query after idle is measured under 1 s (go-live step 5); the deletion order is in *Old code* below. Parked capacity then decides how many sleeping databases answer in about 1 s on one server (measured in the density run); the rest wake from full hibernation in 8–9 s.
 - **Capacity:** EU2 (owner's costed go) for redundancy and capacity; sleeping Thin overbooking,
   which needs an all-write bound beyond `io.max`; node drain, move with kept IDs and decommission.
 - **Operations:** alert history, acknowledgement, test send and evaluation of every region;
@@ -146,11 +140,9 @@ Not gating go-live; ordered by expected need.
   protocol):** an inventory against the live fleet (R2.11: route token 3, attestation V1, native
   controller and gateway, TypeScript relay and edge) orders the deletions:
   1. Optional fields, fallbacks and unused tools with no live dependency.
-  2. The shared pool after the sub-second gate, if it stays unused: 123 pool-only files, pool
-     sites in 106 shared files and a migration that drops its 14 empty tables. The native reclaimer crate goes first (owner approved 2026-10-15; nothing deploys it).
-  3. Retire us-dev; its cancelled US1 still posts observations with its agent key.
-  4. Route token v2, then v3 and attestation V1 after a release with v4 and a v4 edge.
-  5. The TypeScript agent and gateway, then the TypeScript relay and edge once their native
+  2. Retire us-dev; its cancelled US1 still posts observations with its agent key.
+  3. Route token v2, then v3 and attestation V1 after a release with v4 and a v4 edge.
+  4. The TypeScript agent and gateway, then the TypeScript relay and edge once their native
      replacements are released.
   Host-extension items wait for the next unavoidable extension change.
 
@@ -235,7 +227,7 @@ samples; a node addition; a volume at 80 % or thin data at its reserve; a data-s
 retained database changing state; overlap with thin qualification, a rollout or the 03:00 backups.
 
 **Prerequisites.** Go-live steps 2–6; retained databases suspended; `autoscale_enabled` false, no
-held node addition, purchases off. The run follows the warm pool, which changes P and idle RAM.
+held node addition, purchases off. The run follows the parked tier, which changes P and idle RAM.
 
 ## Thin storage qualification gates
 

@@ -336,8 +336,8 @@ quota until actual Ready, later RAM and Native LV/Pod IO-limit proof cover it. T
 startup writes and dirty writeback; established or sleeping databases do not permanently debit
 that quota. Mapping headroom includes these in-flight bytes and established writers' bounded
 64KiB chunk exposure. These holds reserve admission runway; they do not preallocate extents.
-The RAM peak includes PostgreSQL, the Barman limit and one assigned host allowance. Idle pool
-memory is already present in actual Node measurements and is not subtracted again. Permission
+The RAM peak includes PostgreSQL, the Barman limit and one assigned host allowance. Idle
+prestarted-slot memory is already present in actual Node measurements and is not subtracted again. Permission
 expiry and an operation timeout do not release uncertain capacity. Accepted readiness or a
 verified stopped runtime must be followed by later bound RAM and Native physical observations
 before their holds are released.
@@ -499,7 +499,7 @@ The default idle path remains Pod-cold hibernation. Administrators explicitly co
 with `GET`/`PUT /v1/databases/{id}/warm-reclaim` (`expected_revision`, `expected_generation`, and a
 nullable policy containing only idle seconds, episode budget and step bytes). PostgreSQL CPU/RAM
 ceilings continue to come from its effective resource policy. Warm idle retains the same running
-Pod, PostgreSQL, Barman and their active CPU accounting; it does not count as a shared-pool hit.
+Pod, PostgreSQL, Barman and their active CPU accounting.
 
 `GET`/`PUT /v1/nodes/{id}/warm-reclaim-qualification` records an independently accepted isolated
 worker proof bound to the current Node UID, boot, sealed cluster/material and selected release.

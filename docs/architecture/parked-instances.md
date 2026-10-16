@@ -13,9 +13,16 @@ the v1.30.1 tag (commit `2a35abb`, the version the repository pins); `cnpg-plugi
 to the plugin-barman-cloud v0.15.1 tag (pinned at `infra/platform/versions.lock.json:117`). `lab` is the
 [lab measurement section](#lab-measurements) at the end (EU1 of 2026-10-15). `plan` is
 `docs/architecture/cloudflare-convergence-and-serverless-plan.md`; `pool` is
-`docs/architecture/warm-postgres-pool.md`; `rt` is `docs/architecture/rust-runtime-and-cold-starts.md`.
+`docs/architecture/warm-postgres-pool.md` at that snapshot (deleted since; git history keeps it); `rt` is
+`docs/architecture/rust-runtime-and-cold-starts.md`.
 No effort or duration estimates appear anywhere in this document (AGENTS.md); all times are
 latencies or time-to-live values.
+
+The shared warm pool that this design compares itself with and stays compatible with (alternative 8:
+`pool`, the `postgres-pool*` modules and the `pool_*` tables) was deleted from the repository after
+this snapshot (owner decision 2026-10-15). Its citations point at the snapshot, and the coexistence
+rules written against it, such as `parked_json IS NULL` in pool claims, no longer have an
+implementation.
 
 ## 0. Decision summary
 
@@ -573,7 +580,7 @@ API-side lease presentation. Three rules, all in `apps/api`:
   `databases.ts:415-420`, and the hint is re-posted at the next controller pass).
   `hostStorageLease` emits for it `desired_state: "running"`, `write_blocked` computed as for a
   running database (the non-drain branch at `node-thin-storage.ts:950-960`: protected writer,
-  unresolved pool holder, missing or blocked node authority), `startup_*: null`, `drain: null`,
+  missing or blocked node authority), `startup_*: null`, `drain: null`,
   `volume: receipt`, and `runtime_authority:` a token signed for
   `(database, current generation, parked.pod_uid)`.
 - **R2 waking from parked.** When D1 is `desired_state='running'`, the power operation is a
@@ -1003,8 +1010,7 @@ claim):
   the page and its databases. One database: 10 sequential round trips became 3 (thick), 20 became
   9 (thin).
 - Item 12: the claim reads the database row with the admission read, the epoch once (it inserts only
-  a first one), no presence for its own mutation, the pool capability with the pool runs, and issues
-  no fence after a returned batch. The hint leaves at the commit, before the snapshot publish, and
+  a first one), no presence for its own mutation, and issues no fence after a returned batch. The hint leaves at the commit, before the snapshot publish, and
   the committed row and operation are not read back. From the call to the hint: 16 round trips
   became 7; to the registered waiter: 17 became 10.
 - Item 13: the push leaves at the commit, independent of the publish. A report is answered after at
@@ -1083,7 +1089,7 @@ Level: `PowerCoordinator::with_clock` against the in-process HTTPS Kubernetes do
 (`apps/native-controller/src/test_server.rs`, records every write and can drop the reply of one
 committed write) in `power.rs` `tls_tests`-style modules; plus the isolated real
 kube-apiserver/etcd fixture (`apps/native-controller/tests/run-kubernetes.py`, example
-`parked-kubernetes.rs` added to its allowed list).
+`parked-kubernetes.rs`, the only example it runs).
 
 | Test (name) | Level | Proves |
 | --- | --- | --- |

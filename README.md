@@ -38,7 +38,6 @@ states what runs where; it does not repeat measurements.
 | Bootstrap relay (EU control only)                | TypeScript (`apps/regional`) is deployed; the native replacement (`apps/native-bootstrap-relay`) is built and not deployed                             |
 | Database storage                                 | New databases use Thin LVM volumes on EU1; retained thick volumes keep their backend and data                                                          |
 | Idle sleep                                       | CNPG hibernation; the [parked sleep tier](docs/architecture/parked-instances.md) is implemented and the region policy `parked_tier` is its only switch |
-| Shared warm PostgreSQL pool                      | [Deferred](docs/architecture/warm-postgres-pool.md): its code is on main and not wired end to end; the parked tier is the path to a sub-second wake    |
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
 through the authenticated management API. Expansion requires ten fresh aligned consecutive
@@ -314,7 +313,6 @@ configuration fails explicitly. Unit tests do not replace the live acceptance re
   runtime architecture, verified routing and the cold-start design.
 - [Parked sleep tier](docs/architecture/parked-instances.md): the idle sleep that keeps the
   instance Pod and stops only PostgreSQL.
-- [Warm PostgreSQL pool](docs/architecture/warm-postgres-pool.md): the deferred shared pool design.
 - [Integrator handover](docs/operations/integrator-handover.md): the model, lifecycle API, client
   behaviour, limits, metering and recovery for an integrator that creates databases on PGCF.
 - [Source-backed diagrams](docs/architecture/mermaider/README.md): declared Cloudflare resources,

@@ -349,7 +349,7 @@ Rules of the database and Thin storage kinds:
 ## Minute cron heartbeat and watchdog
 
 The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
-`infrastructure_backup_dispatch`, then `admission_recovery`, `pool_role_recovery`,
+`infrastructure_backup_dispatch`, then `admission_recovery`,
 `resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `role_deletion_timeouts`,
 `idempotency_purge`, `region_hints`, `database_actors`, `usage`, `node_capacity`,
 `retained_archives`, `fleet_updates` and `fleet_rollouts`. Alerting needs only D1 and a bounded send, so it
