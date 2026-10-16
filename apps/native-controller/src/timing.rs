@@ -137,9 +137,155 @@ pub async fn summarized<F: std::future::Future>(db: &Value, work: F) -> F::Outpu
     }
     output
 }
+/// One decision of the pool about a wake (`wake_path`): its path, the reason of a miss or a
+/// refusal, the node and slot, and the milliseconds of each step reached.
+pub struct WakePath<'a> {
+    pub database: &'a str,
+    pub operation: &'a str,
+    pub generation: u64,
+    /// `gateway` or `desired`.
+    pub trigger: &'static str,
+    /// `pool_hit`, `pool_miss` or `refused`.
+    pub path: &'static str,
+    pub reason: Option<&'a str>,
+    pub node: &'a str,
+    pub slot: Option<&'a str>,
+    pub ms: &'a std::collections::BTreeMap<String, u64>,
+    pub agent_us: &'a std::collections::BTreeMap<String, u64>,
+}
+pub fn wake_path_event(path: &WakePath) -> Value {
+    json!({"event":"wake_path","database_id":path.database,"operation":path.operation,"generation":path.generation,"trigger":path.trigger,"path":path.path,"reason":path.reason,"node":path.node,"slot":path.slot,"ms":path.ms,"agent_us":path.agent_us,"at_ms":wall_clock_ms()})
+}
+/// How a released pool hit's ticket ended: `confirmed`, `refuted` or `expired`.
+pub fn wake_ticket_event(
+    database: &str,
+    operation: &str,
+    generation: u64,
+    outcome: &str,
+    after_ms: u64,
+) -> Value {
+    json!({"event":"wake_ticket","database_id":database,"operation":operation,"generation":generation,"outcome":outcome,"after_ms":after_ms,"at_ms":wall_clock_ms()})
+}
+/// A slot changed state: `creating`, `free`, `claimed` or `discarded`.
+pub fn pool_slot_event(
+    slot: &str,
+    node: &str,
+    state: &str,
+    reason: Option<&str>,
+    ms: Option<u64>,
+) -> Value {
+    json!({"event":"pool_slot","slot":slot,"node":node,"state":state,"reason":reason,"ms":ms,"at_ms":wall_clock_ms()})
+}
+/// The pool of one node.
+pub fn pool_state_event(node: &str, free: usize, creating: usize, serving: usize) -> Value {
+    json!({"event":"pool_state","node":node,"free":free,"creating":creating,"serving":serving,"at_ms":wall_clock_ms()})
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pool_events_name_their_path_ticket_slot_and_state() {
+        let ms = std::collections::BTreeMap::from([
+            ("attach".to_string(), 25_u64),
+            ("total".to_string(), 300),
+        ]);
+        let agent = std::collections::BTreeMap::from([("fsmount".to_string(), 900_u64)]);
+        let hit = wake_path_event(&WakePath {
+            database: "dbbbbbbbbbbbbbbbbbbb",
+            operation: "op_wwwwwwwwwwwwwwwwwwww",
+            generation: 5,
+            trigger: "gateway",
+            path: "pool_hit",
+            reason: None,
+            node: "n1",
+            slot: Some("0a1b2c3d"),
+            ms: &ms,
+            agent_us: &agent,
+        });
+        let at = hit["at_ms"].as_u64().unwrap();
+        assert!(at > 1_700_000_000_000);
+        assert_eq!(
+            hit,
+            json!({"event":"wake_path","database_id":"dbbbbbbbbbbbbbbbbbbb","operation":"op_wwwwwwwwwwwwwwwwwwww","generation":5,"trigger":"gateway","path":"pool_hit","reason":null,"node":"n1","slot":"0a1b2c3d","ms":{"attach":25,"total":300},"agent_us":{"fsmount":900},"at_ms":at})
+        );
+        let miss = wake_path_event(&WakePath {
+            path: "pool_miss",
+            reason: Some("no_free_slot"),
+            slot: None,
+            trigger: "desired",
+            ..WakePath {
+                ..hit_fields(&ms, &agent)
+            }
+        });
+        assert_eq!(miss["reason"], "no_free_slot");
+        assert_eq!(miss["slot"], Value::Null);
+        assert_eq!(miss["trigger"], "desired");
+        let ticket = wake_ticket_event(
+            "dbbbbbbbbbbbbbbbbbbb",
+            "op_wwwwwwwwwwwwwwwwwwww",
+            5,
+            "expired",
+            10_001,
+        );
+        assert_eq!(ticket["event"], "wake_ticket");
+        assert_eq!(ticket["database_id"], "dbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(ticket["outcome"], "expired");
+        assert_eq!(ticket["after_ms"], 10_001);
+        assert!(ticket["at_ms"].as_u64().is_some());
+        let slot = pool_slot_event("0a1b2c3d", "n1", "discarded", Some("replaced"), Some(12));
+        assert_eq!(
+            [
+                &slot["event"],
+                &slot["slot"],
+                &slot["node"],
+                &slot["state"],
+                &slot["reason"],
+                &slot["ms"]
+            ],
+            [
+                &json!("pool_slot"),
+                &json!("0a1b2c3d"),
+                &json!("n1"),
+                &json!("discarded"),
+                &json!("replaced"),
+                &json!(12)
+            ]
+        );
+        let state = pool_state_event("n1", 3, 1, 2);
+        assert_eq!(
+            [
+                &state["event"],
+                &state["node"],
+                &state["free"],
+                &state["creating"],
+                &state["serving"]
+            ],
+            [
+                &json!("pool_state"),
+                &json!("n1"),
+                &json!(3),
+                &json!(1),
+                &json!(2)
+            ]
+        );
+    }
+    fn hit_fields<'a>(
+        ms: &'a std::collections::BTreeMap<String, u64>,
+        agent: &'a std::collections::BTreeMap<String, u64>,
+    ) -> WakePath<'a> {
+        WakePath {
+            database: "dbbbbbbbbbbbbbbbbbbb",
+            operation: "op_wwwwwwwwwwwwwwwwwwww",
+            generation: 5,
+            trigger: "gateway",
+            path: "pool_hit",
+            reason: None,
+            node: "n1",
+            slot: Some("0a1b2c3d"),
+            ms,
+            agent_us: agent,
+        }
+    }
     fn waking_database() -> Value {
         json!({"id":"dbbbbbbbbbbbbbbbbbbb","desired_state":"running","power":{"operation":format!("op_{}","w".repeat(20)),"revision":3,"mode":"running","reason":null}})
     }
