@@ -219,12 +219,13 @@ export async function storageHolds(
   now = Date.now(),
 ) {
   const rows = await env.DB.prepare(
-    `SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.granted_at,h.ready_at,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
+    `SELECT h.operation_id,h.database_id,h.generation,h.storage_budget_bytes,h.granted_at,h.ready_at,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
   )
     .bind(nodeId, nodeUid)
     .all<{
       operation_id: string;
       database_id: string;
+      generation: number;
       storage_budget_bytes: number;
       granted_at: string;
       ready_at: string | null;
@@ -259,11 +260,13 @@ export async function storageHolds(
     count: rows.results.length,
     /** Starts the controller has not reported ready yet: each waits for the next inventory, which
      * carries its new Pod's io.max, and the controller cannot ready the database before that. */
-    waiting: rows.results.filter(
-      (hold) =>
-        hold.ready_at === null &&
-        now - Date.parse(hold.granted_at) <= THIN_START_WAIT_SECONDS * 1000,
-    ).length,
+    waiting: rows.results
+      .filter(
+        (hold) =>
+          hold.ready_at === null &&
+          now - Date.parse(hold.granted_at) <= THIN_START_WAIT_SECONDS * 1000,
+      )
+      .map(({ database_id, generation }) => ({ database_id, generation })),
     newVolumes: unknownVolumes,
     ids: new Set(rows.results.map((r) => r.database_id)),
     operations: rows.results.map((r) => r.operation_id),
@@ -1386,11 +1389,16 @@ export async function issueThinStorageTransport(
   return NodeBootstrapTransport.parse({ ...singleton, token: tokens[0] });
 }
 
-/** Ask the node's NodeBootstrap for an identity turn now instead of at its cadence. */
-export async function requestThinStorageTurn(env: Env, nodeId: string) {
+/** Ask the node's NodeBootstrap for an identity turn now instead of at its cadence. The starts that
+ * wait for it, if any, supersede a running turn that read their databases before they began. */
+export async function requestThinStorageTurn(
+  env: Env,
+  nodeId: string,
+  waiting: readonly { database_id: string; generation: number }[] = [],
+) {
   await env.NODE_BOOTSTRAP.get(
     env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
-  ).thinStorageDue(nodeId);
+  ).thinStorageDue(nodeId, waiting);
 }
 /** A thin database just placed on a node, or starting there again, needs the node's next identity
  * proof: only a proof reads a new volume into its receipt or measures the Pod writing to it, and the

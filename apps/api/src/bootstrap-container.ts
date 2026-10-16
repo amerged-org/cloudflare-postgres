@@ -26,7 +26,11 @@ import {
   prepareThinStorageLease,
   readThinStorageLeaseRow,
 } from "./domain/node-thin-storage-execution.ts";
-import { NodeId, THIN_INVENTORY_INTERVAL_SECONDS } from "@pgcf/contracts";
+import {
+  DatabaseId,
+  NodeId,
+  THIN_INVENTORY_INTERVAL_SECONDS,
+} from "@pgcf/contracts";
 import {
   failThinQualificationTurn,
   prepareThinQualificationTurn,
@@ -276,6 +280,17 @@ const TURN_REQUEST_MS = 10_000,
   TURN_POLL_MS = 2_000;
 /** A requested identity turn starts no sooner than this after the previous turn started. */
 const THIN_TURN_SPACING_MS = 10_000;
+/** The container's record of a turn it ended early on request. */
+const THIN_TURN_CANCELLED = "thin_storage_turn_cancelled";
+/** The starts whose holds wait for the node's next identity proof. */
+const WaitingThinStarts = z
+  .array(
+    z.strictObject({
+      database_id: DatabaseId,
+      generation: z.number().int().positive(),
+    }),
+  )
+  .max(1000);
 /** What the container's own record proves about one exact turn. Only a record of no turn or of
  * another turn proves it is not running; a body still arriving or no readable record proves nothing. */
 export function executorTurnObservation(raw: unknown, turn: NodeExecutorTurn) {
@@ -301,6 +316,11 @@ async function statusIdentifierHash(value: string) {
 }
 
 export class NodeBootstrap extends DurableObject<Env> {
+  /** The read-only identity turn this instance follows now: the generation of each database its input
+   * was read with, and how to supersede it. Memory only: a restarted instance follows no turn. */
+  #thinTurn:
+    | { generations: ReadonlyMap<string, number>; supersede: () => void }
+    | undefined;
   async rotateRegionAuthority(value: FleetRegionMaterialRotationInput) {
     const input = FleetRegionMaterialRotationInput.parse(value);
     if (
@@ -497,6 +517,19 @@ export class NodeBootstrap extends DurableObject<Env> {
     const current = await thinStorageInput(this.env, nodeId);
     if (current.lease.revision !== input.lease.revision)
       throw new Error("thin_storage_container_input_changed");
+    // Only a turn without a pool action may end early: its every command is a read, so ending it leaves
+    // no write whose outcome is uncertain. A turn with an action always runs to its own end.
+    const superseded =
+      current.lease.action === null
+        ? new Promise<void>((supersede) => {
+            this.#thinTurn = {
+              generations: new Map(
+                current.lease.databases.map((d) => [d.id, d.generation]),
+              ),
+              supersede,
+            };
+          })
+        : undefined;
     // The container bearer is fixed at start. A separate current lease bearer is only inside private input.
     const outcome = await this.#executorTurn(
       container,
@@ -509,8 +542,13 @@ export class NodeBootstrap extends DurableObject<Env> {
         revision: current.lease.revision,
       },
       95_000,
-    );
-    if (outcome.state === "failed")
+      superseded,
+    ).finally(() => {
+      this.#thinTurn = undefined;
+    });
+    const cancelled =
+      outcome.state === "failed" && outcome.error_code === THIN_TURN_CANCELLED;
+    if (outcome.state === "failed" && !cancelled)
       console.warn(
         JSON.stringify({
           event: "thin_storage_executor_failed",
@@ -538,16 +576,32 @@ export class NodeBootstrap extends DurableObject<Env> {
           ? outcome.error_code
           : "thin_storage_executor_unconfirmed";
     if (
+      cancelled ||
       outcome.state === "absent" ||
       (code !== null && TRANSIENT_THIN_STORAGE_FAILURES.has(code))
     ) {
-      // Not running here, or stopped on a transient failure: only this lease ends now, the node stays
-      // ready and the next turn reads a dispatched action back.
+      // Superseded, not running here, or stopped on a transient failure: only this lease ends now, the
+      // node stays ready and the next turn reads a dispatched action back.
       await this.env.DB.prepare(
         "UPDATE node_thin_storage SET lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
       )
         .bind(nodeId, current.lease.operation_id, current.lease.revision)
         .run();
+      if (cancelled) {
+        // Not a failure: the next turn starts at once, and the spacing counts from that turn.
+        console.log(
+          JSON.stringify({
+            event: "thin_storage_turn_superseded",
+            node_id: nodeId,
+            turn_ms: Date.now() - startedAt,
+          }),
+        );
+        await this.ctx.storage.transaction(async (storage) => {
+          await storage.delete("thinStorageStartedAt");
+          await storage.setAlarm(Date.now());
+        });
+        return;
+      }
       const failures = await this.#retryThinStorageTurn();
       console.warn(
         JSON.stringify({
@@ -610,10 +664,16 @@ export class NodeBootstrap extends DurableObject<Env> {
     });
   }
   /** Cloudflare needs an identity proof now: a refused sample, a needed growth, a ready thin
-   * database without a receipt or a start whose hold waits for one. A turn already running keeps
-   * running; the next one starts now, but no sooner than 10 s after the previous one started. */
-  async thinStorageDue(nodeId: string) {
+   * database without a receipt or a start whose hold waits for one. The next turn starts now, but no
+   * sooner than 10 s after the previous one started. A running turn keeps running, except a read-only
+   * one whose input has a waiting start's database at an older generation or not at all: its report
+   * could never be accepted, so it is superseded and the next turn starts at once. */
+  async thinStorageDue(
+    nodeId: string,
+    waiting: readonly { database_id: string; generation: number }[] = [],
+  ) {
     NodeId.parse(nodeId);
+    const starts = WaitingThinStarts.parse(waiting);
     if (
       !this.ctx.id.equals(
         this.env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
@@ -642,6 +702,16 @@ export class NodeBootstrap extends DurableObject<Env> {
       );
       if (alarm === null || alarm !== dueAt) await storage.setAlarm(dueAt);
     });
+    // After the demand is recorded, so the superseded turn's own alarm comes last.
+    const running = this.#thinTurn;
+    if (
+      running &&
+      starts.some(
+        (start) =>
+          (running.generations.get(start.database_id) ?? 0) < start.generation,
+      )
+    )
+      running.supersede();
   }
   /** One bounded scratch qualification turn in this run's own container. */
   async thinQualification(runId: string, step: string) {
@@ -801,7 +871,9 @@ export class NodeBootstrap extends DurableObject<Env> {
   }
   /** Register one executor turn, then follow the container's own record of it. No request is held
    * for the turn, so a lost answer is read again; only a record of no or another turn ends the wait
-   * early. The container runs one turn at a time and refuses another while this one runs. */
+   * early. The container runs one turn at a time and refuses another while this one runs. Once
+   * `superseded` resolves, the container is asked to end the turn, and its record then says how the
+   * turn ended. */
   async #executorTurn(
     container: NonNullable<DurableObjectState["container"]>,
     bearer: string,
@@ -809,6 +881,7 @@ export class NodeBootstrap extends DurableObject<Env> {
     input: unknown,
     turn: NodeExecutorTurn,
     timeoutMs: number,
+    superseded?: Promise<void>,
   ): Promise<
     | { state: "succeeded" }
     | { state: "absent" }
@@ -864,7 +937,28 @@ export class NodeBootstrap extends DurableObject<Env> {
         );
         return { state };
       }
-      await scheduler.wait(Math.min(TURN_POLL_MS, remaining));
+      const cancel = await Promise.race([
+        scheduler.wait(Math.min(TURN_POLL_MS, remaining)).then(() => false),
+        ...(superseded ? [superseded.then(() => true)] : []),
+      ]);
+      if (cancel) {
+        superseded = undefined;
+        // The container answers once the turn has ended; a lost answer only leaves the record to read.
+        const answer = await Promise.race([
+          port
+            .fetch(
+              new Request("http://localhost:8080/v1/turn/cancel", {
+                method: "POST",
+                headers: { authorization, "content-type": "application/json" },
+                body: JSON.stringify(turn),
+                signal: AbortSignal.timeout(TURN_REQUEST_MS),
+              }),
+            )
+            .catch(() => null),
+          scheduler.wait(TURN_REQUEST_MS).then(() => null),
+        ]);
+        await answer?.body?.cancel();
+      }
     }
   }
   /** The container's own turn record, or null when no readable answer arrived in time. */

@@ -535,7 +535,9 @@ it("asks for an identity turn at every sample while a start waits for a proof, a
     },
   };
   await identityProof(f, { physical });
-  DatabaseWithOperation.parse(await (await f.create()).json());
+  const created = DatabaseWithOperation.parse(
+    await (await f.create()).json(),
+  ).database;
   // The placement asked for its own turn; a sample is what asks while the start still waits.
   await forgetTurns(f);
   const accepted = NodeStorageHeadroomResponse.parse(
@@ -546,13 +548,14 @@ it("asks for an identity turn at every sample while a start waits for a proof, a
   // A start older than two minutes is a stuck one, not a wait for the next proof.
   const identity = (await readCurrentNodeThinStorage(f.local, f.node))!
     .authority;
-  expect((await storageHolds(f.local, f.node, f.uid, identity)).waiting).toBe(
-    1,
-  );
+  // Each waiting start with the generation it starts, which a running turn must have read.
+  expect(
+    (await storageHolds(f.local, f.node, f.uid, identity)).waiting,
+  ).toEqual([{ database_id: created.id, generation: created.generation }]);
   expect(
     (await storageHolds(f.local, f.node, f.uid, identity, Date.now() + 121_000))
       .waiting,
-  ).toBe(0);
+  ).toEqual([]);
   // The proof that evidences the Pod lets the controller report the database ready.
   await env.DB.prepare(
     "UPDATE database_start_admissions SET ready_at=?,ready_sample_observed_at=? WHERE node_id=?",
