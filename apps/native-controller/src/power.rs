@@ -66,8 +66,20 @@ impl std::fmt::Display for Fault {
 }
 impl std::error::Error for Fault {}
 impl From<Error> for Fault {
-    fn from(_: Error) -> Self {
-        Self::Unavailable("power_step_unavailable")
+    /// A write the API server refused says how: a conflict, a refusal of an admission webhook,
+    /// a server that failed (the operator's webhooks being down is one). The rest is unavailable.
+    fn from(error: Error) -> Self {
+        Self::Unavailable(
+            match error
+                .downcast_ref::<crate::kubernetes::KubernetesError>()
+                .map(|refused| refused.status)
+            {
+                Some(409) => "kubernetes_conflict",
+                Some(500..=599) => "kubernetes_server_error",
+                Some(400..=499) => "kubernetes_rejected",
+                _ => "power_step_unavailable",
+            },
+        )
     }
 }
 type Result<T> = std::result::Result<T, Fault>;
@@ -3603,6 +3615,23 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn a_refused_write_is_told_from_a_conflict_and_from_a_server_that_failed() {
+        // The Cluster write that unfences is two admission webhooks of the CNPG operator long: an
+        // operator that is down refuses it with a server error, which no read of the Cluster
+        // cures, and a conflict is cured by one.
+        let reason = |status: u16| -> String {
+            let error: Error = Box::new(crate::kubernetes::KubernetesError { status });
+            Fault::from(error).to_string()
+        };
+        assert_eq!(reason(409), "kubernetes_conflict");
+        assert_eq!(reason(500), "kubernetes_server_error");
+        assert_eq!(reason(503), "kubernetes_server_error");
+        assert_eq!(reason(422), "kubernetes_rejected");
+        assert_eq!(reason(403), "kubernetes_rejected");
+        let other: Error = "the connection ended".into();
+        assert_eq!(Fault::from(other).to_string(), "power_step_unavailable");
     }
     #[test]
     fn authoritative_typescript_persisted_phase_traces_roundtrip_without_losing_proof() {

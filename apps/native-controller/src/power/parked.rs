@@ -1125,7 +1125,11 @@ impl PowerCoordinator {
         );
         match &unfenced {
             Ok(()) => lift.completed(),
-            Err(_) => lift.failed(),
+            Err(why) => {
+                let mut lift = lift;
+                lift.note("reason", why.to_string());
+                lift.failed();
+            }
         }
         // A resize that did not land is retried by the next pass of the wake, which keeps the
         // record; the unfence either landed, and is read back, or was not written.
