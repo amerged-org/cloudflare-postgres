@@ -7,6 +7,10 @@ rust-version = "1.99"
 license = "Apache-2.0"
 publish = false
 
+[[bin]]
+name = "pgcf-attach"
+path = "src/attach/main.rs"
+
 [dependencies]
 webpki-roots = "=1.0.9"
 pgcf-native-protocol = { path = "../../packages/native-protocol" }
@@ -26,6 +30,10 @@ sha2 = "=0.11.0"
 hmac = "=0.13.0"
 base64 = "=0.23.1"
 time = { version = "=0.3.55", features = ["formatting", "parsing"] }
+httparse = "=1.10.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.190"
 
 [dev-dependencies]
 tokio-rustls = {version="=0.26.6",default-features=false,features=["ring","tls12"]}
