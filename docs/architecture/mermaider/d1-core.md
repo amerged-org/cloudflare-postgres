@@ -123,5 +123,6 @@ erDiagram
 - [apps/api/migrations/0054_role_lifecycle.sql:1](../../../apps/api/migrations/0054_role_lifecycle.sql#L1)
 - [apps/api/migrations/0055_start_admission_attestation.sql:1](../../../apps/api/migrations/0055_start_admission_attestation.sql#L1)
 - [apps/api/migrations/0056_drop_postgres_pool.sql:1](../../../apps/api/migrations/0056_drop_postgres_pool.sql#L1)
+- [apps/api/migrations/0057_fleet_release_thin_facts.sql:1](../../../apps/api/migrations/0057_fleet_release_thin_facts.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.
