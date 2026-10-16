@@ -43,30 +43,6 @@ and a vector-distance query. It does not connect to Dev or qualify a live upgrad
 The repository's single CI workflow must qualify the complete image and publish its
 immutable registry digest before any configured regional image pin uses it.
 
-The pool supervisor's `pgdata`, `readonly`, `inspection`, `readonly_deadline` and
-`readonly_lookup_deadline` Rust tests require actual PostgreSQL data or owned
-read-only/suspended device fixtures. They are selected explicitly rather than run
-by ordinary workspace tests. Compile their executables in the pinned Rust builder:
-
-```sh
-cargo test --locked -p pgcf-pool-supervisor --features real-fixtures --no-run
-```
-
-Run the selected executable inside the pinned PostgreSQL image with its actual
-fixture mounted. For example, the `pgdata` executable uses real `initdb` and a
-non-root writable fixture directory:
-
-```sh
-PGCF_TEST_ROOT=/actual-fixture "$PGCF_PGDATA_TEST_BINARY"
-```
-
-The read-only tests use `PGCF_TEST_READONLY_ROOT`; the two suspended-device tests
-use `PGCF_TEST_BLOCKED_ROOT` and `PGCF_TEST_COLD_ROOT`, respectively. Missing fixture
-setup remains a hard failure. Compilation and ordinary workspace CI do not claim
-these physical checks passed. The supervisor's CLI and agent-frame tests remain
-part of ordinary workspace tests; the separate local PG/Barman/S3 driver remains
-`apps/pool-supervisor/tests/docker_accept.py`.
-
 Existing databases still need a coordinated engine image rollout and
 `ALTER EXTENSION vector UPDATE` where vector is installed. An image replacement
 alone does not change an existing database's extension catalog version. Preserve
