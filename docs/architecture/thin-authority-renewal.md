@@ -190,7 +190,27 @@ NodeBootstrap alarm to now instead of waiting for the cadence.
 
 - **Host guard:** unchanged. It fetches `/agent/v1/nodes/{id}/storage-guard` every second
   (sc/storage.rs:563-603, sc/policy.rs:251-253), and `hostStorageLease` signs from the current
-  composed authority (dom/node-thin-storage.ts:239-432).
+  composed authority (dom/node-thin-storage.ts:239-432). A token lives `guard_seconds` from the
+  nonce issue of the sample it was signed from, and a fetch's duration comes out of that life, so
+  the lease has to be cheap. It reads the node once and every database's rows and inputs (pool
+  holders, startup holds, wake operations) in one batch, whatever their number, and computes each
+  entry in memory with the function the fast sample's token loop and the desired page use: the
+  Worker's local D1 harness counts nine statements in six round trips for a node with three live
+  databases and for one with forty live and a hundred deleted ones (570 statements before). Each
+  lease and each accepted sample logs its own time (`storage_guard_served` with `elapsed_ms`, the
+  entry and tombstone counts and one compact line per live entry; `handler_ms` on
+  `thin_storage_sample_accepted`).
+- **Deleted databases leave the lease.** The guard forgets a retained signed scope only from an
+  accepted lease that names its database deleted, writable and without a volume
+  (`retirement_scope`, sc/storage.rs@e4b8873:500-529), and acts on it within its next 100 ms tick; it
+  fetches every 6 s at most (5 s client timeout, 1 s sleep) and keeps a lease for at most 120 s. A
+  tombstone is therefore served for one hour from the row's confirmation, which a fresh complete
+  absence read gates, and then no longer: a guard that fetches at all within that hour still gets
+  the entry it needs, and one cut off for longer has stopped every Pod already. A deleted database
+  that never had a volume receipt never had a token, so no scope exists for it and it is not named
+  at all; an unconfirmed deletion keeps its entry, which blocks writes and carries the drain. The
+  contract caps a lease at 4096 databases and the guard refuses a body over 2 MiB, which the
+  previously unbounded tombstones would have reached.
 - **Gateway:** the controller writes each returned token into `storage-<id>`
   (nc/reconcile.rs:543-560). Writes are monotonic: a token never replaces one with a higher
   `authority_revision`, because the gateway disconnects on a regression (np/storage.rs:234-256) and a
@@ -263,6 +283,8 @@ dom/storage-capacity.ts:265-270, ct/database-storage.ts:353-379, nc/reconcile.rs
 | Node reboot | New boot ID: samples refused, and the host guard rejects leases of the old boot (sc/storage.rs:183-187). Authority returns only after the fleet path confirms the fresh boot (plan:130-139) and a slow proof on that boot. |
 | Driver Pod replaced (patch, eviction) | New driver Pod UID: samples refused until a slow proof re-reads binaries and identity. |
 | Slow turns failing transiently | Identity stays valid until its expiry while turns retry; writes stop only if no proof succeeds within 300 s. |
+| A lease that is slow or fails (D1 queueing, a Worker restart, the guard's 5 s timeout) | The guard keeps its last accepted lease and each entry runs down to its own token's expiry, at most `guard_seconds` after the nonce it was signed from, minus the lease's age at receipt; then it stops the Pod's tasks and freezes the volume (sc/storage.rs@e4b8873:579-595, 764-877). Every thin database of the node is affected alike, and the controller stops one whose token its samples stopped renewing. The lease's cost does not depend on the number of databases. |
+| One entry of a lease the guard refuses | The guard accepts a lease whole or not at all (sc/storage.rs@e4b8873:182-365): a token that fails verification, names another Pod at the same or a lower generation than the one accepted before, or differs at an authority revision it already holds refuses every entry, and a token for a Pod the sandbox runtime has not assigned is dropped by the persistence step before acceptance (sc/storage.rs@e4b8873:701-708, sc/controller.rs@e4b8873:779-806). The other entries then run down as above. |
 
 ## 7. Trust argument
 
@@ -318,10 +340,13 @@ evidence of that Pod while
    `max(startup_reserve_bytes, quota)` and is released only after a later slow proof shows the Pod's
    `io.max` within the profile (dom/storage-capacity.ts:463-507, dom/startup-admission.ts:256-279);
 2. the immutable receipt exists and its LV is a thin LV of the identity proof;
-3. the controller's runtime attestation of this generation names the Pod together with the receipt's
-   storage, claim, volume, namespace and CNPG Cluster UIDs, the Kubernetes cluster UID and the
-   identity proof's boot. The Actor already routes by that attestation, and hold release already
-   cross-checks it (dom/storage-capacity.ts:430-432);
+3. the controller's runtime attestation names the Pod together with the receipt's storage, claim,
+   volume, namespace and CNPG Cluster UIDs, the Kubernetes cluster UID and the identity proof's
+   boot, for the start's generation or a later one. The Actor already routes by that attestation,
+   and hold release already cross-checks it (dom/storage-capacity.ts:430-432). A ready report
+   without an attestation clears the row's attestation, so the hold remembers the one of the last
+   accepted ready report (`database_start_admissions.attested_json`), used only while the row has
+   none;
 4. the composed authority is current with `write_allowed`.
 
 A thin LV maps at most its virtual size, and the hold debits at least that from admission until IO
@@ -334,6 +359,19 @@ response to the ready observation removes that period from the first SQL.
 A create still needs one slow turn after its claim binds, because only the slow readback establishes
 the receipt's LV UUID (dom/node-thin-storage-execution.ts:691-725); Cloudflare starts that turn at
 once. The rule does not depend on the renewal source.
+
+**A generation that starts nothing.** A role creation, a password reset and a role removal advance
+the row's generation while the Pod keeps running, and the identity proof names the database at the
+generation it was prepared for, up to a minute and a half behind. Every start of a Pod has a
+startup hold of its generation, so while no hold is newer than the one the Pod was started for,
+that hold, the controller's attestation of that start or a later generation, and the node's
+reading of an earlier generation (exactly one Pod on the receipt's volume, inside the profile's
+limits, not frozen) still name the writer, and the token of the new generation is signed for it.
+The grant of a start under way follows the newest start at or below the row's generation in the
+same way, and so does the fast wake's token for a parked Pod, whose operation is the generation
+after the parked one. When the node's reading and the controller's attestation name different
+Pods, or a protective stop's marker is set, nothing is carried: a protective stop is released only
+by a start of its own. The identity proof prepared at the new generation takes over unchanged.
 
 ## 9. Delivery
 

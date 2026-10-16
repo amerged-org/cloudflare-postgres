@@ -543,7 +543,8 @@ the window ends with the controller's stop observation or the operation's timeou
 lease through `storage.rs` also showed that a wake from parked that later takes the slow path at the
 same generation leaves the replacement Pod unpermitted. Fix: the wake token for the parked Pod is
 issued only when the parked record claims `wake: "fast"` and the database generation is exactly the
-parked generation plus one; every other wake retires the parked Pod and starts a new one. The stop
+parked generation plus one (the row may be ahead of it by role changes, which start nothing); every
+other wake retires the parked Pod and starts a new one. The stop
 window accepts the same evidence as the running token: the Pod a node reading measured, or before
 any reading the held writer (startup hold plus the controller's attestation). Two limits remain on
 thin volumes: a database that parks before the first reading after its start gets no parked token
