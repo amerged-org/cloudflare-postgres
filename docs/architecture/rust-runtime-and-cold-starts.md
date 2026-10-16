@@ -231,13 +231,14 @@ Successful proxy-side authentication cannot bypass PostgreSQL's authentication o
 
 ## 12. Additional warm reclaim
 
-**Status.** The API policy and the host publisher are implemented; the node reclaimer binary was deleted
-(2026-10-15), no node is qualified and no database carries a policy. This mode is additional to
+**Status.** The API policy is implemented; the node reclaimer binary was deleted (2026-10-15) and so
+was the host extension's publisher (source; the deployed extension keeps publishing until the next
+host release). No node is qualified and no database carries a policy. This mode is additional to
 the parked tier. It may optimize an already assigned idle runtime.
 
 Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/zswap_config.go).
 
-**Status (2026-10-15).** The node-local reclaimer binary and its image were deleted; no release contained it and nothing deployed it. The control-plane half remains: the API's per-database policy and per-node qualification endpoints, the signed reclaim scopes, the host extension's reclaim publisher and the Actor's revoke barrier. Qualification requires a `node-reclaimer` image component in the release specification, so no node can qualify until a consumer is built again and passes its own Dev acceptance.
+**Status (2026-10-15).** The node-local reclaimer binary and its image were deleted; no release contained it and nothing deployed it. The control-plane half remains: the API's per-database policy and per-node qualification endpoints, the signed reclaim scopes and the Actor's revoke barrier. The host extension's publisher is gone as well: it polled `GET /agent/v1/nodes/{id}/reclaim` four times a second and fsynced a task snapshot that no process read. Qualification requires a `node-reclaimer` image component in the release specification, so no node can qualify until a consumer and its publisher are built again and pass their own Dev acceptance.
 
 A node-local reclaimer is a separate DaemonSet/binary on explicitly approved worker nodes. It is not part of the regional controller Pod and does not give the controller a writable host cgroup mount. The current control-plane/worker baseline remains outside the swap/reclaim trial; enable the trial only on a separately accepted, isolated Dev worker.
 

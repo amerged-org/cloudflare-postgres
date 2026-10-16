@@ -262,8 +262,6 @@ export async function runSandboxProof() {
         "actual_PostgreSQL_18_6_long_SQL_stopped_without_CF_or_Kube_API",
         "material_revision_reload_preserves_running_SQL_and_expiry",
         "retired_physical_scope_survives_normal_CRI_remove_and_restart",
-        "readonly_reclaimer_host_CRI_PID_mapping_verified",
-        "unprivileged_reclaimer_private_inputs_and_controls_denied",
       ].every((key) => result[key] === true) ||
       evidence.filter((x) => x.assignment_mode === "prestarted").length !== 2 ||
       evidence.filter((x) => x.assignment_mode === "on_demand").length !== 1 ||
@@ -295,7 +293,6 @@ export async function runSandboxProof() {
         actual_long_SQL_stopped: true,
         continuous_guard_material_reload: true,
         removed_scope_restart_protection: true,
-        least_privilege_reclaimer_boundary: true,
         storage_expiry_stop_ms:
           Math.round(result.storage_expiry_stop_ms * 1000) / 1000,
         all_tasks_deleted: true,

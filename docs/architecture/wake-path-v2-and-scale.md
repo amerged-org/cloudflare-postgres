@@ -399,7 +399,8 @@ experiment (it removes a known 6.2 statements/s per node).
   stalled write behind a parked Pod's flush stopped the fetches within two leases; the fetch loop is
   now a thread of its own that accepts first and records afterwards (`sc/intake.rs`, source on
   branch `golive/host-guard-r3`; effective with the next host extension release and a new thin
-  qualification).
+  qualification). The reclaim poller and its 250 ms fsynced publication are deleted from that source
+  (the snapshot had no reader).
 - Host guard fixes that need an extension release: one bad lease entry must not refuse every entry
   (`accept` is all-or-nothing), `remember_storage_authority` must tolerate Pods not yet assigned (one such
   token starves every other database's renewals), a sticky `stopped` per Pod UID, fetch errors are silent.

@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
     tonic_prost_build::configure()
-        .build_client(true)
+        .build_client(false)
         .build_server(false)
         .disable_comments(["."])
         .compile_protos(&["proto/cri.proto"], &["proto"])?;

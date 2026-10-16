@@ -177,33 +177,6 @@ impl Client {
     pub fn local(&self) -> &Cloudflare {
         &self.local
     }
-    #[cfg(target_os = "linux")]
-    pub async fn reclaim_intents(&self) -> Result<serde_json::Value, Status> {
-        let mut response = self
-            .http
-            .get(format!(
-                "{}/agent/v1/nodes/{}/reclaim",
-                self.local.api_url.trim_end_matches('/'),
-                self.local.node_id
-            ))
-            .bearer_auth(&self.key)
-            .send()
-            .await
-            .map_err(|_| Status::unavailable("reclaim_intents_unavailable"))?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(Status::permission_denied("reclaim_intents_refused"));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err(Status::resource_exhausted(
-                    "bounded_reclaim_intents_exceeded",
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| invalid())
-    }
     pub fn new(local: Cloudflare) -> Result<Self, Status> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let url = reqwest::Url::parse(&local.api_url).map_err(|_| invalid())?;
@@ -284,25 +257,6 @@ impl Client {
             body.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&body).map_err(|_| invalid())
-    }
-    #[cfg(target_os = "linux")]
-    pub async fn report_reclaim(&self, report: &serde_json::Value) -> Result<(), Status> {
-        let response = self
-            .http
-            .post(format!(
-                "{}/agent/v1/nodes/{}/reclaim-observations",
-                self.local.api_url.trim_end_matches('/'),
-                self.local.node_id
-            ))
-            .bearer_auth(&self.key)
-            .json(report)
-            .send()
-            .await
-            .map_err(|_| Status::unavailable("reclaim_observation_unconfirmed"))?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(Status::permission_denied("reclaim_observation_refused"));
-        }
-        Ok(())
     }
     pub async fn lease(&self) -> Result<Authority, Status> {
         let mut response = self

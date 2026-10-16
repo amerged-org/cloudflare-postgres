@@ -5,7 +5,6 @@ ARG POSTGRES_FIXTURE
 FROM --platform=linux/amd64 ${POSTGRES_FIXTURE} AS postgres
 FROM ${RUST_BUILDER} AS build
 ARG RUST_VERSION
-ARG POSTGRES_FIXTURE
 RUN apk add --no-cache protobuf=31.1-r1 protobuf-dev=31.1-r1
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -19,7 +18,7 @@ COPY packages/native-protocol/ packages/native-protocol/
 COPY packages/contracts/native/ packages/contracts/native/
 RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && cargo build --release --locked -p pgcf-node-runtime \
- && PGCF_POSTGRES_FIXTURE_IMAGE="$POSTGRES_FIXTURE" cargo build --release --locked -p pgcf-sandbox-controller --example containerd-proof
+ && cargo build --release --locked -p pgcf-sandbox-controller --example containerd-proof
 FROM ${RUST_BUILDER} AS proof
 ARG CONTAINERD_ASSET
 ARG CONTAINERD_SHA256

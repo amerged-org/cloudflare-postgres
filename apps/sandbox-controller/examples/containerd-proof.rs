@@ -265,61 +265,9 @@ async fn child_controller(base: PathBuf) -> Result<(), Box<dyn std::error::Error
         storage_receiver,
     ));
     let mut storage_epoch = Vec::new();
-    let host = pgcf_sandbox_controller::host_proc::HostProc::inherited()?;
-    let mut reclaim_proved = false;
     loop {
         if configuration_updates.has_changed().unwrap_or(false) {
             local = configuration_updates.borrow_and_update().local().clone();
-        }
-        if !reclaim_proved && let Ok(bytes) = fs::read(base.join("reclaim-proof.json")) {
-            let request: serde_json::Value = serde_json::from_slice(&bytes)?;
-            let cri_pid = request["cri_pid"].as_u64().unwrap() as u32;
-            let candidate = pgcf_sandbox_controller::reclaim_inventory::Candidate {
-                database_id: STORAGE_DATABASE.into(),
-                namespace: format!("pgcf-db-{STORAGE_DATABASE}"),
-                pod_uid: pod_uid("tenant-c"),
-                container_id: request["container_id"].as_str().unwrap().into(),
-                cri_pid,
-                start_ticks: pgcf_sandbox_controller::slot::start_ticks(cri_pid)?,
-                pid_namespace: pgcf_sandbox_controller::slot::namespace(cri_pid, "pid")?,
-                cgroup_path: request["cgroup_path"].as_str().unwrap().into(),
-                postgres_image_id: request["image"].as_str().unwrap().into(),
-            };
-            let trust: pgcf_sandbox_controller::policy::StorageAuthorityTrust =
-                serde_json::from_slice(&fs::read(base.join("storage-trust.json"))?)?;
-            let verifier = pgcf_native_protocol::reclaim::Trust::new(
-                &serde_json::to_string(&trust.keys)?,
-                &trust.sha256,
-            )
-            .unwrap();
-            let scope = verifier
-                .verify(
-                    request["token"].as_str().unwrap(),
-                    pgcf_sandbox_controller::policy::now_ms() as u64,
-                )
-                .unwrap();
-            pgcf_sandbox_controller::reclaim_inventory::delegate_reclaim(
-                &candidate,
-                &scope,
-                &local.node_uid,
-                &host.boot_id()?,
-            )?;
-            let snapshot = pgcf_sandbox_controller::reclaim_inventory::snapshot_candidates(
-                &host,
-                &local.node_uid,
-                vec![candidate],
-            )?;
-            assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
-            assert_ne!(
-                snapshot["pid_namespace_inode"],
-                snapshot["cri_pid_namespace_inode"]
-            );
-            pgcf_sandbox_controller::reclaim_inventory::publish_public("tasks", &snapshot)?;
-            atomic(
-                &base.join("reclaim-ready.json"),
-                &json!({"controller_pid":std::process::id(),"mapped_host_pid":snapshot["tasks"][0]["pid"],"cri_pid":cri_pid}),
-            )?;
-            reclaim_proved = true;
         }
         if let Ok(bytes) = fs::read(base.join("storage-lease.json"))
             && bytes != storage_epoch
@@ -368,87 +316,6 @@ async fn child_controller(base: PathBuf) -> Result<(), Box<dyn std::error::Error
     }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() == Some("--owned-unprivileged-access") {
-        let args = std::env::args().collect::<Vec<_>>();
-        assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWCGROUP) }, 0);
-        let last = fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
-            .trim()
-            .parse::<i32>()?;
-        assert!(last <= 63);
-        for capability in 0..=last {
-            assert_eq!(
-                unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) },
-                0
-            );
-        }
-        assert_eq!(unsafe { libc::setgroups(0, std::ptr::null()) }, 0);
-        assert_eq!(unsafe { libc::setgid(65532) }, 0);
-        assert_eq!(unsafe { libc::setuid(65532) }, 0);
-        assert_eq!(
-            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
-            0
-        );
-        let own = fs::read_to_string("/proc/self/status")?;
-        for field in ["CapEff:", "CapPrm:", "CapInh:", "CapAmb:", "CapBnd:"] {
-            assert_eq!(
-                own.lines()
-                    .find_map(|line| line.strip_prefix(field))
-                    .unwrap()
-                    .trim(),
-                "0000000000000000"
-            );
-        }
-        let public: serde_json::Value =
-            serde_json::from_slice(&fs::read("/run/pgcf-reclaim-input/reclaim.json")?)?;
-        assert_eq!(public["tasks"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            fs::write("/run/pgcf-reclaim-input/tamper", b"no")
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        let task = &public["tasks"][0];
-        assert_eq!(
-            pgcf_sandbox_controller::slot::start_ticks(task["cri_pid"].as_u64().unwrap() as u32)?,
-            task["start_ticks"].as_u64().unwrap()
-        );
-        for path in [&args[3], &args[4]] {
-            assert_eq!(
-                std::os::unix::net::UnixStream::connect(path)
-                    .unwrap_err()
-                    .kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
-        }
-        for path in [&args[5], &args[6]] {
-            assert_eq!(
-                fs::read(path).unwrap_err().kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
-        }
-        for name in ["memory.max", "cgroup.procs", "cgroup.kill"] {
-            assert_eq!(
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(PathBuf::from(&args[2]).join(name))
-                    .unwrap_err()
-                    .kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
-        }
-        use std::io::Write;
-        let mut control = fs::OpenOptions::new()
-            .write(true)
-            .open(PathBuf::from(&args[2]).join("memory.reclaim"))?;
-        match control.write_all(b"4096") {
-            Ok(()) => {}
-            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EAGAIN)),
-        };
-        println!(
-            "{{\"unprivileged\":true,\"private_sockets_denied\":true,\"private_config_denied\":true,\"other_cgroup_controls_denied\":true,\"delegated_reclaim_only\":true}}"
-        );
-        return Ok(());
-    }
     if std::env::args().nth(1).as_deref() == Some("--owned-controller-host") {
         let base = PathBuf::from(std::env::args().nth(2).unwrap());
         let code = pgcf_sandbox_controller::host_context::launch(
@@ -457,7 +324,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         std::process::exit(code);
     }
-    pgcf_sandbox_controller::host_context::seal_inherited_handles()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -1137,73 +1003,6 @@ wait "$server"
                 fs::read_to_string(data.join("sql-committed"))?.trim(),
                 "committed-tenant-c"
             );
-            let image = option_env!("PGCF_POSTGRES_FIXTURE_IMAGE")
-                .ok_or("qualified fixture image metadata missing")?;
-            let clock = pgcf_sandbox_controller::policy::now_ms() as u64;
-            let reclaim = json!({"v":1,"kid":"fixture-cf","database_id":STORAGE_DATABASE,"operation_id":"op_abcdefghijklmnopqrst","intent_revision":1,"generation":1,"storage_generation":1,"node_uid":local.node_uid,"boot_id":fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),"cluster_uid":"77777777-7777-4777-8777-777777777777","namespace_uid":"88888888-8888-4888-8888-888888888888","cnpg_cluster_uid":"99999999-9999-4999-8999-999999999999","storage_uid":"44444444-4444-4444-8444-444444444444","pvc_uid":"55555555-5555-4555-8555-555555555555","pv_uid":"66666666-6666-4666-8666-666666666666","pod_uid":pod_uid(name),"container_id":task_id,"postgres_image_sha256":image.rsplit("sha256:").next().unwrap(),"mode":"reclaim","budget_bytes":4096,"step_bytes":4096,"memory_request_bytes":67108864,"memory_limit_bytes":134217728,"issued_at":clock,"expires_at":clock+5000});
-            let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&reclaim)?);
-            let contract: serde_json::Value = serde_json::from_str(include_str!(
-                "../../../packages/contracts/native/reclaim.generated.json"
-            ))?;
-            let signed = storage_key.sign(
-                format!(
-                    "{}{body}",
-                    contract["constants"]["RECLAIM_DOMAIN"].as_str().unwrap()
-                )
-                .as_bytes(),
-            );
-            let reclaim_token = format!("rc1.{body}.{}", URL_SAFE_NO_PAD.encode(signed.as_ref()));
-            atomic(
-                &base.join("reclaim-proof.json"),
-                &json!({"cri_pid":created.pid,"container_id":task_id,"cgroup_path":cg,"image":image,"token":reclaim_token}),
-            )?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !base.join("reclaim-ready.json").exists() {
-                assert!(
-                    Instant::now() < deadline,
-                    "actual host/CRI task mapping was not published"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let ready: serde_json::Value =
-                serde_json::from_slice(&fs::read(base.join("reclaim-ready.json"))?)?;
-            let secret = base.join("fixture-private-config");
-            fs::write(&secret, b"fixture-only-private")?;
-            fs::set_permissions(&secret, fs::Permissions::from_mode(0o600))?;
-            let output = Command::new("nsenter")
-                .args([
-                    format!("--mount=/proc/{cri_host_pid}/ns/mnt"),
-                    format!("--pid=/proc/{cri_host_pid}/ns/pid"),
-                    "--".into(),
-                    "/usr/local/bin/pgcf-containerd-proof".into(),
-                    "--owned-unprivileged-access".into(),
-                    format!("/sys/fs/cgroup{cg}"),
-                    controller_socket.to_string_lossy().into_owned(),
-                    assigned
-                        .address
-                        .strip_prefix("ttrpc+unix://")
-                        .unwrap()
-                        .to_owned(),
-                    secret.to_string_lossy().into_owned(),
-                    format!(
-                        "/proc/{}/root{}",
-                        ready["controller_pid"].as_u64().unwrap(),
-                        secret.display()
-                    ),
-                ])
-                .output()?;
-            if !output.status.success() {
-                eprintln!(
-                    "owned_unprivileged_failure: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            assert!(
-                output.status.success(),
-                "least-privilege reclaimer kernel boundary failed"
-            );
-            let checked: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            assert_eq!(checked["delegated_reclaim_only"], true);
             let now = pgcf_sandbox_controller::policy::now_ms() as u64;
             let expires = now + 8000;
             let claims = pgcf_native_protocol::storage::StorageWriteClaims {
@@ -1455,8 +1254,6 @@ wait "$server"
     );
     drop(controller);
     fs::remove_file(&controller_socket)?;
-    fs::remove_file(base.join("reclaim-proof.json"))?;
-    fs::remove_file(base.join("reclaim-ready.json"))?;
     let mut restart_settings = settings.clone();
     restart_settings.cloudflare = Some(local.clone());
     controller =
@@ -1494,7 +1291,7 @@ wait "$server"
     );
     println!(
         "{}",
-        json!({"actual_separate_CRI_PID_and_mount_context":true,"real_containerd":"2.3.6","tenant_free_slots_prestarted":2,"assigned_once":true,"separate_shims":true,"normal_runc_tasks_late_bound":true,"all_tasks_deleted":true,"idle_cgroup_limits_observed":true,"expired_lease_retires_idle_preserves_running_tenant":true,"actual_process_restart_recovers_same_assigned_PID_and_discards_unassigned":true,"bounded_on_demand_miss_verified_separately":true,"background_refill_primitive_verified":true,"actual_PostgreSQL_18_6_long_SQL_stopped_without_CF_or_Kube_API":true,"retired_physical_scope_survives_normal_CRI_remove_and_restart":true,"material_revision_reload_preserves_running_SQL_and_expiry":true,"storage_expiry_stop_ms":storage_stop_ms,"thin_physical_storage_acceptance":false,"readonly_reclaimer_host_CRI_PID_mapping_verified":true,"unprivileged_reclaimer_private_inputs_and_controls_denied":true,"warm_reclaim_acceptance":false,"runc":"1.5.2","evidence":evidence,"CF_CRI_CNI_CNPG_SQL_acceptance":false})
+        json!({"actual_separate_CRI_PID_and_mount_context":true,"real_containerd":"2.3.6","tenant_free_slots_prestarted":2,"assigned_once":true,"separate_shims":true,"normal_runc_tasks_late_bound":true,"all_tasks_deleted":true,"idle_cgroup_limits_observed":true,"expired_lease_retires_idle_preserves_running_tenant":true,"actual_process_restart_recovers_same_assigned_PID_and_discards_unassigned":true,"bounded_on_demand_miss_verified_separately":true,"background_refill_primitive_verified":true,"actual_PostgreSQL_18_6_long_SQL_stopped_without_CF_or_Kube_API":true,"retired_physical_scope_survives_normal_CRI_remove_and_restart":true,"material_revision_reload_preserves_running_SQL_and_expiry":true,"storage_expiry_stop_ms":storage_stop_ms,"thin_physical_storage_acceptance":false,"runc":"1.5.2","evidence":evidence,"CF_CRI_CNI_CNPG_SQL_acceptance":false})
     );
     // Retire remaining unassigned runtimes through actual lease expiry before stopping the disposable daemon.
     controller.refresh(fresh_lease(lease, &local, 1)?).await?;

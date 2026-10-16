@@ -18,24 +18,6 @@ use std::{
 use tonic::Status;
 static CHILD: AtomicI32 = AtomicI32::new(-1);
 static STOP: AtomicBool = AtomicBool::new(false);
-pub const HOST_PROC_FD: i32 = 198;
-pub const HOST_PID_NAMESPACE_FD: i32 = 197;
-/// The self-exec retains these read-only handles, but holders/shims and all later children must not inherit them.
-pub fn seal_inherited_handles() -> Result<(), Status> {
-    for fd in [HOST_PROC_FD, HOST_PID_NAMESPACE_FD] {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
-                continue;
-            }
-            return Err(failed());
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(failed());
-        }
-    }
-    Ok(())
-}
 extern "C" fn terminate(_: i32) {
     STOP.store(true, Ordering::Relaxed);
     let fd = CHILD.load(Ordering::Relaxed);
@@ -142,7 +124,6 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
     let current_mount = File::open("/proc/self/ns/mnt").map_err(|_| failed())?;
     let current_pid = File::open("/proc/self/ns/pid").map_err(|_| failed())?;
     let current_root = File::open("/").map_err(|_| failed())?;
-    let host_proc = File::open("/proc").map_err(|_| failed())?;
     if start_ticks(pid)? != ticks {
         return Err(failed());
     }
@@ -184,23 +165,8 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
         return Err(failed());
     }
     let parent_handle = unsafe { OwnedFd::from_raw_fd(parent_fd) };
-    let host_proc_fd = host_proc.as_raw_fd();
-    let host_pidns_fd = current_pid.as_raw_fd();
     unsafe {
         command.pre_exec(move || {
-            for (source, target) in [
-                (host_proc_fd, HOST_PROC_FD),
-                (host_pidns_fd, HOST_PID_NAMESPACE_FD),
-            ] {
-                let result = if source == target {
-                    libc::fcntl(source, libc::F_SETFD, 0)
-                } else {
-                    libc::dup3(source, target, 0)
-                };
-                if result < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
