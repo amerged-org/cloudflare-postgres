@@ -181,6 +181,8 @@ export function parseDriverReadFrames(
 }
 /** Bound for a driver read of several commands; each is a read that takes milliseconds. */
 const DRIVER_READ_MS = 20_000;
+/** The writer Pods one driver read carries. */
+const DRIVER_READ_PODS = 48;
 export async function readDriverFrames(
   exec: (args: string[], timeout?: number) => Promise<CommandResult>,
   steps: readonly DriverReadStep[],
@@ -1399,24 +1401,44 @@ export async function verifyThinTurnNode(
     readLvm: async () => await thinNodeLvmReadback(scope, driverRead),
     initialLvm: facts(thinLvmReport(frames.slice(THIN_SOFTWARE_STEPS.length))),
     closingRead: async (podUids) => {
-      const closing = await readDriverFrames(driverRead, [
-        ...podUids.map((podUid) => ({
-          argv: [
-            "sh",
-            "-ec",
-            IO_LIMITS_SCRIPT,
-            "--",
-            ...thinPodCgroupPaths(podUid),
-          ],
-          soft: true,
-        })),
-        ...thinLvmSteps(),
-      ]);
-      return {
-        limits: new Map(
-          podUids.map((podUid, index) => [podUid, closing[index]!]),
+      // The script is one argument of the exec and a Pod adds about 1.3 KiB to it; an argument may be
+      // 128 KiB. More Pods than one read can carry are read together in several, the last of which
+      // ends with the closing LVM report.
+      const reads = Array.from(
+        { length: Math.max(1, Math.ceil(podUids.length / DRIVER_READ_PODS)) },
+        (_, index) =>
+          podUids.slice(
+            index * DRIVER_READ_PODS,
+            (index + 1) * DRIVER_READ_PODS,
+          ),
+      );
+      const settled = await Promise.allSettled(
+        reads.map((chunk, index) =>
+          readDriverFrames(driverRead, [
+            ...chunk.map((podUid) => ({
+              argv: [
+                "sh",
+                "-ec",
+                IO_LIMITS_SCRIPT,
+                "--",
+                ...thinPodCgroupPaths(podUid),
+              ],
+              soft: true,
+            })),
+            ...(index === reads.length - 1 ? thinLvmSteps() : []),
+          ]),
         ),
-        lvm: facts(thinLvmReport(closing.slice(podUids.length))),
+      );
+      const frames = settled.map((result) => settledValue(result));
+      const limits = new Map<string, DriverFrame>();
+      reads.forEach((chunk, index) =>
+        chunk.forEach((podUid, offset) =>
+          limits.set(podUid, frames[index]![offset]!),
+        ),
+      );
+      return {
+        limits,
+        lvm: facts(thinLvmReport(frames.at(-1)!.slice(reads.at(-1)!.length))),
       };
     },
   };

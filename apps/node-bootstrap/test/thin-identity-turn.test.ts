@@ -73,6 +73,23 @@ test("an identity turn needs at most 6 sequential relay connections and 22 comma
   assert.equal(large.commands, small.commands);
 });
 
+// One script argument can be 128 KiB at most (MAX_ARG_STRLEN), and each writer Pod adds about 1.3 KiB.
+test("a node with many writer Pods reads their io.max in several driver reads, none beyond the argument limit, in the same sequential connections", async () => {
+  const world = identityWorld(120);
+  const { report } = await identityTurn(world);
+  const reads = world.relay.filter((command) => command.args[0] === "exec");
+  assert.ok(reads.length >= 3, `${reads.length} driver reads`);
+  for (const read of reads)
+    for (const arg of read.args)
+      assert.ok(arg.length < 100_000, `a ${arg.length} byte argument`);
+  assert.ok(world.rounds <= MAX_ROUNDS, `${world.rounds} connections`);
+  // Every Pod with a cgroup is read: the writer's two and the 120 more.
+  assert.equal(
+    report.authority.volumes.flatMap((volume) => volume.io).length,
+    122,
+  );
+});
+
 test("the LVM reports bracket the cluster inventory and every writer's io.max is read before the closing report", async () => {
   const world = identityWorld();
   await identityTurn(world);
