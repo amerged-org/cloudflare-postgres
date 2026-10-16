@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::sessions::{Action, SharedSessions};
 use futures_util::StreamExt;
-use pgcf_native_protocol::{constant, valid_pattern, valid_schema, wire};
+use pgcf_native_protocol::{constant, valid_pattern, valid_schema, wake, wire};
 use reqwest::{Client, Url};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde::Deserialize;
@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{Notify, RwLock, watch};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +52,9 @@ pub struct FenceState {
     pub observed: Option<Instant>,
     database_epochs: HashMap<String, u64>,
     next_database_epoch: u64,
+    /// Signalled after every applied change of the fences and every loss of their watch: a held
+    /// wake connection waits on it for the fence that releases it.
+    pub changed: Arc<Notify>,
 }
 impl FenceState {
     pub fn bound_epoch(&self, database: &str) -> (u64, u64) {
@@ -128,11 +131,13 @@ impl FenceState {
         self.records = records;
         self.ready = true;
         self.observed = Some(Instant::now());
+        self.changed.notify_waiters();
         Ok(())
     }
     pub fn disconnect(&mut self) {
         self.ready = false;
         self.epoch += 1;
+        self.changed.notify_waiters();
     }
 }
 #[derive(Clone)]
@@ -439,7 +444,8 @@ pub(crate) fn typed(value: &Value, api_version: &str, kind: &str) -> bool {
         && (value["kind"].is_null() || value["kind"] == kind)
 }
 /// The target the controller published in a fence's data, bound to that fence's own database
-/// and revision. The fence watch and the writer cache both read it through this function.
+/// and revision. The fence watch and the writer cache both read it through this function. Its TLS
+/// name is the database's own Service or the Service of the pool slot a wake was served from.
 pub(crate) fn admission_target(
     data: &Value,
     intent: &Intent,
@@ -457,7 +463,9 @@ pub(crate) fn admission_target(
             let target: AdmissionTarget =
                 serde_json::from_value(value).map_err(|_| "invalid admitted target")?;
             if target.generation > intent.revision
-                || target.tls_server_name != format!("database-rw.pgcf-db-{}.svc", intent.database)
+                || (target.tls_server_name
+                    != format!("database-rw.pgcf-db-{}.svc", intent.database)
+                    && wake::slot_namespace_of_tls_name(&target.tls_server_name).is_none())
             {
                 return Err("invalid admitted target binding");
             }
@@ -719,6 +727,37 @@ mod tests {
             data["retired-at"] = json!(crate::control::timestamp(crate::control::now() - 65_001));
         }
         json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":"pgcf-system","name":format!("gateway-fence-{database}"),"uid":"01234567-89ab-4def-8123-0123456789ab","resourceVersion":revision.to_string(),"labels":{"pgcf.io/gateway-fence":"true","pgcf.io/database-id":database}},"data":data})
+    }
+    #[test]
+    fn the_admitted_tls_name_is_the_database_service_or_a_slot_service_and_nothing_else() {
+        let database = "a".repeat(20);
+        let intent = Intent {
+            database: database.clone(),
+            operation: format!("op_{}", "b".repeat(20)),
+            revision: 2,
+            mode: "running".into(),
+        };
+        let pod = "01234567-89ab-4def-8123-0123456789ab";
+        let data = |name: &str| json!({"admission_target":json!({"v":1,"generation":2,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":"b".repeat(64),"tls_server_name":name}).to_string()});
+        for name in [
+            format!("database-rw.pgcf-db-{database}.svc"),
+            "database-rw.pgcf-slot-0a1b2c3d.svc".into(),
+        ] {
+            let target = admission_target(&data(&name), &intent).unwrap().unwrap();
+            assert_eq!(target.tls_server_name, name);
+        }
+        for name in [
+            format!("database-rw.pgcf-db-{}.svc", "c".repeat(20)),
+            format!("database-ro.pgcf-db-{database}.svc"),
+            "database-rw.pgcf-slot-0a1b2c3.svc".into(),
+            "database-rw.pgcf-slot-0a1b2c3d0.svc".into(),
+            "database-rw.pgcf-slot-0a1b2c3g.svc".into(),
+            "database-ro.pgcf-slot-0a1b2c3d.svc".into(),
+            "database-rw.pgcf-slot-0a1b2c3d.svc.cluster.local".into(),
+            "database-rw.pgcf-system.svc".into(),
+        ] {
+            assert!(admission_target(&data(&name), &intent).is_err(), "{name}");
+        }
     }
     #[test]
     fn fence_list_items_without_type_meta_parse_and_a_stated_mismatch_fails() {

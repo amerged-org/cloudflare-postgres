@@ -6,7 +6,7 @@ use crate::{
     storage::{StorageBinding, StorageGate, StorageTrust},
 };
 use futures_util::StreamExt;
-use pgcf_native_protocol::{valid_pattern, valid_schema, wire};
+use pgcf_native_protocol::{valid_pattern, valid_schema, wake, wire};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{Notify, RwLock, watch};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetIdentity {
@@ -89,7 +89,7 @@ pub struct LegacyStorageBinding {
 /// connection is given to start is routed as a Ready endpoint only. The bound is needed because
 /// the report cannot always have been seen: a Pod that never becomes Ready, or one that went not
 /// Ready before this gateway started, leaves no Ready for the attestation to be spent on.
-const ATTESTED_ROUTE_BOUND: Duration = crate::transport::STARTUP_BOUND;
+const ATTESTED_ROUTE_BOUND: Duration = Duration::from_secs(10);
 
 /// What this gateway has itself seen of the controller's current attestation of one database's
 /// Pod, kept per Pod, container and revision: an attestation of any other starts again. It is the
@@ -142,6 +142,9 @@ pub struct Targets {
     slices_observed: Option<Instant>,
     pods_observed: Option<Instant>,
     maps_observed: Option<Instant>,
+    /// Signalled after every applied list or event and every loss of a watch: a held wake
+    /// connection waits on it for the writer the fence releases it to.
+    pub changed: Arc<Notify>,
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, &'static str> {
     v[key]
@@ -184,17 +187,20 @@ fn owned_map(v: &Value) -> Result<Option<String>, &'static str> {
         || name == format!("ca-{database}"))
     .then(|| name.into()))
 }
+/// A writer runs in its database's own namespace or in a pool slot's.
+fn writer_namespace(namespace: &str) -> bool {
+    namespace
+        .strip_prefix("pgcf-db-")
+        .is_some_and(|v| valid_pattern("database", v))
+        || wake::is_slot_namespace(namespace)
+}
 fn owned_slice(v: &Value) -> Result<String, &'static str> {
     if !crate::kubernetes::typed(v, "discovery.k8s.io/v1", "EndpointSlice")
         || v["metadata"]["labels"]["kubernetes.io/service-name"] != "database-rw"
     {
         return Err("invalid writer discovery");
     }
-    let namespace = text(&v["metadata"], "namespace")?;
-    if !namespace
-        .strip_prefix("pgcf-db-")
-        .is_some_and(|v| valid_pattern("database", v))
-    {
+    if !writer_namespace(text(&v["metadata"], "namespace")?) {
         return Err("invalid writer namespace");
     }
     uuid(&v["metadata"], "uid")
@@ -205,11 +211,7 @@ fn owned_pod(v: &Value) -> Result<String, &'static str> {
     {
         return Err("invalid runtime Pod discovery");
     }
-    let namespace = text(&v["metadata"], "namespace")?;
-    if !namespace
-        .strip_prefix("pgcf-db-")
-        .is_some_and(|v| valid_pattern("database", v))
-    {
+    if !writer_namespace(text(&v["metadata"], "namespace")?) {
         return Err("invalid runtime Pod namespace");
     }
     uuid(&v["metadata"], "uid")
@@ -312,6 +314,21 @@ impl Targets {
                 .collect(),
         })
     }
+    /// The intent of this database's fence and the target the controller last published in it,
+    /// whatever the fence's mode.
+    fn published(&self, database: &str) -> Option<(Intent, AdmissionTarget)> {
+        let fence = self.maps.get(&format!("gateway-fence-{database}"))?;
+        let intent = json(&fence["data"], "intent.json").ok()?;
+        if !valid_schema("intent", &intent) {
+            return None;
+        }
+        let intent: Intent = serde_json::from_value(intent).ok()?;
+        if intent.database != database {
+            return None;
+        }
+        let target = admission_target(&fence["data"], &intent).ok()??;
+        Some((intent, target))
+    }
     /// The controller's target for the running revision of this database's fence. A fence that
     /// is quiesced, retired, deleting or ahead of its target attests nothing.
     fn attested(&self, database: &str) -> Option<AdmissionTarget> {
@@ -319,16 +336,30 @@ impl Targets {
         if !fence["metadata"]["deletionTimestamp"].is_null() {
             return None;
         }
-        let intent = json(&fence["data"], "intent.json").ok()?;
-        if !valid_schema("intent", &intent) {
-            return None;
-        }
-        let intent: Intent = serde_json::from_value(intent).ok()?;
-        if intent.database != database || intent.mode != "running" {
-            return None;
-        }
-        let target = admission_target(&fence["data"], &intent).ok()??;
-        (target.generation == intent.revision).then_some(target)
+        let (intent, target) = self.published(database)?;
+        (intent.mode == "running" && target.generation == intent.revision).then_some(target)
+    }
+    /// The namespace of the database's writer: the pool slot its fence's target names, from the
+    /// claim until the slot is deleted, or the database's own.
+    fn writer_namespace(&self, database: &str) -> String {
+        self.published(database)
+            .and_then(|(_, target)| {
+                wake::slot_namespace_of_tls_name(&target.tls_server_name).map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("pgcf-db-{database}"))
+    }
+    /// The databases whose fence names this pool slot: none for a free slot, one for a claimed.
+    pub fn slot_databases(&self, namespace: &str) -> Vec<String> {
+        self.maps
+            .keys()
+            .filter_map(|name| name.strip_prefix("gateway-fence-"))
+            .filter(|database| {
+                self.published(database).is_some_and(|(_, target)| {
+                    wake::slot_namespace_of_tls_name(&target.tls_server_name) == Some(namespace)
+                })
+            })
+            .map(str::to_string)
+            .collect()
     }
     /// Whether the attestation may still stand in for the kubelet's report of its Pod: not once
     /// this gateway has seen that Pod and container Ready at that revision, and not after the
@@ -431,6 +462,7 @@ impl Targets {
             self.maps_observed = Some(Instant::now());
         }
         self.refresh_gates(trust);
+        self.changed.notify_waiters();
         Ok(())
     }
     pub fn event(
@@ -487,14 +519,20 @@ impl Targets {
             }
         }
         self.touch(kind);
-        let database = if kind == "endpointslices" || kind == "pods" {
-            text(&object["metadata"], "namespace")?
-                .strip_prefix("pgcf-db-")
-                .ok_or("invalid writer namespace")?
+        let databases = if kind == "endpointslices" || kind == "pods" {
+            let namespace = text(&object["metadata"], "namespace")?;
+            match namespace.strip_prefix("pgcf-db-") {
+                Some(database) => vec![database.to_string()],
+                // A pool slot belongs to the database whose fence names it, a free one to none.
+                None => self.slot_databases(namespace),
+            }
         } else {
-            text(&object["metadata"]["labels"], "pgcf.io/database-id")?
+            vec![text(&object["metadata"]["labels"], "pgcf.io/database-id")?.to_string()]
         };
-        self.refresh_gate(database, trust);
+        for database in databases {
+            self.refresh_gate(&database, trust);
+        }
+        self.changed.notify_waiters();
         Ok(())
     }
     fn touch(&mut self, kind: &str) {
@@ -512,16 +550,17 @@ impl Targets {
             for target in self.identities.values_mut() {
                 target.container_id = None;
             }
-            return;
-        }
-        if kind == "endpointslices" {
-            self.slices_observed = None;
         } else {
-            self.maps_observed = None;
+            if kind == "endpointslices" {
+                self.slices_observed = None;
+            } else {
+                self.maps_observed = None;
+            }
+            for gate in self.gates.values_mut() {
+                gate.disconnect();
+            }
         }
-        for gate in self.gates.values_mut() {
-            gate.disconnect();
-        }
+        self.changed.notify_waiters();
     }
     /// The writer's address, Pod UID and node, and whether its endpoint is Ready. A Pod the
     /// kubelet has not reported Ready is the writer only when it is the Pod of `attested` (the
@@ -532,7 +571,10 @@ impl Targets {
         database: &str,
         attested: Option<&AdmissionTarget>,
     ) -> Result<(IpAddr, String, String, bool), &'static str> {
-        let namespace = format!("pgcf-db-{database}");
+        let namespace = self.writer_namespace(database);
+        if wake::is_slot_namespace(&namespace) && self.slot_databases(&namespace).len() != 1 {
+            return Err("pool slot claimed twice");
+        }
         let mut endpoints = BTreeMap::new();
         // The attested Pod while not Ready, and the other endpoints not Ready either.
         let mut waiting = BTreeMap::new();
@@ -628,11 +670,15 @@ impl Targets {
             .map(|(address, uid, node)| (address, uid, node, true))
             .ok_or("writer target unavailable")
     }
+    /// The storage binding the writer's I/O authority is checked against. A pool slot has none:
+    /// it is routed on the controller's attestation of its Pod and container, on the node of the
+    /// database's volume.
     fn binding(
         &self,
         database: &str,
         pod_uid: &str,
         node: &str,
+        slot: bool,
     ) -> Result<Option<StorageBinding>, &'static str> {
         let storage = self
             .maps
@@ -650,6 +696,9 @@ impl Targets {
         let state = json(&storage["data"], "state")?;
         if state["node"] != node {
             return Err("writer node changed");
+        }
+        if slot {
+            return Ok(None);
         }
         if state["storage"].is_null() {
             let retained = self
@@ -776,7 +825,12 @@ impl Targets {
                         unready: !ready || container_id != reported,
                         container_id,
                         ca: self.current_ca(database),
-                        storage: self.binding(database, &pod_uid, &node)?,
+                        storage: self.binding(
+                            database,
+                            &pod_uid,
+                            &node,
+                            wake::is_slot_namespace(&self.writer_namespace(database)),
+                        )?,
                         pod_uid,
                         node,
                     })
@@ -1689,5 +1743,134 @@ mod tests {
         let target = wake.route().unwrap();
         assert!(target.unready);
         assert!(wake.state.permits(WAKE, &target, control::now()));
+    }
+    // A database woken into a pool slot: its fence attests the slot's Pod, which runs in the
+    // slot's own namespace and not in `pgcf-db-<id>`.
+    const SLOT: &str = "pgcf-slot-0a1b2c3d";
+    /// The wake fixture as the pool leaves it: a thin database whose running fence attests the
+    /// `postgres` container of the slot Pod `wake_id(40)`, not yet reported Ready.
+    fn slot_wake() -> Wake {
+        let mut wake = Wake::new();
+        let profile = json!({"backend":"lvm-thin-v1","storage_class":format!("pgcf-lvm-thin-v1-{}","a".repeat(16)),"profile_sha256":"a".repeat(64),"node_uid":wake_id(50),"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg"});
+        wake.maps[0]["data"]["state"] = json!({"node":"customer-us1","storage":profile})
+            .to_string()
+            .into();
+        wake.edit("admission_target", |target| {
+            target["pod_uid"] = wake_id(40).into();
+            target["tls_server_name"] = pgcf_native_protocol::wake::slot_tls_name(SLOT).into();
+        });
+        wake.slices[0]["metadata"]["namespace"] = SLOT.into();
+        wake.slices[0]["endpoints"][0]["targetRef"]["namespace"] = SLOT.into();
+        wake.slices[0]["endpoints"][0]["targetRef"]["uid"] = wake_id(40).into();
+        wake.pods[0]["metadata"]["namespace"] = SLOT.into();
+        wake.pods[0]["metadata"]["uid"] = wake_id(40).into();
+        wake
+    }
+    /// A free slot: its Pod runs with PostgreSQL fenced, and no fence names it.
+    fn free_slot(namespace: &str, uid: u32) -> (Value, Value) {
+        let mut slice = slice(&wake_id(uid), "10.0.0.9");
+        slice["metadata"]["namespace"] = namespace.into();
+        slice["metadata"]["uid"] = wake_id(uid + 1).into();
+        slice["metadata"]["resourceVersion"] = "1".into();
+        slice["endpoints"][0]["targetRef"]["namespace"] = namespace.into();
+        slice["endpoints"][0]["conditions"] =
+            json!({"ready":false,"serving":false,"terminating":false});
+        let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":namespace,"uid":wake_id(uid),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database","pgcf.io/slot":"0a1b2c3d"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.9","containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{}","d".repeat(64)),"state":{"running":{"startedAt":"2026-10-16T10:00:00Z"}}}]}});
+        (slice, pod)
+    }
+    #[test]
+    fn slot_pods_and_slices_never_break_discovery_and_free_slots_map_to_no_database() {
+        let (slice, pod) = free_slot(SLOT, 60);
+        // Beside a database routed on its own Pod, a free slot changes nothing.
+        let mut wake = Wake::armed();
+        let before = wake.route().unwrap();
+        wake.slices.push(slice.clone());
+        wake.pods.push(pod.clone());
+        wake.apply();
+        assert_eq!(wake.route().unwrap(), before);
+        assert!(wake.state.slot_databases(SLOT).is_empty());
+        for (kind, object) in [("pods", &pod), ("endpointslices", &slice)] {
+            for change in ["MODIFIED", "DELETED", "ADDED"] {
+                wake.state
+                    .event(kind, &json!({"type":change,"object":object}), None)
+                    .unwrap();
+            }
+        }
+        assert_eq!(wake.route().unwrap(), before);
+        // Only a slot namespace is discovery besides the databases' own.
+        for namespace in ["pgcf-slot-0A1B2C3D", "pgcf-slot-0a1b2c3", "kube-system"] {
+            let (slice, pod) = free_slot(namespace, 70);
+            let mut state = Targets::default();
+            assert!(state.replace("pods", &[pod], None).is_err(), "{namespace}");
+            assert!(
+                state.replace("endpointslices", &[slice], None).is_err(),
+                "{namespace}"
+            );
+        }
+    }
+    #[test]
+    fn a_slot_target_is_routed_by_its_attestation_without_a_storage_gate() {
+        let mut wake = slot_wake();
+        wake.apply();
+        // A thin database with no signed authority at all: the slot is routed on the
+        // controller's attestation alone.
+        let target = wake.route().unwrap();
+        assert_eq!(target.pod_uid, wake_id(40));
+        assert_eq!(target.address.to_string(), "10.0.0.7");
+        assert_eq!(target.container_id, Some("a".repeat(64)));
+        assert!(target.storage.is_none());
+        assert!(target.unready);
+        assert_eq!(wake.state.slot_databases(SLOT), vec![WAKE.to_string()]);
+        assert!(wake.state.permits(WAKE, &target, control::now()));
+        // An event of the slot Pod is an event of the database it serves.
+        let mut restarted = wake.pods[0].clone();
+        restarted["status"]["containerStatuses"][0]["containerID"] =
+            format!("containerd://{}", "b".repeat(64)).into();
+        restarted["metadata"]["resourceVersion"] = "2".into();
+        wake.state
+            .event("pods", &json!({"type":"MODIFIED","object":restarted}), None)
+            .unwrap();
+        assert!(wake.route().is_err());
+        assert!(!wake.state.permits(WAKE, &target, control::now()));
+    }
+    #[test]
+    fn a_slot_target_requires_the_attested_running_postgres_container_on_its_node() {
+        type Change = (&'static str, fn(&mut Wake));
+        let changes: [Change; 6] = [
+            ("another container", |wake| {
+                wake.pods[0]["status"]["containerStatuses"][0]["containerID"] =
+                    format!("containerd://{}", "b".repeat(64)).into();
+            }),
+            ("a stopped container", |wake| {
+                wake.pods[0]["status"]["containerStatuses"][0]["state"] =
+                    json!({"terminated":{"exitCode":0}});
+            }),
+            ("a Pod on another node", |wake| {
+                wake.pods[0]["spec"]["nodeName"] = "customer-us2".into();
+            }),
+            ("an endpoint on another node than the database's", |wake| {
+                wake.slices[0]["endpoints"][0]["nodeName"] = "customer-us2".into();
+                wake.pods[0]["spec"]["nodeName"] = "customer-us2".into();
+            }),
+            ("a deleting Pod", |wake| {
+                wake.pods[0]["metadata"]["deletionTimestamp"] = "2026-10-16T10:00:00Z".into();
+            }),
+            ("another slot's Pod", |wake| {
+                wake.slices[0]["endpoints"][0]["targetRef"]["uid"] = wake_id(41).into();
+                wake.pods[0]["metadata"]["uid"] = wake_id(41).into();
+            }),
+        ];
+        for (reason, change) in changes {
+            let mut wake = slot_wake();
+            wake.apply();
+            let target = wake.route().expect(reason);
+            change(&mut wake);
+            wake.apply();
+            assert!(wake.route().is_err(), "{reason}");
+            assert!(
+                !wake.state.permits(WAKE, &target, control::now()),
+                "{reason}"
+            );
+        }
     }
 }

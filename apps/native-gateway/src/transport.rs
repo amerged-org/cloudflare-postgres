@@ -2,6 +2,7 @@
 use crate::{
     budget::{BudgetedStream, Lease, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, MemoryBudget, WireBudget},
     control::{self, Control, HttpHead},
+    hold::{Held, Verdict, WakeQueue},
     kubernetes::{FenceState, Kubernetes},
     sessions::{Action, Sessions, SharedSessions},
     targets::{TargetIdentity, TargetUnavailable, Targets},
@@ -13,6 +14,7 @@ use pgcf_native_protocol::{
     constant,
     route::{Keyring, ReplayCache, RouteClaims, valid_websocket_key, verify},
     startup::{Event, StartupReader, error_response},
+    wake::{self, Outcome, WakeClaims},
 };
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
@@ -44,6 +46,8 @@ type WebSocket = WebSocketStream<BudgetedStream>;
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
 /// The time a connection has to send its StartupMessage and have its writer dialled.
 pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
+/// How long a held wake connection waits for its release, counted from its upgrade.
+pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
 pub struct Config {
     pub region: String,
     pub keyring: Keyring,
@@ -122,6 +126,8 @@ pub struct Gateway {
     pub measurements: Arc<Mutex<GatewayMeasurements>>,
     pub control: Control,
     pub draining: AtomicBool,
+    /// The held connections of sleeping databases and their wake tickets.
+    pub wakes: Arc<WakeQueue>,
     admission: Mutex<Admission>,
     memory: Arc<MemoryBudget>,
 }
@@ -130,12 +136,14 @@ impl Gateway {
         let fences = Arc::new(RwLock::new(FenceState::default()));
         let sessions = Arc::new(Mutex::new(Sessions::default()));
         let measurements = Arc::new(Mutex::new(GatewayMeasurements::new()));
+        let wakes = WakeQueue::new();
         let control = Control::new(
             config.clone(),
             pod,
             fences.clone(),
             sessions.clone(),
             measurements.clone(),
+            wakes.clone(),
         );
         Arc::new(Self {
             memory: MemoryBudget::new(config.maximum_memory, config.database_memory),
@@ -147,14 +155,18 @@ impl Gateway {
             measurements,
             control,
             draining: AtomicBool::new(false),
+            wakes,
             admission: Mutex::new(Admission::default()),
         })
     }
+    /// Reserves the session of an admitted route. `replay` is false only for a held wake
+    /// connection, whose route was checked against the replay cache when it was held.
     fn reserve(
         self: &Arc<Self>,
         claims: &RouteClaims,
         wire: WireBudget,
         target: &TargetIdentity,
+        replay: bool,
     ) -> Result<(SessionLease, watch::Receiver<Action>), u16> {
         let mut admission = self.admission.lock().unwrap();
         if admission.counts.get(&claims.db).copied().unwrap_or(0)
@@ -169,10 +181,12 @@ impl Gateway {
         if self.sessions.lock().unwrap().contains(&id) {
             return Err(403);
         }
-        admission
-            .replay
-            .use_token(claims, control::now())
-            .map_err(|reason| if reason == "replayed" { 403u16 } else { 429u16 })?;
+        if replay {
+            admission
+                .replay
+                .use_token(claims, control::now())
+                .map_err(replay_status)?;
+        }
         if !self.measurements.lock().unwrap().begin(&claims.db, &id) {
             return Err(503);
         }
@@ -215,6 +229,9 @@ impl Drop for SessionLease {
         }
     }
 }
+fn replay_status(reason: &str) -> u16 {
+    if reason == "replayed" { 403 } else { 429 }
+}
 /// Monotonic stage marks of one routed connection, logged once as `conn_stages` when it is
 /// dropped. The outcome and the route are fixed classes; roles, addresses, tokens and payloads
 /// are never logged.
@@ -224,6 +241,15 @@ struct Stages {
     target_reason: Option<TargetUnavailable>,
     /// The class of the writer the connection was admitted on, once one was chosen.
     route: Option<&'static str>,
+    /// `warm` for a route to a running database, `pool_hit` for a held wake released to a pool
+    /// slot, `pool_miss` for any other held wake.
+    wake_path: &'static str,
+    /// How a held wake connection's wait ended; none for any other connection.
+    held_outcome: Option<&'static str>,
+    /// From the upgrade of a held wake connection to its release.
+    wake_wait: Option<Duration>,
+    /// The controller's result for the wake, as it arrives, read when the line is logged.
+    verdict: Option<Verdict>,
     received: Instant,
     accepted: Option<Instant>,
     startup: Option<Instant>,
@@ -239,6 +265,10 @@ impl Stages {
             outcome: "aborted",
             target_reason: None,
             route: None,
+            wake_path: "warm",
+            held_outcome: None,
+            wake_wait: None,
+            verdict: None,
             received,
             accepted: None,
             startup: None,
@@ -254,9 +284,23 @@ impl Drop for Stages {
         let between = |from: Option<Instant>, to: Option<Instant>| {
             from.zip(to).map(|(from, to)| ms(to.duration_since(from)))
         };
-        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"route":self.route,"session_ms":ms(self.received.elapsed())});
+        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"route":self.route,"wake_path":self.wake_path,"session_ms":ms(self.received.elapsed())});
         if let Some(reason) = self.target_reason {
             observation["target_reason"] = reason.code().into();
+        }
+        if let Some(held) = self.held_outcome {
+            observation["held_outcome"] = held.into();
+            if let Some(wait) = self.wake_wait {
+                observation["wake_wait_ms"] = ms(wait).into();
+            }
+            if let Some(result) = self.verdict.as_ref().and_then(Verdict::get) {
+                if let Some(reason) = result.reason {
+                    observation["miss_reason"] = reason.into();
+                }
+                if !result.steps_ms.is_empty() {
+                    observation["controller_ms"] = serde_json::json!(result.steps_ms);
+                }
+            }
         }
         println!("{observation}");
     }
@@ -293,7 +337,7 @@ pub async fn serve_socket(
         Ok(Ok(head)) => head,
         _ => return control::reply_text(&mut socket, 400, "Bad Request\n").await,
     };
-    if let Some((status, body)) = gateway.control.handle(&head).await {
+    if let Some((status, body)) = gateway.control.handle(&head, &mut socket).await {
         return control::reply(&mut socket, status, body).await;
     }
     let path = head.path.split('?').next().unwrap_or("");
@@ -334,24 +378,58 @@ pub async fn serve_socket(
         )
         .await;
     }
-    let claims = match verify(
-        head.one("x-pgcf-route"),
-        &gateway.config.keyring.keys,
-        &gateway.config.region,
-        control::now() as f64,
-    ) {
-        Ok(claims) => claims,
-        Err(reason) => {
-            return control::reply(
-                &mut socket,
-                if reason == "wrong_region" { 403 } else { 401 },
-                serde_json::json!({"error":"route_denied"}),
-            )
-            .await;
-        }
-    };
+    let route = head.one("x-pgcf-route");
     // Declared before the lease and both streams, so it is dropped and logged after them.
-    let mut stages = Stages::new(&claims.db, received);
+    let (claims, mut stages) =
+        if route.is_some_and(|route| route.starts_with(&format!("{}.", wake::ROUTE_PREFIX))) {
+            let ticket = match wake::verify_wake(
+                route,
+                &gateway.config.keyring.keys,
+                &gateway.config.region,
+                control::now(),
+            ) {
+                Ok(ticket) => ticket,
+                Err(reason) => return route_denied(&mut socket, reason).await,
+            };
+            let mut stages = Stages::new(&ticket.db, received);
+            match wake_state(&gateway, &ticket).await {
+                // Released at its generation already: routed at once, as a running database is.
+                WakeState::Released { pod, .. } => (ticket.admitted(Some(&pod)), stages),
+                WakeState::Stale => {
+                    stages.outcome = "route_stale";
+                    return control::reply(
+                        &mut socket,
+                        503,
+                        serde_json::json!({"error":"route_stale"}),
+                    )
+                    .await;
+                }
+                WakeState::Waiting => {
+                    return serve_held(
+                        socket,
+                        head,
+                        gateway,
+                        stop,
+                        handshake_permit,
+                        ticket,
+                        stages,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            let claims = match verify(
+                route,
+                &gateway.config.keyring.keys,
+                &gateway.config.region,
+                control::now() as f64,
+            ) {
+                Ok(claims) => claims,
+                Err(reason) => return route_denied(&mut socket, reason).await,
+            };
+            let stages = Stages::new(&claims.db, received);
+            (claims, stages)
+        };
     let state = gateway.fences.read().await;
     let epoch = state.bound_epoch(&claims.db);
     if gateway.draining.load(Ordering::Acquire) || !state.admits(&claims.db) {
@@ -387,24 +465,12 @@ pub async fn serve_socket(
         stages.outcome = "route_stale";
         return control::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"})).await;
     }
-    let mut base = gateway.memory.lease(&claims.db);
-    if !base.grow(SESSION_MEMORY_BYTES) {
+    let Some(base) = session_memory(&gateway, &claims.db) else {
         stages.outcome = "memory_capacity";
-        return control::reply(
-            &mut socket,
-            if gateway.memory.database_used(&claims.db) + SESSION_MEMORY_BYTES
-                > gateway.config.database_memory
-            {
-                429
-            } else {
-                503
-            },
-            serde_json::json!({"error":"memory_capacity"}),
-        )
-        .await;
-    }
+        return memory_refused(&mut socket, &gateway, &claims.db).await;
+    };
     let wire = WireBudget::new(gateway.memory.lease(&claims.db));
-    let (lease, mut actions) = match gateway.reserve(&claims, wire.clone(), &target) {
+    let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, true) {
         Ok(value) => value,
         Err(status) => {
             stages.outcome = "admission_denied";
@@ -416,23 +482,15 @@ pub async fn serve_socket(
             .await;
         }
     };
-    let id = lease.id.clone();
-    let session = lease;
     // The route names the database, the user and the Pod, so nothing the StartupMessage says
     // changes where PostgreSQL is dialled: the dial overlaps the client's own round trips to it
     // (the upgrade, the answer to SSLRequest, the StartupMessage). Not a byte is sent before the
     // StartupMessage has been checked against the route and the fence.
     let mut early = early_dial(&gateway, &claims, &target).await;
     let stream = BudgetedStream::new(socket, head.prefix, head.end, wire.clone(), base);
-    let config = WebSocketConfig::default()
-        .read_buffer_size(4096)
-        .write_buffer_size(4096)
-        .max_write_buffer_size(MAX_FRAME_BYTES * 2)
-        .max_frame_size(Some(MAX_PAYLOAD_BYTES))
-        .max_message_size(Some(MAX_PAYLOAD_BYTES));
     let accepted = timeout(
         Duration::from_secs(10),
-        accept_async_with_config(stream, Some(config)),
+        accept_async_with_config(stream, Some(websocket_config())),
     )
     .await;
     if !matches!(accepted, Ok(Ok(_))) {
@@ -446,27 +504,465 @@ pub async fn serve_socket(
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
         _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
-    let (mut postgres, initial, initial_leases, rest) = match result {
+    let (postgres, started) = match result {
         Ok(value) => value,
         Err(_) => {
             let _ = send_error(&mut websocket, "08006", "database connection failed").await;
             return Ok(());
         }
     };
+    let admitted = Admitted {
+        claims: &claims,
+        session: &session,
+        epoch,
+    };
+    run_session(
+        &mut websocket,
+        postgres,
+        started,
+        admitted,
+        &mut actions,
+        &mut stop,
+        &mut stages,
+    )
+    .await
+}
+async fn route_denied(socket: &mut TcpStream, reason: &str) -> Result<(), Failure> {
+    control::reply(
+        socket,
+        if reason == "wrong_region" { 403 } else { 401 },
+        serde_json::json!({"error":"route_denied"}),
+    )
+    .await
+}
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(4096)
+        .write_buffer_size(4096)
+        .max_write_buffer_size(MAX_FRAME_BYTES * 2)
+        .max_frame_size(Some(MAX_PAYLOAD_BYTES))
+        .max_message_size(Some(MAX_PAYLOAD_BYTES))
+}
+/// The memory one session holds before its first frame, or none within the gateway's bounds.
+fn session_memory(gateway: &Arc<Gateway>, database: &str) -> Option<Lease> {
+    let mut base = gateway.memory.lease(database);
+    base.grow(SESSION_MEMORY_BYTES).then_some(base)
+}
+async fn memory_refused(
+    socket: &mut TcpStream,
+    gateway: &Gateway,
+    database: &str,
+) -> Result<(), Failure> {
+    control::reply(
+        socket,
+        if gateway.memory.database_used(database) + SESSION_MEMORY_BYTES
+            > gateway.config.database_memory
+        {
+            429
+        } else {
+            503
+        },
+        serde_json::json!({"error":"memory_capacity"}),
+    )
+    .await
+}
+/// What the fence shows of a wake ticket.
+enum WakeState {
+    /// Running at the ticket's generation and operation, with an admission target of that
+    /// generation and route revision whose Pod is the writer the watches show.
+    Released {
+        pod: String,
+        slot: bool,
+    },
+    Waiting,
+    /// The fence moved past the ticket: another generation or operation, or retirement.
+    Stale,
+}
+async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
+    // Global order whenever both are held: fences, then targets.
+    let state = gateway.fences.read().await;
+    let Some(fence) = state.records.get(&ticket.db) else {
+        return WakeState::Waiting;
+    };
+    let intent = &fence.intent;
+    let target = fence
+        .admission_target
+        .as_ref()
+        .filter(|target| target.generation == ticket.generation);
+    if intent.mode == "retired"
+        || intent.revision > ticket.generation
+        || (intent.revision == ticket.generation && intent.operation != ticket.op)
+        || target.is_some_and(|target| target.route_revision != ticket.route_revision)
+    {
+        return WakeState::Stale;
+    }
+    let Some(target) = target.filter(|_| {
+        state.synchronized() && intent.mode == "running" && intent.revision == ticket.generation
+    }) else {
+        return WakeState::Waiting;
+    };
+    let writer = gateway
+        .targets
+        .read()
+        .await
+        .target(&ticket.db, control::now());
+    match writer {
+        Ok(writer) if writer.pod_uid == target.pod_uid => WakeState::Released {
+            pod: target.pod_uid.clone(),
+            slot: wake::slot_namespace_of_tls_name(&target.tls_server_name).is_some(),
+        },
+        _ => WakeState::Waiting,
+    }
+}
+/// Where a held wake connection stands: released to a writer, ended, or (none) still waiting.
+async fn held_state(
+    gateway: &Gateway,
+    ticket: &WakeClaims,
+    held: &Held,
+    stop: &watch::Receiver<bool>,
+) -> Option<Result<(String, bool), HeldEnd>> {
+    if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
+        return Some(Err(HeldEnd::Draining));
+    }
+    if held
+        .verdict()
+        .is_some_and(|result| result.outcome == Outcome::Refused)
+    {
+        return Some(Err(HeldEnd::Refused));
+    }
+    match wake_state(gateway, ticket).await {
+        WakeState::Released { pod, slot } => Some(Ok((pod, slot))),
+        WakeState::Stale => Some(Err(HeldEnd::Stale)),
+        WakeState::Waiting => None,
+    }
+}
+/// How a held wake connection ended without its release.
+enum HeldEnd {
+    Refused,
+    Bound,
+    Stale,
+    Draining,
+    ClientClosed,
+}
+/// Answers a held connection that is not released with its FATAL ErrorResponse.
+async fn end_held(websocket: &mut WebSocket, stages: &mut Stages, end: HeldEnd) {
+    let (held, outcome, state, message) = match end {
+        HeldEnd::Refused => (
+            "refused",
+            "wake_refused",
+            "57P03",
+            "database is not accepting connections",
+        ),
+        HeldEnd::Bound => (
+            "bound",
+            "wake_timeout",
+            "57P03",
+            "database did not wake in time",
+        ),
+        HeldEnd::Stale => (
+            "stale",
+            "route_stale",
+            "57P03",
+            "database is not accepting connections",
+        ),
+        HeldEnd::Draining => (
+            "draining",
+            "gateway_draining",
+            "08006",
+            "gateway restarting",
+        ),
+        HeldEnd::ClientClosed => {
+            stages.held_outcome = Some("client_closed");
+            stages.outcome = "client_closed";
+            return;
+        }
+    };
+    stages.held_outcome = Some(held);
+    stages.outcome = outcome;
+    let _ = send_error(websocket, state, message).await;
+}
+/// A wake ticket (route v5) of a database the fence has not released: the connection is upgraded
+/// at once, its StartupMessage is read and held, and its wake is queued for the controller. It is
+/// released by the fence that shows the woken writer and then routed as an admitted route; until
+/// then not a byte reaches PostgreSQL and nothing is dialled.
+async fn serve_held(
+    mut socket: TcpStream,
+    head: HttpHead,
+    gateway: Arc<Gateway>,
+    mut stop: watch::Receiver<bool>,
+    handshake_permit: OwnedSemaphorePermit,
+    ticket: WakeClaims,
+    mut stages: Stages,
+) -> Result<(), Failure> {
+    stages.wake_path = "pool_miss";
+    let database = ticket.db.clone();
+    if gateway.draining.load(Ordering::Acquire) {
+        stages.outcome = "fenced";
+        return control::reply(&mut socket, 503, serde_json::json!({"error":"fenced"})).await;
+    }
+    let Some(base) = session_memory(&gateway, &database) else {
+        stages.outcome = "memory_capacity";
+        return memory_refused(&mut socket, &gateway, &database).await;
+    };
+    // The replay of the route the connection is admitted under is checked now, once.
+    let replay = gateway
+        .admission
+        .lock()
+        .unwrap()
+        .replay
+        .use_token(&ticket.admitted(None), control::now());
+    if let Err(reason) = replay {
+        stages.outcome = "admission_denied";
+        return control::reply(
+            &mut socket,
+            replay_status(reason),
+            serde_json::json!({"error":"admission_denied"}),
+        )
+        .await;
+    }
+    let mut held = match gateway
+        .wakes
+        .hold(&ticket, control::now(), std::time::Instant::now())
+    {
+        Ok(held) => held,
+        Err(status) => {
+            stages.outcome = "wake_capacity";
+            return control::reply(
+                &mut socket,
+                status,
+                serde_json::json!({"error":"wake_capacity"}),
+            )
+            .await;
+        }
+    };
+    let wire = WireBudget::new(gateway.memory.lease(&database));
+    let stream = BudgetedStream::new(socket, head.prefix, head.end, wire.clone(), base);
+    let accepted = timeout(
+        Duration::from_secs(10),
+        accept_async_with_config(stream, Some(websocket_config())),
+    )
+    .await;
+    if !matches!(accepted, Ok(Ok(_))) {
+        stages.outcome = "upgrade_failed";
+    }
+    let mut websocket = accepted??;
+    let upgraded = Instant::now();
+    stages.accepted = Some(upgraded);
+    drop(handshake_permit);
+    let deadline = tokio::time::Instant::from_std(upgraded + WAKE_BOUND);
+    let id = format!("{database}/{}", ticket.cid);
+    let route = ticket.admitted(None);
+    // Until the StartupMessage is read, the read itself is what the wait polls besides the fence
+    // and the controller's result: a refusal, the bound or the fence moving on end it as well.
+    let read = {
+        let read = read_startup(&mut websocket, &route, &gateway, &id, &wire, &mut stages);
+        tokio::pin!(read);
+        loop {
+            let fences_changed = gateway.fences.read().await.changed.clone();
+            let fences = fences_changed.notified();
+            tokio::pin!(fences);
+            fences.as_mut().enable();
+            if let Some(Err(end)) = held_state(&gateway, &ticket, &held, &stop).await {
+                break Err(Some(end));
+            }
+            tokio::select! {
+                read = read.as_mut() => break read.map_err(|_| None),
+                _ = fences.as_mut() => {},
+                _ = held.answered() => {},
+                _ = tokio::time::sleep_until(deadline) => break Err(Some(HeldEnd::Bound)),
+                changed = stop.changed() => if changed.is_err() { break Err(Some(HeldEnd::Draining)) },
+            }
+        }
+    };
+    let mut started = match read {
+        Ok(started) => started,
+        Err(end) => {
+            stages.verdict = Some(held.release());
+            match end {
+                Some(end) => end_held(&mut websocket, &mut stages, end).await,
+                // The client ended or broke its startup; a refused one was already answered.
+                None if stages.outcome == "client_closed" => {
+                    stages.held_outcome = Some("client_closed");
+                }
+                None => {}
+            }
+            return Ok(());
+        }
+    };
+    let released = loop {
+        // Armed before the fence is read, so a change between the read and the wait wakes it.
+        let fences_changed = gateway.fences.read().await.changed.clone();
+        let targets_changed = gateway.targets.read().await.changed.clone();
+        let fences = fences_changed.notified();
+        let targets = targets_changed.notified();
+        tokio::pin!(fences, targets);
+        fences.as_mut().enable();
+        targets.as_mut().enable();
+        if let Some(state) = held_state(&gateway, &ticket, &held, &stop).await {
+            break state;
+        }
+        tokio::select! {
+            _ = fences.as_mut() => {},
+            _ = targets.as_mut() => {},
+            _ = held.answered() => {},
+            _ = tokio::time::sleep_until(deadline) => break Err(HeldEnd::Bound),
+            changed = stop.changed() => if changed.is_err() { break Err(HeldEnd::Draining) },
+            // What the client sends after its StartupMessage (a pipelined password) is held with
+            // it, within the connection's memory.
+            message = websocket.next() => match message {
+                Some(Ok(Message::Binary(bytes))) => {
+                    started.leases.push(wire.take_message().inspect_err(|_| stages.outcome = "websocket_error")?);
+                    started.initial.extend_from_slice(&bytes);
+                    started.rest.extend_from_slice(&bytes);
+                }
+                Some(Ok(Message::Ping(value))) => send_client(&mut websocket, Message::Pong(value), &mut stages).await?,
+                Some(Ok(Message::Pong(_))) => {},
+                Some(Ok(Message::Text(_))) => {
+                    stages.outcome = "text_frame";
+                    let _ = wire.take_message()?;
+                    close(&mut websocket, CloseCode::Unsupported, "binary frames required").await;
+                    return Ok(());
+                }
+                _ => break Err(HeldEnd::ClientClosed),
+            },
+        }
+    };
+    stages.verdict = Some(held.release());
+    let (pod, slot) = match released {
+        Ok(released) => released,
+        Err(end) => {
+            end_held(&mut websocket, &mut stages, end).await;
+            return Ok(());
+        }
+    };
+    stages.held_outcome = Some("released");
+    stages.wake_wait = Some(upgraded.elapsed());
+    if slot {
+        stages.wake_path = "pool_hit";
+    }
+    // From here the connection is the admitted route of the woken writer.
+    let claims = ticket.admitted(Some(&pod));
+    let state = gateway.fences.read().await;
+    let epoch = state.bound_epoch(&database);
+    let revision_current = state.admits(&database) && route_revision_current(&state, &claims);
+    drop(state);
+    let target = match gateway
+        .targets
+        .read()
+        .await
+        .target(&database, control::now())
+    {
+        Ok(target) => target,
+        Err(reason) => {
+            stages.outcome = "target_unavailable";
+            stages.target_reason = Some(reason);
+            let _ = send_error(&mut websocket, "08006", "database connection failed").await;
+            return Ok(());
+        }
+    };
+    stages.route = Some(if target.unready { "attested" } else { "ready" });
+    if !revision_current
+        || target.pod_uid != pod
+        || !route_target_current(&claims, &target)
+        || !admitted_runtime_current(&*gateway.fences.read().await, &claims, &target)
+    {
+        stages.outcome = "route_stale";
+        let _ = send_error(&mut websocket, "08006", "database connection failed").await;
+        return Ok(());
+    }
+    let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, false) {
+        Ok(value) => value,
+        Err(_) => {
+            stages.outcome = "admission_denied";
+            let _ = send_error(&mut websocket, "08006", "database connection failed").await;
+            return Ok(());
+        }
+    };
+    {
+        // The session is measured from its reservation; what the client sent while held is its.
+        let mut metrics = gateway.measurements.lock().unwrap();
+        metrics.ingress(&session.id, started.initial.len());
+        metrics.client_activity(&session.id);
+    }
+    let mut early = None;
+    let dialed = tokio::select! {
+        result=timeout(STARTUP_BOUND,dial_started(&claims,&session,epoch,&mut stages,&mut early))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
+        _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
+    };
+    let Ok(postgres) = dialed else {
+        let _ = send_error(&mut websocket, "08006", "database connection failed").await;
+        return Ok(());
+    };
+    let admitted = Admitted {
+        claims: &claims,
+        session: &session,
+        epoch,
+    };
+    run_session(
+        &mut websocket,
+        postgres,
+        started,
+        admitted,
+        &mut actions,
+        &mut stop,
+        &mut stages,
+    )
+    .await
+}
+/// A route admitted on a writer, with its reserved session and the fence epoch it was admitted at.
+struct Admitted<'a> {
+    claims: &'a RouteClaims,
+    session: &'a SessionLease,
+    epoch: (u64, u64),
+}
+/// The client's StartupMessage, with what it sent behind it, checked against the route.
+struct Started {
+    /// The StartupMessage and the bytes behind it, written to PostgreSQL first.
+    initial: Vec<u8>,
+    leases: Vec<Lease>,
+    /// The bytes behind the StartupMessage.
+    rest: Vec<u8>,
+}
+/// Writes the checked StartupMessage to the dialled writer while the fence and the writer still
+/// admit it, then relays the session.
+async fn run_session(
+    websocket: &mut WebSocket,
+    mut postgres: TlsStream<TcpStream>,
+    started: Started,
+    admitted: Admitted<'_>,
+    actions: &mut watch::Receiver<Action>,
+    stop: &mut watch::Receiver<bool>,
+    stages: &mut Stages,
+) -> Result<(), Failure> {
+    let Admitted {
+        claims,
+        session,
+        epoch,
+    } = admitted;
+    let gateway = &session.gateway;
+    let id = &session.id;
+    let wire = &session.wire;
+    let target = &session.target;
+    let Started {
+        initial,
+        leases: initial_leases,
+        rest,
+    } = started;
     let result = async {
         let mut activity = PostgresActivity::new();
         activity.observe_frontend(&rest);
-        update(&gateway, &id, &activity, true, false);
+        update(gateway, id, &activity, true, false);
         let state = gateway.fences.read().await;
         if state.bound_epoch(&claims.db) != epoch
             || !state.admits(&claims.db)
-            || !target_revision_matches(&state, &claims.db, &target)
+            || !target_revision_matches(&state, &claims.db, target)
         {
             stages.outcome = "fenced";
             return Err("startup fenced before first upstream write".into());
         }
         let physical = gateway.targets.read().await;
-        if !physical.permits(&claims.db, &target, control::now()) {
+        if !physical.permits(&claims.db, target, control::now()) {
             stages.outcome = "target_changed";
             return Err("storage or target changed before first upstream write".into());
         }
@@ -486,13 +982,13 @@ pub async fn serve_socket(
         drop(initial_leases);
         wire.allow_relay();
         relay(
-            &mut websocket,
+            websocket,
             &mut postgres,
-            &session,
+            session,
             &mut activity,
-            &mut actions,
-            &mut stop,
-            &mut stages,
+            actions,
+            stop,
+            stages,
         )
         .await
     }
@@ -563,18 +1059,17 @@ async fn close_upstream(postgres: &mut TlsStream<TcpStream>) {
         let _ = timeout(Duration::from_millis(500), postgres.shutdown()).await;
     }
 }
-async fn startup(
+/// Reads the client's StartupMessage, answering SSLRequest and GSSENCRequest with `N`. A
+/// StartupMessage for another database or user than the route's is refused with 28000; no byte of
+/// the client reaches PostgreSQL here.
+async fn read_startup(
     socket: &mut WebSocket,
     claims: &RouteClaims,
-    session: &SessionLease,
-    epoch: (u64, u64),
+    gateway: &Gateway,
+    id: &str,
+    wire: &WireBudget,
     stages: &mut Stages,
-    early: &mut Option<EarlyDial>,
-) -> Result<(TlsStream<TcpStream>, Vec<u8>, Vec<Lease>, Vec<u8>), Failure> {
-    let gateway = &*session.gateway;
-    let id = &session.id;
-    let wire = &session.wire;
-    let bound = &session.target;
+) -> Result<Started, Failure> {
     let mut reader = StartupReader::default();
     let mut leases = Vec::new();
     loop {
@@ -656,73 +1151,111 @@ async fn startup(
                         .await?;
                         return Err("startup route mismatch".into());
                     }
-                    let state = gateway.fences.read().await;
-                    if state.bound_epoch(&database) != epoch
-                        || !state.admits(&database)
-                        || !target_revision_matches(&state, &database, bound)
-                    {
-                        stages.outcome = "fenced";
-                        return Err("fence changed during startup".into());
-                    }
-                    if !admitted_runtime_current(&state, claims, bound) {
-                        return Err("admitted runtime changed before dial".into());
-                    }
-                    let admitted = if claims.v == 4 {
-                        state
-                            .records
-                            .get(&database)
-                            .and_then(|fence| fence.admission_target.clone())
-                    } else {
-                        None
-                    };
-                    drop(state);
-                    // The route was checked against this writer; a replacement is never dialled.
-                    if !gateway
-                        .targets
-                        .read()
-                        .await
-                        .permits(&database, bound, control::now())
-                    {
-                        stages.outcome = "target_changed";
-                        return Err("writer changed before dial".into());
-                    }
-                    gateway
-                        .sessions
-                        .lock()
-                        .unwrap()
-                        .update(id, false, true, true);
-                    let target = database_target(&database, bound, admitted);
-                    // The dial that began with the admission is this one if it was for this target;
-                    // a target that changed since is dialled anew, and the old connection is
-                    // dropped unused.
-                    let (dialed, took) = match early.take() {
-                        Some(early) if early.target == target => early.finish().await,
-                        other => {
-                            drop(other);
-                            let dialing = Instant::now();
-                            let dialed = gateway.dial.dial(&target).await;
-                            (dialed, dialing.elapsed())
-                        }
-                    };
-                    stages.dial = Some(took);
-                    let mut postgres =
-                        dialed.inspect_err(|_| stages.outcome = "postgres_connect_error")?;
-                    let state = gateway.fences.read().await;
-                    if state.bound_epoch(&database) != epoch
-                        || !state.admits(&database)
-                        || !target_revision_matches(&state, &database, bound)
-                    {
-                        drop(state);
-                        stages.outcome = "fenced";
-                        close_upstream(&mut postgres).await;
-                        return Err("fence changed during TLS negotiation".into());
-                    }
                     raw.extend_from_slice(&rest);
-                    return Ok((postgres, raw, leases, rest));
+                    return Ok(Started {
+                        initial: raw,
+                        leases,
+                        rest,
+                    });
                 }
             }
         }
     }
+}
+/// Dials the writer the route was admitted on (or takes the dial that began with the admission)
+/// once the checked StartupMessage is there, while the fence and the writer still admit it.
+async fn dial_started(
+    claims: &RouteClaims,
+    session: &SessionLease,
+    epoch: (u64, u64),
+    stages: &mut Stages,
+    early: &mut Option<EarlyDial>,
+) -> Result<TlsStream<TcpStream>, Failure> {
+    let gateway = &*session.gateway;
+    let id = &session.id;
+    let bound = &session.target;
+    let database = &claims.db;
+    let state = gateway.fences.read().await;
+    if state.bound_epoch(database) != epoch
+        || !state.admits(database)
+        || !target_revision_matches(&state, database, bound)
+    {
+        stages.outcome = "fenced";
+        return Err("fence changed during startup".into());
+    }
+    if !admitted_runtime_current(&state, claims, bound) {
+        return Err("admitted runtime changed before dial".into());
+    }
+    let admitted = if claims.v == 4 {
+        state
+            .records
+            .get(database)
+            .and_then(|fence| fence.admission_target.clone())
+    } else {
+        None
+    };
+    drop(state);
+    // The route was checked against this writer; a replacement is never dialled.
+    if !gateway
+        .targets
+        .read()
+        .await
+        .permits(database, bound, control::now())
+    {
+        stages.outcome = "target_changed";
+        return Err("writer changed before dial".into());
+    }
+    gateway
+        .sessions
+        .lock()
+        .unwrap()
+        .update(id, false, true, true);
+    let target = database_target(database, bound, admitted);
+    // The dial that began with the admission is this one if it was for this target; a target that
+    // changed since is dialled anew, and the old connection is dropped unused.
+    let (dialed, took) = match early.take() {
+        Some(early) if early.target == target => early.finish().await,
+        other => {
+            drop(other);
+            let dialing = Instant::now();
+            let dialed = gateway.dial.dial(&target).await;
+            (dialed, dialing.elapsed())
+        }
+    };
+    stages.dial = Some(took);
+    let mut postgres = dialed.inspect_err(|_| stages.outcome = "postgres_connect_error")?;
+    let state = gateway.fences.read().await;
+    if state.bound_epoch(database) != epoch
+        || !state.admits(database)
+        || !target_revision_matches(&state, database, bound)
+    {
+        drop(state);
+        stages.outcome = "fenced";
+        close_upstream(&mut postgres).await;
+        return Err("fence changed during TLS negotiation".into());
+    }
+    Ok(postgres)
+}
+/// The StartupMessage, checked against the route, and the writer dialled for it.
+async fn startup(
+    socket: &mut WebSocket,
+    claims: &RouteClaims,
+    session: &SessionLease,
+    epoch: (u64, u64),
+    stages: &mut Stages,
+    early: &mut Option<EarlyDial>,
+) -> Result<(TlsStream<TcpStream>, Started), Failure> {
+    let started = read_startup(
+        socket,
+        claims,
+        &session.gateway,
+        &session.id,
+        &session.wire,
+        stages,
+    )
+    .await?;
+    let postgres = dial_started(claims, session, epoch, stages, early).await?;
+    Ok((postgres, started))
 }
 /// The PostgreSQL a route is dialled at: the Pod it names, under the TLS name and authority the
 /// fence admitted for it (a v4 route), or the database's Service name.

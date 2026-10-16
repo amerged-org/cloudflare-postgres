@@ -2,6 +2,7 @@
 //! Native data transport. Lifecycle control/activity parity is a release gate.
 pub mod budget;
 pub mod control;
+pub mod hold;
 pub mod kubernetes;
 pub mod sessions;
 pub mod storage;
