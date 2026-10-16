@@ -844,6 +844,7 @@ async fn supervise_shared(
             }
             let mut state = guard.lock().await;
             if outcome.retired {
+                eprintln!("storage_scope_retired {}", outcome.uid);
                 state.forget_protective(&outcome.uid);
                 continue;
             }
