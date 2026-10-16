@@ -105,12 +105,33 @@ pub struct Trigger {
     pub database: String,
     pub name: String,
 }
+/// What the watch holds of one object: its identity and version, and the shape of the rest of
+/// its metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tracked {
+    uid: String,
+    version: String,
+    /// A digest of what a write of an object's status leaves as it is: its generation, labels,
+    /// annotations, finalizers, owners and deletion mark.
+    shape: [u8; 32],
+}
+fn shape(metadata: &Value) -> [u8; 32] {
+    let shape = json!([
+        metadata["generation"],
+        metadata["labels"],
+        metadata["annotations"],
+        metadata["finalizers"],
+        metadata["ownerReferences"],
+        metadata["deletionTimestamp"]
+    ]);
+    Sha256::digest(shape.to_string().as_bytes()).into()
+}
 #[derive(Debug)]
 struct WatchContinuity {
     controller_epoch: String,
     epoch: u64,
     kinds: HashMap<String, (String, Instant, bool)>,
-    objects: HashMap<(String, String, String), (String, String)>,
+    objects: HashMap<(String, String, String), Tracked>,
     /// Versions of watched objects that this controller itself wrote and whose watch events have
     /// not arrived yet, by (kind, namespace, name): the pass that wrote one holds the object as
     /// written, so its event is not a change someone else made.
@@ -166,7 +187,14 @@ impl WatchContinuity {
             if self.objects.len() >= 4096 && !self.objects.contains_key(&key) {
                 return false;
             }
-            self.objects.insert(key, (uid.into(), rv.into()));
+            self.objects.insert(
+                key,
+                Tracked {
+                    uid: uid.into(),
+                    version: rv.into(),
+                    shape: shape(metadata),
+                },
+            );
         }
         true
     }
@@ -180,9 +208,9 @@ impl WatchContinuity {
         self.kinds
             .get(kind)
             .is_some_and(|(_, at, live)| *live && at.elapsed() < Duration::from_secs(70))
-            && self.objects.get(&key).is_some_and(|(uid, version)| {
-                Some(uid.as_str()) == meta["uid"].as_str()
-                    && Some(version.as_str()) == meta["resourceVersion"].as_str()
+            && self.objects.get(&key).is_some_and(|held| {
+                Some(held.uid.as_str()) == meta["uid"].as_str()
+                    && Some(held.version.as_str()) == meta["resourceVersion"].as_str()
             })
     }
     fn gap(&mut self, kind: &str) {
@@ -273,10 +301,22 @@ impl WatchContinuity {
         if event_type == "BOOKMARK" {
             return Ok((version.to_string(), None));
         }
+        let meta = &object["metadata"];
+        let key = (
+            kind.to_string(),
+            text(meta, "namespace").to_string(),
+            text(meta, "name").to_string(),
+        );
+        // A write that only moved the status of the object leaves the rest of its metadata as it
+        // was held; an object the watch did not hold, or held as another, is news.
+        let status_only = event_type == "MODIFIED"
+            && self
+                .objects
+                .get(&key)
+                .is_some_and(|held| held.uid == text(meta, "uid") && held.shape == shape(meta));
         if !self.observe(kind, object, event_type == "DELETED") {
             return Err("watch object metadata invalid".into());
         }
-        let meta = &object["metadata"];
         let labelled = text(&meta["labels"], "pgcf.io/database-id");
         let id = if labelled.is_empty() {
             text(meta, "namespace")
@@ -285,11 +325,22 @@ impl WatchContinuity {
         } else {
             labelled
         };
-        let hint = (pgcf_native_protocol::valid_pattern("database", id) && !self.own(kind, object))
-            .then(|| Trigger {
-                database: id.to_string(),
-                name: text(meta, "name").to_string(),
-            });
+        // The records of pgcf-system are written by this controller alone, the sampler's ledger
+        // every two seconds among them: a change of one is its own, and a deleted one is news.
+        // The status of a Cluster is CNPG's: its Pod, its Secrets and its annotations say what a
+        // pass decides on. A Pod's status is not set apart like that, it is read.
+        let own_record = kind == "ConfigMap"
+            && text(meta, "namespace") == "pgcf-system"
+            && event_type != "DELETED";
+        let status_of_cnpg = kind == "Cluster" && status_only;
+        let hint = (pgcf_native_protocol::valid_pattern("database", id)
+            && !own_record
+            && !status_of_cnpg
+            && !self.own(kind, object))
+        .then(|| Trigger {
+            database: id.to_string(),
+            name: text(meta, "name").to_string(),
+        });
         Ok((version.to_string(), hint))
     }
 }
@@ -477,15 +528,12 @@ impl Kubernetes {
         ]
         .iter()
         .all(|(key, kind, uid)| {
-            state
-                .objects
-                .iter()
-                .any(|((resource, _, _), (actual, rv))| {
-                    resource == kind
-                        && Some(actual.as_str()) == proof[*uid].as_str()
-                        && Some(rv.as_str())
-                            == proof["observation"]["resource_versions"][*key].as_str()
-                })
+            state.objects.iter().any(|((resource, _, _), held)| {
+                resource == kind
+                    && Some(held.uid.as_str()) == proof[*uid].as_str()
+                    && Some(held.version.as_str())
+                        == proof["observation"]["resource_versions"][*key].as_str()
+            })
         })
     }
     /// The watch of an in-process test world: every runtime kind is live and the cache holds
@@ -1322,6 +1370,103 @@ mod tests {
                 .is_err()
         );
     }
+    fn meta_event(kind: &str, event_type: &str, metadata: Value) -> Value {
+        serde_json::json!({"type":event_type,"object":{"apiVersion":"meta.k8s.io/v1","kind":kind,"metadata":metadata}})
+    }
+    #[test]
+    fn the_controllers_own_records_and_the_status_of_a_cluster_hint_nothing() {
+        // Live, an awake thin database was reconciled every two seconds, the cadence at which
+        // its ledger is written. The records of pgcf-system are written by this controller alone;
+        // a Cluster whose resourceVersion moves by a status write has changed nothing a pass
+        // decides on that its Pod, its Secrets and its own writes do not already say.
+        let mut state = WatchContinuity::default();
+        let id = "dbbbbbbbbbbbbbbbbbbb";
+        let namespace = format!("pgcf-db-{id}");
+        let record = |version: &str, event_type: &str| {
+            meta_event(
+                "ConfigMap",
+                event_type,
+                serde_json::json!({"name":format!("storage-{id}"),"namespace":"pgcf-system","uid":"u-1","resourceVersion":version,"labels":{"pgcf.io/database-id":id}}),
+            )
+        };
+        assert_eq!(
+            state
+                .event("ConfigMap", &record("5", "MODIFIED"))
+                .unwrap()
+                .1,
+            None,
+            "a record of this controller, written by it"
+        );
+        assert!(
+            state
+                .event("ConfigMap", &record("6", "DELETED"))
+                .unwrap()
+                .1
+                .is_some(),
+            "a record that was deleted is news"
+        );
+        let monitoring = meta_event(
+            "ConfigMap",
+            "MODIFIED",
+            serde_json::json!({"name":"cnpg-monitoring","namespace":namespace,"uid":"u-2","resourceVersion":"5"}),
+        );
+        assert!(state.event("ConfigMap", &monitoring).unwrap().1.is_some());
+        let cluster = |version: &str, generation: u64, annotations: Value, event_type: &str| {
+            meta_event(
+                "Cluster",
+                event_type,
+                serde_json::json!({"name":"database","namespace":namespace,"uid":"u-3","resourceVersion":version,"generation":generation,"annotations":annotations}),
+            )
+        };
+        let hinted = |state: &mut WatchContinuity, event: &Value| {
+            state.event("Cluster", event).unwrap().1.is_some()
+        };
+        let marked = serde_json::json!({"cnpg.io/hibernation":"off"});
+        assert!(hinted(
+            &mut state,
+            &cluster("10", 2, marked.clone(), "ADDED")
+        ));
+        assert!(
+            !hinted(&mut state, &cluster("11", 2, marked.clone(), "MODIFIED")),
+            "a status write moves the resourceVersion alone"
+        );
+        assert!(
+            hinted(&mut state, &cluster("12", 3, marked.clone(), "MODIFIED")),
+            "a change of the spec moves the generation"
+        );
+        assert!(
+            hinted(
+                &mut state,
+                &cluster(
+                    "13",
+                    3,
+                    serde_json::json!({"cnpg.io/hibernation":"on"}),
+                    "MODIFIED"
+                )
+            ),
+            "an annotation is what PGCF and CNPG ask each other with"
+        );
+        assert!(hinted(
+            &mut state,
+            &cluster("14", 3, marked.clone(), "MODIFIED")
+        ));
+        assert!(!hinted(
+            &mut state,
+            &cluster("15", 3, marked.clone(), "MODIFIED")
+        ));
+        assert!(hinted(&mut state, &cluster("16", 3, marked, "DELETED")));
+        // Only a custom resource's status is separate from the rest of it: a Pod's status is
+        // what the pass reads.
+        let pod = |version: &str| {
+            meta_event(
+                "Pod",
+                "MODIFIED",
+                serde_json::json!({"name":"database-1","namespace":namespace,"uid":"u-4","resourceVersion":version,"generation":1}),
+            )
+        };
+        assert!(state.event("Pod", &pod("20")).unwrap().1.is_some());
+        assert!(state.event("Pod", &pod("21")).unwrap().1.is_some());
+    }
     #[tokio::test]
     async fn a_cached_read_and_a_cached_list_ask_the_watch_cache_and_the_plain_ones_ask_etcd() {
         use crate::test_server::{Server, uid};
@@ -1384,22 +1529,23 @@ mod tests {
         use crate::test_server::{Server, uid};
         let server = Server::start().await;
         let id = "dbbbbbbbbbbbbbbbbbbb";
-        let name = format!("gateway-fence-{id}");
-        server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"pgcf-system","uid":uid(1),"labels":{"pgcf.io/database-id":id}},"data":{"power.json":"1"}}));
+        let name = "maintenance-credentials".to_string();
+        let namespace = format!("pgcf-db-{id}");
+        server.put(serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":name,"namespace":namespace,"uid":uid(1),"labels":{"pgcf.io/database-id":id}},"data":{"password":"1"}}));
         let current = server
             .k8s
-            .read("ConfigMap", Some("pgcf-system"), &name)
+            .read("Secret", Some(&namespace), &name)
             .await
             .unwrap()
             .unwrap();
         let written = server
             .k8s
-            .patch(&current, &serde_json::json!({"data":{"power.json":"2"}}))
+            .patch(&current, &serde_json::json!({"data":{"password":"2"}}))
             .await
             .unwrap();
         let events = std::mem::take(&mut server.state.lock().unwrap().events);
         assert_eq!(events.len(), 1);
-        let (version, hint) = server.k8s.watch_event("ConfigMap", &events[0].1).unwrap();
+        let (version, hint) = server.k8s.watch_event("Secret", &events[0].1).unwrap();
         assert_eq!(version, written["metadata"]["resourceVersion"]);
         assert_eq!(hint, None, "the write of this controller is not news");
         // Someone else writes the same object next: a version of its own, and a hint. The
@@ -1411,11 +1557,11 @@ mod tests {
             name: name.clone(),
         };
         assert_eq!(
-            server.k8s.watch_event("ConfigMap", &other).unwrap(),
+            server.k8s.watch_event("Secret", &other).unwrap(),
             ("9".to_string(), Some(trigger.clone()))
         );
         assert_eq!(
-            server.k8s.watch_event("ConfigMap", &events[0].1).unwrap().1,
+            server.k8s.watch_event("Secret", &events[0].1).unwrap().1,
             Some(trigger)
         );
         // A write that changed nothing answers the version it was made over, leaves no event
@@ -1426,7 +1572,7 @@ mod tests {
             .continuity
             .lock()
             .unwrap()
-            .wrote("ConfigMap", &written, version);
+            .wrote("Secret", &written, version);
         assert!(server.k8s.continuity.lock().unwrap().written.is_empty());
     }
     #[test]
