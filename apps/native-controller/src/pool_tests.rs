@@ -395,8 +395,10 @@ fn memory_headroom_counts_requests_of_non_terminal_pods_and_sidecars_on_the_node
         pod("a", "Succeeded", "1Gi", None),
         pod("b", "Running", "1Gi", None),
     ];
-    assert!(memory_headroom(&node, &pods, 1280));
-    assert!(!memory_headroom(&node, &pods, 1281));
+    let requested = requested_memory(&pods);
+    assert_eq!(requested.get("a"), Some(&768.0));
+    assert!(memory_headroom(&node, requested["a"], 1280));
+    assert!(!memory_headroom(&node, requested["a"], 1281));
     // The need is the class request above what the slot already requests.
     let mut db = thin_database();
     db["size"]["memory_request_mib"] = 384.into();
@@ -407,7 +409,7 @@ fn memory_headroom_counts_requests_of_non_terminal_pods_and_sidecars_on_the_node
         .remove("memory_request_mib");
     assert_eq!(headroom_need(&db), 256 - 128);
     // A node without an allocatable memory has no headroom.
-    assert!(!memory_headroom(&json!({"status":{}}), &[], 0));
+    assert!(!memory_headroom(&json!({"status":{}}), 0.0, 0));
 }
 
 #[test]
@@ -835,6 +837,46 @@ mod world {
         // Nothing reached Cloudflare: the claim is the Actor's, and the observation the next
         // pass's once the claim is confirmed.
         assert!(!has(&lines, "observation"));
+    }
+
+    #[tokio::test]
+    async fn a_pool_hit_lists_nothing_and_reads_no_keyring_before_its_claim() {
+        let mut w = World::pooled().await;
+        w.reconciler.pool.refresh(&w.reconciler).await;
+        let from = w.server.state.lock().unwrap().requests.len();
+        delivered_wake(&mut w).await;
+        assert!(w.reconciler.pool.serves(&w.id), "a hit");
+        let state = w.server.state.lock().unwrap();
+        let requests: Vec<_> = state.requests[from..]
+            .iter()
+            .zip(&state.queries[from..])
+            .collect();
+        let claim = requests
+            .iter()
+            .position(|((method, path), _)| {
+                method == "PATCH"
+                    && *path
+                        == format!(
+                            "/apis/postgresql.cnpg.io/v1/namespaces/{}/clusters/database",
+                            slot_ns()
+                        )
+            })
+            .expect("the claim patch");
+        // Everything the decision and the attach read of Pods, agents, gateways and keys is the
+        // pool's own, refreshed off the path.
+        for ((method, path), query) in &requests[..claim] {
+            assert!(
+                !(method == "GET"
+                    && (query.contains("resourceVersion=0")
+                        || query.contains("labelSelector")
+                        || query.contains("limit="))),
+                "a list on the path: {path}?{query}"
+            );
+            assert!(
+                !path.ends_with("/secrets/pgcf-gateway"),
+                "a keyring read on the path"
+            );
+        }
     }
 
     fn cluster(w: &World, ns: &str) -> Value {

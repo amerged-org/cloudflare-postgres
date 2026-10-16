@@ -98,6 +98,7 @@ pub struct GatewayPod {
     pub ip: String,
     pub restarts: u64,
 }
+#[derive(Clone)]
 pub struct GatewaySnapshot {
     pub pods: Vec<GatewayPod>,
     pub active: String,
@@ -1202,7 +1203,8 @@ impl PowerCoordinator {
     }
     /// Releases the gateways to a pool slot (pool design 2026-10-16): one CAS write of the fence
     /// `map` as it was read when the slot was claimed, with the running intent and the slot's
-    /// admission target, then the release control of every gateway. The power record stays the
+    /// admission target, then the release control of every gateway of `snapshot` (the pool's,
+    /// read off the request path). The power record stays the
     /// sleep's until Cloudflare confirms the wake, so an unconfirmed claim can be undone.
     ///
     /// A gateway releases its held connections from the fence its watch delivers; the control is
@@ -1215,6 +1217,7 @@ impl PowerCoordinator {
         map: &Value,
         intent: &PowerIntent,
         target: &Value,
+        snapshot: &GatewaySnapshot,
     ) -> std::result::Result<Value, Error> {
         let result: Result<Value> = async {
             let map = self.fence_checked(db, map.clone())?;
@@ -1236,8 +1239,7 @@ impl PowerCoordinator {
             let intent_text = serde_json::to_string(intent).unwrap();
             let target_text = serde_json::to_string(target).unwrap();
             let patch = json!({"data":{"intent.json":intent_text,"admission_target":target_text}});
-            let (written, snapshot) = tokio::join!(self.k8s.patch(&map, &patch), self.snapshot());
-            let written = self.fence_checked(db, written?)?;
+            let written = self.fence_checked(db, self.k8s.patch(&map, &patch).await?)?;
             if written["metadata"]["uid"] != map["metadata"]["uid"]
                 || text(&written["data"], "intent.json") != intent_text
                 || text(&written["data"], "admission_target") != target_text
@@ -1245,9 +1247,7 @@ impl PowerCoordinator {
                 return Err(Fault::Unavailable("slot_release_unknown"));
             }
             self.bind_fence(db, &written).await?;
-            if let Ok(snapshot) = snapshot {
-                let _ = self.controls(intent, &snapshot, "release").await;
-            }
+            let _ = self.controls(intent, snapshot, "release").await;
             Ok(written)
         }
         .await;

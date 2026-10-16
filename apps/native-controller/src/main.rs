@@ -1290,10 +1290,8 @@ async fn run() -> Result<(), Error> {
                     let controller = controller.clone();
                     let dbs: Vec<Value> = cells.values().map(|cell| cell.db.clone()).collect();
                     refills.spawn_local(async move {
-                        let ready = match controller.power.gateway_snapshot().await {
-                            Ok(gateways) => controller.pool.intake.ready(&gateways.pods),
-                            Err(_) => false,
-                        };
+                        // What the request path reads is read here, off it.
+                        let ready = controller.pool.refresh(&controller).await;
                         let work = controller.pool.refill_work(&dbs, ready, Instant::now().into_std());
                         let done = futures_util::future::join_all(work.iter().map(|step| async {
                             match step {

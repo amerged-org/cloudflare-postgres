@@ -15,7 +15,7 @@ use crate::{
     intake::Intake,
     kubernetes::Kubernetes,
     manifests,
-    power::{Basis, GatewayPod, PowerCoordinator, PowerIntent, Sleep, SlotSleep},
+    power::{Basis, GatewayPod, GatewaySnapshot, PowerCoordinator, PowerIntent, Sleep, SlotSleep},
     reconcile::Reconciler,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -379,28 +379,37 @@ const SLOT_REQUEST_MEMORY_MIB: u64 = 128;
 fn mebibytes(value: &Value) -> Option<f64> {
     crate::reconcile::quantity(value).map(|bytes| bytes / 1_048_576.0)
 }
-/// Whether `node` has `need_mib` of allocatable memory that no request of a non-terminal Pod on
-/// it takes.
-pub fn memory_headroom(node: &Value, pods: &[Value], need_mib: u64) -> bool {
+/// The memory (MiB) the requests of non-terminal Pods take on each node: their containers and
+/// their sidecars.
+pub fn requested_memory(pods: &[Value]) -> HashMap<String, f64> {
+    let mut nodes: HashMap<String, f64> = HashMap::new();
+    for pod in pods
+        .iter()
+        .filter(|pod| !crate::kubernetes::terminal_pod(pod))
+    {
+        let containers = pod["spec"]["containers"].as_array().into_iter().flatten();
+        let sidecars = pod["spec"]["initContainers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["restartPolicy"] == "Always");
+        let requested: f64 = containers
+            .chain(sidecars)
+            .filter_map(|c| mebibytes(&c["resources"]["requests"]["memory"]))
+            .sum();
+        *nodes
+            .entry(text(&pod["spec"], "nodeName").to_string())
+            .or_default() += requested;
+    }
+    nodes
+}
+/// Whether `node` has `need_mib` of allocatable memory that the `requested` MiB of its Pods do
+/// not take.
+pub fn memory_headroom(node: &Value, requested: f64, need_mib: u64) -> bool {
     let Some(allocatable) = mebibytes(&node["status"]["allocatable"]["memory"]) else {
         return false;
     };
-    let name = &node["metadata"]["name"];
-    let taken: f64 = pods
-        .iter()
-        .filter(|pod| pod["spec"]["nodeName"] == *name && !crate::kubernetes::terminal_pod(pod))
-        .flat_map(|pod| {
-            let containers = pod["spec"]["containers"].as_array().into_iter().flatten();
-            let sidecars = pod["spec"]["initContainers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|c| c["restartPolicy"] == "Always");
-            containers.chain(sidecars)
-        })
-        .filter_map(|c| mebibytes(&c["resources"]["requests"]["memory"]))
-        .sum();
-    allocatable - taken >= need_mib as f64
+    allocatable - requested >= need_mib as f64
 }
 /// The configuration a sleep is recorded under: the configuration fingerprint without the
 /// request fields that depend on whether the desired row runs.
@@ -726,10 +735,22 @@ pub enum PoolWork {
     Create(manifests::SlotSpec),
     Discard(String),
 }
+/// What a wake decision and its attach read of Kubernetes, kept by the pool's tick so that the
+/// request path makes no list and no keyring read (pool design 2026-10-16, step 5).
+#[derive(Default)]
+struct Inputs {
+    /// The Ready agent of each node.
+    agents: HashMap<String, Agent>,
+    /// The memory the requests of non-terminal Pods take on each node.
+    requested: Option<HashMap<String, f64>>,
+    gateways: Option<GatewaySnapshot>,
+    keys: Option<attach_protocol::Keys>,
+}
 #[derive(Default)]
 struct State {
     slots: HashMap<String, Slot>,
     serving: HashMap<String, Serving>,
+    inputs: Inputs,
     /// The gateway Pods that delivered each database's wake, with its operation and generation.
     deliveries: HashMap<String, Vec<(GatewayPod, String, u64)>>,
     /// When each node may create a slot again.
@@ -745,6 +766,10 @@ struct Plan {
     record: SleepRecord,
     /// The gateway fence as it was read: the release is a CAS write of it.
     fence: Value,
+    /// The gateways and the keyring the release goes to.
+    gateways: GatewaySnapshot,
+    /// The node's agent and the keys its tokens are signed with, as the pool's tick read them.
+    agent: Option<(Agent, attach_protocol::Keys)>,
 }
 /// The milliseconds of each step of a wake decision.
 struct Timer {
@@ -931,6 +956,34 @@ impl Pool {
             });
         }
     }
+    /// Reads what the request path needs of Kubernetes into the pool, off the path: the memory
+    /// the Pods request per node, the Ready agents, and the gateway Pods with the keyring. The
+    /// pool's tick calls it every second. Answers whether every gateway Pod answered a wake poll.
+    pub async fn refresh(&self, rec: &Reconciler) -> bool {
+        let (pods, agents, gateways) = tokio::join!(
+            self.k8s.list_cached("Pod", None, None),
+            rec.power.attach.agents(),
+            rec.power.gateway_snapshot(),
+        );
+        let gateways = gateways.ok();
+        let keys = gateways.as_ref().and_then(|gateways| {
+            attach_protocol::Keys::derive(rec.power.region(), &gateways.active, &gateways.keys).ok()
+        });
+        let ready = gateways
+            .as_ref()
+            .is_some_and(|gateways| self.intake.ready(&gateways.pods));
+        self.state.lock().unwrap().inputs = Inputs {
+            agents: agents
+                .unwrap_or_default()
+                .into_iter()
+                .map(|agent| (agent.node.clone(), agent))
+                .collect(),
+            requested: pods.ok().map(|pods| requested_memory(&pods)),
+            gateways,
+            keys,
+        };
+        ready
+    }
     /// The free slots of `node`.
     fn free_on(&self, node: &str) -> Vec<Slot> {
         self.state
@@ -1102,15 +1155,29 @@ impl Pool {
         let ns = crate::contracts::namespace(db);
         let storage_name = format!("storage-{id}");
         let fence_name = format!("gateway-fence-{id}");
-        let (storage, fence, cluster, node, pods, gateways) = tokio::join!(
+        let (storage, fence, cluster, node) = tokio::join!(
             self.k8s
                 .read_known("ConfigMap", Some(SYSTEM), &storage_name),
             self.k8s.read_known("ConfigMap", Some(SYSTEM), &fence_name),
             self.k8s.read_known("Cluster", Some(&ns), "database"),
             self.k8s.read_known_cached("Node", None, text(db, "node")),
-            self.k8s.list_cached("Pod", None, None),
-            rec.power.gateway_pods(),
         );
+        let (requested, gateways, agent) = {
+            let state = self.state.lock().unwrap();
+            let inputs = &state.inputs;
+            (
+                inputs
+                    .requested
+                    .as_ref()
+                    .map(|nodes| nodes.get(text(db, "node")).copied().unwrap_or(0.0)),
+                inputs.gateways.clone(),
+                inputs
+                    .agents
+                    .get(text(db, "node"))
+                    .cloned()
+                    .zip(inputs.keys.clone()),
+            )
+        };
         let storage = storage.ok().flatten();
         let fence = fence.ok().flatten();
         let node = node.ok().flatten();
@@ -1151,15 +1218,19 @@ impl Pool {
             image: &image,
             fingerprint: &fingerprint,
             authority,
-            gateways_ready: gateways.is_ok_and(|pods| self.intake.ready(&pods)),
+            gateways_ready: gateways
+                .as_ref()
+                .is_some_and(|gateways| self.intake.ready(&gateways.pods)),
             slots: slots.iter().collect(),
-            headroom: match (&node, &pods) {
-                (Some(node), Ok(pods)) => memory_headroom(node, pods, headroom_need(&view)),
+            headroom: match (&node, requested) {
+                (Some(node), Some(requested)) => {
+                    memory_headroom(node, requested, headroom_need(&view))
+                }
                 _ => false,
             },
         };
         let choice = decide(&facts)?;
-        let (Some(record), Some(fence)) = (record, fence) else {
+        let (Some(record), Some(fence), Some(gateways)) = (record, fence, gateways) else {
             return Err((Outcome::Miss, "no_sleep_record"));
         };
         // Claimed in memory: no other wake takes the slot meanwhile.
@@ -1182,6 +1253,8 @@ impl Pool {
             pod,
             record,
             fence,
+            gateways,
+            agent,
         })
     }
     /// Gives a claimed slot back to the pool: nothing of the tenant reached it.
@@ -1215,6 +1288,8 @@ impl Pool {
             pod,
             record,
             fence,
+            gateways,
+            agent,
         } = plan;
         let id = text(&view, "id").to_string();
         let ns = slot_namespace(&slot.hex);
@@ -1251,8 +1326,7 @@ impl Pool {
         };
         // 17-18: the attach.
         let attached = async {
-            let agent = rec.power.attach.agent(&node).await.ok().flatten()?;
-            let keys = rec.power.attach_keys().await.ok()?;
+            let (agent, keys) = agent?;
             let request = AttachRequest {
                 volume: choice.volume.clone(),
                 pod_uid: pod.uid.clone(),
@@ -1403,7 +1477,7 @@ impl Pool {
         claiming.pending = None;
         if rec
             .power
-            .release_slot(&view, &fence, &intent, &target)
+            .release_slot(&view, &fence, &intent, &target, &gateways)
             .await
             .is_err()
         {
@@ -2505,6 +2579,7 @@ impl Pool {
                     .await;
             }
         }
+        self.refresh(rec).await;
         Ok(retiring)
     }
     /// Writes the attach keyring the agents verify tokens with into Secret
