@@ -1374,3 +1374,64 @@ async fn the_wake_reads_the_anchor_with_the_fence_it_looks_at() {
     assert!(matches!(prepared, PrepareRunning::Parked(_)));
     assert_eq!(held(&w), (1, 0));
 }
+
+#[tokio::test]
+async fn the_identity_of_the_cluster_and_the_shared_credential_come_from_the_watch_cache() {
+    // The UID of kube-system and the backup credential of the region are written by no pass: any
+    // version of them says what the newest does.
+    let w = World::awake().await;
+    let at = w.mark();
+    w.reconciler
+        .k8s
+        .assert_cluster(&kube_system())
+        .await
+        .unwrap();
+    w.reconciler
+        .context(&w.db, &w.snapshot, false)
+        .await
+        .unwrap();
+    let made = w.made(at);
+    assert_eq!(made.len(), 2, "{made:?}");
+    assert!(
+        made.iter()
+            .all(|(_, _, query)| query == "resourceVersion=0")
+    );
+}
+
+#[tokio::test]
+async fn the_reads_after_postgresql_answered_are_the_newest_versions() {
+    // What a wake judges after PostgreSQL answered is judged as the barrier of its publication:
+    // the Pod that answered and the Cluster as they are now, not as a cache last saw them.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let (state, marker) = (w.server.state.clone(), accepted.clone());
+    w.sql.lock().unwrap().during.insert(
+        "accepting",
+        std::sync::Arc::new(move || {
+            marker.store(
+                state.lock().unwrap().requests.len(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }),
+    );
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    let from = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_ne!(from, usize::MAX, "PostgreSQL answered");
+    let after = w.made(from);
+    let first = |wanted: &str| {
+        after
+            .iter()
+            .find(|(method, at, _)| method == "GET" && at == wanted)
+            .unwrap_or_else(|| panic!("{wanted} was read after PostgreSQL answered"))
+    };
+    for barrier in [
+        path("Pod", Some(&w.ns), "database-1"),
+        path("Cluster", Some(&w.ns), "database"),
+    ] {
+        assert_eq!(first(&barrier).2, "", "{barrier}");
+    }
+}

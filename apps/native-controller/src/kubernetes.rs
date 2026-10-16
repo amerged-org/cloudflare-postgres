@@ -822,15 +822,41 @@ impl Kubernetes {
         }
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
+    /// Reads one object from etcd: the newest version, which no write that was answered precedes.
     pub async fn read(
         &self,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Value>, Error> {
-        let value = self
-            .request(Method::GET, &named(kind, namespace, name)?, None)
-            .await?;
+        self.read_with(kind, namespace, name, false).await
+    }
+    /// Reads one object from the API server's watch cache (`resourceVersion=0`): any version of
+    /// it that the server has seen, which trails a write by the watch's lag, milliseconds. Only
+    /// for an object whose newest version does not matter to what the caller does with it: one
+    /// it compares with an identity it recorded, never one it patches under its resourceVersion
+    /// (a version that trails makes that patch conflict) and never the read that proves nothing
+    /// changed since another (that is what a read of etcd is for).
+    pub async fn read_cached(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Value>, Error> {
+        self.read_with(kind, namespace, name, true).await
+    }
+    async fn read_with(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        cached: bool,
+    ) -> Result<Option<Value>, Error> {
+        let mut path = named(kind, namespace, name)?;
+        if cached {
+            path.push_str("?resourceVersion=0");
+        }
+        let value = self.request(Method::GET, &path, None).await?;
         if value
             .as_ref()
             .is_some_and(|v| !is_object(v, kind, namespace, name))
@@ -846,9 +872,23 @@ impl Kubernetes {
         &self,
         objects: &[(&str, Option<&str>, &str)],
     ) -> Result<Vec<Option<Value>>, Error> {
+        self.read_all_with(objects, false).await
+    }
+    /// `read_all` from the watch cache, for objects as `read_cached` allows.
+    pub async fn read_all_cached(
+        &self,
+        objects: &[(&str, Option<&str>, &str)],
+    ) -> Result<Vec<Option<Value>>, Error> {
+        self.read_all_with(objects, true).await
+    }
+    async fn read_all_with(
+        &self,
+        objects: &[(&str, Option<&str>, &str)],
+        cached: bool,
+    ) -> Result<Vec<Option<Value>>, Error> {
         let mut answered: Vec<(usize, Option<Value>)> = stream::iter(objects.iter().enumerate())
             .map(|(index, (kind, namespace, name))| async move {
-                Ok::<_, Error>((index, self.read(kind, *namespace, name).await?))
+                Ok::<_, Error>((index, self.read_with(kind, *namespace, name, cached).await?))
             })
             .buffer_unordered(READ_FANOUT)
             .try_collect()
@@ -861,6 +901,27 @@ impl Kubernetes {
         kind: &str,
         namespace: Option<&str>,
         selector: Option<&str>,
+    ) -> Result<Vec<Value>, Error> {
+        self.list_with(kind, namespace, selector, false).await
+    }
+    /// A list from the API server's watch cache (`resourceVersion=0`), for what `read_cached`
+    /// allows. A list of etcd waits until the API server's cache has caught up with etcd's newest
+    /// revision, which it learns from etcd's progress notifications, one every 100 ms while
+    /// anything waits: up to that long, for every list. The cache serves the whole list at once.
+    pub async fn list_cached(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<Vec<Value>, Error> {
+        self.list_with(kind, namespace, selector, true).await
+    }
+    async fn list_with(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        selector: Option<&str>,
+        cached: bool,
     ) -> Result<Vec<Value>, Error> {
         let path = collection(kind, namespace)?;
         let prefix = resource(kind)?.0;
@@ -875,7 +936,12 @@ impl Kubernetes {
             let mut url = self.origin.join(&path)?;
             {
                 let mut query = url.query_pairs_mut();
-                query.append_pair("limit", "200");
+                if cached {
+                    // The cache ignores a limit and answers the whole list.
+                    query.append_pair("resourceVersion", "0");
+                } else {
+                    query.append_pair("limit", "200");
+                }
                 if let Some(selector) = selector {
                     if selector.len() > 1024 {
                         return Err("Kubernetes selector exceeds bound".into());
@@ -919,6 +985,9 @@ impl Kubernetes {
             cursor = text(&value["metadata"], "continue").to_string();
             if cursor.is_empty() {
                 return Ok(result);
+            }
+            if cached {
+                return Err("Kubernetes cached list was not whole".into());
             }
         }
         Err("Kubernetes pagination exceeds bound".into())
@@ -1084,8 +1153,9 @@ impl Kubernetes {
         Ok(String::from_utf8_lossy(&bounded(response, 2 * 1024 * 1024).await?).into_owned())
     }
     pub async fn assert_cluster(&self, uid: &str) -> Result<(), Error> {
+        // The UID of a Namespace never changes: any version of it says which cluster this is.
         let cluster = self
-            .read("Namespace", None, "kube-system")
+            .read_cached("Namespace", None, "kube-system")
             .await?
             .ok_or("cluster identity missing")?;
         if uid.is_empty() || text(&cluster["metadata"], "uid") != uid {
@@ -1240,6 +1310,63 @@ mod tests {
                 .patch(&other, &serde_json::json!({"data":{"value":"x"}}))
                 .await
                 .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn a_cached_read_and_a_cached_list_ask_the_watch_cache_and_the_plain_ones_ask_etcd() {
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        for (n, name) in ["one", "two"].into_iter().enumerate() {
+            server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"pgcf-system","uid":uid(n as u64 + 1),"labels":{"app":"x"}},"data":{}}));
+        }
+        let from = server.state.lock().unwrap().requests.len();
+        let plain = server
+            .k8s
+            .read("ConfigMap", Some("pgcf-system"), "one")
+            .await
+            .unwrap();
+        let cached = server
+            .k8s
+            .read_cached("ConfigMap", Some("pgcf-system"), "one")
+            .await
+            .unwrap();
+        assert_eq!(plain, cached);
+        let all = server
+            .k8s
+            .read_all_cached(&[
+                ("ConfigMap", Some("pgcf-system"), "one"),
+                ("ConfigMap", Some("pgcf-system"), "missing"),
+            ])
+            .await
+            .unwrap();
+        assert!(all[0].is_some() && all[1].is_none());
+        let listed = server
+            .k8s
+            .list("ConfigMap", Some("pgcf-system"), Some("app=x"))
+            .await
+            .unwrap();
+        let from_cache = server
+            .k8s
+            .list_cached("ConfigMap", Some("pgcf-system"), Some("app=x"))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed, from_cache);
+        let state = server.state.lock().unwrap();
+        let queries = &state.queries[from..];
+        assert_eq!(queries[0], "", "a plain read asks etcd");
+        assert_eq!(queries[1], "resourceVersion=0");
+        assert_eq!(queries[2], "resourceVersion=0");
+        assert_eq!(queries[3], "resourceVersion=0");
+        assert!(
+            queries[4].starts_with("limit=200") && !queries[4].contains("resourceVersion"),
+            "a plain list pages through etcd: {}",
+            queries[4]
+        );
+        assert!(
+            queries[5].contains("resourceVersion=0") && !queries[5].contains("limit"),
+            "a cached list is the whole list of the cache: {}",
+            queries[5]
         );
     }
     #[tokio::test]

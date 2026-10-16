@@ -77,6 +77,8 @@ pub struct State {
     /// Every request the double received, writes and reads, in the order it was received, as
     /// (method, path).
     pub requests: Vec<(String, String)>,
+    /// The query string of every request in `requests`, at the same index (`""` for none).
+    pub queries: Vec<String>,
     /// The watch event of every committed write as the API server sends it to a metadata watch of
     /// the object's kind, with that kind: what the controller's own writes make its watches
     /// deliver.
@@ -456,7 +458,9 @@ impl Server {
                     );
                     let mut first = header.lines().next().unwrap().split_whitespace();
                     let method = first.next().unwrap().to_string();
-                    let path = first.next().unwrap().split('?').next().unwrap().to_string();
+                    let target = first.next().unwrap();
+                    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                    let (path, query) = (path.to_string(), query.to_string());
                     let length = header
                         .lines()
                         .find_map(|line| {
@@ -520,6 +524,7 @@ impl Server {
                     let response = {
                         let mut state = state.lock().unwrap();
                         state.requests.push((method.clone(), path.clone()));
+                        state.queries.push(query);
                         if method == "PATCH" {
                             state.patch_types.push((path.clone(), content_type));
                         }

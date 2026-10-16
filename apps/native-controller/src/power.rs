@@ -754,22 +754,28 @@ impl PowerCoordinator {
             let handle = text(&identity, "handle");
             identifier(handle).then(|| handle.to_string())
         });
+        // The Node, the volume and the LVMVolume are only compared with the identity the receipt
+        // recorded, so their versions do not matter: they come from the watch cache.
         let (node, volume, lvm) = tokio::try_join!(
             async {
                 match &storage_profile {
-                    Some(_) => self.k8s.read("Node", None, text(db, "node")).await,
+                    Some(_) => self.k8s.read_cached("Node", None, text(db, "node")).await,
                     None => Ok(None),
                 }
             },
             async {
                 match &recorded {
-                    Some(handle) => self.k8s.read("PersistentVolume", None, handle).await,
+                    Some(handle) => self.k8s.read_cached("PersistentVolume", None, handle).await,
                     None => Ok(None),
                 }
             },
             async {
                 match &recorded {
-                    Some(handle) => self.k8s.read("LVMVolume", Some(OPENEBS), handle).await,
+                    Some(handle) => {
+                        self.k8s
+                            .read_cached("LVMVolume", Some(OPENEBS), handle)
+                            .await
+                    }
                     None => Ok(None),
                 }
             },
@@ -818,7 +824,7 @@ impl PowerCoordinator {
         }
         let claim = self
             .k8s
-            .read("PersistentVolumeClaim", Some(&ns), claim_name)
+            .read_cached("PersistentVolumeClaim", Some(&ns), claim_name)
             .await?
             .ok_or(Fault::Recovery("persistent_claim_missing_or_replaced"))?;
         if claim["metadata"]["uid"] != identity["claimUid"]
@@ -991,9 +997,12 @@ impl PowerCoordinator {
     }
     async fn gateways(&self) -> Result<Vec<GatewayPod>> {
         // Node shutdown leaves terminal Pods behind: no connections, controls or replica count.
+        // The list is the cache's: a replica that appeared in the last few milliseconds is a
+        // replica that has loaded its fence from the persisted record itself, and the set is
+        // compared again after the acknowledgements.
         let resources: Vec<_> = self
             .k8s
-            .list(
+            .list_cached(
                 "Pod",
                 Some(SYSTEM),
                 Some("app.kubernetes.io/name=pgcf-gateway"),

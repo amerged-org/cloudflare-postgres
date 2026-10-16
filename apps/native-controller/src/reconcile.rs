@@ -2163,9 +2163,10 @@ impl Reconciler {
         snapshot: &DesiredSnapshot,
         finalized: bool,
     ) -> Result<Value, Error> {
+        // The shared backup credential is written by no pass of the controller.
         let secret = self
             .k8s
-            .read("Secret", Some(SYSTEM), "pgcf-backup-s3")
+            .read_cached("Secret", Some(SYSTEM), "pgcf-backup-s3")
             .await?
             .ok_or("regional backup credentials missing")?;
         let decode = |name: &str| -> Result<String, Error> {
@@ -2212,11 +2213,12 @@ impl Reconciler {
             return Ok(Value::Null);
         }
         let (class, policy, binding, node) = tokio::try_join!(
-            self.k8s.read("RuntimeClass", None, PRESTARTED),
-            self.k8s.read("MutatingAdmissionPolicy", None, ADMISSION),
+            self.k8s.read_cached("RuntimeClass", None, PRESTARTED),
             self.k8s
-                .read("MutatingAdmissionPolicyBinding", None, ADMISSION),
-            self.k8s.read("Node", None, text(db, "node"))
+                .read_cached("MutatingAdmissionPolicy", None, ADMISSION),
+            self.k8s
+                .read_cached("MutatingAdmissionPolicyBinding", None, ADMISSION),
+            self.k8s.read_cached("Node", None, text(db, "node"))
         )?;
         let profile = class.as_ref().map_or("", |class| {
             text(

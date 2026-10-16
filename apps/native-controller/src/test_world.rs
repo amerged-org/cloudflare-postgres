@@ -624,6 +624,19 @@ impl World {
         world.suspend_idle();
         world
     }
+    /// How many requests the Kubernetes double has received so far: where `made` starts from.
+    pub fn mark(&self) -> usize {
+        self.server.state.lock().unwrap().requests.len()
+    }
+    /// Every request the Kubernetes double received since `from`, as (method, path, query).
+    pub fn made(&self, from: usize) -> Vec<(String, String, String)> {
+        let state = self.server.state.lock().unwrap();
+        state.requests[from..]
+            .iter()
+            .zip(&state.queries[from..])
+            .map(|((method, path), query)| (method.clone(), path.clone(), query.clone()))
+            .collect()
+    }
     /// The instance Pod as CNPG leaves it: ready with PostgreSQL running, or fenced and not ready.
     pub fn pod(&self, ready: bool) {
         let requests = json!({"cpu":"25m","memory":"128Mi"});

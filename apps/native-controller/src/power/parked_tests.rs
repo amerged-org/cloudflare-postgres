@@ -1455,3 +1455,92 @@ fn a_parked_observation_validates_against_the_generated_schema() {
         observed["power"]["parked"]
     );
 }
+
+/// The path and query of every GET the controller made since `from`.
+fn reads(w: &World, from: usize) -> Vec<(String, String)> {
+    w.made(from)
+        .into_iter()
+        .filter(|(method, ..)| method == "GET")
+        .map(|(_, path, query)| (path, query))
+        .collect()
+}
+/// Whether a request asked the API server's watch cache for any version of the object.
+fn cached(query: &str) -> bool {
+    query.split('&').any(|part| part == "resourceVersion=0")
+}
+/// How many of the reads of `path` asked for the watch cache, and how many did not.
+fn split_of(made: &[(String, String)], path: &str) -> (usize, usize) {
+    let all = made.iter().filter(|(at, _)| at == path);
+    (
+        all.clone().filter(|(_, query)| cached(query)).count(),
+        all.filter(|(_, query)| !cached(query)).count(),
+    )
+}
+
+#[tokio::test]
+async fn the_gateway_pods_are_listed_from_the_watch_cache() {
+    // Every list that is not served from the cache waits for the API server's etcd to report its
+    // progress, up to a tenth of a second each, and the release lists the gateways twice.
+    let w = World::awake().await;
+    let at = w.mark();
+    w.reconciler.power.gateways().await.unwrap();
+    let made = reads(&w, at);
+    assert_eq!(made.len(), 1, "{made:?}");
+    assert_eq!(made[0].0, format!("/api/v1/namespaces/{SYSTEM}/pods"));
+    assert!(cached(&made[0].1), "{made:?}");
+    assert!(made[0].1.contains("labelSelector="), "{made:?}");
+}
+
+#[tokio::test]
+async fn the_anchor_compares_the_volume_objects_from_the_watch_cache_and_reads_its_own_fresh() {
+    let w = World::awake().await;
+    let at = w.mark();
+    w.reconciler.power.anchor(&w.db).await.unwrap();
+    let made = reads(&w, at);
+    // The namespace, the Cluster and the receipt are the objects a pass goes on to patch under
+    // their resourceVersion: a version that trails would make that patch conflict.
+    for fresh in [
+        path("Namespace", None, &w.ns),
+        cluster_path(&w),
+        path("ConfigMap", Some(SYSTEM), &format!("storage-{}", w.id)),
+    ] {
+        assert_eq!(split_of(&made, &fresh), (0, 1), "{fresh}: {made:?}");
+    }
+    // The volume, its claim and its LVMVolume are only compared with the identity recorded.
+    for compared in [
+        path("PersistentVolume", None, HANDLE),
+        path("PersistentVolumeClaim", Some(&w.ns), "database-1"),
+        path("LVMVolume", Some("openebs"), HANDLE),
+    ] {
+        assert_eq!(split_of(&made, &compared), (1, 0), "{compared}: {made:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_wake_judges_the_retained_pod_by_reads_from_the_watch_cache() {
+    let mut w = parked().await;
+    w.wake(3);
+    w.start_postgres().await;
+    let inputs = Inputs::of(&w).await;
+    let at = w.mark();
+    let PrepareRunning::Parked(_) = wake_pass(&w, &inputs).await else {
+        panic!("a parked database with unchanged desired state wakes fast");
+    };
+    let made = reads(&w, at);
+    // Nothing the inspection reads is patched by it: the Pod and the thirteen manifests.
+    for manifest in &inputs.manifests {
+        if text(manifest, "kind") == "Namespace" {
+            continue;
+        }
+        let at = path(
+            text(manifest, "kind"),
+            manifest["metadata"]["namespace"].as_str(),
+            text(&manifest["metadata"], "name"),
+        );
+        // The Cluster is also what the anchor reads, and the unfence patches it.
+        let anchored = usize::from(text(manifest, "kind") == "Cluster");
+        assert_eq!(split_of(&made, &at), (1, anchored), "{at}");
+    }
+    // The fence is the object the wake writes next, under its resourceVersion.
+    assert_eq!(split_of(&made, &fence_path(&w)).0, 0, "{made:?}");
+}
