@@ -217,11 +217,14 @@ impl Drop for SessionLease {
     }
 }
 /// Monotonic stage marks of one routed connection, logged once as `conn_stages` when it is
-/// dropped. The outcome is a fixed class; roles, addresses, tokens and payloads are never logged.
+/// dropped. The outcome and the route are fixed classes; roles, addresses, tokens and payloads
+/// are never logged.
 struct Stages {
     database: String,
     outcome: &'static str,
     target_reason: Option<TargetUnavailable>,
+    /// The class of the writer the connection was admitted on, once one was chosen.
+    route: Option<&'static str>,
     received: Instant,
     accepted: Option<Instant>,
     startup: Option<Instant>,
@@ -236,6 +239,7 @@ impl Stages {
             // Kept only when the task is cancelled before it records an end.
             outcome: "aborted",
             target_reason: None,
+            route: None,
             received,
             accepted: None,
             startup: None,
@@ -251,7 +255,7 @@ impl Drop for Stages {
         let between = |from: Option<Instant>, to: Option<Instant>| {
             from.zip(to).map(|(from, to)| ms(to.duration_since(from)))
         };
-        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"session_ms":ms(self.received.elapsed())});
+        let mut observation = serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"route":self.route,"session_ms":ms(self.received.elapsed())});
         if let Some(reason) = self.target_reason {
             observation["target_reason"] = reason.code().into();
         }
@@ -372,6 +376,7 @@ pub async fn serve_socket(
             .await;
         }
     };
+    stages.route = Some(if target.unready { "attested" } else { "ready" });
     if !revision_current
         || !route_target_current(&claims, &target)
         || !admitted_runtime_current(&*gateway.fences.read().await, &claims, &target)
