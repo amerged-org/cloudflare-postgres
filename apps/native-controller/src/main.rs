@@ -47,6 +47,8 @@ struct Cell {
     woke: Option<String>,
     /// Consecutive not-ready results of the pending wake.
     stalled: u32,
+    /// When the pending wake first reported not ready.
+    wake_since: Option<Instant>,
     /// A Pod change of the ready database awaits a fresh runtime attestation.
     reattest: bool,
     /// Actual V2 proof expiry is independent of token-only ledger deliveries.
@@ -142,6 +144,7 @@ fn apply_snapshot(
                 cell.renew = false;
                 cell.attempt = 0;
                 cell.stalled = 0;
+                cell.wake_since = None;
                 cell.due = due;
                 cell.hints = cell.hints.wrapping_add(1);
             } else if cell.ready && db["storage_authority"] != cell.db["storage_authority"] {
@@ -167,6 +170,7 @@ fn apply_snapshot(
                     authority_at: pulled_at,
                     woke: None,
                     stalled: 0,
+                    wake_since: None,
                     reattest: false,
                     verification_due: None,
                     started: None,
@@ -521,10 +525,14 @@ fn class(cell: &Cell, renewals: &Renewals, clock: i128) -> Class {
         Class::Routine
     }
 }
-/// The first not-ready results of a pending wake retry each second; later ones back off to
+/// How long a pending wake is polled each second whatever the passes before: a cold wake waits
+/// for the node's next identity proof about twenty seconds, and the passes that CNPG's Pod
+/// changes cause while the Pod is created would otherwise have used up the backoff by then.
+const WAKE_POLL: Duration = Duration::from_secs(60);
+/// A pending wake retries each second for its first minute; later not-ready results back off to
 /// 30 s, so stuck wakes cannot hold the slots. A Kubernetes hint still retries at once.
-fn not_ready_delay(stalled: u32) -> Duration {
-    Duration::from_secs(if stalled <= 5 {
+fn not_ready_delay(stalled: u32, waited: Duration) -> Duration {
+    Duration::from_secs(if waited < WAKE_POLL || stalled <= 5 {
         1
     } else {
         (1_u64 << (stalled - 5).min(5)).min(30)
@@ -606,6 +614,7 @@ fn reconcile_failure_delay(attempt: u32) -> Duration {
 fn stale_snapshot_retry(cell: &mut Cell, now: Instant) {
     cell.attempt = 0;
     cell.stalled = 0;
+    cell.wake_since = None;
     cell.due = now + Duration::from_secs(1);
 }
 /// Records a finished storage-authority renewal that started at hint `marker`. A failed one
@@ -689,6 +698,7 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u
         }
         if cell.ready {
             cell.stalled = 0;
+            cell.wake_since = None;
             if cell.hints == marker {
                 cell.renew = false;
             }
@@ -706,7 +716,8 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u
     cell.due = started
         + if waking(cell) {
             cell.stalled = cell.stalled.saturating_add(1);
-            not_ready_delay(cell.stalled)
+            let since = *cell.wake_since.get_or_insert(started);
+            not_ready_delay(cell.stalled, started.saturating_duration_since(since))
         } else {
             Duration::from_secs(1)
         };
@@ -1394,6 +1405,7 @@ mod tests {
             authority_at: due,
             woke: None,
             stalled: 0,
+            wake_since: None,
             reattest: false,
             verification_due: None,
             started: None,
@@ -1766,15 +1778,18 @@ mod tests {
             schedule(&cells, &Renewals::default(), &wakes, now, 0, true),
             vec![("routine".to_string(), Class::Routine)]
         );
-        // Each stuck wake backs off after its first not-ready results.
+        // Each stuck wake polls each second for its first minute and backs off after it.
         let stuck = cells.get_mut("wake3").unwrap();
+        finish(stuck, now, None);
+        assert_eq!(stuck.due.duration_since(now).as_secs(), 1);
+        let late = now + WAKE_POLL + Duration::from_secs(1);
         let delays: Vec<_> = (0..11)
             .map(|_| {
-                finish(stuck, now, None);
-                stuck.due.duration_since(now).as_secs()
+                finish(stuck, late, None);
+                stuck.due.duration_since(late).as_secs()
             })
             .collect();
-        assert_eq!(delays, [1, 1, 1, 1, 1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(delays, [1, 1, 1, 1, 2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(class(stuck, &Renewals::default(), 0), Class::Wake);
     }
     #[test]
@@ -2014,36 +2029,55 @@ mod tests {
         assert_eq!(woken.due, now);
     }
     #[test]
-    fn a_wake_that_waits_for_a_proof_polls_with_backoff_and_not_busily() {
-        // The cold wake of a thin database waited 37 s for the node's next identity proof: no
-        // object changes, only the timer brings the next pass, and each is later than the one
-        // before it.
+    fn a_wake_that_waits_for_a_proof_polls_each_second_for_a_minute_and_then_backs_off() {
+        // The cold wake of a thin database waited 30 s for the node's next identity proof although
+        // the proof was accepted 18 s into the wait: the passes CNPG's Pod changes had caused
+        // while the Pod was created had used up the backoff, so the first timer-driven pass after
+        // the proof was thirty seconds away. No object changes while it waits, only the timer
+        // brings the next pass.
         let start = Instant::now();
         let mut entry = cell(wake("db", &operation(1)), start, false);
+        let marker = entry.hints;
+        let pending = json!({"state":"provisioning"});
+        // A dozen passes in the first two seconds, as the Pod changes cause them.
+        for step in 0..12 {
+            settle(
+                &mut entry,
+                start + Duration::from_millis(step * 150),
+                Some(&pending),
+                marker,
+            );
+        }
         let mut began: Vec<Duration> = vec![];
-        let mut now = start;
-        while now < start + Duration::from_secs(37) {
+        let mut now = start + Duration::from_secs(2);
+        while now < start + Duration::from_secs(300) {
             if entry.due <= now {
                 began.push(now - start);
                 entry.started = Some(now);
-                let marker = entry.hints;
-                settle(
-                    &mut entry,
-                    now,
-                    Some(&json!({"state":"provisioning"})),
-                    marker,
-                );
-                rehint(&mut entry, now, marker, now);
+                settle(&mut entry, now, Some(&pending), marker);
             }
             now += Duration::from_millis(10);
         }
-        assert!(began.len() <= 11, "{} passes: {began:?}", began.len());
         let gaps: Vec<_> = began.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let first_minute: Vec<_> = began
+            .iter()
+            .zip(&gaps)
+            .filter(|(at, _)| **at < Duration::from_secs(59))
+            .map(|(_, gap)| *gap)
+            .collect();
+        assert!(first_minute.len() >= 50, "{first_minute:?}");
         assert!(
-            gaps.windows(2)
-                .all(|pair| pair[1] + Duration::from_millis(20) >= pair[0]),
-            "{gaps:?}"
+            first_minute
+                .iter()
+                .all(|gap| *gap <= Duration::from_millis(1100)),
+            "{first_minute:?}"
         );
+        // After the minute the pending wake backs off so stuck wakes cannot hold the slots.
+        let late = began
+            .iter()
+            .filter(|at| **at > Duration::from_secs(62))
+            .count();
+        assert!(late <= 9, "{late} passes after the first minute: {began:?}");
     }
     #[test]
     fn a_pod_change_during_an_in_flight_check_keeps_re_attestation_urgent() {
