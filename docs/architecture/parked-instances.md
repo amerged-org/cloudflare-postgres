@@ -879,7 +879,9 @@ new controller runs.
 ### 5.5 Infrastructure
 
 - `infra/platform/regional-native/rbac.yaml`: JSON-patch op adding `{apiGroups:[""],
-  resources:[pods/resize], verbs:[patch]}` to ClusterRole `pgcf-agent`. Update the comment in
+  resources:[pods/resize], verbs:[patch]}` to ClusterRole `pgcf-agent`. The wake path v2 adds `watch`
+  for the kinds of the manifests and the volume that the metadata watches follow (quotas, limits,
+  network policies, Cilium policies, the scheduled backup, the object store, the LVMVolume). Update the comment in
   `infra/platform/regional/rbac.yaml` ("Pods are never ... patched"). The right is cluster-wide
   like the existing Pod `delete` (`infra/platform/regional/rbac.yaml:86-89`); RBAC cannot scope by namespace label.
   A ValidatingAdmissionPolicy limiting `pods/resize` by this principal to `pgcf-db-*`
@@ -1078,6 +1080,13 @@ next run, not of this list:
   database wrote the fence twice (once without the operation in the record) and now writes nothing; a
   completed wake leaves no hint behind, and the next pass is the proof renewal or a change of
   someone else.
+
+Wake path v2 (W1, [wake-path-v2-and-scale.md](wake-path-v2-and-scale.md) 4.2) changes this list's
+shape: a wake reads through a memory of what the watch proves unchanged, publishes on the barrier
+read of the Pod and the Cluster, and leaves the stamps of items 3 and 4, the role logins of item 5 and
+the archive probe to the pass after it. In the same in-process world a parked wake after a periodic
+parked pass is 4 reads and 6 writes in 5 sequential rounds (from 100 and 19 in 43), and its first
+request is the wave of writes that unfences.
 
 Optional, only if P0/P1 show the pull dominating: **speculative unfence on hint**. The existing
 principle (rt:264) says hints are not executable desired state; the unfence is idempotent,

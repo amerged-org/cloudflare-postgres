@@ -163,6 +163,60 @@ writes recovers to one consistent state with at most one postmaster; intent prec
 retried, target only after every ack, observation last; a follow-up mismatch publishes a non-ready
 observation exactly as a Pod change does.
 
+Status (branch `golive/wake-v2-controller`, tested in the in-process world, not deployed or measured
+live). One parked wake in the world (every Kubernetes request answered after the same delay, so that
+requests issued together are one round) after a periodic parked pass:
+
+| | requests | sequential rounds |
+| --- | --- | --- |
+| origin/main (`d4cff9f`) | 100 reads + 19 writes | 43 |
+| branch, memory warm | 4 reads + 6 writes | 5 |
+| branch, memory off (every read is made) | 95 reads + 6 writes | 32 |
+
+The pass after the wake is 11 reads + 12 writes (the stamps); the one after that writes nothing.
+
+- Rows 1 to 4: cached reads (`resourceVersion=0`) for identity facts, the shared credential, the
+  inspection and the gateway Pods; the resize actuation is not awaited when the kubelet has accepted it
+  (a `Deferred` or `Infeasible` resize still holds the wake and demotes after the budget); the gateway
+  release is asked again every 5 ms for 150 ms on 409 and 503; the record of the wake, the Cluster patch
+  that unfences and the resize are one wave, and the poll of PostgreSQL starts with it.
+- Row 5: no `WakePlan` structure. The client keeps what it last read or wrote of every object of a
+  watched kind, and `read_known` answers from it when the watch holds that very version (or holds none
+  of an object that was found absent) and reads otherwise. The parked passes populate it; the wake
+  reads through it. Kinds added to the metadata watches (no hints, outside the runtime proof's epoch):
+  `ResourceQuota`, `LimitRange`, `NetworkPolicy`, `CiliumNetworkPolicy`, `ObjectStore`,
+  `ScheduledBackup`, `LVMVolume`; they need `watch` in `infra/platform/regional-native/rbac.yaml`
+  (added) or their watches back off and their reads are made. A hit issues no read before the unfence;
+  a changed version, a gap or a version the watch has not delivered (409, one read of the Cluster) is
+  a read. The Cluster is held by its exact version, not by generation: a status write of CNPG is a read.
+- Row 6: a database that was ready before, is admitted and whose watch can vouch is published on the
+  barrier read of the Pod and the Cluster, the volume identity and the SQL proof; the generation stamps
+  of the manifests and the receipt, every role's credential, the archive sample and the removal of
+  roles are the next pass's, made due a second after the wake. The SQL proof now also compares
+  `system_identifier` and the timeline of `pg_control` with the values the sleep recorded while the
+  postmaster still ran (`pg_control_system()` and `pg_control_checkpoint()` check no privilege in
+  PostgreSQL 18; to confirm on the pinned image). A sleep that cannot read them hibernates, a record
+  without them is never resumed. A follow-up that finds a role that cannot log in fails and renews
+  nothing, so the attestation of the wake lapses at its expiry; no other channel withdraws it.
+- Row 7: the watch baseline reads every page (100 objects) at one revision, the tracked objects are
+  bounded at 65536, and a watch that ends is logged (`watch_ended`) and asked for again after 1 s,
+  doubling to 30 s.
+- Gateway (row 4 of 4.5): `TCP_NODELAY` on every accepted socket and the dial of PostgreSQL at the
+  admission of the route, with every check where it was (the StartupMessage is compared with the route
+  and the fence is checked after it and after the dial); the greeting already leaves in one frame.
+- Live findings: a database whose objects keep changing is looked at twice a second at most, a write
+  of the controller's own and a status write of a Cluster hint nothing, the log names what hinted a
+  database (`database_hinted`, once a second), and a wake that waits for a proof polls with backoff.
+  What hinted the 2 s pass of the awake thin database is not known; the next run's log says.
+- Left out: gateway snapshot and keyring from memory (the two cached LISTs remain), HTTP/2 and the
+  token cache (row 8), label scoping of the new watches, a demotion of an awake database whose resize
+  turns `Infeasible` after publication (the kubelet decides before PostgreSQL accepts, and the barrier
+  read holds the wake for a resize it has deferred or refused).
+- To measure live: the cost of one round; the hit rate (`reconcile_summary.memo_hits` against `calls`);
+  the CNPG reaction time to the unfence; whether the Cluster's version holds between the parked pass and
+  the wake; `pg_control_system()` for the maintenance role on the pinned image; the `watch_ended` lines
+  of the new kinds after the RBAC is applied; the time from the wake to the pass after it.
+
 ### 4.3 W2 cut the pull (API + controller)
 
 The Actor sends the row (or a delta against the controller's cached row, guarded by a base generation
@@ -195,8 +249,8 @@ measured.
   region, Smart Placement for the Edge; service bindings instead of public fetches between Workers.
 - Edge admission has five sequential awaits (limiter, ensure-awake, database limiter, token, gateway
   connect); the stage timings are already logged in `conn_admission`.
-- Gateway: `TCP_NODELAY` on accepted sockets (only the PostgreSQL-dial socket has it), flush the
-  PostgreSQL greeting once, dial the target as early as the route decision allows; client: pipeline the
+- Gateway: `TCP_NODELAY` on accepted sockets, flush the PostgreSQL greeting once, dial the target as
+  early as the route decision allows (done on `golive/wake-v2-controller`, see 4.2); client: pipeline the
   PostgreSQL startup (SSLRequest + Startup in one flight; SCRAM first message with the startup, saving
   69–129 ms of 0.54–0.61 s) [E].
 - Neon-compatible HTTP `POST /sql` (3 RTT cold, 1 warm) only if cold stays under 150 ms and warm under
@@ -307,7 +361,7 @@ Go, TypeScript or kube-rs for latency.
   sleep): a re-park within that window is applied late; role and config changes wait for it.
 - A clean stop releases the primary Lease; any SIGKILL path (guard, OOM, node reboot) costs up to 15 s at
   the next start.
-- The controller's watch baseline caps at 512 objects; the agent's CPU limit is 500m.
+- The agent's CPU limit is 500m. (The watch baseline capped at 512 objects; it is paged now.)
 
 ## 6. Control-plane scale
 
