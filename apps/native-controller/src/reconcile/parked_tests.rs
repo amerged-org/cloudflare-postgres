@@ -1739,7 +1739,7 @@ async fn the_release_proves_the_anchor_and_reads_the_fence_together() {
     let released = w
         .reconciler
         .power
-        .finish_running(&w.db, woken, Some(&intent))
+        .finish_running(&w.db, woken, Some(&intent), false)
         .await
         .unwrap()
         .expect("released");

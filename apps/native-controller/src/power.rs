@@ -350,6 +350,18 @@ pub struct Sleep<'a> {
     /// `region.parking`; null while the region has no parked sleep tier.
     pub parking: &'a Value,
     pub basis: Basis<'a>,
+    /// The pool slot that serves the database, which the sleep is proved on instead of the
+    /// database's own Pod.
+    pub slot: Option<SlotSleep>,
+}
+/// The pool slot a slot-served database sleeps from.
+pub struct SlotSleep {
+    /// Where the proof's session dials: the slot Pod's address and port.
+    pub pod: std::net::SocketAddr,
+    /// The slot's own service name its certificate is verified under.
+    pub tls_name: String,
+    /// The slot was retired: fenced, recorded, deleted and its volume released.
+    pub gone: bool,
 }
 #[cfg(test)]
 static NOTHING: Value = Value::Null;
@@ -372,6 +384,7 @@ impl Sleep<'static> {
         Self {
             parking: &NOTHING,
             basis: Basis::cold(),
+            slot: None,
         }
     }
 }
@@ -414,6 +427,10 @@ pub struct PowerCoordinator {
     /// The kubelet's Ready bit of a database's resumed Pod, which its wake did not wait for, by
     /// database id: the measurement that ends when a later pass finds the bit set.
     kubelet: Mutex<HashMap<String, parked::KubeletWait>>,
+    /// The node agents that hold the single-writer rule of thin volumes (pool design 2026-10-16).
+    pub(crate) attach: crate::pool::Attach,
+    /// The image a database runs under unless it names one.
+    pub(crate) postgres_image: String,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -764,7 +781,7 @@ impl PowerCoordinator {
         }
         let http = crate::cluster_http(Duration::from_secs(3))?;
         Ok(Self {
-            k8s,
+            k8s: k8s.clone(),
             region,
             replicas,
             http,
@@ -772,6 +789,8 @@ impl PowerCoordinator {
             stop_budget: STOP_BUDGET,
             clock,
             kubelet: Mutex::default(),
+            attach: crate::pool::Attach::new(k8s.clone())?,
+            postgres_image: String::new(),
         })
     }
     fn now(&self) -> u64 {
@@ -1163,6 +1182,202 @@ impl PowerCoordinator {
         let (active, keys, _, _) = self.keyring().await?;
         Ok((active, keys))
     }
+    /// The attach keyring derived from the regional keyring.
+    pub(crate) async fn attach_keys(
+        &self,
+    ) -> std::result::Result<crate::attach_protocol::Keys, Error> {
+        let (active, keys) = self.regional_keys().await?;
+        Ok(crate::attach_protocol::Keys::derive(
+            &self.region,
+            &active,
+            &keys,
+        )?)
+    }
+    /// The phase of the power record in the database's gateway fence, if it holds one.
+    pub(crate) async fn sleep_phase(&self, db: &Value) -> Option<&'static str> {
+        let map = self.fence(db).await.ok()??;
+        let progress = progress_from(&map, self.now()).ok()??;
+        Some(phase_name(progress.phase))
+    }
+    /// Releases the gateways to a pool slot (pool design 2026-10-16): one CAS write of the fence
+    /// `map` as it was read when the slot was claimed, with the running intent and the slot's
+    /// admission target, then the release control of every gateway. The power record stays the
+    /// sleep's until Cloudflare confirms the wake, so an unconfirmed claim can be undone.
+    pub(crate) async fn release_slot(
+        &self,
+        db: &Value,
+        map: &Value,
+        intent: &PowerIntent,
+        target: &Value,
+    ) -> std::result::Result<Value, Error> {
+        let result: Result<Value> = async {
+            let map = self.fence_checked(db, map.clone())?;
+            if intent.mode != "running"
+                || intent.revision != number(db, "generation")
+                || !valid_schema("gatewayAdmissionTarget", target)
+                || target["generation"] != intent.revision
+            {
+                return Err(Fault::Unavailable("slot_release_invalid"));
+            }
+            let intent_text = serde_json::to_string(intent).unwrap();
+            let target_text = serde_json::to_string(target).unwrap();
+            let patch = json!({"data":{"intent.json":intent_text,"admission_target":target_text}});
+            let (written, snapshot) = tokio::join!(self.k8s.patch(&map, &patch), self.snapshot());
+            let written = self.fence_checked(db, written?)?;
+            if written["metadata"]["uid"] != map["metadata"]["uid"]
+                || text(&written["data"], "intent.json") != intent_text
+                || text(&written["data"], "admission_target") != target_text
+            {
+                return Err(Fault::Unavailable("slot_release_unknown"));
+            }
+            self.bind_fence(db, &written).await?;
+            self.controls(intent, &snapshot?, "release").await?;
+            Ok(written)
+        }
+        .await;
+        Ok(result?)
+    }
+    /// Undoes an unconfirmed slot release: the fence intent goes back to the one the sleep's power
+    /// record names, and the admission target to `target` (none when it is not known).
+    pub(crate) async fn restore_fence(
+        &self,
+        id: &str,
+        claimed: &PowerIntent,
+        target: Option<&str>,
+    ) -> std::result::Result<bool, Error> {
+        let name = format!("gateway-fence-{id}");
+        let Some(map) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
+            return Ok(false);
+        };
+        let map = owned(Some(map), &name, id, Some(SYSTEM), false)?;
+        if intent_from(&map, id)? != *claimed {
+            // Not the claim's any more: nothing of it to undo.
+            return Ok(false);
+        }
+        let Some(progress) = progress_from(&map, self.now())? else {
+            return Ok(false);
+        };
+        if progress.phase != Phase::Hibernated {
+            return Ok(false);
+        }
+        let intent = serde_json::to_string(&progress.target).unwrap();
+        self.k8s
+            .patch(
+                &map,
+                &json!({"data":{"intent.json":intent,"admission_target":target}}),
+            )
+            .await?;
+        Ok(true)
+    }
+    /// Takes the volume's holder for the database's own CNPG Pod. A database without thin
+    /// storage, without a recorded LV or on a node without an agent takes none.
+    async fn hold_cnpg(&self, db: &Value, identity: &str) -> Result<()> {
+        use crate::attach_protocol::{Action, HoldRequest, HoldResponse, Holder};
+        let Some(volume) = crate::pool::volume_of(db, identity) else {
+            return Ok(());
+        };
+        let busy = Fault::Unavailable("volume_holder_busy");
+        let Some(agent) = self
+            .attach
+            .agent(text(db, "node"))
+            .await
+            .map_err(|_| Fault::Unavailable("volume_holder_busy"))?
+        else {
+            return Ok(());
+        };
+        let keys = self
+            .attach_keys()
+            .await
+            .map_err(|_| Fault::Unavailable("volume_holder_busy"))?;
+        let request = HoldRequest {
+            holder: Holder::Cnpg {
+                database: text(db, "id").into(),
+            },
+            volume: volume.clone(),
+        };
+        self.attach
+            .call::<_, HoldResponse>(
+                &keys,
+                &agent,
+                Action::Hold,
+                &volume.lv_uuid,
+                &request,
+                Duration::from_secs(2),
+                self.now(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| busy)
+    }
+    /// Records the clean sleep of a database's own CNPG Pod on its storage receipt, and releases
+    /// the holder its Pod had once the volume is closed. Thick databases record nothing.
+    async fn record_sleep(
+        &self,
+        db: &Value,
+        anchor: &Anchor,
+        system: Option<&SystemIdentity>,
+    ) -> Result<()> {
+        use crate::attach_protocol::{Action, Holder, ReleaseRequest, ReleaseResponse};
+        if db["storage"].is_null() {
+            return Ok(());
+        }
+        let record = system.and_then(|system| {
+            Some(crate::pool::SleepRecord {
+                v: 1,
+                system_identifier: system.identifier.clone(),
+                timeline: u32::try_from(system.timeline).ok()?,
+                configuration_sha256: crate::pool::sleep_fingerprint(db, &self.postgres_image)
+                    .ok()?,
+                image: db["postgres"]["image"]
+                    .as_str()
+                    .unwrap_or(&self.postgres_image)
+                    .into(),
+                written_at_ms: self.now(),
+                via: crate::pool::Via::Cnpg,
+            })
+        });
+        crate::pool::write_sleep_record(&self.k8s, text(db, "id"), record.as_ref()).await?;
+        let Some(volume) = crate::pool::volume_of(db, &anchor.volume_identity) else {
+            return Ok(());
+        };
+        let unavailable = || Fault::Unavailable("volume_holder_busy");
+        let Some(agent) = self
+            .attach
+            .agent(text(db, "node"))
+            .await
+            .map_err(|_| unavailable())?
+        else {
+            return Ok(());
+        };
+        let keys = self.attach_keys().await.map_err(|_| unavailable())?;
+        let request = ReleaseRequest {
+            volume: volume.clone(),
+            holder: Holder::Cnpg {
+                database: text(db, "id").into(),
+            },
+            wait_ms: crate::attach_protocol::MAX_RELEASE_WAIT_MS,
+        };
+        match self
+            .attach
+            .call::<_, ReleaseResponse>(
+                &keys,
+                &agent,
+                Action::Release,
+                &volume.lv_uuid,
+                &request,
+                Duration::from_millis(crate::attach_protocol::MAX_RELEASE_WAIT_MS + 2_000),
+                self.now(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Another holder holds the volume: not this Pod's to release.
+            Err(crate::attach_protocol::CallError::Refused(code)) if code == "holder_mismatch" => {
+                Ok(())
+            }
+            Err(_) => Err(unavailable()),
+        }
+    }
     pub async fn gateway_snapshot(&self) -> std::result::Result<GatewaySnapshot, Error> {
         Ok(tokio::time::timeout(Duration::from_secs(3), self.snapshot()).await??)
     }
@@ -1418,6 +1633,35 @@ pub(crate) fn sql(name: &str) -> &'static str {
         .as_str()
         .expect("generated SQL")
 }
+fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Quiescing => "quiescing",
+        Phase::Switching => "switching",
+        Phase::Archive => "archive",
+        Phase::Proved => "proved",
+        Phase::Hibernating => "hibernating",
+        Phase::Hibernated => "hibernated",
+        Phase::Wake => "wake",
+        Phase::Awake => "awake",
+        Phase::Refused => "refused",
+        Phase::Parking => "parking",
+        Phase::Parked => "parked",
+    }
+}
+/// Whether `map`, a gateway fence, holds the power record of a completed sleep: a valid record
+/// with its anchor, at `Hibernated`.
+pub(crate) fn sleep_completed(map: &Value, now: u64) -> bool {
+    progress_from(map, now).is_ok_and(|p| p.is_some_and(|p| p.phase == Phase::Hibernated))
+}
+/// The intent of `map`, a gateway fence of database `id`.
+pub(crate) fn fence_intent(map: &Value, id: &str) -> Option<PowerIntent> {
+    intent_from(map, id).ok()
+}
+/// Whether the power record of `map` is the completed wake of `intent`.
+pub(crate) fn woke_under(map: &Value, intent: &PowerIntent, now: u64) -> bool {
+    progress_from(map, now)
+        .is_ok_and(|p| p.is_some_and(|p| p.phase == Phase::Awake && p.target == *intent))
+}
 fn condition(cluster: &Value, name: &str) -> bool {
     cluster["status"]["conditions"]
         .as_array()
@@ -1449,9 +1693,9 @@ impl PowerCoordinator {
         &self,
         db: &Value,
         intent: &PowerIntent,
-        map: &mut Value,
-        progress: &mut Progress,
+        (map, progress): (&mut Value, &mut Progress),
         snapshot: &GatewaySnapshot,
+        slot: Option<&SlotSleep>,
     ) -> Result<Option<&'static str>> {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             self.verify(db, intent, map, progress, snapshot).await?;
@@ -1485,15 +1729,30 @@ impl PowerCoordinator {
             )?;
             let ca = required(text(&ca["data"], "ca.crt"), 128 * 1024)?;
             postgres::validate_ca(ca.as_bytes())?;
-            let session = postgres::connect_via(
-                db,
-                ca.as_bytes(),
-                role,
-                text(&db["maintenance"], "password"),
-                text(db, "id"),
-                self.postgres,
-            )
-            .await?;
+            let session = match slot {
+                Some(slot) => {
+                    postgres::connect_slot(
+                        db,
+                        slot.pod,
+                        &slot.tls_name,
+                        ca.as_bytes(),
+                        role,
+                        text(&db["maintenance"], "password"),
+                    )
+                    .await?
+                }
+                None => {
+                    postgres::connect_via(
+                        db,
+                        ca.as_bytes(),
+                        role,
+                        text(&db["maintenance"], "password"),
+                        text(db, "id"),
+                        self.postgres,
+                    )
+                    .await?
+                }
+            };
             let rows = session.query(sql("IDENTITY"), &[&role]).await?;
             if rows.len() != 1
                 || rows[0].try_get::<_, String>("database").ok().as_deref() != Some(text(db, "id"))
@@ -1620,11 +1879,13 @@ impl PowerCoordinator {
         intent: &PowerIntent,
         sleep: &Sleep<'_>,
     ) -> Option<Value> {
-        match self.protected_manual_suspend(db, intent).await {
-            Ok(Some(result)) => return result,
-            Ok(None) => {}
-            Err(Fault::Recovery(reason)) => return Some(recovery_observation(db, reason)),
-            Err(_) => return None,
+        if sleep.slot.is_none() {
+            match self.protected_manual_suspend(db, intent).await {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(Fault::Recovery(reason)) => return Some(recovery_observation(db, reason)),
+                Err(_) => return None,
+            }
         }
         let mut map = None;
         let mut progress = None;
@@ -1676,9 +1937,10 @@ impl PowerCoordinator {
                 }
             }
             if progress.as_ref().is_none_or(|p| p.target != *intent) {
-                let already_off = progress
-                    .as_ref()
-                    .is_some_and(|p| matches!(p.phase, Phase::Hibernating | Phase::Hibernated))
+                let already_off = sleep.slot.is_none()
+                    && progress
+                        .as_ref()
+                        .is_some_and(|p| matches!(p.phase, Phase::Hibernating | Phase::Hibernated))
                     && cluster["metadata"]["annotations"][HIBERNATION] == "on"
                     && condition(&cluster, HIBERNATION)
                     && self
@@ -1725,6 +1987,31 @@ impl PowerCoordinator {
                     Some(p.refusal.unwrap_or(Refusal::Unknown)),
                 )));
             }
+            // A slot-served database is hibernated once its slot is retired; its own Cluster has
+            // been hibernated all along.
+            if let Some(slot) = &sleep.slot
+                && matches!(p.phase, Phase::Hibernating | Phase::Hibernated)
+            {
+                if !slot.gone {
+                    return Ok(None);
+                }
+                let snapshot = self.snapshot().await?;
+                if p.phase == Phase::Hibernating
+                    && (p.gateways.as_ref() != Some(&snapshot.pods)
+                        || p.key_uid.as_deref() != Some(&snapshot.key_uid)
+                        || p.key_version.as_deref() != Some(&snapshot.key_version))
+                {
+                    return Ok(None);
+                }
+                self.controls(intent, &snapshot, "status").await?;
+                let (confirmed, _) = self.anchor(db).await?;
+                if !confirmed.matches(&p.anchor) {
+                    return Err(Fault::Recovery("power_storage_identity_changed"));
+                }
+                p.phase = Phase::Hibernated;
+                self.write(db, Some(&current), None, p).await?;
+                return Ok(Some(observation(db, intent, "hibernated", None)));
+            }
             if matches!(p.phase, Phase::Hibernating | Phase::Hibernated)
                 && cluster["metadata"]["annotations"][HIBERNATION] == "on"
             {
@@ -1758,6 +2045,11 @@ impl PowerCoordinator {
                 if self.gateways().await? != snapshot.pods {
                     return Ok(None);
                 }
+                // The sleep is clean and the Pod gone: the record a pool wake starts from, and the
+                // volume is free for the next holder.
+                if p.phase == Phase::Hibernating {
+                    self.record_sleep(db, &p.anchor, p.system.as_ref()).await?;
+                }
                 p.phase = Phase::Hibernated;
                 self.write(db, Some(&current), None, p).await?;
                 return Ok(Some(observation(db, intent, "hibernated", None)));
@@ -1788,7 +2080,13 @@ impl PowerCoordinator {
                 map = Some(current.clone());
             }
             if let Some(reason) = self
-                .sleep_proof(db, intent, &mut current, p, &snapshot)
+                .sleep_proof(
+                    db,
+                    intent,
+                    (&mut current, p),
+                    &snapshot,
+                    sleep.slot.as_ref(),
+                )
                 .await?
             {
                 map = Some(current.clone());
@@ -1821,7 +2119,8 @@ impl PowerCoordinator {
             }
             // Step S5: a proved idle sleep keeps the Pod when the region's tier admits it. Any
             // read that fails here only means the ordinary hibernation.
-            if let Some(system) = p.system.clone()
+            if sleep.slot.is_none()
+                && let Some(system) = p.system.clone()
                 && let Ok(Some(park)) = self.park_plan(db, intent, &cluster, sleep, &system).await
             {
                 // Step S6: the record is persisted before the Cluster is written (S7).
@@ -1835,7 +2134,11 @@ impl PowerCoordinator {
             p.phase = Phase::Hibernating;
             current = self.write(db, Some(&current), None, p).await?;
             map = Some(current);
-            self.cluster_intent(intent, &cluster, "on").await?;
+            // A slot-served database's own Cluster is hibernated already: its slot is retired by
+            // the pool, and the next pass completes the sleep.
+            if sleep.slot.is_none() {
+                self.cluster_intent(intent, &cluster, "on").await?;
+            }
             Ok(None)
         }
         .await;
@@ -2101,6 +2404,11 @@ impl PowerCoordinator {
                     Err(error) => return Err(error),
                 }
             }
+            // The miss path takes the volume's holder before its own Pod is created on it: never
+            // while a pool slot holds it (pool design 2026-10-16).
+            if cluster["metadata"]["annotations"][HIBERNATION] == "on" {
+                self.hold_cnpg(db, &physical.volume_identity).await?;
+            }
             let mut progress = Progress::new(intent.clone(), Phase::Wake, physical, self.now());
             if let Some(prior) = &previous
                 && prior.target.revision == intent.revision
@@ -2125,7 +2433,9 @@ impl PowerCoordinator {
         .await;
         let outcome = match result {
             Ok(Ok(value)) => value,
-            Ok(Err(Fault::Stale)) | Err(_) => PrepareRunning::Pending,
+            Ok(Err(Fault::Stale | Fault::Unavailable("volume_holder_busy"))) | Err(_) => {
+                PrepareRunning::Pending
+            }
             Ok(Err(_)) => {
                 PrepareRunning::Observation(recovery_observation(db, "wake identity unavailable"))
             }
@@ -2141,6 +2451,7 @@ impl PowerCoordinator {
         &self,
         db: &Value,
         observation: Value,
+        slot: bool,
     ) -> std::result::Result<Option<Value>, Error> {
         // The operation that brought this database into existence: its creation or, for a
         // restored database, which has no creation, the restore.
@@ -2184,7 +2495,7 @@ impl PowerCoordinator {
         .await;
         match result {
             Ok(Some(intent)) => {
-                self.finish_running(db, observation, Some(&serde_json::to_value(intent)?))
+                self.finish_running(db, observation, Some(&serde_json::to_value(intent)?), slot)
                     .await
             }
             Ok(None) => Ok(None),
@@ -2197,11 +2508,13 @@ impl PowerCoordinator {
             Err(_) => Ok(None),
         }
     }
+    /// `slot`: the database runs in a pool slot, and its own Cluster stays hibernated.
     pub async fn finish_running(
         &self,
         db: &Value,
         observation: Value,
         execution_intent: Option<&Value>,
+        slot: bool,
     ) -> std::result::Result<Option<Value>, Error> {
         if observation["state"] != "ready" {
             return Ok(Some(observation));
@@ -2224,7 +2537,7 @@ impl PowerCoordinator {
             if prior.as_ref().is_some_and(|p| !physical.matches(&p.anchor)) {
                 return Err(Fault::Recovery("power_storage_identity_changed"));
             }
-            if cluster["metadata"]["annotations"][HIBERNATION] == "on" {
+            if !slot && cluster["metadata"]["annotations"][HIBERNATION] == "on" {
                 return Ok(None);
             }
             let mut progress = Progress::new(intent.clone(), Phase::Awake, physical, self.now());
@@ -3410,6 +3723,12 @@ fn report_count(value: &Value, key: &str) -> Result<u64> {
         })
         .filter(|v| *v <= MAX_SAFE)
         .ok_or(Fault::Unavailable("gateway_ack_identity_mismatch"))
+}
+/// The generation of the storage protection marker a storage receipt holds, if it holds one.
+pub(crate) fn protection_generation(storage: &Value) -> Option<u64> {
+    let raw = storage["data"][protection_key()].as_str()?;
+    let marker: Value = serde_json::from_str(raw).ok()?;
+    marker["generation"].as_u64()
 }
 fn protection_key() -> &'static str {
     POWER_CONTRACT["constants"]["STORAGE_PROTECTION_LEDGER_KEY"]
@@ -5089,7 +5408,7 @@ mod tls_tests {
         let ready = json!({"id":db["id"],"generation":1,"state":"ready","archive":{"continuous":true,"ready_wal_files":0}});
         assert_eq!(
             coordinator
-                .publish_ready_fence(&db, ready.clone())
+                .publish_ready_fence(&db, ready.clone(), false)
                 .await
                 .unwrap(),
             Some(ready)

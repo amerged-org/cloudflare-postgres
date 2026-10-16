@@ -162,10 +162,12 @@ impl Intake {
         self.answered.lock().unwrap().insert(pod.uid.clone(), true);
         Ok(answer.wakes)
     }
-    /// Sends `result` to the gateway Pod that delivered its wake.
+    /// Sends `result` to the gateway Pod that delivered its wake, signed with the regional
+    /// keyring `keys` (active key ID and keys) of `region`.
     pub async fn send_result(
         &self,
-        power: &PowerCoordinator,
+        (active, keys): &(String, HashMap<String, Vec<u8>>),
+        region: &str,
         pod: &GatewayPod,
         result: &WakeResult,
     ) -> Result<(), Error> {
@@ -176,15 +178,7 @@ impl Intake {
         if !result.valid() || body.len() > RESULT_MAX_BYTES {
             return Err("wake result invalid".into());
         }
-        let (active, keys) = power.regional_keys().await?;
-        let token = sign_poll(
-            &keys,
-            &active,
-            power.region(),
-            &pod.uid,
-            RESULT_ACTION,
-            now_ms(),
-        )?;
+        let token = sign_poll(keys, active, region, &pod.uid, RESULT_ACTION, now_ms())?;
         let response = self
             .http
             .post(format!("http://{}:8080{RESULT_PATH}", host(pod)))
@@ -287,6 +281,57 @@ mod tests {
         );
         let pods = w.reconciler.power.gateway_pods().await.unwrap();
         assert!(intake.ready(&pods));
+    }
+
+    #[tokio::test]
+    async fn a_wake_result_goes_only_to_the_gateway_that_delivered_the_wake() {
+        let w = World::awake().await;
+        let second = second_gateway(&w);
+        let request = wake(&w);
+        let reconciler = &w.reconciler;
+        let steps = std::collections::BTreeMap::from([("decide".to_string(), 3_u64)]);
+        // A pool whose intake speaks to the gateways through the double's proxy.
+        let mut with_proxy =
+            crate::pool::Pool::new(w.server.k8s.clone(), crate::test_world::IMAGE.into()).unwrap();
+        with_proxy.intake = intake(&w);
+        // Only the second gateway queued and delivered it.
+        with_proxy.delivered(&second, &request);
+        with_proxy
+            .report(
+                &reconciler.power,
+                (&request.database, &request.operation, request.generation),
+                (
+                    pgcf_native_protocol::wake::Outcome::Miss,
+                    Some("no_free_slot"),
+                ),
+                &steps,
+            )
+            .await;
+        for _ in 0..100 {
+            if !w.gateway.wake.lock().unwrap().results.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let results = w.gateway.wake.lock().unwrap().results.clone();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].0, "10.0.0.2");
+        assert_eq!(
+            results[0].1,
+            json!({"database":w.id,"operation":request.operation,"generation":3,"outcome":"miss","reason":"no_free_slot","steps_ms":{"decide":3}})
+        );
+        // A wake no gateway delivered has nowhere to go.
+        with_proxy
+            .report(
+                &reconciler.power,
+                (&request.database, "op_xxxxxxxxxxxxxxxxxxxx", 9),
+                (pgcf_native_protocol::wake::Outcome::Hit, None),
+                &steps,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(w.gateway.wake.lock().unwrap().results.len(), 1);
     }
 
     #[tokio::test]

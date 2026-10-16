@@ -78,7 +78,239 @@ pub struct Gateway {
     pub refuse_releases: Arc<Mutex<u32>>,
     /// The wake long-poll and the wake results of the gateways (pool design 2026-10-16).
     pub wake: Arc<Mutex<WakeDouble>>,
+    /// The node agent `pgcf-attach` of the world's node.
+    pub agent: Arc<Mutex<AgentDouble>>,
     task: tokio::task::JoinHandle<()>,
+}
+/// One device-mapper device of the agent double.
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub dm_uuid: String,
+    /// Opens other than the slot mounts the agent made: a database's own Pod.
+    pub opens: u32,
+    pub suspended: bool,
+    /// What its `pg_control` says while no PostgreSQL runs on it.
+    pub control: crate::attach_protocol::Control,
+    /// The slot namespace and the containers the volume was moved into.
+    pub attached: Option<(String, Vec<String>)>,
+}
+/// The node agent double: device-mapper devices by LV UUID and the holder files, enforcing the
+/// single-writer rule as the agent does. A slot mount counts as an open while the slot's
+/// namespace exists in the API double.
+#[derive(Default)]
+pub struct AgentDouble {
+    pub devices: HashMap<String, Device>,
+    pub holders: BTreeMap<String, String>,
+    pub boot_id: String,
+    /// Every request, as `<action> <answer>`.
+    pub calls: Vec<String>,
+}
+fn agent_answer(
+    agent: &Arc<Mutex<AgentDouble>>,
+    objects: &Arc<Mutex<crate::test_server::State>>,
+    action: &str,
+    token: Option<&str>,
+    body: &[u8],
+) -> (u16, Value) {
+    use crate::attach_protocol::{self as attach, Action};
+    let refuse = |code: &str| {
+        let status = match code {
+            "invalid" => 400,
+            "denied" => 401,
+            "busy" | "keys_unavailable" | "unsupported_platform" => 503,
+            _ => 409,
+        };
+        (status, json!({"error":code}))
+    };
+    let Some(action) = Action::from_path(&format!("/v1/{action}")) else {
+        return refuse("invalid");
+    };
+    let keys = attach::Keys::derive(
+        "eu-test",
+        "local",
+        &HashMap::from([("local".to_string(), vec![7_u8; 32])]),
+    )
+    .unwrap();
+    if token
+        .map(|token| attach::verify(token, &keys, NODE, action, now_ms()))
+        .is_none_or(|claims| claims.is_err())
+    {
+        return refuse("denied");
+    }
+    let state = objects.lock().unwrap();
+    let exists = |kind: &str, ns: Option<&str>, name: &str| {
+        state
+            .objects
+            .contains_key(&crate::test_server::path(kind, ns, name))
+    };
+    let fenced = |ns: &str| {
+        state
+            .objects
+            .get(&crate::test_server::path("Cluster", Some(ns), "database"))
+            .is_some_and(crate::power::fenced)
+    };
+    let live = |container: &str| {
+        state.objects.values().any(|object| {
+            object["kind"] == "Pod"
+                && object["metadata"]["deletionTimestamp"].is_null()
+                && ["containerStatuses", "initContainerStatuses"]
+                    .iter()
+                    .any(|key| {
+                        object["status"][*key].as_array().is_some_and(|all| {
+                            all.iter().any(|c| {
+                                text(c, "containerID") == format!("containerd://{container}")
+                            })
+                        })
+                    })
+        })
+    };
+    let mut agent = agent.lock().unwrap();
+    let open_count = |device: &Device| {
+        device.opens
+            + u32::from(
+                device
+                    .attached
+                    .as_ref()
+                    .is_some_and(|(ns, _)| exists("Namespace", None, ns)),
+            )
+    };
+    let boot = agent.boot_id.clone();
+    match action {
+        Action::Attach => {
+            let Ok(request) = serde_json::from_slice::<attach::AttachRequest>(body) else {
+                return refuse("invalid");
+            };
+            let lv = request.volume.lv_uuid.clone();
+            let Some(device) = agent.devices.get(&lv).cloned() else {
+                return refuse("volume_missing");
+            };
+            if device.dm_uuid != request.volume.dm_uuid() {
+                return refuse("uuid_mismatch");
+            }
+            if device.suspended {
+                return refuse("volume_suspended");
+            }
+            if open_count(&device) != 0 {
+                return refuse("volume_open");
+            }
+            if agent.holders.contains_key(&lv) {
+                return refuse("holder_busy");
+            }
+            let holder = format!("slot:{}:{boot}", request.pod_uid);
+            agent.holders.insert(lv.clone(), holder.clone());
+            if !device.control.shut_down() {
+                agent.holders.remove(&lv);
+                return refuse("unclean");
+            }
+            if !request.containers.iter().all(|c| live(c)) {
+                agent.holders.remove(&lv);
+                return refuse("container_missing");
+            }
+            let ns = state
+                .objects
+                .values()
+                .find(|object| object["metadata"]["uid"] == request.pod_uid.as_str())
+                .and_then(|pod| pod["metadata"]["namespace"].as_str())
+                .unwrap_or("")
+                .to_string();
+            agent.devices.get_mut(&lv).unwrap().attached = Some((ns, request.containers.clone()));
+            (
+                200,
+                serde_json::to_value(attach::AttachResponse {
+                    holder,
+                    control: device.control.clone(),
+                    attached: request.containers,
+                    steps_us: BTreeMap::from([("total".to_string(), 900)]),
+                })
+                .unwrap(),
+            )
+        }
+        Action::Hold => {
+            let Ok(request) = serde_json::from_slice::<attach::HoldRequest>(body) else {
+                return refuse("invalid");
+            };
+            let lv = request.volume.lv_uuid.clone();
+            let record = request.holder.record(&boot);
+            if agent.holders.get(&lv) == Some(&record) {
+                return (200, json!({"holder":record,"created":false}));
+            }
+            if agent.holders.contains_key(&lv) {
+                return refuse("holder_busy");
+            }
+            let Some(device) = agent.devices.get(&lv) else {
+                return refuse("volume_missing");
+            };
+            if device.dm_uuid != request.volume.dm_uuid() {
+                return refuse("uuid_mismatch");
+            }
+            if device.suspended {
+                return refuse("volume_suspended");
+            }
+            if open_count(device) != 0 {
+                return refuse("volume_open");
+            }
+            agent.holders.insert(lv, record.clone());
+            (200, json!({"holder":record,"created":true}))
+        }
+        Action::Release => {
+            let Ok(request) = serde_json::from_slice::<attach::ReleaseRequest>(body) else {
+                return refuse("invalid");
+            };
+            let lv = request.volume.lv_uuid.clone();
+            let Some(held) = agent.holders.get(&lv).cloned() else {
+                return (200, json!({"released":false,"waited_ms":0}));
+            };
+            if held != request.holder.record(&boot) {
+                return refuse("holder_mismatch");
+            }
+            if agent.devices.get(&lv).is_some_and(|d| open_count(d) != 0) {
+                return refuse("release_timeout");
+            }
+            agent.holders.remove(&lv);
+            if let Some(device) = agent.devices.get_mut(&lv) {
+                device.attached = None;
+            }
+            (200, json!({"released":true,"waited_ms":0}))
+        }
+        Action::Inspect => {
+            let Ok(request) = serde_json::from_slice::<attach::InspectRequest>(body) else {
+                return refuse("invalid");
+            };
+            let lv = request.volume.lv_uuid.clone();
+            let Some(device) = agent.devices.get(&lv) else {
+                return (
+                    200,
+                    json!({"exists":false,"open_count":0,"suspended":false,"holder":null,"control":null,"postmaster_running":null}),
+                );
+            };
+            let (mut control, mut running) = (Value::Null, Value::Null);
+            if let Some(container) = &request.postgres_container {
+                let Some((ns, _)) = device
+                    .attached
+                    .as_ref()
+                    .filter(|(ns, ids)| ids.contains(container) && exists("Namespace", None, ns))
+                    .filter(|_| live(container))
+                else {
+                    return refuse("container_missing");
+                };
+                let stopped = fenced(ns);
+                let mut seen = device.control.clone();
+                if !stopped {
+                    seen.state = 6;
+                }
+                control = serde_json::to_value(seen).unwrap();
+                running = (!stopped).into();
+            }
+            (
+                200,
+                json!({"exists":true,"open_count":open_count(device),"suspended":device.suspended,"holder":agent.holders.get(&lv),"control":control,"postmaster_running":running}),
+            )
+        }
+        Action::Holders => (
+            200,
+            json!({"boot_id":boot,"holders":agent.holders.iter().map(|(lv,holder)|json!({"lv_uuid":lv,"holder":holder})).collect::<Vec<_>>()}),
+        ),
+    }
 }
 /// What the gateways' wake endpoints hold and received.
 #[derive(Default)]
@@ -103,7 +335,10 @@ fn now_ms() -> u64 {
     u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap()
 }
 impl Gateway {
-    async fn start(log: Arc<Mutex<Vec<String>>>) -> Self {
+    async fn start(
+        log: Arc<Mutex<Vec<String>>>,
+        objects: Arc<Mutex<crate::test_server::State>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let client = reqwest::Client::builder()
@@ -119,17 +354,24 @@ impl Gateway {
         let refusing = refuse_releases.clone();
         let wake: Arc<Mutex<WakeDouble>> = Arc::default();
         let waking = wake.clone();
+        let agent: Arc<Mutex<AgentDouble>> = Arc::new(Mutex::new(AgentDouble {
+            boot_id: BOOT_ID.into(),
+            ..AgentDouble::default()
+        }));
+        let attaching = agent.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (served, log, current, refusing, waking) = (
+                let (served, log, current, refusing, waking, attaching, objects) = (
                     served.clone(),
                     log.clone(),
                     current.clone(),
                     refusing.clone(),
                     waking.clone(),
+                    attaching.clone(),
+                    objects.clone(),
                 );
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
@@ -175,6 +417,27 @@ impl Gateway {
                             body.len()
                         )
                     };
+                    if target.contains(":8081/v1/") {
+                        let token = header.lines().find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| {
+                                    name.eq_ignore_ascii_case(crate::attach_protocol::HEADER)
+                                })
+                                .map(|(_, value)| value.trim().to_string())
+                        });
+                        let (status, answer) =
+                            agent_answer(&attaching, &objects, &action, token.as_deref(), &body);
+                        let line = format!(
+                            "AGENT {action} {}",
+                            answer["error"].as_str().unwrap_or("ok")
+                        );
+                        attaching.lock().unwrap().calls.push(line.clone());
+                        log.lock().unwrap().push(line);
+                        let _ = socket
+                            .write_all(reply(status, answer.to_string()).as_bytes())
+                            .await;
+                        return;
+                    }
                     if action == "wakes" || action == "wake-result" {
                         let (pod, old) = {
                             let state = waking.lock().unwrap();
@@ -327,6 +590,7 @@ impl Gateway {
             pod,
             refuse_releases,
             wake,
+            agent,
             task,
         }
     }
@@ -447,6 +711,7 @@ fn answers(
     state: Arc<Mutex<Sql>>,
     fenced: Arc<dyn Fn() -> bool + Send + Sync>,
     log: Arc<Mutex<Vec<String>>>,
+    (who, ip): (&'static str, &'static str),
 ) -> Handler {
     Arc::new(move |sql: &str, parameters: &[String], user: &str| {
         let s = state.lock().unwrap().clone();
@@ -478,7 +743,7 @@ fn answers(
         };
         log.lock()
             .unwrap()
-            .push(format!("SQL {user} {kind}").trim_end().to_string());
+            .push(format!("{who} {user} {kind}").trim_end().to_string());
         if let Some(during) = s.during.get(kind.as_str()) {
             during();
         }
@@ -581,7 +846,7 @@ fn answers(
                 ("database", name(id)),
                 ("recovery", Cell::Bool(s.recovery)),
                 ("tls", Cell::Bool(true)),
-                ("server_address", server_address(sql, POD_IP)),
+                ("server_address", server_address(sql, ip)),
                 ("postmaster_age_ms", Cell::Int8(s.postmaster_age_ms)),
                 ("system_identifier", text(&s.system_identifier)),
                 ("timeline", Cell::Int4(s.timeline)),
@@ -596,7 +861,7 @@ fn answers(
                 ("database", name(id)),
                 ("role", text(user)),
                 ("recovery", Cell::Bool(s.recovery)),
-                ("server_address", server_address(sql, POD_IP)),
+                ("server_address", server_address(sql, ip)),
                 ("tls", Cell::Bool(true)),
                 ("rolsuper", Cell::Bool(false)),
                 ("rolcreatedb", Cell::Bool(false)),
@@ -644,7 +909,7 @@ fn answers(
                 ),
                 ("archive_timeout", Cell::Int4(60)),
                 ("current_database", text(id)),
-                (column, server_address(sql, POD_IP)),
+                (column, server_address(sql, ip)),
                 ("pg_is_in_recovery", Cell::Bool(s.recovery)),
             ])
         } else if sql.contains("FROM pg_roles WHERE rolname=current_user") {
@@ -694,6 +959,9 @@ pub struct World {
     pub sql: Arc<Mutex<Sql>>,
     pub ns: String,
     pub id: String,
+    /// The CA of the pool slot's instance, and the PostgreSQL of the slot.
+    pub slot_authority: Authority,
+    pub slot_postgres: Option<Postgres>,
 }
 
 fn owned_by_cluster() -> Value {
@@ -775,6 +1043,7 @@ impl World {
         ] {
             server.put(object);
         }
+        let objects = server.state.clone();
         let mut world = Self {
             log,
             server,
@@ -783,11 +1052,13 @@ impl World {
             snapshot,
             node,
             authority,
-            gateway: Gateway::start(log_for_gateway).await,
+            gateway: Gateway::start(log_for_gateway, objects).await,
             postgres: None,
             sql: Arc::new(Mutex::new(Sql::default())),
             ns,
             id,
+            slot_authority: Authority::new(),
+            slot_postgres: None,
         };
         world.gateway.fenced(false);
         world.reconciler.power.http = world.gateway.client.clone();
@@ -885,7 +1156,13 @@ impl World {
             &self.authority,
             &format!("database-rw.{}.svc", self.ns),
             address,
-            answers(self.db.clone(), self.sql.clone(), fenced, self.log.clone()),
+            answers(
+                self.db.clone(),
+                self.sql.clone(),
+                fenced,
+                self.log.clone(),
+                ("SQL", POD_IP),
+            ),
             login,
         )
         .await;
@@ -1041,6 +1318,7 @@ impl World {
                         manifests,
                         runtime_class,
                     },
+                    slot: None,
                 },
             )
             .await
@@ -1149,6 +1427,263 @@ impl World {
             "{observed}"
         );
         w
+    }
+}
+
+/// The pool slot of the pooled world: its hex, address and containers.
+pub const SLOT_HEX: &str = "0a1b2c3d";
+pub const SLOT_IP: &str = "10.0.0.9";
+pub const SLOT_POSTGRES: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+pub const SLOT_SIDECAR: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+/// The thin LV of the pooled world's database and its volume group.
+pub const LV_UUID: &str = "iLeDnR-3bK4-F2Sh-j05A-x0NW-MCcd-TfCn8O";
+pub const VG_UUID: &str = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
+pub const AGENT_IP: &str = "10.0.0.8";
+pub fn slot_ns() -> String {
+    format!("pgcf-slot-{SLOT_HEX}")
+}
+pub fn slot_pod_uid() -> String {
+    uid(60)
+}
+pub fn slot_cluster_uid() -> String {
+    uid(62)
+}
+fn iso_ms(ms: u64) -> String {
+    let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).unwrap();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
+}
+impl World {
+    /// A thin database that slept cleanly through its own Cluster, on a node with a node agent
+    /// and one free pool slot: what a pool wake starts from. The sleep is at generation 2.
+    pub async fn pooled() -> Self {
+        let mut w = Self::awake().await;
+        w.quick();
+        w.reconciler.pool.start_budget = std::time::Duration::from_secs(2);
+        w.reconciler.power.attach.client =
+            crate::attach_protocol::Client::new(w.gateway.client.clone());
+        w.reconciler.pool.intake.http = w.gateway.client.clone();
+        w.thin();
+        w.snapshot.region["parking"] = Value::Null;
+        w.admitted();
+        // The sleep of its own Cluster: proved, hibernated by CNPG, recorded.
+        assert!(
+            w.sleep_pass().await.is_none(),
+            "the first pass proves the sleep"
+        );
+        w.hibernated_by_cnpg();
+        let observed = w.sleep_pass().await.expect("a hibernated observation");
+        assert_eq!(observed["state"], "hibernated", "{observed}");
+        w.free_slot().await;
+        w
+    }
+    /// The database's storage is a thin LV on the world's node, under a current node write
+    /// authority, and the node agent knows its device (open by the database's own Pod).
+    pub fn thin(&mut self) {
+        let class = "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa";
+        self.db["storage"] = json!({"backend":"lvm-thin-v1","storage_class":class,"volume_attributes_class":class,"profile_revision":1,"profile_sha256":"a".repeat(64),"node_uid":node_uid(),"volume_group_uuid":VG_UUID,"pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","startup_reserve_bytes":1048576,"write_bytes_per_second":1048576,"write_iops_per_second":10,"guard_seconds":10,"drain_seconds":1});
+        let storage = self.db["storage"].clone();
+        let archive = self.db["archive"]["destination_path"].clone();
+        self.server.edit(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("storage-{}", self.id),
+            |map| {
+                map["data"]["state"] = json!({"namespaceUid":namespace_uid(),"clusterUid":cluster_uid(),"node":NODE,"archivePath":archive,"storage":storage}).to_string().into();
+                map["metadata"]["annotations"]["pgcf.io/volume-identity"] = json!({"claimUid":claim_uid(),"volumeUid":volume_uid(),"handle":HANDLE,"lvUuid":LV_UUID}).to_string().into();
+            },
+        );
+        self.server.edit("PersistentVolume", None, HANDLE, |pv| {
+            pv["spec"]["storageClassName"] = class.into();
+        });
+        self.server.edit(
+            "PersistentVolumeClaim",
+            Some(&self.ns),
+            "database-1",
+            |claim| {
+                claim["spec"]["storageClassName"] = class.into();
+            },
+        );
+        self.fresh_authority();
+        self.server.edit("Node", None, NODE, |node| {
+            node["status"]["allocatable"] = json!({"memory":"8Gi","cpu":"4"});
+        });
+        self.node = self.server.get("Node", None, NODE).unwrap();
+        self.gateway.agent.lock().unwrap().devices.insert(
+            LV_UUID.into(),
+            Device {
+                dm_uuid: crate::attach_protocol::Volume {
+                    lv_name: HANDLE.into(),
+                    lv_uuid: LV_UUID.into(),
+                    vg_uuid: VG_UUID.into(),
+                }
+                .dm_uuid(),
+                opens: 1,
+                suspended: false,
+                control: crate::attach_protocol::Control {
+                    state: 1,
+                    system_identifier: Sql::default().system_identifier,
+                    timeline: 1,
+                },
+                attached: None,
+            },
+        );
+        self.server.put(json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"pgcf-attach-x","namespace":"pgcf-attach","uid":uid(50),"labels":{"app.kubernetes.io/name":"pgcf-attach"}},"spec":{"nodeName":NODE},"status":{"phase":"Running","podIP":AGENT_IP,"conditions":[{"type":"Ready","status":"True"}]}}));
+    }
+    /// The node's Cloudflare write authority, observed now.
+    pub fn fresh_authority(&mut self) {
+        let now = now_ms();
+        let storage = &self.db["storage"];
+        self.snapshot.region["storage_nodes"] = json!([{"name":NODE,"node_uid":node_uid(),"cluster_uid":kube_system(),"volume_group_uuid":storage["volume_group_uuid"],"pool_uuid":storage["pool_uuid"],"profile_sha256":storage["profile_sha256"],"profile_revision":1,"storage_class":storage["storage_class"],"write_allowed":true,"observed_at":iso_ms(now),"expires_at":iso_ms(now + 9_000)}]);
+    }
+    /// CNPG hibernated the database's Cluster: its Pod is gone and the volume closed.
+    pub fn hibernated_by_cnpg(&mut self) {
+        self.stop_postgres();
+        self.server
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .remove(&crate::test_server::path(
+                "Pod",
+                Some(&self.ns),
+                "database-1",
+            ));
+        self.server
+            .edit("Cluster", Some(&self.ns), "database", |cluster| {
+                cluster["status"]["conditions"] =
+                    json!([{"type":"cnpg.io/hibernation","status":"True","reason":"Hibernated"}]);
+            });
+        if let Some(device) = self.gateway.agent.lock().unwrap().devices.get_mut(LV_UUID) {
+            device.opens = 0;
+        }
+    }
+    /// One free pool slot on the world's node, as CNPG runs it: fenced, its Pod up with both
+    /// containers, its CA made; and the PostgreSQL its instance starts once the fence is lifted.
+    pub async fn free_slot(&mut self) {
+        let ns = slot_ns();
+        let labels = json!({"pgcf.io/slot":SLOT_HEX});
+        let owner = json!([{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":slot_cluster_uid(),"controller":true}]);
+        let requests = json!({"cpu":"100m","memory":"128Mi"});
+        let limits = json!({"cpu":"500m","memory":"512Mi"});
+        let placeholder = STANDARD.encode("pgcf-slot-placeholder");
+        for object in [
+            json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns,"uid":uid(61),"labels":{"pgcf.io/slot":SLOT_HEX,"pgcf.io/slot-node":NODE,"pgcf.io/compute-runtime":"standard"}}}),
+            json!({"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","metadata":{"name":"database","namespace":ns,"uid":slot_cluster_uid(),"labels":labels,"annotations":{"cnpg.io/fencedInstances":"[\"*\"]"}},"spec":{"instances":1,"imageName":IMAGE,"resources":{"requests":requests,"limits":limits},"postgresql":{"parameters":{"max_connections":"20"}},"managed":{"roles":[]}},"status":{"phase":"Cluster in healthy state","certificates":{"serverCASecret":"database-ca"}}}),
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":slot_pod_uid(),"labels":{"cnpg.io/cluster":"database","pgcf.io/slot":SLOT_HEX},"ownerReferences":owner},
+                "spec":{"nodeName":NODE,"containers":[{"name":"postgres","image":IMAGE,"resources":{"requests":requests,"limits":limits}}],"initContainers":[{"name":"plugin-barman-cloud","restartPolicy":"Always","resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":"500m","memory":"512Mi"}}}],"volumes":[{"name":"pgdata","persistentVolumeClaim":{"claimName":"database-1"}}]},
+                "status":{"phase":"Running","podIP":SLOT_IP,"conditions":[{"type":"Ready","status":"False"}],
+                    "containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{SLOT_POSTGRES}"),"imageID":IMAGE,"state":{"running":{"startedAt":"2026-10-16T00:00:00Z"}},"restartCount":0,"resources":{"requests":requests}}],
+                    "initContainerStatuses":[{"name":"plugin-barman-cloud","ready":true,"containerID":format!("containerd://{SLOT_SIDECAR}"),"state":{"running":{"startedAt":"2026-10-16T00:00:00Z"}},"restartCount":0}]}}),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"database-ca","namespace":ns,"uid":uid(63),"labels":labels,"ownerReferences":owner},"data":{"ca.crt":STANDARD.encode(&self.slot_authority.pem)}}),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"archive-credentials","namespace":ns,"uid":uid(64),"labels":labels},"type":"Opaque","data":{"AWS_ACCESS_KEY_ID":placeholder,"AWS_SECRET_ACCESS_KEY":placeholder}}),
+            json!({"apiVersion":"barmancloud.cnpg.io/v1","kind":"ObjectStore","metadata":{"name":"archive","namespace":ns,"uid":uid(65),"labels":labels},"spec":{"configuration":{"destinationPath":format!("s3://native-controller-test/slots/{SLOT_HEX}/")},"retentionPolicy":"1d"}}),
+        ] {
+            self.server.put(object);
+        }
+        self.start_slot_postgres().await;
+        self.reconciler
+            .pool
+            .rediscover(&self.reconciler)
+            .await
+            .unwrap();
+        self.gateways_polled().await;
+    }
+    /// The slot's PostgreSQL: it answers once the slot's fence is lifted, on whatever data the
+    /// instance runs on (the world's `Sql`), under the slot's own service name.
+    pub async fn start_slot_postgres(&mut self) {
+        let state = self.server.state.clone();
+        let cluster = crate::test_server::path("Cluster", Some(&slot_ns()), "database");
+        let fenced: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            state
+                .lock()
+                .unwrap()
+                .objects
+                .get(&cluster)
+                .is_none_or(crate::power::fenced)
+        });
+        let log = self.log.clone();
+        let login: Login = Arc::new(move |user: &str| {
+            log.lock().unwrap().push(format!("SLOT LOGIN {user}"));
+            None
+        });
+        let postgres = Postgres::start_with(
+            &self.slot_authority,
+            &format!("database-rw.{}.svc", slot_ns()),
+            None,
+            answers(
+                self.db.clone(),
+                self.sql.clone(),
+                fenced,
+                self.log.clone(),
+                ("SLOT SQL", SLOT_IP),
+            ),
+            login,
+        )
+        .await;
+        self.reconciler.pool.postgres = Some(postgres.address);
+        self.slot_postgres = Some(postgres);
+    }
+    /// Every gateway Pod answered a wake poll.
+    pub async fn gateways_polled(&self) {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            self.reconciler
+                .pool
+                .intake
+                .run(&self.reconciler.power, sender),
+        )
+        .await;
+        let pods = self.reconciler.power.gateway_pods().await.unwrap();
+        assert!(self.reconciler.pool.intake.ready(&pods));
+    }
+    /// The gateway Pod of the world.
+    pub fn gateway_pod(&self) -> crate::power::GatewayPod {
+        crate::power::GatewayPod {
+            name: "gateway-0".into(),
+            uid: self.gateway.pod.lock().unwrap().clone(),
+            ip: "10.0.0.1".into(),
+            restarts: 0,
+        }
+    }
+    /// The wake the Edge's ticket names for the sleeping row: the next generation.
+    pub fn wake_request(&self) -> pgcf_native_protocol::wake::WakeRequest {
+        pgcf_native_protocol::wake::WakeRequest {
+            database: self.id.clone(),
+            operation: format!("op_{}", "w".repeat(20)),
+            generation: self.db["generation"].as_u64().unwrap() + 1,
+            route_revision: self.db["admission"]["route_revision"].as_u64().unwrap(),
+            role_revision_hash: pgcf_native_protocol::wake::role_revision_hash(
+                present_roles(&self.db)
+                    .map(|r| (r["name"].as_str().unwrap(), r["revision"].as_u64().unwrap())),
+            ),
+            queued_at_ms: now_ms(),
+        }
+    }
+    /// Cloudflare committed the wake of `wake`: the desired row runs at its generation, under
+    /// its operation, with the startup hold of a thin start.
+    pub fn claimed(&mut self, wake: &pgcf_native_protocol::wake::WakeRequest) {
+        self.db["generation"] = wake.generation.into();
+        self.db["desired_state"] = "running".into();
+        self.db["power"] = json!({"operation":wake.operation,"revision":wake.generation,"mode":"running","reason":null});
+        self.db["size"]["memory_request_mib"] = 128.into();
+        self.db["storage_startup"] = json!({"operation_id":wake.operation,"generation":wake.generation,"node_uid":node_uid(),"budget_bytes":1048576,"expires_at":iso_ms(now_ms() + 60_000)});
+    }
+    /// The lines of the log since `from`.
+    pub fn since(&self, from: usize) -> Vec<String> {
+        self.log.lock().unwrap()[from..].to_vec()
+    }
+    pub fn log_len(&self) -> usize {
+        self.log.lock().unwrap().len()
     }
 }
 

@@ -1392,6 +1392,7 @@ fn a_parked_pods_identity_gap_names_its_first_cause() {
                 manifests: None,
                 runtime_class: "",
             },
+            slot: None,
         };
         parked::identity_gap(pod, &park, cluster, &db, &sleep)
     };
