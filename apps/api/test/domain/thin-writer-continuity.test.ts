@@ -512,3 +512,17 @@ it("keeps the start's hold in the identity lease the executor reads across a rol
     generation: 2,
   });
 }, 60_000);
+
+it("does not carry a writer over a role change from a reading that found the volume frozen", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  // The guard froze the volume: the node's reading of generation 1 has it quiesced.
+  await w.evidence({ quiesced: true });
+  expect((await createRole(w, "reader")).status).toBe(201);
+  expect(await leaseEntry(w.f, w.id)).toMatchObject({
+    generation: 2,
+    runtime_authority: null,
+  });
+  expect(
+    (await sampled(w)).find((token) => token.database_id === w.id),
+  ).toBeUndefined();
+}, 60_000);

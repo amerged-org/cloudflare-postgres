@@ -695,9 +695,6 @@ async function runningWriterAuthority(
   const started = c.inputs.started.get(database.id);
   let pod = io?.pod_uid;
   if (pod === undefined) {
-    // A protective stop is released by a start of its own, never by a generation that started
-    // nothing: while its marker stands, no writer is carried across one.
-    const marked = database.storage_protected_at != null;
     // The reading of an earlier generation, when none is of this one.
     const earlier = volume
         ? undefined
@@ -706,6 +703,10 @@ async function runningWriterAuthority(
               value.database_id === database.id &&
               value.storage_generation === receipt.storage_generation,
           ),
+      // A protective stop is released by a start of its own, never by a generation that started
+      // nothing: while its marker stands or the volume was read frozen, no writer is carried.
+      marked =
+        database.storage_protected_at != null || earlier?.quiesced === true,
       held =
         marked && (started ?? database.generation) < database.generation
           ? undefined
