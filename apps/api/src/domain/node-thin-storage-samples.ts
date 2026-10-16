@@ -482,6 +482,21 @@ async function productSample(
   };
   let tokens: NodeStorageHeadroomResponse["tokens"];
   let failed = false;
+  // A start whose hold waits cannot finish before the next identity proof. Ask while the tokens are
+  // computed; the Durable Object spaces the turns and runs one at a time.
+  let asked: Promise<void> | undefined;
+  if (holds.waiting > 0) {
+    if (hotLogDue("thin_storage_turn_requested", nodeId))
+      console.log(
+        JSON.stringify({
+          event: "thin_storage_turn_requested",
+          node_id: nodeId,
+          reason: "start_waiting",
+          holds: holds.waiting,
+        }),
+      );
+    asked = requestThinStorageTurn(env, nodeId).catch(() => undefined);
+  }
   try {
     // The node as the compare-and-set left it: the row read above with exactly the columns the
     // update wrote, and the qualification its predicate has just held. Reading the row back would
@@ -493,6 +508,7 @@ async function productSample(
       now,
       nodeReading({ ...row, ...written, current_qualified: 1 }, now),
     );
+    await asked;
     if (
       thinPoolDataGrowthNeeded(
         profile,

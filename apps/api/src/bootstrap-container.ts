@@ -274,6 +274,8 @@ function thinStorageRetryMilliseconds(failures: number) {
 /** A turn request only registers the turn; the container's own record then follows it. */
 const TURN_REQUEST_MS = 10_000,
   TURN_POLL_MS = 2_000;
+/** A requested identity turn starts no sooner than this after the previous turn started. */
+const THIN_TURN_SPACING_MS = 10_000;
 /** What the container's own record proves about one exact turn. Only a record of no turn or of
  * another turn proves it is not running; a body still arriving or no readable record proves nothing. */
 export function executorTurnObservation(raw: unknown, turn: NodeExecutorTurn) {
@@ -469,6 +471,8 @@ export class NodeBootstrap extends DurableObject<Env> {
       throw new Error("thin_storage_container_identity_mismatch");
     // This turn serves demand already received. A request arriving during it remains pending.
     await this.ctx.storage.delete("thinStorageDue");
+    const startedAt = Date.now();
+    await this.ctx.storage.put("thinStorageStartedAt", startedAt);
     const input = await thinStorageInput(this.env, nodeId),
       container = this.ctx.container;
     if (!container) throw new Error("thin_storage_container_unavailable");
@@ -569,7 +573,7 @@ export class NodeBootstrap extends DurableObject<Env> {
       const due = await storage.get<boolean>("thinStorageDue");
       await storage.setAlarm(
         due
-          ? Date.now()
+          ? Math.max(Date.now(), startedAt + THIN_TURN_SPACING_MS)
           : Math.max(
               Date.now() + 1000,
               Date.parse(input.lease.issued_at) +
@@ -592,8 +596,9 @@ export class NodeBootstrap extends DurableObject<Env> {
       return failures;
     });
   }
-  /** Cloudflare needs an identity proof now: a refused sample, a needed growth or a ready thin
-   * database without a receipt. A turn already running keeps running; the next one starts now. */
+  /** Cloudflare needs an identity proof now: a refused sample, a needed growth, a ready thin
+   * database without a receipt or a start whose hold waits for one. A turn already running keeps
+   * running; the next one starts now, but no sooner than 10 s after the previous one started. */
   async thinStorageDue(nodeId: string) {
     NodeId.parse(nodeId);
     if (
@@ -613,7 +618,15 @@ export class NodeBootstrap extends DurableObject<Env> {
               alarm ??
               now + thinStorageRetryMilliseconds(failures))
             : now;
-      const dueAt = Math.max(now, retryAt);
+      // A pending retry keeps its backoff; otherwise a request waits out the spacing.
+      const dueAt = Math.max(
+        now,
+        retryAt,
+        failures > 0
+          ? 0
+          : ((await storage.get<number>("thinStorageStartedAt")) ?? 0) +
+              THIN_TURN_SPACING_MS,
+      );
       if (alarm === null || alarm !== dueAt) await storage.setAlarm(dueAt);
     });
   }

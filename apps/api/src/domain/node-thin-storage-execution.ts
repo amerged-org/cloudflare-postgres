@@ -171,6 +171,9 @@ function retainedPoolAuthority(
     : null;
 }
 
+/** A start waits for the node's next inventory this long after its hold was granted. A start that
+ * is older is stuck on something else, and a stuck start must not keep identity turns running. */
+export const THIN_START_WAIT_SECONDS = 120;
 export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM (
   SELECT h.operation_id FROM database_start_admissions h WHERE h.node_id=node_thin_storage.node_id AND h.node_uid=node_thin_storage.node_uid AND h.storage_budget_bytes>0
 ) storage_hold WHERE NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
@@ -182,13 +185,15 @@ export async function storageHolds(
   now = Date.now(),
 ) {
   const rows = await env.DB.prepare(
-    `SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
+    `SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.granted_at,h.ready_at,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
   )
     .bind(nodeId, nodeUid)
     .all<{
       operation_id: string;
       database_id: string;
       storage_budget_bytes: number;
+      granted_at: string;
+      ready_at: string | null;
       storage_volume_json: string | null;
       binding_json: string | null;
       storage_profile_json: string | null;
@@ -218,6 +223,13 @@ export async function storageHolds(
   return {
     bytes,
     count: rows.results.length,
+    /** Starts the controller has not reported ready yet: each waits for the next inventory, which
+     * carries its new Pod's io.max, and the controller cannot ready the database before that. */
+    waiting: rows.results.filter(
+      (hold) =>
+        hold.ready_at === null &&
+        now - Date.parse(hold.granted_at) <= THIN_START_WAIT_SECONDS * 1000,
+    ).length,
     newVolumes: unknownVolumes,
     ids: new Set(rows.results.map((r) => r.database_id)),
     operations: rows.results.map((r) => r.operation_id),
@@ -1118,12 +1130,25 @@ async function acceptIdentityProof(
     const results = protectedAdmissions.length
       ? await withAdmissionMutation(env, protectedAdmissions, execute)
       : await execute();
-    if (results[0]!.meta.changes === 1)
+    if (results[0]!.meta.changes === 1) {
+      // From the lease's issue to the acceptance: the executor's turn as the control plane saw it.
+      console.log(
+        JSON.stringify({
+          event: "thin_storage_turn_accepted",
+          node_id: nodeId,
+          authority_revision: composed.revision,
+          turn_ms: Date.now() - issued,
+          volumes: a.volumes.length,
+          write_allowed: composed.write_allowed,
+          action: lease.action?.kind ?? null,
+        }),
+      );
       return {
         accepted: true,
         revision: composed.revision,
         write_allowed: composed.write_allowed,
       };
+    }
     const after = await readThinStorageLeaseRow(env, nodeId);
     if (
       after.authority_revision === row.authority_revision ||

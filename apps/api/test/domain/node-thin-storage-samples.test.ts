@@ -522,7 +522,7 @@ it("decides write_allowed on the fresh reading with today's headroom rule and as
   ).toEqual([false, true]);
 });
 
-it("asks for an identity turn at every sample while a start's hold waits for a proof, and stops when the start is released or old", async () => {
+it("asks for an identity turn at every sample while a start waits for a proof, and stops when it is reported ready or old", async () => {
   const f = await thinExecutionFixture(releases);
   const physical = {
     ...f.authority.physical,
@@ -553,7 +553,7 @@ it("asks for an identity turn at every sample while a start's hold waits for a p
     (await storageHolds(f.local, f.node, f.uid, identity, Date.now() + 121_000))
       .waiting,
   ).toBe(0);
-  // The proof that evidences the Pod releases the hold.
+  // The proof that evidences the Pod lets the controller report the database ready.
   await env.DB.prepare(
     "UPDATE database_start_admissions SET ready_at=?,ready_sample_observed_at=? WHERE node_id=?",
   )
