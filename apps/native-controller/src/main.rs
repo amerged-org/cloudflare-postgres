@@ -701,6 +701,13 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u
             Duration::from_secs(1)
         };
 }
+/// How soon after a wake that was published on the barrier alone the pass that makes the checks
+/// it left to that pass is made.
+const FOLLOWUP: Duration = Duration::from_secs(1);
+/// Makes the pass over `cell` that follows a wake published on the barrier due.
+fn followed_up(cell: &mut Cell, now: Instant) {
+    cell.due = cell.due.min(now + FOLLOWUP);
+}
 /// Selects due work for the free slots; `busy` maps each running job to its class.
 /// Storage work comes first, then wakes, then routine reconciliation. Routine work never
 /// takes the last slot, so a wake does not wait behind unrelated database work, and wakes
@@ -1180,7 +1187,12 @@ async fn run() -> Result<(), Error> {
                                 continue;
                             }
                             match result {
-                                Ok(observed) => settle(cell, started, observed.as_ref(), marker),
+                                Ok(observed) => {
+                                    settle(cell, started, observed.as_ref(), marker);
+                                    if controller.take_followup(&id) {
+                                        followed_up(cell, Instant::now());
+                                    }
+                                }
                                 Err(error) if storage_snapshot_expired(&error) => {
                                     pull_ids.insert(id.clone());
                                     stale_snapshot_retry(cell,Instant::now());
@@ -1975,6 +1987,21 @@ mod tests {
         assert_eq!(line["kind"], "Secret");
         assert!(line["error"].is_string());
         assert_eq!(line.as_object().unwrap().len(), 3, "{line}");
+    }
+    #[test]
+    fn a_wake_published_on_the_barrier_is_followed_by_a_full_pass_a_moment_later() {
+        // The wake did not prove the roles, the archive or stamp the manifests: the pass that
+        // does is due a second after the wake, not a minute.
+        let now = Instant::now();
+        let mut woken = cell(json!({"id":"db","generation":3}), now, true);
+        settle(&mut woken, now, Some(&json!({"state":"ready"})), 0);
+        assert_eq!(woken.due, now + Duration::from_secs(60));
+        followed_up(&mut woken, now);
+        assert_eq!(woken.due, now + Duration::from_secs(1));
+        // A pass that is due sooner than that stays so.
+        woken.due = now;
+        followed_up(&mut woken, now);
+        assert_eq!(woken.due, now);
     }
     #[test]
     fn a_wake_that_waits_for_a_proof_polls_with_backoff_and_not_busily() {

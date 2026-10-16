@@ -95,8 +95,8 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
         "{observed}"
     );
     // Order: progress `Wake`, one patch lifting the fence and releasing hibernation and the Pod's
-    // requests returning (one wave of three writes), PostgreSQL's fresh postmaster, every role
-    // and the archive through the Pod, and only then the gateway release that admits clients.
+    // requests returning (one wave of three writes), PostgreSQL's fresh postmaster, and then the
+    // gateway release that admits clients. The roles and the archive are the next pass's.
     let wake = at(&w, &["PATCH", "gateway-fence-", r#"\"phase\":\"wake\""#]);
     let unfence = at(
         &w,
@@ -109,20 +109,25 @@ async fn a_parked_wake_unfences_resizes_and_publishes_after_sql_identity() {
     );
     let resize = at(&w, &["PATCH", "/pods/database-1/resize"]);
     let accepting = at(&w, &["SQL pgcf_maintenance accepting"]);
-    let roles = at(&w, &["SQL app role login"]);
-    let archive = at(&w, &["SQL pgcf_maintenance archive"]);
     let release = at(&w, &["GATEWAY release"]);
     assert!(
         wake < accepting && unfence < accepting && resize < release,
         "the first wave is written before PostgreSQL answers"
     );
     assert!(
-        accepting < roles && roles < archive && archive < release,
+        accepting < release,
         "{:#?}",
         log(&w)
             .iter()
             .map(|line| line.chars().take(110).collect::<String>())
             .collect::<Vec<_>>()
+    );
+    assert!(
+        log(&w)
+            .iter()
+            .all(|line| !line.contains("role login")
+                && !line.contains("SQL pgcf_maintenance archive")),
+        "the roles and the archive are the next pass's"
     );
     assert_eq!(
         log(&w)
@@ -176,7 +181,7 @@ async fn a_kubelet_that_reports_ready_while_the_chain_runs_does_not_cost_the_att
     w.wake(3);
     w.start_postgres().await;
     let ready = w.kubelet_ready_now();
-    w.sql.lock().unwrap().during.insert("archive", ready);
+    w.sql.lock().unwrap().during.insert("accepting", ready);
     let observed = reconcile(&w).await;
     assert_eq!(observed["state"], "ready", "{observed}");
     assert!(pod_ready(&w));
@@ -875,9 +880,17 @@ async fn a_completed_wake_leaves_the_cluster_quiet_until_something_else_changes(
         hinted.is_empty(),
         "the controller's own writes mark the database due: {hinted:?}"
     );
-    // The kubelet reports the Pod Ready some time later; the passes that follow are the ordinary
-    // chain over the same facts.
+    // The kubelet reports the Pod Ready some time later. The pass that follows the wake makes the
+    // checks it left, the stamps among them; the passes after that are the ordinary chain over the
+    // same facts, and change nothing.
     w.kubelet_ready_now()();
+    let after = reconcile(&w).await;
+    assert_eq!(after["state"], "ready", "{after}");
+    let hinted = w.watch_delivers();
+    assert!(
+        hinted.is_empty(),
+        "the pass after the wake marks the database due: {hinted:?}"
+    );
     for operation_in_record in [true, false] {
         if !operation_in_record {
             // The operation is complete: the desired record no longer carries it.
@@ -921,10 +934,10 @@ fn requests_since(w: &World, from: usize) -> (usize, usize) {
 
 #[tokio::test]
 async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
-    // The requests of the wake that parked databases wait for, and of the pass that looks at the
-    // awake database again once the kubelet reports its Pod ready, as (reads, writes). Every
-    // request is a round trip of the wake or a charge on the API server of a database that only
-    // sits there: a change that adds one changes these numbers.
+    // The requests of the wake that parked databases wait for, of the pass that makes the checks
+    // it left once the kubelet reports its Pod ready, and of the pass after that, as (reads,
+    // writes). Every request is a round trip of the wake or a charge on the API server of a
+    // database that only sits there: a change that adds one changes these numbers.
     let mut w = World::parked().await;
     w.admitted();
     periodic_pass(&w).await;
@@ -933,13 +946,22 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     let at = w.server.state.lock().unwrap().requests.len();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
-    assert_eq!(requests_since(&w, at), (12, 19), "the wake");
+    assert_eq!(requests_since(&w, at), (4, 6), "the wake");
     let _ = w.watch_delivers();
     w.kubelet_ready_now()();
     let at = w.server.state.lock().unwrap().requests.len();
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
-    assert_eq!(requests_since(&w, at), (11, 0), "the pass after it");
+    assert_eq!(requests_since(&w, at), (11, 12), "the pass after it");
+    let _ = w.watch_delivers();
+    let at = w.server.state.lock().unwrap().requests.len();
+    let quiet = reconcile(&w).await;
+    assert_eq!(quiet["state"], "ready", "{quiet}");
+    assert_eq!(
+        requests_since(&w, at).1,
+        0,
+        "a pass after that writes nothing"
+    );
 }
 
 /// The sequential rounds of Kubernetes requests the controller made since the double's counter
@@ -971,11 +993,7 @@ async fn a_parked_wake_makes_this_many_requests_in_this_many_rounds() {
     let (reads, writes) = requests_since(&w, at);
     let rounds = rounds_of(&w);
     eprintln!("a parked wake: {reads} reads, {writes} writes, {rounds} sequential rounds");
-    assert_eq!(
-        (reads, writes, rounds),
-        (12, 19, 16),
-        "reads, writes, rounds"
-    );
+    assert_eq!((reads, writes, rounds), (4, 6, 5), "reads, writes, rounds");
 }
 
 #[tokio::test]
@@ -1037,6 +1055,135 @@ async fn an_object_that_changed_since_it_was_read_is_read_again_and_judged_as_be
         [HIBERNATION]
         == "on";
     assert!(hibernated, "the Pod was not demoted");
+}
+
+#[tokio::test]
+async fn a_parked_wake_leaves_the_stamps_the_roles_and_the_archive_to_the_pass_after_it() {
+    // What the wake proves before it admits a client is who writes (the Pod, its containers and
+    // volume, the postmaster of the data directory it was parked with) and that nothing it
+    // judged by changed. The generation stamps of the manifests, the credential of every role
+    // and the health of the archive are not that: the pass after the wake makes them, and
+    // is due at once.
+    let mut w = World::parked().await;
+    w.admitted();
+    periodic_pass(&w).await;
+    w.wake(3);
+    w.start_postgres().await;
+    w.log.lock().unwrap().clear();
+    let at = w.mark();
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert_eq!(woken["runtime_attestation"]["v"], 2, "{woken}");
+    let made = w.made(at);
+    let patched: Vec<&str> = made
+        .iter()
+        .filter(|(method, ..)| method == "PATCH")
+        .map(|(_, path, _)| path.as_str())
+        .collect();
+    for kind in [
+        "resourcequotas",
+        "limitranges",
+        "networkpolicies",
+        "ciliumnetworkpolicies",
+        "objectstores",
+        "scheduledbackups",
+        "/configmaps/ca-",
+    ] {
+        assert!(
+            patched.iter().all(|path| !path.contains(kind)),
+            "{kind} was stamped before the release: {patched:?}"
+        );
+    }
+    assert_eq!(
+        patched
+            .iter()
+            .filter(|path| path.ends_with("/clusters/database"))
+            .count(),
+        1,
+        "the Cluster is written once, to lift the fence: {patched:?}"
+    );
+    // The namespace is accepted and completed at the generation in one write, ahead of the proof.
+    let namespace = format!("/api/v1/namespaces/{}", w.ns);
+    assert_eq!(
+        patched.iter().filter(|path| **path == namespace).count(),
+        1,
+        "{patched:?}"
+    );
+    assert_eq!(
+        w.server.get("Namespace", None, &w.ns).unwrap()["metadata"]["annotations"]["pgcf.io/generation"],
+        "3"
+    );
+    assert!(
+        log(&w)
+            .iter()
+            .all(|line| !line.contains("role login") && !line.contains("pgcf_maintenance archive")),
+        "{:?}",
+        log(&w)
+    );
+    assert!(w.reconciler.take_followup(&w.id), "the pass after is due");
+    assert!(!w.reconciler.take_followup(&w.id), "and is asked for once");
+    // That pass does what the wake left: it stamps every manifest, proves every role, samples the
+    // archive, and publishes the database again.
+    let _ = w.watch_delivers();
+    w.kubelet_ready_now()();
+    w.log.lock().unwrap().clear();
+    let again = reconcile(&w).await;
+    assert_eq!(again["state"], "ready", "{again}");
+    for (kind, name) in [
+        ("ResourceQuota", "database-resources"),
+        ("LimitRange", "container-defaults"),
+        ("NetworkPolicy", "default-deny"),
+        ("ScheduledBackup", "daily-backup"),
+    ] {
+        let object = w.server.get(kind, Some(&w.ns), name).unwrap();
+        assert_eq!(
+            object["metadata"]["annotations"]["pgcf.io/generation"], "3",
+            "{kind}"
+        );
+    }
+    assert!(
+        log(&w)
+            .iter()
+            .any(|line| line.contains("SQL app role login"))
+    );
+    assert!(
+        log(&w)
+            .iter()
+            .any(|line| line.contains("SQL pgcf_maintenance archive"))
+    );
+}
+
+#[tokio::test]
+async fn a_role_that_cannot_log_in_is_found_by_the_pass_after_the_wake_which_renews_nothing() {
+    // The wake published the database without having proved the credential of a role. The pass
+    // after it does, and a role that cannot log in is a pass that fails: it forms no proof and
+    // admits nothing again, so the attestation of the wake is the last one and lapses at its
+    // expiry, as that of a Pod nobody can attest any longer.
+    let mut w = World::parked().await;
+    w.admitted();
+    periodic_pass(&w).await;
+    w.wake(3);
+    w.start_postgres().await;
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
+    assert!(w.reconciler.take_followup(&w.id));
+    let _ = w.watch_delivers();
+    w.kubelet_ready_now()();
+    w.sql
+        .lock()
+        .unwrap()
+        .refused
+        .insert("app".into(), ("28P01", "password authentication failed"));
+    let releases = |w: &World| {
+        log(w)
+            .iter()
+            .filter(|l| l.contains("GATEWAY release"))
+            .count()
+    };
+    let before = releases(&w);
+    let again = w.reconciler.reconcile(&w.db, &w.snapshot).await;
+    assert!(again.is_err(), "{again:?}");
+    assert_eq!(releases(&w), before, "nothing was admitted again");
 }
 
 #[tokio::test]
@@ -1375,6 +1522,7 @@ async fn the_proof_reads_the_resources_it_names_back_together() {
                 node: &node,
             },
             &volume,
+            false,
         )
         .await
         .unwrap()
@@ -1395,8 +1543,8 @@ async fn the_proof_reads_the_resources_it_names_back_together() {
 
 #[tokio::test]
 async fn a_parked_wake_logs_the_maintenance_role_in_once() {
-    // The login that proves PostgreSQL accepts on the resumed Pod is the session the archive
-    // sample then asks its questions in; every role proves its own credential, together.
+    // The login that proves PostgreSQL accepts on the resumed Pod is the only one of the wake;
+    // every role proves its own credential, together, in the pass that follows.
     let mut w = World::parked().await;
     w.admitted();
     w.wake(3);
@@ -1404,6 +1552,22 @@ async fn a_parked_wake_logs_the_maintenance_role_in_once() {
     w.log.lock().unwrap().clear();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
+    let logins: Vec<String> = log(&w)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("LOGIN ").map(str::to_string))
+        .collect();
+    assert_eq!(
+        logins,
+        ["pgcf_maintenance"],
+        "the login that proved PostgreSQL accepts"
+    );
+    // The pass after it proves every role its own credential, together, and the archive is asked
+    // in the maintenance session it opens.
+    let _ = w.watch_delivers();
+    w.kubelet_ready_now()();
+    w.log.lock().unwrap().clear();
+    let again = reconcile(&w).await;
+    assert_eq!(again["state"], "ready", "{again}");
     let logins: Vec<String> = log(&w)
         .into_iter()
         .filter_map(|line| line.strip_prefix("LOGIN ").map(str::to_string))
@@ -1584,38 +1748,51 @@ async fn the_release_proves_the_anchor_and_reads_the_fence_together() {
 }
 
 #[tokio::test]
-async fn the_release_binds_the_fence_while_it_reads_the_gateways() {
-    let (w, woken) = completed().await;
-    let intent = serde_json::to_value(desired_power(&w.db).unwrap().unwrap()).unwrap();
-    // The anchor and the fence read the receipt twice; then the receipt, the gateway Pods and the
-    // keyring are read for the binding and the snapshot.
+async fn the_gateways_are_read_while_the_intent_is_written() {
+    // The gateway Pods and the keyring the release goes to depend on nothing of the intent that
+    // is written meanwhile; the release is asked of them only after it. (The fence is written
+    // once before: the record of the wake.)
+    let mut w = World::parked().await;
+    w.admitted();
+    w.cold();
+    w.wake(3);
+    w.start_postgres().await;
     let wanted = [
-        storage_path(&w),
         format!("/api/v1/namespaces/{SYSTEM}/pods"),
         path("Secret", Some(SYSTEM), "pgcf-gateway"),
     ];
+    let fence = fence_path(&w);
     hold(
         &w,
         Gate::new(3, move |method, at| {
-            method == "GET" && wanted.iter().any(|object| object == at)
+            (method == "GET" && wanted.iter().any(|object| object == at))
+                || (method == "PATCH" && *at == fence)
         })
-        .after(2)
+        .after(1)
         .once(),
     );
-    let released = w
-        .reconciler
-        .power
-        .finish_running(&w.db, woken, Some(&intent))
-        .await
-        .unwrap()
-        .expect("released");
-    assert_eq!(released["state"], "ready");
+    let woken = reconcile(&w).await;
+    assert_eq!(woken["state"], "ready", "{woken}");
     assert_eq!(held(&w), (1, 0));
 }
 
 #[tokio::test]
 async fn the_archive_probe_reads_the_bindings_it_checks_together() {
     let (w, _) = completed().await;
+    // The probe is the pass after the wake's: the Cluster and the receipt carry the generation
+    // by then.
+    w.server
+        .edit("Cluster", Some(&w.ns), "database", |cluster| {
+            cluster["metadata"]["annotations"]["pgcf.io/generation"] = "3".into();
+        });
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("storage-{}", w.id),
+        |receipt| {
+            receipt["metadata"]["annotations"]["pgcf.io/generation"] = "3".into();
+        },
+    );
     let cluster = w.server.get("Cluster", Some(&w.ns), "database").unwrap();
     let pod = w.server.get("Pod", Some(&w.ns), "database-1").unwrap();
     // The credential is read first and again after the questions, with the Cluster, the Pod and
@@ -1721,7 +1898,7 @@ async fn the_authority_is_read_while_its_published_copy_is() {
         })
         .once(),
     );
-    let authority = w.reconciler.ca(&w.db, &cluster).await.unwrap();
+    let authority = w.reconciler.ca(&w.db, &cluster, false).await.unwrap();
     assert!(authority.is_some());
     assert_eq!(held(&w), (1, 0));
 }
@@ -1753,26 +1930,39 @@ async fn the_record_of_the_wake_the_unfence_and_the_resize_are_issued_together()
 }
 
 #[tokio::test]
-async fn postgresql_is_asked_from_the_unfence_on_and_not_after_the_apply_pass() {
-    // The apply pass is seven rounds of requests, and PostgreSQL starts a tenth of a second after
-    // the unfence. The first login of the poll is made while the apply pass runs, not after its
-    // last write.
+async fn postgresql_is_asked_from_the_unfence_on_and_not_after_what_the_pass_does_meanwhile() {
+    // PostgreSQL starts a tenth of a second after the unfence, and the pass has requests to make
+    // meanwhile (every one of them takes the time of a round trip, and with nothing remembered
+    // they are many). The poll asks from the unfence: PostgreSQL is asked about when only the
+    // wave of the unfence has been sent, not after the rest.
     let mut w = World::parked().await;
     w.admitted();
+    w.cold();
     w.wake(3);
     w.start_postgres().await;
-    w.log.lock().unwrap().clear();
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let (state, marker) = (w.server.state.clone(), asked.clone());
+    w.sql.lock().unwrap().during.insert(
+        "accepting",
+        std::sync::Arc::new(move || {
+            marker.store(
+                state.lock().unwrap().requests.len(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }),
+    );
+    w.server.state.lock().unwrap().latency = Some(Duration::from_millis(100));
+    w.reconciler.accept_budget = Duration::from_secs(60);
+    let at = w.mark();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
-    let login = at(&w, &["LOGIN pgcf_maintenance"]);
-    let last_write_of_the_apply_pass = at(&w, &["PATCH", "/scheduledbackups/daily-backup"]);
+    let before_the_answer = asked.load(std::sync::atomic::Ordering::SeqCst);
+    assert_ne!(before_the_answer, usize::MAX, "PostgreSQL answered");
+    let made = before_the_answer - at;
+    let total = w.made(at).len();
     assert!(
-        login < last_write_of_the_apply_pass,
-        "{:#?}",
-        log(&w)
-            .iter()
-            .map(|line| line.chars().take(90).collect::<String>())
-            .collect::<Vec<_>>()
+        made < total / 2,
+        "{made} of {total} requests were made when PostgreSQL was asked"
     );
 }
 

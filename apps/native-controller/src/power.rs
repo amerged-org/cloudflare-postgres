@@ -2212,14 +2212,16 @@ impl PowerCoordinator {
             {
                 progress.started_at = prior.started_at;
             }
-            let current = self
-                .write(db, map.as_ref(), Some(&intent), &progress)
-                .await?;
-            // The binding may write the receipt: both are awaited, so that no write is dropped
-            // half sent when the other fails.
-            let (bound, snapshot) = tokio::join!(self.bind_fence(db, &current), self.snapshot());
-            bound?;
+            // The gateways and the keyring the release goes to are read while the intent is
+            // written: they depend on nothing of it, and the release is asked of them only after
+            // it, with the read-back after the acknowledgements still comparing them.
+            let (current, snapshot) = tokio::join!(
+                self.write(db, map.as_ref(), Some(&intent), &progress),
+                self.snapshot()
+            );
+            let current = current?;
             let snapshot = snapshot?;
+            self.bind_fence(db, &current).await?;
             self.controls(&intent, &snapshot, "release").await?;
             // Every gateway has acknowledged the release. The read-back that the gateways and
             // the fence are still what they were released under, and the publication of the

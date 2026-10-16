@@ -69,6 +69,9 @@ pub struct Reconciler {
     pub(crate) http: reqwest::Client,
     /// How long a resumed Pod is polled for a fresh, accepting postmaster before the pass ends.
     pub(crate) accept_budget: Duration,
+    /// The databases whose wake was published on the barrier alone: the pass that makes the
+    /// checks the wake left to it is still to be made.
+    followups: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 fn uid(v: &Value) -> Result<&str, Error> {
     let value = text(&v["metadata"], "uid");
@@ -1444,6 +1447,8 @@ impl Reconciler {
         let built = manifests::build(db, &context);
         let mut parked: Option<ParkedWake> = None;
         let mut accepting: Option<Accepting> = None;
+        let established =
+            db["creation"]["ever_ready"] == true || db["recovery"]["ever_ready"] == true;
         if intent.is_some() {
             // CNPG creates the woken primary as soon as hibernation is released, and admission
             // matches the namespace label at that moment, so the runtime is selected first.
@@ -1471,6 +1476,17 @@ impl Reconciler {
                 }
             }
         }
+        // A database that was ready before, admitted, whose Pod resumes and whose watch can vouch
+        // for its objects is published on the barrier: what only keeps it right (the stamps of
+        // the manifests, every role's credential, the health of the archive) is made by the pass
+        // that follows, which is due at once. Any of these missing, and the pass is the whole chain.
+        let lean = parked.is_some()
+            && established
+            && !db["admission"].is_null()
+            && db["recovery"].is_null()
+            && self.k8s.runtime_continuity().is_some();
+        // Whatever becomes of the rest of this pass, the manifests were not stamped.
+        let stamps_left = lean;
         if fence.is_none() && !db["storage"].is_null() {
             stored["storage"] = db["storage"].clone();
         }
@@ -1502,27 +1518,34 @@ impl Reconciler {
                 return Err("recovery source identity changed".into());
             }
         }
-        fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
+        fence = Some(self.save_state(db, &stored, fence.as_ref(), lean).await?);
         let mut manifests = built?;
         let mut desired_ns = manifests.remove(0);
         desired_ns["metadata"]["annotations"] =
             json!({ACCEPTED:number(db,"generation").to_string()});
+        let wanted = number(db, "generation").to_string();
         let namespace_value = if let Some(current) = ns_current {
-            if current["metadata"]["annotations"][ACCEPTED].as_str()
-                == Some(number(db, "generation").to_string().as_str())
+            // A pass that publishes on the barrier completes the generation here, with its
+            // acceptance, so that the watch has delivered it long before the proof reads it back.
+            let annotations = &current["metadata"]["annotations"];
+            if annotations[ACCEPTED].as_str() == Some(wanted.as_str())
+                && (!lean || annotations[GENERATION].as_str() == Some(wanted.as_str()))
             {
                 current
             } else {
                 let mut patch = desired_ns.clone();
-                patch["metadata"]["annotations"] =
-                    json!({ACCEPTED:number(db,"generation").to_string()});
+                patch["metadata"]["annotations"] = if lean {
+                    json!({ACCEPTED:wanted,GENERATION:wanted})
+                } else {
+                    json!({ACCEPTED:wanted})
+                };
                 self.k8s.patch(&current, &patch).await?
             }
         } else {
             self.k8s.create(&desired_ns).await?
         };
         stored["namespaceUid"] = namespace_value["metadata"]["uid"].clone();
-        fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
+        fence = Some(self.save_state(db, &stored, fence.as_ref(), lean).await?);
         let mut applied = vec![];
         let apply_phase = timing::Phase::begin(db, "desired_apply");
         // The objects the pass is about to bring to the desired state are read together before the
@@ -1571,7 +1594,7 @@ impl Reconciler {
                 manifests[..cluster_at]
                     .iter()
                     .zip(binding)
-                    .map(|(manifest, read)| self.apply_to(db, manifest, read)),
+                    .map(|(manifest, read)| self.apply_to(db, manifest, read, lean)),
             )
             .await;
             for actual in written {
@@ -1579,7 +1602,7 @@ impl Reconciler {
             }
         } else {
             for (manifest, read) in manifests[..cluster_at].iter().zip(binding) {
-                applied.push(self.apply_to(db, manifest, read).await?);
+                applied.push(self.apply_to(db, manifest, read, lean).await?);
             }
         }
         for (index, manifest) in manifests.iter().enumerate().skip(cluster_at) {
@@ -1592,7 +1615,7 @@ impl Reconciler {
                         .await?
                 }
             };
-            let actual = self.apply_to(db, manifest, read).await?;
+            let actual = self.apply_to(db, manifest, read, lean).await?;
             if text(manifest, "kind") == "Cluster" {
                 if !stored["clusterUid"].is_null()
                     && actual["metadata"]["uid"] != stored["clusterUid"]
@@ -1603,7 +1626,7 @@ impl Reconciler {
             }
             applied.push(actual);
         }
-        fence = Some(self.save_state(db, &stored, fence.as_ref()).await?);
+        fence = Some(self.save_state(db, &stored, fence.as_ref(), lean).await?);
         self.renew_storage_authority(db, integer(&authority, "revision").ok())
             .await?;
         apply_phase.completed();
@@ -1625,7 +1648,7 @@ impl Reconciler {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let ca_phase = timing::Phase::begin(db, "ca_publication");
-        let Some((ca, ca_secret)) = self.ca(db, &cluster).await? else {
+        let Some((ca, ca_secret)) = self.ca(db, &cluster, lean).await? else {
             ca_phase.pending();
             return Ok(Some(observation(db, "provisioning", None)));
         };
@@ -1652,7 +1675,7 @@ impl Reconciler {
                 return Ok(Some(observation(db, "provisioning", None)));
             }
             stored["recoveryMappedOperation"] = db["recovery"]["operation_id"].clone();
-            self.save_state(db, &stored, fence.as_ref()).await?;
+            self.save_state(db, &stored, fence.as_ref(), false).await?;
             return Ok(Some(observation(db, "provisioning", None)));
         }
         if finalized {
@@ -1767,21 +1790,28 @@ impl Reconciler {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let proof_continuity = self.k8s.runtime_continuity();
-        let roles = timing::Phase::begin(db, "role_runtime_auth");
-        let roles_ok = match &parked {
-            Some(_) => {
-                let ip = text(&pod["status"], "podIP");
-                postgres::roles_pod(db, &ca, ip, self.power.pod_socket(ip)?, held.as_ref()).await?
+        // Without a watch that vouches for the objects there is no proof to publish on, and the
+        // whole chain is made.
+        let lean = lean && proof_continuity.is_some();
+        if !lean {
+            let roles = timing::Phase::begin(db, "role_runtime_auth");
+            let roles_ok = match &parked {
+                Some(_) => {
+                    let ip = text(&pod["status"], "podIP");
+                    postgres::roles_pod(db, &ca, ip, self.power.pod_socket(ip)?, held.as_ref())
+                        .await?
+                }
+                None => {
+                    postgres::roles(db, &ca, text(&pod["status"], "podIP"), self.power.postgres)
+                        .await?
+                }
+            };
+            if !roles_ok {
+                roles.pending();
+                return Ok(Some(observation(db, "provisioning", None)));
             }
-            None => {
-                postgres::roles(db, &ca, text(&pod["status"], "podIP"), self.power.postgres).await?
-            }
-        };
-        if !roles_ok {
-            roles.pending();
-            return Ok(Some(observation(db, "provisioning", None)));
+            roles.completed();
         }
-        roles.completed();
         let unchanged = timing::Phase::begin(db, "runtime_unchanged");
         // Every applied object and the TLS authority are read together, and judged in order.
         let mut asked: Vec<_> = applied
@@ -1826,11 +1856,23 @@ impl Reconciler {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         unchanged.completed();
-        let metrics = timing::Phase::begin(db, "archive_metrics");
-        let probed = self
-            .archive(db, &cluster, &pod, &ca, parked.is_some(), held.as_ref())
-            .await?;
-        metrics.completed();
+        let probed = if lean {
+            // The Pod and the Cluster of the barrier are the last reads: the archive is sampled by
+            // the pass that follows.
+            Probed {
+                archive: json!({"continuous":false,"ready_wal_files":null,"health":"unknown"}),
+                alarm: false,
+                cluster: cluster.clone(),
+                pod: pod.clone(),
+            }
+        } else {
+            let metrics = timing::Phase::begin(db, "archive_metrics");
+            let probed = self
+                .archive(db, &cluster, &pod, &ca, parked.is_some(), held.as_ref())
+                .await?;
+            metrics.completed();
+            probed
+        };
         let Probed {
             archive,
             alarm: archive_alarm,
@@ -1852,9 +1894,6 @@ impl Reconciler {
         };
         let status = postgres_status(pod_now).ok_or("postgres runtime proof missing")?;
         self.power.kubelet_ready(db, pod_now);
-        let established =
-            db["creation"]["ever_ready"] == true || db["recovery"]["ever_ready"] == true;
-
         if !db["storage"].is_null() && db["storage_authority"].as_str().is_none() {
             return Ok(Some(observation(db, "provisioning", None)));
         }
@@ -1900,6 +1939,9 @@ impl Reconciler {
             if proof_continuity.is_some() && !db["admission"].is_null() {
                 self.k8s.observed(&final_ns, WATCH_LAG).await;
             }
+        } else if lean {
+            // Completed ahead of the proof; the proof is read back against a watch that has it.
+            self.k8s.observed(&final_ns, WATCH_LAG).await;
         }
         if is_ready {
             let cid = text(status, "containerID")
@@ -1921,6 +1963,7 @@ impl Reconciler {
                                 node: &node_observed,
                             },
                             &volume_identity,
+                            lean,
                         )
                         .await?
                     {
@@ -1963,6 +2006,11 @@ impl Reconciler {
                 result["runtime_attestation"] = proof;
             }
         }
+        // A database published on the barrier is published on its proof: without one, the pass
+        // that makes the whole chain takes it from here.
+        if lean && result["runtime_attestation"]["v"] != 2 {
+            return Ok(Some(observation(db, "provisioning", None)));
+        }
         // The gateway routes to a Pod whose kubelet has not reported it Ready only by its
         // attestation: a resumed Pod that cannot be attested is published once the kubelet
         // reports it, and not before.
@@ -1988,7 +2036,14 @@ impl Reconciler {
         // The roles awaiting removal advance after the database is ready, never before: readiness
         // waits for the present roles only. The Cluster is not written until the attestation above
         // was formed and published, which pins the Cluster's version.
-        if let Some(value) = result.as_mut().filter(|value| value["state"] == "ready") {
+        if stamps_left
+            && result
+                .as_ref()
+                .is_some_and(|value| value["state"] == "ready")
+        {
+            self.followups.lock().unwrap().insert(id.to_string());
+        }
+        if !lean && let Some(value) = result.as_mut().filter(|value| value["state"] == "ready") {
             let socket = match &parked {
                 Some(_) => Some(self.power.pod_socket(text(&pod["status"], "podIP"))?),
                 None => self.power.postgres,
@@ -2014,12 +2069,16 @@ impl Reconciler {
             self.k8s.read_known(kind, namespace, name).await
         }
     }
+    /// The proof read back: the resources it was built from are the ones the controller holds now,
+    /// at the versions its watch holds. `barrier` says the Pod and the Cluster are the ones read
+    /// a moment ago, as the barrier of the wake: they are not read again.
     async fn runtime_readback(
         &self,
         db: &Value,
         start: &(String, u64),
         resources: &RuntimeResources<'_>,
         volume: &Value,
+        barrier: bool,
     ) -> Result<Option<Value>, Error> {
         let (namespace, cluster, pod, ca, node) = (
             resources.namespace,
@@ -2040,8 +2099,20 @@ impl Reconciler {
             self.k8s
                 .read_known("ConfigMap", Some(SYSTEM), &storage_name),
             self.reread(namespace),
-            self.reread(cluster),
-            self.reread(pod),
+            async {
+                if barrier {
+                    Ok(Some(cluster.clone()))
+                } else {
+                    self.reread(cluster).await
+                }
+            },
+            async {
+                if barrier {
+                    Ok(Some(pod.clone()))
+                } else {
+                    self.reread(pod).await
+                }
+            },
             self.reread(ca),
             self.reread(node),
         )?;
@@ -2116,7 +2187,13 @@ impl Reconciler {
             postgres_image,
             http,
             accept_budget: ACCEPT_BUDGET,
+            followups: std::sync::Mutex::default(),
         })
+    }
+    /// Whether the wake of `id` left checks to a pass that is still to be made, and forgets that
+    /// it did: the caller schedules the pass.
+    pub fn take_followup(&self, id: &str) -> bool {
+        self.followups.lock().unwrap().remove(id)
     }
     /// The Node and the host authority the database stands on. The pass has asserted the identity
     /// of the cluster before it asks.
@@ -2166,11 +2243,15 @@ impl Reconciler {
         )?;
         Ok((authority.clone(), node))
     }
+    /// The receipt of the database's storage, with the state it records. A receipt that records
+    /// the state already is left as it is when its generation is the desired one, or when
+    /// `lean` leaves the stamp to the pass that follows.
     async fn save_state(
         &self,
         db: &Value,
         stored: &Value,
         previous: Option<&Value>,
+        lean: bool,
     ) -> Result<Value, Error> {
         let name = format!("storage-{}", text(db, "id"));
         let encoded = serde_json::to_string(stored)?;
@@ -2179,7 +2260,9 @@ impl Reconciler {
             if generation(previous) > number(db, "generation") {
                 return Err("storage revision advanced".into());
             }
-            if generation(previous) == number(db, "generation") && state(previous)? == *stored {
+            if (lean || generation(previous) == number(db, "generation"))
+                && state(previous)? == *stored
+            {
                 return Ok(previous.clone());
             }
             self.k8s.patch(previous,&json!({"metadata":{"annotations":{GENERATION:number(db,"generation").to_string()}},"data":{"state":encoded}})).await
@@ -2192,14 +2275,17 @@ impl Reconciler {
         let ns = manifest["metadata"]["namespace"].as_str();
         let name = text(&manifest["metadata"], "name");
         let current = self.k8s.read(kind, ns, name).await?;
-        self.apply_to(db, manifest, current).await
+        self.apply_to(db, manifest, current, false).await
     }
-    /// Brings the object `manifest` names, as it was read, to the manifest.
+    /// Brings the object `manifest` names, as it was read, to the manifest. An object that has
+    /// the manifest's content and labels is left as it is when it carries this generation, or
+    /// when `lean` leaves its stamp to the pass that follows.
     async fn apply_to(
         &self,
         db: &Value,
         manifest: &Value,
         current: Option<Value>,
+        lean: bool,
     ) -> Result<Value, Error> {
         let kind = text(manifest, "kind");
         let ns = manifest["metadata"]["namespace"].as_str();
@@ -2214,7 +2300,7 @@ impl Reconciler {
             } else {
                 "spec"
             };
-            if (kind == "Secret" || generation(current) == number(db, "generation"))
+            if (kind == "Secret" || lean || generation(current) == number(db, "generation"))
                 && contains(&current[content], &manifest[content], "")
                 && contains(
                     &current["metadata"]["labels"],
@@ -2374,7 +2460,12 @@ impl Reconciler {
             });
         Ok(if admitted { pool.clone() } else { Value::Null })
     }
-    async fn ca(&self, db: &Value, cluster: &Value) -> Result<Option<(Vec<u8>, Value)>, Error> {
+    async fn ca(
+        &self,
+        db: &Value,
+        cluster: &Value,
+        lean: bool,
+    ) -> Result<Option<(Vec<u8>, Value)>, Error> {
         let name = text(&cluster["status"]["certificates"], "serverCASecret");
         if name.is_empty() {
             return Ok(None);
@@ -2393,7 +2484,7 @@ impl Reconciler {
         if !db["admission"].is_null() {
             manifest["metadata"]["annotations"] = json!({"pgcf.io/source-ca-secret-uid":secret["metadata"]["uid"],"pgcf.io/source-ca-secret-resource-version":secret["metadata"]["resourceVersion"]});
         }
-        self.apply_to(db, &manifest, published).await?;
+        self.apply_to(db, &manifest, published, lean).await?;
         Ok(Some((ca, secret)))
     }
     async fn map_recovery(

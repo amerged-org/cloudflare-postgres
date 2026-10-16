@@ -1465,7 +1465,7 @@ impl PowerCoordinator {
         let ns = namespace(db);
         // Nothing here is patched by the judgement, and the unfence that follows is a patch under
         // the Cluster's own resourceVersion: the watch cache's versions are enough.
-        let (pod, current) = tokio::try_join!(
+        let (pod, current, _) = tokio::try_join!(
             self.k8s.read_known_cached("Pod", Some(&ns), &park.pod_name),
             try_join_all(
                 manifests
@@ -1476,7 +1476,22 @@ impl PowerCoordinator {
                         m["metadata"]["namespace"].as_str(),
                         text(&m["metadata"], "name"),
                     ))
-            )
+            ),
+            // The server CA and its publication are no part of the judgement; reading them here
+            // leaves them in memory for the wake, which forms its proof on them.
+            async {
+                let authority = text(&cluster["status"]["certificates"], "serverCASecret");
+                if authority.is_empty() {
+                    return Ok(());
+                }
+                let published = format!("ca-{}", text(db, "id"));
+                tokio::try_join!(
+                    self.k8s.read_known_cached("Secret", Some(&ns), authority),
+                    self.k8s
+                        .read_known_cached("ConfigMap", Some(SYSTEM), &published),
+                )
+                .map(|_| ())
+            },
         )?;
         let mut fits = release_changed.then_some("release_changed");
         // Applying the desired manifests must change no spec and no data: the `apply` predicate,
