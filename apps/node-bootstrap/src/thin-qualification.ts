@@ -37,8 +37,7 @@ import {
   thinPoolCommand,
   uid,
   verifyThinNode,
-  verifyThinTurnNode,
-  readThinInventory,
+  readThinIdentityCycle,
   type ObjectValue,
   type ThinNode,
   type ThinSession,
@@ -2811,7 +2810,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       },
       this.options,
       async (session) => {
-        const node = await verifyThinTurnNode(
+        await readThinIdentityCycle(
           session,
           {
             node_id: this.run.node_id,
@@ -2827,9 +2826,6 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
           },
           () => this.lease(),
         );
-        const inventory = await readThinInventory(session, node, []);
-        inventory.witness();
-        await node.closingRead([]);
       },
     );
     return Date.now() - started;

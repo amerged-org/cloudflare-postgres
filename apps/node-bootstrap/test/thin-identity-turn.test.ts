@@ -6,6 +6,7 @@ import type {
   NodeThinStorageReport,
 } from "@pgcf/contracts/node-thin-storage";
 import { BootstrapError } from "../src/bootstrap.ts";
+import { openThinSession, readThinIdentityCycle } from "../src/thin-storage.ts";
 import golden from "./thin-identity-turn.golden.json" with { type: "json" };
 import {
   identityTurn,
@@ -87,6 +88,50 @@ test("a node with many writer Pods reads their io.max in several driver reads, n
   assert.equal(
     report.authority.volumes.flatMap((volume) => volume.io).length,
     122,
+  );
+});
+
+test("the qualification's executor cycle reads like a turn, in the same sequential connections, and writes nothing", async () => {
+  const world = identityWorld(),
+    input = world.input();
+  await openThinSession(
+    {
+      callback: input.callback,
+      cluster_endpoint: input.cluster_endpoint,
+      talos_admin_config: input.talos_admin_config,
+      kubeconfig: input.kubeconfig,
+      address: input.lease.address,
+      budget_ms: 60_000,
+      prefix: "pgcf-thin-cycle-test-",
+    },
+    {
+      run: (command) => world.command(command),
+      proxy: async () => ({ url: "http://127.0.0.1:1", close: async () => {} }),
+    },
+    (session) =>
+      readThinIdentityCycle(
+        session,
+        {
+          node_id: input.lease.node_id,
+          region_id: input.lease.region_id,
+          node_uid: input.lease.node_uid,
+          cluster_uid: input.lease.cluster_uid,
+          name: input.lease.name,
+          provider_instance_id: input.lease.provider_instance_id,
+          driver_image: input.lease.profile.driver_image,
+          host_extension_version: input.host_extension.version,
+          boot_id: input.lease.boot_id,
+          kernel_version: input.lease.kernel_version,
+        },
+        async () => {},
+      ),
+  );
+  assert.ok(world.rounds <= MAX_ROUNDS, `${world.rounds} connections`);
+  assert.ok(world.commands <= MAX_COMMANDS, `${world.commands} commands`);
+  assert.ok(
+    world.relay.every((command) =>
+      ["get", "read", "exec"].includes(command.args[0]!),
+    ),
   );
 });
 

@@ -1526,6 +1526,19 @@ export async function readThinInventory(
   };
 }
 
+/** The reads of a product identity turn without its databases, in the order the turn makes them: what
+ * the qualification times as the executor cycle. Nothing is judged beyond the node's identity. */
+export async function readThinIdentityCycle(
+  session: ThinSession,
+  scope: ThinNodeScope,
+  lease: () => Promise<void>,
+) {
+  const node = await verifyThinTurnNode(session, scope, lease);
+  const inventory = await readThinInventory(session, node, []);
+  inventory.witness();
+  await node.closingRead([]);
+}
+
 export async function runThinStorage(
   raw: unknown,
   options: {
