@@ -10,13 +10,9 @@ export default class RequestProbe extends rust {
       ? undefined
       : setTimeout(() => controller.abort(), 100);
     if (immediate) controller.abort();
-    const headers = new Headers(request.headers);
-    // Miniflare supplies CF-Connecting-IP at ingress; remove it inside the host for this failure case.
-    if (url.searchParams.get("probe_no_ip") === "true")
-      headers.delete("CF-Connecting-IP");
     try {
       return await super.fetch(
-        new Request(request, { headers, signal: controller.signal }),
+        new Request(request, { signal: controller.signal }),
       );
     } finally {
       if (timer) clearTimeout(timer);

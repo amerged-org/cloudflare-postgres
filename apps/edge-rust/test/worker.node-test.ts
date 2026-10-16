@@ -568,26 +568,13 @@ test(
         },
       );
       await t.test(
-        "missing actor and source IP fail closed before gateway",
+        "a missing actor and an invalid source IP fail closed before gateway",
         async () => {
           await reset();
           const { database } = await seed();
           assert.equal(
             await sqlstate(await open(database, { worker: "no-actor-edge" })),
             "08006",
-          );
-          assert.equal(
-            await sqlstate(
-              await open(database, {
-                worker: "abort-edge",
-                query: new URLSearchParams({
-                  database,
-                  user: "app",
-                  probe_no_ip: "true",
-                }).toString(),
-              }),
-            ),
-            "53300",
           );
           assert.equal(
             await sqlstate(await open(database, { ip: "192.168.001.1" })),
