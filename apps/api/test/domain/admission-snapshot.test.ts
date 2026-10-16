@@ -529,3 +529,64 @@ it("a real control-plane rollback to a legacy release removes snapshot wire and 
   const result = await actorFor(f.id).admit(f.id, "app");
   if (result.ok) expect(result.target?.route_revision).toBeUndefined();
 });
+
+it("wakeable is true only for an idle suspension with a power operation, a node and no barrier", async () => {
+  const f = await admissionSnapshotFixture();
+  const wakeable = async () =>
+    (await readDatabaseAdmissionSnapshot(env, f.id))?.snapshot.wakeable;
+  expect(await wakeable()).toBe(false);
+  const sleepOperation = newOperationId(),
+    sleepGeneration = f.proof.generation + 1,
+    at = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,?,?,?,?)",
+    ).bind(sleepOperation, f.project, f.id, sleepGeneration, at, at, at),
+    env.DB.prepare(
+      "UPDATE databases SET desired_state='suspended',suspension_reason='idle',generation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=?,power_operation=?,runtime_attestation_json=NULL WHERE id=?",
+    ).bind(sleepGeneration, sleepGeneration, sleepOperation, f.id),
+  ]);
+  expect(await wakeable()).toBe(true);
+  const refusedBy = async (change: string, restore: string) => {
+    await env.DB.exec(change);
+    try {
+      expect(await wakeable(), change).toBe(false);
+    } finally {
+      await env.DB.exec(restore);
+    }
+    expect(await wakeable()).toBe(true);
+  };
+  const where = `WHERE id='${f.id}'`;
+  await refusedBy(
+    `UPDATE databases SET suspension_reason='manual' ${where}`,
+    `UPDATE databases SET suspension_reason='idle' ${where}`,
+  );
+  await refusedBy(
+    `UPDATE databases SET power_operation=NULL ${where}`,
+    `UPDATE databases SET power_operation='${sleepOperation}' ${where}`,
+  );
+  await refusedBy(
+    `UPDATE databases SET node_id=NULL ${where}`,
+    `UPDATE databases SET node_id='${f.node}' ${where}`,
+  );
+  await refusedBy(
+    `UPDATE database_admission_epochs SET mutation_id='${crypto.randomUUID()}',mutation_started_at='${at}',mutation_status='pending' WHERE database_id='${f.id}'`,
+    `UPDATE database_admission_epochs SET mutation_id=NULL,mutation_started_at=NULL,mutation_status=NULL WHERE database_id='${f.id}'`,
+  );
+  await refusedBy(
+    `UPDATE databases SET storage_protected_at='${at}',storage_protected_generation=${sleepGeneration} ${where}`,
+    `UPDATE databases SET storage_protected_at=NULL,storage_protected_generation=NULL ${where}`,
+  );
+  // A protection marker of an earlier generation does not hold the sleeper.
+  await env.DB.exec(
+    `UPDATE databases SET storage_protected_at='${at}',storage_protected_generation=${sleepGeneration - 1} ${where}`,
+  );
+  expect(await wakeable()).toBe(true);
+  // A lost node is final.
+  await env.DB.exec(`UPDATE nodes SET lost_at='${at}' WHERE id='${f.node}'`);
+  expect(await wakeable()).toBe(false);
+  await env.DB.exec(
+    `UPDATE databases SET desired_state='deleted',deleted_at='${at}' ${where}`,
+  );
+  expect(await wakeable()).toBe(false);
+});
