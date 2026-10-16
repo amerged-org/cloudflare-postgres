@@ -17,7 +17,9 @@ import {
 } from "../src/bootstrap.ts";
 import { ThinWorld } from "./thin-qualification.fixture.ts";
 import {
+  driverReadScript,
   issueAgain,
+  parseDriverReadFrames,
   readCommand,
   thinLvmFacts,
   thinPoolCommand,
@@ -1098,4 +1100,125 @@ test("only a genuine current delete retains its sealed LV after Kube resource re
       }),
     /retained_delete_identity_changed/,
   );
+});
+
+/** The driver's shell is a POSIX sh; the host's is the nearest real one. */
+async function shell(script: string[]) {
+  return await runCommand({
+    executable: script[0]!,
+    args: script.slice(1),
+    timeout_ms: 5000,
+    signal: new AbortController().signal,
+    env: process.env,
+  });
+}
+test("a driver read runs independent commands in one shell and frames each stdout with its status", async () => {
+  const steps = [
+    // Arguments are never interpreted by the shell.
+    { argv: ["printf", "%s", "a b'c$d;`touch x`\n"] },
+    { argv: ["sh", "-c", "printf soft; exit 3"], soft: true },
+    { argv: ["echo", "last"] },
+  ];
+  const result = await shell(driverReadScript(steps));
+  assert.equal(result.exit_code, 0);
+  assert.deepEqual(parseDriverReadFrames(result.stdout, steps.length), [
+    { stdout: "a b'c$d;`touch x`\n", exit_code: 0 },
+    { stdout: "soft", exit_code: 3 },
+    { stdout: "last\n", exit_code: 0 },
+  ]);
+});
+
+test("a failing step of a driver read ends the script and no truncated stream reads as a report", async () => {
+  const failed = await shell(
+    driverReadScript([
+      { argv: ["echo", "a"] },
+      { argv: ["false"] },
+      { argv: ["echo", "b"] },
+    ]),
+  );
+  assert.notEqual(failed.exit_code, 0);
+  assert.throws(
+    () => parseDriverReadFrames(failed.stdout, 3),
+    /thin_storage_readback_invalid/,
+  );
+  const whole = (
+    await shell(
+      driverReadScript([{ argv: ["echo", "a"] }, { argv: ["echo", "b"] }]),
+    )
+  ).stdout;
+  assert.equal(parseDriverReadFrames(whole, 2).length, 2);
+  for (const broken of [
+    whole.slice(0, -1),
+    whole.replace(/\0[0-9]\0/, "\0x\0"),
+    whole.replace("pgcf.read.v1", "other"),
+  ])
+    assert.throws(
+      () => parseDriverReadFrames(broken, 2),
+      /thin_storage_readback_invalid/,
+    );
+  assert.throws(
+    () => parseDriverReadFrames(whole, 3),
+    /thin_storage_readback_invalid/,
+  );
+});
+
+test("a kubectl get of several resources is read as the objects it printed", async () => {
+  const objects = [
+    { kind: "Node", metadata: { name: "eu1" } },
+    { kind: "Namespace", metadata: { name: "kube-system" } },
+  ];
+  const answers = [
+    JSON.stringify({ kind: "List", items: objects }),
+    // One resource by name prints the object itself.
+    JSON.stringify(objects[0]),
+    // --ignore-not-found prints nothing for an absent object.
+    "",
+  ];
+  const scope = {
+    callback: { url: "https://api.invalid/internal/storage", bearer: "t" },
+    cluster_endpoint: "https://192.0.2.21:6443/",
+    address: "192.0.2.21",
+    budget_ms: 5000,
+    prefix: "pgcf-thin-list-test-",
+    talos_admin_config: stringify({
+      context: "test",
+      contexts: { test: { ca: "x", crt: "x", key: "x" } },
+    }),
+    kubeconfig: stringify({
+      clusters: [
+        {
+          cluster: {
+            server: "https://192.0.2.21:6443/",
+            "certificate-authority-data": "x",
+          },
+        },
+      ],
+      users: [
+        { user: { "client-certificate-data": "x", "client-key-data": "x" } },
+      ],
+    }),
+  };
+  const asked: string[][] = [];
+  const read = await openThinSession(
+    scope,
+    {
+      proxy: async () => ({ url: "http://127.0.0.1:1", close: async () => {} }),
+      run: async (command) => {
+        asked.push(command.args.slice(3));
+        return { exit_code: 0, stdout: answers[asked.length - 1]! };
+      },
+    },
+    async (session) => [
+      await session.list(["node/eu1", "namespace/kube-system"]),
+      await session.list(["node/eu1"]),
+      await session.list(["storageclass/x", "--ignore-not-found"]),
+    ],
+  );
+  assert.deepEqual(read, [objects, [objects[0]], []]);
+  assert.deepEqual(asked[0], [
+    "get",
+    "node/eu1",
+    "namespace/kube-system",
+    "--output=json",
+  ]);
 });

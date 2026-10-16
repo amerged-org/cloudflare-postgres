@@ -758,6 +758,8 @@ export class IdentityWorld extends ThinWorld {
         thin_check: `${seen("thin_check")}test "$1" = --version || exit 98\nexec /bin/cat '${join(outputs, "thin_check")}'\n`,
         dmsetup: `${seen("dmsetup")}test "$1 $2" = "info --columns" || exit 99\nexec /bin/cat '${join(outputs, "dmsetup")}'\n`,
         cat: `${seen("cat")}exec /bin/cat "$@"\n`,
+        // A nested shell of the script: its own commands are found and logged the same way.
+        sh: `exec /bin/sh "$@"\n`,
       };
       for (const [name, body] of Object.entries(programs)) {
         const path = join(bin, name);

@@ -114,7 +114,11 @@ export async function readThinLvm(
   lvFields = THIN_LV_FIELDS,
   mode: "product" | "qualification" = "qualification",
 ) {
-  if (mode === "product") return await readThinLvmBatch(exec, lvFields);
+  // Product identity turns avoid relay round trips; the qualified scratch procedure stays unchanged.
+  if (mode === "product")
+    return thinLvmReport(
+      await readDriverFrames((args) => exec(args), thinLvmSteps(lvFields)),
+    );
   const [vgsArgs, lvsArgs, dmArgs] = thinLvmReadCommands(lvFields);
   const before = await exec(dmArgs!);
   const [vg, lv] = await Promise.all([exec(vgsArgs!), exec(lvsArgs!)]);
@@ -126,43 +130,80 @@ export async function readThinLvm(
     before: before.stdout,
   };
 }
-/** Product identity turns avoid relay round trips; the qualified scratch procedure stays unchanged. */
-async function readThinLvmBatch(
-  exec: (args: string[]) => Promise<CommandResult>,
-  lvFields = THIN_LV_FIELDS,
-) {
-  const [vgsArgs, lvsArgs, dmArgs] = thinLvmReadCommands(lvFields);
-  // No LVM/device mutation or shell-interpreted argument: the exact existing reads execute on the
-  // driver, with DM strictly before and after both LVM reports, in one bounded driver command.
-  const result = await exec([
-    "sh",
-    "-ec",
-    [
-      "printf '%s\\0' 'pgcf.lvm.read.v1'",
-      ...[dmArgs!, vgsArgs!, lvsArgs!, dmArgs!].flatMap((args) => [
-        args.map(shellQuote).join(" "),
-        "printf '\\0'",
-      ]),
-      "printf '%s\\0' 'pgcf.lvm.read.end.v1'",
-    ].join("\n"),
-  ]);
+/** One command of a driver read. A soft step may exit non-zero without ending the script: its exit
+ * status is part of its frame and the caller judges it. Every other step ends the script on failure. */
+export interface DriverReadStep {
+  argv: string[];
+  soft?: boolean;
+}
+/** What one step wrote to stdout, and the status it ended with. */
+export interface DriverFrame {
+  stdout: string;
+  exit_code: number;
+}
+const READ_START = "pgcf.read.v1",
+  READ_END = "pgcf.read.end.v1";
+/** Independent read-only commands in one driver shell, so a turn pays one relay round trip for them.
+ * No step mutates or interprets an argument: each argv is quoted word by word, and its complete stdout
+ * is framed by NUL bytes between fixed markers so a truncated stream is never read as a report. */
+export function driverReadScript(steps: readonly DriverReadStep[]): string[] {
+  const lines = [`printf '%s\\0' '${READ_START}'`];
+  for (const step of steps) {
+    const argv = step.argv.map(shellQuote).join(" ");
+    if (step.soft)
+      lines.push(
+        `if ${argv}; then status=0; else status=$?; fi`,
+        `printf '\\0%s\\0' "$status"`,
+      );
+    else lines.push(argv, `printf '\\0%s\\0' 0`);
+  }
+  lines.push(`printf '%s\\0' '${READ_END}'`);
+  return ["sh", "-ec", lines.join("\n")];
+}
+export function parseDriverReadFrames(
+  stdout: string,
+  steps: number,
+): DriverFrame[] {
+  const parts = stdout.split("\0");
+  if (
+    parts.length !== 2 * steps + 3 ||
+    parts[0] !== READ_START ||
+    parts[2 * steps + 1] !== READ_END ||
+    parts[2 * steps + 2] !== ""
+  )
+    throw new BootstrapError("thin_storage_readback_invalid");
+  return Array.from({ length: steps }, (_, index) => {
+    const status = parts[2 + 2 * index]!;
+    if (!/^[0-9]{1,3}$/.test(status))
+      throw new BootstrapError("thin_storage_readback_invalid");
+    return { stdout: parts[1 + 2 * index]!, exit_code: Number(status) };
+  });
+}
+/** Bound for a driver read of several commands; each is a read that takes milliseconds. */
+const DRIVER_READ_MS = 20_000;
+export async function readDriverFrames(
+  exec: (args: string[], timeout?: number) => Promise<CommandResult>,
+  steps: readonly DriverReadStep[],
+  timeout = DRIVER_READ_MS,
+): Promise<DriverFrame[]> {
+  const result = await exec(driverReadScript(steps), timeout);
   if (result.exit_code !== 0)
     throw new BootstrapError("thin_storage_command_failed");
   if (Buffer.byteLength(result.stdout) > 2 * 1024 * 1024)
     throw new BootstrapError("thin_storage_output_limit");
-  const parts = result.stdout.split("\0");
-  if (
-    parts.length !== 7 ||
-    parts[0] !== "pgcf.lvm.read.v1" ||
-    parts[5] !== "pgcf.lvm.read.end.v1" ||
-    parts[6] !== ""
-  )
-    throw new BootstrapError("thin_storage_readback_invalid");
+  return parseDriverReadFrames(result.stdout, steps.length);
+}
+/** The device list strictly before and after both LVM reports. */
+export function thinLvmSteps(lvFields = THIN_LV_FIELDS): DriverReadStep[] {
+  const [vgsArgs, lvsArgs, dmArgs] = thinLvmReadCommands(lvFields);
+  return [dmArgs!, vgsArgs!, lvsArgs!, dmArgs!].map((argv) => ({ argv }));
+}
+function thinLvmReport(frames: readonly DriverFrame[]) {
   return {
-    vgs: parts[2]!,
-    lvs: parts[3]!,
-    dm: parts[4]!,
-    before: parts[1]!,
+    vgs: frames[1]!.stdout,
+    lvs: frames[2]!.stdout,
+    dm: frames[3]!.stdout,
+    before: frames[0]!.stdout,
   };
 }
 /** A read-only command repeats a failed relay round trip or native command timeout at most twice.
@@ -588,6 +629,8 @@ export function thinPoolCommand(
   ];
 }
 
+/** Prints the io.max of each readable cgroup file named by an argument. */
+const IO_LIMITS_SCRIPT = 'for p do if [ -r "$p" ]; then cat "$p"; fi; done';
 export function thinPodCgroupPaths(podUid: string) {
   uid(podUid);
   const u = podUid.replaceAll("-", "_");
@@ -675,6 +718,9 @@ export interface ThinSession {
     timeout?: number,
   ): Promise<CommandResult>;
   get(args: string[]): Promise<ObjectValue>;
+  /** One `kubectl get` of any resources: the objects it printed, whatever the form of its answer. An
+   * object that is absent under `--ignore-not-found` is no object. */
+  list(args: string[]): Promise<ObjectValue[]>;
   talos(args: string[], timeout?: number): Promise<string>;
 }
 /** Relay-only Talos/Kubernetes access with private 0600 configs, removed after every execution. */
@@ -834,6 +880,14 @@ export async function openThinSession<T>(
           ),
         ),
       );
+    const list = async (args: string[]) => {
+      const stdout = await read(() =>
+        kube(["get", ...args, "--output=json"], undefined, true),
+      );
+      if (!stdout.trim()) return [];
+      const value = object(JSON.parse(stdout));
+      return value.kind === "List" ? items(value.items) : [value];
+    };
     // Every talosctl use here is a read: read, get and dmesg.
     const talos = async (args: string[], timeout = 10000) =>
       await read(() =>
@@ -853,7 +907,7 @@ export async function openThinSession<T>(
           timeout,
         ),
       );
-    return await use({ signal, call, command, kube, get, talos });
+    return await use({ signal, call, command, kube, get, list, talos });
   } catch (error) {
     if (
       scope.deadline_code &&
@@ -915,27 +969,59 @@ export interface ThinNode {
   freshDriver(): Promise<void>;
   readLvm(): Promise<ThinLvmFacts>;
 }
-/** Independent read-only measurements of the pinned driver's software and cgroup view. */
-export async function readThinDriverSoftware(
-  driverRead: ThinNode["driverRead"],
-) {
-  const [hashesRaw, toolsRaw, cgroupRaw] = await Promise.all([
-    driverRead([
+/** The pinned driver's binaries, its thin tools and the cgroup controllers its container sees. */
+export const THIN_SOFTWARE_STEPS: DriverReadStep[] = [
+  {
+    argv: [
       "sha256sum",
       "/usr/local/bin/lvm-driver",
       "/sbin/lvm",
       "/usr/sbin/pdata_tools",
-    ]),
-    driverRead(["thin_check", "--version"]),
-    driverRead(["cat", "/sys/fs/cgroup/cgroup.controllers"]),
-  ]);
-  const hashes = hashesRaw.stdout
+    ],
+  },
+  { argv: ["thin_check", "--version"] },
+  { argv: ["cat", "/sys/fs/cgroup/cgroup.controllers"] },
+];
+export function parseThinDriverSoftware(
+  hashesRaw: string,
+  toolsRaw: string,
+  cgroupRaw: string,
+) {
+  const hashes = hashesRaw
     .trim()
     .split("\n")
     .map((value) => value.split(/\s+/)[0]!);
-  const tools = toolsRaw.stdout.trim();
-  const cgroup = cgroupRaw.stdout.split(/\s+/).includes("io");
+  const tools = toolsRaw.trim();
+  const cgroup = cgroupRaw.split(/\s+/).includes("io");
   return { hashes, tools, cgroup };
+}
+/** Independent read-only measurements of the pinned driver's software and cgroup view. */
+export async function readThinDriverSoftware(
+  driverRead: ThinNode["driverRead"],
+) {
+  const [hashesRaw, toolsRaw, cgroupRaw] = await Promise.all(
+    THIN_SOFTWARE_STEPS.map((step) => driverRead(step.argv)),
+  );
+  return parseThinDriverSoftware(
+    hashesRaw!.stdout,
+    toolsRaw!.stdout,
+    cgroupRaw!.stdout,
+  );
+}
+/** The driver's binaries are the pinned ones, the thin module is live and the host cgroups reach it. */
+function assertThinDriverSoftware(
+  software: ReturnType<typeof parseThinDriverSoftware>,
+  modules: string,
+) {
+  if (
+    software.hashes[0] !== sources.driver.binary_sha256 ||
+    software.hashes[1] !== sources.driver.lvm_binary_sha256 ||
+    software.hashes[2] !== sources.thin_tools.binary_sha256 ||
+    software.tools !== sources.thin_tools.version ||
+    !/^dm_thin_pool\s/m.test(modules) ||
+    !software.cgroup
+  )
+    throw new BootstrapError("thin_storage_driver_unqualified");
 }
 /** The same physical reader returned by verifyThinNode; callers select only a read protocol. */
 export async function thinNodeLvmReadback(
@@ -949,39 +1035,26 @@ export async function thinNodeLvmReadback(
   );
   return thinLvmFacts(read.vgs, read.lvs, read.dm, read.before);
 }
-/** Node, cluster, boot, kernel, host guard, driver binaries and live module, before any write. */
-export async function verifyThinNode(
-  session: ThinSession,
+/** The node and its cluster are the ones the lease names, and the node is Ready. */
+function assertNodeIdentity(
+  node: ObjectValue,
+  cluster: ObjectValue,
   scope: ThinNodeScope,
-  lease: () => Promise<void>,
-  hostConfiguration?: () => Promise<boolean>,
-): Promise<ThinNode> {
-  const { get, talos, kube } = session;
-  const authorize = async () => {
-    const [node, cluster] = await Promise.all([
-      get(["node", scope.name]),
-      get(["namespace", "kube-system"]),
-    ]);
-    const labels = object(metadata(node).labels);
-    if (
-      uid(metadata(node).uid) !== scope.node_uid ||
-      uid(metadata(cluster).uid) !== scope.cluster_uid ||
-      !ready(node) ||
-      metadata(node).deletionTimestamp ||
-      labels["pgcf.io/node-id"] !== scope.node_id ||
-      labels["pgcf.io/provider-instance-id"] !== scope.provider_instance_id ||
-      labels["pgcf.io/region"] !== scope.region_id
-    )
-      throw new BootstrapError("thin_storage_physical_identity_changed");
-    await lease();
-  };
-  await authorize();
-  const [pods, bootRaw, systemRaw, modules] = await Promise.all([
-    get(["pods", "--namespace", "openebs"]),
-    talos(["read", "/proc/sys/kernel/random/boot_id"]),
-    talos(["read", "/sys/class/dmi/id/product_uuid"]),
-    talos(["read", "/proc/modules"]),
-  ]);
+) {
+  const labels = object(metadata(node).labels);
+  if (
+    uid(metadata(node).uid) !== scope.node_uid ||
+    uid(metadata(cluster).uid) !== scope.cluster_uid ||
+    !ready(node) ||
+    metadata(node).deletionTimestamp ||
+    labels["pgcf.io/node-id"] !== scope.node_id ||
+    labels["pgcf.io/provider-instance-id"] !== scope.provider_instance_id ||
+    labels["pgcf.io/region"] !== scope.region_id
+  )
+    throw new BootstrapError("thin_storage_physical_identity_changed");
+}
+/** The node's one Ready driver Pod, owned by one DaemonSet. */
+function selectDriverPod(pods: ObjectValue[], scope: ThinNodeScope) {
   const plugin = (p: ObjectValue) =>
     items(object(p.spec).containers).find(
       (c) =>
@@ -996,7 +1069,7 @@ export async function verifyThinNode(
       ? owners[0]
       : undefined;
   };
-  const driverPods = items(pods.items).filter(
+  const driverPods = pods.filter(
     (p) =>
       object(p.spec).nodeName === scope.name &&
       plugin(p) &&
@@ -1006,21 +1079,32 @@ export async function verifyThinNode(
   );
   if (driverPods.length !== 1)
     throw new BootstrapError("thin_storage_driver_ambiguous");
-  const driver = driverPods[0]!,
-    driverImage = text(plugin(driver)!.image),
-    podName = text(metadata(driver).name),
-    driverUid = uid(metadata(driver).uid);
-  const owner = driverOwner(driver)!,
-    ds = await get(["daemonset", text(owner.name), "--namespace", "openebs"]);
+  const driver = driverPods[0]!;
+  return {
+    driver,
+    driverImage: text(plugin(driver)!.image),
+    podName: text(metadata(driver).name),
+    driverUid: uid(metadata(driver).uid),
+    owner: driverOwner(driver)!,
+  };
+}
+function assertDriverOwner(owner: ObjectValue, ds: ObjectValue) {
   if (
     uid(owner.uid) !== uid(metadata(ds).uid) ||
     metadata(ds).deletionTimestamp ||
     !openEbsCgroupReadback(ds)
   )
     throw new BootstrapError("thin_storage_driver_owner_changed");
+}
+/** The node object's boot, system UUID and kernel are the ones Talos itself reads. */
+function talosIdentity(
+  bootRaw: string,
+  systemRaw: string,
+  targetNode: ObjectValue,
+  scope: ThinNodeScope,
+) {
   const boot = uid(bootRaw.trim()),
     systemUuid = uid(systemRaw.trim().toLowerCase());
-  const targetNode = await get(["node", scope.name]);
   const nodeInfo = object(object(targetNode.status).nodeInfo);
   if (
     text(nodeInfo.systemUUID).toLowerCase() !== systemUuid ||
@@ -1030,26 +1114,49 @@ export async function verifyThinNode(
       text(nodeInfo.kernelVersion) !== scope.kernel_version)
   )
     throw new BootstrapError("thin_storage_talos_identity_changed");
-  if (scope.host_extension_version !== null) {
-    const [hostMatches, extensionRaw, serviceRaw] = await Promise.all([
-      hostConfiguration ? hostConfiguration() : true,
-      talos(["get", "extensionstatuses", "--output=json"]),
-      talos(["get", "services", "--output=json"]),
-    ]);
-    const service = readFleetTalosServices(serviceRaw).get(
-      "ext-pgcf-sandbox-controller",
-    );
-    if (
-      !hostMatches ||
-      readFleetTalosExtensions(extensionRaw).get("pgcf-sandbox-controller") !==
-        scope.host_extension_version ||
-      !service?.running ||
-      (!service.healthy && !service.unknown)
-    )
-      throw new BootstrapError("thin_storage_host_guard_unqualified");
-  }
+  return { boot, systemUuid, nodeInfo };
+}
+function assertHostGuard(
+  hostMatches: boolean,
+  extensionRaw: string,
+  serviceRaw: string,
+  scope: ThinNodeScope,
+) {
+  const service = readFleetTalosServices(serviceRaw).get(
+    "ext-pgcf-sandbox-controller",
+  );
+  if (
+    !hostMatches ||
+    readFleetTalosExtensions(extensionRaw).get("pgcf-sandbox-controller") !==
+      scope.host_extension_version ||
+    !service?.running ||
+    (!service.healthy && !service.unknown)
+  )
+    throw new BootstrapError("thin_storage_host_guard_unqualified");
+}
+/** The driver Pod is the verified one on the verified boot. */
+function assertDriverRuns(
+  next: ObjectValue,
+  bootRaw: string,
+  scope: ThinNodeScope,
+  driver: { uid: string; image: string; boot: string },
+) {
+  if (
+    metadata(next).uid !== driver.uid ||
+    !ready(next) ||
+    metadata(next).deletionTimestamp ||
+    object(next.spec).nodeName !== scope.name ||
+    !items(object(next.spec).containers).some(
+      (c) => c.name === "openebs-lvm-plugin" && c.image === driver.image,
+    ) ||
+    bootRaw.trim() !== driver.boot
+  )
+    throw new BootstrapError("thin_storage_driver_identity_changed");
+}
+/** Commands into the driver container of one Pod. */
+function driverTools(session: ThinSession, podName: string) {
   const driverExec = async (args: string[], permit = false, timeout = 10000) =>
-    await kube(
+    await session.kube(
       [
         "exec",
         "--namespace",
@@ -1064,24 +1171,6 @@ export async function verifyThinNode(
       permit,
       timeout,
     );
-  const freshDriver = async () => {
-    await authorize();
-    const [next, bootRaw] = await Promise.all([
-      get(["pod", podName, "--namespace", "openebs"]),
-      talos(["read", "/proc/sys/kernel/random/boot_id"]),
-    ]);
-    if (
-      metadata(next).uid !== driverUid ||
-      !ready(next) ||
-      metadata(next).deletionTimestamp ||
-      object(next.spec).nodeName !== scope.name ||
-      !items(object(next.spec).containers).some(
-        (c) => c.name === "openebs-lvm-plugin" && c.image === driverImage,
-      ) ||
-      bootRaw.trim() !== boot
-    )
-      throw new BootstrapError("thin_storage_driver_identity_changed");
-  };
   const driverRead = async (args: string[], timeout = 10000) => {
     const result = await readCommand(
       () => driverExec(args, true, timeout),
@@ -1091,20 +1180,79 @@ export async function verifyThinNode(
       throw new BootstrapError("thin_storage_command_failed");
     return result;
   };
-  const { hashes, tools, cgroup } = await readThinDriverSoftware(driverRead);
-  const moduleLive = /^dm_thin_pool\s/m.test(modules);
-  if (
-    hashes[0] !== sources.driver.binary_sha256 ||
-    hashes[1] !== sources.driver.lvm_binary_sha256 ||
-    hashes[2] !== sources.thin_tools.binary_sha256 ||
-    tools !== sources.thin_tools.version ||
-    !moduleLive ||
-    !cgroup
-  )
-    throw new BootstrapError("thin_storage_driver_unqualified");
-  const readLvm = async () => {
-    return await thinNodeLvmReadback(scope, driverRead);
+  return { driverExec, driverRead };
+}
+/** A promise's value or its rejection, when its turn in the checks comes. */
+function settledValue<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
+}
+
+/** Node, cluster, boot, kernel, host guard, driver binaries and live module, before any write. One
+ * read after the other, as the qualified scratch procedure has always run them. */
+export async function verifyThinNode(
+  session: ThinSession,
+  scope: ThinNodeScope,
+  lease: () => Promise<void>,
+  hostConfiguration?: () => Promise<boolean>,
+): Promise<ThinNode> {
+  const { get, talos } = session;
+  const authorize = async () => {
+    const [node, cluster] = await Promise.all([
+      get(["node", scope.name]),
+      get(["namespace", "kube-system"]),
+    ]);
+    assertNodeIdentity(node, cluster, scope);
+    await lease();
   };
+  await authorize();
+  const [pods, bootRaw, systemRaw, modules] = await Promise.all([
+    get(["pods", "--namespace", "openebs"]),
+    talos(["read", "/proc/sys/kernel/random/boot_id"]),
+    talos(["read", "/sys/class/dmi/id/product_uuid"]),
+    talos(["read", "/proc/modules"]),
+  ]);
+  const { driver, driverImage, podName, driverUid, owner } = selectDriverPod(
+    items(pods.items),
+    scope,
+  );
+  const ds = await get([
+    "daemonset",
+    text(owner.name),
+    "--namespace",
+    "openebs",
+  ]);
+  assertDriverOwner(owner, ds);
+  const targetNode = await get(["node", scope.name]);
+  const { boot, systemUuid, nodeInfo } = talosIdentity(
+    bootRaw,
+    systemRaw,
+    targetNode,
+    scope,
+  );
+  if (scope.host_extension_version !== null) {
+    const [hostMatches, extensionRaw, serviceRaw] = await Promise.all([
+      hostConfiguration ? hostConfiguration() : true,
+      talos(["get", "extensionstatuses", "--output=json"]),
+      talos(["get", "services", "--output=json"]),
+    ]);
+    assertHostGuard(hostMatches, extensionRaw, serviceRaw, scope);
+  }
+  const { driverExec, driverRead } = driverTools(session, podName);
+  const freshDriver = async () => {
+    await authorize();
+    const [next, bootNow] = await Promise.all([
+      get(["pod", podName, "--namespace", "openebs"]),
+      talos(["read", "/proc/sys/kernel/random/boot_id"]),
+    ]);
+    assertDriverRuns(next, bootNow, scope, {
+      uid: driverUid,
+      image: driverImage,
+      boot,
+    });
+  };
+  const software = await readThinDriverSoftware(driverRead);
+  assertThinDriverSoftware(software, modules);
   return {
     authorize,
     driver,
@@ -1114,14 +1262,163 @@ export async function verifyThinNode(
     boot,
     systemUuid,
     nodeInfo,
-    hashes,
-    tools,
-    moduleLive,
-    cgroup,
+    hashes: software.hashes,
+    tools: software.tools,
+    moduleLive: true,
+    cgroup: software.cgroup,
     driverExec,
     driverRead,
     freshDriver,
-    readLvm,
+    readLvm: async () => await thinNodeLvmReadback(scope, driverRead),
+  };
+}
+
+/** What a product identity turn's node reads in the driver container twice, one exec each. */
+export interface ThinTurnNode extends Omit<ThinNode, "authorize"> {
+  /** The first LVM report: the verification's own driver read already holds it. */
+  initialLvm: ThinLvmFacts;
+  /** One driver read for the end of the turn: the io.max of each given writer Pod, then the closing
+   * LVM report. An io.max read that fails does not end the read; its frame carries the status. */
+  closingRead(podUids: readonly string[]): Promise<{
+    limits: Map<string, DriverFrame>;
+    lvm: ThinLvmFacts;
+  }>;
+}
+/** An executor's identity read of the node as one wave: what is independent is issued together and
+ * judged afterwards in the order the sequential read judges it, so the checks and the code of a
+ * failure are the same. The driver's software and the first LVM report share one exec. Product turns
+ * only: the qualified scratch procedure keeps `verifyThinNode`. */
+export async function verifyThinTurnNode(
+  session: ThinSession,
+  scope: ThinNodeScope,
+  lease: () => Promise<void>,
+  hostConfiguration?: () => Promise<boolean>,
+): Promise<ThinTurnNode> {
+  const { list, talos } = session;
+  const hostGuard = scope.host_extension_version !== null;
+  const wave = await Promise.allSettled([
+    list([`node/${scope.name}`, "namespace/kube-system"]),
+    list(["pods,daemonsets", "--namespace", "openebs"]),
+    talos(["read", "/proc/sys/kernel/random/boot_id"]),
+    talos(["read", "/sys/class/dmi/id/product_uuid"]),
+    talos(["read", "/proc/modules"]),
+    hostGuard && hostConfiguration ? hostConfiguration() : true,
+    hostGuard ? talos(["get", "extensionstatuses", "--output=json"]) : "",
+    hostGuard ? talos(["get", "services", "--output=json"]) : "",
+    lease(),
+  ]);
+  const found = settledValue(wave[0]);
+  const target = found.find((value) => value.kind === "Node"),
+    cluster = found.find((value) => value.kind === "Namespace");
+  if (!target || !cluster)
+    throw new BootstrapError("thin_storage_readback_invalid");
+  assertNodeIdentity(target, cluster, scope);
+  settledValue(wave[8]);
+  const openebs = settledValue(wave[1]);
+  const bootRaw = settledValue(wave[2]),
+    systemRaw = settledValue(wave[3]),
+    modules = settledValue(wave[4]);
+  const { driver, driverImage, podName, driverUid, owner } = selectDriverPod(
+    openebs.filter((value) => value.kind === "Pod"),
+    scope,
+  );
+  const ds = openebs.find(
+    (value) =>
+      value.kind === "DaemonSet" && metadata(value).name === text(owner.name),
+  );
+  // A DaemonSet that is no longer there is a failed read of it, as `get daemonset` reports it.
+  if (!ds) throw new BootstrapError("thin_storage_command_failed");
+  assertDriverOwner(owner, ds);
+  const { boot, systemUuid, nodeInfo } = talosIdentity(
+    bootRaw,
+    systemRaw,
+    target,
+    scope,
+  );
+  if (hostGuard)
+    assertHostGuard(
+      settledValue(wave[5]) as boolean,
+      settledValue(wave[6]) as string,
+      settledValue(wave[7]) as string,
+      scope,
+    );
+  const { driverExec, driverRead } = driverTools(session, podName);
+  const freshDriver = async () => {
+    const [read, bootRead, leased] = await Promise.allSettled([
+      list([
+        `node/${scope.name}`,
+        "namespace/kube-system",
+        `pod/${podName}`,
+        "--namespace",
+        "openebs",
+      ]),
+      talos(["read", "/proc/sys/kernel/random/boot_id"]),
+      lease(),
+    ]);
+    const objects = settledValue(read),
+      node = objects.find((value) => value.kind === "Node"),
+      namespace = objects.find((value) => value.kind === "Namespace"),
+      next = objects.find((value) => value.kind === "Pod");
+    if (!node || !namespace || !next)
+      throw new BootstrapError("thin_storage_readback_invalid");
+    assertNodeIdentity(node, namespace, scope);
+    settledValue(leased);
+    assertDriverRuns(next, settledValue(bootRead), scope, {
+      uid: driverUid,
+      image: driverImage,
+      boot,
+    });
+  };
+  const frames = await readDriverFrames(driverRead, [
+    ...THIN_SOFTWARE_STEPS,
+    ...thinLvmSteps(),
+  ]);
+  const software = parseThinDriverSoftware(
+    frames[0]!.stdout,
+    frames[1]!.stdout,
+    frames[2]!.stdout,
+  );
+  assertThinDriverSoftware(software, modules);
+  const facts = (report: ReturnType<typeof thinLvmReport>) =>
+    thinLvmFacts(report.vgs, report.lvs, report.dm, report.before);
+  return {
+    driver,
+    daemonSet: ds,
+    podName,
+    driverUid,
+    boot,
+    systemUuid,
+    nodeInfo,
+    hashes: software.hashes,
+    tools: software.tools,
+    moduleLive: true,
+    cgroup: software.cgroup,
+    driverExec,
+    driverRead,
+    freshDriver,
+    readLvm: async () => await thinNodeLvmReadback(scope, driverRead),
+    initialLvm: facts(thinLvmReport(frames.slice(THIN_SOFTWARE_STEPS.length))),
+    closingRead: async (podUids) => {
+      const closing = await readDriverFrames(driverRead, [
+        ...podUids.map((podUid) => ({
+          argv: [
+            "sh",
+            "-ec",
+            IO_LIMITS_SCRIPT,
+            "--",
+            ...thinPodCgroupPaths(podUid),
+          ],
+          soft: true,
+        })),
+        ...thinLvmSteps(),
+      ]);
+      return {
+        limits: new Map(
+          podUids.map((podUid, index) => [podUid, closing[index]!]),
+        ),
+        lvm: facts(thinLvmReport(closing.slice(podUids.length))),
+      };
+    },
   };
 }
 
@@ -1134,24 +1431,77 @@ export async function thinStorageHostConfiguration(
   assertThinStorageHostSettings(input);
   const lease = input.lease;
   // A failed file read rejects with its own error: one still failing after its repeats or cut by the
-  // turn's deadline stays transient. Only a file read back with other content is unqualified.
-  return (
-    (
-      await readHostConfiguration(
-        { talos },
-        input.host_configuration,
-        undefined,
-        false,
-        lease.configuration_boot_id
-          ? {
-              boot_id: lease.boot_id,
-              configuration_boot_id: lease.configuration_boot_id,
-            }
-          : undefined,
-      )
-    ).matches &&
-    (await hostFilesMaterialized({ talos }, input.host_configuration))
-  );
+  // turn's deadline stays transient. Only a file read back with other content is unqualified. The
+  // files are read while the configuration is, and judged after it: a configuration that does not
+  // match decides false whatever its files did.
+  const [configuration, files] = await Promise.allSettled([
+    readHostConfiguration(
+      { talos },
+      input.host_configuration,
+      undefined,
+      false,
+      lease.configuration_boot_id
+        ? {
+            boot_id: lease.boot_id,
+            configuration_boot_id: lease.configuration_boot_id,
+          }
+        : undefined,
+    ),
+    hostFilesMaterialized({ talos }, input.host_configuration),
+  ]);
+  if (configuration.status === "rejected") throw configuration.reason;
+  if (!configuration.value.matches) return false;
+  if (files.status === "rejected") throw files.reason;
+  return files.value;
+}
+
+/** The cluster objects of one identity turn, read after the first LVM report and before the closing
+ * one: the thin classes the lease expects (absent ones are not an error here) and the seven
+ * cluster-wide lists, together with the witness that the node and its driver are still the verified
+ * ones. Independent reads share one wave; the caller judges them in the order a sequential turn
+ * did and calls `witness` where the sequential turn read it, before the closing LVM report. */
+export async function readThinInventory(
+  session: ThinSession,
+  node: Pick<ThinNode, "freshDriver">,
+  classes: readonly { kind: string; name: string }[],
+) {
+  const { get, list } = session;
+  const wave = await Promise.allSettled([
+    classes.length
+      ? list([
+          ...classes.map(({ kind, name }) => `${kind.toLowerCase()}/${name}`),
+          "--ignore-not-found",
+        ])
+      : [],
+    get(["pv"]),
+    get(["pvc", "--all-namespaces"]),
+    get(["lvmvolumes.local.openebs.io", "--all-namespaces"]),
+    get(["pods", "--all-namespaces"]),
+    get(["namespaces"]),
+    get(["clusters.postgresql.cnpg.io", "--all-namespaces"]),
+    get(["configmaps", "--namespace", "pgcf-system"]),
+    node.freshDriver(),
+  ]);
+  const found = settledValue(wave[0]);
+  const pvRaw = settledValue(wave[1]),
+    pvcRaw = settledValue(wave[2]),
+    lvmRaw = settledValue(wave[3]),
+    podRaw = settledValue(wave[4]),
+    namespaceRaw = settledValue(wave[5]),
+    clusterRaw = settledValue(wave[6]),
+    mapsRaw = settledValue(wave[7]);
+  return {
+    classes: found,
+    pvs: items(pvRaw.items),
+    pvcs: items(pvcRaw.items),
+    lvms: items(lvmRaw.items),
+    pods: items(podRaw.items),
+    namespaces: items(namespaceRaw.items),
+    clusters: items(clusterRaw.items),
+    maps: items(mapsRaw.items),
+    /** Throws what the witness found; nothing before this call depends on it. */
+    witness: () => void settledValue(wave[8]),
+  };
 }
 
 export async function runThinStorage(
@@ -1187,20 +1537,7 @@ export async function runThinStorage(
     options,
     async (session) => {
       const { call, kube, get } = session;
-      const {
-        driver,
-        driverUid,
-        boot,
-        systemUuid,
-        nodeInfo,
-        hashes,
-        tools,
-        moduleLive,
-        cgroup,
-        driverExec,
-        freshDriver,
-        readLvm,
-      } = await verifyThinNode(
+      const node = await verifyThinTurnNode(
         session,
         {
           node_id: lease.node_id,
@@ -1213,7 +1550,6 @@ export async function runThinStorage(
           host_extension_version: input.host_extension.version,
           boot_id: lease.boot_id,
           kernel_version: lease.kernel_version,
-          lvm_read_mode: "product",
         },
         async () => {
           const current = object(await call({ kind: "status" }));
@@ -1231,7 +1567,21 @@ export async function runThinStorage(
         () =>
           thinStorageHostConfiguration(input, (args) => session.talos(args)),
       );
-      let facts = await readLvm();
+      const {
+        driver,
+        driverUid,
+        boot,
+        systemUuid,
+        nodeInfo,
+        hashes,
+        tools,
+        moduleLive,
+        cgroup,
+        driverExec,
+        freshDriver,
+        readLvm,
+      } = node;
+      let facts = node.initialLvm;
       if (facts.vg_uuid !== lease.volume_group_uuid)
         throw new BootstrapError("thin_storage_vg_identity_changed");
       let actionApplied = false;
@@ -1270,25 +1620,32 @@ export async function runThinStorage(
         }
       }
       const className = thinStorageClass(lease.profile_sha256);
-      for (const expected of [
+      const expectedClasses = [
         thinStorageClassObject(lease.profile, lease.profile_sha256),
         thinVolumeAttributesClassObject(lease.profile, lease.profile_sha256),
-      ]) {
-        const existing = await kube([
-          "get",
-          expected.kind,
-          expected.metadata.name,
-          "--ignore-not-found",
-          "--output=json",
-        ]);
+      ];
+      const inventory = await readThinInventory(
+        session,
+        node,
+        expectedClasses.map((expected) => ({
+          kind: expected.kind,
+          name: expected.metadata.name,
+        })),
+      );
+      for (const expected of expectedClasses) {
+        const existing = inventory.classes.find(
+          (value) =>
+            value.kind === expected.kind &&
+            metadata(value).name === expected.metadata.name,
+        );
         let actual: ObjectValue;
-        if (!existing.stdout.trim()) {
+        if (!existing) {
           if (!input.class_creation_allowed)
             throw new BootstrapError("thin_storage_class_identity_missing");
           await freshDriver();
           await kube(["create", "--filename=-"], JSON.stringify(expected));
           actual = await get([expected.kind, expected.metadata.name]);
-        } else actual = object(JSON.parse(existing.stdout));
+        } else actual = existing;
         const normalized = { ...actual };
         delete normalized.metadata;
         const body = { ...expected };
@@ -1303,26 +1660,25 @@ export async function runThinStorage(
         )
           throw new BootstrapError("thin_storage_class_owner_changed");
       }
-      const [pvRaw, pvcRaw, lvmRaw, podRaw, namespaceRaw, clusterRaw, mapsRaw] =
-        await Promise.all([
-          get(["pv"]),
-          get(["pvc", "--all-namespaces"]),
-          get(["lvmvolumes.local.openebs.io", "--all-namespaces"]),
-          get(["pods", "--all-namespaces"]),
-          get(["namespaces"]),
-          get(["clusters.postgresql.cnpg.io", "--all-namespaces"]),
-          get(["configmaps", "--namespace", "pgcf-system"]),
-        ]);
-      const pvs = items(pvRaw.items),
-        pvcs = items(pvcRaw.items),
-        lvms = items(lvmRaw.items),
-        allPods = items(podRaw.items),
-        namespaces = items(namespaceRaw.items),
-        clusters = items(clusterRaw.items),
-        maps = items(mapsRaw.items);
+      const {
+        pvs,
+        pvcs,
+        lvms,
+        pods: allPods,
+        namespaces,
+        clusters,
+        maps,
+      } = inventory;
       const volumes: NodeThinStorageAuthority["volumes"] = [],
         protections: NodeThinStorageAuthority["protections"] = [];
       const accounted = new Set<string>();
+      // Each instance Pod of an active thin volume: its io.max is read with the closing LVM report.
+      const writers: {
+        db: (typeof lease.databases)[number];
+        lv: ObjectValue;
+        podUid: string;
+        io: NodeThinStorageAuthority["volumes"][number]["io"];
+      }[] = [];
       for (const db of lease.databases) {
         const namespace = `pgcf-db-${db.id}`,
           ns = namespaces.find((v) => metadata(v).name === namespace),
@@ -1461,43 +1817,8 @@ export async function runThinStorage(
         };
         for (const pod of db.storage && text(lv.lv_attr)[4] === "a"
           ? thinWriterPods(pods)
-          : []) {
-          const podUid = uid(metadata(pod).uid);
-          let limits: ReturnType<typeof thinIoLimit>;
-          try {
-            const limitsRaw = await driverExec([
-              "sh",
-              "-ec",
-              'for p do if [ -r "$p" ]; then cat "$p"; fi; done',
-              "--",
-              ...thinPodCgroupPaths(podUid),
-            ]);
-            limits = thinIoLimit(
-              limitsRaw.stdout,
-              bytes(lv.lv_kernel_major),
-              bytes(lv.lv_kernel_minor),
-            );
-          } catch (error) {
-            // An unstarted cgroup is bounded by its current full logical startup hold.
-            // Established writers have no such substitute for an actual IO readback.
-            if (
-              db.startup &&
-              db.startup.generation === db.generation &&
-              db.startup.node_uid === lease.node_uid &&
-              db.startup.budget_bytes >= bytes(lv.lv_size) &&
-              Date.parse(db.startup.expires_at) > Date.now()
-            )
-              continue;
-            throw error;
-          }
-          if (
-            !db.storage ||
-            limits.write_bytes_per_second > db.storage.write_bytes_per_second ||
-            limits.write_iops_per_second > db.storage.write_iops_per_second
-          )
-            throw new BootstrapError("thin_storage_io_limit_unqualified");
-          io.push({ pod_uid: podUid, ...limits });
-        }
+          : [])
+          writers.push({ db, lv, podUid: uid(metadata(pod).uid), io });
         accounted.add(lvmUid(lv.lv_uuid));
         volumes.push(volume);
       }
@@ -1508,8 +1829,44 @@ export async function runThinStorage(
         facts.volumes.every((v) =>
           ["thin", "thin-pool", "linear"].includes(v.segtype),
         );
-      await freshDriver();
-      const final = await readLvm();
+      // The witness and the closing report come after everything above, as in a sequential turn.
+      inventory.witness();
+      const closing = await node.closingRead(
+        writers.map((writer) => writer.podUid),
+      );
+      for (const { db, lv, podUid, io } of writers) {
+        const frame = closing.limits.get(podUid)!;
+        let limits: ReturnType<typeof thinIoLimit>;
+        try {
+          if (frame.exit_code !== 0)
+            throw new BootstrapError("thin_storage_command_failed");
+          limits = thinIoLimit(
+            frame.stdout,
+            bytes(lv.lv_kernel_major),
+            bytes(lv.lv_kernel_minor),
+          );
+        } catch (error) {
+          // An unstarted cgroup is bounded by its current full logical startup hold.
+          // Established writers have no such substitute for an actual IO readback.
+          if (
+            db.startup &&
+            db.startup.generation === db.generation &&
+            db.startup.node_uid === lease.node_uid &&
+            db.startup.budget_bytes >= bytes(lv.lv_size) &&
+            Date.parse(db.startup.expires_at) > Date.now()
+          )
+            continue;
+          throw error;
+        }
+        if (
+          !db.storage ||
+          limits.write_bytes_per_second > db.storage.write_bytes_per_second ||
+          limits.write_iops_per_second > db.storage.write_iops_per_second
+        )
+          throw new BootstrapError("thin_storage_io_limit_unqualified");
+        io.push({ pod_uid: podUid, ...limits });
+      }
+      const final = closing.lvm;
       if (
         final.vg_uuid !== facts.vg_uuid ||
         final.pool_uuid !== facts.pool_uuid ||

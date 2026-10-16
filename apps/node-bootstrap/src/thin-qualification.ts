@@ -37,6 +37,8 @@ import {
   thinPoolCommand,
   uid,
   verifyThinNode,
+  verifyThinTurnNode,
+  readThinInventory,
   type ObjectValue,
   type ThinNode,
   type ThinSession,
@@ -2793,7 +2795,8 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
     };
   }
 
-  /** One full product-equivalent Native readback turn, timed from a fresh relay session. */
+  /** One full product-equivalent Native readback turn, timed from a fresh relay session. It reads
+   * what the product identity turn reads, in the order it reads it, through the same readers. */
   private async productCycle() {
     const started = Date.now();
     await openThinSession(
@@ -2808,7 +2811,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       },
       this.options,
       async (session) => {
-        const node = await verifyThinNode(
+        const node = await verifyThinTurnNode(
           session,
           {
             node_id: this.run.node_id,
@@ -2824,18 +2827,9 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
           },
           () => this.lease(),
         );
-        await node.readLvm();
-        await Promise.all([
-          session.get(["pv"]),
-          session.get(["pvc", "--all-namespaces"]),
-          session.get(["lvmvolumes.local.openebs.io", "--all-namespaces"]),
-          session.get(["pods", "--all-namespaces"]),
-          session.get(["namespaces"]),
-          session.get(["clusters.postgresql.cnpg.io", "--all-namespaces"]),
-          session.get(["configmaps", "--namespace", "pgcf-system"]),
-        ]);
-        await node.freshDriver();
-        await node.readLvm();
+        const inventory = await readThinInventory(session, node, []);
+        inventory.witness();
+        await node.closingRead([]);
       },
     );
     return Date.now() - started;

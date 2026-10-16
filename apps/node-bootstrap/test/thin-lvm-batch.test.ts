@@ -4,10 +4,15 @@ import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { BootstrapError, runCommand, shellQuote } from "../src/bootstrap.ts";
 import {
+  THIN_LV_FIELDS,
+  THIN_SOFTWARE_STEPS,
+  parseThinDriverSoftware,
+  readDriverFrames,
   readThinDriverSoftware,
   readThinLvm,
+  thinLvmFacts,
+  thinLvmSteps,
   thinNodeLvmReadback,
-  THIN_LV_FIELDS,
 } from "../src/thin-storage.ts";
 import sources from "../../../infra/storage/sources.lock.json" with { type: "json" };
 
@@ -222,6 +227,61 @@ test("reads actual LVM and kernel DM inventory in one bounded remote command", a
     ]);
     assert.equal(software.tools, sources.thin_tools.version);
     assert.equal(software.cgroup, true);
+    // The identity turn's first driver read: the software, the LVM reports and two soft steps in
+    // one real exec. Each step's complete stdout is framed; a soft step reports its status.
+    let reads = 0;
+    const read = (args: string[]) => {
+      reads++;
+      return docker(["exec", container, ...args]);
+    };
+    const frames = await readDriverFrames(read, [
+      ...THIN_SOFTWARE_STEPS,
+      ...thinLvmSteps(),
+      { argv: ["sh", "-c", "exit 7"], soft: true },
+      {
+        argv: [
+          "sh",
+          "-ec",
+          'for p do if [ -r "$p" ]; then cat "$p"; fi; done',
+          "--",
+          "/nonexistent/io.max",
+        ],
+        soft: true,
+      },
+    ]);
+    assert.equal(reads, 1, "software, LVM and soft steps share one exec");
+    const combined = parseThinDriverSoftware(
+      frames[0]!.stdout,
+      frames[1]!.stdout,
+      frames[2]!.stdout,
+    );
+    assert.deepEqual(combined, software);
+    assert.deepEqual(
+      thinLvmFacts(
+        frames[4]!.stdout,
+        frames[5]!.stdout,
+        frames[6]!.stdout,
+        frames[3]!.stdout,
+      ).volumes,
+      facts.volumes,
+    );
+    assert.deepEqual(
+      frames.slice(7).map((frame) => [frame.stdout, frame.exit_code]),
+      [
+        ["", 7],
+        ["", 0],
+      ],
+    );
+    await assert.rejects(
+      readDriverFrames(
+        (args) => invoke(["exec", container, ...args]),
+        [{ argv: ["true"] }, { argv: ["false"] }, { argv: ["true"] }],
+      ),
+      (error) =>
+        error instanceof BootstrapError &&
+        error.code === "thin_storage_command_failed",
+      "a failing hard step ends the real script",
+    );
   } finally {
     if (loopCreated) {
       await docker([
