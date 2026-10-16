@@ -60,9 +60,14 @@ findings from the same run:
    leaves the accepted inventory older than the 120 s startup freshness window [E]. Reading the code
    adds a second candidate: the wake predicate needs the identity proof's volume entry at the database's
    current generation, so a wake shortly after an idle sleep is refused until the next accepted proof
-   [E]. Branch `golive/claim-wait` (not yet measured live): the refused claim logs `actor_claim_refused`
-   with every part of the guard, and waits for late reports within the caller's deadline
-   (`actor_claim_waited`).
+   [E]. Branch `golive/claim-wait`: the refused claim logs `actor_claim_refused` with every part of the
+   guard, and waits for late reports within the caller's deadline (`actor_claim_waited`). With it the
+   second candidate was confirmed live on EU1 (2026-10-16 [M]): every wake of a parked thin database
+   within one identity-proof interval after its sleep was held about 15 s, `blocked_by:
+   ["thin_identity_behind"]` with `volume_bound: true`, `volume_current: false` and every other part
+   holding; the first query took 1.24 s when a proof happened to land between the sleep and the wake and
+   17 s when not. Branch `golive/wake-identity` (not yet measured live): the wake claim of a parked
+   sleeper accepts the proof's entry of the generation before its sleep (section 4.8, (e)).
 2. **A cold wake of a thin database took 44 s** (hint 02:10:40, ready 02:11:24): `volume_identity` pended
    37 s, waiting for the next identity proof that carries the new Pod's I/O limits (a turn takes about
    47 s and runs every 60 s). The Edge gave up after 30 s (`08006`). During the Pod creation the controller
@@ -321,6 +326,22 @@ Status (branch `golive/identity-turn`, tested against the Dev fixture, not deplo
 - To measure live: `thin_storage_turn_accepted.turn_ms` (lease issue to acceptance) against the 47 s of
   R2.14, `thin_storage_turn_requested` (a sample asked for a turn, with the waiting holds), the cold wake's
   `volume_identity` phase and create to ready. (c) is done in the Actor (`actor_claim_waited`, `actor_claim_refused`); (d) is open.
+- (e) A wake claim needs the proof's entry of its database at the database's current generation, and an
+  idle sleep bumps the generation without touching the Pod or the volume, so a parked sleeper waited for
+  a proof that could not show anything new. The claim of a parked sleeper (and only the Actor's wake
+  claim, not a resume or a restart after a refused stop) now also accepts the entry of the generation
+  before the sleep, when all of this holds: the controller confirmed the idle sleep and reported the
+  parked Pod within the last 180 s, the sleep directly followed a start (the operation of the generation
+  before is a creation, restore, wake, resume or resize and the entry is that generation), the entry
+  shows exactly the parked Pod with its io limits and the volume not frozen, and every fact of the volume
+  binding still matches. A role created between the start and the sleep, a resize, a hibernated sleeper
+  whose Pod is gone, or a proof of another Pod keep the strict rule. A wake, a short use and a second
+  sleep before any proof read the wake's generation still wait for the next proof (the entry is then two
+  generations behind). To measure live: `actor_claim_refused.blocked_by` should no longer name
+  `thin_identity_behind` for a parked database (the event now carries `parked` and `volume_generation`,
+  so a refusal that remains shows what the proof read), `actor_claim_waited` should disappear for a
+  wake after a sleep, and the Edge's `ensure_awake_ms` of the first wake after a sleep should match
+  the awake-in-proof case (1.24 s on R2.14).
 
 Measured after the deploys of 2026-10-16 (API from `0a5cb81` and `d4cff9f`) [M]: total API requests per
 second fell from 8.8 to 1.5 and each node's reclaim poll from about 3.2/s to 0.23/s (the 3.5 s hold);

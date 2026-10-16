@@ -410,6 +410,13 @@ set or the earlier reading found the volume frozen, nothing is carried: a protec
 released only by a start of its own. The identity proof prepared at the new generation takes over
 unchanged.
 
+The wake claim of a parked sleeper reads the proof the same way. Its start predicate (dom/storage-capacity.ts,
+`boundStorageVolumeSql` with the reading `parked_sleep`) accepts the entry of the generation before the
+idle sleep, instead of waiting for a proof of the sleep, when the sleep directly followed a start, the
+controller reported the Pod parked within 180 s, and the entry shows exactly that Pod unfrozen; the
+volume binding is compared in full. Only the Actor's wake claim reads it that way. The writer's token needs
+no such rule: it was always signed from the reading of any earlier generation.
+
 ## 9. Delivery
 
 Option 1 is deployed. The contracts and API carry the headroom sample route, the identity proof

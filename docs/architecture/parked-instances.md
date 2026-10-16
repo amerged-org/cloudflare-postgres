@@ -603,6 +603,10 @@ API-side lease presentation. Three rules, all in `apps/api`:
   parked token is therefore refused whole and replaced by the next fetch: acceptance is delayed by
   one fetch and nothing is killed, because the parked Pod stays permitted by the previous entry.
   Ordinary wakes carry the same property.
+  The claim of that wake reads the node's proof the same way: the wake transition's start predicate
+  accepts the proof's entry of the generation before the idle sleep when the sleep directly followed
+  a start and the entry shows exactly the parked Pod (`parkedSleepEntrySql`), so a wake right after a
+  sleep does not wait for a proof that cannot show anything new.
 - **R3 evidence.** `parkedHolder` returns the Pod UID only if the latest identity proof's volume
   entry for this database (any generation `<= row.generation`, same storage/namespace/cluster/
   LV/PVC/PV identities as the receipt) has exactly one `io` element whose `pod_uid` equals
