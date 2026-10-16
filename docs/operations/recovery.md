@@ -519,7 +519,11 @@ isolated-worker and actual encrypted-swap acceptance remain required before any 
 The protected host publisher uses the existing regional identity to fetch
 `GET /agent/v1/nodes/{id}/reclaim` and post bounded observations to
 `POST /agent/v1/nodes/{id}/reclaim-observations`. It publishes a two-second envelope of CF-signed,
-five-second maximum rc1 scopes. A consumer receives public verification keys and local identity
+five-second maximum rc1 scopes. A poll with nothing to deliver, the 404 of a node without a
+qualification included, is answered 3.5 s after it arrived (the host's client gives up after 5 s),
+so an idle node polls about every 3.75 s; a Worker isolate remembers a node's missing
+qualification for 5 s, and a new one reaches the node within about 9 s. A consumer receives public
+verification keys and local identity
 snapshots; it receives no CF write credential, PostgreSQL credential or CRI socket. The node
 reclaimer that consumed them was deleted on 2026-10-15 and no replacement exists, so the scopes are
 published but nothing executes them.

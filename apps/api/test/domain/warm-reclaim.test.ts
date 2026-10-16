@@ -7,7 +7,7 @@ import {
   waitOnExecutionContext,
   runInDurableObject,
 } from "cloudflare:test";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   DatabaseWithOperation,
   ThinStorageProfile,
@@ -36,8 +36,11 @@ import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.t
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
+import { countStatements } from "./d1-statements.ts";
 const releases: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   await cleanupFixtures();
   for (const id of releases.splice(0))
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
@@ -116,7 +119,19 @@ async function ready(actualRam = false) {
   );
   return { ...f, id: created.database.id };
 }
-async function qualified() {
+/**
+ * A node with an accepted qualification and one database with a policy.
+ * `policy: false` leaves the node's databases without one. `before` runs once everything the
+ * qualification stands on exists and before it is made. `viaSql` writes the qualification row as
+ * another isolate's request would have left it, bypassing this isolate's request path.
+ */
+async function qualified(
+  options: {
+    policy?: boolean;
+    before?: (f: Awaited<ReturnType<typeof ready>>) => Promise<void>;
+    viaSql?: boolean;
+  } = {},
+) {
   const f = await ready(true),
     cluster = crypto.randomUUID(),
     uid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
@@ -194,35 +209,46 @@ async function qualified() {
     encrypted_swap_dm_uuids: ["CRYPT-LUKS2-" + "a".repeat(32) + "-pgcf-swap"],
     system_services_excluded: true,
   });
-  const qualifyKey = crypto.randomUUID();
-  const qualify = await request(
-    `/v1/nodes/${f.node}/warm-reclaim-qualification`,
-    f.admin,
-    "PUT",
-    { expected_revision: 0, node_uid: uid, qualification },
-    qualifyKey,
-  );
-  expect(qualify.status, JSON.stringify(await qualify.clone().json())).toBe(
-    200,
-  );
-  expect(
-    (
-      await request(
-        `/v1/nodes/${f.node}/warm-reclaim-qualification`,
-        f.admin,
-        "PUT",
-        { expected_revision: 0, node_uid: uid, qualification },
-        qualifyKey,
-      )
-    ).status,
-  ).toBe(200);
-  const configure = await request(
-    `/v1/databases/${f.id}/warm-reclaim`,
-    f.admin,
-    "PUT",
-    { expected_revision: 0, expected_generation: 1, policy },
-  );
-  expect(configure.status).toBe(200);
+  await options.before?.(f);
+  if (options.viaSql) {
+    await env.DB.prepare(
+      "UPDATE nodes SET warm_reclaim_qualification_json=? WHERE id=?",
+    )
+      .bind(JSON.stringify({ revision: 1, qualification }), f.node)
+      .run();
+  } else {
+    const qualifyKey = crypto.randomUUID();
+    const qualify = await request(
+      `/v1/nodes/${f.node}/warm-reclaim-qualification`,
+      f.admin,
+      "PUT",
+      { expected_revision: 0, node_uid: uid, qualification },
+      qualifyKey,
+    );
+    expect(qualify.status, JSON.stringify(await qualify.clone().json())).toBe(
+      200,
+    );
+    expect(
+      (
+        await request(
+          `/v1/nodes/${f.node}/warm-reclaim-qualification`,
+          f.admin,
+          "PUT",
+          { expected_revision: 0, node_uid: uid, qualification },
+          qualifyKey,
+        )
+      ).status,
+    ).toBe(200);
+  }
+  if (options.policy !== false) {
+    const configure = await request(
+      `/v1/databases/${f.id}/warm-reclaim`,
+      f.admin,
+      "PUT",
+      { expected_revision: 0, expected_generation: 1, policy },
+    );
+    expect(configure.status).toBe(200);
+  }
   const size = await env.DB.prepare(
     "SELECT memory_mib FROM size_classes WHERE id=?",
   )
@@ -294,6 +320,34 @@ async function snapshot(f: Awaited<ReturnType<typeof qualified>>) {
   const r = await request(`/agent/v1/nodes/${f.node}/reclaim`, f.agent);
   expect(r.status).toBe(200);
   return ReclaimIntentSnapshot.parse(await r.json());
+}
+/**
+ * One poll of the reclaim route under a fake clock. A poll with nothing to deliver is held for
+ * about 3.5 s; this steps the clock through that in 100 ms and reports how long the answer was
+ * held, without waiting for it. `skewMs` moves the clock forward before the request.
+ */
+async function poll(node: string, key: string, skewMs = 0) {
+  const real = globalThis.setTimeout;
+  const tick = () => new Promise<void>((resolve) => real(resolve, 1));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  try {
+    if (skewMs) vi.setSystemTime(Date.now() + skewMs);
+    const arrived = Date.now();
+    let response: Response | undefined;
+    const pending = request(`/agent/v1/nodes/${node}/reclaim`, key).then(
+      (value) => (response = value),
+    );
+    // D1 answers in real time; a hold shows as a pending fake timer.
+    for (let i = 0; i < 5000 && !response && vi.getTimerCount() === 0; i++)
+      await tick();
+    let held = 0;
+    for (; vi.getTimerCount() > 0 && held < 6000; held += 100)
+      await vi.advanceTimersByTimeAsync(100);
+    await pending;
+    return { response: response!, heldMs: held, arrived };
+  } finally {
+    vi.useRealTimers();
+  }
 }
 async function ack(
   f: Awaited<ReturnType<typeof qualified>>,
@@ -391,9 +445,7 @@ it("policy and qualification commits wait for the existing reclaim revocation ac
 });
 it("keeps cold idle behavior until explicit policy and isolated-node qualification exist", async () => {
   const f = await ready();
-  expect(
-    (await request(`/agent/v1/nodes/${f.node}/reclaim`, f.agent)).status,
-  ).toBe(404);
+  expect((await poll(f.node, f.agent)).response.status).toBe(404);
   expect(
     (
       await request(`/v1/databases/${f.id}/warm-reclaim`, f.integrator, "PUT", {
@@ -525,9 +577,7 @@ it("persists a lost-revocation barrier across eviction and only uses lease expir
 }, 10000);
 it("invalidates changed runtime and refuses another region or a control-plane qualification", async () => {
   const f = await qualified();
-  expect(
-    (await request(`/agent/v1/nodes/${f.node}/reclaim`, f.foreignAgent)).status,
-  ).toBe(404);
+  expect((await poll(f.node, f.foreignAgent)).response.status).toBe(404);
   await actor(f.id).requestIdle(f.id, 1);
   await request(
     "/agent/v1/observations",
@@ -551,9 +601,7 @@ it("invalidates changed runtime and refuses another region or a control-plane qu
   )
     .bind(f.node)
     .run();
-  expect(
-    (await request(`/agent/v1/nodes/${f.node}/reclaim`, f.agent)).status,
-  ).toBe(404);
+  expect((await poll(f.node, f.agent)).response.status).toBe(404);
   const token = await actor(f.id).reclaimIntent(f.id);
   expect((await signed(token!)).mode).toBe("revoked");
   expect(
@@ -606,4 +654,198 @@ it("authenticates the qualified node before accepting a bounded observation body
   };
   expect((await call(f.agent)).status).toBe(200);
   expect((await call("invalid")).status).toBe(401);
+});
+
+// The host asks again 250 ms after every answer and gives up after 5 s, so a poll with nothing in
+// it is held for 3 to 4 s and, once the node is known to be unqualified, answered without D1.
+const HOLD_FROM_MS = 3000,
+  HOLD_TO_MS = 4000,
+  RECLAIM_HOLD_MS = 3500;
+it("holds the poll of an unqualified node and then answers it without a D1 statement", async () => {
+  const f = await ready();
+  const first = await poll(f.node, f.agent);
+  expect(first.response.status).toBe(404);
+  expect(first.heldMs).toBeGreaterThanOrEqual(HOLD_FROM_MS);
+  expect(first.heldMs).toBeLessThanOrEqual(HOLD_TO_MS);
+  // A held request waits on a timer: nothing is read before, during or after it.
+  const next = await countStatements(() => poll(f.node, f.agent));
+  expect(next.statements).toBe(0);
+  expect(next.result.response.status).toBe(404);
+  expect(next.result.heldMs).toBeGreaterThanOrEqual(HOLD_FROM_MS);
+  expect(next.result.heldMs).toBeLessThanOrEqual(HOLD_TO_MS);
+});
+
+it("never holds a refusal", async () => {
+  const f = await ready();
+  const wrong = await poll(f.node, f.admin);
+  expect(wrong.response.status).toBe(401);
+  expect(wrong.heldMs).toBe(0);
+  const malformed = await poll("not-a-node", f.agent);
+  expect(malformed.response.status).toBeGreaterThanOrEqual(400);
+  expect(malformed.heldMs).toBe(0);
+});
+
+it("answers at once whatever a policy may still deliver", async () => {
+  const f = await qualified();
+  // A policy and no token yet: the answer is empty, and not held.
+  const waiting = await poll(f.node, f.agent);
+  expect(waiting.response.status).toBe(200);
+  expect(waiting.heldMs).toBe(0);
+  expect(
+    ReclaimIntentSnapshot.parse(await waiting.response.json()).tokens,
+  ).toEqual([]);
+  // A token to deliver.
+  expect((await actor(f.id).requestIdle(f.id, 1)).ok).toBe(true);
+  const delivering = await poll(f.node, f.agent);
+  expect(delivering.response.status).toBe(200);
+  expect(delivering.heldMs).toBe(0);
+  expect(
+    ReclaimIntentSnapshot.parse(await delivering.response.json()).tokens,
+  ).toHaveLength(1);
+});
+
+it("holds the empty snapshot of a qualified node without a policy and stamps it after the hold", async () => {
+  const f = await qualified({ policy: false });
+  const result = await poll(f.node, f.agent);
+  expect(result.response.status).toBe(200);
+  expect(result.heldMs).toBeGreaterThanOrEqual(HOLD_FROM_MS);
+  expect(result.heldMs).toBeLessThanOrEqual(HOLD_TO_MS);
+  const snapshot = ReclaimIntentSnapshot.parse(await result.response.json());
+  expect(snapshot.tokens).toEqual([]);
+  // What the host checks: issued within a second of its clock, expiring within two of the issue.
+  expect(snapshot.issued_at - result.arrived).toBeGreaterThanOrEqual(
+    HOLD_FROM_MS,
+  );
+  expect(snapshot.expires_at - snapshot.issued_at).toBeLessThanOrEqual(2000);
+});
+
+it("holds at most a bounded number of polls and answers the rest at once", async () => {
+  const f = await ready();
+  expect((await poll(f.node, f.agent)).response.status).toBe(404);
+  const real = globalThis.setTimeout;
+  const tick = () => new Promise<void>((resolve) => real(resolve, 1));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  // Past the warm-up poll's hold, which a clock stepped through left ahead of the real one.
+  vi.setSystemTime(Date.now() + 4000);
+  const answered: number[] = [];
+  const polls = Array.from({ length: 80 }, () =>
+    request(`/agent/v1/nodes/${f.node}/reclaim`, f.agent).then((response) => {
+      answered.push(response.status);
+    }),
+  );
+  for (let i = 0; i < 2000 && answered.length < 80 - 64; i++) await tick();
+  // The held ones wait on their timers; the others came back without waiting for the clock.
+  expect(answered.length).toBe(80 - 64);
+  expect(vi.getTimerCount()).toBe(64);
+  await vi.advanceTimersByTimeAsync(HOLD_TO_MS);
+  await Promise.all(polls);
+  expect(answered).toHaveLength(80);
+  expect(new Set(answered)).toEqual(new Set([404]));
+});
+
+it("shows a qualification at once to the isolate that made it", async () => {
+  let early = 0;
+  const f = await qualified({
+    before: async (ready) => {
+      early = (await poll(ready.node, ready.agent)).response.status;
+    },
+  });
+  expect(early).toBe(404);
+  // The unqualified answer of a moment ago does not outlive the grant that ended it.
+  const now = await poll(f.node, f.agent);
+  expect(now.response.status).toBe(200);
+  expect(now.heldMs).toBe(0);
+});
+
+it("shows a qualification another isolate made within the cache bound", async () => {
+  let early = 0,
+    learned = 0;
+  const f = await qualified({
+    viaSql: true,
+    before: async (ready) => {
+      learned = Date.now();
+      early = (await poll(ready.node, ready.agent)).response.status;
+    },
+  });
+  expect(early).toBe(404);
+  // A second after the answer was learned: still the cached answer, since nothing here can know
+  // of a write another isolate made.
+  const within = await poll(f.node, f.agent, learned + 1000 - Date.now());
+  expect(within.response.status).toBe(404);
+  // Ten seconds on, the node is read again and found qualified.
+  const later = await poll(f.node, f.agent, learned + 10_000 - Date.now());
+  expect(later.response.status).toBe(200);
+});
+
+it("does not remember an unqualified answer that a qualification overtook", async () => {
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
+  const prepare = prototype.prepare;
+  let release!: () => void,
+    reached!: () => void,
+    armed = false;
+  const gate = new Promise<void>((resolve) => (release = resolve)),
+    atGate = new Promise<void>((resolve) => (reached = resolve));
+  const gated = (statement: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind")
+          return (...values: unknown[]) => gated(target.bind(...values));
+        if (property === "first")
+          return async (...args: unknown[]) => {
+            const row = await Reflect.apply(
+              Reflect.get(target, property) as (...a: unknown[]) => unknown,
+              target,
+              args,
+            );
+            reached();
+            await gate;
+            return row;
+          };
+        const value = Reflect.get(target, property) as unknown;
+        return typeof value === "function"
+          ? (value as (...a: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    });
+  // The poll's own read of the node answers "no qualification" and then waits, before it can
+  // remember that answer, while the qualification is written.
+  vi.spyOn(prototype, "prepare").mockImplementation(function (
+    this: D1Database,
+    sql: string,
+  ) {
+    const statement = prepare.call(this, sql);
+    if (
+      armed &&
+      sql.startsWith(
+        "SELECT n.region_id,n.node_uid,n.warm_reclaim_qualification_json",
+      )
+    ) {
+      armed = false;
+      return gated(statement);
+    }
+    return statement;
+  });
+  let early: Promise<Response> | undefined;
+  const f = await qualified({
+    before: async (unqualifiedNode) => {
+      armed = true;
+      early = request(
+        `/agent/v1/nodes/${unqualifiedNode.node}/reclaim`,
+        unqualifiedNode.agent,
+      );
+      await atGate;
+    },
+  });
+  const real = globalThis.setTimeout;
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  release();
+  for (let i = 0; i < 5000 && vi.getTimerCount() === 0; i++)
+    await new Promise((r) => real(r, 1));
+  expect(vi.getTimerCount()).toBe(1);
+  await vi.advanceTimersByTimeAsync(RECLAIM_HOLD_MS);
+  expect((await early!).status).toBe(404);
+  vi.useRealTimers();
+  const next = await poll(f.node, f.agent);
+  expect(next.response.status).toBe(200);
+  expect(next.heldMs).toBe(0);
 });

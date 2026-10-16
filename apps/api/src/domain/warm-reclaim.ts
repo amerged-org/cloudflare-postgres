@@ -18,6 +18,7 @@ import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
 import { agentRegion } from "./agent-auth.ts";
+import { IsolateCache } from "./isolate-cache.ts";
 import {
   loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
@@ -60,6 +61,51 @@ const closed = (): never => {
     "Current qualified isolated worker authority is unavailable or changed",
   );
 };
+
+/**
+ * The host polls `GET /agent/v1/nodes/{id}/reclaim` again 250 ms after each answer
+ * (apps/sandbox-controller/src/reclaim_inventory.rs, `run`), and its HTTP client gives up after 5 s
+ * (policy.rs, `Client::new`). A node with nothing to deliver would therefore cost this Worker a
+ * request three to four times a second, each answering "nothing". Such an answer is held until this
+ * long after the request arrived instead: the poll becomes one request per 3.75 s, and a held
+ * request waits on a timer, which costs no D1 read and no CPU. The 1.5 s that remain are for the
+ * network, a cold isolate and the reads that precede the hold; the hold is counted from the
+ * request's arrival, so a slow read shortens it rather than adding to it.
+ *
+ * The host takes a 200 only when `issued_at` is within one second of its own clock and
+ * `expires_at` is at most two seconds after `issued_at` (the checks in `run`), so the empty
+ * snapshot of a qualified node is stamped after the hold. An answer with something in it, a token
+ * or a policy that may yield one, is never held, and neither is a refusal.
+ */
+export const RECLAIM_IDLE_HOLD_MS = 3_500;
+/** The most polls one isolate holds at once; a poll beyond it is answered at once, as it was. */
+const RECLAIM_MAX_HELD = 64;
+/**
+ * How long this isolate answers "unqualified" for a node without asking D1 again. Only that
+ * negative is kept: a qualification is always read, so revoking one takes effect on the next poll,
+ * and granting one is seen at once by the isolate that grants it (`setWarmReclaimQualification`)
+ * and within this long by every other, which fails closed (no reclaim) meanwhile. With the hold's
+ * 3.75 s between polls, a grant reaches a node within about 9 s in the worst case.
+ */
+const RECLAIM_UNQUALIFIED_CACHE_MS = 5_000;
+const unqualified = new IsolateCache<true>(RECLAIM_UNQUALIFIED_CACHE_MS, 256);
+/** Counts the qualifications this isolate has written, so a read they overtook is not kept. */
+let qualificationWrites = 0;
+/**
+ * Deadlines of the polls this isolate holds now. A cancelled request never gets to remove its own,
+ * so a deadline that has passed, or lies further off than a hold lasts, no longer counts.
+ */
+const holding: number[] = [];
+async function holdIdlePoll(arrived: number) {
+  const now = Date.now(),
+    until = arrived + RECLAIM_IDLE_HOLD_MS;
+  for (let i = holding.length - 1; i >= 0; i--)
+    if (holding[i]! <= now || holding[i]! > now + RECLAIM_IDLE_HOLD_MS)
+      holding.splice(i, 1);
+  if (until <= now || holding.length >= RECLAIM_MAX_HELD) return;
+  holding.push(until);
+  await new Promise<void>((resolve) => setTimeout(resolve, until - now));
+}
 interface WarmNodeRow {
   region_id: string;
   node_uid: string;
@@ -422,6 +468,9 @@ export async function setWarmReclaimQualification(
       )
         .bind(id)
         .first<{ region_id: string }>();
+      // This isolate's poll sees the change on its next request; another isolate's within the cache.
+      qualificationWrites++;
+      if (node) unqualified.delete(`${node.region_id}:${id}`);
       if (node && affected.length)
         c.executionCtx.waitUntil(
           c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(node.region_id))
@@ -443,14 +492,32 @@ export async function authenticateReclaimRequest(c: ApiContext, id: string) {
   return { region, node };
 }
 export async function getReclaimIntents(c: ApiContext, id: string) {
-  const { region, node } = await authenticateReclaimRequest(c, id);
-  const issued = Date.now(),
-    rows = await c.env.DB.prepare(
-      "SELECT id FROM databases WHERE node_id=? AND region_id=? AND deleted_at IS NULL AND warm_reclaim_policy_json IS NOT NULL ORDER BY id LIMIT ?",
-    )
-      .bind(id, region.id, RECLAIM_LIMITS.max_tasks + 1)
-      .all<{ id: string }>();
+  const arrived = Date.now(),
+    region = await agentRegion(c),
+    key = `${region.id}:${id}`;
+  let node: Awaited<ReturnType<typeof approvedNode>> = null;
+  if (unqualified.get(key) === undefined) {
+    const writes = qualificationWrites;
+    node = await approvedNode(c.env, id, region.id);
+    // A qualification written while this read ran may not be in it: the answer stands, not its memory.
+    if (!node && writes === qualificationWrites) unqualified.set(key, true);
+  }
+  if (!node) {
+    await holdIdlePoll(arrived);
+    throw new ApiError(
+      "not_found",
+      "Current warm reclaimer qualification unavailable",
+    );
+  }
+  const rows = await c.env.DB.prepare(
+    "SELECT id FROM databases WHERE node_id=? AND region_id=? AND deleted_at IS NULL AND warm_reclaim_policy_json IS NOT NULL ORDER BY id LIMIT ?",
+  )
+    .bind(id, region.id, RECLAIM_LIMITS.max_tasks + 1)
+    .all<{ id: string }>();
   if (rows.results.length > RECLAIM_LIMITS.max_tasks) closed();
+  // No database of the node has a policy: nothing can be delivered, so wait, then stamp the answer.
+  if (rows.results.length === 0) await holdIdlePoll(arrived);
+  const issued = Date.now();
   const tokens: string[] = [];
   for (const row of rows.results) {
     const token = await c.env.DATABASE_ACTOR.get(

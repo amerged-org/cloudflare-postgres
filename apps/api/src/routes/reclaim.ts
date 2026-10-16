@@ -8,6 +8,7 @@ import {
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import {
+  RECLAIM_IDLE_HOLD_MS,
   WarmReclaimPolicyState,
   WarmReclaimPolicyUpdate,
   WarmReclaimQualificationState,
@@ -34,6 +35,11 @@ function route(
       method,
       path,
       tags: ["Warm reclaim"],
+      ...(agent && method === "get"
+        ? {
+            description: `A poll with nothing to deliver is answered ${RECLAIM_IDLE_HOLD_MS / 1000} s after it arrived, the refusal of a node without a current qualification (404) included; a client's timeout must exceed that.`,
+          }
+        : {}),
       security: [agent ? { AgentBearer: [] } : { bearerAuth: [] }],
       request: {
         params: z.object({ id }),
