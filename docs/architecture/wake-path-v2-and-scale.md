@@ -322,6 +322,19 @@ Status (branch `golive/identity-turn`, tested against the Dev fixture, not deplo
   R2.14, `thin_storage_turn_requested` (a sample asked for a turn, with the waiting holds), the cold wake's
   `volume_identity` phase and create to ready. (c) is done in the Actor (`actor_claim_waited`, `actor_claim_refused`); (d) is open.
 
+Measured after the deploys of 2026-10-16 (API from `0a5cb81` and `d4cff9f`) [M]: total API requests per
+second fell from 8.8 to 1.5 and each node's reclaim poll from about 3.2/s to 0.23/s (the 3.5 s hold);
+an identity turn takes 18.6–29 s instead of 47 s (six sequential relay connections and 22 commands, first
+turns after the deploy 29 s, then 21 s and 19 s); a cold wake of a thin database took 20.5 s instead of
+44 s (the turn is requested when a start waits: `thin_storage_turn_requested`). The new
+`actor_claim_refused` event then named the cause of the 57P03 class: `blocked_by: thin_identity_behind`
+with `volume_bound: true, volume_current: false`. A sleep bumps `databases.generation` without touching the
+Pod or the volume, and the wake predicate demands a node proof that lists the volume at the CURRENT
+generation, so every wake of a parked database within one proof interval after its sleep waits for a proof
+that cannot show anything new (the claim wait turned the refusal into a 15–17 s hold; 1.24 s only when a
+proof happened to land in between). Fix (W9): accept the proof entry at the newest start generation while
+every generation since is a pure power transition that kept the Pod and volume; everything else stays strict.
+
 ### 4.9 W8 client handshake after the wake (CLI proxy, driver, gateway)
 
 Everything the client does after the socket opens is paid at the client's round-trip time. Neon's
