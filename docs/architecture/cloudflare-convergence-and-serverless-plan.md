@@ -145,6 +145,25 @@ turn (`3b1a7cc`, API only: the first failure of a turn with demand retries at th
 itself takes 18.8 s (6 relay connections), so the floor of a cold thin wake stays near 25 s until the
 identity proof is read inside the cluster.
 
+**Measured on R2.16 (2026-10-16, controller with the 250 ms first retry and the identity-turn retry; same database):**
+parked first query 1.51 s, 1.56 s, then a 30 s failure (08006), 10.6 s and 4.9 s. The 2 s stall of R2.15 is
+gone from the rounds that met a parked Pod (1.5 s, of which the node chain is 0.27 s). The bad rounds met a
+database whose parked Pod the controller had demoted about 80 s after parking (`park_demotion` reason
+`identity`, which makes the next wake a cold one; the event carries the failing fact from the next release).
+The cold thin wake has a second cause: after `volume_identity` went pending the controller ran no pass for
+exactly 30 s although the identity proof was accepted 18 s into the wait, because the passes that CNPG's Pod
+changes cause while the Pod is created had used up the not-ready backoff (fixed: a pending wake polls each
+second for its first minute). And the new `wake_path` event says why the wake never takes the lean path
+(publishing on the barrier, no wait for the kubelet): `blocked_by: no_admission`. The release specs since R2.11
+declare only `route_token_version: 3`; route token v4, runtime attestation v2 and the admission snapshot
+(`docs/operations/operator-installation.md`, Route tokens) have never been active live, so the controller's
+barrier publication and the Actor's verified-target admission are untested outside the in-process world.
+The next release declares them (`route_token_version: 4`, `runtime_attestation_version: 2`,
+`admission_snapshot_version: 1`).
+Tried and reverted: constraining the NodeBootstrap container to `WEUR` (`containers[].constraints.regions`)
+made the identity turn slower (20.9 to 22.3 s, 7 turns, against 17.9 to 18.8 s in the default placement), so
+the 18 s is not distance to the container; the floor of a turn is its four sequential relay steps.
+
 **Language.** It is not what limits the wake. A parked wake issues about 100–145 Kubernetes requests,
 which cost 11–14 ms of CPU in Rust, 22 ms in Go and 28 ms in Node on a laptop (at most 3–5 % of
 0.8–1.9 s); Xata's Go gateway and operators show the same 1.1–1.25 s mode as PGCF's projection, and
