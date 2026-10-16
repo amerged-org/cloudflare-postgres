@@ -184,6 +184,11 @@ struct Fixture {
     gateway: Arc<Gateway>,
     port: u16,
     calls: Arc<AtomicUsize>,
+    /// A second handle on every socket the gateway accepts once `observe` is set, to read what it
+    /// set on them. A second handle keeps the connection open after the gateway closes its own,
+    /// so it is held only by a test that asks for it.
+    accepted: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
+    observe: Arc<std::sync::atomic::AtomicBool>,
     upstream: mpsc::Receiver<Vec<u8>>,
     /// Per ended upstream session: true when the gateway ended TLS with close_notify.
     closes: mpsc::Receiver<bool>,
@@ -284,11 +289,17 @@ impl Fixture {
         });
         let run = gateway.clone();
         let mut shutdown = receiver.clone();
+        let accepted: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> = Arc::default();
+        let observers = accepted.clone();
+        let observe: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let observing = observe.clone();
         let gateway_task = tokio::spawn(async move {
             let pending = Arc::new(Semaphore::new(128));
             let mut tasks = tokio::task::JoinSet::new();
             loop {
-                tokio::select! {_=shutdown.changed()=>break,accepted=listener.accept()=>{let(socket,_)=accepted.unwrap();let(gateway,receiver,permit)=(run.clone(),shutdown.clone(),pending.clone().acquire_owned().await.unwrap());tasks.spawn(async move{let _=transport::serve_socket(socket,gateway,receiver,permit).await;});}}
+                tokio::select! {_=shutdown.changed()=>break,accepted=listener.accept()=>{let(socket,_)=accepted.unwrap();
+                let socket=if observing.load(Ordering::SeqCst){let std=socket.into_std().unwrap();observers.lock().unwrap().push(std.try_clone().unwrap());TcpStream::from_std(std).unwrap()}else{socket};
+                let(gateway,receiver,permit)=(run.clone(),shutdown.clone(),pending.clone().acquire_owned().await.unwrap());tasks.spawn(async move{let _=transport::serve_socket(socket,gateway,receiver,permit).await;});}}
             }
             tasks.abort_all();
         });
@@ -296,6 +307,8 @@ impl Fixture {
             gateway,
             port,
             calls,
+            accepted,
+            observe,
             upstream: received,
             closes,
             stop,
@@ -516,8 +529,95 @@ async fn native_http_activity_and_quiescence_match_authorized_pod_revision_and_i
     fixture.stop().await;
 }
 #[tokio::test]
-async fn startup_binding_is_checked_before_the_real_tls_dial() {
+async fn every_socket_cloudflared_opened_sends_without_waiting_for_an_acknowledgement() {
+    // The gateway answers a client in several small writes (the answer to SSLRequest, a pong, the
+    // pieces of a result), and a write that waits for the acknowledgement of the one before it
+    // meets the peer's delayed acknowledgement: a stall of about 40 ms on Linux.
     let fixture = Fixture::new().await;
+    fixture.observe.store(true, Ordering::SeqCst);
+    let _client = fixture.connect(2).await;
+    {
+        let accepted = fixture.accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(
+            accepted[0].nodelay().unwrap(),
+            "TCP_NODELAY is not set on the accepted socket"
+        );
+    }
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn postgres_is_dialled_when_the_route_is_admitted_and_not_when_the_startup_message_arrives() {
+    // The route names the database, the user and the Pod, so nothing the StartupMessage says
+    // changes where PostgreSQL is dialled: the dial overlaps the client's own round trips to it.
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.connect(3).await;
+    timeout(Duration::from_secs(5), async {
+        while fixture.calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the dial begins with the admission");
+    // Dialled, and not a byte sent: PostgreSQL has heard nothing of the client yet.
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err()
+    );
+    // The StartupMessage then goes to the connection that is there: no second dial.
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn what_postgresql_answers_in_one_piece_reaches_the_client_as_one_message() {
+    // The greeting (authentication ok, then ReadyForQuery) is one burst of the server, and each
+    // WebSocket message is flushed on its own: a burst split into messages would cost the client
+    // a read per piece, and one flush per piece.
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.connect(3).await;
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    fixture.upstream.recv().await.unwrap();
+    timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    client
+        .send(Message::Binary(b"p\0\0\0\x0aopaque".to_vec().into()))
+        .await
+        .unwrap();
+    let greeting = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert_eq!(
+        &greeting[..],
+        [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I']
+    );
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_startup_that_is_not_the_route_s_reaches_postgres_as_not_one_byte() {
+    let mut fixture = Fixture::new().await;
     let mut client = fixture.connect(3).await;
     client
         .send(Message::Binary(startup("wrong_role").into()))
@@ -530,7 +630,12 @@ async fn startup_binding_is_checked_before_the_real_tls_dial() {
         .unwrap()
         .into_data();
     assert!(String::from_utf8_lossy(&error).contains("28000"));
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "bytes of a client whose startup is not its route's reached PostgreSQL"
+    );
     fixture.stop().await;
 }
 #[tokio::test]
@@ -954,8 +1059,17 @@ async fn a_route_dials_only_its_admitted_revision_and_verified_pod() {
     }
     fixture.intent("running", 2, true).await;
     assert_eq!(fixture.upgrade(&route_token(903)).await.err(), Some(503));
-    assert!(fixture.upgrade(&routed(904, 2, &cid(200))).await.is_ok());
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    let admitted = fixture.upgrade(&routed(904, 2, &cid(200))).await.unwrap();
+    // One dial for each route that was admitted, none for the routes that were refused.
+    timeout(Duration::from_secs(5), async {
+        while fixture.calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    drop(admitted);
     fixture.stop().await;
 }
 #[tokio::test]
@@ -980,7 +1094,9 @@ async fn a_writer_replaced_after_admission_is_never_dialled() {
         .unwrap()
         .into_data();
     assert!(String::from_utf8_lossy(&error).contains("08006"));
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    // The writer admitted was dialled when it was admitted, and no replacement was: nothing
+    // reached either of them.
+    assert!(fixture.calls.load(Ordering::SeqCst) <= 1);
     assert!(
         timeout(Duration::from_millis(150), fixture.upstream.recv())
             .await
@@ -1530,7 +1646,7 @@ async fn an_established_session_on_an_unready_writer_closes_when_the_fence_leave
 }
 #[tokio::test]
 async fn a_writer_replaced_between_admission_and_dial_is_not_dialled_on_the_unready_path() {
-    let fixture = Fixture::with_fences(attested_fence()).await;
+    let mut fixture = Fixture::with_fences(attested_fence()).await;
     unready_wake(&fixture, true).await;
     let mut client = fixture
         .upgrade(&admitted(996, 1, &cid(200), 19))
@@ -1555,7 +1671,14 @@ async fn a_writer_replaced_between_admission_and_dial_is_not_dialled_on_the_unre
         .unwrap()
         .into_data();
     assert!(String::from_utf8_lossy(&error).contains("08006"));
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    // The writer admitted was dialled when it was admitted, and no replacement was: nothing of the
+    // client reached either of them.
+    assert!(fixture.calls.load(Ordering::SeqCst) <= 1);
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err()
+    );
     fixture.stop().await;
 }
 /// One plain HTTP request to the gateway: the status and the body.

@@ -64,6 +64,7 @@ impl Default for Admission {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabaseTarget {
     pub database: String,
     pub host: String,
@@ -284,6 +285,10 @@ pub async fn serve_socket(
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), Failure> {
     let received = Instant::now();
+    // The gateway answers a client in several small writes: the answer to SSLRequest, a pong, the
+    // pieces of a result. A write that waits for the acknowledgement of the one before it meets
+    // the peer's delayed acknowledgement, a stall of about 40 ms.
+    let _ = socket.set_nodelay(true);
     let head = match timeout(Duration::from_secs(10), control::read_head(&mut socket)).await {
         Ok(Ok(head)) => head,
         _ => return control::reply_text(&mut socket, 400, "Bad Request\n").await,
@@ -413,6 +418,11 @@ pub async fn serve_socket(
     };
     let id = lease.id.clone();
     let session = lease;
+    // The route names the database, the user and the Pod, so nothing the StartupMessage says
+    // changes where PostgreSQL is dialled: the dial overlaps the client's own round trips to it
+    // (the upgrade, the answer to SSLRequest, the StartupMessage). Not a byte is sent before the
+    // StartupMessage has been checked against the route and the fence.
+    let mut early = early_dial(&gateway, &claims, &target).await;
     let stream = BudgetedStream::new(socket, head.prefix, head.end, wire.clone(), base);
     let config = WebSocketConfig::default()
         .read_buffer_size(4096)
@@ -432,7 +442,7 @@ pub async fn serve_socket(
     stages.accepted = Some(Instant::now());
     drop(handshake_permit);
     let result = tokio::select! {
-        result=timeout(STARTUP_BOUND,startup(&mut websocket,&claims,&session,epoch,&mut stages))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        result=timeout(STARTUP_BOUND,startup(&mut websocket,&claims,&session,epoch,&mut stages,&mut early))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
         _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
@@ -559,6 +569,7 @@ async fn startup(
     session: &SessionLease,
     epoch: (u64, u64),
     stages: &mut Stages,
+    early: &mut Option<EarlyDial>,
 ) -> Result<(TlsStream<TcpStream>, Vec<u8>, Vec<Lease>, Vec<u8>), Failure> {
     let gateway = &*session.gateway;
     let id = &session.id;
@@ -680,20 +691,20 @@ async fn startup(
                         .lock()
                         .unwrap()
                         .update(id, false, true, true);
-                    let target = DatabaseTarget {
-                        host: admitted
-                            .as_ref()
-                            .map(|target| target.tls_server_name.clone())
-                            .unwrap_or_else(|| format!("database-rw.pgcf-db-{database}.svc")),
-                        ca_sha256: admitted.map(|target| target.ca_sha256),
-                        database: database.clone(),
-                        port: 5432,
-                        address: bound.address,
-                        pod_uid: bound.pod_uid.clone(),
+                    let target = database_target(&database, bound, admitted);
+                    // The dial that began with the admission is this one if it was for this target;
+                    // a target that changed since is dialled anew, and the old connection is
+                    // dropped unused.
+                    let (dialed, took) = match early.take() {
+                        Some(early) if early.target == target => early.finish().await,
+                        other => {
+                            drop(other);
+                            let dialing = Instant::now();
+                            let dialed = gateway.dial.dial(&target).await;
+                            (dialed, dialing.elapsed())
+                        }
                     };
-                    let dialing = Instant::now();
-                    let dialed = gateway.dial.dial(&target).await;
-                    stages.dial = Some(dialing.elapsed());
+                    stages.dial = Some(took);
                     let mut postgres =
                         dialed.inspect_err(|_| stages.outcome = "postgres_connect_error")?;
                     let state = gateway.fences.read().await;
@@ -712,6 +723,83 @@ async fn startup(
             }
         }
     }
+}
+/// The PostgreSQL a route is dialled at: the Pod it names, under the TLS name and authority the
+/// fence admitted for it (a v4 route), or the database's Service name.
+fn database_target(
+    database: &str,
+    bound: &TargetIdentity,
+    admitted: Option<crate::kubernetes::AdmissionTarget>,
+) -> DatabaseTarget {
+    DatabaseTarget {
+        host: admitted
+            .as_ref()
+            .map(|target| target.tls_server_name.clone())
+            .unwrap_or_else(|| format!("database-rw.pgcf-db-{database}.svc")),
+        ca_sha256: admitted.map(|target| target.ca_sha256),
+        database: database.into(),
+        port: 5432,
+        address: bound.address,
+        pod_uid: bound.pod_uid.clone(),
+    }
+}
+/// A dial of PostgreSQL that began when the route was admitted: the connection is TLS-verified and
+/// has had no byte of the client written to it.
+struct EarlyDial {
+    target: DatabaseTarget,
+    task: tokio::task::JoinHandle<(Result<TlsStream<TcpStream>, Failure>, Duration)>,
+}
+impl EarlyDial {
+    /// The connection, or why there is none, and how long the dial itself took.
+    async fn finish(mut self) -> (Result<TlsStream<TcpStream>, Failure>, Duration) {
+        match (&mut self.task).await {
+            Ok(dialed) => dialed,
+            Err(_) => (Err("PostgreSQL dial ended".into()), Duration::ZERO),
+        }
+    }
+}
+impl Drop for EarlyDial {
+    /// A connection that ends before its StartupMessage takes the dial with it.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+/// Starts the dial of the writer a route was admitted for, if it is still the writer.
+async fn early_dial(
+    gateway: &Arc<Gateway>,
+    claims: &RouteClaims,
+    bound: &TargetIdentity,
+) -> Option<EarlyDial> {
+    let admitted = if claims.v == 4 {
+        gateway
+            .fences
+            .read()
+            .await
+            .records
+            .get(&claims.db)
+            .and_then(|fence| fence.admission_target.clone())
+    } else {
+        None
+    };
+    // The route was checked against this writer; a replacement is never dialled.
+    if !gateway
+        .targets
+        .read()
+        .await
+        .permits(&claims.db, bound, control::now())
+    {
+        return None;
+    }
+    let target = database_target(&claims.db, bound, admitted);
+    let (dialer, wanted) = (gateway.clone(), target.clone());
+    Some(EarlyDial {
+        target,
+        task: tokio::spawn(async move {
+            let began = Instant::now();
+            let dialed = dialer.dial.dial(&wanted).await;
+            (dialed, began.elapsed())
+        }),
+    })
 }
 fn certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
