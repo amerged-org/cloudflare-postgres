@@ -884,21 +884,6 @@ it("a wake claim whose row keeps moving is tried three times, then refused", asy
   expect(await wakeOperations(f.id)).toBe(0);
 });
 
-it("a wake claim the commit refuses with its row unmoved is not tried again", async () => {
-  const f = await ready();
-  await idle(f);
-  // No startup headroom: the commit refuses whatever version the row has.
-  await env.DB.prepare("UPDATE nodes SET schedulable=0 WHERE id=?")
-    .bind(f.node)
-    .run();
-  const seen = await observationsBeforeCommit(f.id, 0);
-  expect(
-    await actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 5000 }),
-  ).toEqual({ ok: false, sqlstate: "57P03" });
-  expect(seen.batches).toBe(1);
-  expect(await wakeOperations(f.id)).toBe(0);
-});
-
 it("a wake claim that lost its row after the caller's deadline is not tried again", async () => {
   const f = await ready();
   await idle(f);

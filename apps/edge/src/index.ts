@@ -5,8 +5,9 @@ import {
   parseRouteKeyring,
   signLegacyRouteToken,
   signRouteToken,
+  signWakeRouteToken,
 } from "@pgcf/contracts/route-token";
-import type { Env } from "./env.ts";
+import type { DatabaseWakeAdmission, Env } from "./env.ts";
 import { decoyResponse } from "./decoy.ts";
 import { connectGateway } from "./gateway.ts";
 import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
@@ -18,9 +19,11 @@ interface Hints {
 
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 interface Timings {
-  limiter_ms?: number;
-  ensure_awake_ms?: number;
-  database_limiter_ms?: number;
+  /** Both limiters, which run in parallel with the Actor's admission. */
+  limiters_ms?: number;
+  admit_ms?: number;
+  /** The route token version signed: v5 for a wake ticket. */
+  route?: "v5" | "v4" | "v3" | "v2";
   token_ms?: number;
   gateway_connect_ms?: number;
 }
@@ -68,20 +71,6 @@ async function admit(
   // Shared proxy networks must not couple unrelated database/role routes.
   // These untrusted hints scope admission; PostgreSQL authenticates the user.
   const key = JSON.stringify([hints.database, hints.user, network]);
-  let connectionAllowed: boolean;
-  const limiterStarted = Date.now();
-  try {
-    connectionAllowed = (await env.CONNECTION_RATE_LIMITER.limit({ key }))
-      .success;
-    timings.limiter_ms = Date.now() - limiterStarted;
-    check();
-    if (!connectionAllowed)
-      throw new AdmissionFailure("53300", "connection rate limit exceeded");
-  } catch (error) {
-    if (error instanceof AdmissionFailure) throw error;
-    throw new AdmissionFailure("53300", "connection admission unavailable");
-  }
-  check();
   const actor = env.DATABASE_ACTOR.get(
     env.DATABASE_ACTOR.idFromName(hints.database),
   );
@@ -92,19 +81,51 @@ async function admit(
         .catch(() => false),
     );
   signal.addEventListener("abort", cancel, { once: true });
-  let admitted;
-  const ensureStarted = Date.now();
+  // Both limiters and the Actor's admission run together: none of them waits for another. The
+  // per-database bucket therefore also counts connects that admission refuses.
+  const started = Date.now();
+  const limited = async (limiter: RateLimit, limitKey: string) =>
+    limiter.limit({ key: limitKey }).finally(() => {
+      timings.limiters_ms = Math.max(
+        timings.limiters_ms ?? 0,
+        Date.now() - started,
+      );
+    });
+  let results: [
+    PromiseSettledResult<RateLimitOutcome>,
+    PromiseSettledResult<RateLimitOutcome>,
+    PromiseSettledResult<DatabaseWakeAdmission>,
+  ];
   try {
     check();
-    admitted = await actor.ensureAwake(hints.database, hints.user, {
-      deadline,
-      waiterId: cid,
-    });
+    results = await Promise.allSettled([
+      limited(env.CONNECTION_RATE_LIMITER, key),
+      limited(env.DATABASE_CONNECTION_RATE_LIMITER, hints.database),
+      actor
+        .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
+        .finally(() => {
+          timings.admit_ms = Date.now() - started;
+        }),
+    ]);
   } finally {
-    timings.ensure_awake_ms = Date.now() - ensureStarted;
     signal.removeEventListener("abort", cancel);
   }
   check();
+  const [connectionLimit, databaseLimit, admission] = results;
+  if (
+    connectionLimit.status === "rejected" ||
+    databaseLimit.status === "rejected"
+  )
+    throw new AdmissionFailure("53300", "connection admission unavailable");
+  if (!connectionLimit.value.success)
+    throw new AdmissionFailure("53300", "connection rate limit exceeded");
+  if (!databaseLimit.value.success)
+    throw new AdmissionFailure(
+      "53300",
+      "database connection rate limit exceeded",
+    );
+  if (admission.status === "rejected") throw admission.reason;
+  const admitted = admission.value;
   if (!admitted.ok) {
     switch (admitted.sqlstate) {
       case "3D000":
@@ -134,23 +155,6 @@ async function admit(
     }
   }
   const route = admitted.region;
-  // Unknown hints must not consume a real database's shared admission bucket.
-  let databaseAllowed: boolean;
-  const databaseLimiterStarted = Date.now();
-  try {
-    databaseAllowed = (
-      await env.DATABASE_CONNECTION_RATE_LIMITER.limit({ key: hints.database })
-    ).success;
-    timings.database_limiter_ms = Date.now() - databaseLimiterStarted;
-  } catch {
-    throw new AdmissionFailure("53300", "connection admission unavailable");
-  }
-  check();
-  if (!databaseAllowed)
-    throw new AdmissionFailure(
-      "53300",
-      "database connection rate limit exceeded",
-    );
   const connection = {
     keyring: parseRouteKeyring(env.ROUTE_MASTER_KEYS),
     region: route.id,
@@ -158,12 +162,21 @@ async function admit(
     user: hints.user,
     cid,
   };
-  // The gateway dials only the admitted verified target. Temporary rollout compatibility
+  // A wake ticket is signed as route v5: the gateway holds the connection until its wake is
+  // released. The gateway dials only an admitted verified target. Temporary rollout compatibility
   // (route-token.ts): an admission without a verified target still receives a v2 route.
   const tokenStarted = Date.now();
-  const token = admitted.target
-    ? await signRouteToken({ ...connection, target: admitted.target })
-    : await signLegacyRouteToken(connection);
+  let token: string;
+  if ("wake" in admitted) {
+    timings.route = "v5";
+    token = await signWakeRouteToken({ ...connection, wake: admitted.wake });
+  } else if (admitted.target) {
+    timings.route = admitted.target.route_revision === undefined ? "v3" : "v4";
+    token = await signRouteToken({ ...connection, target: admitted.target });
+  } else {
+    timings.route = "v2";
+    token = await signLegacyRouteToken(connection);
+  }
   timings.token_ms = Date.now() - tokenStarted;
   check();
   const gatewayStarted = Date.now();

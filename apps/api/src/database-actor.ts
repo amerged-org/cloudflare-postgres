@@ -5,6 +5,7 @@ import {
   DatabaseId,
   DatabaseRegionRoute as RegionRoute,
   type DatabaseAdmission,
+  type DatabaseWakeAdmission,
   CnpgDatabaseTarget,
   RoleName,
   Timestamp,
@@ -20,6 +21,7 @@ import {
   DatabaseRuntimeAttestation,
   reclaimScopeFromRuntime,
 } from "@pgcf/contracts/reclaim";
+import { roleRevisionHash } from "@pgcf/contracts/route-token";
 import { nodeProofSigningKey } from "./domain/node-proof-session.ts";
 import {
   routeTokenV3Sql,
@@ -47,7 +49,10 @@ import {
   AdmissionMutationIntent,
   DatabaseAdmissionSnapshot,
 } from "./domain/admission-state.ts";
-import { withAdmissionMutation } from "./domain/admission-mutations.ts";
+import {
+  withAdmissionMutation,
+  type LocalAdmissionActor,
+} from "./domain/admission-mutations.ts";
 import { readDatabaseAdmissionSnapshot } from "./domain/database-admission-snapshot.ts";
 import {
   readWakeGuard,
@@ -79,6 +84,19 @@ const WAKE_GUARD_POLL_MS = 1000;
 const WAKE_GUARD_MARGIN_MS = 3000;
 /** Connects of one database that wait on the guard together; any further one is refused at once. */
 const WAKE_GUARD_WAITERS = 4;
+/**
+ * A wake ticket of a sleeping database (pool design 2026-10-16): the operation and generation its
+ * claim commits in D1, and the route revision and role hash the Edge signs into route v5 with it.
+ * Every connect of the same wake answers the same ticket, so the gateway coalesces them.
+ */
+interface WakeTicket {
+  operation: string;
+  generation: number;
+  route_revision: number;
+  role_revision_hash: string;
+  state: "pending" | "claimed" | "refused";
+  issued_at: number;
+}
 /**
  * A role the actor may admit: live in D1, with the time its credential stops being accepted.
  * A bare name (the form older persisted presence and seeds use) is a role without expiry.
@@ -214,6 +232,10 @@ export class DatabaseActor extends DurableObject<Env> {
   private waitStartedAt = 0;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private interruptPoll: (() => void) | undefined;
+  /** The admission mutation of the ticket claim in flight: its barrier does not refuse admitWake. */
+  private ticketMutation: string | undefined;
+  /** The ticket claim in flight, by operation; claims run one at a time. */
+  private claim: { operation: string; done: Promise<void> } | undefined;
   private admissionState() {
     if (!this.presence()) return undefined;
     this.ctx.storage.sql.exec(
@@ -904,6 +926,297 @@ export class DatabaseActor extends DurableObject<Env> {
     } catch {
       return { ok: false, sqlstate: "08006" };
     }
+  }
+  /**
+   * The Edge's admission (pool design 2026-10-16). It reads only this Actor's own state: an
+   * admissible snapshot answers its verified target, and an idle sleeper answers a wake ticket
+   * whose D1 claim runs after the answer, in the background. A snapshot that cannot say whether
+   * the database is wakeable takes ensureAwake, today's authoritative path.
+   */
+  async admitWake(
+    databaseId: unknown,
+    user: unknown,
+    options?: { deadline?: number; waiterId?: string },
+  ): Promise<DatabaseWakeAdmission> {
+    const id = DatabaseId.safeParse(databaseId),
+      role = RoleName.safeParse(user);
+    if (!id.success) return { ok: false, sqlstate: "3D000" };
+    if (!role.success) return { ok: false, sqlstate: "28P01" };
+    this.identity(id.data);
+    try {
+      const snapshot = this.admissionState()?.snapshot;
+      if (!snapshot?.cache_capable || snapshot.wakeable === undefined)
+        return await this.ensureAwake(id.data, role.data, options);
+      const failure = this.earlyAdmission(id.data, role.data);
+      if (failure) return failure;
+      if (
+        !(await this.revokeBeforeAdmission(
+          id.data,
+          Math.min(options?.deadline ?? Infinity, Date.now() + 30000),
+        ))
+      )
+        return { ok: false, sqlstate: "57P03" };
+      const state = this.admissionState()!;
+      if (state.barrier) {
+        if (state.barrier.mutation_id !== this.ticketMutation)
+          return { ok: false, sqlstate: "57P03" };
+      } else {
+        const admitted = this.snapshotAdmission(role.data);
+        if (admitted?.ok) return admitted;
+      }
+      const current = state.snapshot!;
+      if (current.deleted) return { ok: false, sqlstate: "3D000" };
+      if (!current.roles.some((value) => value.name === role.data))
+        return { ok: false, sqlstate: "28P01" };
+      let ticket = this.storedTicket();
+      const reused =
+        ticket !== undefined &&
+        ticket.state !== "refused" &&
+        ((ticket.generation === current.generation + 1 &&
+          current.wakeable === true) ||
+          (ticket.generation === current.generation && !current.admissible));
+      if (!reused) {
+        if (!current.wakeable) return { ok: false, sqlstate: "57P03" };
+        ticket = {
+          operation: newOperationId(),
+          generation: current.generation + 1,
+          route_revision: current.route_revision,
+          role_revision_hash: await roleRevisionHash(current.roles),
+          state: "pending",
+          issued_at: Date.now(),
+        };
+        this.saveTicket(ticket);
+      }
+      if (ticket!.state === "pending")
+        this.startClaim(id.data, role.data, ticket!);
+      console.log(
+        JSON.stringify({
+          event: "actor_ticket",
+          database_id: id.data,
+          operation: ticket!.operation,
+          generation: ticket!.generation,
+          reused,
+          at_ms: Date.now(),
+        }),
+      );
+      return {
+        ok: true,
+        region: current.region,
+        wake: {
+          operation: ticket!.operation,
+          generation: ticket!.generation,
+          route_revision: ticket!.route_revision,
+          role_revision_hash: ticket!.role_revision_hash,
+        },
+      };
+    } catch {
+      return { ok: false, sqlstate: "08006" };
+    }
+  }
+  private storedTicket(): WakeTicket | undefined {
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS database_ticket(singleton INTEGER PRIMARY KEY CHECK(singleton=1),operation TEXT NOT NULL,generation INTEGER NOT NULL,route_revision INTEGER NOT NULL,role_revision_hash TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('pending','claimed','refused')),issued_at INTEGER NOT NULL)",
+    );
+    return this.ctx.storage.sql
+      .exec<{
+        operation: string;
+        generation: number;
+        route_revision: number;
+        role_revision_hash: string;
+        state: WakeTicket["state"];
+        issued_at: number;
+      }>(
+        "SELECT operation,generation,route_revision,role_revision_hash,state,issued_at FROM database_ticket WHERE singleton=1",
+      )
+      .toArray()[0];
+  }
+  private saveTicket(ticket: WakeTicket): void {
+    this.storedTicket();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO database_ticket(singleton,operation,generation,route_revision,role_revision_hash,state,issued_at) VALUES(1,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET operation=excluded.operation,generation=excluded.generation,route_revision=excluded.route_revision,role_revision_hash=excluded.role_revision_hash,state=excluded.state,issued_at=excluded.issued_at",
+      ticket.operation,
+      ticket.generation,
+      ticket.route_revision,
+      ticket.role_revision_hash,
+      ticket.state,
+      ticket.issued_at,
+    );
+  }
+  /** Starts the ticket's claim unless it is already in flight; claims run one after another. */
+  private startClaim(id: string, user: string, ticket: WakeTicket): void {
+    if (this.claim?.operation === ticket.operation) return;
+    const previous = this.claim?.done ?? Promise.resolve();
+    const done: Promise<void> = previous
+      .then(() => this.claimTicket(id, user, ticket))
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.claim?.done === done) this.claim = undefined;
+      });
+    this.claim = { operation: ticket.operation, done };
+    this.ctx.waitUntil(done);
+  }
+  /**
+   * The D1 claim of a ticket, after its answer: the wake transition at the ticket's generation
+   * with the ticket's operation, then the region hint. It never waits for a guard: a ticket D1
+   * refuses is refused, and the region is told at once so the controller refutes it.
+   */
+  private async claimTicket(
+    id: string,
+    user: string,
+    ticket: WakeTicket,
+  ): Promise<void> {
+    const started = Date.now();
+    let outcome: "claimed" | "already" | "refused" | "lost" | "failed" =
+      "failed";
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const read = await this.env.DB.prepare(
+          `SELECT d.*,EXISTS(SELECT 1 FROM operations o WHERE o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id
+            AND o.generation<=d.generation AND o.kind='database.hibernate') sleeping_intent FROM databases d WHERE d.id=?`,
+        )
+          .bind(id)
+          .first<DatabaseRow & { sleeping_intent: number }>();
+        if (!read) {
+          outcome = "refused";
+          break;
+        }
+        const { sleeping_intent, ...row } = read;
+        if (
+          row.generation + 1 !== ticket.generation ||
+          row.desired_state !== "suspended" ||
+          row.suspension_reason !== "idle" ||
+          !row.power_operation ||
+          sleeping_intent !== 1
+        ) {
+          outcome =
+            row.generation === ticket.generation &&
+            row.power_operation === ticket.operation
+              ? "already"
+              : "refused";
+          break;
+        }
+        const now = new Date().toISOString();
+        const result = await withAdmissionMutation(
+          this.env,
+          [id],
+          async (mutation) => {
+            const transition = await mutation.batch(
+              powerTransitionStatements(
+                this.env.DB,
+                row,
+                "wake",
+                ticket.operation,
+                now,
+                user,
+                mutation.guard(id),
+              ),
+            );
+            // Committed at the ticket's generation: the region may pull it now, ahead of the
+            // snapshot publish that closes this mutation.
+            if (transition[0]!.meta.changes === 1)
+              await this.hintWake(
+                id,
+                row.region_id,
+                ticket.operation,
+                ticket.generation,
+                started,
+                ticket.issued_at,
+              );
+            return transition;
+          },
+          undefined,
+          this.ticketAdmissionActor(id),
+        );
+        if (result[0]!.meta.changes === 1) {
+          this.ctx.waitUntil(thinStorageTurnsFor(this.env, [id]));
+          outcome = "claimed";
+          break;
+        }
+        // Compare-and-set on the row read above: a periodic report that landed since lost it.
+        if (attempt >= WAKE_CLAIM_RETRIES) {
+          outcome = "lost";
+          break;
+        }
+      }
+    } catch {
+      // A D1 failure says nothing about the ticket: it stays pending, and the next connect of
+      // this wake claims it again.
+      outcome = "failed";
+    } finally {
+      this.ticketMutation = undefined;
+    }
+    const stored = this.storedTicket();
+    if (stored?.operation === ticket.operation && outcome !== "failed")
+      this.saveTicket({
+        ...stored,
+        state:
+          outcome === "claimed" || outcome === "already"
+            ? "claimed"
+            : "refused",
+      });
+    if (outcome === "refused" || outcome === "lost")
+      await this.refuteTicket(id);
+    console.log(
+      JSON.stringify({
+        event: "actor_ticket_claim",
+        database_id: id,
+        operation: ticket.operation,
+        generation: ticket.generation,
+        outcome,
+        claim_ms: Date.now() - started,
+        at_ms: Date.now(),
+      }),
+    );
+  }
+  /** Tells the region a ticket was refused, with the database's current page when it is a wake. */
+  private async refuteTicket(id: string): Promise<void> {
+    try {
+      const row = await this.env.DB.prepare(
+        "SELECT region_id,power_operation,generation FROM databases WHERE id=?",
+      )
+        .bind(id)
+        .first<{
+          region_id: string;
+          power_operation: string | null;
+          generation: number;
+        }>();
+      if (!row) return;
+      const page = row.power_operation
+        ? await wakeHintPage(this.env, row.region_id, id, {
+            operation: row.power_operation,
+            revision: row.generation,
+          }).catch(() => undefined)
+        : undefined;
+      await this.env.REGION_LINK.get(
+        this.env.REGION_LINK.idFromName(row.region_id),
+      )
+        .notify([id], page)
+        .catch(() => undefined);
+    } catch {
+      /* The region's periodic pull finds the refusal; the ticket lease refutes it meanwhile. */
+    }
+  }
+  /** The local admission actor of a ticket claim: its barrier is the Actor's own ticket mutation. */
+  private ticketAdmissionActor(databaseId: string): LocalAdmissionActor {
+    return {
+      database_id: databaseId,
+      begin: (intent) =>
+        this.gate("ticketBegin", async () => {
+          this.ticketMutation = intent.mutation_id;
+          return this.beginAdmissionMutationLocked(intent);
+        }),
+      publish: async (completedMutation) => {
+        const state = await readDatabaseAdmissionSnapshot(this.env, databaseId);
+        return state
+          ? this.gate("ticketPublish", () =>
+              this.publishAdmissionSnapshotLocked(
+                state.snapshot,
+                completedMutation,
+              ),
+            )
+          : false;
+      },
+    };
   }
   private readyRevision(row: AdmissionRow): boolean {
     if (row.observed_generation === row.generation) return true;

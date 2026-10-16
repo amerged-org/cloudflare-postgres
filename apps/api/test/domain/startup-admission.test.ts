@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation } from "@pgcf/contracts";
+import { DatabaseWithOperation, newOperationId } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
+import type { DatabaseRow } from "../../src/domain/rows.ts";
 import {
   recoverQuiescence,
   powerTransitionStatements,
@@ -188,46 +189,93 @@ it("requires the current physical Node UID and refuses MemoryPressure before gra
   expect((await resume(f, id)).status).toBe(202);
 });
 
-it("refuses a cold Actor wake before changing idle intent when the full startup peak does not fit", async () => {
-  const f = await coldDatabases(1);
+/** The first cold database as an idle sleeper, and its row as the Actor's wake claim reads it. */
+async function idleSleeper(f: Awaited<ReturnType<typeof coldDatabases>>) {
   const id = f.databases[0]!;
-  const operation = (await env.DB.prepare(
-    "SELECT power_operation FROM databases WHERE id=?",
-  )
-    .bind(id)
-    .first("power_operation")) as string;
   await env.DB.batch([
     env.DB.prepare(
-      "UPDATE operations SET kind='database.hibernate' WHERE id=? AND database_id=? AND generation=2",
-    ).bind(operation, id),
+      "UPDATE operations SET kind='database.hibernate' WHERE id=(SELECT power_operation FROM databases WHERE id=?)",
+    ).bind(id),
     env.DB.prepare(
-      "UPDATE databases SET suspension_reason='idle',power_operation=? WHERE id=?",
-    ).bind(operation, id),
+      "UPDATE databases SET suspension_reason='idle' WHERE id=?",
+    ).bind(id),
   ]);
+  return (await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+    .bind(id)
+    .first<DatabaseRow>())!;
+}
+const databaseRow = async (id: string) =>
+  (await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+    .bind(id)
+    .first<DatabaseRow>())!;
+
+it("a wake transition no longer requires startup headroom while resume still does", async () => {
+  const f = await coldDatabases();
+  const sleeper = await idleSleeper(f);
+  const manual = await databaseRow(f.databases[1]!);
+  // The node's last physical sample leaves room for no full startup peak.
   await sample(f, 256 * mib);
-  const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
-  expect(
-    await actor.ensureAwake(id, "app", { deadline: Date.now() + 25 }),
-  ).toEqual({ ok: false, sqlstate: "57P03" });
+  const at = new Date().toISOString();
+  const [resumed] = await env.DB.batch(
+    powerTransitionStatements(env.DB, manual, "resume", newOperationId(), at),
+  );
+  expect(resumed!.meta.changes).toBe(0);
+  const [woken] = await env.DB.batch(
+    powerTransitionStatements(
+      env.DB,
+      sleeper,
+      "wake",
+      newOperationId(),
+      at,
+      "app",
+    ),
+  );
+  expect(woken!.meta.changes).toBe(1);
+  // With room for its peak beside the wake's reservation the same resume is granted: only
+  // headroom refused it.
+  await sample(f, 4096 * mib);
+  const [granted] = await env.DB.batch(
+    powerTransitionStatements(
+      env.DB,
+      await databaseRow(manual.id),
+      "resume",
+      newOperationId(),
+      new Date().toISOString(),
+    ),
+  );
+  expect(granted!.meta.changes).toBe(1);
+});
+
+it("a wake transition still records the start reservation", async () => {
+  const f = await coldDatabases(1);
+  const sleeper = await idleSleeper(f);
+  await sample(f, 256 * mib);
+  const operation = newOperationId();
+  await env.DB.batch(
+    powerTransitionStatements(
+      env.DB,
+      sleeper,
+      "wake",
+      operation,
+      new Date().toISOString(),
+      "app",
+    ),
+  );
   expect(
     await env.DB.prepare(
-      "SELECT desired_state,suspension_reason,power_operation,generation FROM databases WHERE id=?",
+      "SELECT operation_id,generation,node_id FROM database_start_admissions WHERE database_id=?",
     )
-      .bind(id)
-      .first(),
-  ).toEqual({
-    desired_state: "suspended",
-    suspension_reason: "idle",
-    power_operation: operation,
-    generation: 2,
+      .bind(sleeper.id)
+      .all(),
+  ).toMatchObject({
+    results: [
+      {
+        operation_id: operation,
+        generation: sleeper.generation + 1,
+        node_id: f.node,
+      },
+    ],
   });
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) count FROM operations WHERE database_id=? AND kind='database.wake'",
-    )
-      .bind(id)
-      .first("count"),
-  ).toBe(0);
 });
 
 it("coalesces ten eligible cold connections to one startup lease without reopening manual suspension", async () => {

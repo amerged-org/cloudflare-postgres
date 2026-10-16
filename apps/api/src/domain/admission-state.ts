@@ -29,6 +29,12 @@ export const DatabaseAdmissionSnapshot = z
     deleted: z.boolean(),
     cache_capable: z.boolean(),
     admissible: z.boolean(),
+    /**
+     * An idle sleeper the Actor may issue a wake ticket for without reading D1 (pool design
+     * 2026-10-16). Optional so snapshots persisted before it still parse; absent means the Actor
+     * takes the authoritative wake path.
+     */
+    wakeable: z.boolean().optional(),
     region: DatabaseRegionRoute,
     runtime: DatabaseRuntimeAttestationV2.nullable(),
   })

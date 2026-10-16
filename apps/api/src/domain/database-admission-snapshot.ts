@@ -194,6 +194,16 @@ export async function readDatabaseAdmissionSnapshot(
     (row.storage_protected_at == null ||
       (row.storage_protected_generation ?? 0) < row.generation) &&
     (row.cache_capable === 0 || runtime !== null);
+  const wakeable =
+    !deleted &&
+    row.mutation_id === null &&
+    row.node_id !== null &&
+    row.lost_at === null &&
+    row.desired_state === "suspended" &&
+    row.suspension_reason === "idle" &&
+    row.power_operation !== null &&
+    (row.storage_protected_at == null ||
+      (row.storage_protected_generation ?? 0) < row.generation);
   return {
     presence: DatabasePresence.parse({
       database_id: id,
@@ -217,6 +227,7 @@ export async function readDatabaseAdmissionSnapshot(
       deleted,
       cache_capable: row.cache_capable === 1,
       admissible,
+      wakeable,
       region: {
         id: row.region_id,
         gateway_url: row.gateway_url,

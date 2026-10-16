@@ -37,6 +37,9 @@ export function powerTransitionStatements(
   admission?: AdmissionSqlGuard,
 ): D1PreparedStatement[] {
   const sleeping = action === "suspend" || action === "hibernate";
+  // A wake claims no start headroom (pool design 2026-10-16): a pool hit starts in an already
+  // running slot, and the controller's miss path keeps its own start checks. The start
+  // reservation below stays, because the miss path's start tokens need it.
   const authorizedRole = action === "wake" ? RoleName.parse(wakeRole) : null;
   const statements = [
     db
@@ -46,7 +49,7 @@ export function powerTransitionStatements(
       AND (EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND ((observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle') OR ${sleeping ? storageProtectionCurrentSql() : "0=1"})))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
-      AND ${sleeping ? "1=1" : databaseStartupHeadroomSql("databases", action === "wake" ? "parked_sleep" : "current")}
+      AND ${sleeping || action === "wake" ? "1=1" : databaseStartupHeadroomSql("databases")}
       AND ${sleeping ? "1=1" : `(storage_protected_at IS NULL OR ${storageProtectionCurrentSql()})`}
       AND (${admission?.sql ?? "1=1"})`,
       )
