@@ -309,8 +309,9 @@ Per database about 0.9 statements/s (usage samples, observations, desired rows) 
 term at about 22 databases per node; usage ingestion writes about 5.5 rows per sample.
 
 First limits, in order: (1) one always-on NodeBootstrap container per thin node (identity proof every
-60 s against a 120 s inactivity timeout; about USD 27–28 per node and month; the example `max_instances`
-of 8 would cap thin nodes near 5–7: check the deployed value); (2) D1 size and the nightly export (a
+60 s against a 120 s inactivity timeout; about USD 27–28 per node and month; the deployed `max_instances`
+is 8 on `standard-1`, which caps thin nodes near 5–7 plus the control node's and operations' containers: raise
+it before the fifth customer node); (2) D1 size and the nightly export (a
 4 s stall today, longer as D1 grows; `usage_samples` grew about 9 MB per database per day before pruning);
 (3) D1's single thread, knee near 12 nodes, saturation near 19 (range 7–54).
 
