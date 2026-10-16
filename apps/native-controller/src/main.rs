@@ -579,6 +579,16 @@ fn hint_to_log(cell: &mut Cell, now: Instant) -> bool {
 fn reconcile_failed(database_id: &str, generation: u64, error: &Error) -> Value {
     json!({"event":"database_reconcile_failed","database_id":database_id,"generation":generation,"error":error_code(error)})
 }
+/// How long a watch of a kind is left alone after it ended for the `failures`-th time in a row:
+/// one second, then more, up to half a minute. Each end lists the kind again and has every
+/// database pulled, so a watch that cannot be established must not be asked for every second.
+fn watch_delay(failures: u32) -> Duration {
+    Duration::from_secs((1_u64 << failures.saturating_sub(1).min(5)).min(30))
+}
+/// The log line of a watch that ended: its kind and the class of the failure, never its text.
+fn watch_ended_line(kind: &str, error: &Error) -> Value {
+    json!({"event":"watch_ended","kind":kind,"error":error_code(error)})
+}
 /// The backoff after the `attempt`-th consecutive failed reconcile or renewal.
 fn failure_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(8)).min(300))
@@ -948,7 +958,9 @@ async fn run() -> Result<(), Error> {
         let kube = kube.clone();
         let hints = hints.clone();
         tokio::task::spawn_local(async move {
+            let mut failures = 0_u32;
             loop {
+                let began = Instant::now();
                 let (events, mut receive) = mpsc::channel(512);
                 let task = tokio::task::spawn_local({
                     let kube = kube.clone();
@@ -964,9 +976,19 @@ async fn run() -> Result<(), Error> {
                         return;
                     }
                 }
-                let _ = task.await;
+                let ended = match task.await {
+                    Ok(Err(error)) => error,
+                    _ => "watch task ended".into(),
+                };
+                eprintln!("{}", watch_ended_line(kind, &ended));
+                // A watch that held for a while was a good one; one that ends at once is not.
+                failures = if began.elapsed() >= Duration::from_secs(30) {
+                    1
+                } else {
+                    failures.saturating_add(1)
+                };
                 let _ = hints.send(Hint::Pull(None)).await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(watch_delay(failures)).await;
             }
         });
     }
@@ -1930,6 +1952,21 @@ mod tests {
         assert!(hint_to_log(&mut entry, now));
         assert!(!hint_to_log(&mut entry, now + Duration::from_millis(900)));
         assert!(hint_to_log(&mut entry, now + Duration::from_millis(2000)));
+    }
+    #[test]
+    fn a_watch_that_keeps_ending_is_asked_for_again_less_and_less_often_and_says_why() {
+        // A baseline that cannot be completed ended the watch of a kind every second, silently,
+        // and each end asked the API server to list the kind again and every database to be
+        // pulled.
+        let waits: Vec<_> = (1..=8)
+            .map(|failures| watch_delay(failures).as_secs())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30]);
+        let line = watch_ended_line("Secret", &"watch baseline incomplete".into());
+        assert_eq!(line["event"], "watch_ended");
+        assert_eq!(line["kind"], "Secret");
+        assert!(line["error"].is_string());
+        assert_eq!(line.as_object().unwrap().len(), 3, "{line}");
     }
     #[test]
     fn a_wake_that_waits_for_a_proof_polls_with_backoff_and_not_busily() {

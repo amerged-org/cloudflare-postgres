@@ -90,6 +90,12 @@ pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
     "Secret",
     "ConfigMap",
 ];
+/// How many objects one page of a watch baseline holds: a page of metadata stays far below the
+/// bound a response is read with, whatever the annotations of the objects weigh.
+const BASELINE_PAGE: usize = 100;
+/// How many objects the watches of all kinds keep track of together; each takes a few hundred
+/// bytes. A cluster with more is not one the controller can prove anything about.
+const MAX_TRACKED_OBJECTS: usize = 65_536;
 /// How long the version of this controller's own write is remembered for the event of the watch
 /// that is still to come; a watch that restarted past it never delivers it.
 const OWN_WRITE_MEMORY: Duration = Duration::from_secs(120);
@@ -201,7 +207,7 @@ impl WatchContinuity {
         if deleted {
             self.objects.remove(&key);
         } else {
-            if self.objects.len() >= 4096 && !self.objects.contains_key(&key) {
+            if self.objects.len() >= MAX_TRACKED_OBJECTS && !self.objects.contains_key(&key) {
                 return false;
             }
             self.objects.insert(
@@ -733,36 +739,56 @@ impl Kubernetes {
             kind: kind.into(),
         };
         let path = collection(kind, None)?;
-        let mut url = self.origin.join(&path)?;
-        url.query_pairs_mut().append_pair("limit", "512");
-        let token = tokio::fs::read_to_string(&self.token).await?;
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(token.trim())
-            .header(
-                "Accept",
-                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
-            )
-            .send()
-            .await?
-            .error_for_status()?;
-        let initial: Value = serde_json::from_slice(&bounded(response, 2 * 1024 * 1024).await?)?;
         let mut held: VecDeque<(Instant, Candidate)> = VecDeque::new();
-        let mut version = text(&initial["metadata"], "resourceVersion").to_string();
-        let items = initial["items"]
-            .as_array()
-            .filter(|items| items.len() <= 512)
-            .ok_or("watch baseline incomplete")?;
-        if version.is_empty()
-            || version.len() > 128
-            || !text(&initial["metadata"], "continue").is_empty()
-        {
-            return Err("watch baseline incomplete or missing revision".into());
-        }
-        for item in items {
-            if !self.continuity.lock().unwrap().observe(kind, item, false) {
-                return Err("watch baseline metadata invalid".into());
+        // The baseline is every object of the kind at one revision. The API server pages a list,
+        // and every page of it answers that revision; the watch continues from it.
+        let mut version = String::new();
+        let mut next = String::new();
+        loop {
+            let mut url = self.origin.join(&path)?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", &BASELINE_PAGE.to_string());
+                if !next.is_empty() {
+                    query.append_pair("continue", &next);
+                }
+            }
+            let token = tokio::fs::read_to_string(&self.token).await?;
+            let response = self
+                .client
+                .get(url)
+                .bearer_auth(token.trim())
+                .header(
+                    "Accept",
+                    "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+                )
+                .send()
+                .await?
+                .error_for_status()?;
+            let page: Value = serde_json::from_slice(&bounded(response, 2 * 1024 * 1024).await?)?;
+            let revision = text(&page["metadata"], "resourceVersion");
+            let items = page["items"]
+                .as_array()
+                .filter(|items| items.len() <= BASELINE_PAGE)
+                .ok_or("watch baseline incomplete")?;
+            if revision.is_empty()
+                || revision.len() > 128
+                || (!version.is_empty() && version != revision)
+            {
+                return Err("watch baseline incomplete or missing revision".into());
+            }
+            version = revision.to_string();
+            for item in items {
+                if !self.continuity.lock().unwrap().observe(kind, item, false) {
+                    return Err("watch baseline metadata invalid".into());
+                }
+            }
+            next = text(&page["metadata"], "continue").to_string();
+            if next.is_empty() {
+                break;
+            }
+            if next.len() > 4096 {
+                return Err("watch baseline continuation invalid".into());
             }
         }
         loop {
@@ -1565,12 +1591,70 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(10), async {
             while server.state.lock().unwrap().streams.is_empty() {
+                assert!(
+                    !task.is_finished(),
+                    "the watch ended before it was established"
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("the watch is established");
         (receiver, task)
+    }
+    #[tokio::test]
+    async fn a_baseline_of_many_pages_is_the_whole_of_the_kind_at_one_revision() {
+        // A cluster of a hundred databases holds thousands of Secrets and ConfigMaps; the API
+        // server answers a list in pages, and a baseline that read the first page only, or
+        // refused one with more, left the controller without a watch for good.
+        use crate::test_server::{Server, uid};
+        let server = Server::start().await;
+        for n in 0..1300_u64 {
+            server.put(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("map-{n}"),"namespace":format!("pgcf-db-{:020}", n % 130),"uid":uid(n + 1000)}}));
+        }
+        let (_hints, watch) = watching(&server, "ConfigMap").await;
+        // The watch is covered once the API server has answered it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !server
+                .k8s
+                .continuity
+                .lock()
+                .unwrap()
+                .kinds
+                .contains_key("ConfigMap")
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the watch is covered");
+        {
+            let state = server.k8s.continuity.lock().unwrap();
+            let held = state
+                .objects
+                .keys()
+                .filter(|(kind, _, _)| kind == "ConfigMap");
+            assert_eq!(held.count(), 1300);
+        }
+        // Several pages, each of the size the controller asks for.
+        let pages: Vec<String> = {
+            let state = server.state.lock().unwrap();
+            state
+                .requests
+                .iter()
+                .zip(&state.queries)
+                .filter(|((_, path), query)| {
+                    path.ends_with("/configmaps") && !query.contains("watch")
+                })
+                .map(|(_, query)| query.clone())
+                .collect()
+        };
+        assert!(pages.len() > 1, "{pages:?}");
+        assert!(
+            pages.iter().all(|query| query.contains("limit=")),
+            "{pages:?}"
+        );
+        watch.abort();
     }
     #[tokio::test]
     async fn an_event_that_arrives_before_the_answer_of_its_own_write_hints_nothing() {
