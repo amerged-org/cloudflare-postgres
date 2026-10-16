@@ -10,9 +10,9 @@ import { BackendAuthentication, FrontendPrelude } from "./auth.ts";
 export const STREAM_BYTES = 64 * 1024;
 export const MESSAGE_BYTES = 1024 * 1024;
 export const CLIENT_LIMIT = 16;
-// The edge answers the upgrade only after a sleeping database is admitted, within its 30 s
-// admission deadline (apps/edge/src/session-policy.ts); the handshake waits for that plus margin.
-export const HANDSHAKE_MS = 35_000;
+// The edge answers the upgrade only after a sleeping database is admitted, within its 60 s
+// admission deadline (ADMISSION_DEADLINE_MS in @pgcf/contracts); the handshake waits for that plus margin.
+export const HANDSHAKE_MS = 65_000;
 export const FRAGMENT_LIMIT = 128;
 export const HALF_CLOSE_MS = 10_000;
 

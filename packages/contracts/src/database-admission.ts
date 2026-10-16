@@ -65,3 +65,8 @@ export const DatabaseAdmission = z.discriminatedUnion("ok", [
   }),
 ]);
 export type DatabaseAdmission = z.infer<typeof DatabaseAdmission>;
+
+/** How long a connect to a sleeping database may wait to be admitted, at the Edge and in the Actor. A cold
+ * Thin wake takes 22 s when the identity turn is free and about 40 s when one is in flight, which the
+ * 30 s of the first deadline cut off (measured 2026-10-16). */
+export const ADMISSION_DEADLINE_MS = 60_000;

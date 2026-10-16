@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DurableObject } from "cloudflare:workers";
 import {
+  ADMISSION_DEADLINE_MS,
   DatabaseId,
   DatabaseRegionRoute as RegionRoute,
   type DatabaseAdmission,
@@ -1263,8 +1264,8 @@ export class DatabaseActor extends DurableObject<Env> {
       .safeParse(options ?? {});
     if (!parsed.success) return { ok: false, sqlstate: "57P03" };
     const deadline = Math.min(
-      parsed.data.deadline ?? Date.now() + 30_000,
-      Date.now() + 30_000,
+      parsed.data.deadline ?? Date.now() + ADMISSION_DEADLINE_MS,
+      Date.now() + ADMISSION_DEADLINE_MS,
     );
     if (deadline <= Date.now()) return { ok: false, sqlstate: "57P03" };
     try {
@@ -1323,8 +1324,8 @@ export class DatabaseActor extends DurableObject<Env> {
       .safeParse(options ?? {});
     if (!parsed.success) return { ok: false, sqlstate: "57P03" };
     const deadline = Math.min(
-      parsed.data.deadline ?? Date.now() + 30_000,
-      Date.now() + 30_000,
+      parsed.data.deadline ?? Date.now() + ADMISSION_DEADLINE_MS,
+      Date.now() + ADMISSION_DEADLINE_MS,
     );
     if (deadline <= Date.now()) return { ok: false, sqlstate: "57P03" };
     try {

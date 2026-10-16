@@ -1794,7 +1794,7 @@ it("keeps a real manually suspended actor refused without creating a wake or dia
   expect(await stats()).toHaveLength(0);
 });
 
-it("passes the connection cid and one absolute 30-second deadline to wake and cancels the same waiter on abort", async () => {
+it("passes the connection cid and one absolute 60-second deadline to wake and cancels the same waiter on abort", async () => {
   let reached!: () => void, release!: () => void;
   const started = new Promise<void>((resolve) => {
     reached = resolve;
@@ -1836,15 +1836,19 @@ it("passes the connection cid and one absolute 30-second deadline to wake and ca
   const options = ensure.mock.calls[0]![2];
   const cid = JSON.parse(logs.mock.calls.at(-1)![0] as string).cid;
   expect(options.waiterId).toBe(cid);
-  expect(options.deadline).toBeGreaterThanOrEqual(before + 30_000);
-  expect(options.deadline).toBeLessThanOrEqual(Date.now() + 30_000);
+  expect(options.deadline).toBeGreaterThanOrEqual(
+    before + ADMISSION_DEADLINE_MS,
+  );
+  expect(options.deadline).toBeLessThanOrEqual(
+    Date.now() + ADMISSION_DEADLINE_MS,
+  );
   expect(cancel).toHaveBeenCalledExactlyOnceWith(database, cid);
   release();
   await waitOnExecutionContext(connection.ctx);
   expect(await stats()).toHaveLength(0);
 });
 
-it("a wake timeout cancels the waiter once, never forwards late success and keeps the total admission budget at 30 seconds", async () => {
+it("a wake timeout cancels the waiter once, never forwards late success and keeps the total admission budget at 60 seconds", async () => {
   let reached!: () => void, release!: () => void;
   const started = new Promise<void>((resolve) => {
     reached = resolve;
@@ -1872,7 +1876,7 @@ it("a wake timeout cancels the waiter once, never forwards late success and keep
   vi.useFakeTimers();
   const pending = open({ bindings: { ...testEnv, DATABASE_ACTOR: actor } });
   await started;
-  expect(ADMISSION_DEADLINE_MS).toBe(30_000);
+  expect(ADMISSION_DEADLINE_MS).toBe(60_000);
   await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
   const connection = await pending;
   vi.useRealTimers();

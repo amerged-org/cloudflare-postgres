@@ -517,7 +517,7 @@ const user = decodeURIComponent(target.username);
 const pool = new Pool({
   connectionString: connectionUri,
   max: 10, // well below the size class's max_connections
-  connectionTimeoutMillis: 40_000, // 3.4: the Edge waits up to 30 s for a wake
+  connectionTimeoutMillis: 70_000, // 3.4: the Edge waits up to 60 s for a wake
   idleTimeoutMillis: 30_000,
 });
 pool.on("error", () => {
@@ -596,7 +596,7 @@ further removals. A demoted (fully hibernated) database takes the 8.1–9.4 s wa
 first row measured stage by stage from one start, with every run labelled hit or miss (demoted,
 hibernated); update this section from that row when *Sub-second wake* closes.
 
-What the Edge does: it waits at most **30 s** for a wake (`ADMISSION_DEADLINE_MS`), coalesces all
+What the Edge does: it waits at most **60 s** for a wake (`ADMISSION_DEADLINE_MS`), coalesces all
 connections of one database into one wake and admits at most 32 waiters per database. Giving up
 removes your waiter only; the wake itself continues, so a retry soon after normally finds the
 database ready.
@@ -605,14 +605,14 @@ Recommended policy (derived from those numbers, not a PGCF guarantee):
 
 | Setting | Value | Reason |
 | --- | --- | --- |
-| Connect timeout | at least 35 s; 40 s used above | 30 s Edge deadline plus SCRAM and startup (0.1–0.4 s) |
+| Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus SCRAM and startup (0.1–0.4 s); a cold Thin wake takes 22 s, about 40 s when an identity turn is in flight, a parked wake 1.4–3 s |
 | Statement timeout | separate from the connect timeout | a connect timeout does not bound a query |
 | Retry `57P03`, `08006`, `53300` | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | transient by definition |
 | Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never | configuration or credentials; fix, do not loop |
 | After a dropped connection | reconnect; never replay a write unless it is idempotent | PGCF never replays SQL; whether an in-flight `COMMIT` took effect is unknown to you and to PGCF |
 | Latency-sensitive paths | pre-wake with `POST /resume`, or use an always-warm class (`sleep_after_seconds: null`) | removes the wake from the request |
 
-A `57P03` that arrives immediately, in well under a second, is not a wake timeout. At the 30 s
+A `57P03` that arrives immediately, in well under a second, is not a wake timeout. At the 60 s
 mark the Edge aborts the admission and answers `08006` ("connection admission interrupted"); the
 Actor's own deadline answers `57P03` and can win that race. To tell the causes apart read
 `GET /v1/databases/{id}`:
@@ -922,7 +922,7 @@ the operator supplies it at handover.** Send:
 - the UTC time, `database_id`, role, operation ID and the request;
 - `X-Request-Id` and `X-PGCF-Diagnostic-Id` of the failing API call (the API logs failed requests
   under that diagnostic ID), or for a connection the SQLSTATE and message and whether it came
-  immediately or after about 30 s (the Edge logs every admission with database ID, role, outcome
+  immediately or after about 60 s (the Edge logs every admission with database ID, role, outcome
   and duration);
 - what `GET /v1/databases/{id}` and `GET /v1/operations/{id}` returned.
 
@@ -1030,9 +1030,9 @@ there is.
 | `28000` | startup does not match the authorized route | StartupMessage `database` or `user` differs from the URL hints | fix the client |
 | `08P01` | duplicate connection admission hint / protocol violation | repeated `database` or `user`, or a malformed startup | fix the client |
 | `0A000` | replication connections are not supported / unsupported frontend protocol | | fix the client |
-| `57P03` | database is not accepting connections | not admissible now: manual suspension, provisioning, no capacity for a wake, error state, more than 32 waiters, or the wake did not finish within the 30 s deadline; see the table in [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | per cause |
+| `57P03` | database is not accepting connections | not admissible now: manual suspension, provisioning, no capacity for a wake, error state, more than 32 waiters, or the wake did not finish within the 60 s deadline; see the table in [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | per cause |
 | `53300` | connection rate limit exceeded / database connection rate limit exceeded / connection admission unavailable; or PostgreSQL "too many clients" / "too many connections for role" | Edge rate limiters, admission limit, `max_connections`, or the role's `connection_limit` | back off; pool |
-| `08006` | gateway connection failed / connection admission interrupted | the 30 s deadline passed during a wake (the usual outcome), you aborted, the per-database gateway limit was hit, or the gateway was unreachable | retry; the wake continues |
+| `08006` | gateway connection failed / connection admission interrupted | the 60 s deadline passed during a wake (the usual outcome), you aborted, the per-database gateway limit was hit, or the gateway was unreachable | retry; the wake continues |
 
 ### A.5 Closing an established connection
 
