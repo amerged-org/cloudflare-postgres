@@ -261,9 +261,10 @@ it("the claim does not wait for the hint's delivery", async () => {
     waiterId,
     deadline: Date.now() + 20_000,
   });
-  // The wake is claimed and its waiter registered while the region's hint is still on its way.
+  // The wake is claimed and its waiter registered while the region's hint is still on its way: the
+  // hint's RPC may reach the region's object after the registration, so its arrival is awaited.
   await registered(f.id, waiterId);
-  expect(notified).toBe(1);
+  await vi.waitFor(() => expect(notified).toBe(1), { timeout: 10_000 });
   open();
   const row = await untilWake(f.id);
   await request(
