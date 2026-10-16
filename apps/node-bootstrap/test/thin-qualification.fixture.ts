@@ -70,6 +70,8 @@ interface Pod {
   rv: number;
   created: string;
   phase: "Pending" | "Running" | "Failed";
+  /** Terminal state of its container once the kubelet reported it, as `status.containerStatuses`. */
+  terminated?: { reason: string; exitCode: number };
   claim: string;
   /** The container script; a PostgreSQL Pod's start is checked against its data directory. */
   script: string;
@@ -119,6 +121,12 @@ export class ThinWorld {
   busy = new Map<string, number>();
   /** Writes, Pod execs and Talos calls other than identity reads, in order. */
   log: string[] = [];
+  /** Drain execs (stop the burst writer, then `sync -f`) the writer Pod received. */
+  drains = 0;
+  /** Pods whose `kubectl get` fails, as while the API server or the relay is unreachable. */
+  unreadable = new Set<string>();
+  /** The result of drain exec number `attempt`, counted from 1; a failure may also change the Pod. */
+  drain: (attempt: number) => CommandResult = () => ok("pgcf-rc=0\n");
   /** Simulated relay latency of one driver command, applied to the mocked clock. */
   cost: (args: string[]) => number = () => 0;
   /** Advances the mocked clock for relay latency and scheduler retries. */
@@ -370,7 +378,21 @@ export class ThinWorld {
         annotations: this.annotations(),
       },
       spec: pod.phase === "Pending" ? {} : { nodeName: this.ids.name },
-      status: { phase: pod.phase },
+      status: {
+        phase: pod.phase,
+        ...(pod.phase === "Pending"
+          ? {}
+          : {
+              containerStatuses: [
+                {
+                  name: "q",
+                  state: pod.terminated
+                    ? { terminated: pod.terminated }
+                    : { running: { startedAt: pod.created } },
+                },
+              ],
+            }),
+      },
     };
   }
   private claimObject(claim: Claim) {
@@ -441,6 +463,12 @@ export class ThinWorld {
               (pod) => pod.metadata.name === name,
             ),
           );
+        if (this.unreadable.has(name!))
+          return {
+            exit_code: 1,
+            stdout: "",
+            stderr: "Unable to connect to the server: EOF\n",
+          };
         const pod = this.pods.get(name!);
         if (pod?.phase === "Pending") {
           this.elapse(SCHEDULER_RETRY_MS);
@@ -659,8 +687,15 @@ export class ThinWorld {
     if (namespace === "openebs") return this.driverCommand(command);
     this.log.push(`exec ${pod} ${command[0]}`);
     // kubectl cannot exec into a missing or completed Pod.
-    if (this.pods.get(pod)?.phase !== "Running")
-      return { exit_code: 1, stdout: "" };
+    const target = this.pods.get(pod);
+    if (target?.phase !== "Running")
+      return {
+        exit_code: 1,
+        stdout: "",
+        stderr: target
+          ? `error: cannot exec into a container in a completed pod; current phase is ${target.phase}\n`
+          : `Error from server (NotFound): pods "${pod}" not found\n`,
+      };
     if (command[0] === "pg_isready") return ok("");
     if (command[0] === "psql")
       return ok(
@@ -683,6 +718,9 @@ export class ThinWorld {
       return ok(
         'psql:<stdin>:1: PANIC:  could not write to file "pg_wal/xlogtemp.88": No space left on device\npgcf-rc=2\n',
       );
+    }
+    if (command[0] === "/bin/bash" && command[2]?.includes("sync -f")) {
+      return this.drain(++this.drains);
     }
     if (command[0] === "/bin/bash" && command[2]?.includes('of="$1" bs="$2"')) {
       this.poolMode = "out_of_data_space";
@@ -760,6 +798,8 @@ export class ThinWorld {
         );
       case "dmsetup":
         return this.dmsetup(rest);
+      case "e2fsck":
+        return ok("");
       case "lvremove": {
         const name = rest.at(-1)!.slice("pgcf/".length);
         this.log.push(`lvremove ${name}`);

@@ -51,12 +51,22 @@ const MARKER = "pgcf-q-committed-marker";
 const UNCOMMITTED = "pgcf-q-uncommitted";
 /** Removal rounds for owned scratch LVs; a device can stay open briefly after heavy writes. */
 const REMOVE_ATTEMPTS = 4;
+/** Runs of the idempotent drain command; only an exec the transport lost is repeated. */
+const DRAIN_ATTEMPTS = 3;
 const QUALIFICATION_LV_FIELDS = `${THIN_LV_FIELDS},chunk_size,lv_health_status`;
 function fail(code: string): never {
   throw new BootstrapError(`thin_qualification_${code}`);
 }
 /** Ends this bounded turn; durable journal state continues in the next turn. */
 class Yield extends Error {}
+/** Journal-safe command output: printable ASCII, runs of 40+ opaque characters masked, last 200. */
+function diagnosticTail(raw: string | undefined) {
+  return (raw ?? "")
+    .replace(/[^\x20-\x7e]+/g, " ")
+    .replace(/[A-Za-z0-9+/=_.-]{40,}/g, "[redacted]")
+    .trim()
+    .slice(-200);
+}
 
 const hex = (value: string) => value.replaceAll("-", "");
 const integer = (value: string | undefined, code: string) => {
@@ -2323,6 +2333,87 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       }
     });
   }
+  /**
+   * Stops the burst writer and writes back its file system. The command is idempotent, so an exec
+   * the transport lost while the Pod still runs is repeated. A command that printed its status, or
+   * a Pod that no longer runs, ends the drain with that failure and is never repeated.
+   */
+  private async drainWriter() {
+    const attempts: Facts[] = [];
+    for (;;) {
+      const result = await this.exec(
+        "writer",
+        [
+          "/bin/bash",
+          "-c",
+          'kill "$(cat /work/dd.pid)" 2>/dev/null; sync -f /data/burst; echo "pgcf-rc=$?"',
+        ],
+        120_000,
+      );
+      const status = /^pgcf-rc=(\d{1,3})$/m.exec(result.stdout)?.[1],
+        attempt = {
+          exec_exit_code: result.exit_code,
+          sync_exit_code: status === undefined ? null : Number(status),
+          stderr_tail: diagnosticTail(result.stderr),
+        };
+      if (attempt.sync_exit_code === 0)
+        return { failure: null, attempts: [...attempts, attempt] };
+      const writer = await this.writerState();
+      attempts.push({ ...attempt, ...writer });
+      // A Pod whose state cannot be read is not known to run, so its exec is not repeated.
+      const failure =
+        attempt.sync_exit_code !== null
+          ? "drain_sync_failed"
+          : writer.writer_phase === null
+            ? "drain_exec_failed"
+            : writer.writer_phase !== "Running"
+              ? "writer_not_running"
+              : attempts.length === DRAIN_ATTEMPTS
+                ? "drain_exec_failed"
+                : null;
+      if (failure) return { failure, attempts };
+      await delay(1000, undefined, { signal: this.session.signal });
+    }
+  }
+  /** The writer Pod's phase and its container's terminal state; a null phase: it could not be read. */
+  private async writerState() {
+    try {
+      const pod = await this.read("pod", "writer");
+      if (!pod)
+        return {
+          writer_phase: "absent",
+          writer_reason: null,
+          writer_exit_code: null,
+        };
+      const status = object(pod.status ?? {}),
+        container = (
+          Array.isArray(status.containerStatuses)
+            ? status.containerStatuses
+            : []
+        )
+          .map(object)
+          .find((value) => value.name === "q"),
+        terminated = object(object(container?.state ?? {}).terminated ?? {}),
+        reason = [terminated.reason, status.reason].find(
+          (value) => typeof value === "string",
+        );
+      return {
+        writer_phase: diagnosticTail(String(status.phase ?? "unknown")),
+        writer_reason:
+          typeof reason === "string" ? diagnosticTail(reason) : null,
+        writer_exit_code: Number.isSafeInteger(terminated.exitCode)
+          ? (terminated.exitCode as number)
+          : null,
+      };
+    } catch (error) {
+      if (this.session.signal.aborted) throw error;
+      return {
+        writer_phase: null,
+        writer_reason: null,
+        writer_exit_code: null,
+      };
+    }
+  }
   private async noflush(): Promise<ThinQualificationReport> {
     const poolUuid = this.setup.pool.pool_uuid,
       quota = this.profile.maximum_quota_gib * GIB;
@@ -2410,26 +2501,21 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
           writerDm,
         ]);
         // The writer stops and every dirty page it left is written back.
-        const synced = await this.exec(
-          "writer",
-          [
-            "/bin/bash",
-            "-c",
-            'kill "$(cat /work/dd.pid)" 2>/dev/null; sync -f /data/burst; echo "pgcf-rc=$?"',
-          ],
-          120_000,
-        );
+        const drained = await this.drainWriter();
         const finished = Date.now();
         return {
           resume_exit_code: resumed.exit_code,
           resume_milliseconds: resumed.milliseconds,
-          sync_ok: /pgcf-rc=0/.test(synced.stdout),
+          sync_ok: drained.failure === null,
           drain_milliseconds: finished - started,
           used_after: (await this.poolStatus(poolUuid)).used_data_blocks,
+          drain_failure: drained.failure,
+          drain_attempts: drained.attempts,
         };
       },
     );
-    if (drain.resume_exit_code !== 0 || !drain.sync_ok) fail("resume_failed");
+    if (drain.resume_exit_code !== 0) fail("resume_failed");
+    if (!drain.sync_ok) fail(String(drain.drain_failure));
     await this.journal.converge("noflush_quiescence:writer-stop", async () => {
       await this.absent("pod", "writer", 0);
       return { stopped: true };

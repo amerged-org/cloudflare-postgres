@@ -28,6 +28,7 @@ import {
   lvm,
   profile,
   thinQualificationRun,
+  type ThinWorld,
 } from "./thin-qualification.fixture.ts";
 
 const GIB = 1024 ** 3,
@@ -920,6 +921,193 @@ test("a resumed noflush turn fills the maximum pool through a claim the schedule
   );
   assert.equal(evidence.full.pool.mode, "out_of_data_space");
   assert.equal(evidence.full.state, "SUSPENDED");
+});
+
+/**
+ * A noflush turn between the frozen reading and the resume, as on EU1: the writer's Pod runs and
+ * its LV is suspended with every earlier measurement journaled. Entries named in `open` are left
+ * for the turn to take itself.
+ */
+function noflushSuspended(open: string[] = []) {
+  const run = thinQualificationRun("noflush_quiescence", {
+    volumeGroupBytes: EU1_SCALED,
+  });
+  run.world.lv("pgcf_thinpool")!.size = profile.maximum_data_bytes;
+  run.workload("data_full", "pg-a", "Pa", { pod: false });
+  const writer = run.workload("noflush_quiescence", "writer", "Wr");
+  const lv = run.world.lvs.find((value) => value.uuid === writer.lv_uuid)!;
+  lv.state = "s";
+  const measured = {
+    "writer-pod": { uid: run.world.pods.get("writer")!.uid },
+    "writer-start": { started: true },
+    // EU1 run op_2494yln622aesr8dav44 measured this much dirty page cache at the same step.
+    dirty: { bytes: 749_735_936 },
+    suspend: { exit_code: 0, milliseconds: 30 },
+    frozen: {
+      state: "SUSPENDED",
+      lv_state: "s",
+      write_sectors_first: 1_204_224,
+      write_sectors_second: 1_204_224,
+      used_first: 2_100,
+      used_second: 2_100,
+      observed_milliseconds: 3_000,
+    },
+  };
+  for (const [key, facts] of Object.entries(measured))
+    if (!open.includes(key)) run.confirm(`noflush_quiescence:${key}`, facts);
+  return { run, lv };
+}
+/** The writer's `dmsetup resume` calls of one turn: a drain is never a reason to resume twice. */
+const resumes = (
+  run: ReturnType<typeof thinQualificationRun>,
+  lv: ThinWorld["lvs"][number],
+) =>
+  run.world.log.filter((line) => line === `dmsetup resume ${run.world.dm(lv)}`);
+const lostExec = {
+  exit_code: 1,
+  stdout: "",
+  stderr:
+    "error: unable to upgrade connection: error dialing backend: dial tcp 10.0.0.7:10250: connect: connection refused\n",
+};
+
+// These turns own their worlds and journals and share no clock mock, so they run concurrently.
+describe("the noflush drain after the resume", { concurrency: true }, () => {
+  test("a drain whose sync reports a failure is its own failure, recorded with the exec and Pod facts, and never repeated", async () => {
+    const { run } = noflushSuspended();
+    run.world.drain = () => ({
+      exit_code: 0,
+      stdout: "pgcf-rc=5\n",
+      stderr: "sync: error syncing '/data/burst': Input/output error\n",
+    });
+    await assert.rejects(run.turn(), /thin_qualification_drain_sync_failed/);
+    assert.equal(run.world.drains, 1);
+    const facts = run.entry("noflush_quiescence:resume")!.facts!;
+    assert.equal(facts.resume_exit_code, 0);
+    assert.equal(facts.sync_ok, false);
+    assert.equal(facts.drain_failure, "drain_sync_failed");
+    assert.deepEqual(facts.drain_attempts, [
+      {
+        exec_exit_code: 0,
+        sync_exit_code: 5,
+        stderr_tail: "sync: error syncing '/data/burst': Input/output error",
+        writer_phase: "Running",
+        writer_reason: null,
+        writer_exit_code: null,
+      },
+    ]);
+  });
+
+  test("a writer Pod that is no longer running ends the drain with its termination reason, without a repeat", async () => {
+    const { run } = noflushSuspended();
+    run.world.drain = () => {
+      // The kernel killed the container while its suspended LV could not write dirty pages back.
+      const writer = run.world.pods.get("writer")!;
+      writer.phase = "Failed";
+      writer.terminated = { reason: "OOMKilled", exitCode: 137 };
+      return {
+        exit_code: 137,
+        stdout: "",
+        stderr: "command terminated with exit code 137\n",
+      };
+    };
+    await assert.rejects(run.turn(), /thin_qualification_writer_not_running/);
+    assert.equal(run.world.drains, 1);
+    const facts = run.entry("noflush_quiescence:resume")!.facts!;
+    assert.equal(facts.sync_ok, false);
+    assert.equal(facts.drain_failure, "writer_not_running");
+    assert.deepEqual(facts.drain_attempts, [
+      {
+        exec_exit_code: 137,
+        sync_exit_code: null,
+        stderr_tail: "command terminated with exit code 137",
+        writer_phase: "Failed",
+        writer_reason: "OOMKilled",
+        writer_exit_code: 137,
+      },
+    ]);
+  });
+
+  test("a drain exec the transport lost is repeated against the running writer and the gate goes on", async () => {
+    const { run, lv } = noflushSuspended();
+    run.world.drain = (attempt) =>
+      attempt < 3 ? lostExec : { exit_code: 0, stdout: "pgcf-rc=0\n" };
+    assert.deepEqual(await run.turn(), { kind: "report" });
+    assert.equal(run.world.drains, 3);
+    assert.equal(resumes(run, lv).length, 1);
+    const facts = run.entry("noflush_quiescence:resume")!.facts!;
+    assert.equal(facts.sync_ok, true);
+    assert.equal(facts.drain_failure, null);
+    const lost = {
+      exec_exit_code: 1,
+      sync_exit_code: null,
+      stderr_tail: lostExec.stderr.trim(),
+      writer_phase: "Running",
+      writer_reason: null,
+      writer_exit_code: null,
+    };
+    assert.deepEqual(facts.drain_attempts, [
+      lost,
+      lost,
+      { exec_exit_code: 0, sync_exit_code: 0, stderr_tail: "" },
+    ]);
+  });
+
+  test("a drain exec that stays lost fails after three attempts with only the last 200 characters of stderr and no token", async () => {
+    const { run, lv } = noflushSuspended();
+    const token = "f".repeat(64);
+    run.world.drain = () => ({
+      exit_code: 1,
+      stdout: "",
+      stderr: `${"noise ".repeat(60)}Authorization: Bearer ${token}\nerror: the connection to the server was lost\n`,
+    });
+    await assert.rejects(run.turn(), /thin_qualification_drain_exec_failed/);
+    assert.equal(run.world.drains, 3);
+    assert.equal(resumes(run, lv).length, 1);
+    const facts = run.entry("noflush_quiescence:resume")!.facts!;
+    assert.equal(facts.sync_ok, false);
+    assert.equal(facts.drain_failure, "drain_exec_failed");
+    const attempts = facts.drain_attempts as { stderr_tail: string }[];
+    assert.equal(attempts.length, 3);
+    for (const attempt of attempts) {
+      assert.ok(attempt.stderr_tail.length <= 200);
+      assert.ok(!attempt.stderr_tail.includes(token.slice(0, 16)));
+      assert.ok(
+        attempt.stderr_tail.endsWith(
+          "Bearer [redacted] error: the connection to the server was lost",
+        ),
+      );
+    }
+  });
+
+  test("an exec the transport lost is not repeated when the writer Pod cannot be read", async () => {
+    const { run } = noflushSuspended();
+    run.world.drain = () => {
+      run.world.unreadable.add("writer");
+      return lostExec;
+    };
+    await assert.rejects(run.turn(), /thin_qualification_drain_exec_failed/);
+    assert.equal(run.world.drains, 1);
+    const [attempt] = run.entry("noflush_quiescence:resume")!.facts!
+      .drain_attempts as Record<string, unknown>[];
+    assert.equal(attempt!.writer_phase, null);
+    assert.equal(attempt!.exec_exit_code, 1);
+  });
+
+  test("a recorded drain failure ends a later turn with the same code and runs nothing", async () => {
+    const { run, lv } = noflushSuspended();
+    run.confirm("noflush_quiescence:resume", {
+      resume_exit_code: 0,
+      resume_milliseconds: 10,
+      sync_ok: false,
+      drain_milliseconds: 1_579,
+      used_after: 35_927,
+      drain_failure: "writer_not_running",
+      drain_attempts: [],
+    });
+    await assert.rejects(run.turn(), /thin_qualification_writer_not_running/);
+    assert.equal(run.world.drains, 0);
+    assert.equal(resumes(run, lv).length, 0);
+  });
 });
 
 test("a fill that cannot outgrow the pool within the scheduler's room fails closed before any write", async (t) => {
