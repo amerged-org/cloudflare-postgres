@@ -557,6 +557,37 @@ test("a Cluster whose database is being deleted never blocks a release but an Ac
   await removed.turn();
   assert.equal(removed.current.state, "confirmed");
 });
+test("a free pool slot is not a database and never blocks a release, but a claimed slot is one", async () => {
+  // A free slot is a fenced CNPG Cluster: its Pod runs without PostgreSQL, so it is never Ready.
+  const slot = (claimed: boolean, ready: boolean) => ({
+      metadata: {
+        name: "database",
+        namespace: "pgcf-slot-0a1b2c3d",
+        labels: { "pgcf.io/slot": "0a1b2c3d" },
+        annotations: {
+          "cnpg.io/fencedInstances": '["*"]',
+          ...(claimed ? { "pgcf.io/claim": "aaaaaaaaaaaaaaaaaaaa" } : {}),
+        },
+      },
+      status: {
+        conditions: [{ type: "Ready", status: ready ? "True" : "False" }],
+      },
+    }),
+    tenant = {
+      metadata: { name: "database", namespace: "pgcf-db-live" },
+      status: { conditions: [{ type: "Ready", status: "True" }] },
+    };
+  const free = runtime();
+  databases(free, [tenant, slot(false, false)], []);
+  await free.turn();
+  assert.equal(free.current.state, "confirmed");
+  assert.equal(free.current.observed?.databases_ready, true);
+  // A claimed slot serves a database: while it is not Ready the release waits, as for any database.
+  const serving = runtime();
+  databases(serving, [tenant, slot(true, false)], []);
+  await assert.rejects(serving.turn(), /patch_preflight_unhealthy/);
+  assert.equal(serving.current.state, "pending");
+});
 test("a modified desired spec and off-origin callback are rejected before access", () => {
   const { input } = patchFixture();
   const changed = structuredClone(input);

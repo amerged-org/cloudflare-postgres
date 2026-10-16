@@ -33,7 +33,9 @@ const object = patchObject,
   objects = patchObjects,
   singleton = patchSingleton;
 /** Every CNPG Cluster is Ready or Hibernated. A Cluster that is being deleted, or whose database
- *  namespace is, can never become Ready again: waiting for it would hold every release forever. */
+ *  namespace is, can never become Ready again: waiting for it would hold every release forever. A free
+ *  pool slot is not a database: it stays fenced without PostgreSQL until a wake claims it, and only a
+ *  claimed slot serves one. */
 function databasesReady(clusters: string, databaseNamespaces: string): boolean {
   const deleting = new Set(
     objects(object(JSON.parse(databaseNamespaces)).items)
@@ -44,6 +46,13 @@ function databasesReady(clusters: string, databaseNamespaces: string): boolean {
   return objects(object(JSON.parse(clusters)).items).every((v) => {
     const metadata = object(v.metadata);
     if (metadata.deletionTimestamp || deleting.has(metadata.namespace))
+      return true;
+    const labels = (metadata.labels ?? {}) as Record<string, unknown>,
+      annotations = (metadata.annotations ?? {}) as Record<string, unknown>;
+    if (
+      labels["pgcf.io/slot"] !== undefined &&
+      annotations["pgcf.io/claim"] === undefined
+    )
       return true;
     const conditions = objects(object(v.status).conditions);
     return (
