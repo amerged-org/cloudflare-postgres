@@ -1,7 +1,7 @@
 {
   "edge": {
     "ips": [
-      { "ip": null, "expected": null },
+      { "ip": null, "expected": "binding" },
       { "ip": "", "expected": null },
       { "ip": "1", "expected": null },
       { "ip": "192.0.2.1", "expected": "ipv4:192.0.2.1" },

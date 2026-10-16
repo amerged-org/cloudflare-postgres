@@ -64,9 +64,13 @@ pub fn routing_hints(query: &str) -> Result<Hints, Failure> {
         user: users[0].into(),
     })
 }
-/// Match the existing trusted CF-Connecting-IP policy: IPv4 address or canonical IPv6 /64.
+/// Match the existing trusted CF-Connecting-IP policy: IPv4 address or canonical IPv6 /64. A
+/// caller without the header arrives through a service binding and is limited under a key of
+/// its own; a present but malformed address is refused.
 pub fn connection_rate_key(input: Option<&str>) -> Option<String> {
-    let text = input?;
+    let Some(text) = input else {
+        return Some("binding".into());
+    };
     if text.len() < 2 || text.len() > 45 {
         return None;
     }
