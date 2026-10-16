@@ -174,16 +174,27 @@ The gateway holds the client for up to 25 s; misses are labelled and alerted on 
   5. fence again, delete the slot, check the volume's open count is back to 0, refill.
 - **Pass:** over 20 runs, p95 from t0 to the first statement's result at most 500 ms on the node, PostgreSQL accepting
   within 350 ms, the tenant's `system_identifier` in every run, and "shut down" at every end.
-- **First run (2026-10-16 16:11Z, slot CPU limit 500m), times from t0:**
-  - volume mounted 62 ms (the ext4 mount itself 47 ms)
-  - attached inside the slot 137 ms (including a 67 ms Kubernetes Pod lookup that the controller avoids)
-  - fence lifted 168 ms
-  - PostgreSQL started 383 ms
-  - **first SaaS statement answered 526 ms**
-  - **whole page request committed 626 ms**
-  - the tenant's `system_identifier` was served
-  - the fence afterwards stopped PostgreSQL cleanly ("shut down")
-  - the volume was free again within 6 ms of the slot's deletion
+- **Result (2026-10-16, 21 runs, slot CPU limit 500m): passed.** The first run is above; 20 more ran on fresh slots,
+  times from t0:
+  - first SaaS statement answered: p50 301 ms, p95 385 ms, max 575 ms (range 226–575 ms)
+  - whole page request committed: p50 322 ms, p95 479 ms
+  - PostgreSQL started: p50 145 ms, p95 187 ms
+  - fence lifted: p50 70 ms
+  - every run served the tenant's `system_identifier`, stopped with `pg_control` "shut down", and freed the volume
+    (open count 0) when its slot was deleted
+  - a replacement slot is ready in about 10 s
+  - **No lost commits:** afterwards the tenant woke through CNPG's normal path and held all 21 inserts and 21 updates
+    of the pool runs.
+- **Not yet covered by the lab:**
+  - binding WAL archiving to the tenant's R2 prefix at the claim (the lab slots had no backup plugin)
+  - a thin volume (the lab used thick volumes)
+  - the Pod lookup and the instance manager's reaction to the fence patch, which the controller can shorten
+- **Worker-to-Edge measurement (same day):** an awake database's first query from the probe Worker through the public
+  hostname took 213–756 ms (median 392 ms). Opening the WebSocket alone took 0.19–0.73 s, and the query 17–29 ms.
+  - The public hop therefore costs about as much as the whole node path.
+  - A service binding from the probe was refused by the Edge (53300): its connection limiter keys on
+    `CF-Connecting-IP`, which a binding call does not carry.
+  - Build step 4 gives binding callers a limiter key of their own and measures that route.
 
 **Order of work.**
 1. Lab plus the Worker-to-Edge measurement.
