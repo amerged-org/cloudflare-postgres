@@ -33,7 +33,9 @@ Cancelled consumers cannot cancel a shared CA read or strand its bounded cache e
 A failed session still ends PostgreSQL TLS with close_notify, unless TLS records are still queued.
 
 Every connection that passes route verification logs one `conn_stages` JSON line to stdout when
-it ends: the database ID, a fixed `outcome` class and monotonic milliseconds `upgrade_ms`,
+it ends: the database ID, a fixed `outcome` class, the fixed `route` class of the writer it was
+admitted on (`ready` for a Ready endpoint, `attested` for the controller's attested Pod before the
+kubelet's report; null before a writer was chosen) and monotonic milliseconds `upgrade_ms`,
 `startup_ms`, `dial_ms`, `first_backend_ms` and `session_ms`, null when a stage was not reached.
 Roles, addresses, tokens and payload bytes are never logged.
 
@@ -67,6 +69,17 @@ attested container ID; the watched CA is the attested one. A Ready endpoint alwa
 precedence, a pool binding never falls through to it, and the route ends with the Pod watch.
 Only a v4 route, which names the admitted runtime, may use such a writer; route token,
 storage binding and signed authority are checked exactly as for a Ready writer.
+
+That attestation is for the wake. It is spent once this gateway has seen the attested Pod's
+endpoint and `postgres` container reported Ready: for that Pod, container and revision only the
+ordinary rules apply from then on, so a later not-Ready Pod refuses new connections and closes
+established sessions as any writer does. It also ends 10 s (the startup bound of a connection)
+after the gateway first relied on it, which covers a Pod the kubelet never reports Ready and a
+gateway that started after the report was withdrawn; the kubelet's report routes the Pod as a
+Ready endpoint again. A new attestation (another Pod, container or revision) starts again. A
+session admitted on the attestation is closed, not drained, when the fence leaves `running` or
+the container is restarted before the kubelet's report. `/readyz` requires the Pod watch, the
+one that recognizes such a writer, beside the fence, EndpointSlice and ConfigMap watches.
 
 The gateway accepts thin write authority only from the public-key map pinned by
 `PGCF_STORAGE_AUTHORITY_KEYS` and its canonical SHA-256 in

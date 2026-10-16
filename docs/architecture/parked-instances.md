@@ -390,6 +390,18 @@ The kubelet's Ready bit is measured, not awaited: the phase `kubelet_ready_obser
 first later read of the Pod that finds it set, counted from the answer of PostgreSQL (the span the
 wake used to wait).
 
+**How long the attestation stands in for the Ready bit.** The gateway routes to the attested Pod
+until the kubelet's report, not for as long as the fence carries the attestation. Once it has seen
+that Pod's endpoint and `postgres` container reported Ready, the attestation is spent for that Pod
+UID, container ID and revision and only the ordinary rules apply: a Pod that is not Ready later
+(PostgreSQL down under the same container, an operator's fence, a node whose lifecycle cleared
+Ready) refuses new connections and closes established sessions as before G-1. It also ends 10 s
+(the startup bound of a connection) after the gateway first relied on it, so a Pod the kubelet
+never reports Ready, or one that was not Ready before a gateway replica started and left that
+replica no report to see, is routed once it is Ready. The controller publishes `ready` on its
+proof, so a wake whose `kubelet_ready_observed` is longer than that bound is refused by the
+gateway until the report arrives.
+
 **The completed generation is written before the proof.** The namespace's `pgcf.io/generation`
 annotation marks the generation a pass completed, and the runtime proof names the namespace at its
 resourceVersion. It was written after the proof, so the first pass of every generation changed the
@@ -808,7 +820,7 @@ new controller runs.
 
 - **Edge** (`apps/edge`, `apps/edge-rust`): no change for correctness. Optional timing fields
   (6.3).
-- **Gateway G-1, implemented on branch `golive/gateway-attested-pod`, no image released**
+- **Gateway G-1, implemented, no image released**
   (`apps/native-gateway/src/targets.rs`, `kubernetes.rs`): route to the controller-attested Pod
   before its Ready condition. In `endpoint()` (466-551), when no ready endpoint exists, accept the
   single endpoint whose `targetRef.uid` equals the fence's `admission_target.pod_uid`
@@ -819,8 +831,11 @@ new controller runs.
   v4 token with equal Pod UID, container ID, CA identity, intent `running` at the admitted
   revision, storage binding and token (transport.rs:632-690,826-879). The EndpointSlice still
   proves the Service selects this Pod. The Ready bit is a kubelet opinion; the attested identity is
-  stronger evidence for admission than it. A dial to a Pod whose PostgreSQL later died only fails
-  the connection. Requires a gateway image release (README: Dockerfile pins).
+  stronger evidence for admission than it. The sketch let the attestation route for as long as the
+  fence carried it; the implementation spends it at the kubelet's report and bounds it (below),
+  because a Pod that was Ready and is not any more is not a wake: the report was withdrawn for a
+  reason the attestation does not know, and a dial to it can still reach a PostgreSQL the cluster
+  has replaced. Requires a gateway image release (README: Dockerfile pins).
   The implementation is stricter than that sketch in these ways, each pinned by a test in
   `targets.rs`: the target counts only from a live fence in mode `running` whose target
   generation equals the intent revision (`Targets::attested`, parsed by the same
@@ -830,13 +845,25 @@ new controller runs.
   with the attested container running, and the watched CA identity must equal the attested one
   (`Targets::runs_attested`); the route is withdrawn while the Pod watch is stale; only a v4
   route may use such a writer (`admitted_runtime_current`); a Ready endpoint always wins and a
-  pool binding never falls through. The measurement gate the sketch named
+  pool binding never falls through. The attestation is spent once the gateway has seen that Pod's
+  endpoint and `postgres` container Ready for that Pod UID, container ID and revision (`Witness`,
+  kept per database in the gateway's own memory; the controller publishes nothing for it), and it
+  ends `ATTESTED_ROUTE_BOUND`, the startup bound of a connection (`transport::STARTUP_BOUND`,
+  10 s), after the gateway first relied on it. No cluster event marks that bound, so it is read at
+  every admission and every check of an established session. A session admitted on the
+  attestation is closed, not drained, when the fence leaves `running` at the attested revision or
+  the container is restarted before the kubelet's report: the evidence it rests on is withdrawn,
+  which the generation check (target generation equals the intent revision) is there for; after
+  the report it is an ordinary session. `/readyz` requires the Pod watch beside the fence,
+  EndpointSlice and ConfigMap watches, since only it recognizes such a writer, and `conn_stages`
+  carries the fixed `route` class (`ready` or `attested`) so that a live read tells the paths
+  apart. The measurement gate the sketch named
   (`kubelet_ready - pg_accepting >= 300 ms` at p50) is met by the lab numbers of section B:
   PostgreSQL accepting 226-305 ms and Cluster Ready 564-753 ms after the same annotation, about
-  390 ms between the range midpoints. The controller side is a separate change: until it stops
-  waiting for kubelet readiness (`resumed_settled` in `power/parked.rs`, the `postgres` container
-  `ready` gate and the archive sample's Pod `Ready` in `reconcile.rs`), G-1 has no effect on the
-  wake, and V-11 must hold on EU1 before the gateway is released.
+  390 ms between the range midpoints. The controller side is implemented (2.2.1: `resumed_settled`
+  in `power/parked.rs`, the `postgres` container `ready` gate and the archive sample's Pod `Ready`
+  in `reconcile.rs` no longer wait for the kubelet's bit); V-11 must hold on EU1 before the
+  gateway is released.
 
 ### 5.5 Infrastructure
 
@@ -1138,7 +1165,7 @@ Run on the thin class used for acceptance, region policy `parked_tier` set expli
 | Q2 | Scope: idle sleeps only (manual suspend stays real hibernation per `rt:205`). | Idle only. |
 | Q3 | TTL and cap. | `ttl_seconds` 600, `max_per_node` 8 (raise after V-6/V-7); upper TTL bound 3300. |
 | Q4 | Lease presentation (R1) versus an honest lease field with a host-extension change and requalification. | R1 now; revisit at the next extension change. |
-| Q5 | Gateway change G-1 is security-relevant (route before kubelet Ready). | Implemented (5.4) on the lab gate; keep v4 token, admission target, token and storage binding checks. Release only after V-11 and a live read of the first-connection stages (`conn_stages`, 6.3). |
+| Q5 | Gateway change G-1 is security-relevant (route before kubelet Ready). | Implemented (5.4) on the lab gate; keep v4 token, admission target, token and storage binding checks. Release only after V-11 and a live read of the first-connection stages (`conn_stages`, 6.3; its `route` tells the attested path from a Ready one). |
 | Q6 | `pods/resize patch` cluster-wide (no namespace scoping in RBAC). | Accept, comment in rbac.yaml; ValidatingAdmissionPolicy restricting to `pgcf-db-*` only if the owner wants it. |
 | Q7 | CNPG operator reconciles each fenced Cluster at 1 Hz; unmeasured. | Measure (V-6). Mitigations only if observed: lower TTL; `cnpg.io/reconciliationLoop: disabled` is possible but also disables hibernation, so it is not recommended. |
 | Q8 | Startup probe kills a *restarted* fenced container after 3600 s; a container waiting in `CrashLoopBackOff` is "not alive" (`cnpg:pkg/utils/pod_conditions.go:98-107`) and a Cluster without a live instance is registered `Unrecoverable` (`cnpg:internal/controller/cluster_controller.go:954-960`, `cnpg:internal/controller/cluster_status.go:101-108`). | TTL <= 3300 s; algorithm B unfences first. |
