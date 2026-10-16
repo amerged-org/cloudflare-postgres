@@ -282,7 +282,7 @@ async function readWriterInputs<Row = never>(
     ...(rows ? [rows] : []),
     postgresPoolHoldersStatement(env.DB, scope),
     env.DB.prepare(
-      `SELECT h.database_id,h.generation,h.node_id,h.node_uid,h.storage_budget_bytes,h.ready_at,h.attested_json,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at
+      `SELECT h.*,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at
       FROM databases d JOIN database_start_admissions h ON h.database_id=d.id JOIN operations o ON o.id=h.operation_id
       WHERE (${scope.sql}) AND h.budget_bytes>0 AND h.storage_budget_bytes>0`,
     ).bind(...scope.bindings),
