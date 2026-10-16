@@ -2307,8 +2307,8 @@ impl Reconciler {
         self.apply_to(db, manifest, current, false).await
     }
     /// Brings the object `manifest` names, as it was read, to the manifest. An object that has
-    /// the manifest's content and labels is left as it is when it carries this generation, or
-    /// when `lean` leaves its stamp to the pass that follows.
+    /// the manifest's content, labels and annotations is left as it is when it carries this
+    /// generation, or when `lean` leaves its stamp to the pass that follows.
     async fn apply_to(
         &self,
         db: &Value,
@@ -2319,6 +2319,11 @@ impl Reconciler {
         let kind = text(manifest, "kind");
         let ns = manifest["metadata"]["namespace"].as_str();
         let name = text(&manifest["metadata"], "name");
+        // The manifest's own annotations (the CA publication names its source Secret in them)
+        // are written with the generation stamp, never in place of it.
+        let stated = &manifest["metadata"]["annotations"];
+        let mut annotations = stated.clone();
+        annotations[GENERATION] = number(db, "generation").to_string().into();
         if let Some(current) = &current {
             owned(current, db, name, ns)?;
             if generation(current) > number(db, "generation") {
@@ -2336,12 +2341,12 @@ impl Reconciler {
                     &manifest["metadata"]["labels"],
                     "",
                 )
+                && (stated.is_null() || contains(&current["metadata"]["annotations"], stated, ""))
             {
                 return Ok(current.clone());
             }
             let mut patch = manifest.clone();
-            patch["metadata"]["annotations"] =
-                json!({GENERATION:number(db,"generation").to_string()});
+            patch["metadata"]["annotations"] = annotations;
             if kind == "Cluster"
                 && manifest["spec"]["enableSuperuserAccess"] == false
                 && !current["spec"]["superuserSecret"].is_null()
@@ -2351,8 +2356,7 @@ impl Reconciler {
             self.k8s.patch(current, &patch).await
         } else {
             let mut manifest = manifest.clone();
-            manifest["metadata"]["annotations"] =
-                json!({GENERATION:number(db,"generation").to_string()});
+            manifest["metadata"]["annotations"] = annotations;
             self.k8s.create(&manifest).await
         }
     }
@@ -3276,6 +3280,8 @@ mod runtime_tests {
         assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
     }
 }
+#[cfg(test)]
+mod admission_tests;
 #[cfg(test)]
 mod parked_tests;
 #[cfg(test)]

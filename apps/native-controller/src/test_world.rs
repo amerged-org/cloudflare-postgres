@@ -700,6 +700,22 @@ impl World {
     /// by, which needs the controller's watch to cover every object the proof names.
     pub fn admitted(&mut self) {
         self.db["admission"] = json!({"v":1,"admission_epoch":1,"route_revision":1});
+        // The CA publication of an admitted database names the Secret it was published from.
+        let secret = self
+            .server
+            .get("Secret", Some(&self.ns), "database-ca")
+            .unwrap();
+        self.server.edit(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("ca-{}", self.id),
+            |map| {
+                let annotations = &mut map["metadata"]["annotations"];
+                annotations["pgcf.io/source-ca-secret-uid"] = secret["metadata"]["uid"].clone();
+                annotations["pgcf.io/source-ca-secret-resource-version"] =
+                    secret["metadata"]["resourceVersion"].clone();
+            },
+        );
         self.server.watch();
     }
     /// The CA ConfigMap the agent publishes for the gateway; the maintenance Secret is among the
