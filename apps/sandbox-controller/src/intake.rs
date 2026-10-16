@@ -266,16 +266,23 @@ fn protects_the_same(a: &StorageWriteClaims, b: &StorageWriteClaims) -> bool {
 pub async fn persist<R: ScopeRecords>(records: R, trust: StorageTrust, pending: Arc<Pending>) {
     let mut written: BTreeMap<String, VerifiedStorageAuthority> = BTreeMap::new();
     let mut unassigned: BTreeSet<String> = BTreeSet::new();
+    // Pods whose superseded private scopes could not all be forgotten yet.
+    let mut uncleaned: BTreeSet<String> = BTreeSet::new();
     let mut reported = Reported::new(Duration::from_secs(30));
     loop {
         let batch = pending.take().await;
         written.retain(|uid, _| batch.contains_key(uid));
         unassigned.retain(|uid| batch.contains_key(uid));
+        uncleaned.retain(|uid| batch.contains_key(uid));
         for (pod_uid, scope) in batch {
             if written
                 .get(&pod_uid)
                 .is_some_and(|old| protects_the_same(old.claims(), scope.authority.claims()))
             {
+                if uncleaned.contains(&pod_uid) && retire_superseded(&records, &trust, &scope).await
+                {
+                    uncleaned.remove(&pod_uid);
+                }
                 continue;
             }
             let started = Instant::now();
@@ -289,7 +296,9 @@ pub async fn persist<R: ScopeRecords>(records: R, trust: StorageTrust, pending: 
             match recorded {
                 Ok(()) => {
                     unassigned.remove(&pod_uid);
-                    retire_superseded(&records, &trust, &scope).await;
+                    if !retire_superseded(&records, &trust, &scope).await {
+                        uncleaned.insert(pod_uid.clone());
+                    }
                     written.insert(pod_uid, scope.authority);
                 }
                 Err(error) => {
@@ -306,12 +315,14 @@ pub async fn persist<R: ScopeRecords>(records: R, trust: StorageTrust, pending: 
     }
 }
 
-/// Old private scope remains until its replacement signed physical scope is durable.
+/// Old private scope remains until its replacement signed physical scope is durable. False when
+/// a scope that is superseded could not be forgotten: the next renewal tries again.
 async fn retire_superseded<R: ScopeRecords>(
     records: &R,
     trust: &StorageTrust,
     durable: &RuntimeScope,
-) {
+) -> bool {
+    let mut forgotten = true;
     for (old_uid, old_token) in records.retired().await {
         if let Ok(old) = trust.verify_for_protection(&old_token)
             && same_physical_scope(durable.authority.claims(), old.claims())
@@ -319,8 +330,10 @@ async fn retire_superseded<R: ScopeRecords>(
             && let Err(error) = records.forget_retired(&old_uid).await
         {
             eprintln!("{}", error.message());
+            forgotten = false;
         }
     }
+    forgotten
 }
 
 /// Run `work` on an OS thread of its own, with a current-thread runtime nothing else shares.
@@ -478,6 +491,76 @@ mod tests {
             .map(|(pod, _)| pod.clone())
             .collect();
         assert_eq!(recorded, BTreeSet::from([pod(1), pod(3)]));
+    }
+
+    /// Records of a node that kept the scope of a removed Pod and cannot yet forget it.
+    #[derive(Clone)]
+    struct Superseded {
+        retired: Arc<Mutex<Vec<(String, String)>>>,
+        refusals: Arc<AtomicUsize>,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl ScopeRecords for Superseded {
+        async fn remember(&self, _: &str, _: &str) -> Result<(), Status> {
+            Ok(())
+        }
+        async fn retired(&self) -> Vec<(String, String)> {
+            self.retired.lock().unwrap().clone()
+        }
+        async fn forget_retired(&self, pod_uid: &str) -> Result<(), Status> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.refusals.load(Ordering::SeqCst) > 0 {
+                self.refusals.fetch_sub(1, Ordering::SeqCst);
+                return Err(Status::internal(
+                    "retired_storage_owner_cleanup_unconfirmed",
+                ));
+            }
+            self.retired
+                .lock()
+                .unwrap()
+                .retain(|(uid, _)| uid != pod_uid);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn a_superseded_scope_that_could_not_be_forgotten_is_forgotten_with_a_later_renewal() {
+        let issuer = Issuer::new();
+        let state = guard(&issuer);
+        let now = clock();
+        let (database, old, current) = (database(4), pod(4), pod(5));
+        let removed = issuer.token(&claims(&database, &old, 1, 1, now));
+        let records = Superseded {
+            retired: Arc::new(Mutex::new(vec![(old.clone(), removed)])),
+            refusals: Arc::new(AtomicUsize::new(1)),
+            attempts: Arc::new(AtomicUsize::new(0)),
+        };
+        let (retired, attempts) = (records.retired.clone(), records.attempts.clone());
+        let pending = Arc::new(Pending::default());
+        tokio::spawn(persist(records, state.trust(), pending.clone()));
+        let scope = |revision: u64| {
+            let token = issuer.token(&claims(&database, &current, 2, revision, now));
+            RuntimeScope {
+                pod_uid: current.clone(),
+                authority: state.trust().verify(&token, now).unwrap(),
+                token,
+            }
+        };
+        pending.offer(vec![scope(2)]);
+        eventually("the first cleanup was never attempted", async || {
+            attempts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(
+            retired.lock().unwrap().len(),
+            1,
+            "the first attempt was refused"
+        );
+        // The next renewal of the same scope changes nothing a restart needs, yet retries the cleanup.
+        pending.offer(vec![scope(3)]);
+        eventually("the refused cleanup was not retried", async || {
+            retired.lock().unwrap().is_empty()
+        })
+        .await;
     }
 
     #[tokio::test]
