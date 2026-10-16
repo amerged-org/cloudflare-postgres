@@ -355,10 +355,10 @@ fixture's):
   database at the old generation), so the proof came 41–44 s after the hint instead of 21.8 s [M].
   Status (branch `golive/turn-cancel`, tested locally, not deployed): an accepted sample names its
   waiting starts; the NodeBootstrap Durable Object then has the container end a running turn without a
-  pool action whose input has such a database at an older generation or not at all (`POST
-  /v1/turn/cancel`), releases its lease without counting a failure and starts the next turn at once; a
-  turn with a pool action always runs to its end. To measure: `thin_storage_turn_superseded` and a cold
-  wake's proof about 22 s after it.
+  pool action that read such a database at an older generation (`POST /v1/turn/cancel`), releases its
+  lease without counting a failure and starts the next turn at once. A turn with a pool action always
+  runs to its end, only an error the cancel itself raised counts as a cancel, and a report already sent
+  is never cut off. To measure: `thin_storage_turn_superseded` and a cold wake's proof about 22 s after it.
 
 Measured after the deploys of 2026-10-16 (API from `0a5cb81` and `d4cff9f`) [M]: total API requests per
 second fell from 8.8 to 1.5 and each node's reclaim poll from about 3.2/s to 0.23/s (the 3.5 s hold);
