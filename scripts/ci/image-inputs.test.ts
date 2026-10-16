@@ -396,7 +396,7 @@ test("PostgreSQL inputs stay scoped and manual, unavailable or malformed compari
 });
 
 async function failedPushHistory(
-  fixPath = "apps/sandbox-controller/src/host_proc.rs",
+  fixPath = "apps/sandbox-controller/src/intake.rs",
 ) {
   const cwd = await mkdtemp(join(tmpdir(), "pgcf-image-baseline-"));
   const git = (...args: string[]) =>
