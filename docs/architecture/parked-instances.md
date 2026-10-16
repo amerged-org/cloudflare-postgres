@@ -1001,9 +1001,13 @@ next run, not of this list:
   database whose operation is still in the record, two without). The failure codes and their order
   are unchanged and pinned.
 - Item 8: a pass reads the identity of the cluster once: 2 reads became 1.
-- Item 3: the thirteen manifests of a generation are read together before the first is written and
-  written in manifest order, the Cluster read when its turn comes. The apply pass of a new
-  generation (nine of thirteen patched): 31 sequential round trips became 12 with item 6.
+- Item 3: the thirteen manifests of a generation are read together before the first is written.
+  What binds the Pod the Cluster creates (quota, limits, the three network policies, the Cilium
+  policy, the archive store) is written together when all of it exists and all of it before the
+  Cluster, which is read when its turn comes (CNPG writes its status continually) and followed by
+  the scheduled backup; when something has to be created, the writes are one after another in
+  manifest order as before. The apply pass of a new generation (nine of thirteen patched): 31
+  sequential round trips became 6 with item 6.
 - Item 4: the check that the applied objects stayed as applied reads them and the TLS authority
   together (14 sequential reads became two bounded waves), and the proof of the runtime reads its
   eleven objects in three rounds (11 sequential reads became 3), every object still read again after
@@ -1024,9 +1028,10 @@ next run, not of this list:
   snapshot (2 rounds fewer); in the archive probe the credential, the Cluster, the Pod and the
   receipt read again after its questions (3 rounds became 1); the claim with the receipt of the
   volume's binding, the namespace label with the primary, the authority with its published copy,
-  and the resumed Pod with the record of the wake (1 round fewer each). Everything above together,
-  with every Kubernetes request of the in-process world answered after the same delay: a parked
-  wake of 145 requests in 115 sequential rounds became 120 requests in 50 rounds.
+  and the resumed Pod with the record of the wake, and the anchor with the fence of the wake's
+  preparation (1 round fewer each). Everything above together, with every Kubernetes request of
+  the in-process world answered after the same delay: a parked wake of 145 requests in 115
+  sequential rounds became 120 requests in 43 rounds.
 - Item 9: the version of every object the controller writes is remembered, and the watch event of
   exactly that version hints no database; a pass over an unchanged awake database writes nothing.
   Live, an awake database was reconciled 1.5 times a second as long as it stayed awake (89 requests
