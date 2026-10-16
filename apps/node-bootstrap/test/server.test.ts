@@ -468,3 +468,104 @@ test("a failed turn keeps only its safe executor code in the container's record"
     await runtime.stop();
   }
 });
+
+test(
+  "a cancel ends only the running read-only identity turn it names, and the next turn runs after it",
+  { timeout: 5000 },
+  async () => {
+    const { BootstrapError } = await import("../src/bootstrap.ts");
+    const bearer = randomBytes(32).toString("base64url");
+    const turns: { signal: AbortSignal | undefined; release: () => void }[] =
+      [];
+    const runtime = createBootstrapServer(bearer, {
+      thinStorage: async (_input, options = {}) => {
+        await new Promise<void>((resolve, reject) => {
+          turns.push({ signal: options.signal, release: resolve });
+          // As every command of a turn ends on its signal.
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(new BootstrapError("job_cancelled")),
+            { once: true },
+          );
+        });
+        return {};
+      },
+    });
+    runtime.server.listen(0, LOOPBACK);
+    await once(runtime.server, "listening");
+    const address = runtime.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `http://${LOOPBACK}:${address.port}`,
+      headers = {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+      };
+    const lease = (revision: number, action: object | null) => ({
+      operation_id: `op_${"c".repeat(20)}`,
+      revision,
+      action,
+    });
+    const start = async (value: ReturnType<typeof lease>) => {
+      const accepted = await fetch(`${url}/v1/thin-storage`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ lease: value }),
+      });
+      assert.equal(accepted.status, 202);
+      await accepted.body?.cancel();
+    };
+    const cancel = async (revision: number) => {
+      const answer = await fetch(`${url}/v1/turn/cancel`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          kind: "thin_storage",
+          operation_id: `op_${"c".repeat(20)}`,
+          revision,
+        }),
+      });
+      assert.equal(answer.status, 200);
+      return (await answer.json()) as unknown;
+    };
+    const record = async () =>
+      (await (await fetch(`${url}/v1/turn`, { headers })).json()) as unknown;
+    const state = (revision: number, value: string, error_code = null) => ({
+      state: value,
+      kind: "thin_storage",
+      operation_id: `op_${"c".repeat(20)}`,
+      revision,
+      error_code,
+    });
+    try {
+      // An idle container has nothing to end.
+      assert.deepEqual(await cancel(1), { state: "idle" });
+      // A turn with a pool action is never ended early.
+      await start(lease(1, { kind: "grow" }));
+      assert.deepEqual(await cancel(1), state(1, "running"));
+      assert.equal(turns[0]!.signal, undefined);
+      turns[0]!.release();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(await record(), state(1, "succeeded"));
+      // A read-only turn ends on a cancel that names it, and only then; the answer is its outcome.
+      await start(lease(2, null));
+      assert.deepEqual(await cancel(3), state(2, "running"));
+      assert.equal(turns[1]!.signal?.aborted, false);
+      const ended = state(2, "failed");
+      (ended as { error_code: string | null }).error_code =
+        "thin_storage_turn_cancelled";
+      assert.deepEqual(await cancel(2), ended);
+      assert.equal(turns[1]!.signal?.aborted, true);
+      assert.deepEqual(await record(), ended);
+      // The container takes the next turn at once.
+      await start(lease(4, null));
+      assert.deepEqual(await record(), state(4, "running"));
+      turns[2]!.release();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(await record(), state(4, "succeeded"));
+    } finally {
+      for (const value of turns) value.release();
+      runtime.stop();
+      runtime.server.closeAllConnections();
+    }
+  },
+);

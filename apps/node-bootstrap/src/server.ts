@@ -8,9 +8,9 @@ import {
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { OperationId } from "@pgcf/contracts";
-import type {
+import {
   NodeExecutorTurn,
-  NodeExecutorTurnStatus,
+  type NodeExecutorTurnStatus,
 } from "@pgcf/contracts/node-bootstrap";
 import { NodeInspectionInput } from "@pgcf/contracts/node-installation";
 import { runInspection } from "./inspector.ts";
@@ -110,14 +110,26 @@ export function createBootstrapServer(
   let turn:
     | Exclude<NodeExecutorTurnStatus, { state: "idle" | "receiving" }>
     | undefined;
+  /** How the current turn ends early, when it may: only a thin identity turn without a pool action,
+   * whose every command is a read. */
+  let cancellable:
+    | {
+        identity: NodeExecutorTurn;
+        abort: AbortController;
+        ended: Promise<void>;
+      }
+    | undefined;
   const executors = new Map<
     string,
     {
       kind: NodeExecutorTurn["kind"];
       fence: (input: unknown) => z.infer<typeof TurnFence>;
+      cancellable?: (input: unknown) => boolean;
       run: (
         input: unknown,
-        options: Pick<BootstrapOptions, "run" | "request">,
+        options: Pick<BootstrapOptions, "run" | "request"> & {
+          signal?: AbortSignal;
+        },
       ) => Promise<unknown>;
     }
   >([
@@ -126,6 +138,9 @@ export function createBootstrapServer(
       {
         kind: "thin_storage",
         fence: (input) => z.object({ lease: TurnFence }).parse(input).lease,
+        cancellable: (input) =>
+          z.object({ lease: z.object({ action: z.null() }) }).safeParse(input)
+            .success,
         run: options.thinStorage ?? runThinStorage,
       },
     ],
@@ -295,22 +310,28 @@ export function createBootstrapServer(
         let accepted = false;
         try {
           const input = await body(request),
-            identity = { kind: executor.kind, ...executor.fence(input) };
+            identity = { kind: executor.kind, ...executor.fence(input) },
+            abort = executor.cancellable?.(input)
+              ? new AbortController()
+              : undefined;
           // The request only registers the turn: an answer lost in transit never loses its outcome.
           const running = executor.run(input, {
             run: options.run,
             request: options.request,
+            ...(abort ? { signal: abort.signal } : {}),
           });
           turn = { state: "running", ...identity, error_code: null };
           accepted = true;
-          void running
+          const ended = running
             .then(
               () => {
                 turn = { state: "succeeded", ...identity, error_code: null };
               },
               (error: unknown) => {
                 const prefix = executor.kind === "patch" ? "patch_" : undefined,
-                  code = failureCode(error, prefix).prefixed;
+                  code = abort?.signal.aborted
+                    ? "thin_storage_turn_cancelled"
+                    : failureCode(error, prefix).prefixed;
                 turn = {
                   state: "failed",
                   ...identity,
@@ -323,6 +344,7 @@ export function createBootstrapServer(
             .finally(() => {
               patchRunning = false;
             });
+          cancellable = abort ? { identity, abort, ended } : undefined;
           reply(response, 202, turn);
         } finally {
           if (!accepted) patchRunning = false;
@@ -336,6 +358,23 @@ export function createBootstrapServer(
             ? { state: "receiving" }
             : (turn ?? { state: "idle" });
         reply(response, 200, status);
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/turn/cancel") {
+        // Only the running turn named here ends, and only one that may end early. The answer, after
+        // it ended, is the record as it then stands.
+        const named = NodeExecutorTurn.parse(await body(request));
+        if (
+          turn?.state === "running" &&
+          cancellable &&
+          cancellable.identity.kind === named.kind &&
+          cancellable.identity.operation_id === named.operation_id &&
+          cancellable.identity.revision === named.revision
+        ) {
+          cancellable.abort.abort();
+          await cancellable.ended;
+        }
+        reply(response, 200, turn ?? { state: "idle" });
         return;
       }
       if (patchRegistered) throw new BootstrapError("patch_container_only");
