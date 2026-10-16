@@ -87,6 +87,19 @@ impl ResumeScope {
         now < self.expires_at && Instant::now() < self.deadline
     }
 }
+/// A retained scope retires when at least this many accepted leases, spread over at least
+/// `UNNAMED_SPAN`, did not name its database. At one fetch per second a minute holds sixty.
+const UNNAMED_ACCEPTS: u32 = 30;
+const UNNAMED_SPAN: Duration = Duration::from_secs(60);
+/// How long a kernel fact that changed nothing (a device confirmed absent, a retirement that the
+/// kernel inventory did not confirm) is left alone before enforcement looks at it again.
+const KERNEL_RECHECK: Duration = Duration::from_secs(2);
+/// Accepted leases in a row that did not name a database whose scope the guard retains.
+#[derive(Clone)]
+struct Unnamed {
+    accepts: u32,
+    since: Instant,
+}
 /// A runtime token the guard accepted for a Pod, with the claims it verified, for the record writer.
 #[derive(Clone)]
 pub struct RuntimeScope {
@@ -114,6 +127,7 @@ pub struct Guard {
     /// The Pods the sandbox runtime has: assigned, or removed with a retained scope. `None` until
     /// the controller says (unit tests, and callers that have no runtime).
     known_pods: Option<BTreeSet<String>>,
+    unnamed: BTreeMap<String, Unnamed>,
 }
 fn invalid() -> Status {
     Status::failed_precondition("storage_host_authority_invalid")
@@ -191,6 +205,7 @@ impl Guard {
             legacy: config.legacy_database_ids.into_iter().collect(),
             highest: BTreeMap::new(),
             known_pods: None,
+            unnamed: BTreeMap::new(),
         })
     }
     pub fn accept(&mut self, lease: HostStorageLease, now: u64) -> Result<(), Status> {
@@ -366,6 +381,19 @@ impl Guard {
         self.entries = entries;
         self.legacy = legacy;
         self.last_issued = lease.issued_at;
+        let (entries, legacy, highest) = (&self.entries, &self.legacy, &self.highest);
+        let named = |id: &String| entries.contains_key(id) || legacy.contains(id);
+        self.unnamed
+            .retain(|id, _| highest.contains_key(id) && !named(id));
+        for id in highest.keys().filter(|id| !named(id)) {
+            self.unnamed
+                .entry(id.clone())
+                .and_modify(|unnamed| unnamed.accepts = unnamed.accepts.saturating_add(1))
+                .or_insert_with(|| Unnamed {
+                    accepts: 1,
+                    since: Instant::now(),
+                });
+        }
         Ok(())
     }
     /// The signed Pod scopes of the entries accepted last. Persisting them is never a condition of
@@ -556,8 +584,33 @@ impl Guard {
                 drain_only: false,
             })
     }
+    /// A retained scope that a minute of accepted leases did not name. The lease is the only
+    /// record of what the node holds, and the API stops serving a deleted database after an hour,
+    /// so a guard that was not looking (restarted, cut off) would otherwise keep the scope for
+    /// ever. Like any retirement it still needs the kernel to confirm the device is gone.
+    fn unnamed_scope(&self, namespace: &str, pod_uid: &str, now: u64) -> Option<ResumeScope> {
+        let id = namespace.strip_prefix("pgcf-db-")?;
+        let old = self.highest.get(id)?;
+        let unnamed = self.unnamed.get(id)?;
+        let deadline = self.snapshot_deadline?;
+        (old.claims().pod_uid == pod_uid
+            && unnamed.accepts >= UNNAMED_ACCEPTS
+            && unnamed.since.elapsed() >= UNNAMED_SPAN
+            && self.snapshot_material_revision == self.material_revision
+            && self.snapshot_expires_at > now
+            && Instant::now() < deadline)
+            .then(|| ResumeScope {
+                authority: old.clone(),
+                expires_at: self.snapshot_expires_at,
+                deadline,
+                operation_id: None,
+                drain_only: false,
+            })
+    }
     fn forget_protective(&mut self, pod_uid: &str) {
         self.highest.retain(|_, v| v.claims().pod_uid != pod_uid);
+        let highest = &self.highest;
+        self.unnamed.retain(|id, _| highest.contains_key(id));
         self.stopped.remove(pod_uid);
         self.quiesced.remove(pod_uid);
         self.resumed.remove(pod_uid);
@@ -656,7 +709,7 @@ pub async fn watch(
         return;
     }
     tokio::select! {
-        () = supervise_shared(controller, guard) => {}
+        () = supervise_shared(controller, guard, Kernel::HOST) => {}
         name = stops.recv() => eprintln!("storage_guard_thread_stopped {}", name.unwrap_or("unknown")),
     }
 }
@@ -702,32 +755,106 @@ async fn supervise_leases(
         guard.clone(),
         pending,
     )));
-    supervise_shared(controller, guard).await;
+    supervise_shared(controller, guard, Kernel::HOST).await;
+}
+/// The kernel facts enforcement reads and changes. Production uses the device-mapper ABI; the
+/// tests of the loop substitute counters, because no unit test can create a thin volume.
+#[derive(Clone, Copy)]
+pub struct Kernel {
+    pub absent: fn(&VerifiedStorageAuthority) -> Result<bool, Status>,
+    pub suspend: fn(&VerifiedStorageAuthority) -> Result<(), Status>,
+    pub resume: fn(&VerifiedStorageAuthority) -> Result<(), Status>,
+}
+impl Kernel {
+    pub const HOST: Kernel = Kernel {
+        absent: crate::storage_dm::absent,
+        suspend: crate::storage_dm::suspend,
+        resume: crate::storage_dm::resume,
+    };
+}
+/// What one enforcement task found out about a Pod, applied by the loop that spawned it.
+struct Outcome {
+    uid: String,
+    stopped: bool,
+    quiesced: Option<bool>,
+    retired: bool,
+    resumed: Option<(String, bool)>,
+    /// The kernel was asked and nothing changed: ask again after `KERNEL_RECHECK`, not every tick.
+    recheck: Recheck,
+    /// A kernel fact that was not confirmed, for the journal (at most once a while per Pod).
+    unconfirmed: Option<&'static str>,
+}
+impl Outcome {
+    fn new(uid: String, stopped: bool) -> Self {
+        Self {
+            uid,
+            stopped,
+            quiesced: None,
+            retired: false,
+            resumed: None,
+            recheck: Recheck::Nothing,
+            unconfirmed: None,
+        }
+    }
+}
+#[derive(PartialEq)]
+enum Recheck {
+    Nothing,
+    /// The volume's device does not exist: there is nothing to quiesce.
+    Device,
+    /// The kernel inventory did not confirm that a scope nobody names is gone.
+    Retirement,
+}
+enum Quiesce {
+    Suspended,
+    /// The volume's device does not exist, so nothing can write through it.
+    Absent,
 }
 /// Expiry enforcement: the only code that stops a Pod or quiesces a volume. It reads what the
 /// intake accepted; it never fetches, accepts or writes records.
-async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync::Mutex<Guard>>) {
+async fn supervise_shared(
+    controller: SandboxController,
+    guard: Arc<tokio::sync::Mutex<Guard>>,
+    kernel: Kernel,
+) {
     let mut stopping = BTreeSet::<String>::new();
-    let (done_tx, mut done_rx) =
-        tokio::sync::mpsc::channel::<(String, bool, Option<bool>, bool, Option<(String, bool)>)>(
-            256,
-        );
+    let mut device_after = BTreeMap::<String, Instant>::new();
+    let mut retirement_after = BTreeMap::<String, Instant>::new();
+    let mut reported = intake::Reported::new(Duration::from_secs(10));
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<Outcome>(256);
     loop {
-        while let Ok((uid, stopped, quiesced, retired, resumed)) = done_rx.try_recv() {
-            stopping.remove(&uid);
+        device_after.retain(|_, until| *until > Instant::now());
+        retirement_after.retain(|_, until| *until > Instant::now());
+        while let Ok(outcome) = done_rx.try_recv() {
+            stopping.remove(&outcome.uid);
+            let later = Instant::now() + KERNEL_RECHECK;
+            match outcome.recheck {
+                Recheck::Nothing => {}
+                Recheck::Device => {
+                    device_after.insert(outcome.uid.clone(), later);
+                }
+                Recheck::Retirement => {
+                    retirement_after.insert(outcome.uid.clone(), later);
+                }
+            }
+            if let Some(what) = outcome.unconfirmed
+                && reported.due(&format!("{what} {}", outcome.uid))
+            {
+                eprintln!("{what} {}", outcome.uid);
+            }
             let mut state = guard.lock().await;
-            if retired {
-                state.forget_protective(&uid);
+            if outcome.retired {
+                state.forget_protective(&outcome.uid);
                 continue;
             }
-            if quiesced == Some(true) {
-                state.note_quiesced(&uid);
+            if outcome.quiesced == Some(true) {
+                state.note_quiesced(&outcome.uid);
             }
-            if let Some((operation, drain_only)) = resumed {
-                state.note_resumed(&uid, &operation, drain_only);
+            if let Some((operation, drain_only)) = outcome.resumed {
+                state.note_resumed(&outcome.uid, &operation, drain_only);
             }
-            if stopped {
-                state.note_stopped(&uid);
+            if outcome.stopped {
+                state.note_stopped(&outcome.uid);
             }
         }
         // Physical expiry cannot wait behind ordinary CRI holder cleanup under the pool lock.
@@ -749,11 +876,13 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
             }
         }
         for (uid, namespace) in pods {
+            let no_device = device_after.contains_key(&uid);
+            let retirement_unconfirmed = retirement_after.contains_key(&uid);
             let (
                 permit,
                 protection,
                 resume,
-                retirement,
+                (retirement, unnamed),
                 was_stopped,
                 was_quiesced,
                 was_resumed,
@@ -764,7 +893,11 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
                     state.permits(&namespace, &uid, now()),
                     state.protection(&namespace, &uid),
                     state.resume_scope(&namespace, &uid, now()),
-                    state.retirement_scope(&namespace, &uid, now()),
+                    match state.retirement_scope(&namespace, &uid, now()) {
+                        Some(scope) => (Some(scope), false),
+                        None if retirement_unconfirmed => (None, false),
+                        None => (state.unnamed_scope(&namespace, &uid, now()), true),
+                    },
                     state.stopped.contains(&uid),
                     state.quiesced.contains(&uid),
                     state.resumed.contains_key(&uid),
@@ -774,7 +907,7 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
             if (retirement.is_none()
                 && resume.is_none()
                 && ((permit && (!was_stopped || was_resumed))
-                    || (was_stopped && (was_quiesced || active_drain))))
+                    || (was_stopped && (was_quiesced || active_drain || no_device))))
                 || !stopping.insert(uid.clone())
             {
                 continue;
@@ -785,7 +918,7 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
                 if let Some(scope) = retirement {
                     let absent = tokio::task::spawn_blocking(move || {
                         if scope.current(now()) {
-                            crate::storage_dm::absent(&scope.authority)
+                            (kernel.absent)(&scope.authority)
                         } else {
                             Err(Status::failed_precondition(
                                 "storage_retirement_snapshot_expired",
@@ -796,15 +929,28 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
                     if matches!(absent, Ok(Ok(true)))
                         && controller.forget_retired(&uid).await.is_ok()
                     {
-                        let _ = done.send((uid, true, None, true, None)).await;
+                        let _ = done
+                            .send(Outcome {
+                                retired: true,
+                                ..Outcome::new(uid, true)
+                            })
+                            .await;
                         return;
                     }
                     // A partial/changed kernel inventory never permits retirement.
-                    let _ = done.send((uid, was_stopped, None, false, None)).await;
+                    let _ = done
+                        .send(Outcome {
+                            recheck: if unnamed {
+                                Recheck::Retirement
+                            } else {
+                                Recheck::Nothing
+                            },
+                            ..Outcome::new(uid, was_stopped)
+                        })
+                        .await;
                     return;
                 }
-                let mut quiesced = None;
-                let mut resumed = None;
+                let mut outcome = Outcome::new(uid.clone(), was_stopped);
                 if let Some(scope) = resume {
                     let operation = scope
                         .operation_id
@@ -817,46 +963,51 @@ async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync:
                                 "storage_resume_startup_expired",
                             ));
                         }
-                        crate::storage_dm::resume(&scope.authority)
+                        (kernel.resume)(&scope.authority)
                     })
                     .await
                     {
                         Ok(Ok(())) => {
-                            quiesced = Some(false);
-                            resumed = Some((operation, drain_only));
+                            outcome.quiesced = Some(false);
+                            outcome.resumed = Some((operation, drain_only));
                         }
                         _ => {
-                            eprintln!("storage_dm_resume_unconfirmed");
-                            let _ = done.send((uid, false, None, false, None)).await;
+                            outcome.stopped = false;
+                            outcome.unconfirmed = Some("storage_dm_resume_unconfirmed");
+                            let _ = done.send(outcome).await;
                             return;
                         }
                     }
                 } else if let Some(authority) =
-                    protection.filter(|_| !was_quiesced && !active_drain)
+                    protection.filter(|_| !was_quiesced && !active_drain && !no_device)
                 {
                     match tokio::task::spawn_blocking(move || {
-                        crate::storage_dm::suspend(&authority)
+                        if (kernel.absent)(&authority)? {
+                            Ok(Quiesce::Absent)
+                        } else {
+                            (kernel.suspend)(&authority).map(|()| Quiesce::Suspended)
+                        }
                     })
                     .await
                     {
-                        Ok(Ok(())) => {
-                            quiesced = Some(true);
-                        }
-                        _ => eprintln!("storage_dm_quiescence_unconfirmed"),
+                        Ok(Ok(Quiesce::Suspended)) => outcome.quiesced = Some(true),
+                        Ok(Ok(Quiesce::Absent)) => outcome.recheck = Recheck::Device,
+                        _ => outcome.unconfirmed = Some("storage_dm_quiescence_unconfirmed"),
                     }
                 }
-                let stopped = if was_stopped {
-                    true
-                } else {
-                    match controller.stop_pod_tasks(&uid).await {
+                if !was_stopped {
+                    outcome.stopped = match controller.stop_pod_tasks(&uid).await {
                         Ok(()) => true,
                         Err(error) => {
-                            eprintln!("{}", error.message());
+                            outcome.unconfirmed = Some(match error.code() {
+                                tonic::Code::NotFound => "storage_pod_tasks_not_found",
+                                _ => "storage_pod_tasks_unconfirmed",
+                            });
                             false
                         }
-                    }
-                };
-                let _ = done.send((uid, stopped, quiesced, false, resumed)).await;
+                    };
+                }
+                let _ = done.send(outcome).await;
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1356,6 +1507,53 @@ mod tests {
         assert_eq!(state.protective_pods().len(), 2);
     }
     #[test]
+    fn a_scope_the_lease_stops_naming_retires_only_after_a_minute_of_leases() {
+        use super::test_support::{Issuer, claims, database, guard, lease, pod, running};
+        let issuer = Issuer::new();
+        let mut state = guard(&issuer);
+        let (database, pod) = (database(5), pod(5));
+        let namespace = format!("pgcf-db-{database}");
+        let clock = now();
+        let held = claims(&database, &pod, 1, 1, clock);
+        state.retain_protective(&pod, &issuer.token(&held)).unwrap();
+        for n in 0..u64::from(UNNAMED_ACCEPTS) {
+            state.accept(lease(vec![], clock + n), clock + n).unwrap();
+        }
+        assert!(
+            state.unnamed_scope(&namespace, &pod, clock).is_none(),
+            "thirty leases within a second say nothing about a minute"
+        );
+        let a_minute_ago = Instant::now()
+            .checked_sub(UNNAMED_SPAN + Duration::from_secs(1))
+            .unwrap();
+        state.unnamed.get_mut(&database).unwrap().since = a_minute_ago;
+        assert!(state.unnamed_scope(&namespace, &pod, clock).is_some());
+        assert!(
+            state
+                .unnamed_scope(&namespace, "another-pod", clock)
+                .is_none()
+        );
+        assert!(
+            state
+                .unnamed_scope(&namespace, &pod, clock + 31_000)
+                .is_none(),
+            "the snapshot that says so has itself expired"
+        );
+        state.unnamed.get_mut(&database).unwrap().accepts = UNNAMED_ACCEPTS - 1;
+        assert!(
+            state.unnamed_scope(&namespace, &pod, clock).is_none(),
+            "too few leases arrived within the minute"
+        );
+        state.unnamed.get_mut(&database).unwrap().accepts = UNNAMED_ACCEPTS;
+        // One lease that names the database again starts the count over.
+        let named = running(&issuer, &claims(&database, &pod, 1, 2, clock + 40));
+        state
+            .accept(lease(vec![named], clock + 40), clock + 40)
+            .unwrap();
+        assert!(!state.unnamed.contains_key(&database));
+        assert!(state.unnamed_scope(&namespace, &pod, clock + 40).is_none());
+    }
+    #[test]
     fn a_pod_removed_before_the_record_writer_reached_it_still_has_its_accepted_token() {
         use super::test_support::{Issuer, claims, database, guard, lease, pod, running};
         let issuer = Issuer::new();
@@ -1366,6 +1564,184 @@ mod tests {
         state.accept(lease(vec![entry], clock), clock).unwrap();
         assert_eq!(state.accepted_token(&pod(3)), token);
         assert_eq!(state.accepted_token(&pod(4)), None);
+    }
+}
+
+/// Enforcement against a controller of an empty node and a kernel that counts what it is asked.
+#[cfg(test)]
+mod enforcement_tests {
+    use super::test_support::{Issuer, claims, controller, database, lease, pod, running};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn clock() -> u64 {
+        now()
+    }
+    /// A retained scope for `database` that the lease does not name, as after a restart.
+    async fn retained(
+        issuer: &Issuer,
+        state: &Arc<tokio::sync::Mutex<Guard>>,
+        database: &str,
+        pod: &str,
+    ) {
+        let held = claims(database, pod, 1, 1, clock());
+        state
+            .lock()
+            .await
+            .retain_protective(pod, &issuer.token(&held))
+            .unwrap();
+    }
+    async fn eventually(what: &str, mut condition: impl AsyncFnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition().await {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    static GONE_ABSENT: AtomicUsize = AtomicUsize::new(0);
+    static GONE_SUSPEND: AtomicUsize = AtomicUsize::new(0);
+    fn gone(_: &VerifiedStorageAuthority) -> Result<bool, Status> {
+        GONE_ABSENT.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+    fn no_such_device(_: &VerifiedStorageAuthority) -> Result<(), Status> {
+        GONE_SUSPEND.fetch_add(1, Ordering::SeqCst);
+        Err(Status::failed_precondition(
+            "storage_dm_identity_or_quiescence_unconfirmed",
+        ))
+    }
+    #[tokio::test]
+    async fn a_scope_the_lease_stopped_naming_whose_device_is_gone_is_forgotten() {
+        let issuer = Issuer::new();
+        let (runtime, directory) = controller(&issuer).await;
+        let state = runtime.storage_guard().unwrap();
+        let (database, pod) = (database(6), pod(6));
+        retained(&issuer, &state, &database, &pod).await;
+        {
+            let mut inner = state.lock().await;
+            let begin = clock();
+            for n in 0..u64::from(UNNAMED_ACCEPTS) {
+                inner.accept(lease(vec![], begin + n), begin + n).unwrap();
+            }
+            inner.unnamed.get_mut(&database).unwrap().since = Instant::now()
+                .checked_sub(UNNAMED_SPAN + Duration::from_secs(1))
+                .unwrap();
+        }
+        let kernel = Kernel {
+            absent: gone,
+            suspend: no_such_device,
+            resume: no_such_device,
+        };
+        let enforcing = tokio::spawn(supervise_shared(runtime.clone(), state.clone(), kernel));
+        eventually("the scope of a deleted database stayed", async || {
+            state.lock().await.protective_pods().is_empty()
+        })
+        .await;
+        assert_eq!(
+            GONE_SUSPEND.load(Ordering::SeqCst),
+            0,
+            "a device that does not exist was asked to suspend"
+        );
+        enforcing.abort();
+        drop(runtime);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    static LOST_ABSENT: AtomicUsize = AtomicUsize::new(0);
+    static LOST_SUSPEND: AtomicUsize = AtomicUsize::new(0);
+    fn lost(_: &VerifiedStorageAuthority) -> Result<bool, Status> {
+        LOST_ABSENT.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+    fn refuse(_: &VerifiedStorageAuthority) -> Result<(), Status> {
+        LOST_SUSPEND.fetch_add(1, Ordering::SeqCst);
+        Err(Status::failed_precondition(
+            "storage_dm_identity_or_quiescence_unconfirmed",
+        ))
+    }
+    static HERE_ABSENT: AtomicUsize = AtomicUsize::new(0);
+    static HERE_SUSPEND: AtomicUsize = AtomicUsize::new(0);
+    fn here(_: &VerifiedStorageAuthority) -> Result<bool, Status> {
+        HERE_ABSENT.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
+    }
+    fn quiesce(_: &VerifiedStorageAuthority) -> Result<(), Status> {
+        HERE_SUSPEND.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn an_unnamed_scope_whose_device_exists_is_quiesced_and_not_probed_every_tick() {
+        let issuer = Issuer::new();
+        let (runtime, directory) = controller(&issuer).await;
+        let state = runtime.storage_guard().unwrap();
+        let (database, pod) = (database(8), pod(8));
+        retained(&issuer, &state, &database, &pod).await;
+        {
+            let mut inner = state.lock().await;
+            let begin = clock();
+            for n in 0..u64::from(UNNAMED_ACCEPTS) {
+                inner.accept(lease(vec![], begin + n), begin + n).unwrap();
+            }
+            inner.unnamed.get_mut(&database).unwrap().since = Instant::now()
+                .checked_sub(UNNAMED_SPAN + Duration::from_secs(1))
+                .unwrap();
+        }
+        let kernel = Kernel {
+            absent: here,
+            suspend: quiesce,
+            resume: quiesce,
+        };
+        let enforcing = tokio::spawn(supervise_shared(runtime.clone(), state.clone(), kernel));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        enforcing.abort();
+        // The device is there: the scope stays, is quiesced once, and the failed retirement is not
+        // retried every tick.
+        assert_eq!(state.lock().await.protective_pods().len(), 1);
+        assert_eq!(HERE_SUSPEND.load(Ordering::SeqCst), 1);
+        assert!(
+            HERE_ABSENT.load(Ordering::SeqCst) <= 2,
+            "the kernel inventory was read {} times in seven ticks",
+            HERE_ABSENT.load(Ordering::SeqCst)
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[tokio::test]
+    async fn a_device_that_does_not_exist_is_not_asked_to_suspend_every_tick() {
+        let issuer = Issuer::new();
+        let (runtime, directory) = controller(&issuer).await;
+        let state = runtime.storage_guard().unwrap();
+        let (database, pod) = (database(7), pod(7));
+        retained(&issuer, &state, &database, &pod).await;
+        // The lease still names the database, but blocks its writes: the scope must be quiesced.
+        {
+            let mut entry = running(&issuer, &claims(&database, &pod, 1, 2, clock()));
+            entry.write_blocked = true;
+            let begin = clock();
+            state
+                .lock()
+                .await
+                .accept(lease(vec![entry], begin), begin)
+                .unwrap();
+        }
+        let kernel = Kernel {
+            absent: lost,
+            suspend: refuse,
+            resume: refuse,
+        };
+        let enforcing = tokio::spawn(supervise_shared(runtime.clone(), state.clone(), kernel));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        enforcing.abort();
+        assert_eq!(LOST_SUSPEND.load(Ordering::SeqCst), 0);
+        assert!(
+            LOST_ABSENT.load(Ordering::SeqCst) <= 2,
+            "the kernel inventory was read {} times in seven ticks",
+            LOST_ABSENT.load(Ordering::SeqCst)
+        );
+        assert_eq!(state.lock().await.protective_pods().len(), 1);
+        drop(runtime);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1509,5 +1885,55 @@ pub(crate) mod test_support {
     }
     pub(crate) fn guard(issuer: &Issuer) -> Guard {
         Guard::new(issuer.trust.clone(), NODE.into(), 1).unwrap()
+    }
+    /// A controller of an empty node whose storage guard trusts `issuer`; the caller removes the directory.
+    pub(crate) async fn controller(
+        issuer: &Issuer,
+    ) -> (crate::controller::SandboxController, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/pg-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["state", "rpc", "s"] {
+            std::fs::create_dir(directory.join(name)).unwrap();
+            std::fs::set_permissions(directory.join(name), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let settings: crate::slot::Settings = serde_json::from_value(serde_json::json!({
+            "socket": directory.join("rpc/controller.sock"),
+            "state": directory.join("state"),
+            "shim_sockets": directory.join("s"),
+            "containerd_socket": "/run/containerd/containerd.sock",
+            "containerd_binary": "/bin/containerd",
+            "shim_binary": "/bin/shim",
+            "runc_binary": "/bin/runc",
+            "holder_binary": "/bin/holder",
+            "namespace": "k8s.io",
+            "slots": 0,
+            "slot_lifetime_ms": 300000,
+            "cloudflare": {
+                "api_url": "https://api.invalid",
+                "agent_key_file": directory.join("key"),
+                "node_id": "nod_abcdefghijklmnopqrst",
+                "node_uid": NODE,
+                "region_id": "eu1",
+                "material_revision": 1,
+                "image": "registry.invalid/pgcf@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cgroup_root": "/sys/fs/cgroup/pgcf-compute",
+                "storage_authority": issuer.trust,
+            }
+        }))
+        .unwrap();
+        (
+            crate::controller::SandboxController::prepare(settings)
+                .await
+                .unwrap(),
+            directory,
+        )
     }
 }

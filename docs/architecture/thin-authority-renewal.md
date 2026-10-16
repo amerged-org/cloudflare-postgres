@@ -218,7 +218,13 @@ NodeBootstrap alarm to now instead of waiting for the cadence.
   that never had a volume receipt never had a token, so no scope exists for it and it is not named
   at all; an unconfirmed deletion keeps its entry, which blocks writes and carries the drain. The
   contract caps a lease at 4096 databases and the guard refuses a body over 2 MiB, which the
-  previously unbounded tombstones would have reached.
+  previously unbounded tombstones would have reached. A guard that was restarted or cut off while
+  the tombstone was served used to keep the scope for ever, and asked a device that no longer
+  existed to suspend ten times a second. It now also forgets a scope that at least thirty accepted
+  leases over at least a minute did not name, once the kernel's complete inventory shows the device
+  absent (the same `absent` check; a lease that is not current, or an inventory that is not
+  complete, forgets nothing), and it looks at a missing device again every two seconds, not every
+  tick.
 - **Gateway:** the controller writes each returned token into `storage-<id>`
   (nc/reconcile.rs:543-560). Writes are monotonic: a token never replaces one with a higher
   `authority_revision`, because the gateway disconnects on a regression (np/storage.rs:234-256) and a

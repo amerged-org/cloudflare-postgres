@@ -109,6 +109,12 @@ controller's runtime every 100 ms and only reads accepted state. Recording a sco
 condition of accepting its token, and a Pod removed before its record was written retains the scope
 the guard accepted for it. Either thread ending ends the service, which the platform restarts.
 
+A retained scope retires from an accepted lease that names its database deleted, or when at least
+thirty accepted leases over at least a minute did not name the database at all and the kernel's
+complete inventory shows its device absent. A missing device is looked at again every two seconds,
+not every tick, and a token naming a Pod the sandbox runtime does not have is accepted but never
+becomes the retained scope.
+
 ## Verification
 
 `cargo test -p pgcf-sandbox-controller` exercises the real upstream protobuf encoding and

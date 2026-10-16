@@ -405,7 +405,8 @@ experiment (it removes a known 6.2 statements/s per node).
   (`accept` is all-or-nothing), a sticky `stopped` per Pod UID. Done in source on branch
   `golive/host-guard-r3`: a token for a Pod not yet assigned no longer starves every other database's
   renewals (it is accepted, reported once per Pod and never retained as the scope), fetch errors are
-  logged.
+  logged, and a retained scope that a minute of leases did not name is forgotten once its device is
+  absent (it used to be retried ten times a second for ever).
 
 ## 8. Experiments, in order
 

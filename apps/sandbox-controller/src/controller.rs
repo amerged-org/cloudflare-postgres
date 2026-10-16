@@ -1494,60 +1494,12 @@ mod tests {
             .name = "unrelated".into();
         assert!(pod_config(&request, "pgcf").is_err());
     }
-    /// A controller of an empty node whose storage guard trusts `issuer`; the caller removes the directory.
-    async fn guarded(
-        issuer: &crate::storage::test_support::Issuer,
-    ) -> (SandboxController, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let directory = std::path::PathBuf::from(format!(
-            "/tmp/pg-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        for name in ["state", "rpc", "s"] {
-            std::fs::create_dir(directory.join(name)).unwrap();
-            std::fs::set_permissions(directory.join(name), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-        }
-        let settings: Settings = serde_json::from_value(serde_json::json!({
-            "socket": directory.join("rpc/controller.sock"),
-            "state": directory.join("state"),
-            "shim_sockets": directory.join("s"),
-            "containerd_socket": "/run/containerd/containerd.sock",
-            "containerd_binary": "/bin/containerd",
-            "shim_binary": "/bin/shim",
-            "runc_binary": "/bin/runc",
-            "holder_binary": "/bin/holder",
-            "namespace": "k8s.io",
-            "slots": 0,
-            "slot_lifetime_ms": 300000,
-            "cloudflare": {
-                "api_url": "https://api.invalid",
-                "agent_key_file": directory.join("key"),
-                "node_id": "nod_abcdefghijklmnopqrst",
-                "node_uid": crate::storage::test_support::NODE,
-                "region_id": "eu1",
-                "material_revision": 1,
-                "image": "registry.invalid/pgcf@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "cgroup_root": "/sys/fs/cgroup/pgcf-compute",
-                "storage_authority": issuer.trust,
-            }
-        }))
-        .unwrap();
-        (
-            SandboxController::prepare(settings).await.unwrap(),
-            directory,
-        )
-    }
     #[tokio::test]
     async fn tokens_naming_pods_the_runtime_does_not_have_do_not_stop_the_lease_or_become_scopes() {
         use crate::storage::test_support::{Issuer, claims, database, lease, pod, running};
         let issuer = Issuer::new();
         // An empty node: the sandbox runtime has no Pod at all.
-        let (controller, directory) = guarded(&issuer).await;
+        let (controller, directory) = crate::storage::test_support::controller(&issuer).await;
         let guard = controller.storage_guard().unwrap();
         let (leases, rx) = tokio::sync::mpsc::channel(1);
         let supervisor = tokio::spawn(crate::storage::supervise_bound(controller.clone(), rx));
@@ -1583,7 +1535,7 @@ mod tests {
     async fn a_stalled_owner_record_write_cannot_stall_the_fetcher_or_the_acceptance_of_a_lease() {
         use crate::storage::test_support::{Issuer, claims, database, lease, pod, running};
         let issuer = Issuer::new();
-        let (controller, directory) = guarded(&issuer).await;
+        let (controller, directory) = crate::storage::test_support::controller(&issuer).await;
         let guard = controller.storage_guard().unwrap();
         // Every durable record write takes the pool lock; a hung fsync or a wedged shim holds it
         // for seconds, exactly as this test holds it.
