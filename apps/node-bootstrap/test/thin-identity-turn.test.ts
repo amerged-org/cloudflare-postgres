@@ -302,7 +302,7 @@ test("a cancelled turn ends as cancelled, whatever its interrupted read raised",
     cancel = new AbortController();
   const { outcome, reports } = await cancellableTurn(world, cancel, {
     status: (current) => {
-      cancel.abort();
+      cancel.abort(new BootstrapError("thin_storage_turn_cancelled"));
       return current;
     },
   });
@@ -316,7 +316,7 @@ test("a failure the turn raised before a cancel keeps its own code, even when th
   const { outcome } = await cancellableTurn(world, cancel, {
     status: (current) => ({ ...current, revision: 99 }),
     close: async () => {
-      cancel.abort();
+      cancel.abort(new BootstrapError("thin_storage_turn_cancelled"));
       await new Promise((resolve) => setTimeout(resolve, 200));
     },
   });
@@ -332,7 +332,8 @@ test("a read that finished before a cancel keeps the failure it proves", async (
   );
   // The cancel arrives as the first driver read returns; that read proves a changed driver.
   world.afterScript = (count) => {
-    if (count === 1) cancel.abort();
+    if (count === 1)
+      cancel.abort(new BootstrapError("thin_storage_turn_cancelled"));
   };
   const { outcome } = await cancellableTurn(world, cancel);
   await assert.rejects(outcome, failedWith("thin_storage_driver_unqualified"));
@@ -343,7 +344,8 @@ test("a cancel before the report is sent ends the turn without it", async () => 
     cancel = new AbortController();
   // The last driver read is the closing one: the cancel arrives as it returns.
   world.afterScript = (count) => {
-    if (count === 2) cancel.abort();
+    if (count === 2)
+      cancel.abort(new BootstrapError("thin_storage_turn_cancelled"));
   };
   const { outcome, reports } = await cancellableTurn(world, cancel);
   await assert.rejects(outcome, failedWith("thin_storage_turn_cancelled"));
@@ -355,7 +357,7 @@ test("the report is the turn's point of no return: a cancel during it waits for 
     cancel = new AbortController();
   const { outcome, reports } = await cancellableTurn(world, cancel, {
     report: async () => {
-      cancel.abort();
+      cancel.abort(new BootstrapError("thin_storage_turn_cancelled"));
       await new Promise((resolve) => setImmediate(resolve));
     },
   });

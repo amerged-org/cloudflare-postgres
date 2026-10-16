@@ -931,17 +931,20 @@ export async function openThinSession<T>(
           error.cause === deadline.reason))
     )
       throw new BootstrapError(scope.deadline_code);
-    // Only what the cancel itself raised is a cancel: a failure the turn raised before it keeps its
-    // code, even when the cancel arrives while the session is cleaned up.
+    // Only the turn's cancel, an abort for that reason, and only what it raised is a cancel: a failure
+    // the turn raised before it keeps its code, even when the cancel arrives while the session is
+    // cleaned up, and any other external abort stays what it raised.
+    const cancel = options.signal?.aborted ? options.signal.reason : undefined;
     if (
       scope.deadline_code &&
-      options.signal?.aborted &&
-      signal.reason === options.signal.reason &&
-      (error === options.signal.reason ||
+      cancel instanceof BootstrapError &&
+      cancel.code === "thin_storage_turn_cancelled" &&
+      signal.reason === cancel &&
+      (error === cancel ||
         (error instanceof BootstrapError && error.code === "job_cancelled") ||
         (error instanceof Error &&
           error.name === "AbortError" &&
-          error.cause === options.signal.reason))
+          error.cause === cancel))
     )
       throw new BootstrapError("thin_storage_turn_cancelled");
     throw error;

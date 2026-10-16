@@ -539,7 +539,6 @@ test(
   "a cancel ends only the running read-only identity turn it names, and the next turn runs after it",
   { timeout: 5000 },
   async () => {
-    const { BootstrapError } = await import("../src/bootstrap.ts");
     const turns: { signal: AbortSignal | undefined; release: () => void }[] =
       [];
     const container = await cancelServer(async (_input, options = {}) => {
@@ -548,7 +547,7 @@ test(
         // As a turn's session ends on its cancel.
         options.signal?.addEventListener(
           "abort",
-          () => reject(new BootstrapError("thin_storage_turn_cancelled")),
+          () => reject(options.signal!.reason as Error),
           { once: true },
         );
       });

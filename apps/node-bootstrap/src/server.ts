@@ -368,7 +368,9 @@ export function createBootstrapServer(
           cancellable.identity.operation_id === named.operation_id &&
           cancellable.identity.revision === named.revision
         ) {
-          cancellable.abort.abort();
+          cancellable.abort.abort(
+            new BootstrapError("thin_storage_turn_cancelled"),
+          );
           await cancellable.ended;
         }
         reply(response, 200, turn ?? { state: "idle" });
