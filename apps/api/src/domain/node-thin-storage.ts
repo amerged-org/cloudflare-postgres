@@ -29,6 +29,7 @@ import {
   POSTGRES_POOL,
 } from "@pgcf/contracts/postgres-pool";
 import {
+  currentStartHoldSql,
   currentStorageStopSql,
   storageDrainReservationStatement,
   nodeThinStorageHeadroomSql,
@@ -235,6 +236,8 @@ interface StartHold {
   storage_budget_bytes: number;
   ready_at: string | null;
   completed_at: string | null;
+  /** The runtime attestation of the controller's last accepted ready report for this start. */
+  attested_json: string | null;
 }
 
 /**
@@ -249,6 +252,8 @@ export interface WriterInputs {
   unresolved: ReadonlySet<string>;
   /** The startup holds that still debit storage, by `${database_id}:${generation}`. */
   holds: ReadonlyMap<string, StartHold>;
+  /** The newest generation each database has a startup hold of: the start of its running Pod. */
+  started: ReadonlyMap<string, number>;
   /** The pending or running wake and resume operations, by operation id. */
   wakes: ReadonlyMap<
     string,
@@ -277,7 +282,7 @@ async function readWriterInputs<Row = never>(
     ...(rows ? [rows] : []),
     postgresPoolHoldersStatement(env.DB, scope),
     env.DB.prepare(
-      `SELECT h.database_id,h.generation,h.node_id,h.node_uid,h.storage_budget_bytes,h.ready_at,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at
+      `SELECT h.database_id,h.generation,h.node_id,h.node_uid,h.storage_budget_bytes,h.ready_at,h.attested_json,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at
       FROM databases d JOIN database_start_admissions h ON h.database_id=d.id JOIN operations o ON o.id=h.operation_id
       WHERE (${scope.sql}) AND h.budget_bytes>0 AND h.storage_budget_bytes>0`,
     ).bind(...scope.bindings),
@@ -299,6 +304,12 @@ async function readWriterInputs<Row = never>(
       generation: number;
     }>,
   ];
+  const started = new Map<string, number>();
+  for (const hold of holds.results)
+    started.set(
+      hold.database_id,
+      Math.max(started.get(hold.database_id) ?? 0, hold.generation),
+    );
   return {
     rows: selected?.results ?? [],
     inputs: {
@@ -309,6 +320,7 @@ async function readWriterInputs<Row = never>(
           hold,
         ]),
       ),
+      started,
       wakes: new Map(wakes.results.map((wake) => [wake.id, wake])),
     },
   };
@@ -353,10 +365,25 @@ function writerContext(
   };
 }
 
+/**
+ * The controller's attestation of a database's Pod: its latest word, `databases.runtime_attestation_json`,
+ * and only when that is absent (a ready report without one clears it) the one the start's hold
+ * remembers from its last accepted ready report.
+ */
+function attestationOf(database: DatabaseRow, hold: StartHold | undefined) {
+  const raw = database.runtime_attestation_json ?? hold?.attested_json;
+  return DatabaseRuntimeAttestation.safeParse(raw ? JSON.parse(raw) : null);
+}
+
 /** A new writer without IO evidence yet (section 8 of thin-authority-renewal.md): its current
- * startup hold of this generation debits at least the LV's virtual size until a later identity
- * proof shows the Pod's io.max, and the controller's runtime attestation of this generation names
- * the Pod together with the receipt's identities, the cluster and the identity proof's boot. */
+ * startup hold debits at least the LV's virtual size until a later identity proof shows the Pod's
+ * io.max, and the controller's runtime attestation names the Pod together with the receipt's
+ * identities, the cluster and the identity proof's boot.
+ *
+ * `since` is the generation the hold and the Pod were started for. The row's generation may have
+ * advanced past it without any start (a role change or a password reset): the attestation of that
+ * start or of a later generation, and the hold of that start, then still name the writer. At the
+ * row's own generation, the default, it is a start of this very generation. */
 function heldWriterPod(
   inputs: WriterInputs,
   database: DatabaseRow,
@@ -370,24 +397,23 @@ function heldWriterPod(
       value.generation === database.generation &&
       value.storage_generation === receipt.storage_generation,
   ),
+  since = database.generation,
 ): string | undefined {
   const lv = authority.physical_lvs.find(
       (value) => value.lv_uuid === receipt.lv_uuid && value.segtype === "thin",
     ),
-    attestation = DatabaseRuntimeAttestation.safeParse(
-      database.runtime_attestation_json
-        ? JSON.parse(database.runtime_attestation_json)
-        : null,
-    ),
+    hold = inputs.holds.get(`${database.id}:${since}`),
+    attestation = attestationOf(database, hold),
     boot = qualification
       ? (JSON.parse(qualification) as { boot_id?: unknown }).boot_id
       : undefined;
   if (!lv || !attestation.success) return undefined;
   const runtime = attestation.data;
   if (
-    database.observed_generation !== database.generation ||
+    runtime.generation < since ||
+    runtime.generation > database.generation ||
+    database.observed_generation < runtime.generation ||
     runtime.database_id !== database.id ||
-    runtime.generation !== database.generation ||
     runtime.storage_generation !== receipt.storage_generation ||
     runtime.node_uid !== storage.node_uid ||
     runtime.boot_id !== boot ||
@@ -400,7 +426,6 @@ function heldWriterPod(
   )
     return undefined;
   const volume = reading;
-  const hold = inputs.holds.get(`${database.id}:${database.generation}`);
   if (
     !hold ||
     hold.node_id !== database.node_id ||
@@ -581,16 +606,18 @@ function parkedHolder(
     // Waking from parked. Once the guard accepted a token for this Pod at the wake's generation it
     // holds the Pod as that generation's writer and refuses a replacement Pod until a newer one.
     // So the token only goes with the controller's claim that every predicate of the fast wake
-    // holds, for the wake that directly follows the reported sleep. Any other wake is ordinary: no
-    // token for the parked Pod, the guard retires it with the startup and the controller demotes.
+    // holds, for the wake that directly follows the reported sleep (its operation is of the
+    // generation after the parked one; the row may be ahead of it by role changes, which start
+    // nothing). Any other wake is ordinary: no token for the parked Pod, the guard retires it
+    // with the startup and the controller demotes.
     const wake = c.inputs.wakes.get(database.power_operation ?? "");
     if (
       parked.wake !== "fast" ||
-      database.generation !== parked.generation + 1 ||
       !wake ||
       wake.database_id !== database.id ||
       wake.project_id !== database.project_id ||
-      wake.generation !== database.generation
+      wake.generation !== parked.generation + 1 ||
+      wake.generation > database.generation
     )
       return undefined;
   } else return undefined;
@@ -598,6 +625,31 @@ function parkedHolder(
     parked.pod_uid
     ? parked.pod_uid
     : undefined;
+}
+
+/**
+ * The writer of a generation that started nothing, by the node's reading of an earlier generation.
+ * A role change, a password reset or a role removal advances the row's generation while the Pod
+ * keeps running, and the node's identity proof names the database at the generation it was
+ * prepared for, up to a minute and a half later: the token of the new generation would otherwise be
+ * missing, the guard stops the Pod that holds the previous one, and the controller cannot ready the
+ * database without it.
+ *
+ * Every start of a Pod has a startup hold of its generation, so while no hold is newer than the
+ * node's reading, that reading still names the one Pod on the volume.
+ */
+function continuedWriter(
+  c: WriterContext,
+  database: DatabaseRow,
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+  authority: NodeThinStorageAuthority,
+  reading: NodeThinStorageAuthority["volumes"][number] | undefined,
+): string | undefined {
+  if (!reading || reading.generation >= database.generation) return undefined;
+  const started = c.inputs.started.get(database.id);
+  if (started !== undefined && started > reading.generation) return undefined;
+  return evidencedWriter(database, storage, receipt, authority);
 }
 
 /**
@@ -636,18 +688,57 @@ async function runningWriterAuthority(
   )
     return undefined;
   // Measured IO limits name the writer; until the identity proof has them, only a held writer,
-  // or the parked Pod that a wake of this very generation reuses.
-  const pod =
-    io?.pod_uid ??
-    heldWriterPod(
-      c.inputs,
+  // or the parked Pod that a wake of this very generation reuses. A generation that started
+  // nothing (a role change, a password reset) continues the writer of the start before it, as
+  // the node's earlier reading and the controller's attestation of that start name it. When the
+  // two name different Pods, nothing is the writer.
+  const started = c.inputs.started.get(database.id);
+  let pod = io?.pod_uid;
+  if (pod === undefined) {
+    // A protective stop is released by a start of its own, never by a generation that started
+    // nothing: while its marker stands, no writer is carried across one.
+    const marked = database.storage_protected_at != null;
+    // The reading of an earlier generation, when none is of this one.
+    const earlier = volume
+        ? undefined
+        : authority.volumes.find(
+            (value) =>
+              value.database_id === database.id &&
+              value.storage_generation === receipt.storage_generation,
+          ),
+      held =
+        marked && (started ?? database.generation) < database.generation
+          ? undefined
+          : heldWriterPod(
+              c.inputs,
+              database,
+              storage,
+              receipt,
+              authority,
+              current!.row.qualification_json,
+              volume ?? earlier,
+              started ?? database.generation,
+            ),
+      continued = marked
+        ? undefined
+        : continuedWriter(c, database, storage, receipt, authority, earlier);
+    if (held !== undefined && continued !== undefined && held !== continued)
+      return undefined;
+    const attested = attestationOf(
       database,
-      storage,
-      receipt,
-      authority,
-      current!.row.qualification_json,
-    ) ??
-    parkedHolder(c, database, storage, receipt, authority);
+      started === undefined
+        ? undefined
+        : c.inputs.holds.get(`${database.id}:${started}`),
+    );
+    pod =
+      held ??
+      parkedHolder(c, database, storage, receipt, authority) ??
+      (attested.success &&
+      continued !== undefined &&
+      attested.data.pod_uid !== continued
+        ? undefined
+        : continued);
+  }
   if (!pod) return undefined;
   return signStorageWriter(c, database, storage, receipt, authority, pod);
 }
@@ -707,18 +798,20 @@ function stoppingWriter(
       io.write_iops_per_second > storage.write_iops_per_second)
   )
     return undefined;
+  const started = inputs.started.get(database.id);
   const held =
-    database.observed_generation === database.generation - 1
-      ? heldWriterPod(
+    started === undefined
+      ? undefined
+      : heldWriterPod(
           inputs,
-          { ...database, generation: database.observed_generation },
+          database,
           storage,
           receipt,
           authority,
           qualification,
           volume,
-        )
-      : undefined;
+          started,
+        );
   if (io && held && io.pod_uid !== held) return undefined;
   return io?.pod_uid ?? held;
 }
@@ -1250,7 +1343,7 @@ export async function hostStorageLease(
       c.env.DB.prepare(
         `SELECT d.*,COUNT(*) OVER() host_snapshot_count,s.storage_gib,a.node_uid startup_node_uid,a.storage_budget_bytes,a.operation_id startup_operation,
  (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation,'status',stop.status) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
- FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.node_uid=? AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation) WHERE ${scope.sql} ORDER BY d.id`,
+ FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON ${currentStartHoldSql()} AND a.node_uid=? WHERE ${scope.sql} ORDER BY d.id`,
       ).bind(node.node_uid, ...scope.bindings),
     ),
     Promise.all([

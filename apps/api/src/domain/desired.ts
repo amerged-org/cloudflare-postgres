@@ -38,6 +38,7 @@ import {
   storageWriteAuthorityForDatabase,
 } from "./node-thin-storage.ts";
 import { desiredRegionStorageSamples } from "./node-thin-storage-samples.ts";
+import { currentStartHoldSql } from "./storage-capacity.ts";
 interface DesiredRow extends DatabaseRow, DesiredSize {
   admission_revision: number;
   route_revision: number;
@@ -129,8 +130,7 @@ export async function desired(
     src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id
-    LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL
-      AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation)
+    LEFT JOIN database_start_admissions a ON ${currentStartHoldSql()}
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     LEFT JOIN database_restores x ON x.target_database_id=d.id
@@ -229,7 +229,8 @@ export async function desired(
       row.storage_startup_node_uid === storage.node_uid &&
       row.storage_startup_budget ===
         Math.max(storage.startup_reserve_bytes, row.storage_gib * 1024 ** 3) &&
-      row.storage_startup_generation === row.generation &&
+      row.storage_startup_generation !== null &&
+      row.storage_startup_generation <= row.generation &&
       thinStorageAuthorityMatches(storage, physical, row.k8s_node_name)
         ? DesiredStorageStartup.parse({
             operation_id: row.storage_startup_operation,

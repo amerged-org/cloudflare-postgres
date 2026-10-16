@@ -179,7 +179,12 @@ it("rejects a second hold for the same generation, unsafe byte budgets and incom
     )
       .bind(f.operation)
       .first(),
-  ).toEqual({ ...row, storage_budget_bytes: 0, storage_volume_json: null });
+  ).toEqual({
+    ...row,
+    storage_budget_bytes: 0,
+    storage_volume_json: null,
+    attested_json: null,
+  });
 });
 
 it("preserves the grant identity and sample while accepting only one complete readiness acknowledgement", async () => {
@@ -241,5 +246,6 @@ it("preserves the grant identity and sample while accepting only one complete re
     ready_sample_observed_at: sample,
     storage_budget_bytes: 0,
     storage_volume_json: null,
+    attested_json: null,
   });
 });

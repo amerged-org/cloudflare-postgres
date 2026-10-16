@@ -313,6 +313,31 @@ export function recordStartupObservationStatement(
     );
 }
 
+/**
+ * The attestation of an accepted ready report stays with the newest thin start of the database:
+ * the writer that hold backs keeps its token (`heldWriterPod`) when a later ready report of the
+ * controller carries no attestation and so clears `databases.runtime_attestation_json`. Run after
+ * the report's own update in the same batch; a report without an attestation changes nothing.
+ */
+export function rememberStartAttestationStatement(
+  db: D1Database,
+  input: { databaseId: string; generation: number; observedAt: string },
+): D1PreparedStatement {
+  DatabaseId.parse(input.databaseId);
+  Timestamp.parse(input.observedAt);
+  if (!Number.isSafeInteger(input.generation) || input.generation < 1)
+    throw new Error("invalid_startup_generation");
+  return db
+    .prepare(
+      `UPDATE database_start_admissions AS a SET attested_json=(SELECT d.runtime_attestation_json FROM databases d WHERE d.id=a.database_id)
+     WHERE a.database_id=? AND a.budget_bytes>0 AND a.storage_budget_bytes>0
+       AND a.generation=(SELECT MAX(h.generation) FROM database_start_admissions h WHERE h.database_id=a.database_id AND h.budget_bytes>0 AND h.storage_budget_bytes>0)
+       AND EXISTS(SELECT 1 FROM databases d WHERE d.id=a.database_id AND d.runtime_attestation_json IS NOT NULL
+         AND d.desired_state='running' AND d.observed_state='ready' AND d.observed_generation=? AND d.updated_at=? AND d.generation>=a.generation)`,
+    )
+    .bind(input.databaseId, input.generation, input.observedAt);
+}
+
 /** A later current-UID physical sample covers the acknowledged runtime before releasing peak RAM.
  * The five-second margin prevents an allowed future-skew sample from predating readiness. */
 export function releaseCoveredStartupReservationsStatement(

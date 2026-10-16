@@ -219,11 +219,15 @@ it("a database idled before any reading measured its Pod gets the window from it
 it("a sleep with neither a measured nor a held writer gets no window", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases));
   await unmeasured(w);
-  await env.DB.prepare(
-    "UPDATE databases SET runtime_attestation_json=NULL WHERE id=?",
-  )
-    .bind(w.id)
-    .run();
+  // No attestation, and none remembered by the start's hold either.
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE databases SET runtime_attestation_json=NULL WHERE id=?",
+    ).bind(w.id),
+    env.DB.prepare(
+      "UPDATE database_start_admissions SET attested_json=NULL WHERE database_id=?",
+    ).bind(w.id),
+  ]);
   await idleIntent(w);
   expect(await leaseEntry(w.f, w.id)).toMatchObject(suspendedEntry);
 });

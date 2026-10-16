@@ -114,7 +114,11 @@ export async function awakeWriter(f: Fixture) {
     (c) => c.name === "postgres",
   )!;
   /** The controller's ready observation with its runtime attestation of the Pod. */
-  const ready = (generation = created.generation, power?: string) =>
+  const ready = (
+    generation = created.generation,
+    power?: string,
+    attestation: object = {},
+  ) =>
     request(
       "/agent/v1/observations",
       f.agent,
@@ -155,6 +159,7 @@ export async function awakeWriter(f: Fixture) {
             memory_limit_bytes: 512 * mib,
             observed_at: Date.now(),
             configuration_fingerprint: "f".repeat(64),
+            ...attestation,
           },
         },
       ]),

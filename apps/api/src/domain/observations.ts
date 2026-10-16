@@ -16,6 +16,7 @@ import { recordNodeMemoryObservation } from "./memory-capacity.ts";
 import { recordNodeStorageObservation } from "./node-storage.ts";
 import {
   recordStartupObservationStatement,
+  rememberStartAttestationStatement,
   databaseCpuChargeSql,
   databaseParkedCpuSql,
   computePoolOverheadSql,
@@ -822,6 +823,14 @@ export async function observations(
             generation: observation.generation,
             observedAt: now,
             state: observation.state,
+          }),
+        );
+      if (observation.state === "ready")
+        statements.push(
+          rememberStartAttestationStatement(c.env.DB, {
+            databaseId: row.id,
+            generation: observation.generation,
+            observedAt: now,
           }),
         );
       return mutation ? mutation.batch(statements) : c.env.DB.batch(statements);

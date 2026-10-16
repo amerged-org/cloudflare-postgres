@@ -161,6 +161,22 @@ function knownHoldBindingSql(
 ) {
   return `(${holdReceiptMatchesCurrentSql(hold, database)} AND ${boundStorageVolumeSql(database, authority, false)} AND (json_extract(${database}.storage_profile_json,'$.node_uid')=${authority}.node_uid AND json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=${authority}.volume_group_uuid AND json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(${authority}.authority_json,'$.pool_uuid') AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=${authority}.profile_sha256))`;
 }
+/**
+ * The predicate joining `admission` to `database` for the start the database is in the middle of:
+ * the newest hold of the database at or below its generation, not ready yet. A role change advances
+ * the row's generation while a start is under way and starts nothing, so the hold stays the
+ * start's: a new start has a hold of its own, which is the newer one. A protective stop blocks a
+ * hold only when its generation is not after the stop's.
+ */
+export function currentStartHoldSql(admission = "a", database = "d"): string {
+  const a = identifier(admission),
+    d = identifier(database);
+  return `${a}.database_id=${d}.id
+    AND ${a}.generation=(SELECT MAX(h.generation) FROM database_start_admissions h WHERE h.database_id=${d}.id AND h.generation<=${d}.generation)
+    AND ${a}.storage_budget_bytes>0 AND ${a}.budget_bytes>0 AND ${a}.ready_at IS NULL
+    AND (${d}.storage_protected_at IS NULL OR ${d}.storage_protected_generation<${a}.generation)`;
+}
+
 /** A stop remains owned after a timeout, but a superseded/foreign intent grants no drain. */
 export function currentStorageStopSql(
   databaseAlias = "d",
