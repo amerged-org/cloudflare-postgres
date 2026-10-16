@@ -329,9 +329,11 @@ it("logs what each lease served: the counts, its time and one compact line per l
   expect(shown(node.held.id)).toEqual({
     id: node.held.id.slice(0, 6),
     generation: 1,
+    revision: lease.databases[0]!.authority_revision,
     write_blocked: false,
     token: false,
     token_life_s: null,
+    token_pod: null,
     startup_valid: true,
     parked: false,
   });
@@ -339,8 +341,10 @@ it("logs what each lease served: the counts, its time and one compact line per l
     const entry = shown(member.id);
     expect(entry).toMatchObject({
       generation: byId.get(member.id)!.generation,
+      revision: byId.get(member.id)!.authority_revision,
       write_blocked: false,
       token: true,
+      token_pod: member.pod.slice(0, 6),
       startup_valid: false,
       parked: member === parked,
     });

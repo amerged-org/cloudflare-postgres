@@ -1294,17 +1294,23 @@ type LeaseRow = DatabaseRow & {
   storage_budget_bytes: number | null;
   startup_operation: string | null;
 };
-/** The seconds a signed writer token is still valid, to a tenth; null when it cannot be read. */
-function tokenLifeSeconds(token: string | null, now: number): number | null {
+/** What `storage_guard_served` shows of a signed writer token: the seconds it is still valid, to a
+ * tenth, and the first characters of the Pod it names; null for what cannot be read. */
+function tokenSummary(token: string | null, now: number) {
   try {
     const claims = JSON.parse(
       new TextDecoder().decode(base64urlToBytes(token!.split(".")[1]!)!),
-    ) as { exp?: unknown };
-    return typeof claims.exp === "number"
-      ? Math.round((claims.exp - now) / 100) / 10
-      : null;
+    ) as { exp?: unknown; pod_uid?: unknown };
+    return {
+      life:
+        typeof claims.exp === "number"
+          ? Math.round((claims.exp - now) / 100) / 10
+          : null,
+      pod:
+        typeof claims.pod_uid === "string" ? claims.pod_uid.slice(0, 6) : null,
+    };
   } catch {
-    return null;
+    return { life: null, pod: null };
   }
 }
 /** What `storage_guard_served` tells about each live entry, so a persisted log can be lined up
@@ -1589,17 +1595,22 @@ export async function hostStorageLease(
       entries: lease.databases.length,
       tombstones: lease.databases.length - live.length,
       elapsed_ms: served - started,
-      live: live.slice(0, LEASE_LOG_LIVE_ENTRIES).map((entry) => ({
-        id: entry.database_id.slice(0, 6),
-        generation: entry.generation,
-        write_blocked: entry.write_blocked,
-        token: entry.runtime_authority !== null,
-        token_life_s: tokenLifeSeconds(entry.runtime_authority, served),
-        startup_valid:
-          entry.startup_expires_at !== null &&
-          entry.startup_expires_at > served,
-        parked: parked.has(entry.database_id),
-      })),
+      live: live.slice(0, LEASE_LOG_LIVE_ENTRIES).map((entry) => {
+        const token = tokenSummary(entry.runtime_authority, served);
+        return {
+          id: entry.database_id.slice(0, 6),
+          generation: entry.generation,
+          revision: entry.authority_revision,
+          write_blocked: entry.write_blocked,
+          token: entry.runtime_authority !== null,
+          token_life_s: token.life,
+          token_pod: token.pod,
+          startup_valid:
+            entry.startup_expires_at !== null &&
+            entry.startup_expires_at > served,
+          parked: parked.has(entry.database_id),
+        };
+      }),
     }),
   );
   return c.json(lease, 200);
