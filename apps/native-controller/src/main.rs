@@ -611,6 +611,16 @@ fn reconcile_failure_delay(attempt: u32) -> Duration {
         failure_delay(attempt - 1)
     }
 }
+/// The delay after a failed reconcile of `error`. A runtime proof that changed while its target was
+/// published is a race with the kubelet's status of the Pod the wake resumed and is met by another
+/// pass at once, up to four times; a proof that keeps changing is a fault and backs off.
+fn reconcile_retry(error: &Error, attempt: u32) -> Duration {
+    if attempt <= 4 && error_code(error).starts_with("runtime_proof_changed_") {
+        Duration::from_millis(250)
+    } else {
+        reconcile_failure_delay(attempt)
+    }
+}
 fn stale_snapshot_retry(cell: &mut Cell, now: Instant) {
     cell.attempt = 0;
     cell.stalled = 0;
@@ -1221,7 +1231,7 @@ async fn run() -> Result<(), Error> {
                                 Err(error) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
-                                    cell.due = Instant::now() + reconcile_failure_delay(cell.attempt);
+                                    cell.due = Instant::now() + reconcile_retry(&error, cell.attempt);
                                     eprintln!("{}", reconcile_failed(&id, generation, &error));
                                 }
                             }
@@ -2091,6 +2101,22 @@ mod tests {
         assert_eq!(class(&db, &Renewals::default(), 0), Class::Wake);
         finish(&mut db, now, Some(&json!({"state":"ready"})));
         assert_eq!(class(&db, &Renewals::default(), 0), Class::Routine);
+    }
+    #[test]
+    fn a_proof_that_changed_while_its_target_was_published_is_retried_at_once() {
+        // The kubelet's status of a resumed Pod arrives between forming the runtime proof and
+        // publishing its target: live that failed a parked wake twice in a row and the second
+        // failure waited the 2 s step (4.5 s and 4.8 s against 2.2 s).
+        let raced: Error = "runtime proof changed during target publication".into();
+        let other: Error = "something else failed".into();
+        let at_once: Vec<_> = (1..=4)
+            .map(|attempt| reconcile_retry(&raced, attempt).as_millis())
+            .collect();
+        assert_eq!(at_once, [250, 250, 250, 250]);
+        // A proof that keeps changing is a fault, not a race: the backoff takes over.
+        assert_eq!(reconcile_retry(&raced, 5), reconcile_failure_delay(5));
+        // Every other failure keeps its schedule.
+        assert_eq!(reconcile_retry(&other, 2), reconcile_failure_delay(2));
     }
     #[test]
     fn a_first_failed_reconcile_retries_at_once_and_later_ones_back_off() {
