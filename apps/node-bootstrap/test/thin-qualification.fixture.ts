@@ -293,7 +293,7 @@ export class ThinWorld {
     throw new Error(`unexpected_kubectl_${verb}`);
   }
 
-  private node() {
+  protected node() {
     return {
       metadata: {
         name: this.ids.name,
@@ -314,7 +314,7 @@ export class ThinWorld {
       },
     };
   }
-  private driver() {
+  protected driver() {
     return {
       metadata: {
         name: "openebs-lvm-localpv-node-eu1",
@@ -340,7 +340,7 @@ export class ThinWorld {
       },
     };
   }
-  private daemonSet() {
+  protected daemonSet() {
     return {
       metadata: { name: "openebs-lvm-localpv-node", uid: this.daemonSetUid },
       spec: {
@@ -746,7 +746,7 @@ export class ThinWorld {
     throw new Error(`unexpected_exec_${command[0]}`);
   }
 
-  private driverCommand(args: string[]): CommandResult {
+  protected driverCommand(args: string[]): CommandResult {
     this.elapse(this.cost(args));
     const [program, ...rest] = args;
     switch (program) {
