@@ -416,6 +416,77 @@ async fn a_resize_up_the_kubelet_cannot_allocate_holds_the_wake_and_then_demotes
 }
 
 #[tokio::test]
+async fn a_release_a_gateway_has_not_yet_seen_the_intent_for_is_asked_again_within_the_pass() {
+    // The gateway answers 409 until its own watch has delivered the intent the controller wrote
+    // just before. The pass used to end there, and the wake waited the second of its retry.
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    *w.gateway.refuse_releases.lock().unwrap() = 3;
+    w.log.lock().unwrap().clear();
+    let observed = reconcile(&w).await;
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let lines = log(&w);
+    let count = |wanted: &str| lines.iter().filter(|line| *line == wanted).count();
+    assert_eq!(count("GATEWAY release refused"), 3, "{lines:#?}");
+    assert_eq!(count("GATEWAY release"), 1);
+    // The intent precedes every attempt, the acknowledgement precedes the target, and the target
+    // is written once.
+    let intent = at(&w, &["PATCH", "gateway-fence-", r#"\"mode\":\"running\""#]);
+    let first = at(&w, &["GATEWAY release refused"]);
+    let acknowledged = lines
+        .iter()
+        .position(|line| line == "GATEWAY release")
+        .unwrap();
+    let target = at(&w, &["PATCH", "gateway-fence-", "admission_target"]);
+    assert!(intent < first && first < acknowledged && acknowledged < target);
+    assert_eq!(admission_target(&w)["generation"], 3);
+}
+
+#[tokio::test]
+async fn a_release_that_is_never_acknowledged_ends_the_pass_after_its_window_and_writes_no_target()
+{
+    let mut w = World::parked().await;
+    w.admitted();
+    w.wake(3);
+    w.start_postgres().await;
+    *w.gateway.refuse_releases.lock().unwrap() = u32::MAX;
+    w.log.lock().unwrap().clear();
+    let started = std::time::Instant::now();
+    let observed = reconcile_pass(&w).await;
+    assert!(
+        observed
+            .as_ref()
+            .is_none_or(|value| value["state"] != "ready"),
+        "{observed:?}"
+    );
+    let lines = log(&w);
+    let refused = lines
+        .iter()
+        .filter(|line| *line == "GATEWAY release refused")
+        .count();
+    assert!(
+        (5..=40).contains(&refused),
+        "{refused} attempts in about 150 ms, 5 ms apart"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!lines.iter().any(|line| line == "GATEWAY release"));
+    let map = w
+        .server
+        .get(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("gateway-fence-{}", w.id),
+        )
+        .unwrap();
+    assert!(
+        map["data"]["admission_target"].is_null(),
+        "no target is written before every gateway acknowledged the release"
+    );
+}
+
+#[tokio::test]
 async fn a_resumed_pod_whose_requests_the_kubelet_is_still_actuating_is_published_without_waiting()
 {
     // The resize changes requests only: no limit, no cgroup limit, no memory the Pod may not use.

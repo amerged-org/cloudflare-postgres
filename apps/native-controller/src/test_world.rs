@@ -73,6 +73,9 @@ pub struct Gateway {
     pub metrics: Arc<Mutex<String>>,
     /// The UID of the gateway Pod the control endpoint answers for.
     pub pod: Arc<Mutex<String>>,
+    /// How many releases the endpoint still refuses with 409 `control_intent_mismatch`, as a
+    /// gateway does until its watch has seen the intent the controller wrote.
+    pub refuse_releases: Arc<Mutex<u32>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Gateway {
@@ -96,12 +99,19 @@ impl Gateway {
         let served = metrics.clone();
         let pod = Arc::new(Mutex::new(gateway_uid()));
         let current = pod.clone();
+        let refuse_releases: Arc<Mutex<u32>> = Arc::default();
+        let refusing = refuse_releases.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (served, log, current) = (served.clone(), log.clone(), current.clone());
+                let (served, log, current, refusing) = (
+                    served.clone(),
+                    log.clone(),
+                    current.clone(),
+                    refusing.clone(),
+                );
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut byte = [0];
@@ -152,6 +162,20 @@ impl Gateway {
                         now_ms(),
                     )
                     .unwrap();
+                    if action == "release" && {
+                        let mut left = refusing.lock().unwrap();
+                        let refuse = *left > 0;
+                        *left = left.saturating_sub(1);
+                        refuse
+                    } {
+                        log.lock()
+                            .unwrap()
+                            .push("GATEWAY release refused".to_string());
+                        let body = r#"{"error":"control_intent_mismatch"}"#;
+                        let _ = socket.write_all(format!("HTTP/1.1 409 Conflict\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
                     log.lock().unwrap().push(format!("GATEWAY {action}"));
                     let (mode, status) = if action == "release" {
                         ("running", "running")
@@ -168,6 +192,7 @@ impl Gateway {
             client,
             metrics,
             pod,
+            refuse_releases,
             task,
         }
     }

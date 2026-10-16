@@ -20,7 +20,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const SYSTEM: &str = "pgcf-system";
 /// The namespace OpenEBS keeps its LVMVolumes in.
@@ -41,6 +41,10 @@ const CLOCK_SKEW: u64 = 5_000;
 /// How long one sleep pass waits for the fenced PostgreSQL to be seen stopped.
 const STOP_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
+/// How long a release is asked again of a gateway that has not yet seen the intent it follows.
+const RELEASE_RETRY_WINDOW: Duration = Duration::from_millis(150);
+/// The pause between two asks of one release.
+const RELEASE_RETRY_SPACING: Duration = Duration::from_millis(5);
 mod parked;
 use parked::{Resumed, Retained};
 pub(crate) use parked::{fenced, runs_wake};
@@ -1145,20 +1149,38 @@ impl PowerCoordinator {
                 } else {
                     pod.ip.clone()
                 };
-                let response = self
-                    .http
-                    .post(format!(
-                        "http://{host}:8080{}{}",
-                        wire("controlPathPrefix"),
-                        action
-                    ))
-                    .header(wire("controlHeader"), token)
-                    .send()
-                    .await
-                    .map_err(|_| Fault::Unavailable("gateway_ack_unavailable"))?;
-                if !response.status().is_success() {
+                // A release is refused while the gateway's own watch has not yet delivered the
+                // intent the controller wrote just before it (409), or while its fences are not
+                // synchronized (503). Both pass within milliseconds, and the retry of the whole
+                // pass would wait a second for them. The request is the same each time: a
+                // release is idempotent and the token names it. Every other control is judged on
+                // its first answer.
+                let retry_until = Instant::now() + RELEASE_RETRY_WINDOW;
+                let response = loop {
+                    let response = self
+                        .http
+                        .post(format!(
+                            "http://{host}:8080{}{}",
+                            wire("controlPathPrefix"),
+                            action
+                        ))
+                        .header(wire("controlHeader"), token.clone())
+                        .send()
+                        .await
+                        .map_err(|_| Fault::Unavailable("gateway_ack_unavailable"))?;
+                    let status = response.status();
+                    if status.is_success() {
+                        break response;
+                    }
+                    if action == "release"
+                        && matches!(status.as_u16(), 409 | 503)
+                        && Instant::now() < retry_until
+                    {
+                        tokio::time::sleep(RELEASE_RETRY_SPACING).await;
+                        continue;
+                    }
                     return Err(Fault::Unavailable("gateway_ack_unavailable"));
-                }
+                };
                 let mut stream = response.bytes_stream();
                 let mut bytes = Vec::new();
                 while let Some(part) = stream.next().await {
