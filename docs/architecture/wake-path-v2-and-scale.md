@@ -168,8 +168,9 @@ writes recovers to one consistent state with at most one postmaster; intent prec
 retried, target only after every ack, observation last; a follow-up mismatch publishes a non-ready
 observation exactly as a Pod change does.
 
-Status (branch `golive/wake-v2-controller`, tested in the in-process world, not deployed or measured
-live). One parked wake in the world (every Kubernetes request answered after the same delay, so that
+Status (deployed in R2.15 on 2026-10-16 and measured live: parked wake chain 0.19 s from the pull to the
+released fence once the lean path is on, see the R2.20 paragraph of the plan; the tests below are the
+in-process world's). One parked wake in the world (every Kubernetes request answered after the same delay, so that
 requests issued together are one round) after a periodic parked pass:
 
 | | requests | sequential rounds |
@@ -304,7 +305,8 @@ of returning 57P03 at once, and logs which predicate refused; (d) raise the Edge
 deadline for a cold start only if (a) and (b) leave it above 20 s. Expected: cold wake 44 s to about
 10 s [E], create and delete several times faster.
 
-Status (branch `golive/identity-turn`, tested against the Dev fixture, not deployed or measured live):
+Status (deployed 2026-10-16; cold Thin wake measured live at 21.8 s; the tests below are the Dev
+fixture's):
 
 - (a) The fixture world counts relay commands and sequential relay connections (a `kubectl exec` is two:
   the Pod, then the upgrade). A turn is **22 commands in 6 sequential connections for any number of
@@ -463,7 +465,7 @@ experiment (it removes a known 6.2 statements/s per node).
   last sample 01:07:16Z, rollout start 01:07:19Z, sampling back at convergence about 01:45Z); awake thin
   databases lose their 10 s tokens and the host guard kills their Pods. Until authority continuity across
   patches that change no qualification fact exists, every rollout needs a maintenance window.
-- **Rollout-safe authority (implemented, not yet deployed or accepted live).** A `continuing`
+- **Rollout-safe authority (deployed and accepted live on R2.19, 2026-10-16).** A `continuing`
   qualification class keeps the fact equalities of `qualifiedThinStorageSql` (receipt facts, authority
   keys, host configuration sha, boot id, node, cluster, material) and drops the release id, spec hash,
   assignment and region revision. The node's completed patch and the release its proof was read
