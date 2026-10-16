@@ -148,6 +148,16 @@ test("thin host qualification requires actual bound verifier settings even when 
     /host_guard_unqualified/,
   );
 });
+test("thin host qualification accepts custody sealed under an earlier release while a rollout's patch has not rewritten it", () => {
+  const earlier = structuredClone(hostInput);
+  earlier.host_configuration.status.release_id = "earlier-release";
+  earlier.host_configuration.status.profile_sha256 = "c".repeat(64);
+  assert.notEqual(
+    earlier.host_configuration.status.release_id,
+    earlier.lease.release_id,
+  );
+  assert.doesNotThrow(() => assertThinStorageHostSettings(earlier));
+});
 test("on a STATE-loaded boot the executor proves host files with the completed patch's configuration boot; unwitnessed absence stays blocked", async () => {
   const boot = randomUUID();
   // After a boot that loaded STATE, Talos lists only the real active resource.

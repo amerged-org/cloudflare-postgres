@@ -263,7 +263,9 @@ export function ready(value: ObjectValue) {
     (c) => c.type === "Ready" && c.status === "True",
   );
 }
-/** A byte-equal settings file cannot qualify thin writes unless its actual guard trust is present. */
+/** A byte-equal settings file cannot qualify thin writes unless its actual guard trust is present.
+ * The custody may be sealed under an earlier release than the lease names, until the patch of a
+ * rollout rewrites it: its bytes, keys and node bindings are what qualify, not its release label. */
 export function assertThinStorageHostSettings(
   input: NodeThinStorageInput,
 ): void {
@@ -283,7 +285,6 @@ export function assertThinStorageHostSettings(
     if (
       input.host_configuration.status.node_uid !== input.lease.node_uid ||
       input.host_configuration.status.cluster_uid !== input.lease.cluster_uid ||
-      input.host_configuration.status.release_id !== input.lease.release_id ||
       input.host_configuration.status.material_revision !==
         input.lease.material_revision ||
       createHash("sha256").update(canonicalKeys).digest("hex") !==
