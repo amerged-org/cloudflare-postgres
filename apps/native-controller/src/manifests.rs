@@ -302,7 +302,7 @@ fn runtime_parts(
     ])
 }
 /// Whether `image` names an immutable digest.
-fn pinned_image(image: &str) -> bool {
+pub(crate) fn pinned_image(image: &str) -> bool {
     image.rsplit_once("@sha256:").is_some_and(|(repo, digest)| {
         !repo.is_empty()
             && digest.len() == 64

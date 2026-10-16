@@ -11,6 +11,7 @@ pub mod kubernetes;
 pub mod manifests;
 pub mod measurements;
 pub mod node_storage;
+pub mod pool;
 pub mod postgres;
 pub mod power;
 pub mod reconcile;
