@@ -58,6 +58,8 @@ pub mod controller;
 pub mod host_context;
 #[cfg(target_os = "linux")]
 pub mod host_proc;
+#[cfg(target_os = "linux")]
+pub mod intake;
 pub mod policy;
 #[cfg(target_os = "linux")]
 pub mod reclaim_inventory;

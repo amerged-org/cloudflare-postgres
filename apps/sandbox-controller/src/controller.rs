@@ -775,89 +775,6 @@ impl SandboxController {
             .map(|container| container.id)
             .collect())
     }
-    /// Internal verified supervisor only; retained signed scope permits protective action after restart, never a grant.
-    pub async fn remember_storage_authority(
-        &self,
-        pod_uid: &str,
-        token: &str,
-    ) -> Result<(), Status> {
-        if token.is_empty() || token.len() > 4096 {
-            return Err(Status::invalid_argument("storage_protection_token_invalid"));
-        }
-        let mut pool = self.pool.lock().await;
-        let mut found = pool
-            .assigned
-            .iter_mut()
-            .filter(|(_, entry)| entry.pod.uid == pod_uid);
-        let (id, entry) = found
-            .next()
-            .ok_or_else(|| Status::not_found("assigned_pod_not_found"))?;
-        if found.next().is_some() {
-            return Err(Status::failed_precondition(
-                "assigned_pod_identity_ambiguous",
-            ));
-        }
-        if entry.protective_storage_authority.as_deref() != Some(token) {
-            entry.protective_storage_authority = Some(token.to_owned());
-            save_owner(id, entry)?;
-        }
-        Ok(())
-    }
-    pub async fn protective_storage_authorities(&self) -> Vec<(String, String)> {
-        let pool = self.pool.lock().await;
-        let mut result: Vec<_> = pool
-            .assigned
-            .values()
-            .filter_map(|entry| {
-                entry
-                    .protective_storage_authority
-                    .as_ref()
-                    .map(|token| (entry.pod.uid.clone(), token.clone()))
-            })
-            .collect();
-        result.extend(pool.retired_storage.values().filter_map(|entry| {
-            entry
-                .owner
-                .protective_storage_authority
-                .as_ref()
-                .map(|token| (entry.owner.pod_uid.clone(), token.clone()))
-        }));
-        result
-    }
-    /// These private records follow actual child-task deletion and completed owned process cleanup.
-    pub async fn retired_storage_authorities(&self) -> Vec<(String, String)> {
-        self.pool
-            .lock()
-            .await
-            .retired_storage
-            .values()
-            .filter_map(|entry| {
-                entry
-                    .owner
-                    .protective_storage_authority
-                    .as_ref()
-                    .map(|token| (entry.owner.pod_uid.clone(), token.clone()))
-            })
-            .collect()
-    }
-    /// Call only after positive exact-volume resume or deletion, never merely after task exit.
-    pub async fn forget_retired_storage_authority(&self, pod_uid: &str) -> Result<(), Status> {
-        let mut pool = self.pool.lock().await;
-        let ids = pool
-            .retired_storage
-            .iter()
-            .filter(|(_, entry)| entry.owner.pod_uid == pod_uid)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in ids {
-            let entry = &pool.retired_storage[&id];
-            crate::slot::ensure_private_directory(&entry.directory)?;
-            std::fs::remove_dir_all(&entry.directory)
-                .map_err(|_| Status::internal("retired_storage_owner_cleanup_unconfirmed"))?;
-            pool.retired_storage.remove(&id);
-        }
-        Ok(())
-    }
     pub(crate) async fn reclaim_candidates(
         &self,
     ) -> Result<Vec<crate::reclaim_inventory::Candidate>, Status> {
@@ -1125,6 +1042,67 @@ impl SandboxController {
             )
             .await
             .map_err(|_| Status::deadline_exceeded("tenant_task_stop_unconfirmed"))??;
+        }
+        Ok(())
+    }
+}
+/// The durable private owner records that retain each Pod's signed physical scope. Retained
+/// signed scope permits protective action after restart, never a grant.
+impl crate::intake::ScopeRecords for SandboxController {
+    async fn remember(&self, pod_uid: &str, token: &str) -> Result<(), Status> {
+        if token.is_empty() || token.len() > 4096 {
+            return Err(Status::invalid_argument("storage_protection_token_invalid"));
+        }
+        let mut pool = self.pool.lock().await;
+        let mut found = pool
+            .assigned
+            .iter_mut()
+            .filter(|(_, entry)| entry.pod.uid == pod_uid);
+        let (id, entry) = found
+            .next()
+            .ok_or_else(|| Status::not_found("assigned_pod_not_found"))?;
+        if found.next().is_some() {
+            return Err(Status::failed_precondition(
+                "assigned_pod_identity_ambiguous",
+            ));
+        }
+        if entry.protective_storage_authority.as_deref() != Some(token) {
+            entry.protective_storage_authority = Some(token.to_owned());
+            save_owner(id, entry)?;
+        }
+        Ok(())
+    }
+    /// These private records follow actual child-task deletion and completed owned process cleanup.
+    async fn retired(&self) -> Vec<(String, String)> {
+        self.pool
+            .lock()
+            .await
+            .retired_storage
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .owner
+                    .protective_storage_authority
+                    .as_ref()
+                    .map(|token| (entry.owner.pod_uid.clone(), token.clone()))
+            })
+            .collect()
+    }
+    /// Call only after positive exact-volume resume or deletion, never merely after task exit.
+    async fn forget_retired(&self, pod_uid: &str) -> Result<(), Status> {
+        let mut pool = self.pool.lock().await;
+        let ids = pool
+            .retired_storage
+            .iter()
+            .filter(|(_, entry)| entry.owner.pod_uid == pod_uid)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            let entry = &pool.retired_storage[&id];
+            crate::slot::ensure_private_directory(&entry.directory)?;
+            std::fs::remove_dir_all(&entry.directory)
+                .map_err(|_| Status::internal("retired_storage_owner_cleanup_unconfirmed"))?;
+            pool.retired_storage.remove(&id);
         }
         Ok(())
     }
@@ -1458,6 +1436,19 @@ impl controller_server::Controller for SandboxController {
             }
         }
         let mut pool = self.pool.lock().await;
+        // The record writer works behind acceptance. A Pod removed before it was reached still
+        // retains the signed scope the guard accepted for it.
+        if let Some(guard) = &self.storage_guard
+            && let Some(uid) = pool
+                .assigned
+                .get(&input.sandbox_id)
+                .filter(|assigned| assigned.protective_storage_authority.is_none())
+                .map(|assigned| assigned.pod.uid.clone())
+            && let Some(token) = guard.lock().await.accepted_token(&uid)
+            && let Some(assigned) = pool.assigned.get_mut(&input.sandbox_id)
+        {
+            assigned.protective_storage_authority = Some(token);
+        }
         let mut retired = None;
         if let Some(assigned) = pool.assigned.get_mut(&input.sandbox_id) {
             if assigned.created {
@@ -1618,5 +1609,94 @@ mod tests {
             .unwrap()
             .name = "unrelated".into();
         assert!(pod_config(&request, "pgcf").is_err());
+    }
+    /// A controller of an empty node whose storage guard trusts `issuer`; the caller removes the directory.
+    async fn guarded(
+        issuer: &crate::storage::test_support::Issuer,
+    ) -> (SandboxController, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/pg-{}-{}",
+            std::process::id(),
+            crate::policy::now_ms().rem_euclid(1_000_000_000)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["state", "rpc", "s"] {
+            std::fs::create_dir(directory.join(name)).unwrap();
+            std::fs::set_permissions(directory.join(name), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "socket": directory.join("rpc/controller.sock"),
+            "state": directory.join("state"),
+            "shim_sockets": directory.join("s"),
+            "containerd_socket": "/run/containerd/containerd.sock",
+            "containerd_binary": "/bin/containerd",
+            "shim_binary": "/bin/shim",
+            "runc_binary": "/bin/runc",
+            "holder_binary": "/bin/holder",
+            "namespace": "k8s.io",
+            "slots": 0,
+            "slot_lifetime_ms": 300000,
+            "cloudflare": {
+                "api_url": "https://api.invalid",
+                "agent_key_file": directory.join("key"),
+                "node_id": "nod_abcdefghijklmnopqrst",
+                "node_uid": crate::storage::test_support::NODE,
+                "region_id": "eu1",
+                "material_revision": 1,
+                "image": "registry.invalid/pgcf@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cgroup_root": "/sys/fs/cgroup/pgcf-compute",
+                "storage_authority": issuer.trust,
+            }
+        }))
+        .unwrap();
+        (
+            SandboxController::prepare(settings).await.unwrap(),
+            directory,
+        )
+    }
+    #[tokio::test]
+    async fn a_stalled_owner_record_write_cannot_stall_the_fetcher_or_the_acceptance_of_a_lease() {
+        use crate::storage::test_support::{Issuer, claims, database, lease, pod, running};
+        let issuer = Issuer::new();
+        let (controller, directory) = guarded(&issuer).await;
+        let guard = controller.storage_guard().unwrap();
+        // Every durable record write takes the pool lock; a hung fsync or a wedged shim holds it
+        // for seconds, exactly as this test holds it.
+        let stalled = controller.pool.lock().await;
+        let (fetched, leases) = tokio::sync::mpsc::channel(1);
+        let supervisor = tokio::spawn(crate::storage::supervise_bound(controller.clone(), leases));
+        let (database, pod) = (database(1), pod(1));
+        let clock = crate::policy::now_ms() as u64;
+        for revision in 1..=6u64 {
+            let claims = claims(&database, &pod, 1, revision, clock);
+            let lease = lease(vec![running(&issuer, &claims)], clock + revision);
+            let sent =
+                tokio::time::timeout(std::time::Duration::from_millis(500), fetched.send(lease))
+                    .await;
+            assert!(
+                sent.is_ok(),
+                "the fetcher was blocked behind the stalled writer at lease {revision}"
+            );
+        }
+        let namespace = format!("pgcf-db-{database}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !guard.lock().await.permits(
+            &namespace,
+            &pod,
+            u64::try_from(crate::policy::now_ms()).unwrap(),
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a token the guard verified was not accepted while the record writer was stalled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(stalled);
+        supervisor.abort();
+        drop(controller);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

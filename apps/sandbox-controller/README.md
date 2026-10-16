@@ -96,6 +96,19 @@ Pod ownership to the same authenticated agent endpoint. Unknown counters remain 
 `GET /v1/nodes/{id}/compute-pool/observations` exposes freshness. A retained assignment keeps
 its own runtime release identity when the controller policy later changes.
 
+## Storage guard loops
+
+The host storage guard keeps three loops that cannot stall one another. The lease intake owns an
+OS thread, a current-thread runtime and an HTTP client of its own: it starts one fetch per second
+(at most three in flight; a request times out after five seconds), accepts each lease into the
+guard the moment it arrives and offers the signed scopes of the accepted entries to the record
+writer. The record writer owns a second thread: it keeps the newest token per Pod and rewrites a
+Pod's private owner record only when the Pod, its generation or its volume is new, because a
+restart needs the physical scope, which renewals do not change. Enforcement runs on the
+controller's runtime every 100 ms and only reads accepted state. Recording a scope is never a
+condition of accepting its token, and a Pod removed before its record was written retains the scope
+the guard accepted for it. Either thread ending ends the service, which the platform restarts.
+
 ## Verification
 
 `cargo test -p pgcf-sandbox-controller` exercises the real upstream protobuf encoding and

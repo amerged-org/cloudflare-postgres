@@ -189,8 +189,11 @@ NodeBootstrap alarm to now instead of waiting for the cadence.
 
 ### 4.5 Delivery to the enforcement points
 
-- **Host guard:** unchanged. It fetches `/agent/v1/nodes/{id}/storage-guard` every second
-  (sc/storage.rs:563-603, sc/policy.rs:251-253), and `hostStorageLease` signs from the current
+- **Host guard:** unchanged on the wire. It starts a fetch of `/agent/v1/nodes/{id}/storage-guard`
+  every second, whether or not an earlier one returned (at most three in flight, a request times out
+  after 5 s), on a thread and an HTTP client of its own, and accepts each lease into the guard the
+  moment it arrives; the signed scopes are recorded on disk afterwards, newest first and off that
+  thread (`sc/intake.rs`). `hostStorageLease` signs from the current
   composed authority (dom/node-thin-storage.ts:239-432). A token lives `guard_seconds` from the
   nonce issue of the sample it was signed from, and a fetch's duration comes out of that life, so
   the lease has to be cheap. It reads the node once and every database's rows and inputs (startup
@@ -208,7 +211,7 @@ NodeBootstrap alarm to now instead of waiting for the cadence.
 - **Deleted databases leave the lease.** The guard forgets a retained signed scope only from an
   accepted lease that names its database deleted, writable and without a volume
   (`retirement_scope`, sc/storage.rs@e4b8873:500-529), and acts on it within its next 100 ms tick; it
-  fetches every 6 s at most (5 s client timeout, 1 s sleep) and keeps a lease for at most 120 s. A
+  starts a fetch every second (three in flight at most, 5 s client timeout) and keeps a lease for at most 120 s. A
   tombstone is therefore served for one hour from the row's confirmation, which a fresh complete
   absence read gates, and then no longer: a guard that fetches at all within that hour still gets
   the entry it needs, and one cut off for longer has stopped every Pod already. A deleted database
@@ -288,7 +291,7 @@ dom/storage-capacity.ts:265-270, ct/database-storage.ts:353-379, nc/reconcile.rs
 | Node reboot | New boot ID: samples refused, and the host guard rejects leases of the old boot (sc/storage.rs:183-187). Authority returns only after the fleet path confirms the fresh boot (plan:130-139) and a slow proof on that boot. |
 | Driver Pod replaced (patch, eviction) | New driver Pod UID: samples refused until a slow proof re-reads binaries and identity. |
 | Slow turns failing transiently | Identity stays valid until its expiry while turns retry; writes stop only if no proof succeeds within 300 s. |
-| A lease that is slow or fails (D1 queueing, a Worker restart, the guard's 5 s timeout) | The guard keeps its last accepted lease and each entry runs down to its own token's expiry, at most `guard_seconds` after the nonce it was signed from, minus the lease's age at receipt; then it stops the Pod's tasks and freezes the volume (sc/storage.rs@e4b8873:579-595, 764-877). Every thin database of the node is affected alike, and the controller stops one whose token its samples stopped renewing. The lease's cost does not depend on the number of databases. |
+| A lease that is slow or fails (D1 queueing, a Worker restart, a request that hangs to the guard's 5 s timeout) | One request that hangs delays nothing: the next goes out one second later on a connection of its own. If none returns, the guard keeps its last accepted lease and each entry runs down to its own token's expiry, at most `guard_seconds` after the nonce it was signed from, minus the lease's age at receipt; then it stops the Pod's tasks and freezes the volume (sc/storage.rs@e4b8873:579-595, 764-877). Every thin database of the node is affected alike, and the controller stops one whose token its samples stopped renewing. The lease's cost does not depend on the number of databases. |
 | One entry of a lease the guard refuses | The guard accepts a lease whole or not at all (sc/storage.rs@e4b8873:182-365): a token that fails verification, names another Pod at the same or a lower generation than the one accepted before, or differs at an authority revision it already holds refuses every entry, and a token for a Pod the sandbox runtime has not assigned is dropped by the persistence step before acceptance (sc/storage.rs@e4b8873:701-708, sc/controller.rs@e4b8873:779-806). The other entries then run down as above. |
 
 ## 7. Trust argument

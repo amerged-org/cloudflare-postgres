@@ -60,7 +60,7 @@ async fn serve() {
             .map_err(|_| tonic::Status::internal("controller_socket_permissions_failed"))?;
         let (config_sender,config_updates)=tokio::sync::watch::channel(client.clone());
         let config_task=tokio::spawn(pgcf_sandbox_controller::configuration::run(args[1].clone().into(),initial_settings,controller.clone(),config_sender));
-        let mut storage_task=client.local().storage_authority.clone().map(|trust|tokio::spawn(pgcf_sandbox_controller::storage::watch(controller.clone(),client.clone(),trust,config_updates.clone())));
+        let mut storage_task=client.local().storage_authority.as_ref().map(|_|tokio::spawn(pgcf_sandbox_controller::storage::watch(controller.clone(),client.clone(),config_updates.clone())));
         let reclaim_task=tokio::spawn(pgcf_sandbox_controller::reclaim_inventory::run(controller.clone(),client.clone(),config_updates.clone()));
         let policy_task=tokio::spawn(controller.clone().run_policy(client,config_updates));
         let service=tonic::transport::Server::builder()

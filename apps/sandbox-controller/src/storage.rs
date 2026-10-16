@@ -2,16 +2,23 @@
 //! One node-local expiry supervisor. Network refresh never blocks the local stop clock.
 use crate::{
     controller::SandboxController,
+    intake::{self, Pending, ScopeRecords},
     policy::{Client, StorageAuthorityTrust},
 };
 use pgcf_native_protocol::storage::{StorageTrust, StorageWriteClaims, VerifiedStorageAuthority};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 use tonic::Status;
+
+/// The generated lease shape, compiled once: a lease is checked while the guard's lock is held.
+static HOST_LEASE: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    jsonschema::validator_for(&pgcf_native_protocol::CONTRACT["storageHostLease"])
+        .expect("generated_storage_host_lease_schema_invalid")
+});
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +87,13 @@ impl ResumeScope {
         now < self.expires_at && Instant::now() < self.deadline
     }
 }
+/// A runtime token the guard accepted for a Pod, with the claims it verified, for the record writer.
+#[derive(Clone)]
+pub struct RuntimeScope {
+    pub pod_uid: String,
+    pub token: String,
+    pub authority: VerifiedStorageAuthority,
+}
 #[derive(Clone)]
 pub struct Guard {
     trust: StorageTrust,
@@ -101,7 +115,7 @@ pub struct Guard {
 fn invalid() -> Status {
     Status::failed_precondition("storage_host_authority_invalid")
 }
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     u64::try_from(crate::policy::now_ms()).unwrap_or(0)
 }
 pub fn current_boot_id() -> Result<String, Status> {
@@ -114,7 +128,7 @@ pub fn current_boot_id() -> Result<String, Status> {
     }
     Ok(id)
 }
-fn same_physical_scope(a: &StorageWriteClaims, b: &StorageWriteClaims) -> bool {
+pub(crate) fn same_physical_scope(a: &StorageWriteClaims, b: &StorageWriteClaims) -> bool {
     a.database_id == b.database_id
         && a.storage_uid == b.storage_uid
         && a.node_uid == b.node_uid
@@ -177,9 +191,7 @@ impl Guard {
     }
     pub fn accept(&mut self, lease: HostStorageLease, now: u64) -> Result<(), Status> {
         let value = serde_json::to_value(&lease).map_err(|_| invalid())?;
-        let schema = jsonschema::validator_for(&pgcf_native_protocol::CONTRACT["storageHostLease"])
-            .map_err(|_| invalid())?;
-        if !schema.is_valid(&value)
+        if !HOST_LEASE.is_valid(&value)
             || lease.purpose != "pgcf-storage-host/v1"
             || lease.node_uid != self.node_uid
             || (!lease.databases.is_empty()
@@ -342,6 +354,33 @@ impl Guard {
         self.legacy = legacy;
         self.last_issued = lease.issued_at;
         Ok(())
+    }
+    /// The signed Pod scopes of the entries accepted last. Persisting them is never a condition of
+    /// accepting them: the record writer works from this copy.
+    pub fn runtime_scopes(&self) -> Vec<RuntimeScope> {
+        self.entries
+            .values()
+            .filter_map(|accepted| {
+                let token = accepted.entry.runtime_authority.as_ref()?;
+                let authority = accepted.runtime.as_ref()?;
+                Some(RuntimeScope {
+                    pod_uid: authority.claims().pod_uid.clone(),
+                    token: token.clone(),
+                    authority: authority.clone(),
+                })
+            })
+            .collect()
+    }
+    /// The token the guard currently holds for a Pod. A Pod removed before the record writer
+    /// reached it still retains this scope.
+    pub fn accepted_token(&self, pod_uid: &str) -> Option<String> {
+        self.entries.values().find_map(|accepted| {
+            let token = accepted.entry.runtime_authority.as_ref()?;
+            (accepted.runtime.as_ref()?.claims().pod_uid == pod_uid).then(|| token.clone())
+        })
+    }
+    pub fn trust(&self) -> StorageTrust {
+        self.trust.clone()
     }
     pub fn rebind_material_revision(&mut self, next: u64, legacy: &[String]) -> Result<(), Status> {
         if next < self.material_revision
@@ -560,55 +599,52 @@ impl Guard {
             .is_some_and(|expiry| expiry > now)
     }
 }
+/// Production wiring. Three failure domains, none of which can stall another:
+/// the lease intake (HTTP fetch and acceptance) and the record writer (disk) each own an OS
+/// thread and a current-thread runtime; enforcement stays on the controller's runtime. Losing
+/// either thread ends the service, which the platform restarts: an intake that died silently
+/// would let every token expire with nothing renewing it.
 pub async fn watch(
     controller: SandboxController,
-    mut client: Client,
-    _trust: StorageAuthorityTrust,
-    mut updates: tokio::sync::watch::Receiver<Client>,
+    client: Client,
+    updates: tokio::sync::watch::Receiver<Client>,
 ) {
     let Some(guard) = controller.storage_guard() else {
         eprintln!("storage_guard_unavailable");
         return;
     };
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let fetch_guard = guard.clone();
-    let fetcher = tokio::spawn(async move {
-        loop {
-            if updates.has_changed().unwrap_or(false) {
-                client = updates.borrow_and_update().clone();
-                let local = client.local();
-                let legacy = local
-                    .storage_authority
-                    .as_ref()
-                    .map(|t| t.legacy_database_ids.as_slice())
-                    .unwrap_or(&[]);
-                if let Err(error) = fetch_guard
-                    .lock()
-                    .await
-                    .rebind_material_revision(u64::from(local.material_revision), legacy)
-                {
-                    eprintln!("{}", error.message());
-                    return;
-                }
-            }
-            if let Ok(lease) = client.storage_lease().await
-                && tx.send(lease).await.is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+    let pending = Arc::new(Pending::default());
+    let trust = guard.lock().await.trust();
+    let (stopped, mut stops) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+    let spawned = intake::spawn_isolated(
+        "pgcf-guard-intake",
+        stopped.clone(),
+        intake::run_http(client, updates, guard.clone(), pending.clone()),
+    )
+    .and_then(|()| {
+        intake::spawn_isolated(
+            "pgcf-guard-records",
+            stopped,
+            intake::persist(controller.clone(), trust, pending),
+        )
     });
-    supervise_shared(controller, guard, rx).await;
-    fetcher.abort();
+    if let Err(error) = spawned {
+        eprintln!("storage_guard_thread_unavailable {error}");
+        return;
+    }
+    tokio::select! {
+        () = supervise_shared(controller, guard) => {}
+        name = stops.recv() => eprintln!("storage_guard_thread_stopped {}", name.unwrap_or("unknown")),
+    }
 }
-/// The exact same loop is exercised by the isolated real containerd/PostgreSQL proof.
+/// The same intake, writer and enforcement as production, fed leases from a channel. The isolated
+/// real containerd/PostgreSQL proof runs this composition on its own runtime.
 pub async fn supervise(
     controller: SandboxController,
     guard: Guard,
     rx: tokio::sync::mpsc::Receiver<HostStorageLease>,
 ) {
-    supervise_shared(controller, Arc::new(tokio::sync::Mutex::new(guard)), rx).await;
+    supervise_leases(controller, Arc::new(tokio::sync::Mutex::new(guard)), rx).await;
 }
 /// Exercise the same configured guard used by task creation and production lease supervision.
 pub async fn supervise_bound(
@@ -618,81 +654,42 @@ pub async fn supervise_bound(
     let Some(guard) = controller.storage_guard() else {
         return;
     };
-    supervise_shared(controller, guard, rx).await;
+    supervise_leases(controller, guard, rx).await;
 }
-async fn supervise_shared(
+struct Abort(tokio::task::JoinHandle<()>);
+impl Drop for Abort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+async fn supervise_leases(
     controller: SandboxController,
     guard: Arc<tokio::sync::Mutex<Guard>>,
-    mut rx: tokio::sync::mpsc::Receiver<HostStorageLease>,
+    rx: tokio::sync::mpsc::Receiver<HostStorageLease>,
 ) {
+    let pending = Arc::new(Pending::default());
+    let trust = guard.lock().await.trust();
+    let _records = Abort(tokio::spawn(intake::persist(
+        controller.clone(),
+        trust,
+        pending.clone(),
+    )));
+    let _intake = Abort(tokio::spawn(intake::run_channel(
+        rx,
+        guard.clone(),
+        pending,
+    )));
+    supervise_shared(controller, guard).await;
+}
+/// Expiry enforcement: the only code that stops a Pod or quiesces a volume. It reads what the
+/// intake accepted; it never fetches, accepts or writes records.
+async fn supervise_shared(controller: SandboxController, guard: Arc<tokio::sync::Mutex<Guard>>) {
     let mut stopping = BTreeSet::<String>::new();
     let (done_tx, mut done_rx) =
         tokio::sync::mpsc::channel::<(String, bool, Option<bool>, bool, Option<(String, bool)>)>(
             256,
         );
-    let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(1);
-    let persist_controller = controller.clone();
-    let persist_guard = guard.clone();
-    tokio::spawn(async move {
-        while let Some(lease) = rx.recv().await {
-            let (trust, node_uid) = {
-                let mut candidate = persist_guard.lock().await.clone();
-                if let Err(error) = candidate.accept(lease.clone(), now()) {
-                    eprintln!("{}", error.message());
-                    continue;
-                }
-                (candidate.trust.clone(), candidate.node_uid.clone())
-            };
-            let mut persisted = true;
-            for entry in &lease.databases {
-                let Some(token) = &entry.runtime_authority else {
-                    continue;
-                };
-                let scope = match trust.verify(token, now()) {
-                    Ok(scope)
-                        if scope.claims().node_uid == node_uid
-                            && scope.claims().database_id == entry.database_id
-                            && scope.claims().generation == entry.generation =>
-                    {
-                        scope
-                    }
-                    _ => {
-                        persisted = false;
-                        break;
-                    }
-                };
-                if let Err(error) = persist_controller
-                    .remember_storage_authority(&scope.claims().pod_uid, token)
-                    .await
-                {
-                    eprintln!("{}", error.message());
-                    persisted = false;
-                    break;
-                }
-                // Old private scope remains until its replacement signed physical scope is durable.
-                for (old_uid, old_token) in persist_controller.retired_storage_authorities().await {
-                    if let Ok(old) = trust.verify_for_protection(&old_token)
-                        && same_physical_scope(scope.claims(), old.claims())
-                        && scope.claims().generation > old.claims().generation
-                        && let Err(error) = persist_controller
-                            .forget_retired_storage_authority(&old_uid)
-                            .await
-                    {
-                        eprintln!("{}", error.message());
-                    }
-                }
-            }
-            if persisted && accepted_tx.send(lease).await.is_err() {
-                return;
-            }
-        }
-    });
     loop {
-        while let Ok(lease) = accepted_rx.try_recv() {
-            if let Err(error) = guard.lock().await.accept(lease, now()) {
-                eprintln!("{}", error.message());
-            }
-        }
         while let Ok((uid, stopped, quiesced, retired, resumed)) = done_rx.try_recv() {
             stopping.remove(&uid);
             let mut state = guard.lock().await;
@@ -770,10 +767,7 @@ async fn supervise_shared(
                     })
                     .await;
                     if matches!(absent, Ok(Ok(true)))
-                        && controller
-                            .forget_retired_storage_authority(&uid)
-                            .await
-                            .is_ok()
+                        && controller.forget_retired(&uid).await.is_ok()
                     {
                         let _ = done.send((uid, true, None, true, None)).await;
                         return;
@@ -1301,5 +1295,160 @@ mod tests {
         guard.accept(value, 1000).unwrap();
         assert!(guard.permits("pgcf-db-abcdefghijklmnopqrst", "pod", 999999));
         assert!(!guard.permits("pgcf-db-bcdefghijklmnopqrstu1", "pod", 999999));
+    }
+    #[test]
+    fn a_pod_removed_before_the_record_writer_reached_it_still_has_its_accepted_token() {
+        use super::test_support::{Issuer, claims, database, guard, lease, pod, running};
+        let issuer = Issuer::new();
+        let mut state = guard(&issuer);
+        let clock = now();
+        let entry = running(&issuer, &claims(&database(3), &pod(3), 1, 1, clock));
+        let token = entry.runtime_authority.clone();
+        state.accept(lease(vec![entry], clock), clock).unwrap();
+        assert_eq!(state.accepted_token(&pod(3)), token);
+        assert_eq!(state.accepted_token(&pod(4)), None);
+    }
+}
+
+/// Real Ed25519 tokens and leases for the guard's loop tests. Nothing here is product behavior.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use sha2::{Digest, Sha256};
+
+    pub(crate) const NODE: &str = "22222222-2222-4222-8222-222222222222";
+
+    pub(crate) struct Issuer {
+        pair: Ed25519KeyPair,
+        pub(crate) trust: StorageAuthorityTrust,
+    }
+    impl Issuer {
+        pub(crate) fn new() -> Self {
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+            let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let keys = BTreeMap::from([(
+                "cf".to_owned(),
+                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref()),
+            )]);
+            let sha256 = Sha256::digest(serde_json::to_vec(&keys).unwrap())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            Self {
+                pair,
+                trust: StorageAuthorityTrust {
+                    keys,
+                    sha256,
+                    legacy_database_ids: vec![],
+                },
+            }
+        }
+        pub(crate) fn token(&self, claims: &StorageWriteClaims) -> String {
+            let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+            let signature = self.pair.sign(
+                format!(
+                    "{}{}",
+                    pgcf_native_protocol::wire("storageAuthorityDomain"),
+                    body
+                )
+                .as_bytes(),
+            );
+            format!(
+                "{}.{}.{}",
+                pgcf_native_protocol::wire("storageAuthorityPrefix"),
+                body,
+                URL_SAFE_NO_PAD.encode(signature.as_ref())
+            )
+        }
+    }
+    pub(crate) fn database(n: u8) -> String {
+        format!("abcdefghijklmnopqr{:02}", n % 100)
+    }
+    pub(crate) fn pod(n: u8) -> String {
+        format!("55555555-5555-4555-8555-5555555555{:02}", n % 100)
+    }
+    /// Claims of a token the wall clock still accepts: issued at `now`, ten seconds long.
+    pub(crate) fn claims(
+        database: &str,
+        pod: &str,
+        generation: u64,
+        authority_revision: u64,
+        now: u64,
+    ) -> StorageWriteClaims {
+        StorageWriteClaims {
+            v: 1,
+            kid: "cf".into(),
+            database_id: database.into(),
+            generation,
+            authority_revision,
+            storage_uid: "11111111-1111-4111-8111-111111111111".into(),
+            node_uid: NODE.into(),
+            volume_group_uuid: "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef".into(),
+            pool_uuid: "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg".into(),
+            profile_sha256: "a".repeat(64),
+            volume_handle: "pvc-33333333-3333-4333-8333-333333333333".into(),
+            lv_uuid: "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh".into(),
+            pvc_uid: "33333333-3333-4333-8333-333333333333".into(),
+            pv_uid: "44444444-4444-4444-8444-444444444444".into(),
+            pod_uid: pod.into(),
+            observed_at: now,
+            iat: now,
+            exp: now + 10_000,
+            guard_seconds: 10,
+            drain_seconds: 10,
+            write_allowed: true,
+        }
+    }
+    /// A running entry that carries the signed token of `claims` and the matching volume receipt.
+    pub(crate) fn running(issuer: &Issuer, claims: &StorageWriteClaims) -> Entry {
+        Entry {
+            database_id: claims.database_id.clone(),
+            generation: claims.generation,
+            authority_revision: claims.authority_revision,
+            write_blocked: false,
+            desired_state: "running".into(),
+            node_uid: claims.node_uid.clone(),
+            volume_group_uuid: claims.volume_group_uuid.clone(),
+            pool_uuid: claims.pool_uuid.clone(),
+            profile_sha256: claims.profile_sha256.clone(),
+            startup_expires_at: None,
+            startup_operation_id: None,
+            volume: Some(serde_json::json!({
+                "storage_generation": 1,
+                "storage_uid": claims.storage_uid,
+                "namespace_uid": "66666666-6666-4666-8666-666666666666",
+                "cluster_uid": "77777777-7777-4777-8777-777777777777",
+                "node_uid": claims.node_uid,
+                "volume_group_uuid": claims.volume_group_uuid,
+                "pool_uuid": claims.pool_uuid,
+                "volume_handle": claims.volume_handle,
+                "lv_uuid": claims.lv_uuid,
+                "pvc_uid": claims.pvc_uid,
+                "pv_uid": claims.pv_uid,
+            })),
+            runtime_authority: Some(issuer.token(claims)),
+            drain: None,
+        }
+    }
+    /// A lease of the current boot that the guard accepts at `issued_at`, valid for thirty seconds.
+    pub(crate) fn lease(entries: Vec<Entry>, issued_at: u64) -> HostStorageLease {
+        HostStorageLease {
+            purpose: "pgcf-storage-host/v1".into(),
+            node_uid: NODE.into(),
+            boot_id: Some(current_boot_id().unwrap()),
+            material_revision: 1,
+            issued_at,
+            expires_at: issued_at + 30_000,
+            legacy: vec![],
+            databases: entries,
+        }
+    }
+    pub(crate) fn guard(issuer: &Issuer) -> Guard {
+        Guard::new(issuer.trust.clone(), NODE.into(), 1).unwrap()
     }
 }

@@ -226,6 +226,9 @@ impl Client {
         {
             return Err(invalid());
         }
+        Self::connect(local, key)
+    }
+    fn connect(local: Cloudflare, key: String) -> Result<Self, Status> {
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
@@ -239,6 +242,11 @@ impl Client {
             .build()
             .map_err(|_| invalid())?;
         Ok(Self { http, local, key })
+    }
+    /// The same identity with connections of its own, for a loop that must share none of them,
+    /// and the threads that drive them, with other work. It reads no file.
+    pub fn isolated(&self) -> Result<Self, Status> {
+        Self::connect(self.local.clone(), self.key.clone())
     }
     fn url(&self) -> String {
         format!(
