@@ -245,6 +245,29 @@ of returning 57P03 at once, and logs which predicate refused; (d) raise the Edge
 deadline for a cold start only if (a) and (b) leave it above 20 s. Expected: cold wake 44 s to about
 10 s [E], create and delete several times faster.
 
+Status (branch `golive/identity-turn`, tested against the Dev fixture, not deployed or measured live):
+
+- (a) The fixture world counts relay commands and sequential relay connections (a `kubectl exec` is two:
+  the Pod, then the upgrade). A turn is **22 commands in 6 sequential connections for any number of
+  volumes**; it was 31 + N commands in 17 + 2N connections for N io.max reads (34 and 23 for a writer with
+  two Pods, a held start, a protected sleeper and a retained delete; 42 and 39 with eight more writers).
+  The report is the same document. One command per turn is not possible: the cluster reads need `kubectl`,
+  which the driver container lacks, and the opening and closing LVM reports must bracket them. Collapsing
+  the bracket would accept a volume created between its PVC and its LV with incomplete accounting and
+  stop every writer of the node, so the floor of this design is wave, driver exec, wave, driver exec. The
+  reads and their order are in [thin-authority-renewal.md](thin-authority-renewal.md) section 5. Peak
+  concurrent relay connections per turn are 10 (were 7), against the relay's limit of 32 connections.
+- (b) The controller posts a waking database's observation only when it carries the power operation or a
+  ready, deleted or hibernated state, and the desired page carries no marker, so the API cannot see
+  `volume_identity` pend. Its marker is the startup hold, which every headroom sample already reads: an
+  accepted sample asks for a turn while a start has no ready report yet and its hold is at most two minutes
+  old. The hold's release after the ready report still waits for the next turn. The NodeBootstrap
+  Durable Object starts a requested turn no sooner than 10 s after the previous turn started and runs one
+  at a time.
+- To measure live: `thin_storage_turn_accepted.turn_ms` (lease issue to acceptance) against the 47 s of
+  R2.14, `thin_storage_turn_requested` (a sample asked for a turn, with the waiting holds), the cold wake's
+  `volume_identity` phase and create to ready. (c) is done in the Actor (`actor_claim_waited`, `actor_claim_refused`); (d) is open.
+
 ### 4.9 W8 client handshake after the wake (CLI proxy, driver, gateway)
 
 Everything the client does after the socket opens is paid at the client's round-trip time. Neon's

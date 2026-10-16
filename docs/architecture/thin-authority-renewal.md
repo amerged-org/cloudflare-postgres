@@ -245,8 +245,9 @@ just before each scrape would add one period of validity at the cost of a second
 
 ## 5. The slow identity loop
 
-The executor's reads stay as they are (nb/thin-storage.ts:834-1013, 1115-1395). What changes is the
-meaning of its report and how the loop is driven.
+The executor's reads stay as they are (nb/thin-storage.ts:834-1013, 1115-1395); they are issued
+together where independent (see the identity read below). What changes is the meaning of its report and
+how the loop is driven.
 
 - **Report.** The authority it builds becomes an identity proof with `inventory_observed_at` (the
   lease's issue), `inventory_expires_at` (300 s later) and its own `inventory_revision`. It no longer
@@ -262,6 +263,21 @@ meaning of its report and how the loop is driven.
   `*_owner_changed`, an uncertain pool action) block the node as today. Transient ones (relay
   transport, a command that still fails after its existing repeats, an unconfirmed executor, a lost
   delivery) keep the node `ready`, record the code and reschedule with backoff up to the cadence.
+- **Identity read.** A product turn costs sequential relay connections, not commands: a
+  `kubectl exec` is two (the Pod, then the upgrade). It reads in four steps: one wave of the node and
+  namespace, the openebs Pods and DaemonSets, the Talos reads and the host files; one driver exec for the
+  pinned software and the opening LVM report; one wave of the thin classes, the seven cluster lists and
+  the node/driver witness; one driver exec for every writer Pod's io.max and the closing LVM report. That
+  is 6 sequential connections and 22 commands whatever the number of volumes (it was 17 + 2N and 31 + N
+  for N io.max reads). The order the proof depends on holds: the opening LVM report precedes every
+  cluster list and the closing one follows every list and every io.max, so a volume created while the
+  turn reads still fails the turn as `thin_storage_inventory_changed`. Each driver exec frames every
+  command's stdout between fixed markers and a command that may fail (an io.max read of a cgroup that
+  does not exist yet) reports its status in its frame, so a held start is still skipped. A driver exec
+  can carry at most 2 MiB of output, the bound of every command, and its script is one argument of at
+  most 128 KiB: a closing read carries at most 48 writer Pods, and a node with more reads them in several
+  execs started together, so the sequential connections stay the same. The qualified scratch procedure
+  keeps the sequential reads.
 - **Validity.** 300 s covers one lost delivery that holds its lease to expiry plus a retry
   (60 s cadence + 95 s lease + a 27.5 s turn) with room for one more attempt. The facts only the slow
   proof sees change only with events the fast witnesses expose (reboot, driver Pod or image change,
