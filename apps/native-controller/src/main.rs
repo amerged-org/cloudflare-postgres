@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use pgcf_native_controller::{
     Error,
     api::{ControlApi, DesiredSnapshot},
-    contracts::{constant, integer, number, removal_roles, schema_valid, text},
+    contracts::{constant, desired_valid, integer, number, removal_roles, schema_valid, text},
     diagnostics::error_code,
     kubernetes::Kubernetes,
     measurements::Measurements,
@@ -30,6 +30,8 @@ use tokio_tungstenite::{
 
 enum Hint {
     Pull(Option<Vec<String>>),
+    /// A wake's hint with the desired page of its one database, and when it arrived.
+    Desired(String, DesiredSnapshot, Instant),
     /// A watched database object changed: its database ID, the object kind and the object's name.
     Kube(String, &'static str, String),
 }
@@ -180,6 +182,46 @@ fn apply_snapshot(
         }
     }
     Ok(())
+}
+/// A `desired` link message. A wake's hint may carry the desired page of its one database, read
+/// right after the claim committed: valid for this region and naming exactly that database, it is
+/// taken like the page a targeted pull of it reads. Anything else is the pull, as before.
+fn desired_hint(message: &Value, page: Option<Value>, region: &str, received: Instant) -> Hint {
+    let ids: Option<Vec<String>> = message["ids"].as_array().map(|ids| {
+        ids.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    });
+    if let (Some(page), Some([id])) = (page, ids.as_deref())
+        && page["next"].is_null()
+        && desired_valid(&page, region)
+        && page["databases"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 1 && text(&rows[0], "id") == id)
+    {
+        return Hint::Desired(
+            id.clone(),
+            DesiredSnapshot {
+                region: page["region"].clone(),
+                fleet_release: page["fleet_release"].clone(),
+                databases: page["databases"].as_array().cloned().unwrap_or_default(),
+            },
+            received,
+        );
+    }
+    Hint::Pull(ids)
+}
+/// Whether a hinted page stands in for the pull: only when it moves a database the controller
+/// holds to a newer revision, so its row was read after the commit the held one predates. A page
+/// of the same or an older revision, or of a database not held, is left to the targeted pull.
+fn hint_advances(cells: &HashMap<String, Cell>, snapshot: &DesiredSnapshot) -> bool {
+    !snapshot.databases.is_empty()
+        && snapshot.databases.iter().all(|db| {
+            cells
+                .get(text(db, "id"))
+                .is_some_and(|cell| number(db, "generation") > number(&cell.db, "generation"))
+        })
 }
 /// Fast renewals (thin-authority-renewal.md, 4.5 and 4.6): per node UID the newest accepted
 /// authority, and per database the newest token delivered with any of them. Each stands in for
@@ -906,7 +948,8 @@ async fn link(api: ControlApi, hints: mpsc::Sender<Hint>) {
             url.set_scheme("wss").map_err(|_| "invalid regional link scheme")?;
             let mut request = url.as_str().into_client_request()?;
             request.headers_mut().insert("Authorization",format!("Bearer {}",api.key().await?).parse()?);
-            let config=WebSocketConfig::default().max_message_size(Some(64*1024)).max_frame_size(Some(64*1024));
+            let bound=constant("LINK_MESSAGE_MAX_BYTES").as_u64().and_then(|bytes|usize::try_from(bytes).ok()).ok_or("regional link bound unknown")?;
+            let config=WebSocketConfig::default().max_message_size(Some(bound)).max_frame_size(Some(bound));
             let (socket,_) = tokio::time::timeout(Duration::from_secs(20),connect_async_with_config(request,Some(config),false)).await??;
             let (mut send,mut receive)=socket.split();
             let instance=format!("{}-{}",std::process::id(),time::OffsetDateTime::now_utc().unix_timestamp_nanos());
@@ -921,11 +964,13 @@ async fn link(api: ControlApi, hints: mpsc::Sender<Hint>) {
                     event = receive.next() => {
                         match event.ok_or("regional link closed")?? {
                             Message::Text(bytes) => {
-                                let value:Value=serde_json::from_str(&bytes)?;
+                                let mut value:Value=serde_json::from_str(&bytes)?;
+                                // A wake's page is judged on its own: one that is not taken is pulled, the link stays.
+                                let page=value.as_object_mut().and_then(|message|message.remove("desired"));
                                 if !schema_valid("ServerLinkMessage",&value){return Err("regional link message invalid".into());}
                                 match text(&value,"type") {
-                                    "welcome" if !welcome => { welcome=true;hints.send(Hint::Pull(None)).await.map_err(|_|"controller queue closed")?; },
-                                    "desired" if welcome => { let ids=value["ids"].as_array().map(|ids|ids.iter().filter_map(Value::as_str).map(str::to_string).collect());hints.send(Hint::Pull(ids)).await.map_err(|_|"controller queue closed")?; },
+                                    "welcome" if !welcome && page.is_none() => { welcome=true;hints.send(Hint::Pull(None)).await.map_err(|_|"controller queue closed")?; },
+                                    "desired" if welcome => { hints.send(desired_hint(&value,page,&api.region,Instant::now())).await.map_err(|_|"controller queue closed")?; },
                                     _ => return Err("regional link message order invalid".into())
                                 }
                             },
@@ -1162,6 +1207,23 @@ async fn run() -> Result<(), Error> {
                             }
                         }
                         pull_ids.extend(ids);
+                    },
+                    Some(Hint::Desired(id, snapshot, received)) => {
+                        if cells.get(&id).is_some_and(|cell| cell.db["desired_state"] == "suspended") {
+                            timing::point("wake_hint_received", &id);
+                        }
+                        if hint_advances(&cells, &snapshot) {
+                            // Taken like the result of a targeted pull of this database begun when the hint arrived.
+                            if latest_snapshot.as_ref().is_none_or(|(at,_)|received>=*at) {
+                                let latest = Arc::new(snapshot.clone());
+                                sync_samplers(&mut samplers, &mut sampling, &latest, (&kube, &api, &mut renewals));
+                                latest_snapshot=Some((received,latest));
+                            }
+                            apply_snapshot(&mut cells, &active, &renewals, snapshot, Some(std::slice::from_ref(&id)), received)?;
+                            timing::point("desired_from_hint", &id);
+                        } else {
+                            pull_ids.insert(id);
+                        }
                     },
                     Some(Hint::Kube(id, kind, name)) => {
                         if let Some(cell) = cells.get_mut(&id) {
@@ -2502,5 +2564,206 @@ mod tests {
             saw_routine,
             "token-only delivery cannot refresh the actual CF V2 proof whose fixed TTL expires"
         );
+    }
+    /// A wake's hint message for the first builder vector, and its desired page for region `eu-test`.
+    fn hinted_wake() -> (Value, Value) {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/controller-vectors.generated.json"
+        ))
+        .unwrap();
+        let mut db = vectors[1]["db"].clone();
+        db["generation"] = 3.into();
+        db["power"] = json!({"operation":operation(3),"revision":3,"mode":"running","reason":null});
+        let page = json!({"region":{"id":"eu-test","backup":{"bucket":"native-controller-test","endpoint_url":"https://backup.example.invalid","region":"auto"}},"databases":[db],"next":null});
+        (json!({"type":"desired","ids":[db["id"]]}), page)
+    }
+    fn hinted_page(hint: Hint) -> Option<(String, DesiredSnapshot, Instant)> {
+        match hint {
+            Hint::Desired(id, snapshot, received) => Some((id, snapshot, received)),
+            _ => None,
+        }
+    }
+    #[test]
+    fn a_wake_hint_carries_its_page_only_when_it_is_valid_for_its_one_database() {
+        let (message, page) = hinted_wake();
+        let id = message["ids"][0].as_str().unwrap().to_string();
+        let received = Instant::now();
+        let (hinted, snapshot, at) = hinted_page(desired_hint(
+            &message,
+            Some(page.clone()),
+            "eu-test",
+            received,
+        ))
+        .unwrap();
+        assert_eq!(hinted, id);
+        assert_eq!(at, received);
+        assert_eq!(
+            snapshot.databases,
+            page["databases"].as_array().unwrap().clone()
+        );
+        assert_eq!(snapshot.region, page["region"]);
+        assert!(snapshot.fleet_release.is_null());
+        // Anything else is the targeted pull of the IDs, as a hint without a page has always been.
+        let mut invalid = page.clone();
+        invalid["databases"][0]["roles"] = json!([]);
+        let mut other = page.clone();
+        other["databases"][0]["id"] = "dccccccccccccccccccc".into();
+        let mut paged = page.clone();
+        paged["next"] = "dccccccccccccccccccc".into();
+        let two = json!({"type":"desired","ids":[id,"dccccccccccccccccccc"]});
+        for (message, page, region) in [
+            (&message, Some(invalid), "eu-test"),
+            (&message, Some(other), "eu-test"),
+            (&message, Some(paged), "eu-test"),
+            (&message, Some(page.clone()), "eu-other"),
+            (&two, Some(page.clone()), "eu-test"),
+            (&message, None, "eu-test"),
+        ] {
+            match desired_hint(message, page, region, received) {
+                Hint::Pull(Some(ids)) => assert_eq!(Value::from(ids), message["ids"]),
+                _ => panic!("a page that is not taken asks for the pull"),
+            }
+        }
+    }
+    #[test]
+    fn a_hinted_page_that_advances_a_known_database_makes_it_due_without_a_pull() {
+        let (message, page) = hinted_wake();
+        let id = message["ids"][0].as_str().unwrap().to_string();
+        let asleep = Instant::now();
+        let mut cells = HashMap::new();
+        let mut sleeping = page["databases"][0].clone();
+        sleeping["generation"] = 2.into();
+        sleeping["desired_state"] = "suspended".into();
+        sleeping["power"] =
+            json!({"operation":operation(2),"revision":2,"mode":"quiesce","reason":"idle"});
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            snapshot(vec![sleeping]),
+            None,
+            asleep,
+        )
+        .unwrap();
+        cells.get_mut(&id).unwrap().due = asleep + Duration::from_secs(60);
+        let received = asleep + Duration::from_millis(5);
+        let (_, hinted, _) =
+            hinted_page(desired_hint(&message, Some(page), "eu-test", received)).unwrap();
+        // Taken, the loop applies it as a targeted pull of the database begun when it arrived.
+        assert!(hint_advances(&cells, &hinted));
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            hinted,
+            Some(std::slice::from_ref(&id)),
+            received,
+        )
+        .unwrap();
+        assert_eq!(cells[&id].db["generation"], 3);
+        assert_eq!(cells[&id].authority_at, received);
+        assert!(cells[&id].due <= Instant::now());
+        assert!(waking(&cells[&id]));
+    }
+    #[test]
+    fn a_stale_or_unknown_hinted_page_is_left_to_the_pull() {
+        let (message, page) = hinted_wake();
+        let started = Instant::now();
+        for held in [None, Some(3), Some(4)] {
+            let mut cells = HashMap::new();
+            if let Some(generation) = held {
+                let mut db = page["databases"][0].clone();
+                db["generation"] = generation.into();
+                db["power"]["revision"] = generation.into();
+                db["power"]["operation"] = operation(generation as usize).into();
+                apply_snapshot(
+                    &mut cells,
+                    &HashMap::new(),
+                    &Renewals::default(),
+                    snapshot(vec![db]),
+                    None,
+                    started,
+                )
+                .unwrap();
+            }
+            let (_, hinted, _) = hinted_page(desired_hint(
+                &message,
+                Some(page.clone()),
+                "eu-test",
+                started + Duration::from_millis(5),
+            ))
+            .unwrap();
+            // Not taken, the loop pulls the database as it did for every hint before.
+            assert!(!hint_advances(&cells, &hinted), "{held:?}");
+        }
+    }
+    #[test]
+    fn the_periodic_pull_after_a_hinted_page_still_repairs_it() {
+        let (message, page) = hinted_wake();
+        let id = message["ids"][0].as_str().unwrap().to_string();
+        let started = Instant::now();
+        let mut cells = HashMap::new();
+        let mut sleeping = page["databases"][0].clone();
+        sleeping["generation"] = 2.into();
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            snapshot(vec![sleeping]),
+            None,
+            started,
+        )
+        .unwrap();
+        let received = started + Duration::from_millis(5);
+        let (_, hinted, _) = hinted_page(desired_hint(
+            &message,
+            Some(page.clone()),
+            "eu-test",
+            received,
+        ))
+        .unwrap();
+        assert!(hint_advances(&cells, &hinted));
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            hinted,
+            Some(std::slice::from_ref(&id)),
+            received,
+        )
+        .unwrap();
+        // A pull begun before the hint arrived never undoes it; one begun after it is the repair.
+        let mut older = page["databases"][0].clone();
+        older["size"]["max_connections"] = 99.into();
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            snapshot(vec![older.clone()]),
+            None,
+            started + Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(cells[&id].db, page["databases"][0]);
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            snapshot(vec![older.clone()]),
+            None,
+            received + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(cells[&id].db, older);
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &Renewals::default(),
+            snapshot(vec![]),
+            None,
+            received + Duration::from_secs(120),
+        )
+        .unwrap();
+        assert!(!cells.contains_key(&id));
     }
 }
