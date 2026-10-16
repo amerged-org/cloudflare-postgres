@@ -17,9 +17,9 @@ import {
   MAINTENANCE_ROLE,
   type MaintenanceCredential,
 } from "@pgcf/contracts/maintenance";
-import type { ApiContext } from "../env.ts";
+import type { ApiContext, Env } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
-import type { DatabaseRow, RoleRow } from "./rows.ts";
+import type { DatabaseRow, RegionRow, RoleRow } from "./rows.ts";
 import {
   readDesiredFleetRelease,
   admissionSnapshotCapable,
@@ -60,14 +60,65 @@ interface DesiredRow extends DatabaseRow, DesiredSize {
   source_backup_bucket: string | null;
   source_backup_endpoint_url: string | null;
 }
+type PageRegion = Pick<
+  RegionRow,
+  "id" | "backup_bucket" | "backup_endpoint_url"
+>;
 export async function desired(
   c: ApiContext,
   query: DesiredQuery,
 ): Promise<Response> {
   const started = Date.now();
   const region = await agentRegion(c);
+  const page = (await desiredPage(c.env, region, query))!;
+  const response = c.json(page);
+  // One line per page, so a wake's pull is measured where the controller reads it.
+  console.log(
+    JSON.stringify({
+      event: "desired_page",
+      region_id: region.id,
+      ...(page.databases.length === 1
+        ? { database_id: page.databases[0]!.id }
+        : {}),
+      databases: page.databases.length,
+      at_ms: Date.now(),
+      elapsedMs: Date.now() - started,
+    }),
+  );
+  return response;
+}
+/**
+ * The page a targeted pull of one database reads now, for the hint of its claimed wake: the same
+ * builder, so the same row. It is carried only while that row is the claimed wake itself (its
+ * revision and power operation, running); anything else is left to the region's pull.
+ */
+export async function wakeHintPage(
+  env: Env,
+  regionId: string,
+  databaseId: string,
+  claim: { operation: string; revision: number },
+): Promise<DesiredResponse | undefined> {
+  const page = await desiredPage(env, regionId, { limit: 1 }, databaseId);
+  const row = page?.databases[0];
+  return page?.databases.length === 1 &&
+    row?.id === databaseId &&
+    row.generation === claim.revision &&
+    row.desired_state === "running" &&
+    row.power?.operation === claim.operation
+    ? page
+    : undefined;
+}
+/** One page of a region's desired state, or with `only` that database's alone; none for an unknown region. */
+async function desiredPage(
+  env: Env,
+  region: PageRegion | string,
+  query: DesiredQuery,
+  only?: string,
+): Promise<DesiredResponse | undefined> {
+  const regionId = typeof region === "string" ? region : region.id;
   // The controller pulls this page on every wake hint. What depends only on the region is read together.
   const [
+    regionRow,
     admissionCapable,
     policy,
     thin,
@@ -75,11 +126,18 @@ export async function desired(
     fleetRelease,
     recoverySources,
   ] = await Promise.all([
-    admissionSnapshotCapable(c.env.DB, region.id),
-    c.env.DB.prepare(
+    typeof region === "string"
+      ? env.DB.prepare(
+          "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
+        )
+          .bind(region)
+          .first<PageRegion>()
+      : region,
+    admissionSnapshotCapable(env.DB, regionId),
+    env.DB.prepare(
       "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json,parked_tier_json FROM node_region_policies WHERE region_id=?",
     )
-      .bind(region.id)
+      .bind(regionId)
       .first<{
         placement_mode: string;
         maximum_database_memory_mib: number | null;
@@ -87,11 +145,12 @@ export async function desired(
         compute_pool_json: string | null;
         parked_tier_json: string | null;
       }>(),
-    readRegionThinStorage(c.env, region.id),
-    desiredRegionStorageSamples(c.env, region.id),
-    readDesiredFleetRelease(c.env.DB, region.id),
-    desiredRegionArchiveSources(c.env, region.id),
+    readRegionThinStorage(env, regionId),
+    desiredRegionStorageSamples(env, regionId),
+    readDesiredFleetRelease(env.DB, regionId),
+    desiredRegionArchiveSources(env, regionId),
   ]);
+  if (!regionRow) return undefined;
   const storageNodes = thin.nodes;
   // The region policy is the only switch, and it is served whether enabled or not: a disabled
   // policy is how the controller learns to demote what it parked. A stored policy that no longer
@@ -107,7 +166,7 @@ export async function desired(
           postgres_memory_request_mib: policy.postgres_memory_request_mib,
         }
       : undefined;
-  const result = await c.env.DB.prepare(
+  const result = await env.DB.prepare(
     `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'deleted_at',r.deleted_at,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls)) FROM roles r WHERE r.database_id=d.id) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
@@ -125,13 +184,18 @@ export async function desired(
     LEFT JOIN databases src ON src.id=x.source_database_id AND src.project_id=d.project_id
     LEFT JOIN regions sr ON sr.id=src.region_id
     WHERE d.region_id=? AND d.node_id IS NOT NULL AND (d.desired_state='deleted' OR (n.schedulable=1 AND n.lost_at IS NULL)) AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
-    ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
+    ${query.after ? "AND d.id>?" : ""} ${only ? "AND d.id=?" : ""} ORDER BY d.id LIMIT ?`,
   )
-    .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)
+    .bind(
+      regionId,
+      ...(query.after ? [query.after] : []),
+      ...(only ? [only] : []),
+      query.limit + 1,
+    )
     .all<DesiredRow>();
   const rows = result.results.slice(0, query.limit),
     databases: DesiredDatabase[] = [];
-  const credentials = keyring(c.env.CREDENTIAL_KEYS);
+  const credentials = keyring(env.CREDENTIAL_KEYS);
   for (const row of rows) {
     const roles: DesiredDatabase["roles"] = [];
     let maintenance: MaintenanceCredential | undefined;
@@ -187,7 +251,7 @@ export async function desired(
     // The page's own reading of the node judges its database: the node is not read again.
     const storageAuthority = storage
       ? await storageWriteAuthorityForDatabase(
-          c.env,
+          env,
           row,
           undefined,
           row.node_id === null ? undefined : thin.snapshots.get(row.node_id),
@@ -318,41 +382,27 @@ export async function desired(
       }),
     );
   }
-  const response = c.json(
-    DesiredResponse.parse({
-      ...(fleetRelease ? { fleet_release: fleetRelease } : {}),
-      region: {
-        id: region.id,
-        ...(policy?.compute_pool_json
-          ? { compute_pool: JSON.parse(policy.compute_pool_json) }
-          : {}),
-        ...(parking?.success ? { parking: parking.data } : {}),
-        ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
-        ...(storageSamples.length ? { storage_samples: storageSamples } : {}),
-        ...(recoverySources === undefined
-          ? {}
-          : { recovery_sources: recoverySources }),
-        ...(scheduling ? { scheduling } : {}),
-        backup: {
-          bucket: region.backup_bucket,
-          endpoint_url: region.backup_endpoint_url,
-          region: "auto",
-        },
+  return DesiredResponse.parse({
+    ...(fleetRelease ? { fleet_release: fleetRelease } : {}),
+    region: {
+      id: regionRow.id,
+      ...(policy?.compute_pool_json
+        ? { compute_pool: JSON.parse(policy.compute_pool_json) }
+        : {}),
+      ...(parking?.success ? { parking: parking.data } : {}),
+      ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
+      ...(storageSamples.length ? { storage_samples: storageSamples } : {}),
+      ...(recoverySources === undefined
+        ? {}
+        : { recovery_sources: recoverySources }),
+      ...(scheduling ? { scheduling } : {}),
+      backup: {
+        bucket: regionRow.backup_bucket,
+        endpoint_url: regionRow.backup_endpoint_url,
+        region: "auto",
       },
-      databases,
-      next: result.results.length > query.limit ? rows.at(-1)!.id : null,
-    }),
-  );
-  // One line per page, so a wake's pull is measured where the controller reads it.
-  console.log(
-    JSON.stringify({
-      event: "desired_page",
-      region_id: region.id,
-      ...(databases.length === 1 ? { database_id: databases[0]!.id } : {}),
-      databases: databases.length,
-      at_ms: Date.now(),
-      elapsedMs: Date.now() - started,
-    }),
-  );
-  return response;
+    },
+    databases,
+    next: result.results.length > query.limit ? rows.at(-1)!.id : null,
+  });
 }

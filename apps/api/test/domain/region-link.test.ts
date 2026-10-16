@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { newDatabaseId } from "@pgcf/contracts";
+import {
+  type DesiredResponse,
+  archiveDestinationPath,
+  newDatabaseId,
+  newNodeId,
+  newOperationId,
+  newRolePassword,
+} from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
@@ -61,6 +68,98 @@ it("sends real DO hints after hibernation and replaces the previous agent socket
   expect(await stub.notify([id])).toBe(1);
   expect(JSON.parse(await next)).toEqual({ type: "desired", ids: [id] });
   second.close(1000);
+});
+/** A valid desired page of one database; `samples` sampled nodes make it as large as needed. */
+function page(region: string, id: string, samples = 0): DesiredResponse {
+  return {
+    region: {
+      id: region,
+      backup: {
+        bucket: "pgcf-backups",
+        endpoint_url: `https://${["archive", "invalid"].join(".")}`,
+        region: "auto",
+      },
+      ...(samples
+        ? {
+            storage_samples: Array.from({ length: samples }, () => ({
+              node_id: newNodeId(),
+              name: "node-sampled",
+              node_uid: crypto.randomUUID(),
+              period_milliseconds: 2000,
+              qualification_run: null,
+            })),
+          }
+        : {}),
+    },
+    databases: [
+      {
+        id,
+        generation: 1,
+        desired_state: "running",
+        node: "node-one",
+        pg_major: 18,
+        size: {
+          memory_mib: 512,
+          cpu_millicores: 500,
+          storage_gib: 5,
+          max_connections: 50,
+          archive_timeout_seconds: 60,
+          backup_retention_days: 7,
+        },
+        roles: [
+          {
+            name: "app",
+            owner: true,
+            password: newRolePassword(),
+            revision: 1,
+          },
+        ],
+        archive: {
+          destination_path: archiveDestinationPath(
+            "pgcf-backups",
+            region,
+            id,
+            1,
+            newOperationId(),
+          ),
+          server_name: "database",
+        },
+      },
+    ],
+    next: null,
+  };
+}
+it("carries a wake's page only when it is valid for its one database and fits the link", async () => {
+  const region = "eu-" + crypto.randomUUID().slice(0, 8),
+    stub = env.REGION_LINK.get(env.REGION_LINK.idFromName(region)),
+    id = newDatabaseId();
+  const socket = await connect(stub);
+  const received = async (desired: DesiredResponse, ids = [id]) => {
+    const message = nextMessage(socket);
+    expect(await stub.notify(ids, desired)).toBe(1);
+    return JSON.parse(await message);
+  };
+  const carried = page(region, id);
+  expect(await received(carried)).toEqual({
+    type: "desired",
+    ids: [id],
+    desired: carried,
+  });
+  // Another database's page, a page for several IDs and one larger than the link takes: the IDs
+  // alone, and the region pulls as before.
+  expect(await received(page(region, newDatabaseId()))).toEqual({
+    type: "desired",
+    ids: [id],
+  });
+  const other = newDatabaseId();
+  expect(await received(carried, [id, other])).toEqual({
+    type: "desired",
+    ids: [id, other],
+  });
+  const large = page(region, id, 600);
+  expect(JSON.stringify(large).length).toBeGreaterThan(64 * 1024);
+  expect(await received(large)).toEqual({ type: "desired", ids: [id] });
+  socket.close(1000);
 });
 it("persists latest orphan observations in the real region DO", async () => {
   const stub = env.REGION_LINK.get(

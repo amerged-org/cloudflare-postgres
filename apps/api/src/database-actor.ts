@@ -39,6 +39,7 @@ interface ReclaimState {
 import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
 import { thinStorageTurnsFor } from "./domain/databases.ts";
+import { wakeHintPage } from "./domain/desired.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 import {
@@ -1024,13 +1025,19 @@ export class DatabaseActor extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         "UPDATE database_wake SET hint_claimed=1 WHERE singleton=1",
       );
-      // Already claimed, so nothing replays it: the claim does not wait for its delivery.
+      // Already claimed, so nothing replays it: the claim does not wait for its delivery. The hint
+      // carries the page the region's targeted pull would read now; without it the region pulls.
       const hinted = Date.now();
       this.ctx.waitUntil(
-        this.env.REGION_LINK.get(this.env.REGION_LINK.idFromName(regionId))
-          .notify([id])
+        wakeHintPage(this.env, regionId, id, { operation, revision })
           .catch(() => undefined)
-          .then(() =>
+          .then(async (page) => {
+            const read = Date.now();
+            await this.env.REGION_LINK.get(
+              this.env.REGION_LINK.idFromName(regionId),
+            )
+              .notify([id], page)
+              .catch(() => undefined);
             // The wake split's first stage on this side: the claim itself and the region hint.
             console.log(
               JSON.stringify({
@@ -1043,10 +1050,12 @@ export class DatabaseActor extends DurableObject<Env> {
                 requested_at_ms: requested,
                 gate_ms: started - requested,
                 claim_ms: hinted - started,
-                hint_ms: Date.now() - hinted,
+                page: page !== undefined,
+                page_ms: read - hinted,
+                hint_ms: Date.now() - read,
               }),
-            ),
-          ),
+            );
+          }),
       );
     }
     return true;

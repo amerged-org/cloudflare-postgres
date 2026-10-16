@@ -2,8 +2,10 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   DatabaseId,
+  LINK_MESSAGE_MAX_BYTES,
   LinkDesiredHint,
   LinkHello,
+  type DesiredResponse,
   type Orphan,
 } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
@@ -72,11 +74,13 @@ export class RegionLink extends DurableObject<Env> {
   override async webSocketError(socket: WebSocket): Promise<void> {
     socket.close(1011, "Link failed");
   }
-  async notify(ids?: string[]): Promise<number> {
+  /** `desired`: a wake's page of its one database, carried when valid and within the link's bound. */
+  async notify(ids?: string[], desired?: DesiredResponse): Promise<number> {
     const hint = LinkDesiredHint.parse({
       type: "desired",
       ...(ids ? { ids: ids.map((id) => DatabaseId.parse(id)) } : {}),
     });
+    const message = linkHint(hint, desired);
     let delivered = 0;
     for (const socket of this.ctx.getWebSockets("agent")) {
       const attachment = socket.deserializeAttachment() as {
@@ -84,7 +88,7 @@ export class RegionLink extends DurableObject<Env> {
       } | null;
       if (!attachment?.hello) continue;
       try {
-        socket.send(JSON.stringify(hint));
+        socket.send(message);
         delivered++;
       } catch {
         socket.close(1011, "Link failed");
@@ -99,4 +103,28 @@ export class RegionLink extends DurableObject<Env> {
       JSON.stringify(orphans),
     );
   }
+}
+/**
+ * A hint on the wire. The page is carried only when it is a valid one of the hint's one database
+ * and the message fits the link; otherwise the IDs alone, and the region pulls. Nothing of the
+ * page is logged: it holds the database's credentials.
+ */
+function linkHint(hint: LinkDesiredHint, desired?: DesiredResponse): string {
+  const plain = JSON.stringify(hint);
+  if (desired === undefined) return plain;
+  const carried = LinkDesiredHint.safeParse({ ...hint, desired });
+  const message = carried.success ? JSON.stringify(carried.data) : undefined;
+  if (
+    message !== undefined &&
+    new TextEncoder().encode(message).byteLength <= LINK_MESSAGE_MAX_BYTES
+  )
+    return message;
+  console.warn(
+    JSON.stringify({
+      event: "link_hint_page_dropped",
+      reason: message === undefined ? "invalid" : "too_large",
+      ...(hint.ids?.length === 1 ? { database_id: hint.ids[0] } : {}),
+    }),
+  );
+  return plain;
 }
