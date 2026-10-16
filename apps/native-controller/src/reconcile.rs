@@ -244,6 +244,27 @@ pub(crate) struct RetainedManifests {
     pub(crate) manifests: Option<Vec<Value>>,
     pub(crate) runtime_class: &'static str,
 }
+/// What keeps a resumed Pod from being published on the barrier, by its first cause: not yet ready
+/// once before, no admission, a recovery in progress, or the kinds of the runtime proof that have no
+/// current watch (named, which is the one cause a release cannot see from outside).
+fn lean_blocker(
+    established: bool,
+    admission: bool,
+    no_recovery: bool,
+    unwatched: &[&str],
+) -> Option<String> {
+    if !established {
+        Some("not_established".into())
+    } else if !admission {
+        Some("no_admission".into())
+    } else if !no_recovery {
+        Some("recovery".into())
+    } else if !unwatched.is_empty() {
+        Some(format!("unwatched:{}", unwatched.join(",")))
+    } else {
+        None
+    }
+}
 /// The Pod a fast wake resumed is the primary only while it is still that Pod: the same UID and
 /// containers, `postgres` running and not restarted, on its node under the selected runtime. Its
 /// Ready bit is not read.
@@ -1480,11 +1501,19 @@ impl Reconciler {
         // for its objects is published on the barrier: what only keeps it right (the stamps of
         // the manifests, every role's credential, the health of the archive) is made by the pass
         // that follows, which is due at once. Any of these missing, and the pass is the whole chain.
-        let lean = parked.is_some()
-            && established
-            && !db["admission"].is_null()
-            && db["recovery"].is_null()
-            && self.k8s.runtime_continuity().is_some();
+        let blocker = lean_blocker(
+            established,
+            !db["admission"].is_null(),
+            db["recovery"].is_null(),
+            &self.k8s.runtime_unwatched(),
+        );
+        if parked.is_some() {
+            eprintln!(
+                "{}",
+                json!({"event":"wake_path","database_id":db["id"],"lean":blocker.is_none(),"blocked_by":blocker})
+            );
+        }
+        let lean = parked.is_some() && blocker.is_none() && self.k8s.runtime_continuity().is_some();
         // Whatever becomes of the rest of this pass, the manifests were not stamped.
         let stamps_left = lean;
         if fence.is_none() && !db["storage"].is_null() {
@@ -2582,6 +2611,26 @@ pub(crate) fn pinned_to_node(pv: &Value, node: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_lean_path_names_its_first_blocker() {
+        assert_eq!(lean_blocker(true, true, true, &[]), None);
+        assert_eq!(
+            lean_blocker(false, false, false, &["Pod"]).as_deref(),
+            Some("not_established")
+        );
+        assert_eq!(
+            lean_blocker(true, false, true, &[]).as_deref(),
+            Some("no_admission")
+        );
+        assert_eq!(
+            lean_blocker(true, true, false, &[]).as_deref(),
+            Some("recovery")
+        );
+        assert_eq!(
+            lean_blocker(true, true, true, &["Node", "Secret"]).as_deref(),
+            Some("unwatched:Node,Secret")
+        );
+    }
     use super::*;
     use crate::test_server::{Server, token, uid};
     #[test]

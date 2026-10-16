@@ -593,6 +593,16 @@ fn watch_ended_line(kind: &str, error: &Error) -> Value {
 fn failure_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(8)).min(300))
 }
+/// The delay after the `attempt`-th consecutive failed reconcile. The first retry is quick: a pass
+/// that met a Pod not yet reachable or a write conflict usually succeeds at once, and a wake waits
+/// for it; the failures after it keep the backoff a failed renewal has.
+fn reconcile_failure_delay(attempt: u32) -> Duration {
+    if attempt <= 1 {
+        Duration::from_millis(250)
+    } else {
+        failure_delay(attempt - 1)
+    }
+}
 fn stale_snapshot_retry(cell: &mut Cell, now: Instant) {
     cell.attempt = 0;
     cell.stalled = 0;
@@ -1200,7 +1210,7 @@ async fn run() -> Result<(), Error> {
                                 Err(error) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
-                                    cell.due = Instant::now() + failure_delay(cell.attempt);
+                                    cell.due = Instant::now() + reconcile_failure_delay(cell.attempt);
                                     eprintln!("{}", reconcile_failed(&id, generation, &error));
                                 }
                             }
@@ -2047,6 +2057,15 @@ mod tests {
         assert_eq!(class(&db, &Renewals::default(), 0), Class::Wake);
         finish(&mut db, now, Some(&json!({"state":"ready"})));
         assert_eq!(class(&db, &Renewals::default(), 0), Class::Routine);
+    }
+    #[test]
+    fn a_first_failed_reconcile_retries_at_once_and_later_ones_back_off() {
+        // A wake whose first pass met a Pod that was not yet reachable (host unreachable, a write
+        // conflict) lost the full 2 s timer before the pass that finishes it.
+        let delays: Vec<_> = (1..=6)
+            .map(|attempt| reconcile_failure_delay(attempt).as_millis())
+            .collect();
+        assert_eq!(delays, [250, 2000, 4000, 8000, 16000, 32000]);
     }
     #[test]
     fn failing_renewals_back_off_instead_of_holding_every_slot() {

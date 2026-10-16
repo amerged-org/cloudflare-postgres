@@ -351,6 +351,13 @@ impl WatchContinuity {
             .all(|kind| self.watching(kind))
             .then(|| (self.controller_epoch.clone(), self.epoch))
     }
+    /// The kinds the runtime proof needs a current watch of that have none.
+    fn unwatched(&self) -> Vec<&'static str> {
+        RUNTIME_WATCH_KINDS
+            .into_iter()
+            .filter(|kind| !self.watching(kind))
+            .collect()
+    }
     /// Remembers that this controller wrote `object`, as the write answered, over the version
     /// `before`. A write that changed nothing answers the version it was made over and leaves no
     /// event, so none is expected for it.
@@ -612,6 +619,10 @@ fn is_object(value: &Value, kind: &str, namespace: Option<&str>, name: &str) -> 
 impl Kubernetes {
     pub fn runtime_continuity(&self) -> Option<(String, u64)> {
         self.continuity.lock().unwrap().snapshot()
+    }
+    /// The kinds without a current watch, which keep a parked wake from being published on the barrier.
+    pub fn runtime_unwatched(&self) -> Vec<&'static str> {
+        self.continuity.lock().unwrap().unwatched()
     }
     /// What one event of a metadata watch of `kind` makes of the watch: the revision it stands at
     /// and the database it hints. An event for a version this controller wrote itself hints no
