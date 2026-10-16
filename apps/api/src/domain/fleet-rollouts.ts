@@ -842,16 +842,6 @@ export async function createFleetRollout(
           id: region.region_id,
         })),
         async (mutation) => {
-          const noHolders = `NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?))
-        AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=held_database.id AND b.state NOT IN('released','refused'))
-          OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=held_database.id AND h.kind='pool' AND h.state NOT IN('released','refused'))))`;
-          const regionsJson = JSON.stringify(intent.regions);
-          if (
-            !(await c.env.DB.prepare(`SELECT 1 WHERE ${noHolders}`)
-              .bind(regionsJson)
-              .first())
-          )
-            return changed();
           const raw = JSON.stringify(FleetRolloutIntent.parse(intent)),
             snapshotJson = JSON.stringify(snapshot),
             anchor = intent.regions[0]!;
@@ -863,7 +853,7 @@ export async function createFleetRollout(
             : { sql: "1=1", bindings: [] };
           const statements: D1PreparedStatement[] = [
             c.env.DB.prepare(
-              `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${guard} AND (${replacement.sql}) AND (${mutation.guard.sql}) AND ${noHolders} ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
+              `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${guard} AND (${replacement.sql}) AND (${mutation.guard.sql}) ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
             ).bind(
               anchor.region_id,
               intent.release_id,
@@ -877,7 +867,6 @@ export async function createFleetRollout(
               JSON.stringify(intent.regions),
               ...replacement.bindings,
               ...mutation.guard.bindings,
-              regionsJson,
             ),
           ];
           for (const region of intent.regions) {

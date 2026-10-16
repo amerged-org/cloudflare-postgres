@@ -135,9 +135,9 @@ async function crowdedNode(live: number, deleted: number) {
 }
 
 // What the guard polls every second costs a fixed number of D1 statements: the agent, the node and
-// its reading, one batch for every database's rows and inputs, and the pool capability. The bound
-// is the design's own count (nine) plus the one conditional read of the physical boot.
-const LEASE_STATEMENT_BOUND = 10;
+// its reading, and one batch for every database's rows and inputs. The bound is the design's own
+// count (six) plus the one conditional read of the physical boot.
+const LEASE_STATEMENT_BOUND = 7;
 it("costs the same D1 statements for three databases as for forty and a hundred deleted ones", async () => {
   const few = await crowdedNode(3, 5),
     many = await crowdedNode(40, 100);
@@ -154,7 +154,7 @@ it("costs the same D1 statements for three databases as for forty and a hundred 
 }, 120_000);
 
 // The accepted sample's whole handler, its token issuance included.
-const SAMPLE_STATEMENT_BOUND = 16;
+const SAMPLE_STATEMENT_BOUND = 15;
 it("issues the tokens of forty databases with the statements of three", async () => {
   const counted = async (live: number, deleted: number) => {
     const { node, proof } = await crowdedNode(live, deleted),

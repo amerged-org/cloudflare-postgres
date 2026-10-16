@@ -514,28 +514,6 @@ describe("role removal", () => {
     ).toBe(201);
   });
 
-  it("is refused while the database is bound to a shared pool", async () => {
-    const f = await ready({ name: "report_job" });
-    await env.DB.prepare(
-      "INSERT INTO database_runtime_holders(database_id,kind,revision,state,updated_at) VALUES(?,'pool',1,'claimed',?)",
-    )
-      .bind(f.id, Date.now())
-      .run();
-    const response = await removeRole(f, "report_job");
-    expect(await refusal(response)).toEqual({
-      status: 409,
-      code: "conflict",
-      reason: "pool_bound",
-      retryAfter: "5",
-    });
-    expect(await listed(f)).toEqual(["app", "report_job"]);
-    await env.DB.prepare(
-      "DELETE FROM database_runtime_holders WHERE database_id=?",
-    )
-      .bind(f.id)
-      .run();
-  });
-
   it("ends a removal the database deletion made pointless", async () => {
     const f = await ready({ name: "report_job" });
     const { operation } = await removal(f, "report_job");

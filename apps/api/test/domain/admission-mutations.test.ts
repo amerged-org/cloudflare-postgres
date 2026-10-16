@@ -37,57 +37,7 @@ async function ready() {
     .run();
   return { ...f, id: created.database.id };
 }
-async function unresolvedPoolHolder(f: Awaited<ReturnType<typeof ready>>) {
-  const uid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
-    .bind(f.node)
-    .first<string>("node_uid");
-  const pod = crypto.randomUUID(),
-    binding = crypto.randomUUID(),
-    boot = crypto.randomUUID(),
-    now = Date.now();
-  // Controlled local SQL ownership metadata; no mount or Dev runtime claim.
-  await env.DB.prepare(
-    "INSERT INTO pool_pods(pod_uid,node_id,node_uid,boot_id,policy_revision,attestation_json,state,first_observed_at,last_observed_at) VALUES(?,?,?,?,1,'{}','claimed',?,?)",
-  )
-    .bind(pod, f.node, uid, boot, now, now)
-    .run();
-  await env.DB.prepare(
-    "INSERT INTO pool_bindings(id,database_id,node_id,node_uid,boot_id,pool_pod_uid,generation,route_revision,admission_epoch,holder_revision,scope_sha256,scope_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,1,1,1,1,?,'{}','claimed',?,?)",
-  )
-    .bind(binding, f.id, f.node, uid, boot, pod, "a".repeat(64), now, now)
-    .run();
-  return binding;
-}
 
-it("a regional authority mutation durably detaches an unresolved pool holder in the same guarded business batch", async () => {
-  const f = await ready(),
-    binding = await unresolvedPoolHolder(f);
-  await env.DB.exec(
-    `CREATE TRIGGER pool_authority_fence BEFORE UPDATE ON regions WHEN NEW.id='${f.region}' AND EXISTS(SELECT 1 FROM pool_bindings WHERE id='${binding}' AND state<>'detaching') BEGIN SELECT RAISE(ABORT,'authority write retains active pool holder'); END`,
-  );
-  try {
-    await withAdmissionMutation(
-      env,
-      [],
-      async (mutation) => {
-        const guard = mutation.scopeGuard();
-        await mutation.batch([
-          env.DB.prepare(
-            `UPDATE regions SET gateway_url='https://next.invalid' WHERE id=? AND (${guard.sql})`,
-          ).bind(f.region, ...guard.bindings),
-        ]);
-      },
-      { kind: "region", id: f.region },
-    );
-    expect(
-      await env.DB.prepare("SELECT state FROM pool_bindings WHERE id=?")
-        .bind(binding)
-        .first("state"),
-    ).toBe("detaching");
-  } finally {
-    await env.DB.exec("DROP TRIGGER pool_authority_fence");
-  }
-});
 it("an atomic declared-region batch fences all delayed writes after a real abort without affecting a third region", async () => {
   const a = await ready(),
     b = await ready(),
@@ -140,26 +90,6 @@ it("an atomic declared-region batch fences all delayed writes after a real abort
     ).toEqual({ mutation_id: null, mutation_outcome: "fenced" });
   }
   expect((await actorFor(other.id).admit(other.id, "app")).ok).toBe(true);
-});
-
-it("a capability rollback cannot route or start CNPG while a pool holder outcome is unknown", async () => {
-  const f = await ready();
-  await unresolvedPoolHolder(f);
-  expect(await actorFor(f.id).admit(f.id, "app")).toEqual({
-    ok: false,
-    sqlstate: "57P03",
-  });
-  expect(
-    await actorFor(f.id).ensureAwake(f.id, "app", {
-      deadline: Date.now() + 100,
-    }),
-  ).toEqual({ ok: false, sqlstate: "57P03" });
-  const desired = (await (
-    await request("/agent/v1/desired", f.agent)
-  ).json()) as { databases: { id: string }[] };
-  expect(desired.databases.some((database) => database.id === f.id)).toBe(
-    false,
-  );
 });
 
 it("a committed v4 role change cannot admit the preceding ready runtime without a power operation", async () => {

@@ -23,15 +23,8 @@ import type { DatabaseRow, RoleRow } from "./rows.ts";
 import {
   readDesiredFleetRelease,
   admissionSnapshotCapable,
-  postgresPoolCapable,
 } from "./fleet-releases.ts";
-import {
-  hasNonterminalPoolHolderSql,
-  readDesiredPostgresPoolBinding,
-  readPostgresPoolPolicies,
-} from "./postgres-pool.ts";
 import { desiredRegionArchiveSources } from "./region-archive-sources.ts";
-import { desiredDeferredPoolRole } from "./roles.ts";
 
 import {
   readRegionThinStorage,
@@ -73,11 +66,9 @@ export async function desired(
 ): Promise<Response> {
   const started = Date.now();
   const region = await agentRegion(c);
-  // The controller pulls this page on every wake hint. What depends only on the region is read
-  // together; the pool policies and the rows follow the capability they depend on.
+  // The controller pulls this page on every wake hint. What depends only on the region is read together.
   const [
     admissionCapable,
-    poolCapable,
     policy,
     thin,
     storageSamples,
@@ -85,7 +76,6 @@ export async function desired(
     recoverySources,
   ] = await Promise.all([
     admissionSnapshotCapable(c.env.DB, region.id),
-    postgresPoolCapable(c.env.DB, region.id),
     c.env.DB.prepare(
       "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json,parked_tier_json FROM node_region_policies WHERE region_id=?",
     )
@@ -103,9 +93,6 @@ export async function desired(
     desiredRegionArchiveSources(c.env, region.id),
   ]);
   const storageNodes = thin.nodes;
-  const postgresPools = poolCapable
-    ? await readPostgresPoolPolicies(c.env, region.id)
-    : [];
   // The region policy is the only switch, and it is served whether enabled or not: a disabled
   // policy is how the controller learns to demote what it parked. A stored policy that no longer
   // parses is served as none, which demotes the same way.
@@ -138,26 +125,14 @@ export async function desired(
     LEFT JOIN databases src ON src.id=x.source_database_id AND src.project_id=d.project_id
     LEFT JOIN regions sr ON sr.id=src.region_id
     WHERE d.region_id=? AND d.node_id IS NOT NULL AND (d.desired_state='deleted' OR (n.schedulable=1 AND n.lost_at IS NULL)) AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
-    AND (?=1 OR NOT ${hasNonterminalPoolHolderSql("d")})
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
-    .bind(
-      region.id,
-      Number(poolCapable),
-      ...(query.after ? [query.after] : []),
-      query.limit + 1,
-    )
+    .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)
     .all<DesiredRow>();
   const rows = result.results.slice(0, query.limit),
     databases: DesiredDatabase[] = [];
   const credentials = keyring(c.env.CREDENTIAL_KEYS);
   for (const row of rows) {
-    const poolBinding = poolCapable
-      ? await readDesiredPostgresPoolBinding(c.env, row.id)
-      : undefined;
-    const pendingPoolRole = poolCapable
-      ? await desiredDeferredPoolRole(c.env, row.id)
-      : undefined;
     const roles: DesiredDatabase["roles"] = [];
     let maintenance: MaintenanceCredential | undefined;
     // Deletion can recover even if a credential key has been retired.
@@ -326,8 +301,6 @@ export async function desired(
               },
             }
           : {}),
-        ...(poolBinding ? { pool_binding: poolBinding } : {}),
-        ...(pendingPoolRole ? { pending_pool_role: pendingPoolRole } : {}),
         ...(maintenance === undefined ? {} : { maintenance }),
         creation:
           row.creation_operation_id === null
@@ -360,7 +333,6 @@ export async function desired(
           ? {}
           : { recovery_sources: recoverySources }),
         ...(scheduling ? { scheduling } : {}),
-        ...(postgresPools.length ? { postgres_pools: postgresPools } : {}),
         backup: {
           bucket: region.backup_bucket,
           endpoint_url: region.backup_endpoint_url,

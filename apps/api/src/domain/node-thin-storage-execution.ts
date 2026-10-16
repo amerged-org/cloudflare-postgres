@@ -41,7 +41,6 @@ import type { Env, ApiContext } from "../env.ts";
 import { bearer } from "../middleware/auth.ts";
 import {
   readCurrentNodeThinStorage,
-  poolHostCustodyForDatabase,
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import {
@@ -62,10 +61,6 @@ import {
   withAdmissionMutation,
   type AdmissionMutation,
 } from "./admission-mutations.ts";
-import {
-  postgresPoolCapable,
-  postgresPoolQualificationCapable,
-} from "./fleet-releases.ts";
 const closed = (): never => {
   throw new ApiError(
     "conflict",
@@ -178,7 +173,6 @@ function retainedPoolAuthority(
 
 export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM (
   SELECT h.operation_id FROM database_start_admissions h WHERE h.node_id=node_thin_storage.node_id AND h.node_uid=node_thin_storage.node_uid AND h.storage_budget_bytes>0
-  UNION ALL SELECT cleanup.operation_id FROM pool_cleanup_grants cleanup JOIN pool_bindings b ON b.id=cleanup.binding_id WHERE b.node_id=node_thin_storage.node_id AND b.node_uid=node_thin_storage.node_uid AND cleanup.state<>'completed'
 ) storage_hold WHERE NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
 export async function storageHolds(
   env: Env,
@@ -187,14 +181,10 @@ export async function storageHolds(
   authority: NodeThinStorageAuthority | null | undefined,
   now = Date.now(),
 ) {
-  const { poolCleanupExposureSql, poolCleanupReceiptSql } =
-    await import("./storage-capacity.ts");
   const rows = await env.DB.prepare(
-    `SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0
-    UNION ALL SELECT cleanup.operation_id,b.database_id,${poolCleanupExposureSql()},${poolCleanupReceiptSql()},d.storage_volume_json,d.storage_profile_json,d.storage_generation
-    FROM pool_cleanup_grants cleanup JOIN pool_bindings b ON b.id=cleanup.binding_id JOIN databases d ON d.id=b.database_id WHERE b.node_id=? AND b.node_uid=? AND cleanup.state<>'completed' ORDER BY operation_id`,
+    `SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
   )
-    .bind(nodeId, nodeUid, nodeId, nodeUid)
+    .bind(nodeId, nodeUid)
     .all<{
       operation_id: string;
       database_id: string;
@@ -421,18 +411,7 @@ export async function reserveThinStorageLease(
           .run();
         return null;
       }
-      const unresolved = await env.DB.prepare(
-        `SELECT EXISTS(SELECT 1 FROM pool_bindings b WHERE b.node_id=? AND b.state NOT IN('released','refused') AND json_extract(b.scope_json,'$.storage.backend')='lvm-thin-v1')
-        OR EXISTS(SELECT 1 FROM database_runtime_holders h JOIN databases d ON d.id=h.database_id WHERE d.node_id=? AND d.storage_profile_json IS NOT NULL AND h.kind='pool' AND h.state NOT IN('released','refused')) held`,
-      )
-        .bind(nodeId, nodeId)
-        .first<number>("held");
-      // Deleted obligations need a new absence proof, never replacement-pool permission.
-      if (
-        holds.count === 0 &&
-        !unresolved &&
-        required.data <= profile.maximum_data_bytes
-      )
+      if (holds.count === 0 && required.data <= profile.maximum_data_bytes)
         action = NodeThinPoolAction.parse({
           kind: "initialize",
           state: "pending",
@@ -495,10 +474,8 @@ export async function reserveThinStorageLease(
   // The newest sample accepted before this lease bounds what its own LVM reading may show.
   const result = await env.DB.prepare(
     `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=?,lease_sample_observed_at=sample_observed_at,lease_sample_data_used_bytes=sample_data_used_bytes WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}
-      AND (?=0 OR ((NOT EXISTS(SELECT 1 FROM database_start_admissions a WHERE a.node_id=node_thin_storage.node_id AND a.storage_budget_bytes>0)
-        AND NOT EXISTS(SELECT 1 FROM pool_bindings b WHERE b.node_id=node_thin_storage.node_id AND b.state NOT IN('released','refused') AND json_extract(b.scope_json,'$.storage.backend')='lvm-thin-v1'))
-        AND (NOT EXISTS(SELECT 1 FROM database_runtime_holders h JOIN databases d ON d.id=h.database_id WHERE d.node_id=node_thin_storage.node_id AND d.storage_profile_json IS NOT NULL AND h.kind='pool' AND h.state NOT IN('released','refused'))
-        AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.node_id=node_thin_storage.node_id AND d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.storage_profile_json IS NOT NULL))))`,
+      AND (?=0 OR (NOT EXISTS(SELECT 1 FROM database_start_admissions a WHERE a.node_id=node_thin_storage.node_id AND a.storage_budget_bytes>0)
+        AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.node_id=node_thin_storage.node_id AND d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.storage_profile_json IS NOT NULL)))`,
   )
     .bind(
       operation,
@@ -611,20 +588,6 @@ async function buildThinStorageInput(
     current.authority ??
     current.reclamation ??
     retainedPoolAuthority(current.row);
-  const poolCapable =
-    (await postgresPoolCapable(env.DB, row.region_id)) ||
-    (await postgresPoolQualificationCapable(env.DB, row.region_id));
-  const poolCustody = new Map(
-    await Promise.all(
-      records.results.map(
-        async (record) =>
-          [
-            record.id,
-            await poolHostCustodyForDatabase(env, record.id, poolCapable),
-          ] as const,
-      ),
-    ),
-  );
   const requiredHeadroom =
     required ??
     minimumHeadroom(
@@ -703,7 +666,6 @@ async function buildThinStorageInput(
               expires_at: row.lease_expires_at,
             }
           : null,
-        ...(poolCustody.get(r.id) ? { pool: poolCustody.get(r.id) } : {}),
       })),
     },
     host_extension: {

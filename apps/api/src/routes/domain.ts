@@ -337,10 +337,6 @@ export function registerDomain(app: ApiApp): void {
           description: "Role created",
           content: jsonExample(Role, "created", exampleRole),
         },
-        202: {
-          description: "Role change accepted after pool drain",
-          content: json(DatabaseWithOperation),
-        },
       },
     },
     async (c) =>
@@ -358,13 +354,7 @@ export function registerDomain(app: ApiApp): void {
       security,
       tags: ["Roles"],
       request: { headers, params: roleParams },
-      responses: {
-        ...responses(Role),
-        202: {
-          description: "Role change accepted after pool drain",
-          content: json(DatabaseWithOperation),
-        },
-      },
+      responses: responses(Role),
     },
     async (c) =>
       resetPassword(

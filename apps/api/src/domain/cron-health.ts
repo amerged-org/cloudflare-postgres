@@ -14,7 +14,6 @@ export const CRON_STEPS = [
   "capacity_alerts",
   "infrastructure_backup_dispatch",
   "admission_recovery",
-  "pool_role_recovery",
   "resource_profile_rollouts",
   "power_timeouts",
   "operation_timeouts",

@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
-import type { PoolHostCustody } from "@pgcf/contracts/postgres-pool";
 import {
   NodeThinStorageInput,
   NodeThinStorageReport,
@@ -270,286 +269,6 @@ export function thinWriterPods(pods: ObjectValue[]) {
       object(metadata(pod).labels)["cnpg.io/podRole"] === "instance" &&
       !["Succeeded", "Failed"].includes(String(object(pod.status).phase)),
   );
-}
-
-/** A pool binding retains its original namespace/Pod/CIDs through detach; CNPG never joins it. */
-export function thinPoolWriter(
-  pool: PoolHostCustody,
-  cnpgPods: ObjectValue[],
-  allPods: ObjectValue[],
-  namespaces: ObjectValue[],
-  nodeName: string,
-  bootId: string,
-) {
-  if (thinWriterPods(cnpgPods).length)
-    throw new BootstrapError("thin_storage_parallel_writer");
-  if (pool.holder_boot_id !== bootId)
-    throw new BootstrapError("thin_storage_pool_boot_changed");
-  if (!pool.device)
-    throw new BootstrapError("thin_storage_pool_device_unconfirmed");
-  if (
-    !["claimed", "mounted", "serving", "detaching", "failed", "lost"].includes(
-      pool.state,
-    )
-  )
-    throw new BootstrapError("thin_storage_pool_custody_changed");
-  const namespace = namespaces.find(
-    (value) => metadata(value).name === pool.pool_namespace,
-  );
-  if (!namespace || metadata(namespace).uid !== pool.pool_namespace_uid)
-    throw new BootstrapError("thin_storage_pool_namespace_changed");
-  const matches = allPods.filter(
-    (value) => metadata(value).uid === pool.pool_pod_uid,
-  );
-  if (matches.length > 1)
-    throw new BootstrapError("thin_storage_pool_pod_changed");
-  const pod = matches[0];
-  if (pod) {
-    if (
-      metadata(pod).namespace !== pool.pool_namespace ||
-      object(pod.spec).nodeName !== nodeName
-    )
-      throw new BootstrapError("thin_storage_pool_pod_changed");
-    const statuses = items(object(pod.status).containerStatuses);
-    const ids = statuses.map((status) => {
-      const match = /^containerd:\/\/([a-f0-9]{64})$/.exec(
-        text(status.containerID),
-      );
-      if (!match)
-        throw new BootstrapError("thin_storage_pool_container_changed");
-      return match[1]!;
-    });
-    if (
-      new Set(ids).size !== ids.length ||
-      canonical([...ids].sort()) !== canonical([...pool.container_ids].sort())
-    )
-      throw new BootstrapError("thin_storage_pool_container_changed");
-  }
-  // Pod API disappearance is never quiescence. The subsequent kernel read must prove every
-  // original CID/ancestor still exists, or fail closed while any retained holder remains.
-  return { pod_uid: pool.pool_pod_uid, container_ids: pool.container_ids };
-}
-
-export function thinPoolProcesses(raw: string, ids: string[]) {
-  const rows = raw.split("\n").flatMap((line) => {
-    const m =
-      /^\S+\s+\S+\s+(?:└─\s+)?([a-f0-9]{64})\s+\S+\s+(\d+)\s+(\S+)\s*$/u.exec(
-        line.trim(),
-      );
-    return m
-      ? [{ container_id: m[1]!, pid: bytes(m[2]), status: m[3]!.toLowerCase() }]
-      : [];
-  });
-  return ids.map((id) => {
-    if (!/^[a-f0-9]{64}$/.test(id))
-      throw new BootstrapError("thin_storage_pool_process_changed");
-    const matches = rows.filter((row) => row.container_id === id);
-    if (
-      matches.length !== 1 ||
-      !matches[0]!.pid ||
-      matches[0]!.status !== "running"
-    )
-      throw new BootstrapError("thin_storage_pool_process_changed");
-    return { container_id: id, pid: matches[0]!.pid };
-  });
-}
-export function thinPoolProcessCgroup(raw: string, podUid: string, id: string) {
-  uid(podUid);
-  const rows = raw.trim().split("\n");
-  if (rows.length !== 1 || !rows[0]!.startsWith("0::/"))
-    throw new BootstrapError("thin_storage_pool_process_changed");
-  const path = rows[0]!.slice(4),
-    parts = path.split("/");
-  if (
-    !/^[a-f0-9]{64}$/.test(id) ||
-    parts.some(
-      (p) => !p || !/^[A-Za-z0-9_.-]+$/.test(p) || p === "." || p === "..",
-    )
-  )
-    throw new BootstrapError("thin_storage_pool_process_changed");
-  const u = podUid.replaceAll("-", "_"),
-    leaf = `cri-containerd-${id}.scope`;
-  const suffixes = [
-    `kubepods.slice/kubepods-pod${u}.slice/${leaf}`,
-    `kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod${u}.slice/${leaf}`,
-    `kubepods/pod${podUid}/${id}`,
-    `kubepods/burstable/pod${podUid}/${id}`,
-  ];
-  if (!suffixes.some((s) => path === s || path.endsWith(`/${s}`)))
-    throw new BootstrapError("thin_storage_pool_process_changed");
-  return path;
-}
-export function thinPoolProcessStat(raw: string, pid: number) {
-  const at = raw.lastIndexOf(") ");
-  if (at < 0 || raw.slice(0, raw.indexOf(" (")).trim() !== String(pid))
-    throw new BootstrapError("thin_storage_pool_process_changed");
-  const fields = raw
-      .slice(at + 2)
-      .trim()
-      .split(/\s+/),
-    start = bytes(fields[19]);
-  if (!start) throw new BootstrapError("thin_storage_pool_process_changed");
-  return start;
-}
-export function thinPoolPidNamespace(raw: string) {
-  const rows = raw.split("\n").flatMap((line) => {
-    const m = /(?:^|\s|\/)pid\s+->\s+pid:\[(\d+)\]\s*$/.exec(line);
-    return m ? [bytes(m[1])] : [];
-  });
-  if (rows.length !== 1 || !rows[0])
-    throw new BootstrapError("thin_storage_pool_process_changed");
-  return rows[0];
-}
-
-/** A slow lease cannot substitute a guessed device for the node's separately accepted /io proof. */
-export function thinPoolDevice(
-  pool: PoolHostCustody,
-  vg: string,
-  lv: ObjectValue,
-) {
-  if (!pool.device)
-    throw new BootstrapError("thin_storage_pool_device_unconfirmed");
-  const device = pool.device;
-  if (
-    device.volume_group_uuid !== vg ||
-    device.lv_uuid !== lv.lv_uuid ||
-    device.thin_id !== bytes(lv.thin_id) ||
-    device.device_major !== bytes(lv.lv_kernel_major) ||
-    device.device_minor !== bytes(lv.lv_kernel_minor)
-  )
-    throw new BootstrapError("thin_storage_pool_device_changed");
-  return { major: device.device_major, minor: device.device_minor };
-}
-
-/** Stopped-holder cleanup still needs fresh inventory before its separate finite PC1 grant.
- * Only an exact same-boot suspended mapping permits physical-only reporting; no IO is inferred. */
-export function thinPoolQuiesced(
-  pool: PoolHostCustody,
-  boot: string,
-  receipt: NodeThinStorageInput["lease"]["databases"][number]["volume"],
-  facts: Pick<ThinLvmFacts, "vg_uuid" | "pool_uuid" | "rows" | "active">,
-  observed: NodeThinStorageAuthority["volumes"][number],
-) {
-  if (pool.holder_boot_id !== boot)
-    throw new BootstrapError("thin_storage_pool_boot_changed");
-  if (!["detaching", "failed", "lost"].includes(pool.state)) return false;
-  const lv = facts.rows.find((row) => row.lv_name === observed.volume_handle);
-  if (!lv || text(lv.lv_attr)[4] !== "s") return false;
-  if (
-    !receipt ||
-    !observed.quiesced ||
-    observed.io.length ||
-    receipt.volume_group_uuid !== facts.vg_uuid ||
-    receipt.pool_uuid !== facts.pool_uuid ||
-    lv.lv_uuid !== receipt.lv_uuid ||
-    lv.segtype !== "thin" ||
-    lv.pool_lv !== "pgcf_thinpool" ||
-    !facts.active.includes(receipt.lv_uuid) ||
-    (
-      [
-        "storage_generation",
-        "storage_uid",
-        "namespace_uid",
-        "cluster_uid",
-        "volume_handle",
-        "lv_uuid",
-        "pvc_uid",
-        "pv_uid",
-      ] as const
-    ).some((field) => receipt[field] !== observed[field])
-  )
-    throw new BootstrapError("thin_storage_pool_receipt_changed");
-  return true;
-}
-
-/** Slow identity rechecks real host tasks and ONE shared Pod/device ceiling already armed by /io. */
-export async function readThinPoolIo(
-  pool: PoolHostCustody,
-  major: number,
-  minor: number,
-  driverRead: (args: string[]) => Promise<string>,
-  talos: (args: string[]) => Promise<string>,
-) {
-  const changed = () => {
-    throw new BootstrapError("thin_storage_pool_cgroup_changed");
-  };
-  const identity = (raw: string) => {
-    const match = /^(\d+):(\d+):(\d+)\s*$/.exec(raw);
-    if (!match || bytes(match[3]) !== 0 || !bytes(match[2])) return changed();
-    return `${bytes(match[1])}:${bytes(match[2])}`;
-  };
-  const processRead = async (task: { container_id: string; pid: number }) => {
-    const [stat, cgroup, namespace] = await Promise.all([
-      talos(["read", `/proc/${task.pid}/stat`]),
-      talos(["read", `/proc/${task.pid}/cgroup`]),
-      talos(["ls", "--long", "--type=l", `/proc/${task.pid}/ns`]),
-    ]);
-    return {
-      ...task,
-      start_ticks: thinPoolProcessStat(stat, task.pid),
-      pid_namespace: thinPoolPidNamespace(namespace),
-      relative: thinPoolProcessCgroup(
-        cgroup,
-        pool.pool_pod_uid,
-        task.container_id,
-      ),
-    };
-  };
-  const tasks = thinPoolProcesses(
-    await talos(["containers", "--namespace", "cri"]),
-    pool.container_ids,
-  );
-  const processes = await Promise.all(tasks.map(processRead));
-  const parents = new Set(
-    processes.map((p) => p.relative.slice(0, p.relative.lastIndexOf("/"))),
-  );
-  if (parents.size !== 1) return changed();
-  const parent = [...parents][0]!,
-    root = "/sys/fs/cgroup/";
-  if (
-    (await driverRead(["stat", "-f", "-c", "%t", "/sys/fs/cgroup"])).trim() !==
-    "63677270"
-  )
-    return changed();
-  const stat = async (relative: string) =>
-    identity(
-      await driverRead(["stat", "-Lc", "%d:%i:%u", `${root}${relative}`]),
-    );
-  const before = await stat(parent);
-  const leaves = await Promise.all(
-    processes.map(async (p) => {
-      const inode = await stat(p.relative);
-      // Kernel membership is relative to the reader's PID namespace. Talos is the
-      // initial-host reader; the driver intentionally has no hostPID permission.
-      const pids = (await talos(["read", `${root}${p.relative}/cgroup.procs`]))
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .map(bytes);
-      if (!pids.includes(p.pid)) return changed();
-      return { relative: p.relative, inode };
-    }),
-  );
-  const raw = await driverRead(["cat", `${root}${parent}/io.max`]);
-  const limits = thinIoLimit(raw, major, minor);
-  const after = await Promise.all(tasks.map(processRead));
-  if (
-    canonical(processes) !== canonical(after) ||
-    (await stat(parent)) !== before
-  )
-    return changed();
-  for (const leaf of leaves)
-    if ((await stat(leaf.relative)) !== leaf.inode) return changed();
-  const current = thinPoolProcesses(
-    await talos(["containers", "--namespace", "cri"]),
-    pool.container_ids,
-  );
-  if (
-    canonical(tasks) !== canonical(current) ||
-    (await driverRead(["cat", `${root}${parent}/io.max`])) !== raw
-  )
-    return changed();
-  return { pod_uid: pool.pool_pod_uid, ...limits };
 }
 
 export interface ThinLvmFacts {
@@ -1467,7 +1186,7 @@ export async function runThinStorage(
     },
     options,
     async (session) => {
-      const { call, kube, get, talos } = session;
+      const { call, kube, get } = session;
       const {
         driver,
         driverUid,
@@ -1479,7 +1198,6 @@ export async function runThinStorage(
         moduleLive,
         cgroup,
         driverExec,
-        driverRead,
         freshDriver,
         readLvm,
       } = await verifyThinNode(
@@ -1624,8 +1342,6 @@ export async function runThinStorage(
             metadata(v).namespace === namespace &&
             object(v.spec).nodeName === lease.name,
         );
-        if (db.pool && thinWriterPods(pods).length)
-          throw new BootstrapError("thin_storage_parallel_writer");
         if (
           (db.desired_state === "deleted" &&
             db.volume &&
@@ -1651,18 +1367,6 @@ export async function runThinStorage(
               : undefined,
           });
           if (retained) {
-            if (
-              db.pool &&
-              !thinPoolQuiesced(db.pool, boot, db.volume, facts, retained)
-            )
-              thinPoolWriter(
-                db.pool,
-                pods,
-                allPods,
-                namespaces,
-                lease.name,
-                boot,
-              );
             accounted.add(retained.lv_uuid);
             volumes.push(retained);
           }
@@ -1679,7 +1383,6 @@ export async function runThinStorage(
           throw new BootstrapError("thin_storage_database_owner_changed");
         const protection = object(storage.data)[STORAGE_PROTECTION_LEDGER_KEY];
         if (
-          !db.pool &&
           typeof protection === "string" &&
           pods.length === 0 &&
           object(metadata(cluster).annotations)["cnpg.io/hibernation"] === "on"
@@ -1756,29 +1459,7 @@ export async function runThinStorage(
           volume_attributes_class: db.storage ? className : null,
           io,
         };
-        const physicalOnly =
-          db.pool && thinPoolQuiesced(db.pool, boot, db.volume, facts, volume);
-        if (db.pool && !physicalOnly) {
-          thinPoolWriter(db.pool, pods, allPods, namespaces, lease.name, boot);
-          const device = thinPoolDevice(db.pool, facts.vg_uuid, lv);
-          if (db.storage && text(lv.lv_attr)[4] === "a") {
-            const measured = await readThinPoolIo(
-              db.pool,
-              device.major,
-              device.minor,
-              async (args) => (await driverRead(args)).stdout,
-              talos,
-            );
-            if (
-              measured.write_bytes_per_second >
-                db.storage.write_bytes_per_second ||
-              measured.write_iops_per_second > db.storage.write_iops_per_second
-            )
-              throw new BootstrapError("thin_storage_io_limit_unqualified");
-            io.push(measured);
-          }
-        }
-        for (const pod of db.storage && text(lv.lv_attr)[4] === "a" && !db.pool
+        for (const pod of db.storage && text(lv.lv_attr)[4] === "a"
           ? thinWriterPods(pods)
           : []) {
           const podUid = uid(metadata(pod).uid);
@@ -1835,17 +1516,6 @@ export async function runThinStorage(
         canonical(final.volumes) !== canonical(facts.volumes)
       )
         throw new BootstrapError("thin_storage_inventory_changed");
-      for (const db of lease.databases) {
-        if (!db.pool) continue;
-        const volume = volumes.find((volume) => volume.database_id === db.id);
-        if (!volume) continue;
-        const lv = final.rows.find(
-          (row) => row.lv_name === volume.volume_handle,
-        );
-        if (!lv) throw new BootstrapError("thin_storage_pool_device_changed");
-        if (!thinPoolQuiesced(db.pool, boot, db.volume, final, volume))
-          thinPoolDevice(db.pool, final.vg_uuid, lv);
-      }
       facts = final;
       const pool = facts.physical.thin_pool;
       const writeAllowed = Boolean(

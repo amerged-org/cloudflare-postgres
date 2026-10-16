@@ -30,15 +30,6 @@ export function computePoolOverheadSql(
   return `COALESCE(json_extract((SELECT compute_pool_json FROM node_region_policies WHERE region_id=${owner}.region_id),'$.per_slot_${resource}'),0)`;
 }
 
-/** The immutable Pod scheduling request survives class, power and delete mutations. */
-export function postgresPoolBoundCpuChargeSql(databaseAlias = "d"): string {
-  const database = identifier(databaseAlias);
-  return `COALESCE((SELECT SUM(CASE WHEN p.idle_cpu_millicores>0 THEN p.idle_cpu_millicores ELSE ${maximumInteger} END)
-    FROM pool_bindings b JOIN pool_pods p ON p.pod_uid=b.pool_pod_uid AND p.binding_id=b.id
-    JOIN nodes pool_cpu_node ON pool_cpu_node.id=b.node_id AND pool_cpu_node.node_uid=b.node_uid
-    WHERE b.database_id=${database}.id AND b.node_id=${database}.node_id AND b.state NOT IN('released','refused')),0)`;
-}
-
 /** A database whose owned runtime stop is confirmed: the one predicate behind every "cold" decision. */
 function stoppedSleeperSql(
   database: string,
@@ -80,8 +71,8 @@ export function databaseCpuChargeSql(
     AND EXISTS(SELECT 1 FROM operations protected_operation WHERE protected_operation.id=${database}.storage_protected_operation
       AND protected_operation.database_id=${database}.id AND protected_operation.project_id=${database}.project_id
       AND protected_operation.generation<=${database}.generation)`;
-  return `MAX((CASE WHEN (${sleeping}) OR (${protectedStop}) THEN 0
-    ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END),${postgresPoolBoundCpuChargeSql(database)})`;
+  return `(CASE WHEN (${sleeping}) OR (${protectedStop}) THEN 0
+    ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END)`;
 }
 
 /**
@@ -102,15 +93,6 @@ export function databaseParkedCpuSql(
     THEN CASE WHEN json_extract(${database}.parked_json,'$.v')=1 AND typeof(${parked})='integer' AND ${parked}>=0 THEN ${parked}
       ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END
     ELSE 0 END)`;
-}
-
-/** Ready pool Pods reserve their real scheduling requests before they become database holders. */
-export function postgresPoolIdleChargeSql(
-  nodeAlias: string,
-  resource: "cpu_millicores" | "memory_mib",
-) {
-  const node = identifier(nodeAlias);
-  return `COALESCE((SELECT SUM(pi.${resource === "cpu_millicores" ? "idle_cpu_millicores" : "idle_memory_mib"}) FROM pool_pods pi WHERE pi.node_id=${node}.id AND pi.node_uid=${node}.node_uid AND pi.state='ready'),0)`;
 }
 
 /**
@@ -136,11 +118,7 @@ export function nodeCpuHeadroomSql(
         ? ""
         : `AND cpu_database.id<>${identifier(excludeDatabaseAlias)}.id`,
     target = `COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)`,
-    targetCharge = `${target}+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(node, "cpu_millicores")}`,
-    effectiveTarget =
-      excludeDatabaseAlias === undefined
-        ? targetCharge
-        : `MAX(${targetCharge},${postgresPoolBoundCpuChargeSql(excludeDatabaseAlias)})`;
+    targetCharge = `${target}+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(node, "cpu_millicores")}`;
   return `((${node}.ready=1 AND ${node}.schedulable=1 AND ${node}.lost_at IS NULL AND ${node}.node_uid IS NOT NULL)
     AND (julianday(${node}.last_observed_at)>=julianday('now','-180 seconds')
     AND julianday(${node}.last_observed_at)<=julianday('now','+5 seconds'))
@@ -151,9 +129,8 @@ export function nodeCpuHeadroomSql(
     AND ${node}.allocatable_cpu_millicores-${node}.platform_reserved_cpu_millicores
       -COALESCE((SELECT SUM(${databaseCpuChargeSql("cpu_database", "cpu_size")})
         FROM databases cpu_database JOIN size_classes cpu_size ON cpu_size.id=cpu_database.size_class_id
-        WHERE cpu_database.node_id=${node}.id AND (cpu_database.observed_state<>'deleted' OR ${postgresPoolBoundCpuChargeSql("cpu_database")}>0) ${excluded}),0)
-      -${postgresPoolIdleChargeSql(node, "cpu_millicores")}
-      >=${effectiveTarget}+${parkedNodeCpuSql(node, excluded)}
+        WHERE cpu_database.node_id=${node}.id AND cpu_database.observed_state<>'deleted' ${excluded}),0)
+      >=${targetCharge}+${parkedNodeCpuSql(node, excluded)}
     AND typeof(${computePoolOverheadSql(node, "cpu_millicores")})='integer'
     AND ${computePoolOverheadSql(node, "cpu_millicores")} BETWEEN 0 AND ${maximumInteger})`;
 }

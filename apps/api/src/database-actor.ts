@@ -4,7 +4,7 @@ import {
   DatabaseId,
   DatabaseRegionRoute as RegionRoute,
   type DatabaseAdmission,
-  type DatabaseTarget,
+  CnpgDatabaseTarget,
   RoleName,
   Timestamp,
   newOperationId,
@@ -47,10 +47,6 @@ import {
 } from "./domain/admission-state.ts";
 import { withAdmissionMutation } from "./domain/admission-mutations.ts";
 import { readDatabaseAdmissionSnapshot } from "./domain/database-admission-snapshot.ts";
-import {
-  hasNonterminalPoolHolderSql,
-  preparePostgresPoolClaim,
-} from "./domain/postgres-pool.ts";
 const PersistedAdmissionMutationIntent = AdmissionMutationIntent.extend({
   started_at: z.number().int().nonnegative().default(0),
 });
@@ -116,7 +112,7 @@ export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state
   CASE WHEN ${admissionSnapshotSql("g")} THEN 1 ELSE 0 END admission_snapshot_capable,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
   CASE WHEN EXISTS(SELECT 1 FROM roles changed WHERE changed.database_id=d.id AND changed.owner=0 AND changed.deleted_at IS NULL
     AND changed.name<>r.name AND changed.updated_at=d.updated_at) THEN 1 ELSE 0 END unrelated_role_configuration,
-  CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) AND NOT ${hasNonterminalPoolHolderSql("d")} THEN 0 ELSE 1 END admission_blocked
+  CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL
@@ -169,7 +165,7 @@ function admittedRoute(
 function verifiedTarget(
   row: AdmissionRow,
   databaseId: string,
-): DatabaseTarget | undefined {
+): z.infer<typeof CnpgDatabaseTarget> | undefined {
   if (row.runtime_attestation_json === null) return undefined;
   const attestation = DatabaseRuntimeAttestation.safeParse(
     JSON.parse(row.runtime_attestation_json),
@@ -425,24 +421,11 @@ export class DatabaseActor extends DurableObject<Env> {
       runtime.observed_at > Date.now() + 1000
     )
       return { ok: false, sqlstate: "57P03" };
-    const target =
-      "kind" in runtime && runtime.kind === "pool"
-        ? {
-            kind: "pool" as const,
-            revision: snapshot.generation,
-            pod_uid: runtime.pod_uid,
-            route_revision: snapshot.route_revision,
-            binding_id: runtime.binding_id,
-            node_uid: runtime.node_uid,
-            pod_ip: runtime.pod_ip,
-            storage_generation: runtime.storage_generation,
-            scope_sha256: runtime.scope_sha256,
-          }
-        : {
-            revision: snapshot.generation,
-            pod_uid: runtime.pod_uid,
-            route_revision: snapshot.route_revision,
-          };
+    const target = {
+      revision: snapshot.generation,
+      pod_uid: runtime.pod_uid,
+      route_revision: snapshot.route_revision,
+    };
     return { ok: true, region: snapshot.region, target };
   }
   private reclaimState(): ReclaimState {
@@ -920,7 +903,6 @@ export class DatabaseActor extends DurableObject<Env> {
   private async known(
     id: string,
     user: string,
-    joinOwnPoolWake = false,
   ): Promise<AdmissionRow | DatabaseAdmission> {
     const snapshot = this.presence();
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
@@ -948,41 +930,10 @@ export class DatabaseActor extends DurableObject<Env> {
     if (
       row.node_id === null ||
       row.lost_at !== null ||
-      (row.admission_blocked !== 0 &&
-        (!joinOwnPoolWake || !(await this.canJoinOwnPoolWake(id, row))))
+      row.admission_blocked !== 0
     )
       return { ok: false, sqlstate: "57P03" };
     return row;
-  }
-  /** An exact owned wake may wait for its current holder; this never admits a connection. */
-  private async canJoinOwnPoolWake(id: string, row: AdmissionRow) {
-    if (this.admissionState()?.barrier || row.desired_state !== "running")
-      return false;
-    const owned = this.ctx.storage.sql
-      .exec<{ operation: string; revision: number }>(
-        "SELECT operation,revision FROM database_wake WHERE singleton=1",
-      )
-      .toArray()[0];
-    if (
-      !owned ||
-      owned.revision !== row.generation ||
-      owned.operation !== row.power_operation
-    )
-      return false;
-    const confirmed = await this.env.DB.prepare(
-      `SELECT 1 FROM databases d JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation=d.generation
-       JOIN database_admission_epochs e ON e.database_id=d.id
-       JOIN database_runtime_holders h ON h.database_id=d.id AND h.kind='pool'
-       JOIN pool_bindings b ON b.id=h.binding_id AND b.database_id=d.id AND b.holder_revision=h.revision AND b.state=h.state
-       JOIN nodes n ON n.id=d.node_id AND n.node_uid=b.node_uid AND n.region_id=d.region_id
-       WHERE d.id=? AND d.generation=? AND d.power_operation=? AND d.desired_state='running' AND d.deleted_at IS NULL
-         AND o.kind IN('database.wake','database.resume') AND o.status IN('pending','running','succeeded')
-         AND b.generation=d.generation AND b.node_id=d.node_id AND b.state IN('claimed','mounted','serving')
-         AND e.mutation_id IS NULL AND e.route_revision>=b.route_revision AND e.admission_revision>=b.admission_epoch`,
-    )
-      .bind(id, owned.revision, owned.operation)
-      .first();
-    return !!confirmed && !this.admissionState()?.barrier;
   }
   private earlyAdmission(
     databaseId: unknown,
@@ -1098,7 +1049,7 @@ export class DatabaseActor extends DurableObject<Env> {
         for (let attempt = 0; ; attempt++) {
           // Every read here holds every other event of this database: independent reads go together.
           const [authorized, row] = await Promise.all([
-            this.known(id, user, true),
+            this.known(id, user),
             this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
               .bind(id)
               .first<DatabaseRow>(),
@@ -1127,36 +1078,16 @@ export class DatabaseActor extends DurableObject<Env> {
               this.env,
               [id],
               async (mutation) => {
-                const plan = await preparePostgresPoolClaim(
-                  this.env,
-                  id,
-                  revision,
-                  mutation,
-                  previous.region_id,
-                );
-                if (
-                  plan &&
-                  plan.statements.length === 0 &&
-                  (await plan.finish()).kind === "blocked"
-                )
-                  throw new Error("pool_holder_unresolved");
-                const statements = powerTransitionStatements(
-                  this.env.DB,
-                  previous,
-                  "wake",
-                  operation,
-                  now,
-                  user,
-                  mutation.guard(id),
-                );
-                const committed = await mutation.batch([
-                  ...(plan?.statements ?? []),
-                  ...statements,
-                ]);
-                if (plan && (await plan.finish()).kind === "blocked")
-                  throw new Error("pool_claim_commit_unconfirmed");
-                const transition = committed.slice(
-                  plan?.statements.length ?? 0,
+                const transition = await mutation.batch(
+                  powerTransitionStatements(
+                    this.env.DB,
+                    previous,
+                    "wake",
+                    operation,
+                    now,
+                    user,
+                    mutation.guard(id),
+                  ),
                 );
                 // The transition is committed with its operation, at the next generation: the region
                 // may pull it now, ahead of the snapshot publish that closes this mutation.
@@ -1304,7 +1235,7 @@ export class DatabaseActor extends DurableObject<Env> {
     try {
       if (!(await this.revokeBeforeAdmission(id.data, deadline)))
         return { ok: false, sqlstate: "57P03" };
-      const current = await this.known(id.data, role.data, true);
+      const current = await this.known(id.data, role.data);
       if ("ok" in current) return current;
       if (
         current.desired_state === "running" &&

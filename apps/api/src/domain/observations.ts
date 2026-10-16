@@ -28,7 +28,6 @@ import { thinStorageDeletionConfirmedSql } from "./storage-capacity.ts";
 import { requestThinStorageTurn } from "./node-thin-storage-execution.ts";
 import {
   withAdmissionMutation,
-  withPoolCertificateRefresh,
   type AdmissionMutation,
 } from "./admission-mutations.ts";
 import {
@@ -74,15 +73,6 @@ function admissionRuntimeIdentity(raw: unknown) {
           p.postgres_port,
           p.observation.controller_epoch,
           p.observation.watch_epoch,
-        ]
-      : []),
-    ...("kind" in p && p.kind === "pool"
-      ? [
-          p.kind,
-          p.binding_id,
-          p.scope_sha256,
-          p.holder_revision,
-          p.pool_namespace_uid,
         ]
       : []),
   ];
@@ -837,15 +827,7 @@ export async function observations(
     };
     const committing = Date.now();
     const result = await (invalidates
-      ? observation.state === "ready"
-        ? withPoolCertificateRefresh(
-            c.env,
-            row.id,
-            previousRuntime,
-            runtime,
-            execute,
-          )
-        : withAdmissionMutation(c.env, [row.id], execute)
+      ? withAdmissionMutation(c.env, [row.id], execute)
       : execute());
     const committed = Date.now();
     const changed = result[0]!.meta.changes === 1;

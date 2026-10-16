@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, DatabaseRegionRoute, RoleName } from "@pgcf/contracts";
-import {
-  DatabaseRuntimeAttestationV2,
-  DatabasePoolRuntimeAttestationV2,
-} from "@pgcf/contracts/reclaim";
+import { DatabaseRuntimeAttestationV2 } from "@pgcf/contracts/reclaim";
 import { z } from "zod";
 
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -33,9 +30,7 @@ export const DatabaseAdmissionSnapshot = z
     cache_capable: z.boolean(),
     admissible: z.boolean(),
     region: DatabaseRegionRoute,
-    runtime: z
-      .union([DatabaseRuntimeAttestationV2, DatabasePoolRuntimeAttestationV2])
-      .nullable(),
+    runtime: DatabaseRuntimeAttestationV2.nullable(),
   })
   .refine(
     (snapshot) =>

@@ -23,10 +23,6 @@ import {
   withAdmissionMutation,
   type AdmissionMutation,
 } from "./admission-mutations.ts";
-import {
-  assertPostgresPoolQualificationReceipt,
-  hasNonterminalPoolHolderSql,
-} from "./postgres-pool.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -111,11 +107,6 @@ export async function approveFleetRelease(
       c.env.DB,
       spec.thin_storage_qualification,
     );
-  if (spec.postgres_pool_qualification)
-    await assertPostgresPoolQualificationReceipt(
-      c.env.DB,
-      spec.postgres_pool_qualification,
-    );
   const read = async () => {
     const current = await release(c.env.DB, id);
     if (current.spec_sha256 !== hash || canonical(current.spec) !== specJson)
@@ -188,7 +179,6 @@ export async function assignFleetRegionRelease(
               `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at)
           SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM regions WHERE id=?)
             AND ${guard.sql}
-            AND NOT EXISTS(SELECT 1 FROM databases pd WHERE pd.region_id=? AND ${hasNonterminalPoolHolderSql("pd")})
             AND (?=0 OR EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND revision=?))
           ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,
             revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_region_releases.revision=?`,
@@ -199,7 +189,6 @@ export async function assignFleetRegionRelease(
               new Date().toISOString(),
               regionId,
               ...guard.bindings,
-              regionId,
               input.expected_revision,
               regionId,
               input.expected_revision,
@@ -249,16 +238,6 @@ async function nodeRow(db: D1Database, id: string): Promise<NodeReleaseRow> {
   if (!row) throw new ApiError("not_found", "Node not found");
   return row;
 }
-/** These images are consumed by scoped, single-use pool holders, not resident
- * regional deployments. Their full release pins and per-holder proofs stay intact. */
-function poolHolderImage(spec: FleetReleaseSpec, name: string) {
-  return (
-    (spec.postgres_pool_qualification_version === 1 ||
-      spec.postgres_pool_version === 1) &&
-    ["postgres", "barman", "pool-supervisor"].includes(name)
-  );
-}
-
 export function mismatches(
   spec: FleetReleaseSpec,
   roleName: "control_relay" | "customer",
@@ -324,14 +303,9 @@ export function mismatches(
       }
     }
   }
-  const wantedNames = new Set([
-    ...role.components.filter((name) => !poolHolderImage(spec, name)),
-    ...role.talos_extensions,
-  ]);
+  const wantedNames = new Set([...role.components, ...role.talos_extensions]);
   const observed = new Map(
-    facts.components
-      .filter((value) => !poolHolderImage(spec, value.name))
-      .map((value) => [value.name, value]),
+    facts.components.map((value) => [value.name, value]),
   );
   for (const component of spec.components.filter((value) =>
     wantedNames.has(value.name),
@@ -579,7 +553,6 @@ export async function assignFleetNodeRelease(
               `INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at)
           SELECT ?,?,?,?,?,? WHERE ${guard}
             AND ${admission.sql}
-            AND NOT EXISTS(SELECT 1 FROM databases pd WHERE pd.region_id=? AND ${hasNonterminalPoolHolderSql("pd")})
             AND (?=0 OR EXISTS(SELECT 1 FROM fleet_node_releases WHERE node_id=? AND revision=?))
           ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,release_id=excluded.release_id,
             role=excluded.role,revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_node_releases.revision=?`,
@@ -592,7 +565,6 @@ export async function assignFleetNodeRelease(
               new Date().toISOString(),
               ...identity,
               ...admission.bindings,
-              node.region_id,
               input.expected_revision,
               id,
               input.expected_revision,
@@ -949,36 +921,6 @@ export async function admissionSnapshotCapable(
       .first(),
   );
 }
-export function postgresPoolSql(region: string) {
-  return `(${admissionSnapshotSql(region)}) AND EXISTS(SELECT 1 FROM fleet_region_releases pf JOIN fleet_releases ps ON ps.id=pf.release_id WHERE pf.region_id=${region}.id AND json_extract(ps.spec_json,'$.postgres_pool_version')=1)`;
-}
-export async function postgresPoolCapable(db: D1Database, regionId: string) {
-  return Boolean(
-    await db
-      .prepare(
-        `SELECT 1 FROM regions pr WHERE pr.id=? AND ${postgresPoolSql("pr")}`,
-      )
-      .bind(regionId)
-      .first(),
-  );
-}
-/** Isolated qualification is separate from receipt-gated ordinary pool admission. */
-export function postgresPoolQualificationSql(region: string) {
-  return `(${admissionSnapshotSql(region)}) AND EXISTS(SELECT 1 FROM fleet_region_releases qf JOIN fleet_releases qs ON qs.id=qf.release_id WHERE qf.region_id=${region}.id AND json_extract(qs.spec_json,'$.postgres_pool_qualification_version')=1)`;
-}
-export async function postgresPoolQualificationCapable(
-  db: D1Database,
-  regionId: string,
-) {
-  return Boolean(
-    await db
-      .prepare(
-        `SELECT 1 FROM regions qr WHERE qr.id=? AND ${postgresPoolQualificationSql("qr")}`,
-      )
-      .bind(regionId)
-      .first(),
-  );
-}
 /** Only explicitly assigned, current physical nodes receive this release. No legacy wire change when unassigned. */
 export async function readDesiredFleetRelease(
   db: D1Database,
@@ -1010,60 +952,13 @@ export async function readDesiredFleetRelease(
     thin_storage_sampling_version: samplingVersion,
     runtime_attestation_version: runtimeAttestationVersion,
     admission_snapshot_version: admissionSnapshotVersion,
-    postgres_pool_version: postgresPoolVersion,
-    postgres_pool_qualification: postgresPoolQualification,
-    postgres_pool_qualification_version: postgresPoolQualificationVersion,
-    postgres_pool_candidate: postgresPoolCandidate,
     ...runtimeSpec
   } = selected.spec;
   void provisioningImage;
-  void postgresPoolVersion;
-  void postgresPoolQualification;
-  void postgresPoolQualificationVersion;
-  void postgresPoolCandidate;
   void routeTokenVersion;
   void samplingVersion;
   void runtimeAttestationVersion;
   void admissionSnapshotVersion;
-  if (
-    !(await postgresPoolCapable(db, regionId)) &&
-    !(await postgresPoolQualificationCapable(db, regionId))
-  ) {
-    runtimeSpec.components = runtimeSpec.components.filter(
-      (component) => component.name !== "pool-supervisor",
-    );
-    runtimeSpec.roles = {
-      control_relay: {
-        ...runtimeSpec.roles.control_relay,
-        components: runtimeSpec.roles.control_relay.components.filter(
-          (name) => name !== "pool-supervisor",
-        ),
-      },
-      customer: {
-        ...runtimeSpec.roles.customer,
-        components: runtimeSpec.roles.customer.components.filter(
-          (name) => name !== "pool-supervisor",
-        ),
-      },
-    };
-  }
-  // A candidate can converge before its first scoped Pod exists, and a Control
-  // member with target_slots=0 never needs a tenant Pod. Keep the same resident
-  // inventory view used by status; pool setup/serving validate the retained pins.
-  runtimeSpec.roles = {
-    control_relay: {
-      ...runtimeSpec.roles.control_relay,
-      components: runtimeSpec.roles.control_relay.components.filter(
-        (name) => !poolHolderImage(selected.spec, name),
-      ),
-    },
-    customer: {
-      ...runtimeSpec.roles.customer,
-      components: runtimeSpec.roles.customer.components.filter(
-        (name) => !poolHolderImage(selected.spec, name),
-      ),
-    },
-  };
   return FleetDesiredRelease.parse({
     region_id: regionId,
     region_revision: state.revision,

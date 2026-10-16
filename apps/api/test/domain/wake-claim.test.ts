@@ -28,9 +28,6 @@ const EPOCH_INSERT = "INSERT INTO database_admission_epochs";
 const EPOCH_READ =
   "SELECT database_id,admission_revision,route_revision,mutation_id FROM";
 const PRESENCE = "SELECT d.id database_id,d.generation revision";
-const REGION = "SELECT region_id FROM databases WHERE id=?";
-const POOL_CAPABLE = "SELECT 1 FROM regions pr WHERE pr.id=?";
-const POOL_RUNS = "SELECT id FROM postgres_pool_qualification_runs";
 const FENCE = "mutation_outcome='fenced'";
 const PUBLISH_SNAPSHOT = "SELECT d.*,p.deleted_at project_deleted_at";
 const PUBLISH_EPOCH =
@@ -177,33 +174,6 @@ it("the claim reads the database row together with its admission read", async ()
   ).toHaveLength(1);
   expect(starts(events, ROW)).toHaveLength(1);
   admission.open();
-  const row = await untilWake(f.id);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    readyBody(f, row.power_operation),
-  );
-  expect(await waiting).toMatchObject({ ok: true });
-}, 30_000);
-
-it("the claim reads the pool capability together with the pool runs and needs no region read", async () => {
-  const capability = gate(POOL_CAPABLE, 1);
-  const f = await sleeping();
-  const events = await record(f.region, [capability]);
-  const waiting = actor(f.id).ensureAwake(f.id, "app", {
-    deadline: Date.now() + 20_000,
-  });
-  for (let i = 0; i < 400 && starts(events, POOL_RUNS).length === 0; i++)
-    await sleep(5);
-  // The runs were read while the capability read was still held back.
-  expect(starts(events, POOL_CAPABLE)).toHaveLength(1);
-  expect(
-    events.filter((e) => e.startsWith("end ") && e.includes(POOL_CAPABLE)),
-  ).toHaveLength(0);
-  expect(starts(events, POOL_RUNS)).toHaveLength(1);
-  expect(starts(events, REGION)).toHaveLength(0);
-  capability.open();
   const row = await untilWake(f.id);
   await request(
     "/agent/v1/observations",

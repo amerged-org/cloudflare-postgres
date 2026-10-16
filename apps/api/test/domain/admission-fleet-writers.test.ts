@@ -345,61 +345,6 @@ it("a reported controller rollback fences cached admission and removes the incom
   }
 });
 
-it("a fleet assignment cannot replace the guarded runtime while a pool holder has no release proof", async () => {
-  const f = await admissionSnapshotFixture(),
-    pod = crypto.randomUUID(),
-    binding = crypto.randomUUID(),
-    now = Date.now();
-  await env.DB.prepare(
-    "INSERT INTO pool_pods(pod_uid,node_id,node_uid,boot_id,policy_revision,attestation_json,state,first_observed_at,last_observed_at) VALUES(?,?,?,?,1,'{}','claimed',?,?)",
-  )
-    .bind(pod, f.node, f.nodeUid, f.proof.boot_id, now, now)
-    .run();
-  await env.DB.prepare(
-    "INSERT INTO pool_bindings(id,database_id,node_id,node_uid,boot_id,pool_pod_uid,generation,route_revision,admission_epoch,holder_revision,scope_sha256,scope_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,1,1,1,1,?,'{}','claimed',?,?)",
-  )
-    .bind(
-      binding,
-      f.id,
-      f.node,
-      f.nodeUid,
-      f.proof.boot_id,
-      pod,
-      "a".repeat(64),
-      now,
-      now,
-    )
-    .run();
-  const node = await request(`/v1/nodes/${f.node}/release`, f.admin, "PUT", {
-    expected_revision: 1,
-    node_uid: f.nodeUid,
-    release_id: f.releaseId,
-    role: "customer",
-  });
-  expect(node.status).toBe(409);
-  const region = await request(
-    `/v1/regions/${f.region}/release`,
-    f.admin,
-    "PUT",
-    { expected_revision: 1, release_id: f.releaseId },
-  );
-  expect(region.status).toBe(409);
-  expect(
-    await env.DB.prepare(
-      "SELECT revision FROM fleet_node_releases WHERE node_id=?",
-    )
-      .bind(f.node)
-      .first("revision"),
-  ).toBe(1);
-  expect(
-    await env.DB.prepare(
-      "SELECT revision FROM fleet_region_releases WHERE region_id=?",
-    )
-      .bind(f.region)
-      .first("revision"),
-  ).toBe(1);
-});
-
 it("a regional runtime template change fences existing admissions before changing its node policy", async () => {
   const f = await admissionSnapshotFixture();
   await publishDatabaseAdmission(env, f.id);

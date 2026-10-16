@@ -80,17 +80,6 @@ export async function setComputePoolPolicy(
       "conflict",
       "Compute runtime differs from the approved fleet component",
     );
-  if (
-    await c.env.DB.prepare(
-      "SELECT 1 FROM node_postgres_pool_policies WHERE node_id=? AND json_extract(policy_json,'$.target_slots')>0",
-    )
-      .bind(id)
-      .first()
-  )
-    throw new ApiError(
-      "conflict",
-      "A PostgreSQL Pod pool already owns this node's idle budget",
-    );
   return withIdempotency(c, {
     replay: () => getComputePoolPolicy(c, id),
     execute: async (lease) => {
@@ -125,7 +114,7 @@ export async function setComputePoolPolicy(
           `INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at)
           SELECT id,node_uid,?,?,?,? FROM nodes WHERE id=? AND node_uid=? AND ready=1 AND lost_at IS NULL
           AND julianday(last_observed_at)>=julianday('now','-180 seconds') AND julianday(last_observed_at)<=julianday('now','+5 seconds') AND ?=0
-          AND NOT EXISTS(SELECT 1 FROM node_postgres_pool_policies x WHERE x.node_id=nodes.id AND json_extract(x.policy_json,'$.target_slots')>0) AND NOT EXISTS(SELECT 1 FROM node_compute_pool_policies p WHERE p.node_id=nodes.id) AND (${guard?.sql ?? "1=1"})
+          AND NOT EXISTS(SELECT 1 FROM node_compute_pool_policies p WHERE p.node_id=nodes.id) AND (${guard?.sql ?? "1=1"})
           ON CONFLICT(node_id) DO NOTHING`,
         ).bind(
           next,
@@ -139,7 +128,7 @@ export async function setComputePoolPolicy(
         ),
         c.env.DB.prepare(
           `UPDATE node_compute_pool_policies SET revision=?,release_id=?,policy_json=?,updated_at=? WHERE node_id=? AND node_uid=? AND revision=? AND ?>0 AND policy_json IS ?
-          AND NOT EXISTS(SELECT 1 FROM node_postgres_pool_policies x WHERE x.node_id=node_compute_pool_policies.node_id AND json_extract(x.policy_json,'$.target_slots')>0) AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_id AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')) AND (${guard?.sql ?? "1=1"})`,
+          AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_id AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')) AND (${guard?.sql ?? "1=1"})`,
         ).bind(
           next,
           policy.profile.release_id,

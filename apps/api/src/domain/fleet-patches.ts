@@ -186,11 +186,7 @@ const baseFleetPatchAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN regions r 
   AND (SELECT count(*) FROM nodes WHERE region_id=fleet_patch_operations.region_id AND lost_at IS NULL) = json_array_length(fleet_patch_operations.cluster_nodes_json) AND (fleet_patch_operations.host_configuration_revision IS NULL OR EXISTS(SELECT 1 FROM node_host_configurations h WHERE h.node_id=fleet_patch_operations.node_id AND h.node_uid=fleet_patch_operations.node_uid AND h.cluster_uid=fleet_patch_operations.cluster_uid AND h.material_revision=fleet_patch_operations.material_revision AND h.release_id=fleet_patch_operations.release_id AND h.revision=fleet_patch_operations.host_configuration_revision AND h.sha256=fleet_patch_operations.host_configuration_sha256))`;
 const parentAuthoritySql = ` AND (fleet_patch_operations.bootstrap_operation_id IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j JOIN node_additions a ON a.operation_id=j.operation_id JOIN nodes n ON n.id=j.node_id WHERE j.operation_id=fleet_patch_operations.bootstrap_operation_id AND j.node_id=fleet_patch_operations.node_id AND j.region_id=fleet_patch_operations.region_id AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0 AND j.admission_authorized=1 AND a.status='bootstrapping' AND n.provider_instance_id=a.provider_instance_id AND json_extract(j.admission_binding_json,'$.node_uid')=fleet_patch_operations.node_uid AND json_extract(j.admission_binding_json,'$.kube_system_uid')=fleet_patch_operations.cluster_uid AND json_extract(a.checkpoint_json,'$.stage')='joined' AND json_extract(a.checkpoint_json,'$.reference')=fleet_patch_operations.bootstrap_joined_reference AND json_extract(a.network_json,'$.checkpoint_reference')=fleet_patch_operations.bootstrap_joined_reference AND json_extract(a.capacity_json,'$.checkpoint_reference')=fleet_patch_operations.bootstrap_joined_reference AND j.input_hash||':'||json_extract(j.admission_binding_json,'$.checkpoint_revision')=fleet_patch_operations.bootstrap_joined_reference))`;
 export const fleetPatchAuthoritySql =
-  baseFleetPatchAuthoritySql +
-  parentAuthoritySql +
-  ` AND NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id=fleet_patch_operations.region_id
-  AND (EXISTS(SELECT 1 FROM pool_bindings held_binding WHERE held_binding.database_id=held_database.id AND held_binding.state NOT IN('released','refused'))
-    OR EXISTS(SELECT 1 FROM database_runtime_holders held_runtime WHERE held_runtime.database_id=held_database.id AND held_runtime.kind='pool' AND held_runtime.state NOT IN('released','refused'))))`;
+  baseFleetPatchAuthoritySql + parentAuthoritySql;
 const authoritySql = fleetPatchAuthoritySql;
 /** Declarative platform stages: Flux applies idempotent desired state after every OS, host and
  *  Kubernetes-version write has completed. */
@@ -1133,14 +1129,6 @@ async function prepareFleetPatchInsert(
     mutation.scope.id !== selected.region_id
   )
     return closed();
-  if (
-    await env.DB.prepare(
-      "SELECT 1 held FROM databases d WHERE d.region_id=? AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=d.id AND b.state NOT IN('released','refused')) OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=d.id AND h.kind='pool' AND h.state NOT IN('released','refused'))) LIMIT 1",
-    )
-      .bind(selected.region_id)
-      .first()
-  )
-    return closed();
   const guard = mutation.scopeGuard();
   const ref = await loadCurrentRegionMaterialReference(
       env.DB,
@@ -1193,7 +1181,7 @@ async function prepareFleetPatchInsert(
         WHERE n.id IS NULL OR a.node_id IS NULL OR n.region_id<>? OR n.node_uid<>json_extract(j.value,'$.node_uid') OR n.lost_at IS NOT NULL OR a.node_uid<>n.node_uid OR a.release_id<>? OR a.revision<>json_extract(j.value,'$.assignment_revision') OR n.database_placement_closed_at IS NOT json_extract(j.value,'$.previous_placement_closed_at'))
       AND (SELECT count(*) FROM nodes WHERE region_id=? AND lost_at IS NULL)=?
       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j JOIN node_additions a ON a.operation_id=j.operation_id JOIN nodes n ON n.id=j.node_id WHERE j.operation_id=? AND j.node_id=? AND j.region_id=? AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0 AND j.admission_authorized=1 AND a.status='bootstrapping' AND n.provider_instance_id=a.provider_instance_id AND json_extract(j.admission_binding_json,'$.node_uid')=? AND json_extract(j.admission_binding_json,'$.kube_system_uid')=? AND json_extract(a.checkpoint_json,'$.stage')='joined' AND json_extract(a.checkpoint_json,'$.reference')=? AND json_extract(a.network_json,'$.checkpoint_reference')=? AND json_extract(a.capacity_json,'$.checkpoint_reference')=? AND j.input_hash||':'||json_extract(j.admission_binding_json,'$.checkpoint_revision')=?))
-      AND (${guard.sql}) AND NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id=? AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=held_database.id AND b.state NOT IN('released','refused')) OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=held_database.id AND h.kind='pool' AND h.state NOT IN('released','refused'))))`,
+      AND (${guard.sql})`,
   ).bind(
     id,
     nodeId,
@@ -1248,7 +1236,6 @@ async function prepareFleetPatchInsert(
     parent?.joined_reference ?? null,
     parent?.joined_reference ?? null,
     ...guard.bindings,
-    selected.region_id,
   );
   const closePlacements = env.DB.prepare(
     `UPDATE nodes SET database_placement_closed_at=COALESCE(database_placement_closed_at,?),updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.operation_id=? AND p.bootstrap_operation_id IS NULL AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND nodes.database_placement_closed_at IS json_extract(j.value,'$.previous_placement_closed_at')) AND (${guard.sql})`,

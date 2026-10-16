@@ -209,7 +209,7 @@ async function prepareHostConfiguration(
   const statement = env.DB.prepare(
     `INSERT INTO node_host_configurations(node_id,node_uid,region_id,cluster_uid,material_revision,revision,sha256,release_id,pool_policy_revision,profile_sha256,kid,iv,ciphertext,created_at)
  SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN node_compute_pool_policies p ON p.node_id=n.id AND p.node_uid=n.node_uid JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=p.release_id WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND r.bootstrap_material_revision=? AND p.release_id=? AND p.revision=? AND p.policy_json=? AND ?=EXISTS(SELECT 1 FROM node_thin_storage thin WHERE thin.node_id=n.id AND thin.node_uid=n.node_uid) AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))
- AND (${guard?.sql ?? "1=1"}) AND NOT EXISTS(SELECT 1 FROM databases held_database WHERE held_database.region_id=? AND (EXISTS(SELECT 1 FROM pool_bindings b WHERE b.database_id=held_database.id AND b.state NOT IN('released','refused')) OR EXISTS(SELECT 1 FROM database_runtime_holders h WHERE h.database_id=held_database.id AND h.kind='pool' AND h.state NOT IN('released','refused'))))
+ AND (${guard?.sql ?? "1=1"})
  ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,region_id=excluded.region_id,cluster_uid=excluded.cluster_uid,material_revision=excluded.material_revision,revision=excluded.revision,sha256=excluded.sha256,release_id=excluded.release_id,pool_policy_revision=excluded.pool_policy_revision,profile_sha256=excluded.profile_sha256,kid=excluded.kid,iv=excluded.iv,ciphertext=excluded.ciphertext,created_at=excluded.created_at WHERE node_host_configurations.revision=?`,
   ).bind(
     status.node_id,
@@ -234,7 +234,6 @@ async function prepareHostConfiguration(
     source.policy_json,
     source.thin_selected,
     ...(guard?.bindings ?? []),
-    source.region_id,
     previous?.revision ?? 0,
   );
   return { status, statement };

@@ -22,7 +22,6 @@ import {
 } from "./startup-admission.ts";
 
 import { storageProtectionCurrentSql } from "./storage-capacity.ts";
-import { postgresPoolCnpgSelectionStatements } from "./postgres-pool-cold-start.ts";
 import {
   withAdmissionMutation,
   type AdmissionSqlGuard,
@@ -116,16 +115,6 @@ export function powerTransitionStatements(
         generation: row.generation + 1,
         nodeId: row.node_id,
         now,
-      }),
-    );
-  if (!sleeping)
-    statements.push(
-      ...postgresPoolCnpgSelectionStatements(db, {
-        databaseId: row.id,
-        generation: row.generation + 1,
-        operationId: operation,
-        now: Date.parse(now),
-        guard: admission,
       }),
     );
   return statements;

@@ -17,19 +17,6 @@ const identifier = (value: string) => {
   return value;
 };
 const field = (name: string) => `json_extract(t.profile_json,'$.${name}')`;
-/** Immutable cleanup budgets remain charged after expiry and uncertainty until physical release. */
-export function poolCleanupExposureSql(alias = "cleanup") {
-  const grant = identifier(alias);
-  return `${grant}.allocation_reserve_bytes`;
-}
-export function poolCleanupReceiptSql(alias = "cleanup") {
-  const grant = identifier(alias),
-    storage = `${grant}.claims_json`;
-  return `json_object('storage_generation',json_extract(${storage},'$.storage.storage_generation'),'storage_uid',json_extract(${storage},'$.storage.storage_uid'),
-    'namespace_uid',json_extract(${storage},'$.storage.namespace_uid'),'cluster_uid',json_extract(${storage},'$.storage.cnpg_cluster_uid'),'node_uid',json_extract(${storage},'$.node_uid'),
-    'volume_group_uuid',json_extract(${storage},'$.storage.volume_group_uuid'),'pool_uuid',json_extract(${storage},'$.storage.profile.pool_uuid'),
-    'volume_handle',json_extract(${storage},'$.storage.volume_handle'),'lv_uuid',json_extract(${storage},'$.storage.lv_uuid'),'pvc_uid',json_extract(${storage},'$.storage.pvc_uid'),'pv_uid',json_extract(${storage},'$.storage.pv_uid'))`;
-}
 /** When the identity proof behind an authority started its read, and until when it may be used.
  * Facts that need a read after an event use these; a fast renewal only moves observed_at. An
  * authority recorded before composition carries neither and was itself one complete read. */
@@ -391,11 +378,6 @@ export function nodeThinStorageHeadroomSql(
       FROM physical p JOIN database_start_admissions a ON a.node_id=p.node_id AND a.node_uid=p.node_uid JOIN databases held_db ON held_db.id=a.database_id
       WHERE a.storage_budget_bytes>0
       UNION ALL SELECT storage_budget_bytes,volume_key FROM retained
-      UNION ALL
-      SELECT cleanup_hold.storage_budget_bytes,CASE WHEN ${knownHoldBindingSql("cleanup_hold", "held_db", "p")} THEN ${volumeKeySql("held_db")} ELSE 'op:'||cleanup_hold.operation_id END
-      FROM physical p JOIN (SELECT cleanup.operation_id,b.database_id,b.node_id,b.node_uid,${poolCleanupExposureSql()} storage_budget_bytes,${poolCleanupReceiptSql()} storage_volume_json
-        FROM pool_cleanup_grants cleanup JOIN pool_bindings b ON b.id=cleanup.binding_id WHERE cleanup.state<>'completed') cleanup_hold ON cleanup_hold.node_id=p.node_id AND cleanup_hold.node_uid=p.node_uid
-      JOIN databases held_db ON held_db.id=cleanup_hold.database_id
     ), held_volumes AS (
       SELECT volume_key,MAX(storage_budget_bytes) bytes,SUM(CASE WHEN substr(volume_key,1,3)='op:' THEN 1 ELSE 0 END) new_volumes FROM held_rows GROUP BY volume_key
     ), held AS (

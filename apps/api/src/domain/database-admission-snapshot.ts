@@ -7,7 +7,6 @@ import {
 } from "@pgcf/contracts";
 import {
   DatabaseRuntimeAttestationV2,
-  DatabasePoolRuntimeAttestationV2,
   reclaimConfigurationFingerprint,
 } from "@pgcf/contracts/reclaim";
 import type { Env } from "../env.ts";
@@ -16,10 +15,6 @@ import { admissionSnapshotSql } from "./fleet-releases.ts";
 import { DatabasePresence } from "../database-actor.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { notifyAdmissionRevisions } from "./admission-mutations.ts";
-import {
-  hasNonterminalPoolHolderSql,
-  readPostgresPoolAdmissionBinding,
-} from "./postgres-pool.ts";
 
 interface SnapshotRow extends DatabaseRow {
   epoch_database_id: string | null;
@@ -33,7 +28,6 @@ interface SnapshotRow extends DatabaseRow {
   admission_revision: number;
   route_revision: number;
   mutation_id: string | null;
-  pool_holder: number;
   completed_mutation_id: string | null;
   cache_capable: number;
   roles_json: string;
@@ -60,7 +54,6 @@ export async function readDatabaseAdmissionSnapshot(
     ae.database_id epoch_database_id,CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END presence_updated_at,
     ae.admission_revision,ae.route_revision,ae.mutation_id,ae.completed_mutation_id,
     CASE WHEN ${admissionSnapshotSql("r")} THEN 1 ELSE 0 END cache_capable,
-    CASE WHEN ${hasNonterminalPoolHolderSql("d")} THEN 1 ELSE 0 END pool_holder,
     s.memory_mib,CASE WHEN policy.placement_mode='actual_ram' AND d.desired_state='running' THEN policy.postgres_memory_request_mib ELSE NULL END memory_request_mib,
     s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json,
@@ -102,10 +95,7 @@ export async function readDatabaseAdmissionSnapshot(
     const raw = row.runtime_attestation_json
       ? JSON.parse(row.runtime_attestation_json)
       : null;
-    const parsed =
-      raw?.kind === "pool"
-        ? DatabasePoolRuntimeAttestationV2.safeParse(raw)
-        : DatabaseRuntimeAttestationV2.safeParse(raw);
+    const parsed = DatabaseRuntimeAttestationV2.safeParse(raw);
     if (parsed.success) runtime = parsed.data;
   } catch {
     /* A malformed/stale proof closes admission; it cannot repair desired state. */
@@ -172,14 +162,6 @@ export async function readDatabaseAdmissionSnapshot(
     )
       runtime = null;
   } else runtime = null;
-  const poolProof = DatabasePoolRuntimeAttestationV2.safeParse(runtime),
-    pool = poolProof.success;
-  if (
-    poolProof.success &&
-    !(await readPostgresPoolAdmissionBinding(env, id, poolProof.data, now))
-  )
-    runtime = null;
-  if (!pool && row.pool_holder === 1) runtime = null;
   if (runtime && (row.storage_profile_json || row.storage_volume_json)) {
     try {
       const volume = DatabaseStorageVolumeReceipt.parse(
@@ -211,7 +193,6 @@ export async function readDatabaseAdmissionSnapshot(
     row.observed_generation === row.generation &&
     (row.storage_protected_at == null ||
       (row.storage_protected_generation ?? 0) < row.generation) &&
-    (row.pool_holder === 0 || (pool && runtime !== null)) &&
     (row.cache_capable === 0 || runtime !== null);
   return {
     presence: DatabasePresence.parse({

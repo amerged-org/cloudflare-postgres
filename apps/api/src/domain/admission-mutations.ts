@@ -4,10 +4,6 @@ import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import type { AdmissionMutationIntent } from "./admission-state.ts";
 import { readDatabasePresence } from "./database-actor-sync.ts";
-import { DatabasePoolRuntimeAttestationV2 } from "@pgcf/contracts/reclaim";
-
-// Only the verified proof-specific entry point below can preserve an existing holder.
-const certificateRefreshes = new WeakSet<AdmissionMutation>();
 
 export interface AdmissionSqlGuard {
   sql: string;
@@ -111,13 +107,6 @@ export class AdmissionMutation {
     )
       throw new Error("database_admission_mutation_already_submitted");
     for (const mutation of mutations) mutation.submitted = true;
-    const { postgresPoolMutationStatements } =
-      await import("./postgres-pool.ts");
-    const prefix = mutations.flatMap((mutation) =>
-      certificateRefreshes.has(mutation)
-        ? []
-        : postgresPoolMutationStatements(env, mutation),
-    );
     const commit: D1PreparedStatement[] = [];
     for (const mutation of mutations) {
       const scopeGuard = mutation.scope ? mutation.scopeGuard() : undefined;
@@ -143,14 +132,14 @@ export class AdmissionMutation {
         );
       }
     }
-    const result = await env.DB.batch([...prefix, ...statements, ...commit]);
-    const receipts = result.slice(prefix.length + statements.length);
+    const result = await env.DB.batch([...statements, ...commit]);
+    const receipts = result.slice(statements.length);
     if (
       receipts.length !== commit.length ||
       receipts.some((receipt) => receipt.meta.changes !== 1)
     )
       throw conflict();
-    return result.slice(prefix.length, prefix.length + statements.length);
+    return result.slice(0, statements.length);
   }
 }
 /** Close only the explicitly declared scopes, in a stable order, before one atomic business batch. */
@@ -192,90 +181,6 @@ export async function withAdmissionMutationScopes<T>(
     });
   };
   return next(0);
-}
-
-/** A CA refresh never supplies a generic skip: every physical/configuration field and the
- * current serving ownership must be positively identical under continuous fresh proofs. */
-export async function withPoolCertificateRefresh<T>(
-  env: Env,
-  id: string,
-  previous: unknown,
-  current: unknown,
-  execute: (mutation: AdmissionMutation) => Promise<T>,
-) {
-  const before = DatabasePoolRuntimeAttestationV2.safeParse(previous),
-    after = DatabasePoolRuntimeAttestationV2.safeParse(current),
-    now = Date.now();
-  let preserve = false;
-  if (before.success && after.success) {
-    const stable = (proof: DatabasePoolRuntimeAttestationV2) => {
-      const {
-        ca_secret_resource_version,
-        ca_sha256,
-        pool_namespace_resource_version,
-        observed_at,
-        observation,
-        ...identity
-      } = proof;
-      void ca_secret_resource_version;
-      void ca_sha256;
-      void pool_namespace_resource_version;
-      void observed_at;
-      return JSON.stringify({
-        ...identity,
-        applied_role_revisions: [...identity.applied_role_revisions].sort(
-          (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
-        ),
-        observation: {
-          v: observation.v,
-          controller_epoch: observation.controller_epoch,
-          watch_epoch: observation.watch_epoch,
-          coverage: observation.coverage,
-        },
-      });
-    };
-    if (
-      before.data.database_id === id &&
-      after.data.database_id === id &&
-      stable(before.data) === stable(after.data) &&
-      before.data.observation.expires_at > now &&
-      after.data.observation.expires_at > now &&
-      after.data.observed_at >= before.data.observed_at &&
-      after.data.observed_at <= now + 1000 &&
-      (before.data.ca_secret_resource_version !==
-        after.data.ca_secret_resource_version ||
-        before.data.ca_sha256 !== after.data.ca_sha256)
-    ) {
-      const { readPostgresPoolAdmissionBinding } =
-        await import("./postgres-pool.ts");
-      const binding = await readPostgresPoolAdmissionBinding(
-        env,
-        id,
-        before.data,
-        now,
-      );
-      const row = await env.DB.prepare(
-        "SELECT runtime_attestation_json FROM databases WHERE id=?",
-      )
-        .bind(id)
-        .first<string | null>("runtime_attestation_json");
-      let retained: unknown = null;
-      try {
-        retained = row ? JSON.parse(row) : null;
-      } catch {
-        /* Unknown retained proof never preserves a holder. */
-      }
-      const parsed = DatabasePoolRuntimeAttestationV2.safeParse(retained);
-      preserve =
-        binding !== null &&
-        parsed.success &&
-        JSON.stringify(parsed.data) === JSON.stringify(before.data);
-    }
-  }
-  return withAdmissionMutation(env, [id], async (mutation) => {
-    if (preserve) certificateRefreshes.add(mutation);
-    return execute(mutation);
-  });
 }
 
 /** Trusted callers close Actors before a guarded authoritative write; no callback is retried. */

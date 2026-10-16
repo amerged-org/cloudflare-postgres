@@ -194,18 +194,17 @@ export async function databaseForRequest(
   await assertProjectAccess(c, row.project_id);
   return row;
 }
-/** Every operation an integrator can read: the table of the lifecycle and those of role changes. */
+/** Every operation an integrator can read: the table of the lifecycle and that of role removals. */
 const OPERATION_COLUMNS =
   "id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at";
 const OPERATIONS_OF_ALL_KINDS = `(SELECT ${OPERATION_COLUMNS} FROM operations
-      UNION ALL SELECT ${OPERATION_COLUMNS} FROM pool_role_mutations
       UNION ALL SELECT ${OPERATION_COLUMNS} FROM role_deletions)`;
 export async function operationForRequest(
   c: ApiContext,
   id: string,
 ): Promise<OperationRow> {
   await getAuth(c);
-  let row = await c.env.DB.prepare(
+  const row = await c.env.DB.prepare(
     `SELECT o.* FROM ${OPERATIONS_OF_ALL_KINDS} o
       JOIN projects p ON p.id=o.project_id AND p.deleted_at IS NULL JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id WHERE o.id=?`,
   )
@@ -213,21 +212,6 @@ export async function operationForRequest(
     .first<OperationRow>();
   if (!row) throw new ApiError("not_found", "Operation not found");
   await assertProjectAccess(c, row.project_id);
-  if (
-    (row.kind === "database.role.create" ||
-      row.kind === "database.role.reset_password") &&
-    row.status === "running"
-  ) {
-    await (
-      await import("./roles.ts")
-    ).refreshDeferredPoolRoleOperations(c.env, row.database_id);
-    row =
-      (await c.env.DB.prepare(
-        "SELECT id,kind,status,project_id,database_id,generation,error_code,error_message,created_at,updated_at,completed_at FROM pool_role_mutations WHERE id=? AND project_id=?",
-      )
-        .bind(id, row.project_id)
-        .first<OperationRow>()) ?? row;
-  }
   return row;
 }
 /** One page of the operations of a database, newest first, with the extra row that marks a next page. */
@@ -239,36 +223,19 @@ export async function operationsForDatabase(
   // A deleted database keeps its operations readable.
   const database = await databaseForRequest(c, databaseId, true);
   const cursor = pagination.where("o.created_at", "o.id");
-  const read = async () =>
-    (
-      await c.env.DB.prepare(
-        `SELECT o.* FROM ${OPERATIONS_OF_ALL_KINDS} o WHERE o.database_id=? AND o.project_id=? AND ${cursor.sql}
+  return (
+    await c.env.DB.prepare(
+      `SELECT o.* FROM ${OPERATIONS_OF_ALL_KINDS} o WHERE o.database_id=? AND o.project_id=? AND ${cursor.sql}
         ORDER BY o.created_at DESC,o.id DESC LIMIT ?`,
-      )
-        .bind(
-          database.id,
-          database.project_id,
-          ...cursor.bindings,
-          pagination.limit + 1,
-        )
-        .all<OperationRow>()
-    ).results;
-  let rows = await read();
-  // A deferred role change completes with the operation it waits on, as a single read settles it.
-  if (
-    rows.some(
-      (row) =>
-        (row.kind === "database.role.create" ||
-          row.kind === "database.role.reset_password") &&
-        row.status === "running",
     )
-  ) {
-    await (
-      await import("./roles.ts")
-    ).refreshDeferredPoolRoleOperations(c.env, database.id);
-    rows = await read();
-  }
-  return rows;
+      .bind(
+        database.id,
+        database.project_id,
+        ...cursor.bindings,
+        pagination.limit + 1,
+      )
+      .all<OperationRow>()
+  ).results;
 }
 export function isConstraintError(error: unknown): boolean {
   return (
