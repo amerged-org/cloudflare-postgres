@@ -365,7 +365,9 @@ mod tests {
             cgroup_root: "/sys/fs/cgroup/pgcf-compute".into(),
             storage_authority: None,
         };
-        assert!(Client::new(local).is_ok());
+        let client = Client::new(local).unwrap();
+        // The guard's intake builds its own connections from the same sealed identity, reading no file.
         std::fs::remove_file(path).unwrap();
+        assert!(client.isolated().is_ok());
     }
 }
