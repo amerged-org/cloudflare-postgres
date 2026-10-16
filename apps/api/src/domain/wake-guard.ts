@@ -64,15 +64,17 @@ const WAKE_GUARD_SQL = `SELECT d.generation,d.desired_state,d.suspension_reason,
   (ds.memory_mib+${SIDECAR.limitMemoryMib}+${computePoolOverheadSql("dn", "memory_mib")})*${mib}
     +COALESCE((SELECT SUM(a.budget_bytes) FROM database_start_admissions a WHERE a.node_id=dn.id AND a.node_uid=dn.node_uid),0) memory_required_bytes,
   d.storage_profile_json IS NOT NULL thin,ts.status thin_status,ts.error_code thin_error,
-  ${onNode(databaseStorageStartupSql("d"))} storage,
+  ${onNode(databaseStorageStartupSql("d", "n", "s", "parked_sleep"))} storage,
   ${age(authority("observed_at"))} authority_age_ms,${age("ts.authority_received_at")} authority_received_age_ms,
   ${remaining(authority("expires_at"))} authority_expires_in_ms,
   ${age(inventoryObserved)} inventory_age_ms,${remaining(inventoryExpires)} inventory_expires_in_ms,
   COALESCE(${authority("write_allowed")}=1 AND ${authority("data_accounting_complete")}=1 AND ts.status='ready',0) authority_write_allowed,
   COALESCE(${qualifiedThinStorageSql("ts")},0) qualified,
   (SELECT MAX(${age("o.observed_at")},${age("o.received_at")}) FROM fleet_node_release_observations o WHERE o.node_id=dn.id AND o.node_uid=dn.node_uid) qualification_age_ms,
-  COALESCE((${boundStorageVolumeSql("d", "ts", false)}),0) volume_bound,
-  COALESCE((${boundStorageVolumeSql("d", "ts", true)}),0) volume_current,
+  d.parked_json IS NOT NULL parked,
+  (SELECT json_extract(volume.value,'$.generation') FROM json_each(ts.authority_json,'$.volumes') volume WHERE json_extract(volume.value,'$.database_id')=d.id) volume_generation,
+  COALESCE((${boundStorageVolumeSql("d", "ts", "any")}),0) volume_bound,
+  COALESCE((${boundStorageVolumeSql("d", "ts", "parked_sleep")}),0) volume_current,
   d.storage_protected_at IS NOT NULL protected,
   (d.storage_protected_at IS NULL OR ${storageProtectionCurrentSql("d")}) protection,
   EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=d.id AND e.mutation_id IS NOT NULL) admission_pending
@@ -118,9 +120,14 @@ export interface WakeGuardReading {
   authority_write_allowed: boolean;
   qualified: boolean;
   qualification_age_ms: number | null;
+  /** The controller reported a Pod parked for the database's idle sleep. */
+  parked: boolean;
+  /** The generation the accepted identity proof lists this database's volume at. */
+  volume_generation: number | null;
   /** The accepted identity proof lists this database's volume, at any generation. */
   volume_bound: boolean;
-  /** ... and at the database's current generation. */
+  /** ... and at the generation a wake reads it at: the database's current one or, for a parked
+   * sleeper, the one its Pod was started for. */
   volume_current: boolean;
   protected: boolean;
   /** A protective stop is none, or still proved by the current report. */
@@ -139,6 +146,7 @@ const FLAGS = [
   "cpu",
   "memory",
   "thin",
+  "parked",
   "storage",
   "authority_write_allowed",
   "qualified",

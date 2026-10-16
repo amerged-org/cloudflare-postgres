@@ -2,6 +2,7 @@
 import type { Env } from "../env.ts";
 import type { AdmissionSqlGuard } from "./admission-mutations.ts";
 import { qualifiedThinStorageSql } from "./node-thin-storage.ts";
+import { PARKED_FRESH_MS } from "./parked-tier.ts";
 import {
   NodeThinStorageAuthority as AuthoritySchema,
   DatabaseStorageVolumeReceipt,
@@ -29,13 +30,81 @@ function inventoryExpiresSql(authorityAlias = "t") {
   return `COALESCE(json_extract(${authority}.authority_json,'$.inventory_expires_at'),json_extract(${authority}.authority_json,'$.expires_at'))`;
 }
 
+/**
+ * A conjunction as a balanced tree. SQLite parses a plain AND chain left-deep, a tree as deep as the
+ * chain is long, and D1 refuses one deeper than 100: the wake transition embeds this predicate and is
+ * within a few levels of it.
+ */
+function allOf(...terms: string[]): string {
+  if (terms.length === 1) return terms[0]!;
+  const half = Math.ceil(terms.length / 2);
+  return `(${allOf(...terms.slice(0, half))} AND ${allOf(...terms.slice(half))})`;
+}
+
+/**
+ * Whether the identity proof's entry of a database may be the one of the generation before its
+ * sleep, when the database sleeps parked, instead of the current one.
+ *
+ * A start that follows a sleep reads the proof's entry of its database. The entry is stamped with
+ * the generation the executor's lease carried and the acceptance saw unchanged, so equality with the
+ * row's generation says the proof was prepared after the latest intent. An idle sleep is such an
+ * intent and changes nothing on the volume: the parked Pod keeps it mounted. The last proof, taken
+ * while the Pod ran, then names the generation before the sleep until the next proof (the turn is
+ * 19 to 29 s long and runs every 60 s) is accepted, and a wake in between would wait for a proof that
+ * cannot show anything new. That entry stands in for the current one only while all of this holds:
+ *
+ * - the controller confirmed the idle sleep as stopped (`stoppedSleeperSql`'s columns and its
+ *   succeeded operation, which is of this generation) and reported a parked Pod, within the bound
+ *   the host guard trusts it;
+ * - the sleep directly followed a start: the operation of the generation before is a creation,
+ *   restore, wake, resume or resize, and the entry is that generation, so the proof read the volume
+ *   after the Pod was started and nothing, no role either, came between;
+ * - the entry shows exactly the Pod the controller reports parked, not frozen: the Pod mounts the
+ *   volume now as it did then, and a Pod keeps its volume.
+ *
+ * Every fact of the volume binding is still compared by `boundStorageVolumeSql`. Written with row
+ * values and one balanced tree: the wake transition embeds this and D1 refuses a tree deeper than 100.
+ */
+function parkedSleepEntrySql(databaseAlias: string): string {
+  const d = identifier(databaseAlias),
+    entry = "json_extract(volume.value,'$.generation')",
+    parked = `${d}.parked_json`;
+  return allOf(
+    `(${d}.desired_state,${d}.suspension_reason,${d}.observed_state,${d}.observed_power,${d}.observed_generation)=('suspended','idle','provisioning','hibernated',${d}.generation)`,
+    `json_extract(${parked},'$.v')=1`,
+    `julianday(json_extract(${parked},'$.observed_at')) BETWEEN julianday('now','-${PARKED_FRESH_MS / 1000} seconds') AND julianday('now','+5 seconds')`,
+    `${entry}=${d}.generation-1`,
+    `EXISTS(SELECT 1 FROM operations slept WHERE (slept.id,slept.database_id,slept.project_id,slept.generation,slept.kind,slept.status)=(${d}.power_operation,${d}.id,${d}.project_id,${d}.generation,'database.hibernate','succeeded'))`,
+    `EXISTS(SELECT 1 FROM operations started WHERE ${allOf(
+      `(started.database_id,started.generation)=(${d}.id,${entry})`,
+      "started.kind IN('database.create','database.restore','database.wake','database.resume','database.resize')",
+    )})`,
+    `(json_array_length(volume.value,'$.io'),json_extract(volume.value,'$.io[0].pod_uid'))=(1,json_extract(${parked},'$.pod_uid'))`,
+    `COALESCE(json_extract(volume.value,'$.quiesced'),0)<>1`,
+  );
+}
+
+/** The generation of the proof's entry a start reads: the database's current one (`current`), or
+ * that or, for a wake of a parked sleeper, the one before its sleep (`parked_sleep`, see
+ * `parkedSleepEntrySql`). */
+export type StartReading = "current" | "parked_sleep";
+
+/** The database's volume, as the accepted identity proof lists it: `any` whenever the proof read it,
+ * else at the generation a start reads. */
 export function boundStorageVolumeSql(
   databaseAlias: string,
   authorityAlias: string,
-  requireGeneration = true,
+  reading: "any" | StartReading = "current",
 ): string {
   const database = identifier(databaseAlias),
-    authority = identifier(authorityAlias);
+    authority = identifier(authorityAlias),
+    current = `json_extract(volume.value,'$.generation')=${database}.generation`,
+    generation =
+      reading === "any"
+        ? ""
+        : reading === "current"
+          ? `AND ${current}`
+          : `AND (${current} OR ${parkedSleepEntrySql(database)})`;
   return `(${database}.storage_volume_json IS NOT NULL
     AND json_extract(${database}.storage_volume_json,'$.node_uid')=${authority}.node_uid
     AND json_extract(${database}.storage_volume_json,'$.volume_group_uuid')=${authority}.volume_group_uuid
@@ -45,7 +114,6 @@ export function boundStorageVolumeSql(
       WHERE json_extract(leaf.value,'$.lv_uuid')=json_extract(${database}.storage_volume_json,'$.lv_uuid') AND json_extract(leaf.value,'$.segtype')='thin')
     AND EXISTS(SELECT 1 FROM json_each(${authority}.authority_json,'$.volumes') volume
       WHERE (json_extract(volume.value,'$.database_id')=${database}.id
-        ${requireGeneration ? `AND json_extract(volume.value,'$.generation')=${database}.generation` : ""}
         AND json_extract(volume.value,'$.storage_generation')=${database}.storage_generation
         AND json_extract(volume.value,'$.storage_uid')=json_extract(${database}.storage_volume_json,'$.storage_uid'))
         AND (json_extract(volume.value,'$.namespace_uid')=json_extract(${database}.storage_volume_json,'$.namespace_uid')
@@ -53,7 +121,8 @@ export function boundStorageVolumeSql(
         AND json_extract(volume.value,'$.volume_handle')=json_extract(${database}.storage_volume_json,'$.volume_handle'))
         AND (json_extract(volume.value,'$.lv_uuid')=json_extract(${database}.storage_volume_json,'$.lv_uuid')
         AND json_extract(volume.value,'$.pvc_uid')=json_extract(${database}.storage_volume_json,'$.pvc_uid')
-        AND json_extract(volume.value,'$.pv_uid')=json_extract(${database}.storage_volume_json,'$.pv_uid')))`;
+        AND json_extract(volume.value,'$.pv_uid')=json_extract(${database}.storage_volume_json,'$.pv_uid'))
+        ${generation})`;
 }
 
 const receiptFields = [
@@ -146,7 +215,7 @@ function knownHoldBindingSql(
   database: string,
   authority: string,
 ) {
-  return `(${holdReceiptMatchesCurrentSql(hold, database)} AND ${boundStorageVolumeSql(database, authority, false)} AND (json_extract(${database}.storage_profile_json,'$.node_uid')=${authority}.node_uid AND json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=${authority}.volume_group_uuid AND json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(${authority}.authority_json,'$.pool_uuid') AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=${authority}.profile_sha256))`;
+  return `(${holdReceiptMatchesCurrentSql(hold, database)} AND ${boundStorageVolumeSql(database, authority, "any")} AND (json_extract(${database}.storage_profile_json,'$.node_uid')=${authority}.node_uid AND json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=${authority}.volume_group_uuid AND json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(${authority}.authority_json,'$.pool_uuid') AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=${authority}.profile_sha256))`;
 }
 /**
  * The predicate joining `admission` to `database` for the start the database is in the middle of:
@@ -307,6 +376,7 @@ export function nodeThinStorageHeadroomSql(
   nodeAlias = "n",
   sizeAlias = "s",
   databaseAlias?: string,
+  reading: StartReading = "current",
 ): string {
   const node = identifier(nodeAlias),
     size = identifier(sizeAlias),
@@ -326,7 +396,7 @@ export function nodeThinStorageHeadroomSql(
     AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=t.profile_sha256)
     AND ( json_extract(${database}.storage_profile_json,'$.profile_revision')<=t.profile_revision
     AND json_extract(${database}.storage_profile_json,'$.storage_class')='pgcf-lvm-thin-v1-'||substr(t.profile_sha256,1,16)
-    AND ${boundStorageVolumeSql(database, "t")})`;
+    AND ${boundStorageVolumeSql(database, "t", reading)})`;
   return `EXISTS(
     WITH physical AS (
       SELECT t.*,
@@ -431,9 +501,10 @@ export function databaseStorageStartupSql(
   databaseAlias = "databases",
   nodeAlias = "n",
   sizeAlias = "s",
+  reading: StartReading = "current",
 ): string {
   const database = identifier(databaseAlias);
-  return `(${database}.storage_profile_json IS NULL OR ${nodeThinStorageHeadroomSql(nodeAlias, sizeAlias, database)})`;
+  return `(${database}.storage_profile_json IS NULL OR ${nodeThinStorageHeadroomSql(nodeAlias, sizeAlias, database, reading)})`;
 }
 
 /** Metadata only; Native independently proves the retained thick volume before granting an exemption. */

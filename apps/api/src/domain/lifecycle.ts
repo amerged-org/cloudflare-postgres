@@ -46,7 +46,7 @@ export function powerTransitionStatements(
       AND (EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND ((observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle') OR ${sleeping ? storageProtectionCurrentSql() : "0=1"})))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
-      AND ${sleeping ? "1=1" : databaseStartupHeadroomSql()}
+      AND ${sleeping ? "1=1" : databaseStartupHeadroomSql("databases", action === "wake" ? "parked_sleep" : "current")}
       AND ${sleeping ? "1=1" : `(storage_protected_at IS NULL OR ${storageProtectionCurrentSql()})`}
       AND (${admission?.sql ?? "1=1"})`,
       )

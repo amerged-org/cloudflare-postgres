@@ -11,6 +11,7 @@ import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
   DesiredResponse,
+  newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
 import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
@@ -30,6 +31,7 @@ import {
 } from "./parked-tier-fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
+import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
 import { storageHoldVolumeStatements } from "../../src/domain/storage-capacity.ts";
 import {
   prepareThinStorageLease,
@@ -262,6 +264,48 @@ it("carries a parked wake's writer through every lease from the claim to the pro
   // Samples renew the node's authority every couple of seconds while the proof is still the one
   // read while parked: every lease in between names the Pod.
   for (let i = 0; i < 3; i++) await expectWriter(w, generation);
+  // The proof prepared at the wake's generation measures the Pod: exact evidence from then on.
+  await w.evidence({ generation });
+  await expectWriter(w, generation);
+}, 60_000);
+
+/** The Actor's wake claim, or the integrator's resume: the power transition itself, committed or not. */
+async function transition(w: AwakeWriter, action: "wake" | "resume") {
+  const operation = newOperationId();
+  const [update] = await env.DB.batch(
+    powerTransitionStatements(
+      env.DB,
+      await databaseRow(w.id),
+      action,
+      operation,
+      new Date().toISOString(),
+      action === "wake" ? "app" : undefined,
+    ),
+  );
+  return { operation, committed: update!.meta.changes === 1 };
+}
+
+it("claims a parked wake on the proof of the start and carries the parked writer through every lease", async () => {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  // The sleep bumped the generation; the last proof still names the one the Pod was started for.
+  const parked = await parkedWriter(w, "fast", { read: false });
+  // Only the Actor's wake claim reads the proof that way: a resume asks for the sleep's own.
+  expect(await transition(w, "resume")).toMatchObject({ committed: false });
+  const claim = await transition(w, "wake");
+  expect(claim.committed).toBe(true);
+  const generation = parked.generation + 1;
+  expect(await databaseRow(w.id)).toMatchObject({
+    desired_state: "running",
+    generation,
+    power_operation: claim.operation,
+  });
+  // The startup grant and the parked Pod's token travel together in the first lease of the wake,
+  // from the reading of the earlier generation, so the guard retires nothing.
+  const claimed = await expectWriter(w, generation);
+  expect(claimed.startup_operation_id).toBe(claim.operation);
+  expect((await w.ready(generation, claim.operation)).status).toBe(200);
+  const ready = await expectWriter(w, generation);
+  expect(ready.startup_operation_id).toBeNull();
   // The proof prepared at the wake's generation measures the Pod: exact evidence from then on.
   await w.evidence({ generation });
   await expectWriter(w, generation);

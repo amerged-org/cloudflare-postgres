@@ -5,19 +5,19 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi, type MockInstance } from "vitest";
-import { cleanupFixtures } from "./fixtures.ts";
+import { cleanupFixtures, request } from "./fixtures.ts";
 import { readDatabasePresence } from "../../src/domain/database-actor-sync.ts";
 import {
   awakeWriter,
   databaseRow,
   hibernated,
   idleIntent,
-  parkedPod,
   parkedWriter,
   type AwakeWriter,
 } from "./parked-tier-fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
+  readWakeGuard,
   wakeGuardBlocks,
   wakeGuardVerdict,
   type WakeGuardReading,
@@ -43,6 +43,24 @@ async function parked() {
   const intent = await parkedWriter(w);
   await actor(w.id).seed((await readDatabasePresence(env.DB, w.id))!);
   return { w, intent };
+}
+/** A parked sleep that the node's identity proof has not read yet: the last proof is the one taken
+ * while the Pod ran, at the generation it was started for (the sleep bumped the database's). */
+async function parkedBeforeProof() {
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  const intent = await parkedWriter(w, undefined, { read: false });
+  await actor(w.id).seed((await readDatabasePresence(env.DB, w.id))!);
+  return { w, intent };
+}
+/** Connects and waits until the claim is held back by the guard. */
+async function connectHeld(w: AwakeWriter) {
+  const connecting = actor(w.id).ensureAwake(w.id, "app", {
+    deadline: Date.now() + 15_000,
+  });
+  await until(async () => (await waiting(w.id)) === 1, "not_waiting");
+  expect((await databaseRow(w.id)).desired_state).toBe("suspended");
+  expect(await wakeOperations(w.id)).toBe(0);
+  return { connecting };
 }
 /** The accepted thin authority as it stood `ms` ago: no renewal or identity proof since. */
 async function agedAuthority(w: AwakeWriter, ms: number) {
@@ -353,27 +371,273 @@ it("more connects than the cap are refused at once while the others keep waiting
   expect(await wakeOperations(w.id)).toBe(1);
 }, 40_000);
 
-it("a sleep whose identity proof has not read its generation yet is waited for, not refused", async () => {
+it("a hibernated sleeper, whose Pod is gone, still waits for the identity proof of its sleep", async () => {
   const log = vi.spyOn(console, "log");
   const w = await awakeWriter(await thinExecutionFixture(releases));
   // The idle intent moved the generation; the node's last proof still describes the awake one.
   const intent = await idleIntent(w);
-  expect(await (await hibernated(w, intent, parkedPod(w))).json()).toEqual({
-    accepted: 1,
-  });
+  expect(await (await hibernated(w, intent)).json()).toEqual({ accepted: 1 });
   await actor(w.id).seed((await readDatabasePresence(env.DB, w.id))!);
-  const connecting = actor(w.id).ensureAwake(w.id, "app", {
-    deadline: Date.now() + 15_000,
-  });
-  await until(async () => (await waiting(w.id)) === 1, "not_waiting");
+  const { connecting } = await connectHeld(w);
   expect(logged(log, "actor_claim_refused")).toEqual([
     expect.objectContaining({
       verdict: "waits",
       blocked_by: ["thin_identity_behind"],
+      // The event says what the proof read and whether a parked Pod could have stood in for it.
+      parked: false,
+      generation: intent.generation,
+      volume_generation: 1,
       volume_bound: true,
       volume_current: false,
     }),
   ]);
+  await w.evidence({ generation: intent.generation });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+}, 40_000);
+
+it("a wake of a parked sleeper whose identity proof is the one of its start is claimed at once", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parkedBeforeProof();
+  // The Pod, its volume and the proof of both are the ones the sleep left, and the guard says so.
+  const reading = (await readWakeGuard(env.DB, w.id, "app"))!;
+  expect(reading).toMatchObject({
+    storage: true,
+    volume_bound: true,
+    volume_current: true,
+  });
+  expect(wakeGuardVerdict(reading)).toBe("holds");
+  const connecting = actor(w.id).ensureAwake(w.id, "app", {
+    deadline: Date.now() + 15_000,
+  });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  expect(await waiting(w.id)).toBe(0);
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+  expect(await wakeOperations(w.id)).toBe(1);
+  expect(logged(log, "actor_claim_refused")).toEqual([]);
+  expect(logged(log, "actor_claim_waited")).toEqual([]);
+}, 30_000);
+
+it("a parked sleeper whose proof names another volume is refused at once, not waited for", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parkedBeforeProof();
+  await w.evidence({ volume: { pvc_uid: crypto.randomUUID() } });
+  const started = Date.now();
+  expect(
+    await actor(w.id).ensureAwake(w.id, "app", {
+      deadline: Date.now() + 20_000,
+    }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  expect(Date.now() - started).toBeLessThan(8000);
+  expect(await wakeOperations(w.id)).toBe(0);
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      revision: intent.generation + 1,
+      verdict: "refused",
+      blocked_by: ["thin_identity_mismatch"],
+      volume_bound: false,
+      volume_current: false,
+    }),
+  ]);
+}, 30_000);
+
+it("a parked sleeper whose proof of its start names another Pod waits for the next proof", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parkedBeforeProof();
+  await w.evidence({ io: [{ pod_uid: crypto.randomUUID(), ...w.limits }] });
+  const { connecting } = await connectHeld(w);
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      verdict: "waits",
+      blocked_by: ["thin_identity_behind"],
+      parked: true,
+      volume_generation: 1,
+      volume_bound: true,
+      volume_current: false,
+    }),
+  ]);
+  await w.evidence({ generation: intent.generation });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+}, 40_000);
+
+it("a parked sleeper resized after its sleep waits for the proof of the resized generation", async () => {
+  const { w, intent } = await parkedBeforeProof();
+  const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
+  await env.DB.prepare(
+    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
+    SELECT ?,1024,750,storage_gib,80,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
+  )
+    .bind(target, w.f.size)
+    .run();
+  try {
+    expect(
+      (
+        await request(
+          `/v1/databases/${w.id}`,
+          w.f.integrator,
+          "PATCH",
+          { size_class_id: target },
+          crypto.randomUUID(),
+        )
+      ).status,
+    ).toBe(202);
+    // The Pod keeps its old shape, so the proof of the start says nothing of what a wake starts.
+    await actor(w.id).seed((await readDatabasePresence(env.DB, w.id))!);
+    const { connecting } = await connectHeld(w);
+    await w.evidence({ generation: intent.generation + 1 });
+    await until(
+      async () => (await databaseRow(w.id)).desired_state === "running",
+      "wake_not_claimed",
+    );
+    await woken(w, intent.generation + 2);
+    expect(await connecting).toMatchObject({ ok: true });
+  } finally {
+    await env.DB.prepare("UPDATE databases SET size_class_id=? WHERE id=?")
+      .bind(w.f.size, w.id)
+      .run();
+    // The resize and the wake after it recorded their events at the class.
+    await env.DB.prepare("DELETE FROM lifecycle_events WHERE size_class_id=?")
+      .bind(target)
+      .run();
+    await env.DB.prepare("DELETE FROM size_classes WHERE id=?")
+      .bind(target)
+      .run();
+  }
+}, 40_000);
+
+it("the proof of the start stands in only while the controller's word and the proof's evidence hold", async () => {
+  const { w } = await parkedBeforeProof();
+  const reads = async () => {
+    const reading = (await readWakeGuard(env.DB, w.id, "app"))!;
+    expect(reading.volume_bound).toBe(true);
+    return reading.volume_current;
+  };
+  expect(await reads()).toBe(true);
+  // The controller's word is older than the host guard trusts it.
+  const word = (await databaseRow(w.id)).parked_json!;
+  await env.DB.prepare(
+    "UPDATE databases SET parked_json=json_set(parked_json,'$.observed_at',?) WHERE id=?",
+  )
+    .bind(new Date(Date.now() - 181_000).toISOString(), w.id)
+    .run();
+  expect(await reads()).toBe(false);
+  await env.DB.prepare("UPDATE databases SET parked_json=? WHERE id=?")
+    .bind(word, w.id)
+    .run();
+  expect(await reads()).toBe(true);
+  // A record of a shape this API does not know says nothing.
+  await env.DB.prepare(
+    "UPDATE databases SET parked_json=json_set(parked_json,'$.v',2) WHERE id=?",
+  )
+    .bind(w.id)
+    .run();
+  expect(await reads()).toBe(false);
+  await env.DB.prepare("UPDATE databases SET parked_json=? WHERE id=?")
+    .bind(word, w.id)
+    .run();
+  expect(await reads()).toBe(true);
+  // The sleep is not confirmed as a stopped runtime.
+  await env.DB.prepare("UPDATE databases SET observed_power='awake' WHERE id=?")
+    .bind(w.id)
+    .run();
+  expect(await reads()).toBe(false);
+  await env.DB.prepare(
+    "UPDATE databases SET observed_power='hibernated' WHERE id=?",
+  )
+    .bind(w.id)
+    .run();
+  expect(await reads()).toBe(true);
+  // Its operation is not completed.
+  const stop = (await databaseRow(w.id)).power_operation!;
+  const { completed_at } = (await env.DB.prepare(
+    "SELECT completed_at FROM operations WHERE id=?",
+  )
+    .bind(stop)
+    .first<{ completed_at: string }>())!;
+  await env.DB.prepare(
+    "UPDATE operations SET status='running',completed_at=NULL WHERE id=?",
+  )
+    .bind(stop)
+    .run();
+  expect(await reads()).toBe(false);
+  await env.DB.prepare(
+    "UPDATE operations SET status='succeeded',completed_at=? WHERE id=?",
+  )
+    .bind(completed_at, stop)
+    .run();
+  expect(await reads()).toBe(true);
+  // The node found the volume frozen: the guard stopped the Pod, whose limits are no evidence.
+  await w.evidence({ quiesced: true });
+  expect(await reads()).toBe(false);
+  await w.evidence();
+  expect(await reads()).toBe(true);
+}, 30_000);
+
+it("a proof of the start that is older than the freshness windows is still waited for", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parkedBeforeProof();
+  await agedAuthority(w, 200_000);
+  const { connecting } = await connectHeld(w);
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      verdict: "waits",
+      blocked_by: ["thin_authority_stale"],
+    }),
+  ]);
+  // The next proof reads the Pod at the generation it still runs at, and that is enough.
+  await w.evidence();
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+}, 40_000);
+
+it("a role created between the start and the sleep ends the exception: the proof must read the sleep", async () => {
+  const log = vi.spyOn(console, "log");
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  expect(
+    (
+      await request(
+        `/v1/databases/${w.id}/roles`,
+        w.f.integrator,
+        "POST",
+        { name: "reader" },
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(201);
+  expect((await w.ready(2)).status).toBe(200);
+  const intent = await parkedWriter(w, undefined, { read: false });
+  expect(intent.generation).toBe(3);
+  await actor(w.id).seed((await readDatabasePresence(env.DB, w.id))!);
+  // The proof of the start (generation 1) is two generations behind the sleep, not one.
+  const { connecting } = await connectHeld(w);
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      verdict: "waits",
+      blocked_by: ["thin_identity_behind"],
+    }),
+  ]);
+  // The proof of the role (generation 2) is one behind, but nothing was started at generation 2.
+  await w.evidence({ generation: 2 });
+  await sleep(2200);
+  expect((await databaseRow(w.id)).desired_state).toBe("suspended");
+  expect(await waiting(w.id)).toBe(1);
   await w.evidence({ generation: intent.generation });
   await until(
     async () => (await databaseRow(w.id)).desired_state === "running",
@@ -458,6 +722,8 @@ const holding: WakeGuardReading = {
   authority_write_allowed: true,
   qualified: true,
   qualification_age_ms: 30_000,
+  parked: false,
+  volume_generation: 2,
   volume_bound: true,
   volume_current: true,
   protected: false,

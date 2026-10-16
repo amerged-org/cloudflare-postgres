@@ -10,6 +10,7 @@ import {
 import {
   databaseStorageStartupSql,
   coveredStorageHoldSql,
+  type StartReading,
 } from "./storage-capacity.ts";
 const maximumInteger = Number.MAX_SAFE_INTEGER;
 const mib = 1024 * 1024;
@@ -183,12 +184,13 @@ export function startupHeadroomSql(nodeAlias = "n", sizeAlias = "s"): string {
 
 export function databaseStartupHeadroomSql(
   databaseAlias = "databases",
+  reading: StartReading = "current",
 ): string {
   const database = identifier(databaseAlias);
   return `EXISTS(
     SELECT 1 FROM nodes n JOIN size_classes s ON s.id=${database}.size_class_id
     WHERE n.id=${database}.node_id AND n.region_id=${database}.region_id
-      AND ${nodeCpuHeadroomSql("n", "s", database)} AND ${startupHeadroomSql()} AND ${databaseStorageStartupSql(database)})`;
+      AND ${nodeCpuHeadroomSql("n", "s", database)} AND ${startupHeadroomSql()} AND ${databaseStorageStartupSql(database, "n", "s", reading)})`;
 }
 
 /** Append after the admitted database mutation and its operation INSERT in the same D1 batch.

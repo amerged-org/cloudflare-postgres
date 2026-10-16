@@ -62,7 +62,12 @@ export async function awakeWriter(f: Fixture) {
     write_bytes_per_second: f.profile.write_bytes_per_second,
     write_iops_per_second: f.profile.write_iops_per_second,
   };
-  const volume = (generation: number, io: object[], quiesced = false) => ({
+  const volume = (
+    generation: number,
+    io: object[],
+    quiesced = false,
+    changes: object = {},
+  ) => ({
     database_id: created.id,
     generation,
     storage_generation: 1,
@@ -77,6 +82,7 @@ export async function awakeWriter(f: Fixture) {
     volume_attributes_class: thinStorageClass(f.authority.profile_sha256),
     quiesced,
     io,
+    ...changes,
   });
   /** The node proof's reading: the Pod's io.max on the active LV, at the given generation. */
   const evidence = (
@@ -85,6 +91,8 @@ export async function awakeWriter(f: Fixture) {
       io?: object[];
       quiesced?: boolean;
       revision?: number;
+      /** Fields of the volume entry that differ from the receipt's, for a reading of another volume. */
+      volume?: object;
     } = {},
   ) =>
     identityProof(f, {
@@ -107,6 +115,7 @@ export async function awakeWriter(f: Fixture) {
           options.generation ?? created.generation,
           options.io ?? [{ pod_uid: pod, ...limits }],
           options.quiesced,
+          options.volume,
         ),
       ],
     });
@@ -239,11 +248,17 @@ export const parkedPod = (w: AwakeWriter) => ({
 /**
  * An idle sleep that the controller confirmed as parked, through the real observation route. The
  * node's identity proof has read the volume again at the sleep's generation by then, and the
- * parked Pod's io.max is still there: the proof counts every instance Pod as a writer.
+ * parked Pod's io.max is still there: the proof counts every instance Pod as a writer. With
+ * `read: false` the proof has not read again yet: it still names the generation the Pod ran at.
  */
-export async function parkedWriter(w: AwakeWriter, wake?: "fast") {
+export async function parkedWriter(
+  w: AwakeWriter,
+  wake?: "fast",
+  options: { read?: boolean } = {},
+) {
   const intent = await idleIntent(w);
-  await w.evidence({ generation: intent.generation });
+  if (options.read !== false)
+    await w.evidence({ generation: intent.generation });
   const response = await hibernated(w, intent, {
     ...parkedPod(w),
     ...(wake === undefined ? {} : { wake }),
