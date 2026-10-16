@@ -43,8 +43,6 @@ pub struct Settings {
     pub slots: usize,
     pub slot_lifetime_ms: u64,
     #[serde(default)]
-    pub postgres_pool: bool,
-    #[serde(default)]
     pub cloudflare: Option<crate::policy::Cloudflare>,
     #[serde(skip)]
     pub budget: Option<crate::cgroup::Budget>,
@@ -863,7 +861,6 @@ mod tests {
             namespace: "k8s.io".into(),
             slots: 0,
             slot_lifetime_ms: 1,
-            postgres_pool: false,
             cloudflare: None,
             budget: None,
             runtime_profile: None,

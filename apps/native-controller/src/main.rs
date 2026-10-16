@@ -78,12 +78,6 @@ fn fingerprint(db: &Value, snapshot: &DesiredSnapshot) -> Result<Vec<u8>, Error>
     db.as_object_mut()
         .ok_or("desired item invalid")?
         .remove("storage_authority");
-    if let Some(binding) = db["pool_binding"].as_object_mut() {
-        binding.remove("storage_authority");
-        if let Some(holder) = binding.get_mut("binding").and_then(Value::as_object_mut) {
-            holder.remove("updated_at");
-        }
-    }
     // The same CF startup hold may be renewed while a bounded reconcile is running.
     // Its scope remains in the fingerprint; a shortened/invalid expiry is fenced below.
     if let Some(startup) = db["storage_startup"].as_object_mut() {
@@ -145,11 +139,7 @@ fn apply_snapshot(
                 cell.stalled = 0;
                 cell.due = due;
                 cell.hints = cell.hints.wrapping_add(1);
-            } else if cell.ready
-                && (db["storage_authority"] != cell.db["storage_authority"]
-                    || db["pool_binding"]["storage_authority"]
-                        != cell.db["pool_binding"]["storage_authority"])
-            {
+            } else if cell.ready && db["storage_authority"] != cell.db["storage_authority"] {
                 cell.renew = true;
                 cell.due = due;
                 cell.hints = cell.hints.wrapping_add(1);
@@ -294,48 +284,17 @@ impl Renewals {
     }
     /// The newest write token of the database's current generation on its node.
     fn token<'a>(&'a self, db: &'a Value) -> Option<&'a str> {
-        let matches = |token: &str| {
-            storage_claims(token).is_some_and(|claims| {
-                if db.get("pool_binding").is_some() {
-                    let scope = &db["pool_binding"]["binding"]["scope"];
-                    let storage = &scope["storage"];
-                    let profile = &storage["profile"];
-                    claims["database_id"] == db["id"]
-                        && claims["generation"] == scope["generation"]
-                        && claims["node_uid"] == scope["node_uid"]
-                        && claims["pod_uid"] == scope["pool_pod_uid"]
-                        && [
-                            "storage_uid",
-                            "volume_group_uuid",
-                            "volume_handle",
-                            "lv_uuid",
-                            "pvc_uid",
-                            "pv_uid",
-                        ]
-                        .iter()
-                        .all(|field| claims[*field] == storage[*field])
-                        && ["pool_uuid", "profile_sha256"]
-                            .iter()
-                            .all(|field| claims[*field] == profile[*field])
-                } else {
-                    claims["generation"] == db["generation"]
-                        && claims["node_uid"] == db["storage"]["node_uid"]
-                }
-            })
-        };
         let delivered = self
             .tokens
             .get(text(db, "id"))
             .map(String::as_str)
-            .filter(|token| matches(token));
-        let held = if db.get("pool_binding").is_some() {
-            db["pool_binding"]["storage_authority"]
-                .as_str()
-                .filter(|token| matches(token))
-        } else {
-            db["storage_authority"].as_str()
-        };
-        newer_token(held, delivered)
+            .filter(|token| {
+                storage_claims(token).is_some_and(|claims| {
+                    claims["generation"] == db["generation"]
+                        && claims["node_uid"] == db["storage"]["node_uid"]
+                })
+            });
+        newer_token(db["storage_authority"].as_str(), delivered)
     }
     /// The database and snapshot a job runs on: the newest token and node authority.
     fn effective(
@@ -346,9 +305,6 @@ impl Renewals {
         let mut view = db.clone();
         if let Some(token) = self.token(db) {
             view["storage_authority"] = token.into();
-            if view.get("pool_binding").is_some() {
-                view["pool_binding"]["storage_authority"] = token.into();
-            }
         }
         let authority = self.authority(db, snapshot);
         if authority == Self::snapshot_listed(db, snapshot) {
@@ -570,26 +526,6 @@ fn not_ready_delay(stalled: u32) -> Duration {
 /// A Kubernetes change of the database's objects makes it due at once. A Pod change of a
 /// ready database may replace its attested primary within the revision; v3 routes to it are
 /// refused until the next ready result re-attests it, so that check is urgent.
-fn kube_hint_ids(cells: &HashMap<String, Cell>, hint: &str) -> Vec<String> {
-    let scoped = [
-        ("pool-pod:", "pool_pod_uid"),
-        ("pool-namespace:", "pool_namespace_uid"),
-        ("pool-node:", "node_uid"),
-    ]
-    .into_iter()
-    .find_map(|(prefix, field)| hint.strip_prefix(prefix).map(|uid| (uid, field)));
-    if let Some((uid, field)) = scoped {
-        if !pgcf_native_protocol::valid_pattern("uuid", uid) {
-            return Vec::new();
-        }
-        return cells
-            .iter()
-            .filter(|(_, cell)| cell.db["pool_binding"]["binding"]["scope"][field] == uid)
-            .map(|(id, _)| id.clone())
-            .collect();
-    }
-    vec![hint.to_owned()]
-}
 fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
     cell.due = now;
     cell.hints = cell.hints.wrapping_add(1);
@@ -951,11 +887,13 @@ async fn run() -> Result<(), Error> {
     let cluster = std::env::var("PGCF_CLUSTER_UID")?;
     let image = std::env::var("PGCF_POSTGRES_IMAGE")?;
     let replicas: usize = std::env::var("PGCF_GATEWAY_REPLICAS")?.parse()?;
-    let pool_runtime = pgcf_native_controller::pool::Runtime::from_env(api.clone())?;
-    let controller = Arc::new(
-        Reconciler::new(kube.clone(), cluster, image, api.region.clone(), replicas)?
-            .with_pool(pool_runtime),
-    );
+    let controller = Arc::new(Reconciler::new(
+        kube.clone(),
+        cluster,
+        image,
+        api.region.clone(),
+        replicas,
+    )?);
     let measurements = Arc::new(Measurements::new(
         kube.clone(),
         api.clone(),
@@ -996,11 +934,6 @@ async fn run() -> Result<(), Error> {
     let mut have_full_snapshot = false;
     let mut latest_snapshot: Option<(Instant, Arc<DesiredSnapshot>)> = None;
     let mut inventories: JoinSet<Result<(), Error>> = JoinSet::new();
-    let mut pool_refills: JoinSet<Result<(), Error>> = JoinSet::new();
-    let mut pool_leases: JoinSet<Result<(), Error>> = JoinSet::new();
-    let mut pool_refill_pending = false;
-    let mut pool_lease_interval = tokio::time::interval(Duration::from_secs(5));
-    let mut pool_preparation_interval = tokio::time::interval(Duration::from_secs(20));
     let mut metering: JoinSet<Result<(), Error>> = JoinSet::new();
     let mut storage: HashMap<String, Value> = HashMap::new();
     let mut storage_sampling: JoinSet<Result<HashMap<String, Value>, Error>> = JoinSet::new();
@@ -1016,22 +949,6 @@ async fn run() -> Result<(), Error> {
     loop {
         tokio::select! {
             _ = shutdown() => break,
-            _ = pool_preparation_interval.tick() => { pool_refill_pending=true; },
-            _ = pool_lease_interval.tick() => {
-                if pool_leases.is_empty() {
-                    let controller=controller.clone();
-                    let databases:Vec<_>=cells.values().filter(|cell|cell.db.get("pool_binding").is_some()).map(|cell|cell.db.clone()).collect();
-                    if !databases.is_empty() {pool_leases.spawn_local(async move {
-                        tokio::time::timeout(Duration::from_secs(10),controller.pool_primary_leases(&databases)).await.map_err(|_|"pool Lease cycle deadline exceeded")?
-                    });}
-                }
-            },
-            result=pool_leases.join_next(), if !pool_leases.is_empty() => {
-                if !matches!(result,Some(Ok(Ok(())))) {eprintln!("{{\"event\":\"pool_primary_lease_cycle_unknown\"}}");}
-            },
-            result=pool_refills.join_next(), if !pool_refills.is_empty() => {
-                if !matches!(result,Some(Ok(Ok(())))) {eprintln!("{{\"event\":\"pool_inventory_cycle_unknown\"}}");}
-            },
             scheduled = meter_interval.tick() => {
                 // The runtime is one thread: a late tick is the lag every task of it suffers.
                 let lag = Instant::now().saturating_duration_since(scheduled);
@@ -1132,12 +1049,9 @@ async fn run() -> Result<(), Error> {
                         pull_ids.extend(ids);
                     },
                     Some(Hint::Kube(id, kind)) => {
-                        for id in kube_hint_ids(&cells,&id) {
-                            if let Some(cell) = cells.get_mut(&id) {
-                                hinted(cell, kind, Instant::now());
-                            } else { pull_ids.insert(id); }
-                        }
-                        if matches!(kind,"Pod"|"Namespace"|"Node") {pool_refill_pending=true;}
+                        if let Some(cell) = cells.get_mut(&id) {
+                            hinted(cell, kind, Instant::now());
+                        } else { pull_ids.insert(id); }
                     },
                     None => break
                 }
@@ -1157,7 +1071,6 @@ async fn run() -> Result<(), Error> {
                                 let latest = Arc::new(snapshot.clone());
                                 sync_samplers(&mut samplers, &mut sampling, &latest, (&kube, &api, &mut renewals));
                                 latest_snapshot=Some((pulled_at,latest));
-                                pool_refill_pending=true;
                             }
                             apply_snapshot(&mut cells, &active, &renewals, snapshot, requested.as_deref(), pulled_at)?;
                         },
@@ -1211,24 +1124,6 @@ async fn run() -> Result<(), Error> {
                 }
             },
             _ = cadence.tick() => {}
-        }
-        if pool_refill_pending
-            && control_healthy
-            && pool_refills.is_empty()
-            && let Some((at, snapshot)) = &latest_snapshot
-            && at.elapsed() <= Duration::from_secs(90)
-        {
-            pool_refill_pending = false;
-            let controller = controller.clone();
-            let snapshot = snapshot.clone();
-            pool_refills.spawn_local(async move {
-                tokio::time::timeout(
-                    Duration::from_secs(45),
-                    controller.pool_inventory(&snapshot),
-                )
-                .await
-                .map_err(|_| "pool inventory deadline exceeded")?
-            });
         }
         poll_renewals(&mut samplers, &mut renewals, clock_ms());
 
@@ -1307,7 +1202,7 @@ async fn run() -> Result<(), Error> {
                     let result = async {
                         if kind == JobKind::Protect {
                             eprintln!("{}", json!({"event":"storage_protection_dispatched","database_id":job_id,"generation":generation,"protection_reason":protection.map(StorageProtectionReason::code)}));
-                            return controller.protect_storage(&db).await;
+                            return controller.power.protect_storage(&db).await;
                         }
                         if kind == JobKind::Renew {
                             tokio::time::timeout(
@@ -1353,8 +1248,6 @@ async fn run() -> Result<(), Error> {
             }
         }
     }
-    pool_refills.abort_all();
-    pool_leases.abort_all();
     inventories.abort_all();
     storage_sampling.abort_all();
     sampling.abort_all();
@@ -2145,78 +2038,6 @@ mod tests {
             fingerprint(&new, &snapshot(vec![])).unwrap()
         );
     }
-    #[test]
-    fn pool_token_refresh_preserves_the_immutable_job_scope_and_rejects_a_retagged_writer() {
-        let source = snapshot(vec![]);
-        let mut db = json!({"id":"db000000000000000001","generation":3,"storage":{"node_uid":NODE},"pool_binding":{"binding":{"scope":{"generation":3,"node_uid":NODE,"pool_pod_uid":NODE},"state":"serving"},"authority":"current","storage_authority":token(3,2,2000),"permission":null}});
-        let claims = storage_claims(&token(3, 2, 2000)).unwrap();
-        db["pool_binding"]["binding"]["scope"]["storage"] = json!({"storage_uid":claims["storage_uid"],"volume_group_uuid":claims["volume_group_uuid"],"volume_handle":claims["volume_handle"],"lv_uuid":claims["lv_uuid"],"pvc_uid":claims["pvc_uid"],"pv_uid":claims["pv_uid"],"profile":{"pool_uuid":claims["pool_uuid"],"profile_sha256":claims["profile_sha256"]}});
-        let initial = fingerprint(&db, &source).unwrap();
-        db["pool_binding"]["storage_authority"] = token(3, 3, 3000).into();
-        assert_eq!(
-            fingerprint(&db, &source).unwrap(),
-            initial,
-            "a refreshed same-scope SA1 must not cancel a healthy pool job"
-        );
-        let mut renewals = Renewals::default();
-        renewals
-            .tokens
-            .insert("db000000000000000001".into(), token(3, 4, 4000));
-        let (effective, _) = renewals.effective(&db, &Arc::new(source.clone()));
-        assert_eq!(
-            effective["pool_binding"]["storage_authority"],
-            token(3, 4, 4000)
-        );
-        db["pool_binding"]["binding"]["scope"]["pool_pod_uid"] =
-            "33333333-3333-4333-8333-333333333333".into();
-        assert!(
-            renewals.token(&db).is_none(),
-            "the old writer token cannot cover a new pool Pod"
-        );
-        assert_ne!(fingerprint(&db, &source).unwrap(), initial);
-    }
-
-    #[test]
-    fn actual_holder_observation_clocks_do_not_cancel_same_scope_pool_delivery() {
-        let state = snapshot(vec![]);
-        let mut db = json!({"id":"db000000000000000001","generation":3,"pool_binding":{"binding":{"scope":{"generation":3},"holder_revision":1,"state":"mounted","created_at":1000,"updated_at":1001},"authority":"current","storage_authority":"original","permission":"original-mount-only"}});
-        let first = fingerprint(&db, &state).unwrap();
-        db["pool_binding"]["binding"]["updated_at"] = 1002.into();
-        db["pool_binding"]["storage_authority"] = "fresh-same-holder-token".into();
-        assert_eq!(fingerprint(&db, &state).unwrap(), first);
-        db["pool_binding"]["binding"]["state"] = "detaching".into();
-        assert_ne!(fingerprint(&db, &state).unwrap(), first);
-    }
-    #[test]
-    fn unlabeled_pool_pod_and_namespace_events_hint_only_the_cf_bound_database() {
-        let now = Instant::now();
-        let uid = "11111111-1111-4111-8111-111111111111";
-        let cells = HashMap::from([
-            (
-                "owned".into(),
-                cell(
-                    json!({"pool_binding":{"binding":{"scope":{"pool_pod_uid":uid,"pool_namespace_uid":uid}}}}),
-                    now,
-                    true,
-                ),
-            ),
-            ("ordinary".into(), cell(json!({"id":"ordinary"}), now, true)),
-        ]);
-        assert_eq!(
-            kube_hint_ids(&cells, &format!("pool-pod:{uid}")),
-            vec!["owned".to_owned()]
-        );
-        assert_eq!(
-            kube_hint_ids(&cells, &format!("pool-namespace:{uid}")),
-            vec!["owned".to_owned()]
-        );
-        assert!(kube_hint_ids(&cells, "pool-pod:22222222-2222-4222-8222-222222222222").is_empty());
-        assert_eq!(
-            kube_hint_ids(&cells, "ordinary"),
-            vec!["ordinary".to_owned()]
-        );
-    }
-
     #[test]
     fn a_completed_wake_is_due_again_when_its_proof_renews_and_not_before() {
         // The pass of the wake met no change of anyone else: the cell was not hinted while it

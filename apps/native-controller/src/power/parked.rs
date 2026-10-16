@@ -368,7 +368,6 @@ impl PowerCoordinator {
         if policy.max_per_node == 0
             || text(&db["power"], "reason") != "idle"
             || intent.mode != "quiesce"
-            || db.get("pool_binding").is_some()
             || cluster["spec"]["instances"] != 1
             || hibernation_on(cluster)
             || fenced(cluster)

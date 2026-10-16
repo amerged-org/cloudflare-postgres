@@ -27,15 +27,12 @@
     "./database-storage": "./src/database-storage.ts",
     "./node-thin-storage": "./src/node-thin-storage.ts",
     "./thin-qualification": "./src/thin-qualification.ts",
-    "./postgres-pool-qualification": "./src/postgres-pool-qualification.ts",
     "./client": "./src/client.ts",
     "./reclaim": "./src/reclaim.ts",
     "./fleet-updates": "./src/fleet-updates.ts",
     "./region-material-rotation": "./src/region-material-rotation.ts",
     "./infrastructure-backups": "./src/infrastructure-backups.ts",
-    "./fleet-rollouts": "./src/fleet-rollouts.ts",
-    "./postgres-pool": "./src/postgres-pool.ts",
-    "./pool-cleanup-authority": "./src/pool-cleanup-authority.ts"
+    "./fleet-rollouts": "./src/fleet-rollouts.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

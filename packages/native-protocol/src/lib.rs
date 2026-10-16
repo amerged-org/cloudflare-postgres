@@ -3,8 +3,6 @@
 pub mod activity;
 #[path = "constants.generated.rs"]
 pub mod generated;
-pub mod pool;
-pub mod qualification;
 pub mod route;
 pub mod scoped_tokens;
 pub mod startup;
@@ -49,7 +47,6 @@ static CLAIM_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
     for name in [
         "routeClaims",
         "admissionRouteClaims",
-        "poolAdmissionRouteClaims",
         "gatewayAdmissionTarget",
         "legacyRouteClaims",
         "controlClaims",

@@ -715,8 +715,6 @@ export const OPERATION_KINDS = [
   "database.resume",
   "database.hibernate",
   "database.wake",
-  "database.role.create",
-  "database.role.reset_password",
   "database.role.delete",
 ] as const;
 export const OperationKind = z

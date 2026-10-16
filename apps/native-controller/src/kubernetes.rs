@@ -246,9 +246,9 @@ impl WatchContinuity {
         true
     }
     /// One event of a metadata watch of `kind`: the revision the watch stands at afterwards and
-    /// what the event hints for reconciliation, a database ID or a pool scope. The event of a
-    /// version this controller wrote itself hints no database: the pass that wrote it holds the
-    /// object as written, and a change someone else makes has a version of its own.
+    /// the database it hints for reconciliation. The event of a version this controller wrote
+    /// itself hints no database: the pass that wrote it holds the object as written, and a change
+    /// someone else makes has a version of its own.
     fn event(&mut self, kind: &str, event: &Value) -> Result<(String, Option<String>), Error> {
         let event_type = text(event, "type");
         if event_type == "ERROR" {
@@ -278,20 +278,8 @@ impl WatchContinuity {
         } else {
             labelled
         };
-        let hint = if pgcf_native_protocol::valid_pattern("database", id) {
-            (!self.own(kind, object)).then(|| id.to_string())
-        } else {
-            let prefix = match kind {
-                "Pod" if meta["namespace"] == "pgcf-pool" => Some("pool-pod:"),
-                "Namespace" if meta["name"] == "pgcf-pool" => Some("pool-namespace:"),
-                "Node" => Some("pool-node:"),
-                _ => None,
-            };
-            prefix.and_then(|prefix| {
-                let uid = text(meta, "uid");
-                pgcf_native_protocol::valid_pattern("uuid", uid).then(|| format!("{prefix}{uid}"))
-            })
-        };
+        let hint = (pgcf_native_protocol::valid_pattern("database", id) && !self.own(kind, object))
+            .then(|| id.to_string());
         Ok((version.to_string(), hint))
     }
 }
@@ -329,7 +317,6 @@ fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
         "Node" => ("/api/v1", "nodes", true),
         "PersistentVolume" => ("/api/v1", "persistentvolumes", true),
         "RuntimeClass" => ("/apis/node.k8s.io/v1", "runtimeclasses", true),
-        "Lease" => ("/apis/coordination.k8s.io/v1", "leases", false),
         "MutatingAdmissionPolicy" => (
             "/apis/admissionregistration.k8s.io/v1",
             "mutatingadmissionpolicies",
@@ -351,7 +338,6 @@ fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
         "Backup" => ("/apis/postgresql.cnpg.io/v1", "backups", false),
         "ObjectStore" => ("/apis/barmancloud.cnpg.io/v1", "objectstores", false),
         "LVMVolume" => ("/apis/local.openebs.io/v1alpha1", "lvmvolumes", false),
-        "LVMSnapshot" => ("/apis/local.openebs.io/v1alpha1", "lvmsnapshots", false),
         "LVMNode" => ("/apis/local.openebs.io/v1alpha1", "lvmnodes", false),
         "NetworkPolicy" => ("/apis/networking.k8s.io/v1", "networkpolicies", false),
         "CiliumNetworkPolicy" => ("/apis/cilium.io/v2", "ciliumnetworkpolicies", false),
@@ -433,8 +419,8 @@ impl Kubernetes {
         self.continuity.lock().unwrap().snapshot()
     }
     /// What one event of a metadata watch of `kind` makes of the watch: the revision it stands at
-    /// and the database or pool scope it hints. An event for a version this controller wrote
-    /// itself hints no database.
+    /// and the database it hints. An event for a version this controller wrote itself hints no
+    /// database.
     pub(crate) fn watch_event(
         &self,
         kind: &str,
@@ -466,15 +452,6 @@ impl Kubernetes {
                 text(&proof["observation"], "controller_epoch").into(),
                 proof["observation"]["watch_epoch"].as_u64().unwrap_or(0),
             ))
-        {
-            return false;
-        }
-        if proof["kind"] == "pool"
-            && !state.objects.iter().any(|((kind, _, _), (uid, version))| {
-                kind == "Namespace"
-                    && Some(uid.as_str()) == proof["pool_namespace_uid"].as_str()
-                    && Some(version.as_str()) == proof["pool_namespace_resource_version"].as_str()
-            })
         {
             return false;
         }
@@ -1083,108 +1060,6 @@ impl Kubernetes {
         .await?;
         Ok(())
     }
-    /// Bounded logs from the exact current OpenEBS driver container, with identity brackets.
-    pub async fn openebs_driver_logs(
-        &self,
-        pod: &Value,
-        container: &str,
-        image: &str,
-        since: u64,
-    ) -> Result<String, Error> {
-        fn identity(pod: &Value, container: &str, image: &str) -> Result<Value, Error> {
-            let digest = image
-                .split_once("@sha256:")
-                .map(|(_, d)| d)
-                .filter(|d| {
-                    d.len() == 64
-                        && d.bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                })
-                .ok_or("qualification driver digest unavailable")?;
-            let specs = pod["spec"]["containers"]
-                .as_array()
-                .ok_or("qualification driver container missing")?
-                .iter()
-                .filter(|c| c["name"] == container && c["image"] == image)
-                .collect::<Vec<_>>();
-            let statuses = pod["status"]["containerStatuses"]
-                .as_array()
-                .ok_or("qualification driver status missing")?
-                .iter()
-                .filter(|c| c["name"] == container)
-                .collect::<Vec<_>>();
-            if pod["kind"] != "Pod"
-                || pod["metadata"]["namespace"] != "openebs"
-                || !pod["metadata"]["deletionTimestamp"].is_null()
-                || pod["status"]["phase"] != "Running"
-                || specs.len() != 1
-                || statuses.len() != 1
-                || statuses[0]["ready"] != true
-                || !statuses[0]["state"]["running"].is_object()
-                || !statuses[0]["imageID"].as_str().is_some_and(|id| {
-                    id == format!("sha256:{digest}")
-                        || id == format!("containerd://sha256:{digest}")
-                        || id.ends_with(&format!("@sha256:{digest}"))
-                })
-                || !pgcf_native_protocol::valid_pattern("uuid", text(&pod["metadata"], "uid"))
-                || statuses[0]["containerID"]
-                    .as_str()
-                    .is_none_or(str::is_empty)
-            {
-                return Err("qualification driver log identity changed".into());
-            }
-            Ok(
-                serde_json::json!({"uid":pod["metadata"]["uid"],"container":statuses[0]["containerID"],"restarts":statuses[0]["restartCount"],"image":statuses[0]["imageID"]}),
-            )
-        }
-        let name = text(&pod["metadata"], "name");
-        if !identifier(name) || !identifier(container) || container.len() > 63 {
-            return Err("qualification driver log selector invalid".into());
-        }
-        let expected = identity(pod, container, image)?;
-        let before = self
-            .read("Pod", Some("openebs"), name)
-            .await?
-            .ok_or("qualification driver absent")?;
-        if identity(&before, container, image)? != expected {
-            return Err("qualification driver changed before logs".into());
-        }
-        let stamp = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(since) * 1_000_000)?
-            .format(&time::format_description::well_known::Rfc3339)?;
-        let token = tokio::fs::read_to_string(&self.token).await?;
-        if token.trim().is_empty() {
-            return Err("Kubernetes bearer missing".into());
-        }
-        let mut url = self
-            .origin
-            .join(&format!("/api/v1/namespaces/openebs/pods/{name}/log"))?;
-        url.query_pairs_mut().extend_pairs([
-            ("container", container),
-            ("sinceTime", stamp.as_str()),
-            ("timestamps", "true"),
-            ("follow", "false"),
-            ("limitBytes", "262144"),
-        ]);
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(token.trim())
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await?;
-        if response.status() != StatusCode::OK {
-            return Err("qualification driver logs unavailable".into());
-        }
-        let raw = String::from_utf8(bounded(response, 262144).await?)?;
-        let after = self
-            .read("Pod", Some("openebs"), name)
-            .await?
-            .ok_or("qualification driver absent")?;
-        if identity(&after, container, image)? != expected {
-            return Err("qualification driver changed during logs".into());
-        }
-        Ok(raw)
-    }
     /// Authenticated API-server proxy to the read-only OpenEBS LVM exporter of one driver Pod.
     pub async fn openebs_metrics(&self, pod: &str) -> Result<String, Error> {
         if pod.len() > 63 || pod.contains('.') || !identifier(pod) {
@@ -1209,12 +1084,10 @@ impl Kubernetes {
         Ok(String::from_utf8_lossy(&bounded(response, 2 * 1024 * 1024).await?).into_owned())
     }
     pub async fn assert_cluster(&self, uid: &str) -> Result<(), Error> {
-        let cluster = self.read("Namespace", None, "kube-system").await?;
-        Self::cluster_is(cluster.as_ref(), uid)
-    }
-    /// Whether `kube_system`, the namespace the identity of a cluster is, is the cluster `uid`.
-    pub fn cluster_is(kube_system: Option<&Value>, uid: &str) -> Result<(), Error> {
-        let cluster = kube_system.ok_or("cluster identity missing")?;
+        let cluster = self
+            .read("Namespace", None, "kube-system")
+            .await?
+            .ok_or("cluster identity missing")?;
         if uid.is_empty() || text(&cluster["metadata"], "uid") != uid {
             return Err("cluster identity changed".into());
         }
@@ -1225,14 +1098,7 @@ impl Kubernetes {
 mod tests {
     use super::*;
     #[test]
-    fn qualification_snapshot_uses_the_pinned_namespaced_resource() {
-        assert_eq!(
-            named("LVMSnapshot", Some("openebs"), "pgcf-q-owned").unwrap(),
-            "/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmsnapshots/pgcf-q-owned"
-        );
-    }
-    #[test]
-    fn pool_namespace_watch_loss_invalidates_only_its_actual_runtime_proof() {
+    fn a_runtime_proof_is_current_only_while_the_watch_holds_every_resource_it_names() {
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let kube = Kubernetes::with_ca(
             Url::parse("https://localhost/").unwrap(),
@@ -1240,8 +1106,8 @@ mod tests {
             PathBuf::from("unused-runtime-proof-token"),
         )
         .unwrap();
-        let mut proof = serde_json::json!({"kind":"pool","pool_namespace_uid":"00000000-0000-4000-8000-000000000009","pool_namespace_resource_version":"7","observation":{"expires_at":u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()+1000,"resource_versions":{}}});
-        let pool_namespace = serde_json::json!({"metadata":{"name":"pgcf-pool","uid":proof["pool_namespace_uid"],"resourceVersion":"7"}});
+        let mut proof = serde_json::json!({"observation":{"expires_at":u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()+1000,"resource_versions":{}}});
+        let pod = serde_json::json!({"metadata":{"name":"pod","uid":"00000000-0000-4000-8000-000000000003","resourceVersion":"7"}});
         {
             let mut state = kube.continuity.lock().unwrap();
             for kind in RUNTIME_WATCH_KINDS {
@@ -1269,23 +1135,14 @@ mod tests {
                     false
                 ));
             }
-            assert!(state.observe("Namespace", &pool_namespace, false));
             proof["observation"]["controller_epoch"] = state.controller_epoch.clone().into();
             proof["observation"]["watch_epoch"] = state.epoch.into();
         }
         assert!(kube.runtime_proof_current(&proof));
-        kube.continuity
-            .lock()
-            .unwrap()
-            .observe("Namespace", &pool_namespace, true);
+        kube.continuity.lock().unwrap().observe("Pod", &pod, true);
         assert!(
             !kube.runtime_proof_current(&proof),
-            "the pool Pod event may lag its namespace deletion"
-        );
-        proof.as_object_mut().unwrap().remove("kind");
-        assert!(
-            kube.runtime_proof_current(&proof),
-            "CNPG still checks its own tenant namespace"
+            "the watch no longer holds the Pod the proof names"
         );
     }
     #[tokio::test]

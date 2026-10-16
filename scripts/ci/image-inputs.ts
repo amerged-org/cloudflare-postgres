@@ -19,7 +19,6 @@ export interface ImageInputs {
   native_controller: boolean;
   rust_bootstrap_relay: boolean;
   sandbox_controller: boolean;
-  pool_supervisor: boolean;
 }
 const all = (): ImageInputs => ({
   regional: true,
@@ -30,7 +29,6 @@ const all = (): ImageInputs => ({
   native_controller: true,
   rust_bootstrap_relay: true,
   sandbox_controller: true,
-  pool_supervisor: true,
 });
 // Explicit inputs copied by the two repository-root Dockerfiles.
 const sharedNodeInputs = new Set([
@@ -94,8 +92,6 @@ const nativeSchemaInputs = new Set(
     "bootstrap",
     "reclaim",
     "compute-pool",
-    "postgres-pool",
-    "qualification",
   ].map((name) => `packages/contracts/native/${name}.generated.json`),
 );
 function rustInputs(path: string, directory: string): boolean {
@@ -105,13 +101,6 @@ function rustInputs(path: string, directory: string): boolean {
     path === `${directory}/build.rs` ||
     (path.startsWith(`${directory}/src/`) && path.endsWith(".rs")) ||
     (path.startsWith(`${directory}/proto/`) && !path.endsWith(".md"))
-  );
-}
-/** Every native image ships cargo metadata for this workspace member. Path-only change
- * detection conservatively includes edits to files that can create/remove automatic targets. */
-function poolWorkspaceMetadataInput(path: string): boolean {
-  return /^apps\/pool-supervisor\/(?:Cargo\.toml|build\.rs|src\/(?:main|lib)\.rs|(?:src\/bin|examples|tests|benches)\/.*\.rs)$/.test(
-    path,
   );
 }
 function canonical(value: unknown): unknown {
@@ -231,7 +220,6 @@ export function selectImageInputs(
     native_controller: false,
     rust_bootstrap_relay: false,
     sandbox_controller: false,
-    pool_supervisor: false,
   };
   for (const path of paths) {
     if (path === ".github/workflows/ci.yml") {
@@ -278,7 +266,6 @@ export function selectImageInputs(
         "infra/platform/versions.lock.json",
       ].includes(path) ||
       rustInputs(path, "packages/native-protocol") ||
-      poolWorkspaceMetadataInput(path) ||
       (nativeSchemaInputs.has(path) &&
         path !== "packages/contracts/native/controller.generated.json")
     ) {
@@ -286,7 +273,6 @@ export function selectImageInputs(
       result.native_controller = true;
       result.rust_bootstrap_relay = true;
       result.sandbox_controller = true;
-      result.pool_supervisor = true;
     }
     // Only the controller embeds this runtime schema.
     if (path === "packages/contracts/native/controller.generated.json")
@@ -305,13 +291,11 @@ export function selectImageInputs(
       result.rust_bootstrap_relay = true;
     if (rustInputs(path, "apps/native-controller"))
       result.native_controller = true;
-    if (rustInputs(path, "apps/pool-supervisor")) result.pool_supervisor = true;
     if (path === "apps/native-gateway/license-bundle.sh") {
       result.rust_gateway = true;
       result.native_controller = true;
       result.rust_bootstrap_relay = true;
       result.sandbox_controller = true;
-      result.pool_supervisor = true;
     }
     if (
       rustInputs(path, "apps/sandbox-controller") ||
@@ -423,7 +407,6 @@ const imageJobs = {
     "native_controller",
     "rust_bootstrap_relay",
     "sandbox_controller",
-    "pool_supervisor",
   ],
 } as const satisfies Record<string, readonly (keyof ImageInputs)[]>;
 type ImageJob = keyof typeof imageJobs;
@@ -433,7 +416,6 @@ const runtimeProfiles = {
   rust_bootstrap_relay: "rust-bootstrap-relay",
 } as const;
 // The established partial-job receipt bundle covers these three runtimes only.
-// The supervisor requires a successful whole native job before reusing its image.
 /** One failed image job does not revoke another group's successfully qualified immutable artifacts. */
 export async function changedImageInputsFromSuccessfulRun(
   input: SuccessfulRunInputs,

@@ -208,64 +208,6 @@ pub fn resume(authority: &VerifiedStorageAuthority) -> Result<(), Status> {
     }
     Ok(())
 }
-fn cleanup_identity(
-    permission: &crate::pool_cleanup_permission::Permission,
-) -> Result<String, Status> {
-    let s = &permission.claims()["storage"];
-    let text = |key| s[key].as_str().ok_or_else(failed);
-    let pool = s["profile"]["pool_uuid"].as_str().ok_or_else(failed)?;
-    let actual = crate::pool_device::thin_metadata(
-        text("volume_group_uuid")?,
-        text("lv_uuid")?,
-        text("volume_handle")?,
-        pool,
-    )
-    .map_err(|_| failed())?;
-    if u64::from(actual.thin_id) != s["thin_id"].as_u64().ok_or_else(failed)? {
-        return Err(failed());
-    }
-    physical_identity(text("volume_group_uuid")?, text("lv_uuid")?, pool)
-}
-/// Historical verified PC1 may only suspend this exact physical identity, never renew permission.
-pub(crate) fn suspend_cleanup(
-    permission: &crate::pool_cleanup_permission::Permission,
-) -> Result<(), Status> {
-    let expected = cleanup_identity(permission)?;
-    if status(&expected)?.flags & SUSPENDED == 0 {
-        let mut value = header(&expected, SUSPENDED | SKIP_LOCKFS | NOFLUSH, 312)?;
-        ioctl(6, &mut value)?;
-    }
-    if cleanup_identity(permission)? != expected || status(&expected)?.flags & SUSPENDED == 0 {
-        return Err(failed());
-    }
-    Ok(())
-}
-/// Fixed drain worker only; no mount/create or tenant execution is authorized by PC1.
-pub(crate) fn resume_cleanup(
-    permission: &crate::pool_cleanup_permission::Permission,
-) -> Result<(), Status> {
-    if !permission.current() {
-        return Err(failed());
-    }
-    permission.device()?;
-    let expected = cleanup_identity(permission)?;
-    if !permission.current() {
-        return Err(failed());
-    }
-    if status(&expected)?.flags & SUSPENDED != 0 {
-        let mut value = header(&expected, SKIP_LOCKFS | NOFLUSH, 312)?;
-        ioctl(6, &mut value)?;
-    }
-    if !permission.current()
-        || permission.device().is_err()
-        || cleanup_identity(permission)? != expected
-        || status(&expected)?.flags & SUSPENDED != 0
-    {
-        let _ = suspend_cleanup(permission);
-        return Err(failed());
-    }
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use super::*;

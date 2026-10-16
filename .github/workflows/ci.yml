@@ -40,7 +40,6 @@ jobs:
       native_controller_image: ${{ steps.image_inputs.outputs.native_controller }}
       rust_bootstrap_relay_image: ${{ steps.image_inputs.outputs.rust_bootstrap_relay }}
       sandbox_controller_image: ${{ steps.image_inputs.outputs.sandbox_controller }}
-      pool_supervisor_image: ${{ steps.image_inputs.outputs.pool_supervisor }}
     steps:
       - name: Check out the revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -184,11 +183,8 @@ jobs:
           node packages/contracts/native/generate-measurements.ts --check
           node packages/contracts/native/generate-bootstrap.ts --check
           node packages/contracts/native/generate-reclaim.ts --check
-          node packages/contracts/native/generate-postgres-pool.ts --check
-          node packages/contracts/native/generate-qualification.ts --check
           cargo fmt --all -- --check
           cargo test --workspace --locked
-          node scripts/ci/root-custody-tests.mjs
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo clippy -p pgcf-edge-rust --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Build the Worker once for actual Workerd tests
@@ -771,7 +767,7 @@ jobs:
 
   native_runtime_images:
     needs: check
-    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true' || needs.check.outputs.pool_supervisor_image == 'true' || vars.PGCF_TALOS_INSTALLER_RELEASE != '') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true' || vars.PGCF_TALOS_INSTALLER_RELEASE != '') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -787,7 +783,6 @@ jobs:
       PGCF_BUILD_CONTROLLER: ${{ needs.check.outputs.native_controller_image }}
       PGCF_BUILD_RELAY: ${{ needs.check.outputs.rust_bootstrap_relay_image }}
       PGCF_BUILD_SANDBOX: ${{ needs.check.outputs.sandbox_controller_image }}
-      PGCF_BUILD_POOL_SUPERVISOR: ${{ needs.check.outputs.pool_supervisor_image }}
     steps:
       - name: Check out the revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -816,13 +811,12 @@ jobs:
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           mkdir -m 700 "$RUNNER_TEMP/pgcf-native-image-gate"
-          for PGCF_PROFILE in rust-gateway native-controller rust-bootstrap-relay sandbox-controller pool-supervisor; do
+          for PGCF_PROFILE in rust-gateway native-controller rust-bootstrap-relay sandbox-controller; do
             case "$PGCF_PROFILE" in
               rust-gateway) [ "$PGCF_BUILD_GATEWAY" = true ] || continue; PGCF_DOCKERFILE=apps/native-gateway/Dockerfile ;;
               native-controller) [ "$PGCF_BUILD_CONTROLLER" = true ] || continue; PGCF_DOCKERFILE=apps/native-controller/Dockerfile ;;
               rust-bootstrap-relay) [ "$PGCF_BUILD_RELAY" = true ] || continue; PGCF_DOCKERFILE=apps/native-bootstrap-relay/Dockerfile ;;
               sandbox-controller) [ "$PGCF_BUILD_SANDBOX" = true ] || continue; PGCF_DOCKERFILE=apps/sandbox-controller/Dockerfile ;;
-              pool-supervisor) [ "$PGCF_BUILD_POOL_SUPERVISOR" = true ] || continue; PGCF_DOCKERFILE=apps/pool-supervisor/Dockerfile ;;
             esac
             PGCF_GATE="$RUNNER_TEMP/pgcf-native-image-gate/$PGCF_PROFILE"
             mkdir -m 700 "$PGCF_GATE"

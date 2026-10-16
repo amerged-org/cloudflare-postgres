@@ -564,7 +564,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         namespace: NS.into(),
         slots: 0,
         slot_lifetime_ms: 300000,
-        postgres_pool: false,
         cloudflare: Some(local.clone()),
         budget: None,
         runtime_profile: None,

@@ -26,20 +26,7 @@ export const CnpgDatabaseTarget = z.strictObject({
     .max(Number.MAX_SAFE_INTEGER)
     .optional(),
 });
-export const PoolDatabaseTarget = z.strictObject({
-  kind: z.literal("pool"),
-  revision: CnpgDatabaseTarget.shape.revision,
-  pod_uid: z.uuid(),
-  route_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  binding_id: z.uuid(),
-  node_uid: z.uuid(),
-  pod_ip: z.union([z.ipv4(), z.ipv6()]),
-  storage_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  scope_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-});
-export const DatabaseTarget = z.union([CnpgDatabaseTarget, PoolDatabaseTarget]);
-export type DatabaseTarget = z.infer<typeof DatabaseTarget>;
-export type PoolDatabaseTarget = z.infer<typeof PoolDatabaseTarget>;
+export type CnpgDatabaseTarget = z.infer<typeof CnpgDatabaseTarget>;
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const DatabaseAdmissionIntent = z.strictObject({
   v: z.literal(1),
@@ -70,7 +57,7 @@ export const DatabaseAdmission = z.discriminatedUnion("ok", [
     ok: z.literal(true),
     region: DatabaseRegionRoute,
     /** Temporary rollout compatibility (route-token.ts): absent only outside a v3 region. */
-    target: DatabaseTarget.optional(),
+    target: CnpgDatabaseTarget.optional(),
   }),
   z.strictObject({
     ok: z.literal(false),

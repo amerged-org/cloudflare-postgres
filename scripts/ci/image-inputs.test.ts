@@ -21,47 +21,7 @@ const selected = (value: Partial<ImageInputs> = {}): ImageInputs => ({
   native_controller: false,
   rust_bootstrap_relay: false,
   sandbox_controller: false,
-  pool_supervisor: false,
   ...value,
-});
-
-test("pool supervisor source selects its own immutable native image", () => {
-  assert.equal(
-    selectImageInputs(["apps/pool-supervisor/src/main.rs"], "push")
-      .pool_supervisor,
-    true,
-  );
-  assert.equal(
-    selectImageInputs(["apps/pool-supervisor/README.md"], "push")
-      .pool_supervisor,
-    false,
-  );
-});
-
-test("qualification verifier schema rebuilds its native consumers", () => {
-  const inputs = selectImageInputs(
-    ["packages/contracts/native/qualification.generated.json"],
-    "push",
-  );
-  assert.equal(inputs.pool_supervisor, true);
-  assert.equal(inputs.native_controller, true);
-  assert.equal(inputs.sandbox_controller, true);
-});
-
-test("supervisor manifest and auto-discovered targets invalidate every shipped workspace metadata file", () => {
-  const manifest = selectImageInputs(
-    ["apps/pool-supervisor/Cargo.toml"],
-    "push",
-  );
-  assert.equal(manifest.native_controller, true);
-  assert.equal(manifest.rust_gateway, true);
-  assert.equal(manifest.sandbox_controller, true);
-  const addedTarget = selectImageInputs(
-    ["apps/pool-supervisor/tests/kernel.rs"],
-    "push",
-  );
-  assert.equal(addedTarget.native_controller, true);
-  assert.equal(addedTarget.pool_supervisor, true);
 });
 
 test("workflow retention, test globs, installer delivery and documentation do not rebuild unchanged native artifacts", async () => {
@@ -130,7 +90,6 @@ test("exact Skopeo installer publication run and env do not rebuild native artif
     native_controller: true,
     rust_bootstrap_relay: true,
     sandbox_controller: true,
-    pool_supervisor: true,
   });
   assert.deepEqual(
     selectImageInputs([".github/workflows/ci.yml"], "push", {
@@ -170,7 +129,6 @@ test("workflow build recipes and consumed native schema bytes still invalidate t
     native_controller: true,
     rust_bootstrap_relay: true,
     sandbox_controller: true,
-    pool_supervisor: true,
   });
   assert.deepEqual(
     selectImageInputs([".github/workflows/ci.yml"], "push", { before, after }),
@@ -293,7 +251,6 @@ test("actual storage and native inputs select only their affected runtime artifa
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -315,7 +272,6 @@ test("actual storage and native inputs select only their affected runtime artifa
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -325,7 +281,6 @@ test("actual storage and native inputs select only their affected runtime artifa
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
 });
@@ -345,7 +300,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -357,7 +311,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -379,7 +332,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -396,7 +348,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
-      pool_supervisor: true,
     }),
   );
 });
@@ -410,7 +361,6 @@ test("PostgreSQL inputs stay scoped and manual, unavailable or malformed compari
     native_controller: true,
     rust_bootstrap_relay: true,
     sandbox_controller: true,
-    pool_supervisor: true,
   });
   assert.deepEqual(
     selectImageInputs(["infra/postgres/sources.lock.json"], "push"),
@@ -873,7 +823,6 @@ test("partial Native receipts reuse exactly three proved runtimes without baseli
       selected({
         storage: true,
         sandbox_controller: true,
-        pool_supervisor: true,
       }),
     );
     assert.equal(result.baselines.sandbox_controller, null);
@@ -889,7 +838,6 @@ test("partial Native receipts reuse exactly three proved runtimes without baseli
         native_controller: true,
         rust_bootstrap_relay: true,
         sandbox_controller: true,
-        pool_supervisor: true,
       }),
     );
   } finally {

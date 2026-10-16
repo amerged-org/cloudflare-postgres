@@ -46,8 +46,6 @@ export const RETRYABLE_ERROR_REASONS = {
   generation_changed: 1,
   /** The database still applies an earlier change or has not started. */
   not_ready: 5,
-  /** The database is bound to a shared pool Pod, or a role change waits for its release. */
-  pool_bound: 5,
   /** The node lacks memory, CPU or storage for the change or the start now. */
   node_capacity: 30,
 } as const;
@@ -71,7 +69,6 @@ export const ERROR_REASONS = [
   "mutation_in_progress",
   "generation_changed",
   "not_ready",
-  "pool_bound",
   "node_capacity",
   ...TERMINAL_ERROR_REASONS,
 ] as const satisfies readonly (
@@ -80,7 +77,7 @@ export const ERROR_REASONS = [
 export const ErrorReason = z.enum(ERROR_REASONS).meta({
   id: "ErrorReason",
   description:
-    "Stable cause of a refusal. Retryable: mutation_in_progress, generation_changed, not_ready, pool_bound, node_capacity; these answers carry a Retry-After header. Terminal: name_in_use, database_deleted, project_not_empty, role_exists, role_limit, role_being_deleted, role_has_members, archive_expired, archive_unusable, no_recovery_point, source_unavailable, region_unavailable.",
+    "Stable cause of a refusal. Retryable: mutation_in_progress, generation_changed, not_ready, node_capacity; these answers carry a Retry-After header. Terminal: name_in_use, database_deleted, project_not_empty, role_exists, role_limit, role_being_deleted, role_has_members, archive_expired, archive_unusable, no_recovery_point, source_unavailable, region_unavailable.",
 });
 export type ErrorReason = z.infer<typeof ErrorReason>;
 

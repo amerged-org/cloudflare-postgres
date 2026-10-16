@@ -37,7 +37,7 @@ def openssl(*args):
 
 def load_metadata(path):
     expected=Path(__file__).resolve().parents[3]/".local"/"kube-fixtures"
-    if path.name!="fixture.json" or path.parent.parent!=expected or not path.parent.name.startswith("pgcf-pool-kube-") or path.is_symlink():
+    if path.name!="fixture.json" or path.parent.parent!=expected or not path.parent.name.startswith("pgcf-kube-") or path.is_symlink():
         raise RuntimeError("Fixture custody path changed")
     if path.parent.stat().st_mode & 0o777 != 0o700 or path.stat().st_mode & 0o777 != 0o600:
         raise RuntimeError("Fixture custody mode changed")
@@ -45,7 +45,7 @@ def load_metadata(path):
     identity=metadata.get("id","")
     if len(identity)!=32 or any(c not in "0123456789abcdef" for c in identity):
         raise RuntimeError("Fixture identity changed")
-    for role,prefix in (("api","pgcf-pool-api-"),("etcd","pgcf-pool-etcd-"),("network","pgcf-pool-kube-")):
+    for role,prefix in (("api","pgcf-kube-api-"),("etcd","pgcf-kube-etcd-"),("network","pgcf-kube-")):
         if metadata.get(role)!=prefix+identity:
             raise RuntimeError("Fixture resource name changed")
     if metadata.get("origin")!="https://"+metadata["api"]+":6443/" or metadata.get("api_image")!=API_IMAGE or metadata.get("etcd_image")!=ETCD_IMAGE:
@@ -81,11 +81,11 @@ def start():
     fixture_parent=Path(__file__).resolve().parents[3]/".local"/"kube-fixtures"
     fixture_parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     fixture_parent.chmod(0o700)
-    root = Path(tempfile.mkdtemp(prefix="pgcf-pool-kube-",dir=fixture_parent))
+    root = Path(tempfile.mkdtemp(prefix="pgcf-kube-",dir=fixture_parent))
     root.chmod(0o700)
-    api, etcd, network = ("pgcf-pool-api-" + fixture_id, "pgcf-pool-etcd-" + fixture_id, "pgcf-pool-kube-" + fixture_id)
+    api, etcd, network = ("pgcf-kube-api-" + fixture_id, "pgcf-kube-etcd-" + fixture_id, "pgcf-kube-" + fixture_id)
     # Files are test-only generated custody; nothing from a user environment is read.
-    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=PGCF isolated pool test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", root/"ca.key", "-out", root/"ca.crt")
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=PGCF isolated test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", root/"ca.key", "-out", root/"ca.crt")
     openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", root/"server.key", "-out", root/"server.csr")
     write_private(root/"san.conf", "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,DNS:" + api + ",IP:127.0.0.1\n")
     openssl("x509", "-req", "-in", root/"server.csr", "-CA", root/"ca.crt", "-CAkey", root/"ca.key", "-CAcreateserial", "-days", "1", "-extfile", root/"san.conf", "-out", root/"server.crt")
@@ -93,7 +93,7 @@ def start():
     openssl("pkey", "-in", root/"sa.key", "-pubout", "-out", root/"sa.pub")
     token = secrets.token_urlsafe(48)
     write_private(root/"token", token)
-    write_private(root/"admin.tokens", token + ',pool-test-admin,pool-test-admin,"system:masters"\n')
+    write_private(root/"admin.tokens", token + ',kube-test-admin,kube-test-admin,"system:masters"\n')
     for path in root.iterdir():
         path.chmod(0o600)
     resources = []
@@ -102,7 +102,7 @@ def start():
         resources.append(("network", network_id))
         etcd_id = command(["docker", "run", "-d", "--platform", "linux/amd64", "--name", etcd, "--network", network, "--label", LABEL+"="+fixture_id, ETCD_IMAGE, "etcd", "--name=default", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://"+etcd+":2379", "--data-dir=/tmp/etcd"], output=True).decode().strip()
         resources.append(("container", etcd_id))
-        api_id = command(["docker", "run", "-d", "--platform", "linux/amd64", "--name", api, "--network", network, "--label", LABEL+"="+fixture_id, "-p", "127.0.0.1::6443", "-v", str(root)+":/tls:ro", API_IMAGE, "/usr/local/bin/kube-apiserver", "--etcd-servers=http://"+etcd+":2379", "--service-cluster-ip-range=10.88.0.0/24", "--secure-port=6443", "--advertise-address=127.0.0.1", "--tls-cert-file=/tls/server.crt", "--tls-private-key-file=/tls/server.key", "--client-ca-file=/tls/ca.crt", "--token-auth-file=/tls/admin.tokens", "--service-account-key-file=/tls/sa.pub", "--service-account-signing-key-file=/tls/sa.key", "--service-account-issuer=https://pool-test.invalid", "--authorization-mode=RBAC", "--anonymous-auth=false"], output=True).decode().strip()
+        api_id = command(["docker", "run", "-d", "--platform", "linux/amd64", "--name", api, "--network", network, "--label", LABEL+"="+fixture_id, "-p", "127.0.0.1::6443", "-v", str(root)+":/tls:ro", API_IMAGE, "/usr/local/bin/kube-apiserver", "--etcd-servers=http://"+etcd+":2379", "--service-cluster-ip-range=10.88.0.0/24", "--secure-port=6443", "--advertise-address=127.0.0.1", "--tls-cert-file=/tls/server.crt", "--tls-private-key-file=/tls/server.key", "--client-ca-file=/tls/ca.crt", "--token-auth-file=/tls/admin.tokens", "--service-account-key-file=/tls/sa.pub", "--service-account-signing-key-file=/tls/sa.key", "--service-account-issuer=https://kube-test.invalid", "--authorization-mode=RBAC", "--anonymous-auth=false"], output=True).decode().strip()
         resources.append(("container", api_id))
         inspect = json.loads(command(["docker", "inspect", api], output=True))[0]
         port = int(inspect["NetworkSettings"]["Ports"]["6443/tcp"][0]["HostPort"])
@@ -146,20 +146,20 @@ def start():
         shutil.rmtree(root)
         raise
 
-def run(path, worktree, target, target_dir, example="pool-kubernetes"):
-    if example not in ("pool-kubernetes", "pool-qualification-kubernetes", "parked-kubernetes"):
+def run(path, worktree, target, target_dir, example="parked-kubernetes"):
+    if example != "parked-kubernetes":
         raise RuntimeError("Fixture example invalid")
     if not target_dir or len(target_dir)>96 or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-/" for c in target_dir) or ".." in target_dir:
         raise RuntimeError("Fixture target directory invalid")
     metadata=load_metadata(path)
     owned(metadata)
     root=path.parent
-    args=["docker","run","--rm","--platform","linux/amd64","--network",metadata["network"],"-e","CARGO_HOME=/cargo","-e","CARGO_TARGET_DIR=/target/"+target_dir,"-e","CARGO_PROFILE_DEV_DEBUG=0","-e","CARGO_PROFILE_TEST_DEBUG=0","-e","CARGO_INCREMENTAL=0","-e","PGCF_POOL_TEST_ORIGIN="+metadata["origin"],"-e","PGCF_POOL_TEST_CA=/fixture/ca.crt","-e","PGCF_POOL_TEST_TOKEN=/fixture/token","-e","PGCF_POOL_TEST_ATTEMPT="+uuid.uuid4().hex,"-v",str(worktree)+":/repo","-v",str(root)+":/fixture:ro","-v","pgcf-diag-cargo-amd64:/cargo","-v",target+":/target","-w","/repo",RUST_IMAGE,"sh","-c","apk add --no-cache musl-dev >/dev/null && cargo run --locked -p pgcf-native-controller --example "+example]
+    args=["docker","run","--rm","--platform","linux/amd64","--network",metadata["network"],"-e","CARGO_HOME=/cargo","-e","CARGO_TARGET_DIR=/target/"+target_dir,"-e","CARGO_PROFILE_DEV_DEBUG=0","-e","CARGO_PROFILE_TEST_DEBUG=0","-e","CARGO_INCREMENTAL=0","-e","PGCF_KUBE_TEST_ORIGIN="+metadata["origin"],"-e","PGCF_KUBE_TEST_CA=/fixture/ca.crt","-e","PGCF_KUBE_TEST_TOKEN=/fixture/token","-e","PGCF_KUBE_TEST_ATTEMPT="+uuid.uuid4().hex,"-v",str(worktree)+":/repo","-v",str(root)+":/fixture:ro","-v","pgcf-diag-cargo-amd64:/cargo","-v",target+":/target","-w","/repo",RUST_IMAGE,"sh","-c","apk add --no-cache musl-dev >/dev/null && cargo run --locked -p pgcf-native-controller --example "+example]
     # The executable reports only fixed public check names; a failed command is not printed raw.
     result=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     if result.returncode:
         lines=result.stderr.decode(errors="replace").splitlines()
-        safe=[line for line in lines if line.startswith("error[") or line.startswith("error: could not compile") or line.startswith('Error: "isolated ' ) or line.startswith('Error: "pool ' ) or line.startswith("Error: KubernetesError")]
+        safe=[line for line in lines if line.startswith("error[") or line.startswith("error: could not compile") or line.startswith('Error: "isolated ' ) or line.startswith("Error: KubernetesError")]
         print(json.dumps({"fixture":"check_failed","compiler_errors":safe}))
         raise RuntimeError("Actual Kubernetes fixture check failed")
     print(result.stdout.decode().strip())
@@ -170,8 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("--metadata",type=Path)
     parser.add_argument("--worktree",type=Path,default=Path(__file__).resolve().parents[3])
     parser.add_argument("--target-volume",default="pgcf-diag-target-amd64")
-    parser.add_argument("--target-dir",default="warm-pool-routing-kubernetes")
-    parser.add_argument("--example", choices=["pool-kubernetes", "pool-qualification-kubernetes", "parked-kubernetes"], default="pool-kubernetes")
+    parser.add_argument("--target-dir",default="native-controller-kubernetes")
+    parser.add_argument("--example", choices=["parked-kubernetes"], default="parked-kubernetes")
     args=parser.parse_args()
     try:
         if args.mode=="start":start()

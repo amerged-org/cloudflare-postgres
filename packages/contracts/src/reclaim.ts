@@ -277,22 +277,9 @@ export const DatabaseRuntimeAttestationV2 = z
 export type DatabaseRuntimeAttestationV2 = z.infer<
   typeof DatabaseRuntimeAttestationV2
 >;
-export const DatabasePoolRuntimeAttestationV2 =
-  DatabaseRuntimeAttestationV2.safeExtend({
-    kind: z.literal("pool"),
-    binding_id: z.uuid(),
-    scope_sha256: Hash,
-    holder_revision: Safe.positive(),
-    pool_namespace_uid: z.uuid(),
-    pool_namespace_resource_version: z.string().min(1).max(256),
-  });
-export type DatabasePoolRuntimeAttestationV2 = z.infer<
-  typeof DatabasePoolRuntimeAttestationV2
->;
 export const DatabaseRuntimeAttestation = z.union([
   DatabaseRuntimeAttestationV1,
   DatabaseRuntimeAttestationV2,
-  DatabasePoolRuntimeAttestationV2,
 ]);
 export type DatabaseRuntimeAttestation = z.infer<
   typeof DatabaseRuntimeAttestation

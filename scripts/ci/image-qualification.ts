@@ -506,7 +506,6 @@ type ToolStage =
   | "runtime_thin_repair"
   | "runtime_rust_gateway"
   | "runtime_native_controller"
-  | "runtime_pool_supervisor"
   | "runtime_rust_bootstrap_relay"
   | "runtime_sandbox_controller"
   | "runtime_sandbox_holder"
@@ -591,7 +590,6 @@ export interface RuntimeCheck {
     | "ssh"
     | "rust-gateway"
     | "native-controller"
-    | "pool-supervisor"
     | "rust-bootstrap-relay"
     | "sandbox-controller"
     | "sandbox-holder";
@@ -601,17 +599,6 @@ export function runtimeChecks(
 ): RuntimeCheck[] {
   const profile = imageProfile(profileInput);
   if (profile === "talos-recipe") return [];
-  if (profile === "pool-supervisor")
-    return [
-      {
-        stage: "runtime_pool_supervisor",
-        entrypoint: "/pgcf-supervisor",
-        args: ["--version"],
-        exit: 0,
-        stderr: "",
-        version: "pool-supervisor",
-      },
-    ];
   if (profile === "storage")
     return [
       {
@@ -842,7 +829,6 @@ export function validateRuntimeResult(
   if (
     check.version === "rust-gateway" ||
     check.version === "native-controller" ||
-    check.version === "pool-supervisor" ||
     check.version === "rust-bootstrap-relay" ||
     check.version === "sandbox-controller" ||
     check.version === "sandbox-holder"
@@ -854,29 +840,25 @@ export function validateRuntimeResult(
       throw new QualificationFailure(`runtime_version_invalid:${check.stage}`);
     }
     const program =
-      check.version === "pool-supervisor"
-        ? "pgcf-pool-supervisor"
-        : check.version === "rust-gateway"
-          ? "pgcf-native-gateway"
-          : check.version === "native-controller"
-            ? "pgcf-native-controller"
-            : check.version === "rust-bootstrap-relay"
-              ? "pgcf-native-bootstrap-relay"
-              : check.version === "sandbox-controller"
-                ? "pgcf-sandbox-controller"
-                : "pgcf-node-runtime";
+      check.version === "rust-gateway"
+        ? "pgcf-native-gateway"
+        : check.version === "native-controller"
+          ? "pgcf-native-controller"
+          : check.version === "rust-bootstrap-relay"
+            ? "pgcf-native-bootstrap-relay"
+            : check.version === "sandbox-controller"
+              ? "pgcf-sandbox-controller"
+              : "pgcf-node-runtime";
     const packagePath =
-      check.version === "pool-supervisor"
-        ? "pool-supervisor"
-        : check.version === "rust-gateway"
-          ? "native-gateway"
-          : check.version === "native-controller"
-            ? "native-controller"
-            : check.version === "rust-bootstrap-relay"
-              ? "native-bootstrap-relay"
-              : check.version === "sandbox-controller"
-                ? "sandbox-controller"
-                : "node-runtime";
+      check.version === "rust-gateway"
+        ? "native-gateway"
+        : check.version === "native-controller"
+          ? "native-controller"
+          : check.version === "rust-bootstrap-relay"
+            ? "native-bootstrap-relay"
+            : check.version === "sandbox-controller"
+              ? "sandbox-controller"
+              : "node-runtime";
     const sourceVersion = /^version\s*=\s*"([^"\r\n]+)"\s*$/m.exec(
       readFileSync(`apps/${packagePath}/Cargo.toml`, "utf8"),
     )?.[1];
@@ -923,19 +905,6 @@ export function validateRuntimeResult(
           sha("packages/contracts/native/protocol.generated.json") &&
           value.bootstrapContractSha256 ===
             sha("packages/contracts/native/bootstrap.generated.json"),
-        `runtime_generated_input_invalid:${check.stage}`,
-      );
-    }
-    if (check.version === "pool-supervisor") {
-      const sha = (path: string) =>
-        createHash("sha256").update(readFileSync(path)).digest("hex");
-      requireCheck(
-        value.protocolSha256 ===
-          sha("packages/contracts/native/protocol.generated.json") &&
-          value.poolContractSha256 ===
-            sha("packages/contracts/native/postgres-pool.generated.json") &&
-          value.qualificationContractSha256 ===
-            sha("packages/contracts/native/qualification.generated.json"),
         `runtime_generated_input_invalid:${check.stage}`,
       );
     }
@@ -1108,7 +1077,6 @@ export async function verifyStorageAssembly(
 }
 
 export function rustArtifactPaths(profile: ImageProfile) {
-  if (profile === "pool-supervisor") return ["pgcf-supervisor"];
   if (profile === "rust-gateway") return ["pgcf-native-gateway"];
   if (profile === "native-controller") return ["pgcf-native-controller"];
   if (profile === "rust-bootstrap-relay")
@@ -1200,18 +1168,6 @@ export async function verifyRustAssembly(
           [
             "measurements.generated.json",
             "packages/contracts/native/measurements.generated.json",
-          ],
-        ]
-      : []),
-    ...(profile === "pool-supervisor"
-      ? [
-          [
-            "postgres-pool.generated.json",
-            "packages/contracts/native/postgres-pool.generated.json",
-          ],
-          [
-            "qualification.generated.json",
-            "packages/contracts/native/qualification.generated.json",
           ],
         ]
       : []),

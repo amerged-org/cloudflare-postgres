@@ -682,13 +682,13 @@ async fn a_parked_wake_and_the_pass_after_it_make_this_many_requests() {
     let at = w.server.state.lock().unwrap().requests.len();
     let woken = reconcile(&w).await;
     assert_eq!(woken["state"], "ready", "{woken}");
-    assert_eq!(requests_since(&w, at), (101, 19), "the wake");
+    assert_eq!(requests_since(&w, at), (100, 19), "the wake");
     let _ = w.watch_delivers();
     w.kubelet_ready_now()();
     let at = w.server.state.lock().unwrap().requests.len();
     let again = reconcile(&w).await;
     assert_eq!(again["state"], "ready", "{again}");
-    assert_eq!(requests_since(&w, at), (84, 0), "the pass after it");
+    assert_eq!(requests_since(&w, at), (83, 0), "the pass after it");
 }
 
 #[tokio::test]
@@ -1107,26 +1107,6 @@ fn storage_path(w: &World) -> String {
 }
 fn cluster_object(w: &World) -> String {
     path("Cluster", Some(&w.ns), "database")
-}
-
-#[tokio::test]
-async fn a_pass_reads_the_identity_of_the_cluster_with_the_fence_it_looks_at_next() {
-    let mut w = World::parked().await;
-    w.admitted();
-    w.wake(3);
-    w.start_postgres().await;
-    let cluster = path("Namespace", None, "kube-system");
-    let fence = fence_path(&w);
-    hold(
-        &w,
-        Gate::new(2, move |method, at| {
-            method == "GET" && (at == cluster || at == fence)
-        })
-        .once(),
-    );
-    let woken = reconcile(&w).await;
-    assert_eq!(woken["state"], "ready", "{woken}");
-    assert_eq!(held(&w), (1, 0));
 }
 
 #[tokio::test]

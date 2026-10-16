@@ -112,32 +112,6 @@ pub struct AdmittedTarget {
     pub pod_uid: String,
     #[serde(default)]
     pub route_revision: Option<u64>,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub binding_id: Option<String>,
-    #[serde(default)]
-    pub node_uid: Option<String>,
-    #[serde(default)]
-    pub pod_ip: Option<String>,
-    #[serde(default)]
-    pub storage_generation: Option<u64>,
-    #[serde(default)]
-    pub scope_sha256: Option<String>,
-}
-impl AdmittedTarget {
-    pub fn pool(&self) -> Option<pgcf_native_protocol::route::PoolRouteTarget<'_>> {
-        if self.kind.as_deref() != Some("pool") {
-            return None;
-        }
-        Some(pgcf_native_protocol::route::PoolRouteTarget {
-            binding_id: self.binding_id.as_deref()?,
-            node_uid: self.node_uid.as_deref()?,
-            pod_ip: self.pod_ip.as_deref()?,
-            storage_generation: self.storage_generation?,
-            scope_sha256: self.scope_sha256.as_deref()?,
-        })
-    }
 }
 /// Parses the trusted DatabaseActor admission. Every field the Edge uses is required and
 /// validated; fields a newer API adds are ignored, as the TypeScript Edge does, so an API
@@ -172,7 +146,7 @@ pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>
             let target = object
                 .get("target")
                 .map(|value| {
-                    let mut target: AdmittedTarget =
+                    let target: AdmittedTarget =
                         serde_json::from_value(value.clone()).map_err(|_| Failure::gateway())?;
                     if target.revision == 0
                         || (value.get("route_revision").is_some()
@@ -184,30 +158,6 @@ pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>
                         || !valid_pattern("uuid", &target.pod_uid)
                     {
                         return Err(Failure::gateway());
-                    }
-                    let has_pool_fields = ["kind", "binding_id", "scope_sha256"]
-                        .iter()
-                        .any(|key| value.get(*key).is_some());
-                    if has_pool_fields {
-                        let pool = target.pool().ok_or_else(Failure::gateway)?;
-                        if target.route_revision.is_none()
-                            || !valid_pattern("uuid", pool.binding_id)
-                            || !valid_pattern("uuid", pool.node_uid)
-                            || pool.pod_ip.parse::<std::net::IpAddr>().is_err()
-                            || pool.storage_generation == 0
-                            || pool.storage_generation > 9_007_199_254_740_991
-                            || pool.scope_sha256.len() != 64
-                            || !pool
-                                .scope_sha256
-                                .bytes()
-                                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
-                        {
-                            return Err(Failure::gateway());
-                        }
-                    } else {
-                        target.node_uid = None;
-                        target.pod_ip = None;
-                        target.storage_generation = None;
                     }
                     Ok(target)
                 })

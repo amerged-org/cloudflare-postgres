@@ -22,11 +22,7 @@ pub const HOST_PROC_FD: i32 = 198;
 pub const HOST_PID_NAMESPACE_FD: i32 = 197;
 /// The self-exec retains these read-only handles, but holders/shims and all later children must not inherit them.
 pub fn seal_inherited_handles() -> Result<(), Status> {
-    for fd in [
-        HOST_PROC_FD,
-        HOST_PID_NAMESPACE_FD,
-        crate::pool_inspector::FD,
-    ] {
+    for fd in [HOST_PROC_FD, HOST_PID_NAMESPACE_FD] {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
@@ -129,24 +125,6 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
         return Err(failed());
     }
     let settings: Settings = serde_json::from_slice(&bytes).map_err(|_| failed())?;
-    let inspector = if settings.postgres_pool {
-        crate::pool_namespaces::eligible().map_err(|_| failed())?;
-        let mut fds = [-1; 2];
-        if unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-                fds.as_mut_ptr(),
-            )
-        } != 0
-        {
-            return Err(failed());
-        }
-        Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-    } else {
-        None
-    };
     let executable = std::env::current_exe().map_err(|_| failed())?;
     let executable_hash = digest(&executable)?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -208,7 +186,6 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
     let parent_handle = unsafe { OwnedFd::from_raw_fd(parent_fd) };
     let host_proc_fd = host_proc.as_raw_fd();
     let host_pidns_fd = current_pid.as_raw_fd();
-    let inspector_child_fd = inspector.as_ref().map(|(_, child)| child.as_raw_fd());
     unsafe {
         command.pre_exec(move || {
             for (source, target) in [
@@ -223,15 +200,6 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
                 if result < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-            }
-            if let Some(fd) = inspector_child_fd
-                && (if fd == crate::pool_inspector::FD {
-                    libc::fcntl(fd, libc::F_SETFD, 0)
-                } else {
-                    libc::dup3(fd, crate::pool_inspector::FD, 0)
-                }) < 0
-            {
-                return Err(std::io::Error::last_os_error());
             }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -248,27 +216,6 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
         });
     }
     let mut child = command.spawn().map_err(|_| failed())?;
-    let inspector_parent = inspector.map(|(parent, child)| {
-        drop(child);
-        parent
-    });
-    if inspector_parent.is_some() {
-        // Only the parent returns to its original mount/root; its active PID NS was never changed.
-        if unsafe { libc::setns(current_mount.as_raw_fd(), libc::CLONE_NEWNS) } < 0
-            || unsafe { libc::fchdir(current_root.as_raw_fd()) } < 0
-            || unsafe { libc::chroot(c".".as_ptr()) } < 0
-            || std::env::set_current_dir("/").is_err()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(failed());
-        }
-        if crate::pool_namespaces::eligible().is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(failed());
-        }
-    }
     drop(parent_handle);
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
     if fd < 0 {
@@ -281,37 +228,7 @@ pub fn launch(settings_file: &Path, args: &[OsString]) -> Result<i32, Status> {
     if STOP.load(Ordering::Relaxed) {
         terminate(0);
     }
-    let status = if let Some(parent) = inspector_parent {
-        loop {
-            if let Some(status) = child.try_wait().map_err(|_| failed())? {
-                break Ok(status);
-            }
-            if crate::pool_inspector::poll(parent.as_raw_fd(), handle.as_raw_fd()).is_err() {
-                terminate(0);
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(failed());
-            }
-        }
-    } else {
-        child.wait().map_err(|_| failed())
-    };
-    if settings.postgres_pool {
-        // The original initial-PID parent remains credentialless. If its CRI child stops,
-        // historical signed journal identities may protect only, never resume or restart PG.
-        if unsafe { libc::setns(mount.as_raw_fd(), libc::CLONE_NEWNS) } < 0
-            || unsafe { libc::fchdir(root.as_raw_fd()) } < 0
-            || unsafe { libc::chroot(c".".as_ptr()) } < 0
-            || std::env::set_current_dir("/").is_err()
-        {
-            return Err(failed());
-        }
-        let local = settings.cloudflare.as_ref().ok_or_else(failed)?;
-        crate::pool_runtime::protect_journals(
-            local.storage_authority.as_ref().ok_or_else(failed)?,
-            &local.node_uid,
-        )?;
-    }
+    let status = child.wait().map_err(|_| failed())?;
     CHILD.store(-1, Ordering::Relaxed);
-    Ok(status?.code().unwrap_or(137))
+    Ok(status.code().unwrap_or(137))
 }

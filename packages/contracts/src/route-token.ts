@@ -18,11 +18,7 @@
 // still accept them. Remove v2 signing and verification and make the admission target
 // required once every region's release declares v3; a missing target is then refused.
 import { z } from "zod";
-import {
-  DatabaseTarget,
-  CnpgDatabaseTarget,
-  PoolDatabaseTarget,
-} from "./database-admission.ts";
+import { CnpgDatabaseTarget } from "./database-admission.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import { DATABASE_ID_PATTERN, REGION_ID_PATTERN, RoleName } from "./ids.ts";
 
@@ -81,27 +77,8 @@ export const cnpgAdmissionRouteTokenClaimsSchema =
     v: z.literal(4),
     route_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   });
-export const poolAdmissionRouteTokenClaimsSchema =
-  cnpgAdmissionRouteTokenClaimsSchema
-    .extend({
-      kind: z.literal("pool"),
-      binding_id: PoolDatabaseTarget.shape.binding_id,
-      node_uid: PoolDatabaseTarget.shape.node_uid,
-      pod_ip: z.string().min(2).max(45),
-      storage_generation: PoolDatabaseTarget.shape.storage_generation,
-      scope_sha256: PoolDatabaseTarget.shape.scope_sha256,
-    })
-    .refine(
-      (value) =>
-        PoolDatabaseTarget.shape.pod_ip.safeParse(value.pod_ip).success,
-      { message: "Invalid pool Pod IP" },
-    );
-export const admissionRouteTokenClaimsSchema = z.union([
-  cnpgAdmissionRouteTokenClaimsSchema,
-  poolAdmissionRouteTokenClaimsSchema,
-]);
 export type AdmissionRouteTokenClaims = z.infer<
-  typeof admissionRouteTokenClaimsSchema
+  typeof cnpgAdmissionRouteTokenClaimsSchema
 >;
 /** Temporary rollout compatibility: no route revision or target. */
 export const legacyRouteTokenClaimsSchema = z.strictObject({
@@ -188,7 +165,7 @@ export interface SignRouteTokenInput {
   readonly user: RoleName;
   readonly cid: string;
   /** The admission's verified connection target. */
-  readonly target: DatabaseTarget;
+  readonly target: CnpgDatabaseTarget;
   /** Milliseconds since the epoch. */
   readonly now?: number;
   readonly ttlSeconds?: number;
@@ -197,35 +174,15 @@ export interface SignRouteTokenInput {
 export async function signRouteToken(
   input: SignRouteTokenInput,
 ): Promise<string> {
-  const poolTarget =
-    input.target &&
-    ("kind" in input.target ||
-      "binding_id" in input.target ||
-      "scope_sha256" in input.target)
-      ? PoolDatabaseTarget.safeParse(input.target)
-      : undefined;
-  if (poolTarget && !poolTarget.success)
-    throw new RangeError("invalid pool route target");
-  const pool = poolTarget?.success ? poolTarget.data : undefined;
   if (input.target?.route_revision !== undefined)
     return seal(
       input,
-      admissionRouteTokenClaimsSchema.safeParse({
+      cnpgAdmissionRouteTokenClaimsSchema.safeParse({
         v: 4,
         ...connection(input),
         rev: input.target.revision,
         pod: input.target.pod_uid,
         route_revision: input.target.route_revision,
-        ...(pool
-          ? {
-              kind: pool.kind,
-              binding_id: pool.binding_id,
-              node_uid: pool.node_uid,
-              pod_ip: pool.pod_ip,
-              storage_generation: pool.storage_generation,
-              scope_sha256: pool.scope_sha256,
-            }
-          : {}),
       }),
       ADMISSION_TOKEN_PREFIX,
       ADMISSION_SIGNATURE_DOMAIN,
@@ -379,7 +336,7 @@ export async function verifyRouteToken(
     legacy
       ? legacyRouteTokenClaimsSchema
       : admission
-        ? admissionRouteTokenClaimsSchema
+        ? cnpgAdmissionRouteTokenClaimsSchema
         : routeTokenClaimsSchema
   ).safeParse(decoded);
   if (!claims.success) return fail("invalid_claims");

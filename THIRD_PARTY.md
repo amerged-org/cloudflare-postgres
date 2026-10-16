@@ -1,22 +1,5 @@
 # Third-party components
 
-**Local pool integration fixture:** the supervisor tests build unmodified
-[MinIO source `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`](https://github.com/minio/minio/tree/9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a)
-from the upstream `RELEASE.2025-10-15T17-29-55Z` tag. MinIO retains its
-[AGPL v3 license](https://github.com/minio/minio/blob/9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a/LICENSE)
-and its source headers permit version 3 or later. It is separate from the Apache-2.0 supervisor.
-The source archive SHA-256 is
-`45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841`;
-the upstream license SHA-256 is
-`0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0`.
-The existing official Go 1.27.2 Alpine builder index
-`sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d`
-selects AMD64 manifest
-`sha256:3b15ba438c60ab8fabe5fee3b11025c0049e358b31feff384648f11fc8e335f8`.
-The fixture image includes the license and corresponding source archive, uses an isolated local
-Docker network and ephemeral credentials, and is never a deployed regional component. Its
-measured local image identity is a test receipt, not an upstream published distribution digest.
-
 Reviewed: 2026-10-06. The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
 No upstream source is vendored in the repository. The TypeScript regional image (`apps/regional`,
@@ -166,10 +149,7 @@ vendor-published digest. The compiler is not shipped in PGCF runtime images.
 The native sandbox-controller adapter uses unchanged Apache-2.0 protobuf definitions from
 [containerd 2.3.6](https://github.com/containerd/containerd/tree/v2.3.6/api),
 [Kubernetes CRI API 0.36.5](https://github.com/kubernetes/cri-api/tree/v0.36.5),
-[containerd ttrpc 1.2.7](https://github.com/containerd/ttrpc/tree/v1.2.7), and
-[CSI specification 1.9.0](https://github.com/container-storage-interface/spec/tree/v1.9.0),
-matching the pinned OpenEBS driver's CSI dependency. The CSI client is restricted to fixed
-qualification denial requests through the exact locally verified driver socket.
+and [containerd ttrpc 1.2.7](https://github.com/containerd/ttrpc/tree/v1.2.7).
 Exact source paths and SHA256 values are retained in
 `apps/sandbox-controller/proto/sources.json`, with their upstream licenses beside them.
 The adapter's direct crates are tonic/tonic-prost/tonic-prost-build 0.14.6 (MIT),

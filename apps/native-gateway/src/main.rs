@@ -63,25 +63,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let legacy = std::env::var("PGCF_GATEWAY_LEGACY_BINDINGS_JSON").unwrap_or_else(|_| "[]".into());
     *gateway.targets.write().await = targets::Targets::with_legacy(&legacy)?;
-    let pool_enabled = match std::env::var("PGCF_POSTGRES_POOL_ENABLED").as_deref() {
-        Ok("1") => true,
-        Ok("0") | Err(std::env::VarError::NotPresent) => false,
-        _ => return Err("invalid PostgreSQL pool feature flag".into()),
-    };
-    gateway.targets.write().await.enable_pool(pool_enabled);
     let (stop, receiver) = watch::channel(false);
-    let mut pool_watches = Vec::new();
-    if pool_enabled {
-        for kind in ["poolpods", "poolnodes"] {
-            pool_watches.push(tokio::spawn(targets::synchronize(
-                api.clone(),
-                gateway.targets.clone(),
-                trust.clone(),
-                kind,
-                receiver.clone(),
-            )));
-        }
-    }
     let endpoints = tokio::spawn(targets::synchronize(
         api.clone(),
         gateway.targets.clone(),
@@ -137,9 +119,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = endpoints.await;
     let _ = storage.await;
     let _ = pods.await;
-    for watcher in pool_watches {
-        let _ = watcher.await;
-    }
     Ok(())
 }
 async fn shutdown_signal() {

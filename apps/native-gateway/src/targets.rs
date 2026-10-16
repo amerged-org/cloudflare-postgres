@@ -26,25 +26,11 @@ pub struct TargetIdentity {
     pub storage: Option<StorageBinding>,
     pub container_id: Option<String>,
     pub ca: Option<CaIdentity>,
-    pub pool: Option<PoolIdentity>,
     /// The writer is admitted on the controller's attestation instead of the kubelet's report:
     /// its endpoint, or its `postgres` container, is not yet reported Ready. It is evidence of
     /// how the writer was chosen, never part of its identity: a session started on it continues
     /// when the kubelet's report arrives.
     pub unready: bool,
-}
-/// The immutable Cloudflare holder scope. Current CA and route revision live in the admission
-/// target, so a same-holder certificate refresh never rewrites the binding's original scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolIdentity {
-    pub binding_id: String,
-    pub node_uid: String,
-    pub boot_id: String,
-    pub scope_sha256: String,
-    pub storage_generation: u64,
-    pub generation: u64,
-    pub admission_epoch: u64,
-    pub route_revision: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaIdentity {
@@ -143,14 +129,10 @@ impl Witness {
 }
 #[derive(Default)]
 pub struct Targets {
-    pool_enabled: bool,
     legacy: HashMap<String, LegacyStorageBinding>,
     identities: HashMap<String, TargetIdentity>,
     slices: HashMap<String, Value>,
     pods: HashMap<String, Value>,
-    pool_pods: HashMap<String, Value>,
-    pool_nodes: HashMap<String, Value>,
-    pool_history: HashMap<String, Value>,
     maps: HashMap<String, Value>,
     gates: HashMap<String, StorageGate>,
     witnesses: HashMap<String, Witness>,
@@ -159,8 +141,6 @@ pub struct Targets {
     authority_refusals: HashMap<String, TargetUnavailable>,
     slices_observed: Option<Instant>,
     pods_observed: Option<Instant>,
-    pool_pods_observed: Option<Instant>,
-    pool_nodes_observed: Option<Instant>,
     maps_observed: Option<Instant>,
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, &'static str> {
@@ -234,29 +214,7 @@ fn owned_pod(v: &Value) -> Result<String, &'static str> {
     }
     uuid(&v["metadata"], "uid")
 }
-fn owned_pool_pod(v: &Value) -> Result<String, &'static str> {
-    if !crate::kubernetes::typed(v, "v1", "Pod")
-        || v["metadata"]["namespace"]
-            != pgcf_native_protocol::pool::constant("namespace")
-                .as_str()
-                .ok_or("pool namespace unavailable")?
-        || v["metadata"]["labels"]["app.kubernetes.io/name"] != "pgcf-pool"
-    {
-        return Err("invalid pool Pod discovery");
-    }
-    uuid(&v["metadata"], "uid")
-}
-fn owned_pool_node(v: &Value) -> Result<String, &'static str> {
-    if !crate::kubernetes::typed(v, "v1", "Node") {
-        return Err("invalid pool Node discovery");
-    }
-    uuid(&v["metadata"], "uid")?;
-    Ok(text(&v["metadata"], "name")?.into())
-}
 impl Targets {
-    pub fn enable_pool(&mut self, enabled: bool) {
-        self.pool_enabled = enabled;
-    }
     pub fn with_legacy(raw: &str) -> Result<Self, &'static str> {
         if raw.len() > 1024 * 1024 {
             return Err("legacy custody configuration too large");
@@ -453,10 +411,6 @@ impl Targets {
                 Some(owned_slice(item)?)
             } else if kind == "pods" {
                 Some(owned_pod(item)?)
-            } else if kind == "poolpods" {
-                Some(owned_pool_pod(item)?)
-            } else if kind == "poolnodes" {
-                Some(owned_pool_node(item)?)
             } else {
                 owned_map(item)?
             };
@@ -472,12 +426,6 @@ impl Targets {
         } else if kind == "pods" {
             self.pods = next;
             self.pods_observed = Some(Instant::now());
-        } else if kind == "poolpods" {
-            self.pool_pods = next;
-            self.pool_pods_observed = Some(Instant::now());
-        } else if kind == "poolnodes" {
-            self.pool_nodes = next;
-            self.pool_nodes_observed = Some(Instant::now());
         } else {
             self.maps = next;
             self.maps_observed = Some(Instant::now());
@@ -512,10 +460,6 @@ impl Targets {
             Some(owned_slice(object)?)
         } else if kind == "pods" {
             Some(owned_pod(object)?)
-        } else if kind == "poolpods" {
-            Some(owned_pool_pod(object)?)
-        } else if kind == "poolnodes" {
-            Some(owned_pool_node(object)?)
         } else {
             owned_map(object)?
         };
@@ -524,10 +468,6 @@ impl Targets {
                 &mut self.slices
             } else if kind == "pods" {
                 &mut self.pods
-            } else if kind == "poolpods" {
-                &mut self.pool_pods
-            } else if kind == "poolnodes" {
-                &mut self.pool_nodes
             } else {
                 &mut self.maps
             };
@@ -547,10 +487,6 @@ impl Targets {
             }
         }
         self.touch(kind);
-        if matches!(kind, "poolpods" | "poolnodes") {
-            self.refresh_gates(trust);
-            return Ok(());
-        }
         let database = if kind == "endpointslices" || kind == "pods" {
             text(&object["metadata"], "namespace")?
                 .strip_prefix("pgcf-db-")
@@ -566,24 +502,11 @@ impl Targets {
             self.slices_observed = Some(Instant::now());
         } else if kind == "pods" {
             self.pods_observed = Some(Instant::now());
-        } else if kind == "poolpods" {
-            self.pool_pods_observed = Some(Instant::now());
-        } else if kind == "poolnodes" {
-            self.pool_nodes_observed = Some(Instant::now());
         } else {
             self.maps_observed = Some(Instant::now());
         }
     }
     pub fn disconnect(&mut self, kind: &str) {
-        if matches!(kind, "poolpods" | "poolnodes") {
-            if kind == "poolpods" {
-                self.pool_pods_observed = None;
-            } else {
-                self.pool_nodes_observed = None;
-            }
-            self.identities.retain(|_, target| target.pool.is_none());
-            return;
-        }
         if kind == "pods" {
             self.pods_observed = None;
             for target in self.identities.values_mut() {
@@ -609,26 +532,6 @@ impl Targets {
         database: &str,
         attested: Option<&AdmissionTarget>,
     ) -> Result<(IpAddr, String, String, bool), &'static str> {
-        // A pool holder is distinct from CNPG. Disabled, malformed or non-serving pool authority
-        // never admits the CNPG Pod that may still have a stale Ready EndpointSlice.
-        if self
-            .maps
-            .get(&format!("gateway-fence-{database}"))
-            .is_some_and(|fence| {
-                fence["data"]
-                    .as_object()
-                    .is_some_and(|data| data.contains_key("pool-binding.json"))
-            })
-        {
-            return Err("pool target unavailable");
-        }
-        if self
-            .pool_history
-            .get(database)
-            .is_some_and(|prior| !matches!(prior["state"].as_str(), Some("released" | "refused")))
-        {
-            return Err("pool holder disappeared");
-        }
         let namespace = format!("pgcf-db-{database}");
         let mut endpoints = BTreeMap::new();
         // The attested Pod while not Ready, and the other endpoints not Ready either.
@@ -724,272 +627,6 @@ impl Targets {
         selected
             .map(|(address, uid, node)| (address, uid, node, true))
             .ok_or("writer target unavailable")
-    }
-    fn pool_record(&self, database: &str) -> Result<Option<Value>, &'static str> {
-        let Some(fence) = self.maps.get(&format!("gateway-fence-{database}")) else {
-            return Ok(None);
-        };
-        if !fence["data"]
-            .as_object()
-            .is_some_and(|data| data.contains_key("pool-binding.json"))
-        {
-            return Ok(None);
-        }
-        let record = json(&fence["data"], "pool-binding.json")?;
-        if !pgcf_native_protocol::pool::binding_valid(&record)
-            || record["scope"]["database_id"] != database
-        {
-            return Err("pool binding invalid");
-        }
-        Ok(Some(record))
-    }
-    fn remember_pool(&mut self, database: &str, record: &Value) -> Result<(), &'static str> {
-        if let Some(prior) = self.pool_history.get(database) {
-            if prior["scope"]["binding_id"] == record["scope"]["binding_id"] {
-                if prior["scope"] != record["scope"]
-                    || prior["scope_sha256"] != record["scope_sha256"]
-                    || safe_integer(&record["holder_revision"])?
-                        < safe_integer(&prior["holder_revision"])?
-                    || record["updated_at"].as_u64() < prior["updated_at"].as_u64()
-                    || (prior["state"] != record["state"]
-                        && !match prior["state"].as_str() {
-                            Some("claimed") => matches!(
-                                record["state"].as_str(),
-                                Some(
-                                    "mounted"
-                                        | "serving"
-                                        | "detaching"
-                                        | "failed"
-                                        | "lost"
-                                        | "refused"
-                                )
-                            ),
-                            Some("mounted") => matches!(
-                                record["state"].as_str(),
-                                Some("serving" | "detaching" | "failed" | "lost" | "released")
-                            ),
-                            Some("serving") => matches!(
-                                record["state"].as_str(),
-                                Some("detaching" | "failed" | "lost")
-                            ),
-                            Some("detaching") => matches!(
-                                record["state"].as_str(),
-                                Some("failed" | "lost" | "released" | "refused")
-                            ),
-                            Some("failed" | "lost") => matches!(
-                                record["state"].as_str(),
-                                Some("failed" | "lost" | "released" | "refused")
-                            ),
-                            _ => false,
-                        })
-                {
-                    return Err("pool holder history changed");
-                }
-            } else if !matches!(prior["state"].as_str(), Some("released" | "refused"))
-                || safe_integer(&record["scope"]["route_revision"])?
-                    <= safe_integer(&prior["scope"]["route_revision"])?
-            {
-                return Err("pool holder replaced before release");
-            }
-        } else if self.pool_history.len() >= 4000 {
-            return Err("pool holder capacity exceeded");
-        }
-        self.pool_history.insert(database.into(), record.clone());
-        Ok(())
-    }
-    fn pool_identity(
-        &self,
-        database: &str,
-        record: &Value,
-    ) -> Result<TargetIdentity, &'static str> {
-        if !self.pool_enabled
-            || !matches!(record["state"].as_str(), Some("serving" | "detaching"))
-            || !self
-                .pool_pods_observed
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
-            || !self
-                .pool_nodes_observed
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
-        {
-            return Err("pool writer unavailable");
-        }
-        let scope = &record["scope"];
-        let fence = self
-            .maps
-            .get(&format!("gateway-fence-{database}"))
-            .ok_or("pool power identity unavailable")?;
-        let storage = self
-            .maps
-            .get(&format!("storage-{database}"))
-            .ok_or("pool storage identity unavailable")?;
-        if !fence["metadata"]["deletionTimestamp"].is_null()
-            || !storage["metadata"]["deletionTimestamp"].is_null()
-        {
-            return Err("pool storage retiring");
-        }
-        let intent = json(&fence["data"], "intent.json")?;
-        let generation = safe_integer(&scope["generation"])?;
-        let intent_generation = safe_integer(&intent["revision"])?;
-        if intent["database"] != database
-            || !matches!(intent["mode"].as_str(), Some("running" | "quiesce"))
-            || (record["state"] == "serving" && intent_generation != generation)
-            || (record["state"] == "detaching" && intent_generation < generation)
-        {
-            return Err("pool power scope changed");
-        }
-        let state = json(&storage["data"], "state")?;
-        let volume = json(
-            &storage["metadata"]["annotations"],
-            "pgcf.io/volume-identity",
-        )?;
-        let power = json(&fence["data"], "power.json")?;
-        let anchor = &power["anchor"];
-        let physical = &scope["storage"];
-        if storage["metadata"]["uid"] != physical["storage_uid"]
-            || anchor["storageUid"] != physical["storage_uid"]
-            || anchor["storage"] != state["storage"]
-            || safe_integer(&anchor["physicalGeneration"])?
-                != safe_integer(&physical["storage_generation"])?
-            || json(anchor, "storageState")? != state
-            || json(anchor, "volumeIdentity")? != volume
-            || state["namespaceUid"] != physical["namespace_uid"]
-            || state["clusterUid"] != physical["cnpg_cluster_uid"]
-            || volume["handle"] != physical["volume_handle"]
-            || volume["claimUid"] != physical["pvc_uid"]
-            || volume["volumeUid"] != physical["pv_uid"]
-            || volume["lvUuid"] != physical["lv_uuid"]
-        {
-            return Err("pool retained storage changed");
-        }
-        match physical["backend"].as_str() {
-            Some("lvm-thick-v1") if state["storage"].is_null() => {}
-            Some("lvm-thin-v1")
-                if state["storage"] == physical["profile"]
-                    && physical["profile"]["node_uid"] == scope["node_uid"]
-                    && physical["profile"]["volume_group_uuid"]
-                        == physical["volume_group_uuid"] => {}
-            _ => return Err("pool storage profile changed"),
-        }
-        let pod_uid = text(scope, "pool_pod_uid")?;
-        let pod = self.pool_pods.get(pod_uid).ok_or("pool Pod unavailable")?;
-        let address: IpAddr = text(scope, "pool_pod_ip")?
-            .parse()
-            .map_err(|_| "pool address invalid")?;
-        if !match address {
-            IpAddr::V4(ip) => ip.is_private(),
-            IpAddr::V6(ip) => ip.is_unique_local(),
-        } {
-            return Err("pool address invalid");
-        }
-        if !pod["metadata"]["deletionTimestamp"].is_null()
-            || pod["metadata"]["name"] != scope["pool_pod_name"]
-            || pod["spec"]["nodeName"] != state["node"]
-            || pod["status"]["podIP"]
-                .as_str()
-                .and_then(|value| value.parse::<IpAddr>().ok())
-                != Some(address)
-        {
-            return Err("pool Pod scope changed");
-        }
-        let node = text(&state, "node")?.to_string();
-        let host = self.pool_nodes.get(&node).ok_or("pool Node unavailable")?;
-        if host["metadata"]["uid"] != scope["node_uid"]
-            || host["status"]["nodeInfo"]["bootID"] != scope["boot_id"]
-            || !host["metadata"]["deletionTimestamp"].is_null()
-            || !host["status"]["conditions"]
-                .as_array()
-                .is_some_and(|items| {
-                    items.iter().filter(|item| item["type"] == "Ready").count() == 1
-                        && items
-                            .iter()
-                            .any(|item| item["type"] == "Ready" && item["status"] == "True")
-                })
-        {
-            return Err("pool Node identity changed");
-        }
-        let statuses = pod["status"]["containerStatuses"]
-            .as_array()
-            .ok_or("pool runtime unavailable")?;
-        let mut actual_ids = statuses
-            .iter()
-            .map(|container| {
-                if container["state"]["running"].is_null() {
-                    return Err("pool container stopped");
-                }
-                text(container, "containerID")?
-                    .strip_prefix("containerd://")
-                    .map(str::to_string)
-                    .ok_or("pool container identity invalid")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut scoped_ids = scope["container_ids"]
-            .as_array()
-            .ok_or("pool container scope unavailable")?
-            .iter()
-            .map(|id| {
-                id.as_str()
-                    .map(str::to_string)
-                    .ok_or("pool container scope invalid")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        actual_ids.sort();
-        scoped_ids.sort();
-        if actual_ids != scoped_ids || pod["metadata"]["namespace"] != scope["pool_namespace"] {
-            return Err("pool container or namespace scope changed");
-        }
-        let postgres = statuses
-            .iter()
-            .filter(|item| item["name"] == "postgres")
-            .collect::<Vec<_>>();
-        if postgres.len() != 1
-            || postgres[0]["ready"] != true
-            || postgres[0]["state"]["running"].is_null()
-            || postgres[0]["containerID"]
-                .as_str()
-                .and_then(|value| value.strip_prefix("containerd://"))
-                != scope["container_id"].as_str()
-            || !postgres[0]["imageID"].as_str().is_some_and(|image| {
-                image.ends_with(&format!(
-                    "@sha256:{}",
-                    text(&scope["class"], "postgres_image_sha256").unwrap_or("")
-                ))
-            })
-        {
-            return Err("pool runtime changed");
-        }
-        let ca = self
-            .current_ca(database)
-            .ok_or("pool TLS authority unavailable")?;
-        let physical_authority = if physical["backend"] == "lvm-thin-v1" {
-            let mut binding = self
-                .binding(database, pod_uid, &node)?
-                .ok_or("pool thin authority identity unavailable")?;
-            // The old writer drains only under its immutable CF-issued generation, even while a
-            // future mutation is pending. A current/new generation sa1 cannot cover this holder.
-            binding.generation = generation;
-            Some(binding)
-        } else {
-            None
-        };
-        Ok(TargetIdentity {
-            address,
-            pod_uid: pod_uid.into(),
-            node,
-            storage: physical_authority,
-            container_id: Some(text(scope, "container_id")?.into()),
-            ca: Some(ca),
-            pool: Some(PoolIdentity {
-                binding_id: text(scope, "binding_id")?.into(),
-                node_uid: text(scope, "node_uid")?.into(),
-                boot_id: text(scope, "boot_id")?.into(),
-                scope_sha256: text(record, "scope_sha256")?.into(),
-                storage_generation: safe_integer(&physical["storage_generation"])?,
-                generation,
-                admission_epoch: safe_integer(&scope["admission_epoch"])?,
-                route_revision: safe_integer(&scope["route_revision"])?,
-            }),
-            unready: false,
-        })
     }
     fn binding(
         &self,
@@ -1142,7 +779,6 @@ impl Targets {
                         storage: self.binding(database, &pod_uid, &node)?,
                         pod_uid,
                         node,
-                        pool: None,
                     })
                 });
         if let Some(published) = &published {
@@ -1152,17 +788,7 @@ impl Targets {
     }
     fn refresh_gate(&mut self, database: &str, trust: Option<&StorageTrust>) {
         let now = control::now();
-        let record = self.pool_record(database).and_then(|record| {
-            if let Some(record) = &record {
-                self.remember_pool(database, record)?;
-            }
-            Ok(record)
-        });
-        let identity = match record {
-            Ok(Some(record)) => self.pool_identity(database, &record),
-            Err(error) => Err(error),
-            Ok(None) => self.writer_identity(database),
-        };
+        let identity = self.writer_identity(database);
         if !self.maps.contains_key(&format!("storage-{database}"))
             && !self.maps.contains_key(&format!("gateway-fence-{database}"))
         {
@@ -1220,28 +846,13 @@ impl Targets {
         database: &str,
         now: u64,
     ) -> Result<&TargetIdentity, TargetUnavailable> {
-        if !valid_pattern("database", database)
-            || !self
-                .maps_observed
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
-        {
+        if !valid_pattern("database", database) || !self.synchronized() {
             return Err(TargetUnavailable::DiscoveryUnavailable);
         }
         let target = self
             .identities
             .get(database)
             .ok_or(TargetUnavailable::WriterIdentityUnavailable)?;
-        if target.pool.is_some() {
-            if !self.pool_enabled
-                || ![self.pool_pods_observed, self.pool_nodes_observed]
-                    .iter()
-                    .all(|at| at.is_some_and(|at| at.elapsed() < Duration::from_secs(70)))
-            {
-                return Err(TargetUnavailable::DiscoveryUnavailable);
-            }
-        } else if !self.synchronized() {
-            return Err(TargetUnavailable::DiscoveryUnavailable);
-        }
         // The attestation ends with the kubelet's report or with its bound, and no event of the
         // cluster marks the bound: it is read here, for every admission and every check of a
         // session.
@@ -1280,36 +891,6 @@ impl Targets {
     }
     pub fn target(&self, database: &str, now: u64) -> Result<TargetIdentity, TargetUnavailable> {
         let mut target = self.current_target(database, now)?.clone();
-        if target.pool.is_some() {
-            let record = self
-                .pool_record(database)
-                .map_err(|_| TargetUnavailable::WriterIdentityUnavailable)?
-                .ok_or(TargetUnavailable::WriterIdentityUnavailable)?;
-            let fence = self
-                .maps
-                .get(&format!("gateway-fence-{database}"))
-                .ok_or(TargetUnavailable::WriterIdentityUnavailable)?;
-            if record["state"] != "serving"
-                || json(&fence["data"], "intent.json")
-                    .map_err(|_| TargetUnavailable::WriterIdentityUnavailable)?["mode"]
-                    != "running"
-            {
-                return Err(TargetUnavailable::WriterIdentityUnavailable);
-            }
-            let pod = self
-                .pool_pods
-                .get(&target.pod_uid)
-                .ok_or(TargetUnavailable::WriterIdentityUnavailable)?;
-            if !pod["status"]["conditions"].as_array().is_some_and(|items| {
-                items.iter().filter(|item| item["type"] == "Ready").count() == 1
-                    && items
-                        .iter()
-                        .any(|item| item["type"] == "Ready" && item["status"] == "True")
-            }) {
-                return Err(TargetUnavailable::WriterIdentityUnavailable);
-            }
-            return Ok(target);
-        }
         if !self.pods_synchronized() {
             // The Pod watch is what recognized a writer the kubelet has not reported Ready.
             if target.unready {
@@ -1350,10 +931,8 @@ impl Targets {
             || current.pod_uid != target.pod_uid
             || current.node != target.node
             || (target.container_id.is_some()
-                && (current.container_id != target.container_id
-                    || (current.pool.is_none() && !self.pods_synchronized())))
-            || (target.pool.is_none() && target.ca.is_some() && current.ca != target.ca)
-            || current.pool != target.pool
+                && (current.container_id != target.container_id || !self.pods_synchronized()))
+            || (target.ca.is_some() && current.ca != target.ca)
         {
             return false;
         }
@@ -1375,41 +954,6 @@ impl Targets {
             _ => false,
         }
     }
-    /// Closing idle sessions under a running intent is restricted to the exact detaching
-    /// thin holder. This uses the same physical/watch/SA1 decision as existing sessions.
-    pub fn running_pool_close_permitted(
-        &self,
-        database: &str,
-        operation: &str,
-        revision: u64,
-        now: u64,
-    ) -> bool {
-        let Ok(target) = self.current_target(database, now) else {
-            return false;
-        };
-        let Some(identity) = target.pool.as_ref() else {
-            return false;
-        };
-        let Ok(Some(record)) = self.pool_record(database) else {
-            return false;
-        };
-        let Some(fence) = self.maps.get(&format!("gateway-fence-{database}")) else {
-            return false;
-        };
-        let Ok(intent) = json(&fence["data"], "intent.json") else {
-            return false;
-        };
-        target.storage.is_some()
-            && record["state"] == "detaching"
-            && identity.generation == revision
-            && record["scope"]["generation"].as_u64() == Some(revision)
-            && record["scope"]["binding_id"] == identity.binding_id
-            && record["scope_sha256"] == identity.scope_sha256
-            && intent["database"] == database
-            && intent["operation"] == operation
-            && intent["revision"].as_u64() == Some(revision)
-            && intent["mode"] == "running"
-    }
 }
 
 fn discovery(kind: &str) -> (String, &'static str) {
@@ -1419,16 +963,6 @@ fn discovery(kind: &str) -> (String, &'static str) {
             "kubernetes.io/service-name=database-rw",
         ),
         "pods" => ("/api/v1/pods".into(), "cnpg.io/cluster=database"),
-        "poolpods" => (
-            format!(
-                "/api/v1/namespaces/{}/pods",
-                pgcf_native_protocol::pool::constant("namespace")
-                    .as_str()
-                    .unwrap()
-            ),
-            "app.kubernetes.io/name=pgcf-pool",
-        ),
-        "poolnodes" => ("/api/v1/nodes".into(), ""),
         _ => (
             format!("/api/v1/namespaces/{}/configmaps", wire("fenceNamespace")),
             "pgcf.io/database-id",
@@ -1458,10 +992,8 @@ pub async fn synchronize(
             };
             let expected_kind = if kind == "endpointslices" {
                 "EndpointSliceList"
-            } else if matches!(kind, "pods" | "poolpods") {
+            } else if kind == "pods" {
                 "PodList"
-            } else if kind == "poolnodes" {
-                "NodeList"
             } else {
                 "ConfigMapList"
             };
@@ -1675,239 +1207,6 @@ mod tests {
         assert!(Targets::with_legacy("{}").is_err());
         assert!(Targets::with_legacy("[{\"database_id\":\"invalid\"}]").is_err());
         assert!(Targets::with_legacy("[]").unwrap().legacy.is_empty());
-    }
-    #[test]
-    fn a_pool_record_never_falls_back_to_a_ready_cnpg_endpoint() {
-        let database = "aaaaaaaaaaaaaaaaaaaa";
-        let id = |number: u32| format!("00000000-0000-4000-8000-{number:012x}");
-        let volume = json!({"handle":format!("pvc-{}",id(5)),"claimUid":id(5),"volumeUid":id(6)});
-        let storage = json!({"node":"customer-us1","namespaceUid":id(7),"clusterUid":id(8)});
-        let cohort = json!([{"database_id":database,"storage_uid":id(2),"namespace_uid":id(7),"cluster_uid":id(8),"physical_generation":1,"volume_identity":volume}]);
-        let labels = json!({"pgcf.io/database-id":database});
-        let mut maps = vec![
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{database}"),"namespace":"pgcf-system","uid":id(2),"labels":labels,"annotations":{"pgcf.io/volume-identity":volume.to_string()}},"data":{"state":storage.to_string()}}),
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("gateway-fence-{database}"),"namespace":"pgcf-system","uid":id(100),"labels":labels},"data":{"power.json":json!({"anchor":{"storageUid":id(2),"storageState":storage.to_string(),"volumeIdentity":volume.to_string(),"physicalGeneration":1}}).to_string()}}),
-        ];
-        let mut state = Targets::with_legacy(&cohort.to_string()).unwrap();
-        state
-            .replace("endpointslices", &[slice(&id(3), "10.0.0.7")], None)
-            .unwrap();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(state.target(database, control::now()).is_ok());
-        // Presence is authority intent even when disabled, malformed or not serving. It is never a hit
-        // on the old CNPG Pod, and must not be bypassed by that Pod's remaining EndpointSlice.
-        maps[1]["data"]["pool-binding.json"] = json!({"state":"claimed"}).to_string().into();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(state.target(database, control::now()).is_err());
-    }
-    fn pool_fixture() -> (Targets, Vec<Value>, Value, Value, Value) {
-        let database = "a".repeat(20);
-        let id = |number: u32| format!("00000000-0000-4000-8000-{number:012x}");
-        let physical = json!({"backend":"lvm-thick-v1","storage_generation":1,"storage_uid":id(2),"namespace_uid":id(7),"cnpg_cluster_uid":id(8),"pvc_uid":id(5),"pv_uid":id(6),"volume_handle":format!("pvc-{}",id(5)),"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","lv_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg"});
-        let class = json!({"postgres_image_sha256":"a".repeat(64),"cpu_request_millicores":250,"cpu_limit_millicores":500,"memory_request_bytes":268435456,"memory_limit_bytes":536870912,"configuration_profile_sha256":"b".repeat(64)});
-        let scope = json!({"v":1,"binding_id":id(10),"database_id":database,"generation":7,"route_revision":19,"admission_epoch":11,"configuration_fingerprint":"c".repeat(64),"region_id":"eu-test","node_id":format!("nod_{}","a".repeat(20)),"node_uid":id(11),"boot_id":id(12),"pool_namespace":"pgcf-pool","pool_namespace_uid":id(22),"container_ids":["d".repeat(64)],"pool_pod_uid":id(13),"pool_pod_name":"pgcf-pool-test","pool_pod_ip":"10.0.0.9","container_id":"d".repeat(64),"supervisor_key_sha256":"e".repeat(64),"supervisor_sha256":"f".repeat(64),"driver_image":format!("registry.test/driver@sha256:{}","1".repeat(64)),"driver_sha256":"2".repeat(64),"host_controller_sha256":"3".repeat(64),"class":class,"storage":physical,"system_identifier":"7000000000000000000","timeline":1,"bundle_nonce":id(14)});
-        let scope_hash = Sha256::digest(serde_json::to_vec(&scope).unwrap())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let record = json!({"v":1,"scope":scope,"scope_sha256":scope_hash,"holder_revision":1,"state":"serving","created_at":1000,"updated_at":2000});
-        let volume = json!({"handle":physical["volume_handle"],"claimUid":physical["pvc_uid"],"volumeUid":physical["pv_uid"],"lvUuid":physical["lv_uuid"]});
-        let storage = json!({"node":"customer-us1","namespaceUid":physical["namespace_uid"],"clusterUid":physical["cnpg_cluster_uid"]});
-        let labels = json!({"pgcf.io/database-id":database});
-        let maps = vec![
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{database}"),"namespace":"pgcf-system","uid":physical["storage_uid"],"labels":labels,"annotations":{"pgcf.io/volume-identity":volume.to_string()}},"data":{"state":storage.to_string()}}),
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("gateway-fence-{database}"),"namespace":"pgcf-system","uid":id(100),"labels":labels},"data":{"power.json":json!({"anchor":{"storageUid":physical["storage_uid"],"storageState":storage.to_string(),"volumeIdentity":volume.to_string(),"physicalGeneration":1}}).to_string(),"intent.json":json!({"database":database,"operation":format!("op_{}","a".repeat(20)),"revision":7,"mode":"running"}).to_string(),"pool-binding.json":record.to_string()}}),
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{database}"),"namespace":"pgcf-system","uid":id(20),"labels":labels,"annotations":{"pgcf.io/source-ca-secret-uid":id(21),"pgcf.io/source-ca-secret-resource-version":"81"}},"data":{"ca.crt":"public test certificate material"}}),
-        ];
-        let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"pgcf-pool-test","namespace":"pgcf-pool","uid":id(13),"resourceVersion":"1","labels":{"app.kubernetes.io/name":"pgcf-pool"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.9","conditions":[{"type":"Ready","status":"True"}],"containerStatuses":[{"name":"postgres","ready":true,"containerID":format!("containerd://{}","d".repeat(64)),"imageID":format!("registry.test/postgres@sha256:{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-13T10:00:00Z"}}}]}});
-        let node = json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"customer-us1","uid":id(11),"resourceVersion":"1"},"status":{"nodeInfo":{"bootID":id(12)},"conditions":[{"type":"Ready","status":"True"}]}});
-        let mut state = Targets::default();
-        state.enable_pool(true);
-        state
-            .replace("endpointslices", &[slice(&id(3), "10.0.0.7")], None)
-            .unwrap();
-        state
-            .replace("poolnodes", std::slice::from_ref(&node), None)
-            .unwrap();
-        state
-            .replace("poolpods", std::slice::from_ref(&pod), None)
-            .unwrap();
-        state.replace("configmaps", &maps, None).unwrap();
-        (state, maps, pod, node, record)
-    }
-    #[test]
-    fn pool_uses_exact_binding_and_watched_runtime_not_cnpg_endpoints_or_late_labels() {
-        let database = "a".repeat(20);
-        let (mut state, maps, mut pod, mut node, _) = pool_fixture();
-        let target = state.target(&database, control::now()).unwrap();
-        assert_eq!(target.address.to_string(), "10.0.0.9");
-        assert!(target.pool.is_some());
-        pod["metadata"]["labels"]["pgcf.io/pool-database"] = "b".repeat(20).into();
-        state
-            .replace("poolpods", std::slice::from_ref(&pod), None)
-            .unwrap();
-        assert!(state.permits(&database, &target, control::now()));
-        pod["status"]["containerStatuses"][0]["containerID"] =
-            format!("containerd://{}", "e".repeat(64)).into();
-        state
-            .replace("poolpods", std::slice::from_ref(&pod), None)
-            .unwrap();
-        assert!(state.target(&database, control::now()).is_err());
-        assert!(!state.permits(&database, &target, control::now()));
-        pod["status"]["containerStatuses"][0]["containerID"] =
-            format!("containerd://{}", "d".repeat(64)).into();
-        state.replace("poolpods", &[pod], None).unwrap();
-        node["status"]["nodeInfo"]["bootID"] = "00000000-0000-4000-8000-000000000099".into();
-        state.replace("poolnodes", &[node], None).unwrap();
-        assert!(!state.permits(&database, &target, control::now()));
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(state.target(&database, control::now()).is_err());
-    }
-    #[test]
-    fn same_pool_busy_session_survives_ca_refresh_and_graceful_detach_but_not_rollback_or_unknown_scope()
-     {
-        let database = "a".repeat(20);
-        let (mut state, mut maps, _, _, mut record) = pool_fixture();
-        let target = state.target(&database, control::now()).unwrap();
-        maps[2]["metadata"]["annotations"]["pgcf.io/source-ca-secret-resource-version"] =
-            "82".into();
-        maps[2]["data"]["ca.crt"] = "refreshed public certificate material".into();
-        state.replace("configmaps", &maps, None).unwrap();
-        let fresh = state.target(&database, control::now()).unwrap();
-        assert_ne!(target.ca, fresh.ca);
-        assert!(state.permits(&database, &target, control::now()));
-        record["state"] = "detaching".into();
-        record["holder_revision"] = 2.into();
-        record["updated_at"] = 3000.into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        maps[1]["data"]["intent.json"]=json!({"database":database,"operation":format!("op_{}","a".repeat(20)),"revision":8,"mode":"quiesce"}).to_string().into();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(state.target(&database, control::now()).is_err());
-        assert!(state.permits(&database, &target, control::now()));
-        record["state"] = "serving".into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(!state.permits(&database, &target, control::now()));
-        record["state"] = "detaching".into();
-        record["unexpected_proof"] = true.into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(!state.permits(&database, &target, control::now()));
-        record.as_object_mut().unwrap().remove("unexpected_proof");
-        record["state"] = "lost".into();
-        record["holder_revision"] = 3.into();
-        record["updated_at"] = 4000.into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(!state.permits(&database, &target, control::now()));
-        record["state"] = "detaching".into();
-        record["holder_revision"] = 4.into();
-        record["updated_at"] = 5000.into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        state.replace("configmaps", &maps, None).unwrap();
-        assert!(
-            !state.permits(&database, &target, control::now()),
-            "hard proof loss cannot be softened into a same-holder drain before release"
-        );
-    }
-
-    #[test]
-    fn thin_pool_holder_needs_its_own_signed_write_authority_and_keeps_expiry_protection() {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        use ring::signature::KeyPair;
-        let database = "a".repeat(20);
-        let (_, mut maps, pod, node, mut record) = pool_fixture();
-        let profile = json!({"backend":"lvm-thin-v1","storage_class":format!("pgcf-lvm-thin-v1-{}","a".repeat(16)),"volume_attributes_class":format!("pgcf-lvm-thin-v1-{}","a".repeat(16)),"profile_revision":1,"profile_sha256":"a".repeat(64),"node_uid":record["scope"]["node_uid"],"volume_group_uuid":record["scope"]["storage"]["volume_group_uuid"],"pool_uuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","startup_reserve_bytes":1048576,"write_bytes_per_second":1048576,"write_iops_per_second":64,"guard_seconds":120,"drain_seconds":1});
-        record["scope"]["storage"]["backend"] = "lvm-thin-v1".into();
-        record["scope"]["storage"]["thin_id"] = 1.into();
-        record["scope"]["storage"]["profile"] = profile.clone();
-        record["scope_sha256"] = Sha256::digest(serde_json::to_vec(&record["scope"]).unwrap())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-            .into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        let mut storage: Value =
-            serde_json::from_str(maps[0]["data"]["state"].as_str().unwrap()).unwrap();
-        storage["storage"] = profile.clone();
-        maps[0]["data"]["state"] = storage.to_string().into();
-        maps[0]["metadata"]["annotations"]["pgcf.io/gateway-fence-uid"] =
-            maps[1]["metadata"]["uid"].clone();
-        let mut power: Value =
-            serde_json::from_str(maps[1]["data"]["power.json"].as_str().unwrap()).unwrap();
-        power["anchor"]["storage"] = profile.clone();
-        power["anchor"]["storageState"] = storage.to_string().into();
-        maps[1]["data"]["power.json"] = power.to_string().into();
-        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-            .unwrap();
-        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
-        let public = serde_json::to_string(&std::collections::BTreeMap::from([(
-            "cf",
-            URL_SAFE_NO_PAD.encode(pair.public_key().as_ref()),
-        )]))
-        .unwrap();
-        let pin = Sha256::digest(public.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let trust = StorageTrust::parse(&public, &pin).unwrap();
-        let now = control::now();
-        let expires = now + 10000;
-        let issue = |generation, revision| {
-            let scope = &record["scope"];
-            let physical = &scope["storage"];
-            let claims = json!({"v":1,"kid":"cf","database_id":database,"generation":generation,"authority_revision":revision,"storage_uid":physical["storage_uid"],"node_uid":scope["node_uid"],"volume_group_uuid":profile["volume_group_uuid"],"pool_uuid":profile["pool_uuid"],"profile_sha256":profile["profile_sha256"],"volume_handle":physical["volume_handle"],"lv_uuid":physical["lv_uuid"],"pvc_uid":physical["pvc_uid"],"pv_uid":physical["pv_uid"],"pod_uid":scope["pool_pod_uid"],"observed_at":now,"iat":now,"exp":expires,"guard_seconds":120,"drain_seconds":1,"write_allowed":true});
-            let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-            let signed = pair.sign(format!("{}{body}", wire("storageAuthorityDomain")).as_bytes());
-            format!(
-                "{}.{body}.{}",
-                wire("storageAuthorityPrefix"),
-                URL_SAFE_NO_PAD.encode(signed.as_ref())
-            )
-        };
-        let mut state = Targets::default();
-        state.enable_pool(true);
-        state.replace("poolnodes", &[node], Some(&trust)).unwrap();
-        state.replace("poolpods", &[pod], Some(&trust)).unwrap();
-        state.replace("endpointslices", &[], Some(&trust)).unwrap();
-        state.replace("configmaps", &maps, Some(&trust)).unwrap();
-        assert!(state.target(&database, now).is_err());
-        maps[0]["data"][wire("storageAuthorityLedgerKey")] = issue(8, 1).into();
-        state.replace("configmaps", &maps, Some(&trust)).unwrap();
-        assert!(
-            state.target(&database, now).is_err(),
-            "a newer generation token cannot cover the old holder"
-        );
-        maps[0]["data"][wire("storageAuthorityLedgerKey")] = issue(7, 2).into();
-        state.replace("configmaps", &maps, Some(&trust)).unwrap();
-        let target = state.target(&database, now).unwrap();
-        assert_eq!(target.storage.as_ref().unwrap().generation, 7);
-        assert!(state.permits(&database, &target, now));
-        assert!(!state.permits(&database, &target, expires));
-        assert!(state.target(&database, expires).is_err());
-        let operation = format!("op_{}", "a".repeat(20));
-        assert!(
-            !state.running_pool_close_permitted(&database, &operation, 7, now),
-            "serving is not a detach request"
-        );
-        record["state"] = "detaching".into();
-        record["holder_revision"] = 2.into();
-        record["updated_at"] = 3000.into();
-        maps[1]["data"]["pool-binding.json"] = record.to_string().into();
-        state.replace("configmaps", &maps, Some(&trust)).unwrap();
-        assert!(state.running_pool_close_permitted(&database, &operation, 7, now));
-        assert!(!state.running_pool_close_permitted(&database, &operation, 8, now));
-        assert!(!state.running_pool_close_permitted(&database, "op_wrong", 7, now));
-        assert!(!state.running_pool_close_permitted(&database, &operation, 7, expires));
-        maps[1]["data"]["intent.json"] =
-            json!({"database":database,"operation":operation,"revision":8,"mode":"running"})
-                .to_string()
-                .into();
-        state.replace("configmaps", &maps, Some(&trust)).unwrap();
-        assert!(
-            !state.running_pool_close_permitted(&database, &operation, 8, now),
-            "a newer running fence cannot authorize the old holder close"
-        );
     }
 
     #[test]
@@ -2161,27 +1460,6 @@ mod tests {
         wake.slices[0]["endpoints"][0]["addresses"] = json!(["10.0.0.7", "10.0.0.8"]);
         wake.apply();
         assert!(wake.route().is_err());
-    }
-    #[test]
-    fn a_pool_holder_never_falls_back_to_an_attested_unready_writer() {
-        let database = "a".repeat(20);
-        let (mut state, mut maps, mut pool_pod, _, _) = pool_fixture();
-        // The CNPG Pod the holder replaced is still attested by the fence and not Ready.
-        let mut writer = slice(&wake_id(3), "10.0.0.7");
-        writer["endpoints"][0]["conditions"] = json!({"ready":false,"terminating":false});
-        let cnpg = json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{database}"),"uid":wake_id(3),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}});
-        let target = json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":wake_id(3),"container_id":"a".repeat(64),"ca_secret_uid":wake_id(21),"ca_secret_resource_version":"81","ca_sha256":sha256_hex(WAKE_CA),"tls_server_name":format!("database-rw.pgcf-db-{database}.svc")});
-        maps[1]["data"]["admission_target"] = target.to_string().into();
-        state.replace("endpointslices", &[writer], None).unwrap();
-        state.replace("pods", &[cnpg], None).unwrap();
-        state.replace("configmaps", &maps, None).unwrap();
-        let routed = state.target(&database, control::now()).unwrap();
-        assert_eq!(routed.address.to_string(), "10.0.0.9");
-        // The holder's runtime changes: nothing is routed, least of all the attested Pod.
-        pool_pod["status"]["containerStatuses"][0]["containerID"] =
-            format!("containerd://{}", "e".repeat(64)).into();
-        state.replace("poolpods", &[pool_pod], None).unwrap();
-        assert!(state.target(&database, control::now()).is_err());
     }
     #[test]
     fn a_lost_pod_watch_withdraws_the_unready_route_it_was_built_on() {

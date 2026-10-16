@@ -30,10 +30,9 @@ fn retry_manifest(
     schedule: &Value,
     backups: &[Value],
 ) -> Result<Option<Value>, Error> {
-    // Pool-owned storage is backed up by the supervisor. A stale desired snapshot must not
-    // cross a newer namespace generation or a CNPG hibernation/primary transition.
+    // A stale desired snapshot must not cross a newer namespace generation or a CNPG
+    // hibernation/primary transition.
     if text(db, "desired_state") != "running"
-        || db.get("pool_binding").is_some()
         || generation(ns) != number(db, "generation")
         || ns["metadata"]["annotations"]["pgcf.io/accepted-generation"].as_str()
             != Some(number(db, "generation").to_string().as_str())
@@ -135,7 +134,7 @@ pub async fn retry(
     cluster: &Value,
     backups: &[Value],
 ) -> Result<(), Error> {
-    if text(db, "desired_state") != "running" || db.get("pool_binding").is_some() {
+    if text(db, "desired_state") != "running" {
         return Ok(());
     }
     let namespace = namespace(db);
@@ -294,19 +293,6 @@ mod tests {
             retry_manifest(
                 &db,
                 &stale,
-                &cluster,
-                &schedule,
-                std::slice::from_ref(&failed)
-            )
-            .unwrap()
-            .is_none()
-        );
-        let mut held = db.clone();
-        held["pool_binding"] = json!({"state":"serving"});
-        assert!(
-            retry_manifest(
-                &held,
-                &namespace,
                 &cluster,
                 &schedule,
                 std::slice::from_ref(&failed)

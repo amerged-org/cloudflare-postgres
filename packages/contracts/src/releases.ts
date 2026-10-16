@@ -140,40 +140,6 @@ export const FleetTalosRawImage = z
       });
   });
 export type FleetTalosRawImage = z.infer<typeof FleetTalosRawImage>;
-export const PostgresPoolQualification = z.strictObject({
-  version: z.literal(1),
-  run_id: z.uuid(),
-  candidate_release_id: FleetReleaseId,
-  candidate_spec_sha256: Sha256,
-  scope_sha256: Sha256,
-  evidence_sha256: Sha256,
-  driver_image: z
-    .string()
-    .max(512)
-    .regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/),
-  driver_sha256: Sha256,
-  supervisor_sha256: Sha256,
-  host_controller_sha256: Sha256,
-  postgres_image_sha256: Sha256,
-  archiver_image_sha256: Sha256,
-  receipt_sha256: Sha256,
-  qualified_at: z.iso.datetime(),
-  gates: z.strictObject({
-    host_mount_context: z.literal(true),
-    finite_creator_fence: z.literal(true),
-    single_writer: z.literal(true),
-    mount_propagation: z.literal(true),
-    wal_archive: z.literal(true),
-    base_backup: z.literal(true),
-    clean_stop: z.literal(true),
-    thin_write_authority: z.literal(true),
-    thin_io_limits: z.literal(true),
-    thin_expiry_protection: z.literal(true),
-  }),
-});
-export type PostgresPoolQualification = z.infer<
-  typeof PostgresPoolQualification
->;
 export const FleetReleaseSpec = z
   .strictObject({
     version: z.literal(1),
@@ -196,95 +162,12 @@ export const FleetReleaseSpec = z
     runtime_attestation_version: z.literal(2).optional(),
     /** Cloudflare-only snapshot capability; requires independent route and proof versions. */
     admission_snapshot_version: z.literal(1).optional(),
-    postgres_pool_version: z.literal(1).optional(),
-    /** Isolated candidate executor only; never enables normal customer pool claims. */
-    postgres_pool_qualification_version: z.literal(1).optional(),
-    /** Qualified executable bytes are distinct from OCI image digests. */
-    postgres_pool_candidate: z
-      .strictObject({
-        driver_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-        supervisor_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-        host_controller_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-      })
-      .optional(),
-    postgres_pool_qualification: PostgresPoolQualification.optional(),
     /** Cloudflare-only declaration of the nonce-bound native controller sampling protocol. */
     thin_storage_sampling_version: z.literal(1).optional(),
     components: z.array(FleetReleaseComponent).min(1).max(128),
     roles: z.strictObject({ control_relay: Role, customer: Role }),
   })
   .superRefine((spec, context) => {
-    if (spec.postgres_pool_qualification_version !== undefined) {
-      const pins = [
-        "native-controller",
-        "native-gateway",
-        "pool-supervisor",
-        "postgres",
-        "barman",
-      ];
-      if (
-        spec.route_token_version !== 4 ||
-        spec.runtime_attestation_version !== 2 ||
-        spec.admission_snapshot_version !== 1 ||
-        spec.postgres_pool_candidate === undefined ||
-        !pins.every((name) =>
-          spec.components.some((c) => c.name === name && c.kind === "image"),
-        ) ||
-        !Object.values(spec.roles).every(
-          (role) =>
-            pins.every((name) => role.components.includes(name)) &&
-            role.talos_extensions.includes("pgcf-sandbox-controller"),
-        ) ||
-        !spec.components.some(
-          (c) => c.name === "pgcf-sandbox-controller" && c.kind === "image",
-        )
-      )
-        context.addIssue({
-          code: "custom",
-          message:
-            "Isolated pool qualification requires the complete candidate native fleet and route/proof/snapshot capabilities",
-        });
-    }
-    if (spec.postgres_pool_version !== undefined) {
-      const pins = [
-        "native-controller",
-        "native-gateway",
-        "pool-supervisor",
-        "postgres",
-        "barman",
-      ];
-      const q = spec.postgres_pool_qualification;
-      if (
-        spec.route_token_version !== 4 ||
-        spec.runtime_attestation_version !== 2 ||
-        spec.admission_snapshot_version !== 1 ||
-        !q ||
-        !pins.every((name) =>
-          spec.components.some((c) => c.name === name && c.kind === "image"),
-        ) ||
-        !Object.values(spec.roles).every(
-          (role) =>
-            pins.every((name) => role.components.includes(name)) &&
-            role.talos_extensions.includes("pgcf-sandbox-controller"),
-        ) ||
-        !spec.components.some(
-          (c) => c.name === "pgcf-sandbox-controller" && c.kind === "image",
-        ) ||
-        q.postgres_image_sha256 !==
-          spec.components.find((c) => c.name === "postgres")?.sha256 ||
-        q.archiver_image_sha256 !==
-          spec.components.find((c) => c.name === "barman")?.sha256 ||
-        q.driver_image !==
-          spec.components.find(
-            (c) => c.name === "openebs-lvm" && c.kind === "image",
-          )?.reference
-      )
-        context.addIssue({
-          code: "custom",
-          message:
-            "PostgreSQL pool admission requires the complete qualified native fleet and route/proof/snapshot capabilities",
-        });
-    }
     if (
       spec.admission_snapshot_version !== undefined &&
       (spec.route_token_version !== 4 || spec.runtime_attestation_version !== 2)
@@ -470,7 +353,6 @@ export const FleetReleaseSpec = z
           "node-bootstrap",
           "postgres",
           "barman",
-          "pool-supervisor",
           "sandbox-controller",
           "image/cert-manager/cert-manager-startupapicheck",
         ].includes(name)

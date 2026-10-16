@@ -257,48 +257,6 @@
       }
     },
     {
-      "name": "pool-v4-exact-scope",
-      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTksImtpbmQiOiJwb29sIiwiYmluZGluZ19pZCI6IjEyMzQ1Njc4LTEyMzQtNDIzNC04MjM0LTEyMzQ1Njc4OTAxMiIsIm5vZGVfdWlkIjoiMjM0NTY3ODktMjM0NS00MzQ1LTgzNDUtMjM0NTY3ODkwMTIzIiwicG9kX2lwIjoiMTAuMS4yLjMiLCJzdG9yYWdlX2dlbmVyYXRpb24iOjIsInNjb3BlX3NoYTI1NiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifQ.Y-GX81d8IMM3oqR38xIDa5-U8yPMzKbi-VdOVVhEzqw",
-      "now": 1000000,
-      "region": "eu-test",
-      "expected": {
-        "ok": true,
-        "claims": {
-          "v": 4,
-          "db": "aaaaaaaaaaaaaaaaaaaa",
-          "user": "app",
-          "cid": "00000000-0000-0000-0000-000000000001",
-          "rg": "eu-test",
-          "kid": "test",
-          "iat": 1000,
-          "exp": 1030,
-          "rev": 7,
-          "pod": "01234567-89ab-4def-8123-0123456789ab",
-          "route_revision": 19,
-          "kind": "pool",
-          "binding_id": "12345678-1234-4234-8234-123456789012",
-          "node_uid": "23456789-2345-4345-8345-234567890123",
-          "pod_ip": "10.1.2.3",
-          "storage_generation": 2,
-          "scope_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }
-      }
-    },
-    {
-      "name": "pool-v4-missing-binding",
-      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTksImtpbmQiOiJwb29sIiwibm9kZV91aWQiOiIyMzQ1Njc4OS0yMzQ1LTQzNDUtODM0NS0yMzQ1Njc4OTAxMjMiLCJwb2RfaXAiOiIxMC4xLjIuMyIsInN0b3JhZ2VfZ2VuZXJhdGlvbiI6Miwic2NvcGVfc2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9.3kj3D7xavi5YnrKc3i-dbbd7ZapjHRZUA-YW4SyGiVk",
-      "now": 1000000,
-      "region": "eu-test",
-      "expected": { "ok": false, "reason": "invalid_claims" }
-    },
-    {
-      "name": "pool-v4-invalid-ip",
-      "token": "v4.eyJ2Ijo0LCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJyb3V0ZV9yZXZpc2lvbiI6MTksImtpbmQiOiJwb29sIiwiYmluZGluZ19pZCI6IjEyMzQ1Njc4LTEyMzQtNDIzNC04MjM0LTEyMzQ1Njc4OTAxMiIsIm5vZGVfdWlkIjoiMjM0NTY3ODktMjM0NS00MzQ1LTgzNDUtMjM0NTY3ODkwMTIzIiwicG9kX2lwIjoiMTAuMS4yLjk5OSIsInN0b3JhZ2VfZ2VuZXJhdGlvbiI6Miwic2NvcGVfc2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9._Ui897RpAab6CB3viWBnGqvYh62COnbDBeySAwt5QqI",
-      "now": 1000000,
-      "region": "eu-test",
-      "expected": { "ok": false, "reason": "invalid_claims" }
-    },
-    {
       "name": "missing",
       "token": null,
       "now": 1000000,

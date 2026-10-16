@@ -158,22 +158,3 @@ it("admission revisions remain independent from configuration and physical gener
     DatabaseAdmissionIntent.safeParse({ v: 1, admission_epoch: 11 }).success,
   ).toBe(false);
 });
-
-it("requires an actual separate pool namespace resource version without changing CNPG proof coverage", () => {
-  const pool = {
-    ...proof,
-    kind: "pool",
-    binding_id: uid,
-    scope_sha256: hash,
-    holder_revision: 1,
-    pool_namespace_uid: uid,
-  };
-  expect(DatabaseRuntimeAttestation.safeParse(pool).success).toBe(false);
-  expect(
-    DatabaseRuntimeAttestation.safeParse({
-      ...pool,
-      pool_namespace_resource_version: "82",
-    }).success,
-  ).toBe(true);
-  expect(DatabaseRuntimeAttestation.safeParse(proof).success).toBe(true);
-});

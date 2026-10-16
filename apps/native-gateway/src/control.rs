@@ -2,7 +2,6 @@
 use crate::{
     kubernetes::{FenceState, retirement_ready},
     sessions::{Action, SharedSessions},
-    targets::Targets,
     telemetry::GatewayMeasurements,
     transport::Config,
 };
@@ -174,7 +173,6 @@ pub struct Control {
     pub config: Arc<Config>,
     pub pod: String,
     pub fences: Arc<RwLock<FenceState>>,
-    pub targets: Arc<RwLock<Targets>>,
     pub sessions: SharedSessions,
     pub measurements: Arc<Mutex<GatewayMeasurements>>,
     control_capacity: Semaphore,
@@ -186,7 +184,6 @@ impl Control {
         config: Arc<Config>,
         pod: String,
         fences: Arc<RwLock<FenceState>>,
-        targets: Arc<RwLock<Targets>>,
         sessions: SharedSessions,
         measurements: Arc<Mutex<GatewayMeasurements>>,
     ) -> Self {
@@ -194,7 +191,6 @@ impl Control {
             config,
             pod,
             fences,
-            targets,
             sessions,
             measurements,
             control_capacity: Semaphore::new(32),
@@ -244,15 +240,6 @@ impl Control {
             return (409, json!({"error":"control_intent_mismatch"}));
         };
         let intent = &fence.intent;
-        drop(current);
-        let running_pool_close = action == "close"
-            && intent.mode == "running"
-            && self.targets.read().await.running_pool_close_permitted(
-                database,
-                &intent.operation,
-                intent.revision,
-                now(),
-            );
         if claims["operation"] != intent.operation
             || claims["revision"] != intent.revision
             || (if action == "retire" {
@@ -262,12 +249,13 @@ impl Control {
                     || (if action == "release" {
                         intent.mode != "running"
                     } else {
-                        action != "status" && intent.mode != "quiesce" && !running_pool_close
+                        action != "status" && intent.mode != "quiesce"
                     })
             })
         {
             return (409, json!({"error":"control_intent_mismatch"}));
         }
+        drop(current);
         if action == "begin" {
             self.sessions
                 .lock()
@@ -301,16 +289,6 @@ impl Control {
             .records
             .get(database)
             .is_none_or(|v| v.intent != *intent || v.uid != fence.uid)
-        {
-            return (409, json!({"error":"control_intent_mismatch"}));
-        }
-        if running_pool_close
-            && !self.targets.read().await.running_pool_close_permitted(
-                database,
-                &intent.operation,
-                intent.revision,
-                now(),
-            )
         {
             return (409, json!({"error":"control_intent_mismatch"}));
         }

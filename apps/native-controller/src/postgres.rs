@@ -88,41 +88,6 @@ pub async fn connect_via(
 ) -> Result<Session, Error> {
     connect_at(db, ca, role, password, database, socket).await
 }
-/// TLS keeps the tenant's exact CNPG server name while the socket uses the authenticated pool Pod IP.
-pub async fn connect_pool(
-    db: &Value,
-    scope: &Value,
-    ca: &[u8],
-    role: &str,
-    password: &str,
-    database: &str,
-) -> Result<Session, Error> {
-    if !pgcf_native_protocol::pool::validate("PoolBindingScope", scope)
-        || scope["database_id"] != db["id"]
-        || scope["generation"].as_u64() > db["generation"].as_u64()
-    {
-        return Err("pool PostgreSQL probe scope changed".into());
-    }
-    let address: std::net::IpAddr = scope["pool_pod_ip"]
-        .as_str()
-        .ok_or("pool PostgreSQL address absent")?
-        .parse()?;
-    if !match address {
-        std::net::IpAddr::V4(v) => v.is_private(),
-        std::net::IpAddr::V6(v) => v.is_unique_local(),
-    } {
-        return Err("pool PostgreSQL address is not private".into());
-    }
-    connect_at(
-        db,
-        ca,
-        role,
-        password,
-        database,
-        Some(SocketAddr::new(address, PORT)),
-    )
-    .await
-}
 async fn connect_at(
     db: &Value,
     ca: &[u8],
@@ -194,12 +159,10 @@ fn probe_identity_current(
                 actual_address.parse::<std::net::IpAddr>().ok() == Some(expected)
             })
 }
-/// Where a role's login dials: the tenant's Service, a pool Pod's recorded address, or the
-/// instance Pod itself.
-enum Route<'a> {
+/// Where a role's login dials: the tenant's Service, or the instance Pod itself.
+enum Route {
     /// The tenant's Service by name, or the given socket in its place.
     Service(Option<SocketAddr>),
-    Pool(&'a Value),
     Pod(SocketAddr),
 }
 /// Every role logs in through the tenant's Service (`socket` is `None`), one after the other.
@@ -222,18 +185,6 @@ pub async fn roles_pod(
     maintenance: Option<&Session>,
 ) -> Result<bool, Error> {
     roles_at(db, ca, primary_address, Route::Pod(socket), maintenance).await
-}
-pub async fn pool_roles(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
-    roles_at(
-        db,
-        ca,
-        scope["pool_pod_ip"]
-            .as_str()
-            .ok_or("pool PostgreSQL address absent")?,
-        Route::Pool(scope),
-        None,
-    )
-    .await
 }
 /// A session of the maintenance role; `socket` as for `connect_via`.
 pub async fn maintenance(
@@ -301,42 +252,6 @@ pub async fn end_sessions(session: &Session, name: &str) -> Result<bool, Error> 
     };
     Ok(row.try_get::<_, i64>(0)? == 0)
 }
-/// A drained gateway is necessary but not sufficient: prepared transactions and real
-/// background client backends also prevent a clean pool stop.
-pub async fn pool_idle(db: &Value, scope: &Value, ca: &[u8]) -> Result<bool, Error> {
-    if db["maintenance"].is_null() {
-        return Err("pool maintenance authority absent".into());
-    }
-    let role = text(&db["maintenance"], "role");
-    let session = connect_pool(
-        db,
-        scope,
-        ca,
-        role,
-        text(&db["maintenance"], "password"),
-        text(db, "id"),
-    )
-    .await?;
-    idle_on(&session, db, role, text(scope, "pool_pod_ip")).await
-}
-/// Whether the PostgreSQL behind `session` is the database's primary at `address`, has no client
-/// backend besides the session and holds no prepared transaction.
-async fn idle_on(session: &Session, db: &Value, role: &str, address: &str) -> Result<bool, Error> {
-    let rows = session.query(IDLE_QUERY, &[]).await?;
-    if rows.len() != 1 {
-        return Ok(false);
-    }
-    let row = &rows[0];
-    Ok(probe_identity_current(
-        text(db, "id"),
-        &row.try_get::<_, String>(0)?,
-        address,
-        &row.try_get::<_, String>(2)?,
-        row.try_get(3)?,
-    ) && row.try_get::<_, String>(1)? == role
-        && row.try_get::<_, String>(4)? == "0"
-        && row.try_get::<_, String>(5)? == "0")
-}
 /// How far ahead of its expiry a role's credential is no longer one a login can prove: a client
 /// that connects after the check finds it expired.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(10);
@@ -366,14 +281,13 @@ fn too_many_connections(error: &Error) -> bool {
 async fn open_on(
     db: &Value,
     ca: &[u8],
-    route: &Route<'_>,
+    route: &Route,
     role: &str,
     password: &str,
 ) -> Result<Session, Error> {
     let database = text(db, "id");
     match route {
         Route::Service(socket) => connect_via(db, ca, role, password, database, *socket).await,
-        Route::Pool(scope) => connect_pool(db, scope, ca, role, password, database).await,
         Route::Pod(socket) => connect_via(db, ca, role, password, database, Some(*socket)).await,
     }
 }
@@ -382,7 +296,7 @@ async fn role_current(
     db: &Value,
     ca: &[u8],
     primary_address: &str,
-    route: &Route<'_>,
+    route: &Route,
     role: &Value,
 ) -> Result<bool, Error> {
     if expiring(role, SystemTime::now()) {
@@ -504,7 +418,7 @@ async fn catalog_holds(session: &Session, role: &Value) -> Result<bool, Error> {
 async fn attributes_current(
     db: &Value,
     ca: &[u8],
-    route: &Route<'_>,
+    route: &Route,
     roles: &[&Value],
     held: Option<&Session>,
 ) -> Result<bool, Error> {
@@ -542,7 +456,7 @@ async fn roles_at(
     db: &Value,
     ca: &[u8],
     primary_address: &str,
-    route: Route<'_>,
+    route: Route,
     maintenance: Option<&Session>,
 ) -> Result<bool, Error> {
     if text(db, "desired_state") != "running" {
@@ -573,12 +487,9 @@ async fn roles_at(
     })
     .await?
 }
-/// What a pool holder's PostgreSQL says of itself, by position: its database, its user, the
-/// address it was reached at (`host()`: the cast of an `inet` to `text` keeps the netmask, which no
-/// Pod address has), whether it is a standby, and its client backends and prepared transactions.
-pub(crate) const IDLE_QUERY: &str = "SELECT current_database()::text, current_user::text, pg_catalog.host(pg_catalog.inet_server_addr()), pg_is_in_recovery(), (SELECT count(*)::text FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()), (SELECT count(*)::text FROM pg_prepared_xacts)";
 /// A role's own view of the server: user, version, settings, database and the address it was
-/// reached at (see `IDLE_QUERY` for `host()`), by position.
+/// reached at (`host()`: the cast of an `inet` to `text` keeps the netmask, which no Pod address
+/// has), by position.
 pub(crate) const ROLE_QUERY: &str = "SELECT current_user::text, current_setting('server_version')::text, current_setting('server_version_num')::int, current_setting('max_connections')::int, pg_size_bytes(current_setting('shared_buffers'))::text, pg_size_bytes(current_setting('effective_cache_size'))::text, EXTRACT(EPOCH FROM current_setting('archive_timeout')::interval)::int, current_database()::text, pg_catalog.host(pg_catalog.inet_server_addr()), pg_is_in_recovery()";
 /// A role's privileges: none beyond login, and row security bypassed only where the record asks.
 pub(crate) const PRIVILEGES_QUERY: &str = "SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE rolname=current_user";
@@ -1236,7 +1147,7 @@ mod tests {
         );
         assert!(!log_has(&w, "role memberships"));
     }
-    /// A role awaiting removal has no credential: no login is attempted for it, on any route.
+    /// A role awaiting removal has no credential: no login is attempted for it, on either route.
     #[tokio::test]
     async fn a_role_awaiting_removal_is_not_logged_in() {
         let mut w = crate::test_world::World::awake().await;
@@ -1259,35 +1170,6 @@ mod tests {
             .unwrap()
         );
         assert!(!log_has(&w, "SQL gone_job"));
-        // The pool route reads the same roles: a record with nothing but a removal needs no
-        // connection at all, where a login attempt without a credential would fail.
-        let mut pooled = w.db.clone();
-        pooled["roles"] = serde_json::json!([{"name":"gone_job","state":"absent"}]);
-        let scope = serde_json::json!({"pool_pod_ip":"10.0.0.7"});
-        assert!(
-            pool_roles(&pooled, &scope, w.authority.pem.as_bytes())
-                .await
-                .unwrap()
-        );
-    }
-    /// The idleness check of a pool holder reads the same address the same way.
-    #[tokio::test]
-    async fn a_pool_holder_is_idle_at_the_address_postgresql_reports_for_it() {
-        use crate::test_world::{POD_IP, World};
-        let w = World::awake().await;
-        let role = text(&w.db["maintenance"], "role");
-        let session = connect_via(
-            &w.db,
-            w.authority.pem.as_bytes(),
-            role,
-            text(&w.db["maintenance"], "password"),
-            text(&w.db, "id"),
-            w.reconciler.power.postgres,
-        )
-        .await
-        .unwrap();
-        assert!(idle_on(&session, &w.db, role, POD_IP).await.unwrap());
-        assert!(!idle_on(&session, &w.db, role, "10.0.0.99").await.unwrap());
     }
     #[tokio::test]
     async fn a_dropped_session_terminates_and_ends_tls_with_close_notify() {

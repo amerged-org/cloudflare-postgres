@@ -24,8 +24,6 @@ pub struct HostStorageLease {
     pub expires_at: u64,
     pub legacy: Vec<Legacy>,
     pub databases: Vec<Entry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preparations: Option<Vec<serde_json::Value>>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,8 +50,6 @@ pub struct Entry {
     runtime_authority: Option<String>,
     #[serde(default)]
     drain: Option<Drain>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool: Option<serde_json::Value>,
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -316,22 +312,6 @@ impl Guard {
             legacy.insert(entry.database_id);
         }
         for (id, accepted) in &entries {
-            if accepted.entry.pool.is_some() {
-                // The ordinary-Pod pool owns a separate clock/journal. This token must never
-                // become a CNPG namespace grant or an assigned RuntimeClass slot identity.
-                if let (Some(pool), Some(runtime)) = (&accepted.entry.pool, &accepted.runtime)
-                    && pool["pool_pod_uid"] == runtime.claims().pod_uid
-                    && pool["device"]["volume_group_uuid"] == runtime.claims().volume_group_uuid
-                    && pool["device"]["lv_uuid"] == runtime.claims().lv_uuid
-                    && self
-                        .highest
-                        .get(id)
-                        .is_some_and(|old| same_physical_scope(old.claims(), runtime.claims()))
-                {
-                    self.highest.remove(id);
-                }
-                continue;
-            }
             if let Some(runtime) = &accepted.runtime {
                 // A new CF-owned running generation is a new actual task lifetime, even when
                 // Kubernetes reuses the same Pod UID. Ordinary lease renewals keep old stop facts.
@@ -440,9 +420,6 @@ impl Guard {
     ) -> Option<(&'a Accepted, &'a VerifiedStorageAuthority, &'a Drain)> {
         let id = namespace.strip_prefix("pgcf-db-")?;
         let accepted = self.entries.get(id)?;
-        if accepted.entry.pool.is_some() {
-            return None;
-        }
         let old = self.highest.get(id)?;
         let drain = accepted.entry.drain.as_ref()?;
         (accepted.entry.desired_state != "running"
@@ -459,13 +436,6 @@ impl Guard {
             .is_some_and(|(_, _, drain)| self.resumed_for(pod_uid, &drain.operation_id, true))
     }
     fn resume_scope(&self, namespace: &str, pod_uid: &str, now: u64) -> Option<ResumeScope> {
-        if namespace
-            .strip_prefix("pgcf-db-")
-            .and_then(|id| self.entries.get(id))
-            .is_some_and(|entry| entry.entry.pool.is_some())
-        {
-            return None;
-        }
         if let Some((accepted, old, drain)) = self.drain_scope(namespace, pod_uid, now) {
             return (!self.resumed_for(pod_uid, &drain.operation_id, true)).then(|| ResumeScope {
                 authority: old.clone(),
@@ -500,9 +470,6 @@ impl Guard {
     fn retirement_scope(&self, namespace: &str, pod_uid: &str, now: u64) -> Option<ResumeScope> {
         let id = namespace.strip_prefix("pgcf-db-")?;
         let entry = &self.entries.get(id)?.entry;
-        if entry.pool.is_some() {
-            return None;
-        }
         let old = self.highest.get(id)?;
         let deadline = self.snapshot_deadline?;
         (self.snapshot_material_revision == self.material_revision
@@ -577,8 +544,7 @@ impl Guard {
             .cloned()
     }
     fn permits_at(&self, accepted: &Accepted, pod_uid: &str, now: u64, elapsed: Duration) -> bool {
-        if accepted.entry.pool.is_some()
-            || elapsed >= accepted.remaining
+        if elapsed >= accepted.remaining
             || accepted.entry.write_blocked
             || accepted.entry.desired_state != "running"
         {
@@ -679,9 +645,6 @@ async fn supervise_shared(
             };
             let mut persisted = true;
             for entry in &lease.databases {
-                if entry.pool.is_some() {
-                    continue;
-                }
                 let Some(token) = &entry.runtime_authority else {
                     continue;
                 };
@@ -912,7 +875,6 @@ mod tests {
             issued_at: 1000,
             expires_at: 11000,
             legacy: vec![],
-            preparations: None,
             databases: vec![Entry {
                 database_id: "abcdefghijklmnopqrst".into(),
                 generation: 1,
@@ -928,9 +890,27 @@ mod tests {
                 volume: None,
                 runtime_authority: None,
                 drain: None,
-                pool: None,
             }],
         }
+    }
+    #[test]
+    fn the_lease_the_guard_parses_is_exactly_the_generated_host_lease_shape() {
+        let shape =
+            jsonschema::validator_for(&pgcf_native_protocol::CONTRACT["storageHostLease"]).unwrap();
+        let raw = serde_json::to_value(lease()).unwrap();
+        assert!(
+            shape.is_valid(&raw),
+            "{:?}",
+            shape
+                .iter_errors(&raw)
+                .map(|e| e.instance_path().to_string())
+                .collect::<Vec<_>>()
+        );
+        // The lease has no pool custody field: neither the schema nor the parser accepts one.
+        let mut extra = raw.clone();
+        extra["databases"][0]["pool"] = serde_json::json!({});
+        assert!(!shape.is_valid(&extra));
+        assert!(serde_json::from_value::<HostStorageLease>(extra).is_err());
     }
     #[test]
     fn only_a_new_cf_startup_can_resume_the_exact_retained_volume_before_its_deadline() {
@@ -1321,121 +1301,5 @@ mod tests {
         guard.accept(value, 1000).unwrap();
         assert!(guard.permits("pgcf-db-abcdefghijklmnopqrst", "pod", 999999));
         assert!(!guard.permits("pgcf-db-bcdefghijklmnopqrstu1", "pod", 999999));
-    }
-    fn signed_guard() -> (Guard, HostStorageLease) {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        use ring::{
-            rand::SystemRandom,
-            signature::{Ed25519KeyPair, KeyPair},
-        };
-        let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
-        let public = serde_json::to_string(&BTreeMap::from([(
-            "cf",
-            URL_SAFE_NO_PAD.encode(pair.public_key().as_ref()),
-        )]))
-        .unwrap();
-        let pin: String = Sha256::digest(public.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let mut guard = guard();
-        guard.trust = StorageTrust::parse(&public, &pin).unwrap();
-        let claims = serde_json::json!({"v":1,"kid":"cf","database_id":"abcdefghijklmnopqrst","generation":1,"authority_revision":1,"storage_uid":"11111111-1111-4111-8111-111111111111","node_uid":guard.node_uid,"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","profile_sha256":"a".repeat(64),"volume_handle":"pvc-33333333-3333-4333-8333-333333333333","lv_uuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","pvc_uid":"33333333-3333-4333-8333-333333333333","pv_uid":"44444444-4444-4444-8444-444444444444","pod_uid":"55555555-5555-4555-8555-555555555555","observed_at":1000,"iat":1000,"exp":11000,"guard_seconds":10,"drain_seconds":10,"write_allowed":true});
-        let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signed = pair.sign(
-            format!(
-                "{}{}",
-                pgcf_native_protocol::wire("storageAuthorityDomain"),
-                body
-            )
-            .as_bytes(),
-        );
-        let token = format!(
-            "{}.{}.{}",
-            pgcf_native_protocol::wire("storageAuthorityPrefix"),
-            body,
-            URL_SAFE_NO_PAD.encode(signed.as_ref())
-        );
-        let mut initial = lease();
-        initial.databases[0].authority_revision = 1;
-        initial.databases[0].startup_expires_at = None;
-        initial.databases[0].startup_operation_id = None;
-        initial.databases[0].runtime_authority = Some(token);
-        let mut volume = claims.clone();
-        let object = volume.as_object_mut().unwrap();
-        object.retain(|k, _| {
-            [
-                "node_uid",
-                "volume_group_uuid",
-                "pool_uuid",
-                "storage_uid",
-                "volume_handle",
-                "lv_uuid",
-                "pvc_uid",
-                "pv_uid",
-            ]
-            .contains(&k.as_str())
-        });
-        object.insert("storage_generation".into(), 1.into());
-        object.insert(
-            "namespace_uid".into(),
-            "66666666-6666-4666-8666-666666666666".into(),
-        );
-        object.insert(
-            "cluster_uid".into(),
-            "77777777-7777-4777-8777-777777777777".into(),
-        );
-        initial.databases[0].volume = Some(volume);
-        assert!(
-            guard
-                .trust
-                .verify(
-                    initial.databases[0].runtime_authority.as_ref().unwrap(),
-                    1000
-                )
-                .is_ok()
-        );
-        let shape =
-            jsonschema::validator_for(&pgcf_native_protocol::CONTRACT["storageHostLease"]).unwrap();
-        let raw = serde_json::to_value(&initial).unwrap();
-        assert!(
-            shape.is_valid(&raw),
-            "{:?}",
-            shape
-                .iter_errors(&raw)
-                .map(|e| e.instance_path().to_string())
-                .collect::<Vec<_>>()
-        );
-        (guard, initial)
-    }
-    #[test]
-    fn pool_holder_is_not_a_cnpg_create_or_resume_permission() {
-        let (mut guard, mut initial) = signed_guard();
-        let entry = &mut initial.databases[0];
-        entry.pool = Some(
-            serde_json::json!({"v":1,"binding_id":"66666666-6666-4666-8666-666666666666","scope_sha256":"c".repeat(64),"holder_revision":1,"holder_generation":entry.generation,"holder_boot_id":guard.boot_id,"state":"claimed","pool_namespace":"pgcf-pool","pool_namespace_uid":"77777777-7777-4777-8777-777777777777","pool_pod_uid":"55555555-5555-4555-8555-555555555555","container_ids":["d".repeat(64)],"device":null,"cleanup_authority":null}),
-        );
-        guard.accept(initial, 1000).unwrap();
-        assert!(!guard.permits(
-            "pgcf-db-abcdefghijklmnopqrst",
-            "55555555-5555-4555-8555-555555555555",
-            1001
-        ));
-        assert!(!guard.permits_create(
-            "pgcf-db-abcdefghijklmnopqrst",
-            "55555555-5555-4555-8555-555555555555",
-            1001
-        ));
-        assert!(
-            guard
-                .resume_scope(
-                    "pgcf-db-abcdefghijklmnopqrst",
-                    "55555555-5555-4555-8555-555555555555",
-                    1001
-                )
-                .is_none()
-        );
-        assert!(guard.protective_pods().is_empty());
     }
 }

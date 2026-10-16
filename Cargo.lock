@@ -1467,27 +1467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgcf-pool-supervisor"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "futures-util",
- "hmac",
- "httparse",
- "libc",
- "pgcf-native-protocol",
- "rcgen",
- "reqwest",
- "ring",
- "rustls",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "tokio-rustls",
-]
-
-[[package]]
 name = "pgcf-sandbox-controller"
 version = "0.1.0"
 dependencies = [
@@ -1499,7 +1478,6 @@ dependencies = [
  "pgcf-node-runtime",
  "prost",
  "prost-types",
- "rcgen",
  "reqwest",
  "ring",
  "rustls",
@@ -1514,7 +1492,6 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "webpki-roots 1.0.9",
- "x509-parser",
 ]
 
 [[package]]

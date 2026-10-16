@@ -396,24 +396,6 @@ fn answers(
             one(vec![("count", Cell::Int8(count))])
         } else if sql.contains("pg_stat_clear_snapshot") {
             one(vec![("pg_stat_clear_snapshot", Cell::Void)])
-        } else if sql.contains("backend_type='client backend'") {
-            // The pool holder's idleness: the statement reads its columns by position.
-            let column = if sql
-                .replace("pg_catalog.", "")
-                .contains("host(inet_server_addr())")
-            {
-                "host"
-            } else {
-                "inet_server_addr"
-            };
-            one(vec![
-                ("current_database", text(id)),
-                ("current_user", text(user)),
-                (column, server_address(sql, POD_IP)),
-                ("pg_is_in_recovery", Cell::Bool(s.recovery)),
-                ("count", text("0")),
-                ("count", text("0")),
-            ])
         } else if sql.contains("pg_prepared_xacts") {
             one(vec![
                 ("busy", Cell::Int4(s.busy)),
@@ -1065,18 +1047,6 @@ mod wire_tests {
                 ],
             ),
             (
-                postgres::IDLE_QUERY,
-                None,
-                vec![
-                    ("", Type::TEXT),
-                    ("", Type::TEXT),
-                    ("", Type::TEXT),
-                    ("", Type::BOOL),
-                    ("", Type::TEXT),
-                    ("", Type::TEXT),
-                ],
-            ),
-            (
                 postgres::PRIVILEGES_QUERY,
                 None,
                 bools(&[
@@ -1224,8 +1194,6 @@ mod wire_tests {
             text
         };
         let role_address = address(settings.try_get::<_, String>(8).unwrap());
-        let idle = &client.query(postgres::IDLE_QUERY, &[]).await.unwrap()[0];
-        assert_eq!(address(idle.try_get::<_, String>(2).unwrap()), role_address);
         let accepting = &client.query(postgres::ACCEPTING_QUERY, &[]).await.unwrap()[0];
         assert_eq!(text_of(accepting, "server_address"), role_address);
         let identity = &client

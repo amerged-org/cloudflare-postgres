@@ -4,63 +4,6 @@ compile_error!("pgcf-sandbox-controller requires Linux namespace and runc APIs")
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.len() == 3 && args[1] == "--pool-qualification-owner-worker" {
-        let result = pgcf_sandbox_controller::pool_worker::bind_parent().and_then(|()| {
-            pgcf_sandbox_controller::pool_qualification::owner_worker(std::path::Path::new(
-                &args[2],
-            ))
-        });
-        if result.is_err() {
-            eprintln!("pool_qualification_owner_unconfirmed");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if args.len() == 3 && args[1] == "--pool-cleanup-worker" {
-        if pgcf_sandbox_controller::pool_cleanup_worker::run(std::path::Path::new(&args[2]))
-            .is_err()
-        {
-            eprintln!("pool_cleanup_worker_unconfirmed");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if args.len() == 3 && args[1] == "--pool-read-worker" {
-        let result = pgcf_sandbox_controller::pool_worker::bind_parent()
-            .and_then(|()| {
-                pgcf_sandbox_controller::pool_read_worker::payload(std::path::Path::new(&args[2]))
-            })
-            .and_then(pgcf_sandbox_controller::pool_read_worker::read);
-        match result {
-            Ok(observation) => match serde_json::to_string(&observation) {
-                Ok(body) => println!("{body}"),
-                Err(_) => std::process::exit(1),
-            },
-            Err(error) => {
-                eprintln!("{}", error.message());
-                std::process::exit(1)
-            }
-        }
-        return;
-    }
-    if args.len() == 3 && args[1] == "--pool-mount-worker" {
-        let result = pgcf_sandbox_controller::pool_worker::bind_parent()
-            .and_then(|()| {
-                pgcf_sandbox_controller::pool_worker::payload(std::path::Path::new(&args[2]))
-            })
-            .and_then(pgcf_sandbox_controller::pool_worker::mount);
-        match result {
-            Ok(observation) => match serde_json::to_string(&observation) {
-                Ok(body) => println!("{body}"),
-                Err(_) => std::process::exit(1),
-            },
-            Err(error) => {
-                eprintln!("{}", error.message());
-                std::process::exit(1)
-            }
-        }
-        return;
-    }
     if args.len() == 3 && args[1] == "--cri-host-context" {
         match pgcf_sandbox_controller::host_context::launch(
             std::path::Path::new(&args[2]),
@@ -116,9 +59,8 @@ async fn serve() {
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| tonic::Status::internal("controller_socket_permissions_failed"))?;
         let (config_sender,config_updates)=tokio::sync::watch::channel(client.clone());
-        let config_task=tokio::spawn(pgcf_sandbox_controller::configuration::run(args[1].clone().into(),initial_settings.clone(),controller.clone(),config_sender));
+        let config_task=tokio::spawn(pgcf_sandbox_controller::configuration::run(args[1].clone().into(),initial_settings,controller.clone(),config_sender));
         let mut storage_task=client.local().storage_authority.clone().map(|trust|tokio::spawn(pgcf_sandbox_controller::storage::watch(controller.clone(),client.clone(),trust,config_updates.clone())));
-        let mut pool_task=initial_settings.postgres_pool.then(||tokio::spawn(pgcf_sandbox_controller::pool_runtime::run(initial_settings.clone(),client.clone(),config_updates.clone())));
         let reclaim_task=tokio::spawn(pgcf_sandbox_controller::reclaim_inventory::run(controller.clone(),client.clone(),config_updates.clone()));
         let policy_task=tokio::spawn(controller.clone().run_policy(client,config_updates));
         let service=tonic::transport::Server::builder()
@@ -131,14 +73,10 @@ async fn serve() {
             )
             ;
         tokio::pin!(service);
-        let result=match (storage_task.as_mut(),pool_task.as_mut()){
-            (Some(storage),Some(pool))=>tokio::select!{result=&mut service=>result.map_err(|_|tonic::Status::internal("controller_service_failed")),_ = storage=>Err(tonic::Status::internal("storage_supervisor_stopped")),_ = pool=>Err(tonic::Status::internal("pool_supervisor_stopped"))},
-            (Some(storage),None)=>tokio::select!{result=&mut service=>result.map_err(|_|tonic::Status::internal("controller_service_failed")),_ = storage=>Err(tonic::Status::internal("storage_supervisor_stopped"))},
-            (None,Some(pool))=>tokio::select!{result=&mut service=>result.map_err(|_|tonic::Status::internal("controller_service_failed")),_ = pool=>Err(tonic::Status::internal("pool_supervisor_stopped"))},
-            (None,None)=>service.await.map_err(|_|tonic::Status::internal("controller_service_failed")),
-        };
-        config_task.abort();policy_task.abort();reclaim_task.abort();if let Some(task)=storage_task {task.abort();}
-        if let Some(task)=pool_task{task.abort();}result
+        let result=if let Some(task)=storage_task.as_mut(){
+            tokio::select!{result=&mut service=>result.map_err(|_|tonic::Status::internal("controller_service_failed")),_ = task=>Err(tonic::Status::internal("storage_supervisor_stopped"))}
+        }else{service.await.map_err(|_|tonic::Status::internal("controller_service_failed"))};
+        config_task.abort();policy_task.abort();reclaim_task.abort();if let Some(task)=storage_task {task.abort();}result
     }
     .await;
     if let Err(error) = result {

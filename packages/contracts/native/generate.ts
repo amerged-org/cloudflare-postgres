@@ -34,7 +34,6 @@ import {
   legacyRouteTokenClaimsSchema,
   routeTokenClaimsSchema,
   cnpgAdmissionRouteTokenClaimsSchema,
-  poolAdmissionRouteTokenClaimsSchema,
   ROUTE_TOKEN_ADMISSION_PREFIX,
   ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
   ROUTE_TOKEN_MAX_LENGTH,
@@ -224,7 +223,6 @@ const contract = {
   databaseAdmission: edge.databaseAdmission,
   routeClaims,
   admissionRouteClaims: schema(cnpgAdmissionRouteTokenClaimsSchema),
-  poolAdmissionRouteClaims: schema(poolAdmissionRouteTokenClaimsSchema),
   gatewayAdmissionTarget: schema(GatewayAdmissionTarget),
   legacyRouteClaims: schema(legacyRouteTokenClaimsSchema),
   controlClaims: schema(gatewayControlClaimsSchema),
@@ -305,17 +303,6 @@ async function legacyToken(value: unknown): Promise<string> {
     ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
   );
 }
-const poolClaims = {
-  ...claims,
-  v: 4,
-  route_revision: 19,
-  kind: "pool",
-  binding_id: "12345678-1234-4234-8234-123456789012",
-  node_uid: "23456789-2345-4345-8345-234567890123",
-  pod_ip: "10.1.2.3",
-  storage_generation: 2,
-  scope_sha256: "a".repeat(64),
-};
 const routeInputs: {
   name: string;
   claims?: unknown;
@@ -356,30 +343,6 @@ const routeInputs: {
   {
     name: "leading-json-bom",
     token: await rawToken("\uFEFF" + JSON.stringify(claims)),
-  },
-  {
-    name: "pool-v4-exact-scope",
-    token: await rawToken(
-      JSON.stringify(poolClaims),
-      ROUTE_TOKEN_ADMISSION_PREFIX,
-      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
-    ),
-  },
-  {
-    name: "pool-v4-missing-binding",
-    token: await rawToken(
-      JSON.stringify({ ...poolClaims, binding_id: undefined }),
-      ROUTE_TOKEN_ADMISSION_PREFIX,
-      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
-    ),
-  },
-  {
-    name: "pool-v4-invalid-ip",
-    token: await rawToken(
-      JSON.stringify({ ...poolClaims, pod_ip: "10.1.2.999" }),
-      ROUTE_TOKEN_ADMISSION_PREFIX,
-      ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
-    ),
   },
   { name: "missing", token: null },
   { name: "malformed", token: "v1.a.b" },

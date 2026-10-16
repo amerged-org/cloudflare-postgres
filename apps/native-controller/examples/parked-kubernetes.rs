@@ -14,15 +14,15 @@ const HIBERNATION: &str = "cnpg.io/hibernation";
 
 async fn run() -> Result<Value, Error> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let origin = Url::parse(&std::env::var("PGCF_POOL_TEST_ORIGIN")?)?;
+    let origin = Url::parse(&std::env::var("PGCF_KUBE_TEST_ORIGIN")?)?;
     let host = origin.host_str().ok_or("isolated API host missing")?;
-    if !host.strip_prefix("pgcf-pool-api-").is_some_and(|suffix| {
+    if !host.strip_prefix("pgcf-kube-api-").is_some_and(|suffix| {
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     }) {
         return Err("isolated fixture host required".into());
     }
-    let ca = tokio::fs::read(std::env::var("PGCF_POOL_TEST_CA")?).await?;
-    let token_path = PathBuf::from(std::env::var("PGCF_POOL_TEST_TOKEN")?);
+    let ca = tokio::fs::read(std::env::var("PGCF_KUBE_TEST_CA")?).await?;
+    let token_path = PathBuf::from(std::env::var("PGCF_KUBE_TEST_TOKEN")?);
     let token = tokio::fs::read_to_string(&token_path).await?;
     let k8s = Kubernetes::with_ca(origin.clone(), &ca, token_path)?;
     let client = Client::builder()
@@ -31,7 +31,7 @@ async fn run() -> Result<Value, Error> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()?;
-    let attempt = std::env::var("PGCF_POOL_TEST_ATTEMPT")?;
+    let attempt = std::env::var("PGCF_KUBE_TEST_ATTEMPT")?;
     if attempt.len() != 32 || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("isolated attempt identity invalid".into());
     }
