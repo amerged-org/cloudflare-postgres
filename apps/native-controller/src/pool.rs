@@ -270,12 +270,17 @@ pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     if admission.is_null() {
         return miss("desired_stale");
     }
-    if let Trigger::Gateway(wake) = facts.trigger {
+    // A ticket is checked against the sleeping row it was signed from. Once Cloudflare committed
+    // its generation and operation, its own claim moved the route revision on, and the row is
+    // what the ticket asked for.
+    if let Trigger::Gateway(wake) = facts.trigger
+        && sleeping
+    {
         let roles = crate::contracts::present_roles(cell)
             .map(|role| (text(role, "name"), number(role, "revision")));
         if wake.route_revision != number(admission, "route_revision")
             || wake.role_revision_hash != pgcf_native_protocol::wake::role_revision_hash(roles)
-            || (sleeping && wake.generation != generation + 1)
+            || wake.generation != generation + 1
         {
             return miss("desired_stale");
         }
@@ -665,10 +670,10 @@ fn random_hex() -> Result<String, Error> {
 // ---------------------------------------------------------------------------------------------
 // The pool.
 
-/// Why a serving slot is retired, and whether its unconfirmed release is undone first.
+/// Why a serving slot is retired. A release Cloudflare never confirmed is not undone: a gateway
+/// refuses a fence that goes back, and the fence Cloudflare's row asks for next supersedes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retire {
-    pub restore: bool,
     pub reason: &'static str,
 }
 /// A slot that serves a database.
@@ -682,8 +687,6 @@ pub struct Serving {
     pub ticket: Option<Ticket>,
     pub pod: SlotPod,
     pub volume: Volume,
-    /// The admission target the fence named before the release, restored with an undone claim.
-    pub target_before: Option<String>,
     /// `structure_fingerprint` and `sleep_fingerprint` of the database as the slot serves it.
     pub structure: String,
     pub configuration: String,
@@ -830,8 +833,7 @@ impl Pool {
     /// Asks for the slot serving `id` to be retired.
     pub fn unwind_later(&self, id: &str, reason: &'static str) {
         if let Some(serving) = self.state.lock().unwrap().serving.get_mut(id) {
-            let restore = serving.ticket.is_some();
-            serving.retire.get_or_insert(Retire { restore, reason });
+            serving.retire.get_or_insert(Retire { reason });
         }
     }
     /// Remembers that `pod` delivered `wake`: its result goes there.
@@ -1208,21 +1210,17 @@ impl Pool {
             ticket: None,
             pod: pod.clone(),
             volume: choice.volume.clone(),
-            target_before: fence["data"]["admission_target"]
-                .as_str()
-                .map(str::to_string),
             structure: structure_fingerprint(&view, &self.image).unwrap_or_default(),
             configuration: sleep_fingerprint(&view, &self.image).unwrap_or_default(),
             retire: None,
         };
-        // Cut off before it serves, the claim leaves its slot to be retired, its release undone.
+        // Cut off before it serves, the claim leaves its slot to be retired.
         let mut claiming = Claiming {
             pool: self,
             pending: Some((
                 id.clone(),
                 Serving {
                     retire: Some(Retire {
-                        restore: true,
                         reason: "interrupted",
                     }),
                     ..serving.clone()
@@ -1375,10 +1373,9 @@ impl Pool {
             .is_err()
         {
             timer.lap("release");
-            // Whether the fence write committed is not known: it is undone with the slot.
+            // Whether the fence write committed is not known: the slot is retired.
             if let Some(serving) = self.state.lock().unwrap().serving.get_mut(&id) {
                 serving.retire = Some(Retire {
-                    restore: true,
                     reason: "release_failed",
                 });
             }
@@ -1714,9 +1711,8 @@ impl Pool {
         };
         write_sleep_record(&self.k8s, id, next.as_ref()).await
     }
-    /// Retires the slot that serves `id` (its `retire` says whether its release is undone first);
-    /// `db` is the desired row the sleep record is written under. `true` once the slot is gone and
-    /// the volume released.
+    /// Retires the slot that serves `id`; `db` is the desired row the sleep record is written
+    /// under. `true` once the slot is gone and the volume released.
     pub async fn unwind(
         &self,
         rec: &Reconciler,
@@ -1726,11 +1722,6 @@ impl Pool {
         let Some(serving) = self.serving(id) else {
             return Ok(true);
         };
-        if serving.retire.is_some_and(|retire| retire.restore) {
-            rec.power
-                .restore_fence(id, &serving.intent(id), serving.target_before.as_deref())
-                .await?;
-        }
         let slot = self
             .state
             .lock()
@@ -1758,7 +1749,7 @@ impl Pool {
         Ok(true)
     }
     /// What Cloudflare's desired rows say of the pending tickets: confirmed ones are dropped,
-    /// refuted and expired ones retire their slot (with the release undone).
+    /// refuted and expired ones retire their slot.
     pub fn confirm_tickets<'a>(
         &self,
         cell: impl Fn(&str) -> Option<&'a Value>,
@@ -1790,7 +1781,6 @@ impl Pool {
             ));
             if outcome != TicketOutcome::Confirmed {
                 serving.retire = Some(Retire {
-                    restore: true,
                     reason: if outcome == TicketOutcome::Refuted {
                         "refuted"
                     } else {
@@ -2349,13 +2339,11 @@ impl Pool {
                     .then(|| Ticket::new(&id, &claim.operation, claim.generation, now)),
                 pod,
                 volume,
-                target_before: None,
                 // The configuration it serves is not known here: the first pass compares with
                 // the desired row and hands over on any difference.
                 structure: String::new(),
                 configuration: String::new(),
                 retire: (!released).then_some(Retire {
-                    restore: false,
                     reason: "unreleased",
                 }),
             };

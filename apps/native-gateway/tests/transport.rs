@@ -1828,7 +1828,13 @@ fn wake_target(generation: u64, slot: bool) -> Value {
 /// generation and operation with its admission target (a pool slot or the database's own Pod),
 /// and the writer as the watches show it before the kubelet reports it Ready.
 async fn release(fixture: &Fixture, generation: u64, slot: bool) {
-    let target = wake_target(generation, slot);
+    release_at(fixture, generation, slot, 19).await;
+}
+/// `release` with the admission target at `route_revision`: Cloudflare's claim of the wake moves
+/// the route revision past the one the ticket was signed with.
+async fn release_at(fixture: &Fixture, generation: u64, slot: bool, route_revision: u64) {
+    let mut target = wake_target(generation, slot);
+    target["route_revision"] = route_revision.into();
     let intent = json!({"database":DATABASE,"operation":wake_operation(),"revision":generation,"mode":"running"});
     let namespace = if slot {
         SLOT.to_string()
@@ -2029,6 +2035,44 @@ async fn the_held_startup_reaches_postgres_unchanged_after_release_and_never_bef
         ]
     );
     client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_wake_released_under_the_route_revision_cloudflare_s_claim_moved_to_is_routed() {
+    // The ticket names route revision 19; Cloudflare's claim of the wake commits 20, and the
+    // controller publishes the target under it (the miss path, or a confirmed hit).
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut client = fixture.upgrade(&wake_token(1080, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    untouched(&mut fixture).await;
+    release_at(&fixture, 2, false, 20).await;
+    fixture.login_sent(&mut client).await;
+    held_count(&fixture, 0).await;
+    client.close(None).await.unwrap();
+    // A ticket signed after the claim is routed at once, as warm.
+    let mut warm = fixture.upgrade(&wake_token(1081, 2)).await.unwrap();
+    fixture.login(&mut warm).await;
+    warm.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_wake_released_under_an_older_route_revision_than_its_ticket_is_stale() {
+    let mut fixture = Fixture::with_fences(sleeping()).await;
+    let mut client = fixture.upgrade(&wake_token(1082, 2)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    release_at(&fixture, 2, false, 18).await;
+    assert!(
+        fatal(&mut client, Duration::from_secs(10))
+            .await
+            .contains("57P03")
+    );
+    untouched(&mut fixture).await;
     fixture.stop().await;
 }
 #[tokio::test]

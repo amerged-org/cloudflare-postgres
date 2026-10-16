@@ -44,6 +44,18 @@ pub struct Fence {
     pub deleting: bool,
     pub admission_target: Option<AdmissionTarget>,
 }
+impl Fence {
+    /// Running at its revision in a pool slot: the controller released a wake there before
+    /// Cloudflare committed the revision, so Cloudflare may still commit another operation or
+    /// state at it, which the controller's next fence names at the same revision.
+    fn pool_release(&self) -> bool {
+        self.intent.mode == "running"
+            && self.admission_target.as_ref().is_some_and(|target| {
+                target.generation == self.intent.revision
+                    && wake::slot_namespace_of_tls_name(&target.tls_server_name).is_some()
+            })
+    }
+}
 #[derive(Default)]
 pub struct FenceState {
     pub ready: bool,
@@ -100,7 +112,9 @@ impl FenceState {
                 })
             }) || new.uid != old.uid
                 || new.intent.revision < old.intent.revision
-                || (new.intent.revision == old.intent.revision && new.intent != old.intent)
+                || (new.intent.revision == old.intent.revision
+                    && new.intent != old.intent
+                    && !old.pool_release())
                 || (old.intent.mode == "retired" && new.intent != old.intent)
                 || (old.intent.mode == "retired" && new.retired_at != old.retired_at)
                 || (new.deleting && !(old.intent.mode == "retired" && can_remove(old)))

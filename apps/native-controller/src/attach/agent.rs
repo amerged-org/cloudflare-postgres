@@ -282,6 +282,13 @@ impl<H: Host> Agent<H> {
         .record(&self.host.boot_id()?);
         self.create_holder(&request.volume.lv_uuid, &holder)?;
         steps.insert("holder".to_string(), micros(started));
+        // Step 3: nothing of this request has the device open yet, so a recheck that refuses
+        // takes the holder it just made away again; kept, only a release of the slot would
+        // remove it.
+        if let Err(code) = self.usable(&request.volume) {
+            let _ = self.remove_holder(&request.volume.lv_uuid);
+            return Err(code);
+        }
         let mut moved = Vec::new();
         match self.attach_held(request, &mut moved, &mut steps, started) {
             Ok(control) => {
@@ -312,8 +319,8 @@ impl<H: Host> Agent<H> {
         }
     }
 
-    /// Attach steps 3-7, after the holder exists. `moved` lists the PIDs whose namespace got the
-    /// volume, for the undo.
+    /// Attach steps 4-7, after the holder exists and the recheck passed. `moved` lists the PIDs
+    /// whose namespace got the volume, for the undo.
     fn attach_held(
         &self,
         request: &AttachRequest,
@@ -321,7 +328,6 @@ impl<H: Host> Agent<H> {
         steps: &mut BTreeMap<String, u64>,
         started: Instant,
     ) -> Result<Control, &'static str> {
-        self.usable(&request.volume)?;
         let mounted = self.host.mount(&request.volume)?;
         steps.insert("fsmount".to_string(), micros(started));
         let control = self.host.read_control(&mounted)?;
@@ -854,8 +860,9 @@ mod tests {
         assert_eq!(state.holder_seen[..2], [false, true]);
         assert_eq!(state.mounts, 0);
         drop(state);
-        // The device is open, so the holder that was created stays.
-        assert_eq!(f.holder(&v), Some(format!("{}\n", slot_record())));
+        // Nothing of the request opened the device, so the holder it made goes again: kept, it
+        // would block the volume for good, as only a release of that slot removes it.
+        assert_eq!(f.holder(&v), None);
     }
 
     #[test]

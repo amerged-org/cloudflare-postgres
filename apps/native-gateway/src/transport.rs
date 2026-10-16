@@ -394,7 +394,11 @@ pub async fn serve_socket(
             let mut stages = Stages::new(&ticket.db, received);
             match wake_state(&gateway, &ticket).await {
                 // Released at its generation already: routed at once, as a running database is.
-                WakeState::Released { pod, .. } => (ticket.admitted(Some(&pod)), stages),
+                WakeState::Released {
+                    pod,
+                    route_revision,
+                    ..
+                } => (admitted_wake(&ticket, &pod, route_revision), stages),
                 WakeState::Stale => {
                     stages.outcome = "route_stale";
                     return control::reply(
@@ -569,10 +573,12 @@ async fn memory_refused(
 /// What the fence shows of a wake ticket.
 enum WakeState {
     /// Running at the ticket's generation and operation, with an admission target of that
-    /// generation and route revision whose Pod is the writer the watches show.
+    /// generation whose Pod is the writer the watches show. Its route revision is the ticket's or
+    /// a later one: Cloudflare's own claim of the wake moves the revision on.
     Released {
         pod: String,
         slot: bool,
+        route_revision: u64,
     },
     Waiting,
     /// The fence moved past the ticket: another generation or operation, or retirement.
@@ -592,7 +598,7 @@ async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
     if intent.mode == "retired"
         || intent.revision > ticket.generation
         || (intent.revision == ticket.generation && intent.operation != ticket.op)
-        || target.is_some_and(|target| target.route_revision != ticket.route_revision)
+        || target.is_some_and(|target| target.route_revision < ticket.route_revision)
     {
         return WakeState::Stale;
     }
@@ -610,9 +616,17 @@ async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
         Ok(writer) if writer.pod_uid == target.pod_uid => WakeState::Released {
             pod: target.pod_uid.clone(),
             slot: wake::slot_namespace_of_tls_name(&target.tls_server_name).is_some(),
+            route_revision: target.route_revision,
         },
         _ => WakeState::Waiting,
     }
+}
+/// The route a released wake is admitted under: the ticket's connection at its generation, the
+/// released Pod, and the route revision of the admission target that released it.
+fn admitted_wake(ticket: &WakeClaims, pod: &str, route_revision: u64) -> RouteClaims {
+    let mut claims = ticket.admitted(Some(pod));
+    claims.route_revision = Some(route_revision);
+    claims
 }
 /// Where a held wake connection stands: released to a writer, ended, or (none) still waiting.
 async fn held_state(
@@ -620,7 +634,7 @@ async fn held_state(
     ticket: &WakeClaims,
     held: &Held,
     stop: &watch::Receiver<bool>,
-) -> Option<Result<(String, bool), HeldEnd>> {
+) -> Option<Result<(String, bool, u64), HeldEnd>> {
     if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
         return Some(Err(HeldEnd::Draining));
     }
@@ -631,7 +645,11 @@ async fn held_state(
         return Some(Err(HeldEnd::Refused));
     }
     match wake_state(gateway, ticket).await {
-        WakeState::Released { pod, slot } => Some(Ok((pod, slot))),
+        WakeState::Released {
+            pod,
+            slot,
+            route_revision,
+        } => Some(Ok((pod, slot, route_revision))),
         WakeState::Stale => Some(Err(HeldEnd::Stale)),
         WakeState::Waiting => None,
     }
@@ -828,7 +846,7 @@ async fn serve_held(
         }
     };
     stages.verdict = Some(held.release());
-    let (pod, slot) = match released {
+    let (pod, slot, route_revision) = match released {
         Ok(released) => released,
         Err(end) => {
             end_held(&mut websocket, &mut stages, end).await;
@@ -841,7 +859,7 @@ async fn serve_held(
         stages.wake_path = "pool_hit";
     }
     // From here the connection is the admitted route of the woken writer.
-    let claims = ticket.admitted(Some(&pod));
+    let claims = admitted_wake(&ticket, &pod, route_revision);
     let state = gateway.fences.read().await;
     let epoch = state.bound_epoch(&database);
     let revision_current = state.admits(&database) && route_revision_current(&state, &claims);

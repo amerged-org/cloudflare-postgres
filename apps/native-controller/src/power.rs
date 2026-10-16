@@ -1034,9 +1034,10 @@ impl PowerCoordinator {
         // What the write answers is the fence as it was written: it is not read again.
         let written = if let Some(map) = map {
             let prior = intent_from(map, id)?;
+            let superseded = unconfirmed_pool_release(map, &prior, self.now());
             if intent.is_some_and(|next| {
                 next.revision < prior.revision
-                    || (next.revision == prior.revision && *next != prior)
+                    || (next.revision == prior.revision && *next != prior && !superseded)
             }) || progress_from(map, self.now())?
                 .is_some_and(|prior| prior.target.revision > progress.target.revision)
             {
@@ -1219,6 +1220,14 @@ impl PowerCoordinator {
             {
                 return Err(Fault::Unavailable("slot_release_invalid"));
             }
+            // The fence's history holds, as for every other write of it.
+            let prior = intent_from(&map, text(db, "id"))?;
+            if prior.revision == intent.revision
+                && prior != *intent
+                && !unconfirmed_pool_release(&map, &prior, self.now())
+            {
+                return Err(Fault::Stale);
+            }
             let intent_text = serde_json::to_string(intent).unwrap();
             let target_text = serde_json::to_string(target).unwrap();
             let patch = json!({"data":{"intent.json":intent_text,"admission_target":target_text}});
@@ -1236,38 +1245,6 @@ impl PowerCoordinator {
         }
         .await;
         Ok(result?)
-    }
-    /// Undoes an unconfirmed slot release: the fence intent goes back to the one the sleep's power
-    /// record names, and the admission target to `target` (none when it is not known).
-    pub(crate) async fn restore_fence(
-        &self,
-        id: &str,
-        claimed: &PowerIntent,
-        target: Option<&str>,
-    ) -> std::result::Result<bool, Error> {
-        let name = format!("gateway-fence-{id}");
-        let Some(map) = self.k8s.read("ConfigMap", Some(SYSTEM), &name).await? else {
-            return Ok(false);
-        };
-        let map = owned(Some(map), &name, id, Some(SYSTEM), false)?;
-        if intent_from(&map, id)? != *claimed {
-            // Not the claim's any more: nothing of it to undo.
-            return Ok(false);
-        }
-        let Some(progress) = progress_from(&map, self.now())? else {
-            return Ok(false);
-        };
-        if progress.phase != Phase::Hibernated {
-            return Ok(false);
-        }
-        let intent = serde_json::to_string(&progress.target).unwrap();
-        self.k8s
-            .patch(
-                &map,
-                &json!({"data":{"intent.json":intent,"admission_target":target}}),
-            )
-            .await?;
-        Ok(true)
     }
     /// Takes the volume's holder for the database's own CNPG Pod. A database without thin
     /// storage, without a recorded LV or on a node without an agent takes none.
@@ -1647,6 +1624,26 @@ fn phase_name(phase: Phase) -> &'static str {
         Phase::Parking => "parking",
         Phase::Parked => "parked",
     }
+}
+/// Whether `map`, a gateway fence running at `intent`, is a pool slot's release that Cloudflare
+/// has not confirmed: its admission target is a slot's at that revision, and its power record is
+/// not the completed wake of that intent. Cloudflare may still commit another operation or state
+/// at the revision, and the fence that names it supersedes the release (the gateway accepts
+/// that for a slot's release only).
+fn unconfirmed_pool_release(map: &Value, intent: &PowerIntent, now: u64) -> bool {
+    let target: Option<Value> = map["data"]["admission_target"]
+        .as_str()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    intent.mode == "running"
+        && target.is_some_and(|target| {
+            target["generation"] == intent.revision
+                && pgcf_native_protocol::wake::slot_namespace_of_tls_name(text(
+                    &target,
+                    "tls_server_name",
+                ))
+                .is_some()
+        })
+        && !woke_under(map, intent, now)
 }
 /// Whether `map`, a gateway fence, holds the power record of a completed sleep: a valid record
 /// with its anchor, at `Hibernated`.

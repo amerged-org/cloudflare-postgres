@@ -87,3 +87,39 @@ async fn every_applied_fence_change_wakes_the_connections_waiting_on_it() {
         .await
         .unwrap();
 }
+#[test]
+fn a_pool_release_cloudflare_never_confirmed_may_be_superseded_at_its_own_revision() {
+    // The controller releases a pool slot at the generation the wake ticket claims before
+    // Cloudflare commits it. When Cloudflare commits that generation under another operation or
+    // state, the controller's next fence names it at the same revision; anything else at the
+    // same revision still fails closed.
+    let database = "a".repeat(20);
+    let pod = "01234567-89ab-4def-8123-0123456789ab";
+    let fence = |operation: &str, mode: &str, tls: &str| {
+        let mut value = snapshot();
+        value["items"][0]["data"]["intent.json"] =
+            json!({"database":database,"operation":operation,"revision":2,"mode":mode})
+                .to_string()
+                .into();
+        value["items"][0]["data"]["admission_target"] = json!({"v":1,"generation":2,"route_revision":19,"admission_epoch":3,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"4","ca_sha256":"b".repeat(64),"tls_server_name":tls}).to_string().into();
+        parse_snapshot(&value).unwrap()
+    };
+    let slot = "database-rw.pgcf-slot-0a1b2c3d.svc".to_string();
+    let own = format!("database-rw.pgcf-db-{database}.svc");
+    let ticket = format!("op_{}", "w".repeat(20));
+    let claimed = format!("op_{}", "c".repeat(20));
+    for next in [
+        fence(&claimed, "running", &slot),
+        fence(&ticket, "quiesce", &slot),
+    ] {
+        let mut state = FenceState::default();
+        state.replace(fence(&ticket, "running", &slot)).unwrap();
+        state.replace(next).unwrap();
+        assert!(state.synchronized());
+    }
+    // The database's own writer at that revision is history: it is never rewritten.
+    let mut state = FenceState::default();
+    state.replace(fence(&ticket, "running", &own)).unwrap();
+    assert!(state.replace(fence(&claimed, "running", &own)).is_err());
+    assert!(!state.synchronized());
+}

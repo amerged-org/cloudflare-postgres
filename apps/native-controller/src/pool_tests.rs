@@ -254,6 +254,42 @@ fn each_decision_row_returns_its_reason_in_table_order() {
 }
 
 #[test]
+fn a_gateway_wake_cloudflare_already_claimed_is_not_stale_for_the_route_revision_its_claim_moved() {
+    // Cloudflare's claim of the wake commits the ticket's generation and operation and moves the
+    // route revision past the one the ticket was signed with: the claim is what the ticket asked
+    // for, so the gateway's wake is still decided.
+    let db = thin_database();
+    let wake = request(&db);
+    let mut claimed = db.clone();
+    claimed["generation"] = wake.generation.into();
+    claimed["desired_state"] = "running".into();
+    claimed["power"] = json!({"operation":wake.operation,"revision":wake.generation,"mode":"running","reason":null});
+    claimed["admission"]["route_revision"] = (wake.route_revision + 1).into();
+    let identity = json!({"claimUid":"c","volumeUid":"v","handle":HANDLE,"lvUuid":LV});
+    let sleep = record(&db);
+    let fits = free_slot("0000000b", 500, 512, IMAGE);
+    let facts = Facts {
+        trigger: Trigger::Gateway(&wake),
+        cell: Some(&claimed),
+        protection: None,
+        asleep: true,
+        busy: false,
+        identity: Some(&identity),
+        power_record: true,
+        record: Some(&sleep),
+        image: IMAGE,
+        fingerprint: &sleep.configuration_sha256,
+        authority: true,
+        gateways_ready: true,
+        slots: vec![&fits],
+        headroom: true,
+    };
+    assert_eq!(
+        decide(&facts).map(|choice| choice.slot),
+        Ok("0000000b".into())
+    );
+}
+#[test]
 fn a_ticket_is_confirmed_by_its_generation_and_operation_refuted_by_another_and_expires_after_10_s()
 {
     let now = Instant::now();
@@ -985,9 +1021,9 @@ mod world {
     #[tokio::test]
     async fn an_unconfirmed_ticket_is_unwound_after_10_s_and_the_slot_namespace_deleted() {
         let mut w = World::pooled().await;
-        let fence_before = fence(&w);
         let wake = delivered_wake(&mut w).await;
         assert!(w.reconciler.pool.serves(&w.id));
+        let released = fence(&w);
         // Cloudflare's row still sleeps: nothing is decided before the lease runs out.
         let db = w.db.clone();
         let cell = |id: &str| (id == db["id"]).then_some(&db);
@@ -1013,15 +1049,16 @@ mod world {
                 .unwrap()
         );
         let lines = w.since(from);
-        // The release is undone first, then the slot fenced, recorded from its shut-down data
-        // directory, deleted and its volume released.
-        let restored = at(
+        // The slot is fenced, recorded from its shut-down data directory, deleted and its volume
+        // released. The fence stays as released: a gateway refuses a fence that goes back, and
+        // the next fence Cloudflare's row asks for supersedes it.
+        assert!(!has(
             &lines,
             &format!(
                 "PATCH /api/v1/namespaces/{SYSTEM}/configmaps/gateway-fence-{}",
                 w.id
-            ),
-        );
+            )
+        ));
         let fenced = at(
             &lines,
             &format!(
@@ -1037,18 +1074,10 @@ mod world {
             ),
         );
         let deleted = at(&lines, &format!("DELETE /api/v1/namespaces/{}", slot_ns()));
-        let released = at(&lines, "AGENT release ok");
-        assert!(restored < fenced && fenced < recorded && recorded < deleted && deleted < released);
-        let map = fence(&w);
-        assert_eq!(
-            map["data"]["intent.json"],
-            fence_before["data"]["intent.json"]
-        );
-        assert_eq!(
-            map["data"]["admission_target"],
-            fence_before["data"]["admission_target"]
-        );
-        assert!(crate::power::sleep_completed(&map, now_ms()));
+        let released_volume = at(&lines, "AGENT release ok");
+        assert!(fenced < recorded && recorded < deleted && deleted < released_volume);
+        assert_eq!(fence(&w)["data"], released["data"]);
+        assert!(crate::power::sleep_completed(&fence(&w), now_ms()));
         let slept = record(&w).unwrap();
         assert_eq!(slept.via, Via::Slot);
         assert_eq!(
@@ -1058,7 +1087,34 @@ mod world {
         assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
         assert_eq!(holder(&w), None);
         assert!(!w.reconciler.pool.serves(&w.id));
-        let _ = wake;
+        // Cloudflare then commits the ticket's generation under another operation, which the
+        // database's own Cluster runs: its fence names it at the same revision.
+        let other = WakeRequest {
+            operation: format!("op_{}", "c".repeat(20)),
+            ..wake.clone()
+        };
+        w.claimed(&other);
+        w.server
+            .edit("Cluster", Some(&w.ns), "database", |cluster| {
+                cluster["metadata"]["annotations"]["cnpg.io/hibernation"] = "off".into();
+            });
+        let ready = json!({"id":w.id,"generation":wake.generation,"state":"ready","archive":{"continuous":true,"ready_wal_files":0}});
+        let observed = w
+            .reconciler
+            .power
+            .finish_running(&w.db, ready, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.expect("ready")["power"]["operation"],
+            other.operation.as_str()
+        );
+        let intent: Value =
+            serde_json::from_str(fence(&w)["data"]["intent.json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            intent,
+            json!({"database":w.id,"operation":other.operation,"revision":wake.generation,"mode":"running"})
+        );
     }
 
     #[tokio::test]
