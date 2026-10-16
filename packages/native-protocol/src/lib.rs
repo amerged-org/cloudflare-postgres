@@ -6,6 +6,7 @@ pub mod generated;
 pub mod route;
 pub mod scoped_tokens;
 pub mod startup;
+pub mod wake;
 
 use regex::Regex;
 use serde_json::Value;
