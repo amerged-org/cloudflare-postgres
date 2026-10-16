@@ -11,6 +11,11 @@
 // derived for its own region, so a compromised gateway cannot mint tokens for
 // any other region.
 //
+// A v5 token is the Edge's wake ticket for a sleeping database (pool design 2026-10-16): it
+// carries the wake operation, the generation the wake claims in D1, the admission route revision
+// and a hash of the role revisions, and no Pod, because the Pod is not known when it is signed.
+// `v: 5` is the wake flag; v5 is issued only for a wake ticket. Rust: native-protocol wake.rs.
+//
 // Temporary rollout compatibility: v2 tokens (prefix "v2", domain "pgcf-route/v2\n")
 // carry no route revision or target. The Edge signs them only for an admission without
 // a target, which the Actor returns only outside a v3 region: one whose assigned release
@@ -18,9 +23,17 @@
 // still accept them. Remove v2 signing and verification and make the admission target
 // required once every region's release declares v3; a missing target is then refused.
 import { z } from "zod";
-import { CnpgDatabaseTarget } from "./database-admission.ts";
+import {
+  CnpgDatabaseTarget,
+  type DatabaseWakeTicket,
+} from "./database-admission.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
-import { DATABASE_ID_PATTERN, REGION_ID_PATTERN, RoleName } from "./ids.ts";
+import {
+  DATABASE_ID_PATTERN,
+  OperationId,
+  REGION_ID_PATTERN,
+  RoleName,
+} from "./ids.ts";
 
 export const ROUTE_TOKEN_HEADER = "X-PGCF-Route";
 export const ROUTE_TOKEN_MAX_LENGTH = 512;
@@ -34,6 +47,8 @@ const TOKEN_PREFIX = "v3";
 const SIGNATURE_DOMAIN = "pgcf-route/v3\n";
 const ADMISSION_TOKEN_PREFIX = "v4";
 const ADMISSION_SIGNATURE_DOMAIN = "pgcf-route/v4\n";
+const WAKE_TOKEN_PREFIX = "v5";
+const WAKE_SIGNATURE_DOMAIN = "pgcf-route/v5\n";
 const LEGACY_TOKEN_PREFIX = "v2";
 const LEGACY_SIGNATURE_DOMAIN = "pgcf-route/v2\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
@@ -44,6 +59,8 @@ export const ROUTE_TOKEN_SIGNATURE_DOMAIN = SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_ADMISSION_PREFIX = ADMISSION_TOKEN_PREFIX;
 export const ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN =
   ADMISSION_SIGNATURE_DOMAIN;
+export const ROUTE_TOKEN_WAKE_PREFIX = WAKE_TOKEN_PREFIX;
+export const ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN = WAKE_SIGNATURE_DOMAIN;
 /** Temporary rollout compatibility; the module comment names the removal condition. */
 export const ROUTE_TOKEN_LEGACY_PREFIX = LEGACY_TOKEN_PREFIX;
 export const ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN = LEGACY_SIGNATURE_DOMAIN;
@@ -80,6 +97,20 @@ export const cnpgAdmissionRouteTokenClaimsSchema =
 export type AdmissionRouteTokenClaims = z.infer<
   typeof cnpgAdmissionRouteTokenClaimsSchema
 >;
+const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const RoleRevisionHash = z.string().regex(/^[a-f0-9]{64}$/);
+/** A wake ticket: the operation, the claimed generation, the route revision and the role hash. */
+export const wakeRouteTokenClaimsSchema = z.strictObject({
+  v: z.literal(5),
+  ...connectionClaims,
+  op: OperationId,
+  /** The generation the wake claims in D1: the Actor snapshot's generation + 1. */
+  gen: Revision,
+  route_revision: Revision,
+  /** roleRevisionHash of the Actor snapshot's roles. */
+  rh: RoleRevisionHash,
+});
+export type WakeRouteTokenClaims = z.infer<typeof wakeRouteTokenClaimsSchema>;
 /** Temporary rollout compatibility: no route revision or target. */
 export const legacyRouteTokenClaimsSchema = z.strictObject({
   v: z.literal(2),
@@ -200,6 +231,47 @@ export async function signRouteToken(
   );
 }
 
+export interface SignWakeRouteTokenInput extends Omit<
+  SignRouteTokenInput,
+  "target"
+> {
+  readonly wake: DatabaseWakeTicket;
+}
+
+/** A v5 wake ticket for a sleeping database. */
+export async function signWakeRouteToken(
+  input: SignWakeRouteTokenInput,
+): Promise<string> {
+  return seal(
+    input,
+    wakeRouteTokenClaimsSchema.safeParse({
+      v: 5,
+      ...connection(input),
+      op: input.wake?.operation,
+      gen: input.wake?.generation,
+      route_revision: input.wake?.route_revision,
+      rh: input.wake?.role_revision_hash,
+    }),
+    WAKE_TOKEN_PREFIX,
+    WAKE_SIGNATURE_DOMAIN,
+  );
+}
+
+/** SHA-256 (lowercase hex) of the sorted lines "<name>\t<revision>\n", one per live role. */
+export async function roleRevisionHash(
+  roles: readonly { readonly name: string; readonly revision: number }[],
+): Promise<string> {
+  const lines = roles
+    .map(({ name, revision }) => `${name}\t${revision}\n`)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", encoder.encode(lines.join(""))),
+  );
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
 /** Temporary rollout compatibility: a v2 token for an admission without a verified target. */
 export async function signLegacyRouteToken(
   input: Omit<SignRouteTokenInput, "target">,
@@ -231,7 +303,10 @@ function connection(input: Omit<SignRouteTokenInput, "target">) {
 async function seal(
   input: Omit<SignRouteTokenInput, "target">,
   claims: z.ZodSafeParseResult<
-    RouteTokenClaims | AdmissionRouteTokenClaims | LegacyRouteTokenClaims
+    | RouteTokenClaims
+    | AdmissionRouteTokenClaims
+    | WakeRouteTokenClaims
+    | LegacyRouteTokenClaims
   >,
   prefix: string,
   domain: string,
@@ -262,7 +337,10 @@ export type RouteTokenResult =
   | {
       readonly ok: true;
       readonly claims:
-        RouteTokenClaims | AdmissionRouteTokenClaims | LegacyRouteTokenClaims;
+        | RouteTokenClaims
+        | AdmissionRouteTokenClaims
+        | WakeRouteTokenClaims
+        | LegacyRouteTokenClaims;
     }
   | { readonly ok: false; readonly reason: RouteTokenFailure };
 
@@ -285,7 +363,8 @@ export async function verifyRouteToken(
   if (typeof token !== "string" || token.length === 0) return fail("missing");
   if (
     token.length >
-    (token.startsWith(`${ADMISSION_TOKEN_PREFIX}.`)
+    (token.startsWith(`${ADMISSION_TOKEN_PREFIX}.`) ||
+    token.startsWith(`${WAKE_TOKEN_PREFIX}.`)
       ? ROUTE_TOKEN_ADMISSION_MAX_LENGTH
       : ROUTE_TOKEN_MAX_LENGTH)
   )
@@ -294,9 +373,10 @@ export async function verifyRouteToken(
   // Temporary rollout compatibility: v2 keeps its own prefix, domain and claims.
   const legacy = parts[0] === LEGACY_TOKEN_PREFIX;
   const admission = parts[0] === ADMISSION_TOKEN_PREFIX;
+  const wake = parts[0] === WAKE_TOKEN_PREFIX;
   if (
     parts.length !== 3 ||
-    (parts[0] !== TOKEN_PREFIX && !legacy && !admission)
+    (parts[0] !== TOKEN_PREFIX && !legacy && !admission && !wake)
   )
     return fail("malformed");
   const payload = parts[1] as string;
@@ -328,7 +408,9 @@ export async function verifyRouteToken(
       ? LEGACY_SIGNATURE_DOMAIN
       : admission
         ? ADMISSION_SIGNATURE_DOMAIN
-        : SIGNATURE_DOMAIN) + payload,
+        : wake
+          ? WAKE_SIGNATURE_DOMAIN
+          : SIGNATURE_DOMAIN) + payload,
   );
   if (!constantTimeEqual(expected, signature)) return fail("bad_signature");
 
@@ -337,7 +419,9 @@ export async function verifyRouteToken(
       ? legacyRouteTokenClaimsSchema
       : admission
         ? cnpgAdmissionRouteTokenClaimsSchema
-        : routeTokenClaimsSchema
+        : wake
+          ? wakeRouteTokenClaimsSchema
+          : routeTokenClaimsSchema
   ).safeParse(decoded);
   if (!claims.success) return fail("invalid_claims");
   const { rg, iat, exp } = claims.data;

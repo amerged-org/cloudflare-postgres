@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
-    route::{self, ReplayCache},
+    route::{self, Connection, Keyring, ReplayCache},
     startup::{Event, StartupReader},
+    wake::{self, Ticket},
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -135,4 +136,96 @@ fn authoritative_control_and_activity_tokens_have_identical_scope_and_expiry() {
             assert_eq!(actual, case["expected"], "{kind} {}", case["name"]);
         }
     }
+}
+#[test]
+fn authoritative_typescript_wake_route_vectors() {
+    let vectors = vectors();
+    let key: Vec<u8> = vectors["key"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u8)
+        .collect();
+    let keys = HashMap::from([("test".into(), key.clone())]);
+    let cases = vectors["wakeRoutes"].as_array().unwrap();
+    assert!(cases.len() > 10);
+    for case in cases {
+        let got = wake::verify_wake(
+            case["token"].as_str(),
+            &keys,
+            case["region"].as_str().unwrap(),
+            case["now"].as_u64().unwrap(),
+        );
+        let result = match got {
+            Ok(claims) => json!({ "ok":true,"claims":claims }),
+            Err(reason) => json!({ "ok":false,"reason":reason }),
+        };
+        assert_eq!(result, case["expected"], "{}", case["name"]);
+    }
+    // The Rust signer produces the TypeScript signer's exact token.
+    let signed = &vectors["wakeSigned"];
+    let input = &signed["input"];
+    let ticket = &input["wake"];
+    let token = wake::sign_wake(
+        &Keyring {
+            active: "test".into(),
+            keys: HashMap::from([("test".into(), key)]),
+        },
+        &Connection {
+            region: input["region"].as_str().unwrap(),
+            database: input["db"].as_str().unwrap(),
+            user: input["user"].as_str().unwrap(),
+            cid: input["cid"].as_str().unwrap(),
+            now_ms: input["now"].as_u64().unwrap(),
+            ttl_seconds: input["ttlSeconds"].as_u64().unwrap(),
+        },
+        &Ticket {
+            operation: ticket["operation"].as_str().unwrap(),
+            generation: ticket["generation"].as_u64().unwrap(),
+            route_revision: ticket["route_revision"].as_u64().unwrap(),
+            role_revision_hash: ticket["role_revision_hash"].as_str().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(token, signed["token"].as_str().unwrap());
+}
+#[test]
+fn role_revision_hash_matches_typescript() {
+    let vectors = vectors();
+    let cases = vectors["roleRevisionHashes"].as_array().unwrap();
+    assert!(cases.len() > 1);
+    for case in cases {
+        let roles: Vec<(&str, u64)> = case["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|role| {
+                (
+                    role["name"].as_str().unwrap(),
+                    role["revision"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            wake::role_revision_hash(roles),
+            case["hash"].as_str().unwrap()
+        );
+    }
+}
+#[test]
+fn wake_wire_constants_match_the_generated_contract() {
+    assert_eq!(
+        wake::ROUTE_PREFIX,
+        pgcf_native_protocol::wire("wakeRouteTokenPrefix")
+    );
+    assert_eq!(
+        wake::ROUTE_DOMAIN,
+        pgcf_native_protocol::wire("wakeRouteSignatureDomain")
+    );
+    assert_eq!(
+        u64::from(wake::ROUTE_VERSION),
+        pgcf_native_protocol::CONTRACT["wakeRouteClaims"]["properties"]["v"]["const"]
+            .as_u64()
+            .unwrap()
+    );
 }

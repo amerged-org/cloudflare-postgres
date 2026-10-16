@@ -34,6 +34,11 @@ import {
   legacyRouteTokenClaimsSchema,
   routeTokenClaimsSchema,
   cnpgAdmissionRouteTokenClaimsSchema,
+  wakeRouteTokenClaimsSchema,
+  ROUTE_TOKEN_WAKE_PREFIX,
+  ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
+  roleRevisionHash,
+  signWakeRouteToken,
   ROUTE_TOKEN_ADMISSION_PREFIX,
   ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
   ROUTE_TOKEN_MAX_LENGTH,
@@ -189,6 +194,8 @@ const contract = {
     routeSignatureDomain: ROUTE_TOKEN_SIGNATURE_DOMAIN,
     admissionRouteTokenPrefix: ROUTE_TOKEN_ADMISSION_PREFIX,
     admissionRouteSignatureDomain: ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
+    wakeRouteTokenPrefix: ROUTE_TOKEN_WAKE_PREFIX,
+    wakeRouteSignatureDomain: ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
     legacyRouteTokenPrefix: ROUTE_TOKEN_LEGACY_PREFIX,
     legacyRouteSignatureDomain: ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
     controlSigningPurpose: GATEWAY_CONTROL_SIGNING_PURPOSE,
@@ -223,6 +230,7 @@ const contract = {
   databaseAdmission: edge.databaseAdmission,
   routeClaims,
   admissionRouteClaims: schema(cnpgAdmissionRouteTokenClaimsSchema),
+  wakeRouteClaims: schema(wakeRouteTokenClaimsSchema),
   gatewayAdmissionTarget: schema(GatewayAdmissionTarget),
   legacyRouteClaims: schema(legacyRouteTokenClaimsSchema),
   controlClaims: schema(gatewayControlClaimsSchema),
@@ -394,6 +402,152 @@ const routeInputs: {
     now: 1035001,
   },
 ];
+const wakeClaims = {
+  ...legacyClaims,
+  v: 5,
+  op: `op_${"c".repeat(20)}`,
+  gen: 8,
+  route_revision: 19,
+  rh: "d".repeat(64),
+};
+async function wakeToken(
+  value: unknown,
+  domain = ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
+): Promise<string> {
+  return rawToken(JSON.stringify(value), ROUTE_TOKEN_WAKE_PREFIX, domain);
+}
+// Only v5-prefixed tokens: wake.rs verifies nothing else.
+const wakeRouteInputs: {
+  name: string;
+  token: string | null;
+  now?: number;
+  region?: string;
+}[] = [
+  { name: "valid", token: await wakeToken(wakeClaims) },
+  {
+    name: "v4-domain",
+    token: await wakeToken(wakeClaims, ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN),
+  },
+  {
+    name: "v4-claims-under-v5",
+    token: await wakeToken({ ...claims, v: 4, route_revision: 19 }),
+  },
+  { name: "v4-version", token: await wakeToken({ ...wakeClaims, v: 4 }) },
+  {
+    name: "missing-rh",
+    token: await wakeToken({ ...wakeClaims, rh: undefined }),
+  },
+  {
+    name: "uppercase-rh",
+    token: await wakeToken({ ...wakeClaims, rh: "D".repeat(64) }),
+  },
+  {
+    name: "short-rh",
+    token: await wakeToken({ ...wakeClaims, rh: "d".repeat(63) }),
+  },
+  { name: "zero-gen", token: await wakeToken({ ...wakeClaims, gen: 0 }) },
+  {
+    name: "fraction-gen",
+    token: await wakeToken({ ...wakeClaims, gen: 7.5 }),
+  },
+  {
+    name: "unsafe-gen",
+    token: await wakeToken({ ...wakeClaims, gen: 2 ** 53 }),
+  },
+  {
+    name: "zero-route-revision",
+    token: await wakeToken({ ...wakeClaims, route_revision: 0 }),
+  },
+  {
+    name: "bad-operation",
+    token: await wakeToken({ ...wakeClaims, op: "op_SHORT" }),
+  },
+  {
+    name: "extra-pod",
+    token: await wakeToken({ ...wakeClaims, pod: claims.pod }),
+  },
+  {
+    name: "reserved-role",
+    token: await wakeToken({ ...wakeClaims, user: "postgres" }),
+  },
+  {
+    name: "wrong-region",
+    token: await wakeToken(wakeClaims),
+    region: "us-test",
+  },
+  {
+    name: "unknown-kid",
+    token: await wakeToken({ ...wakeClaims, kid: "other" }),
+  },
+  {
+    name: "bad-signature",
+    token: (await wakeToken(wakeClaims)).slice(0, -3) + "AAA",
+  },
+  {
+    name: "bad-lifetime",
+    token: await wakeToken({ ...wakeClaims, exp: 1031 }),
+  },
+  {
+    name: "zero-lifetime",
+    token: await wakeToken({ ...wakeClaims, exp: 1000 }),
+  },
+  { name: "not-yet-valid", token: await wakeToken(wakeClaims), now: 994999 },
+  { name: "skew-start", token: await wakeToken(wakeClaims), now: 995000 },
+  { name: "skew-end", token: await wakeToken(wakeClaims), now: 1035000 },
+  { name: "expired", token: await wakeToken(wakeClaims), now: 1035001 },
+  { name: "missing", token: null },
+  { name: "malformed", token: "v5.a.b" },
+  {
+    name: "too-long",
+    token: `v5.${"A".repeat(ROUTE_TOKEN_ADMISSION_MAX_LENGTH)}.x`,
+  },
+];
+const wakeRoutes = await Promise.all(
+  wakeRouteInputs.map(async (input) => ({
+    name: input.name,
+    token: input.token,
+    now: input.now ?? 1000000,
+    region: input.region ?? region,
+    expected: await verifyRouteToken(input.token, {
+      keys: new Map([["test", key]]),
+      region: input.region ?? region,
+      now: input.now ?? 1000000,
+    }),
+  })),
+);
+const wakeSignedInput = {
+  region,
+  db: database,
+  user: "app",
+  cid: legacyClaims.cid,
+  now: 1000000,
+  ttlSeconds: 30,
+  wake: {
+    operation: wakeClaims.op,
+    generation: wakeClaims.gen,
+    route_revision: wakeClaims.route_revision,
+    role_revision_hash: wakeClaims.rh,
+  },
+};
+const wakeSigned = {
+  input: wakeSignedInput,
+  token: await signWakeRouteToken({
+    ...wakeSignedInput,
+    keyring: { active: "test", keys: new Map([["test", key]]) },
+  }),
+};
+const roleRevisionHashes = await Promise.all(
+  [
+    [],
+    [{ name: "app", revision: 1 }],
+    [
+      { name: "reader", revision: 12 },
+      { name: "app", revision: 3 },
+      { name: "app_admin", revision: 9007199254740991 },
+      { name: "a", revision: 2 },
+    ],
+  ].map(async (roles) => ({ roles, hash: await roleRevisionHash(roles) })),
+);
 const routes = await Promise.all(
   routeInputs.map(async (input) => {
     const encoded =
@@ -615,6 +769,9 @@ for (const [name, value] of [
       edge: await edgeVectors(),
       key: [...key],
       routes,
+      wakeRoutes,
+      wakeSigned,
+      roleRevisionHashes,
       startups,
       controls,
       activities,

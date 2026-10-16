@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   ReplayCache,
@@ -11,10 +11,16 @@ import {
   serializeRouteKeyring,
   signLegacyRouteToken,
   signRouteToken,
+  signWakeRouteToken,
+  roleRevisionHash,
+  ROUTE_TOKEN_WAKE_PREFIX,
+  ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
+  ROUTE_TOKEN_ADMISSION_MAX_LENGTH,
   verifyRouteToken,
   type RouteKeyring,
   type SignRouteTokenInput,
 } from "../src/route-token.ts";
+import conformance from "../native/conformance.generated.json" with { type: "json" };
 
 const region = "eu-1";
 const user = "app";
@@ -846,6 +852,127 @@ describe("route token", () => {
     expect(
       (await verifyRouteToken(token, { keys: derived.keys, region, now })).ok,
     ).toBe(true);
+  });
+});
+
+describe("wake route token v5", () => {
+  const wake = {
+    operation: `op_${"c".repeat(20)}`,
+    generation: 8,
+    route_revision: 19,
+    role_revision_hash: "a".repeat(64),
+  };
+  const input = { keyring: master, region, db, user, cid, wake, now };
+
+  it("a v5 wake route signs and verifies with op, gen, route_revision and rh", async () => {
+    expect(ROUTE_TOKEN_WAKE_PREFIX).toBe("v5");
+    expect(ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN).toBe("pgcf-route/v5\n");
+    const token = await signWakeRouteToken(input);
+    const [prefix, payload, signature] = token.split(".") as [
+      string,
+      string,
+      string,
+    ];
+    expect(prefix).toBe("v5");
+    const regionKey = (await regionKeys()).get("k2")!;
+    expect(
+      createHmac("sha256", regionKey)
+        .update("pgcf-route/v5\n" + payload)
+        .digest("base64url"),
+    ).toBe(signature);
+    const claims = {
+      v: 5,
+      db,
+      user,
+      cid,
+      rg: region,
+      kid: "k2",
+      iat: nowSec,
+      exp: nowSec + 30,
+      op: wake.operation,
+      gen: 8,
+      route_revision: 19,
+      rh: wake.role_revision_hash,
+    };
+    expect(JSON.parse(Buffer.from(payload, "base64url").toString())).toEqual(
+      claims,
+    );
+    expect(
+      await verifyRouteToken(token, { keys: await regionKeys(), region, now }),
+    ).toEqual({ ok: true, claims });
+  });
+
+  it("v5 refuses the v4 domain, a changed gen, a missing rh and an over-long token", async () => {
+    const keys = await regionKeys();
+    const regionKey = keys.get("k2")!;
+    const token = await signWakeRouteToken(input);
+    const claims = JSON.parse(
+      Buffer.from(token.split(".")[1]!, "base64url").toString(),
+    );
+    const verify = (value: string) =>
+      verifyRouteToken(value, { keys, region, now });
+    // The same claims under the v4 domain, and v5 claims sealed as v4.
+    const underV4Domain = signPayload(JSON.stringify(claims), regionKey, "v4");
+    expect(await verify(`v5.${underV4Domain.slice(3)}`)).toEqual({
+      ok: false,
+      reason: "bad_signature",
+    });
+    expect(await verify(underV4Domain)).toEqual({
+      ok: false,
+      reason: "invalid_claims",
+    });
+    const [, , signature] = token.split(".");
+    const changed = b64u(Buffer.from(JSON.stringify({ ...claims, gen: 9 })));
+    expect(await verify(`v5.${changed}.${signature}`)).toEqual({
+      ok: false,
+      reason: "bad_signature",
+    });
+    const withoutRh = { ...claims, rh: undefined };
+    expect(
+      await verify(signPayload(JSON.stringify(withoutRh), regionKey, "v5")),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+    expect(
+      await verify(
+        signPayload(
+          JSON.stringify({ ...claims, rh: "A".repeat(64) }),
+          regionKey,
+          "v5",
+        ),
+      ),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+    expect(
+      await verify(
+        signPayload(JSON.stringify({ ...claims, v: 4 }), regionKey, "v5"),
+      ),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+    // v5 shares the v4 admission length limit.
+    expect(token.length).toBeLessThanOrEqual(ROUTE_TOKEN_ADMISSION_MAX_LENGTH);
+    expect(
+      await verify(`v5.${"A".repeat(ROUTE_TOKEN_ADMISSION_MAX_LENGTH)}.x`),
+    ).toEqual({ ok: false, reason: "too_long" });
+    await expect(
+      signWakeRouteToken({ ...input, wake: { ...wake, generation: 0 } }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it("roleRevisionHash is order independent and equals the generated vector", async () => {
+    const roles = [
+      { name: "app", revision: 3 },
+      { name: "reader", revision: 12 },
+      { name: "admin", revision: 1 },
+    ];
+    const expected = createHash("sha256")
+      .update("admin\t1\napp\t3\nreader\t12\n")
+      .digest("hex");
+    expect(await roleRevisionHash(roles)).toBe(expected);
+    expect(await roleRevisionHash([...roles].reverse())).toBe(expected);
+    expect(await roleRevisionHash([])).toBe(
+      createHash("sha256").update("").digest("hex"),
+    );
+    const vectors = conformance.roleRevisionHashes;
+    expect(vectors.length).toBeGreaterThan(1);
+    for (const vector of vectors)
+      expect(await roleRevisionHash(vector.roles)).toBe(vector.hash);
   });
 });
 

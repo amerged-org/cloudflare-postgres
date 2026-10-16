@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { RegionId } from "./ids.ts";
+import { OperationId, RegionId } from "./ids.ts";
 
 /** The existing DatabaseActor RPC response; Rust Edge consumes its generated schema. */
 export const DatabaseRegionRoute = z.strictObject({
@@ -65,6 +65,34 @@ export const DatabaseAdmission = z.discriminatedUnion("ok", [
   }),
 ]);
 export type DatabaseAdmission = z.infer<typeof DatabaseAdmission>;
+/** The wake ticket the DatabaseActor issues for a sleeping database; the Edge signs it as route v5. */
+export const DatabaseWakeTicket = z.strictObject({
+  operation: OperationId,
+  /** The generation the wake claims in D1: the snapshot's generation + 1. */
+  generation: Revision,
+  route_revision: Revision,
+  role_revision_hash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type DatabaseWakeTicket = z.infer<typeof DatabaseWakeTicket>;
+/** `DatabaseActor.admitWake`: an awake target, a wake ticket, or a refusal. */
+export const DatabaseWakeAdmission = z.union([
+  z.strictObject({
+    ok: z.literal(true),
+    region: DatabaseRegionRoute,
+    /** Absent only on the ensureAwake fallback outside a v3 region (route-token.ts). */
+    target: CnpgDatabaseTarget.optional(),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
+    region: DatabaseRegionRoute,
+    wake: DatabaseWakeTicket,
+  }),
+  z.strictObject({
+    ok: z.literal(false),
+    sqlstate: z.enum(["3D000", "28P01", "57P03", "08006", "53300"]),
+  }),
+]);
+export type DatabaseWakeAdmission = z.infer<typeof DatabaseWakeAdmission>;
 
 /** How long a connect to a sleeping database may wait to be admitted, at the Edge and in the Actor. A cold
  * Thin wake takes 22 s when the identity turn is free and about 40 s when one is in flight, which the
