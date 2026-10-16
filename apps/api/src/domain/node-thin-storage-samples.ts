@@ -22,6 +22,7 @@ import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
 import {
+  nodeReading,
   qualifiedThinStorageSql,
   readCurrentNodeThinStorage,
   runningWriterTokens,
@@ -428,21 +429,26 @@ async function productSample(
     nonce = sampleNonce();
   // Consumes the nonce in the same compare-and-set that writes the authority. The slow lease's
   // issue is updated_at, so a sample never writes it.
+  const written = {
+    authority_revision: authority.revision,
+    authority_json: JSON.stringify(authority),
+    authority_received_at: iso(now),
+    status: writeAllowed ? ("ready" as const) : ("blocked" as const),
+    sample_nonce: nonce,
+    sample_nonce_issued_at: iso(Date.now()),
+    sample_observed_at: iso(issued),
+    sample_data_used_bytes: pool.data_used_bytes_upper_bound,
+  };
   const result = await env.DB.prepare(
-    `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,status=?,sample_nonce=?,sample_nonce_issued_at=?,sample_observed_at=?,sample_data_used_bytes=?
+    `UPDATE node_thin_storage SET ${Object.keys(written)
+      .map((column) => `${column}=?`)
+      .join(",")}
     WHERE node_id=? AND node_uid=? AND profile_revision=? AND authority_revision=? AND sample_nonce=? AND error_code IS NULL AND status IN('ready','blocked')
       AND ${thinStorageAuthoritySql} AND ${qualifiedThinStorageSql("node_thin_storage")} AND ${storageHoldSnapshotSql}
       AND EXISTS(SELECT 1 FROM nodes sg JOIN regions sr ON sr.id=sg.region_id WHERE sg.id=node_thin_storage.node_id AND ${thinStorageSamplingSql("sr")})`,
   )
     .bind(
-      authority.revision,
-      JSON.stringify(authority),
-      iso(now),
-      writeAllowed ? "ready" : "blocked",
-      nonce,
-      iso(Date.now()),
-      iso(issued),
-      pool.data_used_bytes_upper_bound,
+      ...Object.values(written),
       nodeId,
       row.node_uid,
       row.profile_revision,
@@ -475,7 +481,16 @@ async function productSample(
   };
   let tokens: NodeStorageHeadroomResponse["tokens"];
   try {
-    tokens = await runningWriterTokens(env, nodeId, row.region_id, now);
+    // The node as the compare-and-set left it: the row read above with exactly the columns the
+    // update wrote, and the qualification its predicate has just held. Reading the row back would
+    // run the same function on the same values.
+    tokens = await runningWriterTokens(
+      env,
+      nodeId,
+      row.region_id,
+      now,
+      nodeReading({ ...row, ...written, current_qualified: 1 }, now),
+    );
     if (
       thinPoolDataGrowthNeeded(
         profile,

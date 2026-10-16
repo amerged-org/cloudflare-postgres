@@ -10,7 +10,11 @@ import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
 import { claimsOf } from "./parked-tier-fixture.ts";
 import { gib, mib, nonce, post, sample } from "./thin-renewal-fixture.ts";
-import { HOST_LEASE_TOMBSTONE_RETENTION_MS } from "../../src/domain/node-thin-storage.ts";
+import {
+  HOST_LEASE_TOMBSTONE_RETENTION_MS,
+  runningWriterTokens,
+} from "../../src/domain/node-thin-storage.ts";
+import type { Env } from "../../src/env.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -375,4 +379,50 @@ it("logs at most twenty live entries and says how many there were", async () => 
   const line = servedLines(log, node.f.node)[0]!;
   expect(line.entries).toBe(25);
   expect((line.live as unknown[]).length).toBe(20);
+}, 60_000);
+
+/** A sample the node's pool answers with room to write, after `crowdedNode`'s proof. */
+function roomySample(
+  f: Awaited<ReturnType<typeof crowdedNode>>["node"]["f"],
+  proof: Awaited<ReturnType<typeof crowdedNode>>["proof"],
+  at: string | null,
+  usedBytes = gib,
+) {
+  return sample(f, at, {
+    physical: {
+      ...proof.physical,
+      thin_pool: {
+        ...proof.physical.thin_pool!,
+        data_used_bytes_upper_bound: usedBytes,
+        metadata_used_bytes_upper_bound: mib,
+      },
+    },
+    lvs: [
+      { name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 16 * gib },
+    ],
+    lv_count: 1,
+  });
+}
+const nodeReads = (sql: string[]) =>
+  sql.filter((text) =>
+    text.startsWith("SELECT t.*,n.region_id,n.k8s_node_name"),
+  );
+
+it("reads the node once for a sample and signs its tokens from the row its own write left", async () => {
+  const { node, proof } = await crowdedNode(3, 2),
+    f = node.f;
+  const first = await nonce(f);
+  const counted = await countStatements(() =>
+    post(f, roomySample(f, proof, first)),
+  );
+  const response = NodeStorageHeadroomResponse.parse(counted.result.body);
+  expect(response.accepted).toBe(true);
+  expect(response.tokens).toHaveLength(3);
+  // The node and the qualification join under it are read before the compare-and-set and not
+  // again after it; the compare-and-set carries its own predicate.
+  expect(nodeReads(counted.sql)).toHaveLength(1);
+  // What reading the written row back signs is what the sample signed.
+  expect(response.tokens).toEqual(
+    await runningWriterTokens(env as Env, f.node, f.region, Date.now()),
+  );
 }, 60_000);

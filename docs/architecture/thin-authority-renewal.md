@@ -181,8 +181,9 @@ It then computes `write_allowed` exactly as the slow report does today, on the f
 accounting complete, pool geometry within the profile, and free data and metadata of at least
 `minimumHeadroom`, i.e. the live writers' measured `io.max` over `guard + drain` plus all holds
 (dom/node-thin-storage-execution.ts:199-222, 627-641). It writes the composed authority with a
-compare-and-set on revision and nonce, signs the node's tokens with `storageWriteAuthorityForDatabase`
-(dom/node-thin-storage.ts:151-236) and evaluates the existing growth rule
+compare-and-set on revision and nonce, signs the node's tokens (`runningWriterTokens`) from the
+node's row as that compare-and-set left it, which a sample reads once and does not read back
+(dom/node-thin-storage.ts:151-236), and evaluates the existing growth rule
 (dom/node-thin-storage-execution.ts:311-337) on the fresh reading; a needed growth sets the
 NodeBootstrap alarm to now instead of waiting for the cadence.
 

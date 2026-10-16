@@ -82,6 +82,16 @@ export function qualifiedThinStorageSql(alias = "t") {
     ))`;
 }
 
+/** A node's thin storage row as one read returns it, with what the node itself says about it. */
+export type CurrentNodeThinStorageRow = NodeThinStorageRow & {
+  region_id: string;
+  k8s_node_name: string;
+  current_node_uid: string | null;
+  ready: number;
+  lost_at: string | null;
+  current_qualified: number;
+};
+
 export async function readCurrentNodeThinStorage(
   env: Pick<Env, "DB">,
   nodeId: string,
@@ -91,17 +101,16 @@ export async function readCurrentNodeThinStorage(
     `SELECT t.*,n.region_id,n.k8s_node_name,n.node_uid current_node_uid,n.ready,n.lost_at,CASE WHEN ${qualifiedThinStorageSql()} THEN 1 ELSE 0 END current_qualified FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE t.node_id=?`,
   )
     .bind(nodeId)
-    .first<
-      NodeThinStorageRow & {
-        region_id: string;
-        k8s_node_name: string;
-        current_node_uid: string | null;
-        ready: number;
-        lost_at: string | null;
-        current_qualified: number;
-      }
-    >();
-  if (!row) return null;
+    .first<CurrentNodeThinStorageRow>();
+  return row ? nodeReading(row, now) : null;
+}
+
+/**
+ * What a row says at `now`: its profile, the authority it hands out and the one that still proves
+ * an absence. A pure function of the row, so a row the caller has just written itself reads the
+ * same as the same row read back.
+ */
+export function nodeReading(row: CurrentNodeThinStorageRow, now: number) {
   const profile = ThinStorageProfile.parse(JSON.parse(row.profile_json));
   const parsed = NodeThinStorageAuthority.safeParse(
     row.authority_json ? JSON.parse(row.authority_json) : null,
@@ -844,19 +853,24 @@ async function parkedStorageWriteAuthority(
 /**
  * The writer token of every running thin database of a node: one reading of the node and one read
  * per kind of input, whatever the number of databases. It is the fast sample's token loop.
+ * `reading` is the node's reading when the caller holds it already; the fast sample does, from the
+ * row its own compare-and-set has just written.
  */
 export async function runningWriterTokens(
   env: Env,
   nodeId: string,
   regionId: string,
   now: number,
+  reading?: NodeReading,
 ): Promise<{ database_id: string; token: string }[]> {
   const scope: DatabaseScope = {
     sql: "d.node_id=? AND d.region_id=? AND d.storage_profile_json IS NOT NULL AND d.storage_volume_json IS NOT NULL AND d.desired_state='running' AND d.deleted_at IS NULL",
     bindings: [nodeId, regionId],
   };
   const [current, read] = await Promise.all([
-    readCurrentNodeThinStorage(env, nodeId, now),
+    reading === undefined
+      ? readCurrentNodeThinStorage(env, nodeId, now)
+      : reading,
     readWriterInputs<DatabaseRow>(
       env,
       scope,
