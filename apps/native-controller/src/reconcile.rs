@@ -2181,6 +2181,14 @@ impl Reconciler {
         if pod["metadata"]["uid"] != serving.pod.uid.as_str() {
             return Err("pool slot Pod replaced".into());
         }
+        // The claim wrote the Cluster and resized the Pod a moment ago: the proof is read back
+        // against a watch that has delivered them.
+        if continuity.is_some() {
+            tokio::join!(
+                self.k8s.observed(&cluster, WATCH_LAG),
+                self.k8s.observed(&pod, WATCH_LAG)
+            );
+        }
         let ca = ca_bytes(&ca_secret, &cluster)?;
         let volume: Value =
             serde_json::from_str(text(&storage["metadata"]["annotations"], VOLUME))?;

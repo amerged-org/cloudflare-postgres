@@ -1092,6 +1092,13 @@ mod world {
             serde_json::from_str(map["data"]["admission_target"].as_str().unwrap()).unwrap();
         assert_eq!(target["pod_uid"], slot_pod_uid());
         assert!(w.reconciler.pool.serving(&w.id).unwrap().ticket.is_none());
+        // Without a watch that vouches for the slot's Pod there is no attestation, and a pass
+        // posts nothing rather than a ready database the gateway cannot route to.
+        w.reconciler.k8s.watch_ends("Pod");
+        assert_eq!(
+            w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

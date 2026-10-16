@@ -1879,6 +1879,11 @@ impl Pool {
             }
         }
         let observation = rec.slot_observation(db, &ns, &serving).await?;
+        // The gateway routes to a slot by its attestation alone: without one the pass ends
+        // without an observation, and the next one forms it.
+        if !db["admission"].is_null() && observation["runtime_attestation"]["v"] != 2 {
+            return Ok(Served::Observed(None));
+        }
         rec.power
             .publish_ready_fence(db, observation, true)
             .await
