@@ -598,6 +598,25 @@ test("image tool checks stop at an unavailable required tool rather than masking
   assert.equal(result.stdout, "");
 });
 
+test("a command result carries only the bounded tail of its stderr beside the exit code", async () => {
+  const result = await runCommand({
+    executable: process.execPath,
+    args: [
+      "-e",
+      'process.stderr.write("head-" + "x".repeat(10_000) + "-tail\\n"); process.exitCode = 3',
+    ],
+    signal: AbortSignal.timeout(5000),
+    timeout_ms: 5000,
+    env: { PATH: process.env.PATH, LANG: "C" },
+  });
+  assert.equal(result.exit_code, 3);
+  assert.equal(result.stdout, "");
+  assert.equal(typeof result.stderr, "string");
+  assert.ok(result.stderr!.endsWith("-tail\n"));
+  assert.ok(!result.stderr!.includes("head-"));
+  assert.ok(result.stderr!.length <= 4096);
+});
+
 test("missing xz uses actual Python stdlib streaming with exact raw bytes and bounds", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pgcf-python-lzma-"));
   try {

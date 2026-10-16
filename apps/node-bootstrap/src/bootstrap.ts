@@ -81,6 +81,8 @@ export function bootstrapStorageDocuments(spec: NodeBootstrapSpec) {
 }
 const MAX_COMMAND_MS = 540_000;
 const OUTPUT_LIMIT = 8 * 1024 * 1024;
+/** Characters of stderr kept in a command result: the end of the output names the failure. */
+const STDERR_TAIL = 4096;
 const RECORD = "\n__PGCF_RECORD__\n";
 const GI = 1024 ** 3;
 const STAGES: NodeBootstrapStage[] = [
@@ -161,6 +163,8 @@ export interface Command {
 export interface CommandResult {
   exit_code: number;
   stdout: string;
+  /** The last characters of stderr, set by runCommand; a runner without stderr omits it. */
+  stderr?: string;
 }
 export type CommandRunner = (command: Command) => Promise<CommandResult>;
 
@@ -175,6 +179,7 @@ export const runCommand: CommandRunner = async (command) => {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
+    let stderr = "";
     let output_bytes = 0;
     let failure: BootstrapError | null = null;
     const stop = (code: string) => {
@@ -198,6 +203,7 @@ export const runCommand: CommandRunner = async (command) => {
     child.stderr.on("data", (bytes: Buffer) => {
       output_bytes += bytes.length;
       if (output_bytes > OUTPUT_LIMIT) stop("command_output_limit");
+      else stderr = (stderr + bytes.toString("utf8")).slice(-STDERR_TAIL);
     });
     child.once("error", () => {
       failure ??= new BootstrapError("command_unavailable");
@@ -206,7 +212,7 @@ export const runCommand: CommandRunner = async (command) => {
       clearTimeout(timer);
       command.signal.removeEventListener("abort", abort);
       if (failure) reject(failure);
-      else resolve({ exit_code: exit_code ?? 255, stdout });
+      else resolve({ exit_code: exit_code ?? 255, stdout, stderr });
     });
     child.stdin.on("error", () => {});
     child.stdin.end(command.stdin);
