@@ -51,7 +51,9 @@ it("retained thin nodes reject successor release verifier omission without repla
   );
   policy.profile.release_id = successor;
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO fleet_releases VALUES(?,?,?,?)").bind(
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(
       successor,
       JSON.stringify(spec),
       await installationHash(spec),

@@ -15,6 +15,7 @@ import {
 import type { Env } from "../env.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
+import { allOf } from "./sql-conjunction.ts";
 import { thinStorageSamplingProtocolCapable } from "./fleet-releases.ts";
 import { hotLogDue } from "./log-sampling.ts";
 import { parkedRecordFresh, readParkedRecord } from "./parked-tier.ts";
@@ -64,34 +65,6 @@ export interface NodeThinStorageRow {
 }
 
 /**
- * The facts of a release that a node's authority cannot outlive: what the receipt qualified, what
- * the guard trusts, what boots and restarts on the node and what restarts a database outside
- * Cloudflare's start admission. Two releases with the same text pin the same facts; the release
- * id, the spec hash and the controller, gateway, API and platform pins are not among them.
- * `spec` is the SQL expression of a release's spec_json, `role` that of the node's role.
- */
-export function thinContinuitySql(spec: string, role: string) {
-  if (
-    !/^[a-z][a-z0-9_]*\.spec_json$/.test(spec) ||
-    !/^(?:[a-z][a-z0-9_]*\.role|'(?:customer|control_relay)')$/.test(role)
-  )
-    throw new Error("invalid_thin_continuity_operand");
-  const roles = (field: string) =>
-      `json_extract(${spec},'$.roles.'||${role}||'.${field}')`,
-    qualification = (field: string) =>
-      `json_extract(${spec},'$.thin_storage_qualification.${field}')`;
-  return `json_object(
-    'receipt',json_object('profile_sha256',${qualification("profile_sha256")},'driver_image',${qualification("driver_image")},'host_extension_image',${qualification("host_extension_image")},'kernel_version',${qualification("kernel_version")}),
-    'keys',json_extract(${spec},'$.storage_authority_keys_sha256'),
-    'schema',json_extract(${spec},'$.configuration_schema_revision'),
-    'os',json_object('talos_version',${roles("talos_version")},'talos_installer',${roles("talos_installer")},'talos_schematic_sha256',${roles("talos_schematic_sha256")},'talos_extensions',${roles("talos_extensions")},'kubernetes_version',${roles("kubernetes_version")},'kubernetes_images',${roles("kubernetes_images")},'host_configuration_required',${roles("host_configuration_required")}),
-    'pins',(SELECT json_group_array(json_object('n',json_extract(c.value,'$.name'),'v',json_extract(c.value,'$.version'),'r',json_extract(c.value,'$.reference'),'s',json_extract(c.value,'$.sha256')))
-      FROM (SELECT value FROM json_each(${spec},'$.components') ORDER BY json_extract(value,'$.name')) c
-      WHERE json_extract(c.value,'$.name') IN('openebs-lvm','sandbox-controller','postgres','barman','cloudnative-pg')
-        OR json_extract(c.value,'$.name') IN(SELECT value FROM json_each(${spec},'$.roles.'||${role}||'.talos_extensions'))))`;
-}
-
-/**
  * Whether a node's authority names the release, host custody and boot it was proven with.
  *
  * `strict` binds the proof, the controller's observation and the node's own completed patch to the
@@ -100,10 +73,13 @@ export function thinContinuitySql(spec: string, role: string) {
  * stay behind it.
  *
  * `continuing` keeps every fact the labels stood for (the receipt's facts, the authority keys, the
- * host custody, the boot, the node, the cluster and the material) and drops the labels: the node's
- * completed patch is that of the assigned release or of one that pins the same thin facts
- * (thinContinuitySql). It renews and delivers the authority of a writer that already runs, and is
- * implied by `strict`: a rollout that changes a pinned fact is strict from its assignment.
+ * host custody, the boot, the node, the cluster and the material) and drops the labels. It asks
+ * three things of releases instead: the node's completed patch and the release its proof was read
+ * under pin the same thin facts as the assigned release (`fleet_releases.thin_continuity`), and
+ * no later patch of the node, in any state, pins others. A rollout that changes a pinned fact is
+ * strict from its assignment, and so is a rollback after one: the node runs the other facts until
+ * its own patch completed and a proof read it. `continuing` renews and delivers the authority of
+ * a writer that already runs, and is implied by `strict`.
  */
 export function qualifiedThinStorageSql(
   alias = "t",
@@ -131,7 +107,9 @@ export function qualifiedThinStorageSql(
     "qo.node_uid=qn.node_uid",
     ...(strict ? ["qo.assignment_revision=qa.revision"] : []),
     "qo.agent_key_hash=qr.agent_key_hash",
-    ...(strict ? [] : ["qps.id=qp.release_id"]),
+    ...(strict
+      ? []
+      : ["qps.id=qp.release_id", `qrp.id=${proof("release_id")}`]),
     "json_extract(qverifier.value,'$.name')='native-gateway'",
     "json_extract(qverifier.value,'$.kind')='image'",
     "qgatewayrole.value='native-gateway'",
@@ -195,25 +173,27 @@ export function qualifiedThinStorageSql(
       : []),
     "json_extract(qp.observed_json,'$.node_ready')=1",
     `json_extract(qp.observed_json,'$.boot_id')=${proof("boot_id")}`,
-    // Last: comparing two releases reads both of their specs, once per patch that passed the rest.
     ...(strict
       ? []
       : [
-          `(qp.release_id=qs.id OR ${thinContinuitySql("qps.spec_json", "qa.role")}=${thinContinuitySql("qs.spec_json", "qa.role")})`,
+          // The proof and the patch are of releases that pin the assigned release's facts.
+          "qrp.thin_continuity=qs.thin_continuity",
+          "qps.thin_continuity=qs.thin_continuity",
+          // And no later patch of the node pins others: the node would run them.
+          `NOT EXISTS(SELECT 1 FROM fleet_patch_operations qx,fleet_releases qxs WHERE ${allOf(
+            "qxs.id=qx.release_id",
+            "qx.node_id=qn.id",
+            "qx.node_uid=qn.node_uid",
+            "qx.rowid>qp.rowid",
+            "qxs.thin_continuity IS NOT qs.thin_continuity",
+          )})`,
         ]),
   ];
   // Inner joins only. Their terms sit in the one balanced tree below: SQLite chains the terms of
   // a join list into one left-deep expression, and this predicate is embedded in statements that
   // already nest deeply.
-  return `EXISTS(SELECT 1 FROM nodes qn,regions qr,fleet_node_releases qa,fleet_region_releases qf,fleet_releases qs,node_host_configurations qh,fleet_node_release_observations qo,fleet_patch_operations qp${strict ? "" : ",fleet_releases qps"},json_each(qs.spec_json,'$.components') qverifier,json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole
-    WHERE ${balanced(conjuncts)})`;
-}
-/** An AND tree of logarithmic depth: SQLite refuses an expression tree deeper than 100, and this
- * predicate is embedded in statements that already nest. */
-function balanced(conjuncts: string[]): string {
-  if (conjuncts.length === 1) return conjuncts[0]!;
-  const middle = Math.ceil(conjuncts.length / 2);
-  return `(${balanced(conjuncts.slice(0, middle))} AND ${balanced(conjuncts.slice(middle))})`;
+  return `EXISTS(SELECT 1 FROM nodes qn,regions qr,fleet_node_releases qa,fleet_region_releases qf,fleet_releases qs,node_host_configurations qh,fleet_node_release_observations qo,fleet_patch_operations qp${strict ? "" : ",fleet_releases qps,fleet_releases qrp"},json_each(qs.spec_json,'$.components') qverifier,json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole
+    WHERE ${allOf(...conjuncts)})`;
 }
 
 /** A node's thin storage row as one read returns it, with what the node itself says about it. */

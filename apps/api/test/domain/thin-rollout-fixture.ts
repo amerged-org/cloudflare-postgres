@@ -298,7 +298,7 @@ export async function addMember(
   return { id, uid };
 }
 
-/** A confirmed `complete` patch of `release` for any member, later than every earlier one. */
+/** A patch of `release` for any member, later than every earlier one: confirmed `complete` unless said. */
 export async function completePatch(
   f: Fixture,
   nodeId: string,
@@ -306,11 +306,15 @@ export async function completePatch(
   release: { id: string; sha: string },
   assignment: number,
   region: number,
+  { stage, state, error }: PatchState = {
+    stage: "complete",
+    state: "confirmed",
+  },
 ) {
   const at = new Date().toISOString();
   await env.DB.prepare(
-    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
-    SELECT ?,?,region_id,?,cluster_uid,?,?,?,?,material_revision,address,cluster_nodes_json,1,'complete','confirmed',?,?,? FROM fleet_patch_operations WHERE node_id=? LIMIT 1`,
+    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,error_code,created_at,updated_at,deadline_at)
+    SELECT ?,?,region_id,?,cluster_uid,?,?,?,?,material_revision,address,cluster_nodes_json,1,?,?,?,?,?,? FROM fleet_patch_operations WHERE node_id=? LIMIT 1`,
   )
     .bind(
       newOperationId(),
@@ -320,6 +324,9 @@ export async function completePatch(
       release.sha,
       assignment,
       region,
+      stage,
+      state,
+      error ?? null,
       at,
       at,
       new Date(Date.now() + 3_600_000).toISOString(),

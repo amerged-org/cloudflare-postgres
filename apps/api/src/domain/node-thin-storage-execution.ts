@@ -33,6 +33,7 @@ import {
   thinStorageReleaseGuardPinned,
 } from "@pgcf/contracts/releases";
 import { storageAuthorityPublicKeys } from "./storage-authority.ts";
+import { allOf } from "./sql-conjunction.ts";
 import { loadNodeHostConfiguration } from "./node-host-configuration.ts";
 import { installationHash } from "./node-installation.ts";
 import sources from "../../../../infra/storage/sources.lock.json" with { type: "json" };
@@ -41,7 +42,6 @@ import type { Env, ApiContext } from "../env.ts";
 import { bearer } from "../middleware/auth.ts";
 import {
   readCurrentNodeThinStorage,
-  thinContinuitySql,
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import {
@@ -75,19 +75,42 @@ export const thinStorageAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN region
 /**
  * The node's lease row and the evidence an identity turn may run under: the sealed host custody
  * and the boot of the node's own completed patch. The patch is that of the assigned release,
- * preferred, or else the newest of any release that pins the same thin facts (thinContinuitySql):
- * a rollout that moves none of them does not stop the identity loop, and with it the authority
- * the loop's proofs bound to 300 s. The custody must be the one the evidence patched and the boot
+ * preferred, or else the newest of any release that pins the same thin facts
+ * (`fleet_releases.thin_continuity`) with no later patch of the node, in any state, that pins
+ * others: a rollout that moves none of them does not stop the identity loop, and with it the
+ * authority the loop's proofs bound to 300 s, but the node of a rollback runs the other facts
+ * until its own patch completed. The custody must be the one the evidence patched and the boot
  * the one the node was proven on.
  */
 export async function readThinStorageLeaseRow(env: Env, nodeId: string) {
+  const strict = `(SELECT q.operation_id FROM fleet_patch_operations q WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.release_id=a.release_id AND q.assignment_revision=a.revision AND q.region_revision=f.revision AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND h.release_id=a.release_id AND q.host_configuration_revision=h.revision AND q.host_configuration_sha256=h.sha256 ORDER BY q.updated_at DESC LIMIT 1)`,
+    continuing = `(SELECT q.operation_id FROM fleet_patch_operations q,fleet_releases qs WHERE ${allOf(
+      "qs.id=q.release_id",
+      "q.node_id=n.id",
+      "q.node_uid=n.node_uid",
+      "q.cluster_uid=t.cluster_uid",
+      "q.material_revision=t.material_revision",
+      "q.stage='complete'",
+      "q.state='confirmed'",
+      "q.error_code IS NULL",
+      "q.host_configuration_sha256=h.sha256",
+      "json_extract(q.observed_json,'$.host_configuration_sha256')=h.sha256",
+      "json_extract(q.observed_json,'$.node_ready')=1",
+      "json_extract(q.observed_json,'$.boot_id')=json_extract(t.qualification_json,'$.boot_id')",
+      "qs.thin_continuity=s.thin_continuity",
+      `NOT EXISTS(SELECT 1 FROM fleet_patch_operations x,fleet_releases xs WHERE ${allOf(
+        "xs.id=x.release_id",
+        "x.node_id=n.id",
+        "x.node_uid=n.node_uid",
+        "x.rowid>q.rowid",
+        "xs.thin_continuity IS NOT s.thin_continuity",
+      )})`,
+    )} ORDER BY q.updated_at DESC,q.rowid DESC LIMIT 1)`;
   const row = await env.DB.prepare(
     `SELECT t.*,n.region_id,n.k8s_node_name,n.provider_instance_id,a.release_id,a.revision assignment_revision,f.revision region_revision,s.spec_json,s.spec_sha256,h.revision host_revision,h.sha256 host_sha256,
     json_extract(p.observed_json,'$.boot_id') boot_id,json_extract(p.observed_json,'$.kubernetes_configuration_boot_id') configuration_boot_id
     FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id LEFT JOIN node_host_configurations h ON h.node_id=n.id AND h.node_uid=n.node_uid AND h.cluster_uid=t.cluster_uid AND h.material_revision=t.material_revision
-    LEFT JOIN fleet_patch_operations p ON p.operation_id=COALESCE(
-      (SELECT q.operation_id FROM fleet_patch_operations q WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.release_id=a.release_id AND q.assignment_revision=a.revision AND q.region_revision=f.revision AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND h.release_id=a.release_id AND q.host_configuration_revision=h.revision AND q.host_configuration_sha256=h.sha256 ORDER BY q.updated_at DESC LIMIT 1),
-      (SELECT q.operation_id FROM fleet_patch_operations q JOIN fleet_releases qs ON qs.id=q.release_id WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.cluster_uid=t.cluster_uid AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND q.host_configuration_sha256=h.sha256 AND json_extract(q.observed_json,'$.host_configuration_sha256')=h.sha256 AND json_extract(q.observed_json,'$.node_ready')=1 AND json_extract(q.observed_json,'$.boot_id')=json_extract(t.qualification_json,'$.boot_id') AND ${thinContinuitySql("qs.spec_json", "a.role")}=${thinContinuitySql("s.spec_json", "a.role")} ORDER BY q.updated_at DESC,q.rowid DESC LIMIT 1))
+    LEFT JOIN fleet_patch_operations p ON p.operation_id=COALESCE(${strict},${continuing})
     WHERE t.node_id=? AND ${thinStorageAuthoritySql.replaceAll("node_thin_storage.", "t.")}`,
   )
     .bind(nodeId)

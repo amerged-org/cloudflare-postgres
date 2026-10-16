@@ -90,8 +90,8 @@ export async function awakeWriter(f: Fixture) {
     io,
     ...changes,
   });
-  /** The node proof's reading: the Pod's io.max on the active LV, at the given generation. */
-  const evidence = (
+  /** What the node proof reads: the Pod's io.max on the active LV, at the given generation. */
+  const reading = (
     options: {
       generation?: number;
       io?: object[];
@@ -100,31 +100,33 @@ export async function awakeWriter(f: Fixture) {
       /** Fields of the volume entry that differ from the receipt's, for a reading of another volume. */
       volume?: object;
     } = {},
-  ) =>
-    identityProof(f, {
-      physical,
-      ...(options.revision === undefined ? {} : { revision: options.revision }),
-      physical_lvs: [
-        lvs.pool,
-        lvs.data,
-        lvs.meta,
-        {
-          name: receipt.volume_handle,
-          lv_uuid: receipt.lv_uuid,
-          size_bytes: 5 * gib,
-          segtype: "thin",
-        },
-      ],
-      active_lv_uuids: [receipt.lv_uuid],
-      volumes: [
-        volume(
-          options.generation ?? created.generation,
-          options.io ?? [{ pod_uid: pod, ...limits }],
-          options.quiesced,
-          options.volume,
-        ),
-      ],
-    });
+  ) => ({
+    physical,
+    ...(options.revision === undefined ? {} : { revision: options.revision }),
+    physical_lvs: [
+      lvs.pool,
+      lvs.data,
+      lvs.meta,
+      {
+        name: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        size_bytes: 5 * gib,
+        segtype: "thin",
+      },
+    ],
+    active_lv_uuids: [receipt.lv_uuid],
+    volumes: [
+      volume(
+        options.generation ?? created.generation,
+        options.io ?? [{ pod_uid: pod, ...limits }],
+        options.quiesced,
+        options.volume,
+      ),
+    ],
+  });
+  /** An accepted identity proof of that reading, as the slow loop records it. */
+  const evidence = (options: Parameters<typeof reading>[0] = {}) =>
+    identityProof(f, reading(options));
   const postgres = f.qualified.spec.components.find(
     (c) => c.name === "postgres",
   )!;
@@ -189,6 +191,7 @@ export async function awakeWriter(f: Fixture) {
     pod,
     limits,
     physical,
+    reading,
     evidence,
     ready,
   };

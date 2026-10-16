@@ -73,12 +73,9 @@ async function configured(
       .run();
   }
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO fleet_releases VALUES(?,?,?,?)").bind(
-      id,
-      JSON.stringify(spec),
-      "a".repeat(64),
-      now,
-    ),
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(id, JSON.stringify(spec), "a".repeat(64), now),
     env.DB.prepare(
       "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
     ).bind(f.region, id, now),

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { allOf } from "./sql-conjunction.ts";
 import { bytesToHex } from "@pgcf/contracts";
 import {
   FleetRelease,
@@ -871,13 +872,33 @@ export function routeTokenV3Sql(region: string) {
 export function thinStorageSamplingSql(region: string) {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_sampling_region_alias");
-  return `EXISTS(SELECT 1 FROM fleet_region_releases sf JOIN fleet_releases ss ON ss.id=sf.release_id
-    WHERE sf.region_id=${region}.id AND json_extract(ss.spec_json,'$.thin_storage_sampling_version')=1
-    AND EXISTS(SELECT 1 FROM nodes sn JOIN fleet_node_releases sa ON sa.node_id=sn.id WHERE sn.region_id=sf.region_id AND sn.lost_at IS NULL)
-    AND NOT EXISTS(SELECT 1 FROM nodes sn JOIN fleet_node_releases sa ON sa.node_id=sn.id WHERE sn.region_id=sf.region_id AND sn.lost_at IS NULL
-      AND (sa.node_uid<>sn.node_uid OR sa.release_id<>sf.release_id OR NOT EXISTS(SELECT 1 FROM fleet_patch_operations sp
-        WHERE sp.node_id=sn.id AND sp.node_uid=sn.node_uid AND sp.release_id=sf.release_id AND sp.spec_sha256=ss.spec_sha256
-        AND sp.assignment_revision=sa.revision AND sp.region_revision=sf.revision AND sp.stage='complete' AND sp.state='confirmed' AND sp.error_code IS NULL))))`;
+  const members =
+      "SELECT count(*) FROM nodes sn,fleet_node_releases sa WHERE sa.node_id=sn.id AND sn.region_id=sf.region_id AND sn.lost_at IS NULL",
+    confirmed = `SELECT count(*) FROM nodes sn,fleet_node_releases sa WHERE ${allOf(
+      "sa.node_id=sn.id",
+      "sn.region_id=sf.region_id",
+      "sn.lost_at IS NULL",
+      "sa.node_uid=sn.node_uid",
+      "sa.release_id=sf.release_id",
+      `EXISTS(SELECT 1 FROM fleet_patch_operations sp WHERE ${allOf(
+        "sp.node_id=sn.id",
+        "sp.node_uid=sn.node_uid",
+        "sp.release_id=sf.release_id",
+        "sp.spec_sha256=ss.spec_sha256",
+        "sp.assignment_revision=sa.revision",
+        "sp.region_revision=sf.revision",
+        "sp.stage='complete'",
+        "sp.state='confirmed'",
+        "sp.error_code IS NULL",
+      )})`,
+    )}`;
+  return `EXISTS(SELECT 1 FROM fleet_region_releases sf,fleet_releases ss WHERE ${allOf(
+    `sf.region_id=${region}.id`,
+    "ss.id=sf.release_id",
+    "ss.thin_sampling_version=1",
+    `(${members})>0`,
+    `(${confirmed})=(${members})`,
+  )})`;
 }
 export async function thinStorageSamplingCapable(
   db: D1Database,
@@ -894,21 +915,49 @@ export async function thinStorageSamplingCapable(
 }
 /**
  * The strict desired schemas are served only to controllers that parse them: the region's release
- * declares the sampling protocol and the latest completed patch of every assigned member was of a
- * release that declares it. A rollout between two such releases changes no controller schema, so
- * it does not close the wire; a member last patched at a release without the protocol does.
+ * declares the sampling protocol and every assigned member's newest completed patch was of a
+ * release that declares it, with no later patch of any state of a release that does not. A patch
+ * that halted after `regional` installed its controller never completed, and its controller may
+ * run. A rollout between two releases that declare the protocol changes no controller schema, so
+ * it does not close the wire. A new protocol version is a new number: all that declare version 1
+ * count alike.
  */
 export function thinStorageSamplingProtocolSql(region: string) {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_sampling_region_alias");
-  return `EXISTS(SELECT 1 FROM fleet_region_releases pf JOIN fleet_releases ps ON ps.id=pf.release_id
-    WHERE pf.region_id=${region}.id AND json_extract(ps.spec_json,'$.thin_storage_sampling_version')=1
-    AND EXISTS(SELECT 1 FROM nodes pn JOIN fleet_node_releases pa ON pa.node_id=pn.id WHERE pn.region_id=pf.region_id AND pn.lost_at IS NULL)
-    AND NOT EXISTS(SELECT 1 FROM nodes pn JOIN fleet_node_releases pa ON pa.node_id=pn.id WHERE pn.region_id=pf.region_id AND pn.lost_at IS NULL
-      AND (pa.node_uid<>pn.node_uid OR pa.release_id<>pf.release_id OR NOT EXISTS(SELECT 1 FROM fleet_patch_operations pp JOIN fleet_releases pr ON pr.id=pp.release_id
-        WHERE pp.operation_id=(SELECT x.operation_id FROM fleet_patch_operations x WHERE x.node_id=pn.id AND x.node_uid=pn.node_uid
-          AND x.stage='complete' AND x.state='confirmed' AND x.error_code IS NULL ORDER BY x.updated_at DESC,x.rowid DESC LIMIT 1)
-        AND json_extract(pr.spec_json,'$.thin_storage_sampling_version')=1))))`;
+  const members =
+      "SELECT count(*) FROM nodes pn,fleet_node_releases pa WHERE pa.node_id=pn.id AND pn.region_id=pf.region_id AND pn.lost_at IS NULL",
+    // The rowid of a patch is its creation order.
+    newest = `(SELECT max(pp.rowid) FROM fleet_patch_operations pp,fleet_releases pr WHERE ${allOf(
+      "pr.id=pp.release_id",
+      "pp.node_id=pn.id",
+      "pp.node_uid=pn.node_uid",
+      "pp.stage='complete'",
+      "pp.state='confirmed'",
+      "pp.error_code IS NULL",
+      "pr.thin_sampling_version=1",
+    )})`,
+    since = `COALESCE((SELECT max(px.rowid) FROM fleet_patch_operations px,fleet_releases pxr WHERE ${allOf(
+      "pxr.id=px.release_id",
+      "px.node_id=pn.id",
+      "px.node_uid=pn.node_uid",
+      "pxr.thin_sampling_version IS NOT 1",
+    )}),0)`,
+    capable = `SELECT count(*) FROM nodes pn,fleet_node_releases pa WHERE ${allOf(
+      "pa.node_id=pn.id",
+      "pn.region_id=pf.region_id",
+      "pn.lost_at IS NULL",
+      "pa.node_uid=pn.node_uid",
+      "pa.release_id=pf.release_id",
+      `${newest}>${since}`,
+    )}`;
+  return `EXISTS(SELECT 1 FROM fleet_region_releases pf,fleet_releases ps WHERE ${allOf(
+    `pf.region_id=${region}.id`,
+    "ps.id=pf.release_id",
+    "ps.thin_sampling_version=1",
+    `(${members})>0`,
+    `(${capable})=(${members})`,
+  )})`;
 }
 export async function thinStorageSamplingProtocolCapable(
   db: D1Database,

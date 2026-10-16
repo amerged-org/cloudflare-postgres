@@ -153,12 +153,9 @@ export async function standingPostjoinFixture(
     }),
     now = new Date().toISOString();
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO fleet_releases VALUES(?,?,?,?)").bind(
-      id,
-      canonicalInstallation(spec),
-      await installationHash(spec),
-      now,
-    ),
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(id, canonicalInstallation(spec), await installationHash(spec), now),
     env.DB.prepare(
       "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?) ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=1,updated_at=excluded.updated_at",
     ).bind(region, id, now),

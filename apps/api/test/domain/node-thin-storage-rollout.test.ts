@@ -48,8 +48,8 @@ import {
 import { ensureNodeHostConfiguration } from "../../src/domain/node-host-configuration.ts";
 import { prepareThinStorageLease } from "../../src/domain/node-thin-storage-execution.ts";
 import {
+  qualifiedThinStorageSql,
   readCurrentNodeThinStorage,
-  thinContinuitySql,
 } from "../../src/domain/node-thin-storage.ts";
 import { nodeThinStorageHeadroomSql } from "../../src/domain/storage-capacity.ts";
 
@@ -104,6 +104,12 @@ async function paused(w: AwakeWriter, leased = true) {
     await expect(
       prepareThinStorageLease(w.f.local, w.f.node),
     ).rejects.toThrow();
+}
+
+/** One identity turn of the awake writer's node, as the slow loop runs it under the current assignment. */
+async function proven(w: AwakeWriter) {
+  expect(await prepareThinStorageLease(w.f.local, w.f.node)).not.toBeNull();
+  expect(await report(w.f, w.reading())).toMatchObject({ accepted: true });
 }
 
 // A release that pins the same thin facts: the controller, the gateway and the API change.
@@ -224,13 +230,68 @@ it("keeps authority while the rollout's patch is halted at regional", async () =
   expect(await leaseEntry(w.f, w.id)).toMatchObject({ write_blocked: false });
 });
 
-it("resumes at once on a rollback to the release the node was proven with, after a release that changed a pinned fact", async () => {
+it("resumes at once on a rollback to the release the node was proven with while no patch of the other release started", async () => {
   const w = await awake();
   await assignRelease(w.f, releases, { change: extension });
   expect(await renewal(w)).toMatchObject({ accepted: false });
   await assignRelease(w.f, releases, { release: w.f.qualified.releaseId });
   expect(await renewal(w)).toMatchObject({ accepted: true });
   expect(await leaseEntry(w.f, w.id)).toMatchObject({ write_blocked: false });
+});
+
+it("pauses a rollback after the patch of a release that changed a pinned fact completed, until the rollback's own patch completed and one proof read it", async () => {
+  const w = await awake(),
+    f = w.f;
+  await renewal(w);
+  // B pins another PostgreSQL version; its patch completes and the node is proven under it.
+  await assignRelease(f, releases, {
+    change: postgres,
+    patch: { stage: "complete", state: "confirmed" },
+  });
+  await proven(w);
+  expect(await renewal(w)).toMatchObject({ accepted: true });
+  // A again, before A's own patch: the node still runs B's pins.
+  const back = await assignRelease(f, releases, {
+    release: f.qualified.releaseId,
+  });
+  await paused(w);
+  await startPatch(f, back, { stage: "complete", state: "confirmed" });
+  await proven(w);
+  expect(await renewal(w)).toMatchObject({ accepted: true });
+});
+
+it("pauses a release with the node's facts that follows a superseded halted patch of a pin change, until its own patch completed", async () => {
+  const w = await awake(),
+    f = w.f;
+  await renewal(w);
+  await assignRelease(f, releases, {
+    change: postgres,
+    patch: {
+      stage: "platform",
+      state: "halted",
+      error: "operator_hold_superseded",
+    },
+  });
+  const next = await assignRelease(f, releases, { change: software });
+  await paused(w);
+  await startPatch(f, next, { stage: "complete", state: "confirmed" });
+  expect(await renewal(w)).toMatchObject({ accepted: true });
+});
+
+it("does not resume on an identity proof read before a pinned fact changed when the patch that changed it completed", async () => {
+  const w = await awake(),
+    f = w.f;
+  await renewal(w);
+  const assigned = await assignRelease(f, releases, { change: kubernetes });
+  await paused(w);
+  await startPatch(f, assigned, { stage: "complete", state: "confirmed" });
+  // The patch completed, but the node's proof is the one read before it.
+  expect(await renewal(w)).toMatchObject({
+    accepted: false,
+    reason: "thin_storage_sample_node_unqualified",
+  });
+  await proven(w);
+  expect(await renewal(w)).toMatchObject({ accepted: true });
 });
 
 // A release that changes what the node runs or how the guard is configured stays strict from
@@ -384,15 +445,26 @@ it("exposes the sampling wire only when the latest completed patch of every memb
   // The member's next completed patch is at a release that declares it again.
   await completePatch(f, member.id, member.uid, next, 1, next.region);
   expect(await served()).toBe(true);
+  // A patch of a release without it that halted after its controller was installed and was
+  // superseded never completed, but its controller may run: the wire closes until a patch
+  // of a release that declares it completes.
+  await completePatch(f, member.id, member.uid, legacy, 1, next.region, {
+    stage: "regional",
+    state: "halted",
+    error: "operator_hold_superseded",
+  });
+  expect(await served()).toBe(false);
+  await completePatch(f, member.id, member.uid, next, 1, next.region);
+  expect(await served()).toBe(true);
 });
 
 // What the continuity facts compare.
 
-it("compares the receipt, the OS block, the keys and the pins, and nothing a controller, gateway or API release changes", async () => {
+it("stores, once per release, the receipt, the OS blocks, the keys and the pins, and nothing a controller, gateway or API release changes", async () => {
   const f = await thinExecutionFixture(releases),
     text = async (spec: FleetReleaseSpec) =>
       env.DB.prepare(
-        `SELECT ${thinContinuitySql("s.spec_json", "'customer'")} text FROM fleet_releases s WHERE s.id=?`,
+        "SELECT thin_continuity text FROM fleet_releases WHERE id=?",
       )
         .bind((await insertRelease(releases, spec)).id)
         .first<string>("text"),
@@ -408,10 +480,132 @@ it("compares the receipt, the OS block, the keys and the pins, and nothing a con
     runtime,
     (spec: FleetReleaseSpec) => ({
       ...spec,
+      configuration_schema_revision: spec.configuration_schema_revision + 1,
+    }),
+    (spec: FleetReleaseSpec) => ({
+      ...spec,
       storage_authority_keys_sha256: "1".repeat(64),
     }),
   ])
     expect(await text(change(f.qualified.spec) as FleetReleaseSpec)).not.toBe(
       base,
     );
+  // The other role's block counts too: a role change cannot hide a changed fact.
+  expect(
+    await text({
+      ...f.qualified.spec,
+      roles: {
+        ...f.qualified.spec.roles,
+        control_relay: {
+          ...f.qualified.spec.roles.control_relay,
+          kubernetes_version: "1.36.9",
+        },
+      },
+    }),
+  ).not.toBe(base);
+});
+
+it("backfills the stored facts of releases that existed before the migration to what the insert trigger computes", async () => {
+  const f = await thinExecutionFixture(releases),
+    stored = () =>
+      env.DB.prepare(
+        "SELECT thin_continuity,thin_sampling_version FROM fleet_releases WHERE id=?",
+      )
+        .bind(f.qualified.releaseId)
+        .first(),
+    before = await stored(),
+    migration = (
+      env as unknown as {
+        TEST_MIGRATIONS: { name: string; queries: string[] }[];
+      }
+    ).TEST_MIGRATIONS.find((value) => value.name.includes("thin_facts"))!;
+  expect(before).toMatchObject({ thin_sampling_version: 1 });
+  await env.DB.prepare(
+    "UPDATE fleet_releases SET thin_continuity=NULL,thin_sampling_version=NULL WHERE id=?",
+  )
+    .bind(f.qualified.releaseId)
+    .run();
+  // The migration's last statement is the backfill.
+  await env.DB.prepare(migration.queries.at(-1)!).run();
+  expect(await stored()).toEqual(before);
+});
+
+// SQLite refuses an expression tree deeper than 100 levels, and every nested subquery costs more
+// than its own conditions: measure the statements the product runs against a margin.
+
+/** `sql` with `levels` more on the deepest WHERE of each of its arms. */
+function deeper(sql: string, levels: number) {
+  const more = " AND 1".repeat(levels),
+    tail = /\s+(?:ORDER BY [^()]*|LIMIT \d+)\s*$/i.exec(sql),
+    body = tail ? sql.slice(0, tail.index) : sql;
+  return (
+    body.replace(/\s+UNION ALL\s+/gi, `${more} UNION ALL `) +
+    more +
+    (tail ? tail[0] : "")
+  );
+}
+/** The depth of the deepest WHERE of `sql`, by the most levels D1 still accepts on top of it. */
+async function depth(sql: string) {
+  const refused = async (levels: number) => {
+    try {
+      await env.DB.prepare(`EXPLAIN ${deeper(sql, levels)}`).all();
+      return false;
+    } catch (error) {
+      // Nothing is bound: a statement that parsed is refused only for its bindings.
+      return /too large/.test(String(error));
+    }
+  };
+  let accepted = 0,
+    limit = 99;
+  while (accepted < limit) {
+    const middle = Math.ceil((accepted + limit) / 2);
+    if (await refused(middle)) limit = middle - 1;
+    else accepted = middle;
+  }
+  return 100 - accepted;
+}
+
+it("keeps every statement that embeds the thin predicates at most 90 levels deep", async () => {
+  const seen = new Map<string, string>(),
+    database = Object.getPrototypeOf(env.DB) as D1Database,
+    prepare = database.prepare;
+  database.prepare = function (this: D1Database, sql: string) {
+    if (/qverifier|thin_continuity|thin_sampling_version/.test(sql))
+      seen.set(sql, sql);
+    return prepare.call(this, sql);
+  };
+  const fits = (f: { size: string; node: string }) =>
+    env.DB.prepare(
+      `SELECT ${nodeThinStorageHeadroomSql()} fits FROM nodes n JOIN size_classes s ON s.id=? WHERE n.id=?`,
+    )
+      .bind(f.size, f.node)
+      .first();
+  try {
+    const w = await awake();
+    await renewal(w);
+    await assignRelease(w.f, releases, {
+      patch: { stage: "regional", state: "pending" },
+    });
+    await renewal(w);
+    await leaseEntry(w.f, w.id);
+    await desired(w);
+    await proven(w);
+    await fits(w.f);
+  } finally {
+    database.prepare = prepare;
+  }
+  // The sample's compare-and-set, the sampling targets, the wire gate and the lease row among them.
+  expect(seen.size).toBeGreaterThanOrEqual(6);
+  const deepest: string[] = [];
+  for (const sql of seen.values())
+    deepest.push(`${await depth(sql)} ${sql.trim().slice(0, 60)}`);
+  for (const line of deepest)
+    expect(Number(line.split(" ")[0])).toBeLessThanOrEqual(90);
+  // A predicate read in a select list (readCurrentNodeThinStorage) is measured on its own.
+  for (const mode of ["strict", "continuing"] as const)
+    expect(
+      await depth(
+        `SELECT 1 FROM node_thin_storage t WHERE ${qualifiedThinStorageSql("t", mode)}`,
+      ),
+    ).toBeLessThanOrEqual(60);
 });

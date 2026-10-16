@@ -2,6 +2,7 @@
 import type { Env } from "../env.ts";
 import type { AdmissionSqlGuard } from "./admission-mutations.ts";
 import { qualifiedThinStorageSql } from "./node-thin-storage.ts";
+import { allOf } from "./sql-conjunction.ts";
 import { PARKED_FRESH_MS } from "./parked-tier.ts";
 import {
   NodeThinStorageAuthority as AuthoritySchema,
@@ -28,17 +29,6 @@ function inventoryObservedSql(authorityAlias = "t") {
 function inventoryExpiresSql(authorityAlias = "t") {
   const authority = identifier(authorityAlias);
   return `COALESCE(json_extract(${authority}.authority_json,'$.inventory_expires_at'),json_extract(${authority}.authority_json,'$.expires_at'))`;
-}
-
-/**
- * A conjunction as a balanced tree. SQLite parses a plain AND chain left-deep, a tree as deep as the
- * chain is long, and D1 refuses one deeper than 100: the wake transition embeds this predicate and is
- * within a few levels of it.
- */
-function allOf(...terms: string[]): string {
-  if (terms.length === 1) return terms[0]!;
-  const half = Math.ceil(terms.length / 2);
-  return `(${allOf(...terms.slice(0, half))} AND ${allOf(...terms.slice(half))})`;
 }
 
 /**
