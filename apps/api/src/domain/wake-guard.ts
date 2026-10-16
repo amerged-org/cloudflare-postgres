@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Why a wake's power transition was refused while the database row did not move, and whether
 // waiting can change it. The transition's start predicates stay the only authority: this module
-// reads them again, part by part, only after a refusal, and sorts the failing parts into those a
-// periodic report will end (the report is late) and those it will not (the node has no room).
+// reads them again, part by part, only after a refusal and while a refused connect waits, and
+// sorts the failing parts into those a periodic report will end (the report is late) and those it
+// will not (the node has no room).
 import { SIDECAR } from "@pgcf/contracts";
 import { qualifiedThinStorageSql } from "./node-thin-storage.ts";
 import {

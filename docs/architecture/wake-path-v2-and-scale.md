@@ -57,8 +57,12 @@ findings from the same run:
    unchanged and returns. Another predicate of the wake transition refused it. Both refusals came shortly
    before the next accepted thin identity proof, after an identity turn had failed transiently
    (`thin_storage_executor_failed`, `thin_storage_authority_refused` at 02:10:57Z and 02:17:10Z), which
-   leaves the accepted inventory older than the 120 s startup freshness window [E]. To confirm: log
-   which predicate refuses.
+   leaves the accepted inventory older than the 120 s startup freshness window [E]. Reading the code
+   adds a second candidate: the wake predicate needs the identity proof's volume entry at the database's
+   current generation, so a wake shortly after an idle sleep is refused until the next accepted proof
+   [E]. Branch `golive/claim-wait` (not yet measured live): the refused claim logs `actor_claim_refused`
+   with every part of the guard, and waits for late reports within the caller's deadline
+   (`actor_claim_waited`).
 2. **A cold wake of a thin database took 44 s** (hint 02:10:40, ready 02:11:24): `volume_identity` pended
    37 s, waiting for the next identity proof that carries the new Pod's I/O limits (a turn takes about
    47 s and runs every 60 s). The Edge gave up after 30 s (`08006`). During the Pod creation the controller

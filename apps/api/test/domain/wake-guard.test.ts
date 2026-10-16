@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // A wake claim whose power transition is refused while the database row has not moved: which start
-// predicate refused it, part by part.
+// predicate refused it, and whether the connect waits for a periodic report instead of a 57P03.
 // Real D1, Durable Object and thin storage fixtures; no live evidence.
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi, type MockInstance } from "vitest";
 import { cleanupFixtures } from "./fixtures.ts";
 import { readDatabasePresence } from "../../src/domain/database-actor-sync.ts";
 import {
   awakeWriter,
+  databaseRow,
+  hibernated,
+  idleIntent,
+  parkedPod,
   parkedWriter,
   type AwakeWriter,
 } from "./parked-tier-fixture.ts";
@@ -29,6 +34,7 @@ afterEach(async () => {
 });
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
+const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
 /** A thin database that sleeps idle with its Pod parked, and whose guard holds: the controller's
  * report is accepted and the node's identity proof has read the volume at the sleep's generation. */
@@ -62,6 +68,12 @@ async function agedAuthority(w: AwakeWriter, ms: number) {
     .bind(JSON.stringify(authority), back(row.authority_received_at), w.f.node)
     .run();
 }
+/** The wake the claim made, and the controller's ready report for it. */
+async function woken(w: AwakeWriter, revision: number) {
+  const row = await databaseRow(w.id);
+  expect(row).toMatchObject({ desired_state: "running", generation: revision });
+  expect((await w.ready(revision, row.power_operation!)).status).toBe(200);
+}
 const wakeOperations = (id: string) =>
   env.DB.prepare(
     "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.wake'",
@@ -83,6 +95,20 @@ function logged(log: MockInstance, event: string) {
     }
   });
 }
+async function until(check: () => boolean | Promise<boolean>, what: string) {
+  for (let i = 0; i < 600; i++) {
+    if (await check()) return;
+    await sleep(10);
+  }
+  throw new Error(what);
+}
+const waiting = (id: string) =>
+  runInDurableObject(
+    actor(id),
+    (instance) =>
+      (Reflect.get(instance, "guardWaits") as Map<string, unknown>).size,
+  );
+
 it("a wake claim refused with its row unmoved logs the start predicates, part by part, once", async () => {
   const log = vi.spyOn(console, "log");
   const { w, intent } = await parked();
@@ -138,6 +164,75 @@ it("a wake claim refused with its row unmoved logs the start predicates, part by
   expect(serialized).not.toContain(w.f.agent);
 }, 30_000);
 
+it("a claim refused for a stale thin inventory waits for the next one within the deadline, then claims and wakes", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parked();
+  await agedAuthority(w, 200_000);
+  const waiterId = crypto.randomUUID();
+  const connecting = actor(w.id).ensureAwake(w.id, "app", {
+    waiterId,
+    deadline: Date.now() + 15_000,
+  });
+  let settled = false;
+  void connecting.finally(() => {
+    settled = true;
+  });
+  // Held, not refused: the connect waits while the inventory is stale, and nothing is claimed.
+  await until(
+    async () => (await waiting(w.id)) === 1,
+    "connect_not_waiting_for_the_guard",
+  );
+  await sleep(1200);
+  expect(settled).toBe(false);
+  expect(await wakeOperations(w.id)).toBe(0);
+  expect((await databaseRow(w.id)).desired_state).toBe("suspended");
+  // The next accepted identity proof of the node arrives.
+  await w.evidence({ generation: intent.generation });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+  expect(await wakeOperations(w.id)).toBe(1);
+  expect(await waiting(w.id)).toBe(0);
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      database_id: w.id,
+      verdict: "waits",
+      blocked_by: ["thin_authority_stale"],
+    }),
+  ]);
+  expect(logged(log, "actor_claim_waited")).toEqual([
+    expect.objectContaining({
+      database_id: w.id,
+      waiter_id: waiterId,
+      outcome: "claim",
+      polls: expect.any(Number),
+      waited_ms: expect.any(Number),
+    }),
+  ]);
+}, 30_000);
+
+it("a claim whose stale inventory outlasts the deadline is refused as before, without a wake", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w } = await parked();
+  await agedAuthority(w, 200_000);
+  const started = Date.now();
+  expect(
+    await actor(w.id).ensureAwake(w.id, "app", { deadline: Date.now() + 5000 }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  const waited = Date.now() - started;
+  // It waited for what the deadline leaves after the margin, and gave the answer before the deadline.
+  expect(waited).toBeGreaterThanOrEqual(1000);
+  expect(waited).toBeLessThan(5000);
+  expect(await wakeOperations(w.id)).toBe(0);
+  expect((await databaseRow(w.id)).desired_state).toBe("suspended");
+  expect(logged(log, "actor_claim_waited")).toEqual([
+    expect.objectContaining({ database_id: w.id, outcome: "expired" }),
+  ]);
+}, 30_000);
+
 it("a claim refused for lack of capacity with fresh facts is refused at once, not waited for", async () => {
   const log = vi.spyOn(console, "log");
   const { w, intent } = await parked();
@@ -165,7 +260,172 @@ it("a claim refused for lack of capacity with fresh facts is refused at once, no
       cpu: false,
     }),
   ]);
+  expect(logged(log, "actor_claim_waited")).toEqual([]);
 }, 30_000);
+
+it("a second connect during the wait joins the one claim: one operation, one hint, both released", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parked();
+  await agedAuthority(w, 200_000);
+  const region = (await databaseRow(w.id)).region_id;
+  const notified = await runInDurableObject(
+    env.REGION_LINK.get(env.REGION_LINK.idFromName(region)),
+    (instance) => vi.spyOn(Object.getPrototypeOf(instance), "notify"),
+  );
+  const first = actor(w.id).ensureAwake(w.id, "app", {
+    waiterId: crypto.randomUUID(),
+    deadline: Date.now() + 20_000,
+  });
+  await until(async () => (await waiting(w.id)) === 1, "first_not_waiting");
+  const second = actor(w.id).ensureAwake(w.id, "app", {
+    waiterId: crypto.randomUUID(),
+    deadline: Date.now() + 20_000,
+  });
+  await until(async () => (await waiting(w.id)) === 2, "second_not_waiting");
+  expect(await wakeOperations(w.id)).toBe(0);
+  // Only the first connect made a claim: the second found it waiting and joined the wait.
+  expect(logged(log, "actor_claim_refused")).toHaveLength(1);
+  await w.evidence({ generation: intent.generation });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await Promise.all([first, second])).toEqual([
+    expect.objectContaining({ ok: true }),
+    expect.objectContaining({ ok: true }),
+  ]);
+  expect(await wakeOperations(w.id)).toBe(1);
+  expect(notified).toHaveBeenCalledTimes(1);
+  expect(await databaseRow(w.id)).toMatchObject({
+    generation: intent.generation + 1,
+  });
+  expect(logged(log, "actor_claim_refused")).toHaveLength(1);
+  expect(
+    logged(log, "actor_claim_waited").map((event) => event.outcome),
+  ).toEqual(["claim", "claim"]);
+}, 40_000);
+
+it("a connect that gives up leaves the wait and claims nothing when the inventory arrives", async () => {
+  const { w, intent } = await parked();
+  await agedAuthority(w, 200_000);
+  const waiterId = crypto.randomUUID();
+  const connecting = actor(w.id).ensureAwake(w.id, "app", {
+    waiterId,
+    deadline: Date.now() + 20_000,
+  });
+  await until(async () => (await waiting(w.id)) === 1, "not_waiting");
+  expect(await actor(w.id).cancelWakeWaiter(w.id, waiterId)).toBe(true);
+  expect(await connecting).toEqual({ ok: false, sqlstate: "57P03" });
+  expect(await waiting(w.id)).toBe(0);
+  await w.evidence({ generation: intent.generation });
+  await sleep(1800);
+  expect(await wakeOperations(w.id)).toBe(0);
+  expect((await databaseRow(w.id)).desired_state).toBe("suspended");
+}, 30_000);
+
+it("more connects than the cap are refused at once while the others keep waiting", async () => {
+  const { w, intent } = await parked();
+  await agedAuthority(w, 200_000);
+  const connects = Array.from({ length: 4 }, () =>
+    actor(w.id).ensureAwake(w.id, "app", {
+      waiterId: crypto.randomUUID(),
+      deadline: Date.now() + 20_000,
+    }),
+  );
+  await until(async () => (await waiting(w.id)) === 4, "cap_not_reached");
+  const started = Date.now();
+  expect(
+    await actor(w.id).ensureAwake(w.id, "app", {
+      waiterId: crypto.randomUUID(),
+      deadline: Date.now() + 20_000,
+    }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  expect(Date.now() - started).toBeLessThan(5000);
+  expect(await waiting(w.id)).toBe(4);
+  await w.evidence({ generation: intent.generation });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect((await Promise.all(connects)).every((value) => value.ok)).toBe(true);
+  expect(await wakeOperations(w.id)).toBe(1);
+}, 40_000);
+
+it("a sleep whose identity proof has not read its generation yet is waited for, not refused", async () => {
+  const log = vi.spyOn(console, "log");
+  const w = await awakeWriter(await thinExecutionFixture(releases));
+  // The idle intent moved the generation; the node's last proof still describes the awake one.
+  const intent = await idleIntent(w);
+  expect(await (await hibernated(w, intent, parkedPod(w))).json()).toEqual({
+    accepted: 1,
+  });
+  await actor(w.id).seed((await readDatabasePresence(env.DB, w.id))!);
+  const connecting = actor(w.id).ensureAwake(w.id, "app", {
+    deadline: Date.now() + 15_000,
+  });
+  await until(async () => (await waiting(w.id)) === 1, "not_waiting");
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      verdict: "waits",
+      blocked_by: ["thin_identity_behind"],
+      volume_bound: true,
+      volume_current: false,
+    }),
+  ]);
+  await w.evidence({ generation: intent.generation });
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+}, 40_000);
+
+it("stale node reports are waited for like a stale inventory: the node's observation and its memory sample", async () => {
+  const log = vi.spyOn(console, "log");
+  const { w, intent } = await parked();
+  const stale = new Date(Date.now() - 200_000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?").bind(
+      stale,
+      w.f.node,
+    ),
+    env.DB.prepare(
+      "UPDATE node_memory_samples SET observed_at=? WHERE node_id=?",
+    ).bind(stale, w.f.node),
+  ]);
+  const connecting = actor(w.id).ensureAwake(w.id, "app", {
+    deadline: Date.now() + 15_000,
+  });
+  await until(async () => (await waiting(w.id)) === 1, "not_waiting");
+  expect(logged(log, "actor_claim_refused")).toEqual([
+    expect.objectContaining({
+      verdict: "waits",
+      blocked_by: ["node_observation_stale", "memory_sample_stale"],
+      placement: "actual_ram",
+      cpu: false,
+      memory: false,
+    }),
+  ]);
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?").bind(
+      now,
+      w.f.node,
+    ),
+    env.DB.prepare(
+      "UPDATE node_memory_samples SET observed_at=? WHERE node_id=?",
+    ).bind(now, w.f.node),
+  ]);
+  await until(
+    async () => (await databaseRow(w.id)).desired_state === "running",
+    "wake_not_claimed",
+  );
+  await woken(w, intent.generation + 1);
+  expect(await connecting).toMatchObject({ ok: true });
+}, 40_000);
 
 /** A reading of a sleeper whose every part holds, to change one fact at a time. */
 const holding: WakeGuardReading = {

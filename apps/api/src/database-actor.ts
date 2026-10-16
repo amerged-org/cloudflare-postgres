@@ -67,6 +67,17 @@ const GATE_LOG_MS = 1000;
 /** A wake claim whose commit lost its row to a concurrent write is read and tried again this often. */
 const WAKE_CLAIM_RETRIES = 2;
 /**
+ * A claim refused only because a periodic report is late (a stale inventory, a node sample, an
+ * identity proof that has not read the generation yet) waits for it, reading the guard this often.
+ * One read costs about what the claim's own guard does, so at most WAKE_GUARD_WAITERS connects
+ * of a database read it at once.
+ */
+const WAKE_GUARD_POLL_MS = 1000;
+/** The wait ends this long before the caller's deadline: a parked wake takes 1.2 to 1.5 s from its claim. */
+const WAKE_GUARD_MARGIN_MS = 3000;
+/** Connects of one database that wait on the guard together; any further one is refused at once. */
+const WAKE_GUARD_WAITERS = 4;
+/**
  * A role the actor may admit: live in D1, with the time its credential stops being accepted.
  * A bare name (the form older persisted presence and seeds use) is a role without expiry.
  */
@@ -192,6 +203,8 @@ export class DatabaseActor extends DurableObject<Env> {
     string,
     { deadline: number; resolve: (ready: boolean) => void; owner: object }
   >();
+  /** Connects waiting for the start guard of an idle sleeper, by waiter id: each one's way out. */
+  private guardWaits = new Map<string, () => void>();
   private polling = false;
   private pushed = false;
   private wake: { operation: string; revision: number } | undefined;
@@ -1039,15 +1052,17 @@ export class DatabaseActor extends DurableObject<Env> {
     return true;
   }
   /**
-   * A wake claim refused with its row unmoved: the transition's other predicates are read part by
-   * part, once, and logged. Only for the log; a read that fails changes nothing.
+   * The wake claim's answer to a refusal that left the row unmoved: the transition's other
+   * predicates are read part by part, once, and logged. "wait" when only late reports refuse it,
+   * "retry" when everything holds now (a report landed in between), "refuse" otherwise. A read
+   * that fails never changes the answer the claim always gave: refused.
    */
   private async diagnoseRefusal(
     id: string,
     user: string,
     revision: number,
     attempt: number,
-  ): Promise<void> {
+  ): Promise<"wait" | "retry" | "refuse"> {
     try {
       const reading = await readWakeGuard(this.env.DB, id, user);
       const blocks = reading ? wakeGuardBlocks(reading) : [];
@@ -1065,6 +1080,11 @@ export class DatabaseActor extends DurableObject<Env> {
           ...(reading ? wakeGuardFacts(reading) : {}),
         }),
       );
+      return verdict === "waits"
+        ? "wait"
+        : verdict === "refused"
+          ? "refuse"
+          : "retry";
     } catch (error) {
       console.warn(
         JSON.stringify({
@@ -1077,6 +1097,7 @@ export class DatabaseActor extends DurableObject<Env> {
           error: error instanceof Error ? error.name : "error",
         }),
       );
+      return "refuse";
     }
   }
   private async claimWake(
@@ -1085,7 +1106,10 @@ export class DatabaseActor extends DurableObject<Env> {
     requested: number,
     deadline: number,
   ): Promise<
-    { operation: string; revision: number } | { failure: "08006" } | undefined
+    | { operation: string; revision: number }
+    | { failure: "08006" }
+    | { wait: true }
+    | undefined
   > {
     return this.gate("claimWake", async () => {
       const started = Date.now();
@@ -1104,9 +1128,17 @@ export class DatabaseActor extends DurableObject<Env> {
           if ("ok" in authorized) return undefined;
           if (!row) return undefined;
           if (lost !== undefined && JSON.stringify(row) === lost) {
-            // Refused with nothing moved: another predicate of the transition holds it back.
-            await this.diagnoseRefusal(id, user, row.generation + 1, attempt);
-            return undefined;
+            const answer = await this.diagnoseRefusal(
+              id,
+              user,
+              row.generation + 1,
+              attempt,
+            );
+            if (answer === "retry") {
+              lost = undefined;
+              continue;
+            }
+            return answer === "wait" ? { wait: true } : undefined;
           }
           if (
             row.desired_state === "suspended" &&
@@ -1204,7 +1236,11 @@ export class DatabaseActor extends DurableObject<Env> {
       }
     });
   }
-  /** Known routes only. One shared observation loop, never application SQL or per-waiter polling. */
+  /**
+   * Known routes only. One shared observation loop for a running wake, never application SQL. The
+   * only reads a waiter makes of its own are the start guard's, while its claim is refused for a
+   * late report (waitForWakeGuard), and only a few connects of a database make them.
+   */
   async ensureAwake(
     databaseId: unknown,
     user: unknown,
@@ -1303,12 +1339,26 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "57P03" };
       if (current.observed_state === "error")
         return { ok: false, sqlstate: "57P03" };
-      const wake = await this.claimWake(
-        id.data,
-        role.data,
-        Date.now(),
-        deadline,
-      );
+      // The id this connect is known by at the Actor: in the guard wait, then as the waiter.
+      const waiter = parsed.data.waiterId ?? crypto.randomUUID();
+      // A connect that finds others waiting for the start guard of the sleeper joins their wait
+      // instead of making a claim of its own that the same late report would refuse.
+      let wake =
+        this.guardWaits.size > 0 && current.desired_state === "suspended"
+          ? { wait: true as const }
+          : await this.claimWake(id.data, role.data, Date.now(), deadline);
+      // A claim refused only because a periodic report is late waits for it outside the gate,
+      // then claims again; the claim is the gate's, so connects that waited together make one
+      // claim and the others find the wake it made.
+      while (wake && "wait" in wake)
+        wake = (await this.waitForWakeGuard(
+          id.data,
+          role.data,
+          waiter,
+          deadline - WAKE_GUARD_MARGIN_MS,
+        ))
+          ? await this.claimWake(id.data, role.data, Date.now(), deadline)
+          : undefined;
       if (wake && "failure" in wake)
         return { ok: false, sqlstate: wake.failure };
       if (!wake && deadline > Date.now()) return this.admit(id.data, role.data);
@@ -1321,7 +1371,6 @@ export class DatabaseActor extends DurableObject<Env> {
       if (replaced) this.finishWaiters(false);
       if (this.wake === undefined || replaced) this.waitStartedAt = Date.now();
       this.wake = wake;
-      const waiter = parsed.data.waiterId ?? crypto.randomUUID();
       if (this.waiters.has(waiter)) return { ok: false, sqlstate: "57P03" };
       const pending = new Promise<boolean>((resolve) =>
         this.waiters.set(waiter, { deadline, resolve, owner }),
@@ -1334,6 +1383,102 @@ export class DatabaseActor extends DurableObject<Env> {
     } catch {
       return { ok: false, sqlstate: "08006" };
     }
+  }
+  /**
+   * A refused claim's wait for the reports the start guard needs. The guard is read here, outside
+   * the Actor's gate and without an admission mutation, every WAKE_GUARD_POLL_MS until `until`.
+   * True when a claim should be made (every part holds, or the database moved: the claim decides);
+   * false when a part fails on current facts, the bound is reached, the connect gave up or too many
+   * connects already wait. The claim itself stays the one authority and is serialised by the gate,
+   * so connects that wait together make one claim and the others join it.
+   */
+  private async waitForWakeGuard(
+    id: string,
+    user: string,
+    waiterId: string,
+    until: number,
+  ): Promise<boolean> {
+    const started = Date.now();
+    let polls = 0,
+      outcome = "expired",
+      blockedBy: string[] = [];
+    if (
+      this.guardWaits.size >= WAKE_GUARD_WAITERS ||
+      this.guardWaits.has(waiterId)
+    )
+      outcome = "crowded";
+    else {
+      let cancelled = false,
+        wake: (() => void) | undefined;
+      this.guardWaits.set(waiterId, () => {
+        cancelled = true;
+        wake?.();
+      });
+      try {
+        for (;;) {
+          const left = until - Date.now();
+          if (left <= 0) break;
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(
+              resolve,
+              Math.min(WAKE_GUARD_POLL_MS, left),
+            );
+            wake = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+          });
+          if (cancelled) {
+            outcome = "cancelled";
+            break;
+          }
+          // The role's presence is the Actor's own: a revoked role claims nothing.
+          const presence = this.presence();
+          if (!presence || presence.deleted || !roleAdmitted(presence, user)) {
+            outcome = "claim";
+            break;
+          }
+          polls++;
+          let reading: Awaited<ReturnType<typeof readWakeGuard>>;
+          try {
+            reading = await readWakeGuard(this.env.DB, id, user);
+          } catch {
+            // A failed read says nothing about the guard; the bound ends the wait.
+            continue;
+          }
+          if (cancelled) {
+            outcome = "cancelled";
+            break;
+          }
+          const blocks = reading ? wakeGuardBlocks(reading) : [];
+          blockedBy = blocks.map((block) => block.reason);
+          const verdict = wakeGuardVerdict(reading, blocks);
+          if (verdict === "holds" || verdict === "moved") {
+            outcome = "claim";
+            break;
+          }
+          if (verdict === "refused") {
+            outcome = "refused";
+            break;
+          }
+        }
+      } finally {
+        this.guardWaits.delete(waiterId);
+      }
+    }
+    console.log(
+      JSON.stringify({
+        event: "actor_claim_waited",
+        database_id: id,
+        waiter_id: waiterId,
+        outcome,
+        polls,
+        waited_ms: Date.now() - started,
+        blocked_by: blockedBy,
+        at_ms: Date.now(),
+      }),
+    );
+    return outcome === "claim";
   }
   /**
    * Trusted API RPC after D1 committed a ready observation of that exact wake revision and
@@ -1475,6 +1620,12 @@ export class DatabaseActor extends DurableObject<Env> {
   ): Promise<boolean> {
     this.identity(DatabaseId.parse(databaseId));
     if (!z.uuid().safeParse(waiterId).success) return false;
+    // A connect still waiting for the start guard has no waiter yet: it stops waiting.
+    const leave = this.guardWaits.get(waiterId);
+    if (leave) {
+      leave();
+      return true;
+    }
     const waiter = this.waiters.get(waiterId);
     if (!waiter) return false;
     this.waiters.delete(waiterId);
