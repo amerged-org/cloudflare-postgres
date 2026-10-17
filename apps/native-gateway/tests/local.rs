@@ -13,7 +13,7 @@ use pgcf_native_gateway::{
 use pgcf_native_protocol::{
     agent::{self, ControlAction, Database, FromGateway, Mode, SessionStatus, ToGateway, Writer},
     route::Keyring,
-    wake::{Outcome, WakeResult},
+    wake::{self, MAX_HELD_PER_DATABASE, Outcome, WakeClaims, WakeResult},
     wire,
 };
 use pgcf_test_postgres::{Cluster, Directory, binaries};
@@ -76,6 +76,17 @@ fn ticket_at(id: usize, generation: u64, operation: &str, route_revision: u64) -
         "pgcf-route/v5\n",
         json!({"v":5,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"op":operation,"gen":generation,"route_revision":route_revision,"rh":"c".repeat(64)}),
     )
+}
+
+/// The claims of a wake ticket, as the gateway verifies them.
+fn claims(gateway: &Gateway, id: usize, generation: u64, operation: &str) -> WakeClaims {
+    wake::verify_wake(
+        Some(&ticket(id, generation, operation)),
+        &gateway.config.keyring.keys,
+        REGION,
+        http::now(),
+    )
+    .unwrap()
 }
 
 /// The database's PostgreSQL, with the tenant role `app` that logs in with SCRAM-SHA-256.
@@ -845,7 +856,8 @@ async fn every_connection_is_labelled_warm_or_cold() {
         assert_eq!(of("sql_stages", "warm").len(), 1, "{lines:?}");
         assert_eq!(of("sql_stages", "cold").len(), 1, "{lines:?}");
         // A connection or request refused before admission or hold is neither: the database was
-        // not running, so `warm` would be false, and nothing waited for a wake.
+        // not running, so `warm` would be false, and nothing waited for a wake. That includes a
+        // ticket refused for want of a hold, which `cold` must not be set before.
         for event in ["conn_stages", "sql_stages"] {
             let mut outcomes = lines
                 .iter()
@@ -853,9 +865,13 @@ async fn every_connection_is_labelled_warm_or_cold() {
                 .map(|line| line["outcome"].as_str().unwrap())
                 .collect::<Vec<_>>();
             outcomes.sort_unstable();
-            assert_eq!(outcomes, ["fenced", "route_stale"], "{event} {lines:?}");
+            assert_eq!(
+                outcomes,
+                ["fenced", "route_stale", "wake_capacity"],
+                "{event} {lines:?}"
+            );
         }
-        assert_eq!(lines.len(), 10, "{lines:?}");
+        assert_eq!(lines.len(), 12, "{lines:?}");
         return;
     }
     let mut cluster = blocking(|| database_cluster(&bin));
@@ -945,6 +961,25 @@ async fn every_connection_is_labelled_warm_or_cold() {
             .0,
         400
     );
+
+    // The database's holds are all taken: a ticket that would wait is refused before its hold,
+    // as a connection and as a request.
+    let full = operation('f');
+    let holds = (100..100 + MAX_HELD_PER_DATABASE)
+        .map(|id| {
+            node.gateway
+                .wakes
+                .hold(
+                    &claims(&node.gateway, id, 5, &full),
+                    http::now(),
+                    std::time::Instant::now(),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(node.upgrade(&ticket(11, 5, &full)).await.err(), Some(429));
+    assert_eq!(node.sql(&ticket(12, 5, &full), "select 1").await.0, 400);
+    drop(holds);
     // Every line is logged before the child ends.
     timeout(Duration::from_secs(10), async {
         while node
