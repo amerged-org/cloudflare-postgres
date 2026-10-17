@@ -395,15 +395,14 @@ async function nodeReleaseStatus(
     differences.push("unobserved/current_material_runtime");
   }
   if (state === "converged") {
-    const { readCurrentNodeThinStorage } =
-        await import("./node-thin-storage.ts"),
-      storage = await readCurrentNodeThinStorage({ DB: db }, row.node_id);
+    const { thinStorageObservation } = await import("./node-thin-storage.ts"),
+      storage = await thinStorageObservation(db, row.node_id);
     // A receipt binds members that take databases; control/relay without placement stays thick.
     if (
       ((desired?.spec.thin_storage_qualification &&
         row.database_placement_enabled === 1) ||
-        storage) &&
-      !storage?.authority?.write_allowed
+        storage.selected) &&
+      !storage.observed
     ) {
       state = "pending";
       differences.push("unobserved/current_material_storage");

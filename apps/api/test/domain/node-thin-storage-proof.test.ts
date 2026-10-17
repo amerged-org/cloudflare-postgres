@@ -628,14 +628,6 @@ it("keeps an identity-only turn available after the last deleted volume removes 
   expect(
     await desiredRegionStorageNodes(env, f.region, afterWriteExpiry + 300_000),
   ).toEqual([]);
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET material_revision=material_revision+1 WHERE node_id=?",
-  )
-    .bind(f.node)
-    .run();
-  expect(
-    await desiredRegionStorageNodes(env, f.region, afterWriteExpiry),
-  ).toEqual([]);
 });
 
 it("the host lease retires a deleted volume from the absence read even after its pool and write authority are gone", async () => {

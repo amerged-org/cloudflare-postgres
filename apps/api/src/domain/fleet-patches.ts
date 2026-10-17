@@ -1022,19 +1022,19 @@ export async function restoreFleetPatchPlacements(
     ))
   )
     return false;
-  const { readCurrentNodeThinStorage } = await import("./node-thin-storage.ts");
+  const { thinStorageObservation } = await import("./node-thin-storage.ts");
   const storageMembers = await env.DB.prepare(
     "SELECT id,database_placement_enabled FROM nodes WHERE region_id=? AND lost_at IS NULL",
   )
     .bind(row.region_id)
     .all<{ id: string; database_placement_enabled: number }>();
   for (const member of storageMembers.results) {
-    const storage = await readCurrentNodeThinStorage(env, member.id);
+    const storage = await thinStorageObservation(env.DB, member.id);
     if (
       ((spec.thin_storage_qualification &&
         member.database_placement_enabled === 1) ||
-        storage) &&
-      !storage?.authority?.write_allowed
+        storage.selected) &&
+      !storage.observed
     )
       return false;
   }

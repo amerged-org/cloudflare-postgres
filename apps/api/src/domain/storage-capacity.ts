@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Env } from "../env.ts";
-import { qualifiedThinStorageSql } from "./node-thin-storage.ts";
 import { allOf } from "./sql-conjunction.ts";
 import {
   NodeThinStorageAuthority as AuthoritySchema,
@@ -391,7 +390,6 @@ export function storageHoldVolumeStatements(
           AND (d.desired_state='running' AND d.observed_state='ready' AND d.observed_power='awake' AND d.deleted_at IS NULL)
           AND ${holdReceiptMatchesCurrentSql("h", "d")}
           AND (t.node_uid=h.node_uid AND t.authority_revision=? AND t.authority_json=? AND julianday(${inventoryObservedSql()})>=julianday(d.updated_at))
-          AND ${qualifiedThinStorageSql()}
           AND (json_extract(d.runtime_attestation_json,'$.database_id')=d.id AND json_extract(d.runtime_attestation_json,'$.generation')=d.generation AND json_extract(d.runtime_attestation_json,'$.storage_generation')=d.storage_generation AND json_extract(d.runtime_attestation_json,'$.node_uid')=h.node_uid)
           AND (json_extract(d.runtime_attestation_json,'$.boot_id')=json_extract(t.qualification_json,'$.boot_id') AND json_extract(d.runtime_attestation_json,'$.cluster_uid')=t.cluster_uid AND json_extract(d.runtime_attestation_json,'$.namespace_uid')=? AND json_extract(d.runtime_attestation_json,'$.cnpg_cluster_uid')=?)
           AND (json_extract(d.runtime_attestation_json,'$.storage_uid')=? AND json_extract(d.runtime_attestation_json,'$.pvc_uid')=? AND json_extract(d.runtime_attestation_json,'$.pv_uid')=? AND json_extract(d.runtime_attestation_json,'$.pod_uid')=?)
@@ -440,7 +438,6 @@ function globallyAbsentDeletedStorageHoldSql(admission: string): string {
       AND julianday(${admission}.granted_at)<=julianday(storage_db.updated_at))
       AND (n.ready=1 AND n.lost_at IS NULL AND t.error_code IS NULL
       AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))
-      AND ${qualifiedThinStorageSql()}
       AND (json_extract(storage_db.storage_profile_json,'$.backend')='lvm-thin-v1'
       AND json_extract(storage_db.storage_profile_json,'$.node_uid')=t.node_uid
       AND json_extract(storage_db.storage_profile_json,'$.volume_group_uuid')=t.volume_group_uuid
@@ -484,7 +481,7 @@ export function coveredStorageHoldSql(admissionAlias = "a"): string {
   const admission = identifier(admissionAlias);
   return `(${admission}.storage_budget_bytes=0 OR ${globallyAbsentDeletedStorageHoldSql(admission)} OR EXISTS(
     SELECT 1 FROM databases storage_db JOIN node_thin_storage t ON t.node_id=storage_db.node_id
-    WHERE (storage_db.id=${admission}.database_id AND t.node_uid=${admission}.node_uid) AND ${qualifiedThinStorageSql()} AND ${holdReceiptMatchesCurrentSql(admission, "storage_db")}
+    WHERE (storage_db.id=${admission}.database_id AND t.node_uid=${admission}.node_uid) AND ${holdReceiptMatchesCurrentSql(admission, "storage_db")}
       AND (json_extract(storage_db.storage_profile_json,'$.node_uid')=t.node_uid
       AND json_extract(storage_db.storage_profile_json,'$.volume_group_uuid')=t.volume_group_uuid
       AND json_extract(storage_db.storage_profile_json,'$.profile_sha256')=t.profile_sha256

@@ -19,9 +19,6 @@ import {
   knownStorageHoldVolume,
 } from "./storage-capacity.ts";
 
-/** How tightly a node's authority is bound to the assigned release: see qualifiedThinStorageSql. */
-export type ThinQualification = "strict" | "continuing";
-
 export interface NodeThinStorageRow {
   node_id: string;
   node_uid: string;
@@ -51,31 +48,16 @@ export interface NodeThinStorageRow {
 }
 
 /**
- * Whether a node's authority names the release, host custody and boot it was proven with.
- *
- * `strict` binds the proof, the controller's observation and the node's own completed patch to the
- * assigned release by label: its id, spec hash, assignment revision and region revision. Placement,
- * wake, hold release, deletion proofs and qualification admit new Pods or confirm absences, and
- * stay behind it.
- *
- * `continuing` keeps every fact the labels stood for (the receipt's facts, the authority keys, the
- * host custody, the boot, the node, the cluster and the material) and drops the labels. It asks
- * three things of releases instead: the node's completed patch and the release its proof was read
- * under pin the same thin facts as the assigned release (`fleet_releases.thin_continuity`), and
- * no later patch of the node, in any state, pins others. A rollout that changes a pinned fact is
- * strict from its assignment, and so is a rollback after one: the node runs the other facts until
- * its own patch completed and a proof read it. `continuing` renews and delivers the authority of
- * a writer that already runs, and is implied by `strict`.
+ * Whether a node's identity proof names the release, host custody and boot it was proven with: the
+ * proof, the controller's observation and the node's own completed patch are of the assigned
+ * release, by id, spec hash, assignment revision and region revision. Only release and node
+ * admission read it (AddNode, a thin selection); no start, attach, deletion or rollout gate does.
  */
-export function qualifiedThinStorageSql(
-  alias = "t",
-  mode: ThinQualification = "strict",
-) {
+export function qualifiedThinStorageSql(alias = "t") {
   if (!/^[a-z][a-z0-9_]*$/.test(alias))
     throw new Error("invalid_thin_authority_alias");
-  const strict = mode === "strict",
-    // The controller observes a new assignment up to two periods after it is made.
-    seconds = strict ? 180 : 300,
+  // The controller observes a new assignment up to two periods after it is made.
+  const seconds = 180,
     proof = (field: string) =>
       `json_extract(${alias}.qualification_json,'$.${field}')`,
     receipt = (field: string) =>
@@ -91,11 +73,8 @@ export function qualifiedThinStorageSql(
     "qh.node_uid=qn.node_uid",
     "qo.node_id=qn.id",
     "qo.node_uid=qn.node_uid",
-    ...(strict ? ["qo.assignment_revision=qa.revision"] : []),
+    "qo.assignment_revision=qa.revision",
     "qo.agent_key_hash=qr.agent_key_hash",
-    ...(strict
-      ? []
-      : ["qps.id=qp.release_id", `qrp.id=${proof("release_id")}`]),
     "json_extract(qverifier.value,'$.name')='native-gateway'",
     "json_extract(qverifier.value,'$.kind')='image'",
     "qgatewayrole.value='native-gateway'",
@@ -110,7 +89,7 @@ export function qualifiedThinStorageSql(
     `length(${keys})=64`,
     `${keys} NOT GLOB '*[^0-9a-f]*'`,
     // The host custody and the boot the controller sees.
-    ...(strict ? ["qh.release_id=qs.id"] : []),
+    "qh.release_id=qs.id",
     `qh.cluster_uid=${alias}.cluster_uid`,
     `qh.material_revision=${alias}.material_revision`,
     `json_extract(qo.facts_json,'$.boot_id')=${proof("boot_id")}`,
@@ -121,14 +100,10 @@ export function qualifiedThinStorageSql(
     // The proof names the profile and the receipt's software.
     `${proof("profile_revision")}=${alias}.profile_revision`,
     `${proof("profile_sha256")}=${receipt("profile_sha256")}`,
-    ...(strict
-      ? [
-          `${proof("release_id")}=qs.id`,
-          `${proof("spec_sha256")}=qs.spec_sha256`,
-          `${proof("assignment_revision")}=qa.revision`,
-          `${proof("region_revision")}=qf.revision`,
-        ]
-      : []),
+    `${proof("release_id")}=qs.id`,
+    `${proof("spec_sha256")}=qs.spec_sha256`,
+    `${proof("assignment_revision")}=qa.revision`,
+    `${proof("region_revision")}=qf.revision`,
     `${receipt("driver_image")}=${alias}.qualified_driver_image`,
     `${receipt("host_extension_image")}=${proof("software.host_extension_image")}`,
     `${receipt("kernel_version")}=${proof("software.kernel_version")}`,
@@ -138,48 +113,45 @@ export function qualifiedThinStorageSql(
     "qp.node_uid=qn.node_uid",
     `qp.cluster_uid=${alias}.cluster_uid`,
     `qp.material_revision=${alias}.material_revision`,
-    ...(strict
-      ? [
-          "qp.release_id=qs.id",
-          "qp.spec_sha256=qs.spec_sha256",
-          "qp.assignment_revision=qa.revision",
-          "qp.region_revision=qf.revision",
-          "qp.host_configuration_revision=qh.revision",
-        ]
-      : []),
+    "qp.release_id=qs.id",
+    "qp.spec_sha256=qs.spec_sha256",
+    "qp.assignment_revision=qa.revision",
+    "qp.region_revision=qf.revision",
+    "qp.host_configuration_revision=qh.revision",
     "qp.stage='complete'",
     "qp.state='confirmed'",
     "qp.error_code IS NULL",
     "qp.host_configuration_sha256=qh.sha256",
     "json_extract(qp.observed_json,'$.host_configuration_sha256')=qh.sha256",
-    ...(strict
-      ? [
-          "json_extract(qp.observed_json,'$.runtime_admission_sha256')=qh.profile_sha256",
-        ]
-      : []),
+    "json_extract(qp.observed_json,'$.runtime_admission_sha256')=qh.profile_sha256",
     "json_extract(qp.observed_json,'$.node_ready')=1",
     `json_extract(qp.observed_json,'$.boot_id')=${proof("boot_id")}`,
-    ...(strict
-      ? []
-      : [
-          // The proof and the patch are of releases that pin the assigned release's facts.
-          "qrp.thin_continuity=qs.thin_continuity",
-          "qps.thin_continuity=qs.thin_continuity",
-          // And no later patch of the node pins others: the node would run them.
-          `NOT EXISTS(SELECT 1 FROM fleet_patch_operations qx,fleet_releases qxs WHERE ${allOf(
-            "qxs.id=qx.release_id",
-            "qx.node_id=qn.id",
-            "qx.node_uid=qn.node_uid",
-            "qx.rowid>qp.rowid",
-            "qxs.thin_continuity IS NOT qs.thin_continuity",
-          )})`,
-        ]),
   ];
   // Inner joins only. Their terms sit in the one balanced tree below: SQLite chains the terms of
   // a join list into one left-deep expression, and this predicate is embedded in statements that
   // already nest deeply.
-  return `EXISTS(SELECT 1 FROM nodes qn,regions qr,fleet_node_releases qa,fleet_region_releases qf,fleet_releases qs,node_host_configurations qh,fleet_node_release_observations qo,fleet_patch_operations qp${strict ? "" : ",fleet_releases qps,fleet_releases qrp"},json_each(qs.spec_json,'$.components') qverifier,json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole
+  return `EXISTS(SELECT 1 FROM nodes qn,regions qr,fleet_node_releases qa,fleet_region_releases qf,fleet_releases qs,node_host_configurations qh,fleet_node_release_observations qo,fleet_patch_operations qp,json_each(qs.spec_json,'$.components') qverifier,json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole
     WHERE ${allOf(...conjuncts)})`;
+}
+
+/**
+ * A fleet rollout's thin storage gate for one node: whether it has thin storage selected, and
+ * whether that storage is observed, with no error and a physical sample of the node at most 120 s
+ * old. Write authority, qualification and the identity proof's freshness do not enter it.
+ */
+export async function thinStorageObservation(
+  db: D1Database,
+  nodeId: string,
+): Promise<{ selected: boolean; observed: boolean }> {
+  const row = await db
+    .prepare(
+      `SELECT t.error_code IS NULL AND EXISTS(SELECT 1 FROM node_storage_observations o WHERE o.node_id=t.node_id AND o.node_uid=t.node_uid
+        AND julianday(o.observed_at)>=julianday('now','-120 seconds') AND julianday(o.observed_at)<=julianday('now','+5 seconds')) observed
+      FROM node_thin_storage t WHERE t.node_id=?`,
+    )
+    .bind(nodeId)
+    .first<{ observed: number }>();
+  return { selected: row !== null, observed: row?.observed === 1 };
 }
 
 /** A node's thin storage row as one read returns it, with what the node itself says about it. */
@@ -193,18 +165,17 @@ export type CurrentNodeThinStorageRow = NodeThinStorageRow & {
 };
 
 /**
- * The node as it is now. `continuing` is for the callers that renew or deliver the authority of a
- * writer that already runs; the default, `strict`, is for every caller that admits a Pod or reads
- * the node as fully qualified for its assignment.
+ * The node as it is now. `qualified` also judges it against its assigned release
+ * (`qualifiedThinStorageSql`): release and node admission ask for it, runtime readers do not.
  */
 export async function readCurrentNodeThinStorage(
   env: Pick<Env, "DB">,
   nodeId: string,
   now = Date.now(),
-  mode: ThinQualification = "strict",
+  qualified = true,
 ) {
   const row = await env.DB.prepare(
-    `SELECT t.*,n.region_id,n.k8s_node_name,n.node_uid current_node_uid,n.ready,n.lost_at,CASE WHEN ${qualifiedThinStorageSql("t", mode)} THEN 1 ELSE 0 END current_qualified FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE t.node_id=?`,
+    `SELECT t.*,n.region_id,n.k8s_node_name,n.node_uid current_node_uid,n.ready,n.lost_at,${qualified ? `CASE WHEN ${qualifiedThinStorageSql("t")} THEN 1 ELSE 0 END` : "1"} current_qualified FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE t.node_id=?`,
   )
     .bind(nodeId)
     .first<CurrentNodeThinStorageRow>();
@@ -291,7 +262,7 @@ export async function desiredRegionStorageNodes(
     .all<{ node_id: string; room: number }>();
   const readings = await Promise.all(
     rows.results.map((row) =>
-      readCurrentNodeThinStorage(env, row.node_id, now, "continuing"),
+      readCurrentNodeThinStorage(env, row.node_id, now, false),
     ),
   );
   return rows.results.flatMap((row, index) => {
@@ -387,7 +358,7 @@ export async function hostStorageLease(
     );
   const scope = hostLeaseScope(id, region.id, now);
   const [current, read] = await Promise.all([
-    readCurrentNodeThinStorage(c.env, id, now, "continuing"),
+    readCurrentNodeThinStorage(c.env, id, now, false),
     c.env.DB.prepare(
       `SELECT d.*,COUNT(*) OVER() host_snapshot_count,
  (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation,'status',stop.status) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
@@ -489,12 +460,7 @@ export async function hostStorageLease(
     let drain:
       import("@pgcf/contracts/node-thin-storage").HostStorageDrain | null =
       null;
-    if (
-      stop?.kind === "database.delete" &&
-      receipt &&
-      current?.row.current_qualified === 1 &&
-      authority
-    ) {
+    if (stop?.kind === "database.delete" && receipt && current && authority) {
       await storageDrainReservationStatement(c.env.DB, {
         databaseId: row.id,
         operationId: stop.operation_id,

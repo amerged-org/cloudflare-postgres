@@ -27,7 +27,7 @@ import {
   software,
   startPatch,
 } from "./thin-rollout-fixture.ts";
-import { identityProof, report, row } from "./thin-proof-fixture.ts";
+import { identityProof, iso, report, row } from "./thin-proof-fixture.ts";
 import { prepareThinStorageLease } from "../../src/domain/node-thin-storage-execution.ts";
 import { qualifiedThinStorageSql } from "../../src/domain/node-thin-storage.ts";
 
@@ -68,6 +68,30 @@ it("serves the running entry and the proven boot in the host lease during such a
     desired_state: "running",
     write_blocked: false,
     runtime_authority: null,
+  });
+});
+
+it("keeps serving the node's storage entry and room while a rollout changes a pinned thin fact", async () => {
+  const w = await awake();
+  // The last identity proof was read a minute ago: its short write lease has lapsed, its
+  // inventory is current.
+  const read = Date.now() - 60_000;
+  await identityProof(w.f, {
+    ...w.reading(),
+    observed_at: iso(read),
+    captured_at: iso(read),
+    expires_at: iso(read + 10_000),
+    inventory_observed_at: iso(read),
+    inventory_expires_at: iso(read + 300_000),
+  });
+  await assignRelease(w.f, releases, { change: extension });
+  const node = (await desired(w)).region.storage_nodes?.find(
+    (entry) => entry.node_id === w.f.node,
+  );
+  expect(node).toMatchObject({ node_uid: w.f.uid, room: true });
+  expect(await leaseEntry(w.f, w.id)).toMatchObject({
+    desired_state: "running",
+    write_blocked: false,
   });
 });
 
@@ -228,18 +252,17 @@ it("keeps every statement that embeds the thin predicates at most 90 levels deep
   } finally {
     database.prepare = prepare;
   }
-  // The lease row, the desired page's node readings and the identity turn among them.
-  expect(seen.size).toBeGreaterThanOrEqual(2);
+  // The identity turn's lease row among them.
+  expect(seen.size).toBeGreaterThanOrEqual(1);
   const deepest: string[] = [];
   for (const sql of seen.values())
     deepest.push(`${await depth(sql)} ${sql.trim().slice(0, 60)}`);
   for (const line of deepest)
     expect(Number(line.split(" ")[0])).toBeLessThanOrEqual(90);
   // A predicate read in a select list (readCurrentNodeThinStorage) is measured on its own.
-  for (const mode of ["strict", "continuing"] as const)
-    expect(
-      await depth(
-        `SELECT 1 FROM node_thin_storage t WHERE ${qualifiedThinStorageSql("t", mode)}`,
-      ),
-    ).toBeLessThanOrEqual(60);
+  expect(
+    await depth(
+      `SELECT 1 FROM node_thin_storage t WHERE ${qualifiedThinStorageSql("t")}`,
+    ),
+  ).toBeLessThanOrEqual(60);
 });

@@ -395,6 +395,10 @@ export async function standingPostjoinFixture(
         now,
         now,
       ),
+      // The controller's minute sample of the same pool.
+      env.DB.prepare(
+        "INSERT INTO node_storage_observations(node_id,node_uid,observed_at,received_at,physical_json) VALUES(?,?,?,?,?)",
+      ).bind(member.id, uid, now, now, JSON.stringify(authority.physical)),
       env.DB.prepare(
         `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,stage,state,baseline_json,observed_json,talos_upgrade_receipt_json,host_configuration_revision,host_configuration_sha256,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,2,'127.0.0.1',?,'complete','confirmed',?,?,?,1,?,?,?,?)`,
       ).bind(

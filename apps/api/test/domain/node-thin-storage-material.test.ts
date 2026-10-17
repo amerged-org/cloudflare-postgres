@@ -161,6 +161,29 @@ it("the actual report CAS rejects a startup hold admitted after its captured hol
   expect((await commit(captured)).meta.changes).toBe(0);
   expect((await commit([held!.operation_id])).meta.changes).toBe(1);
 });
+it("keeps an observed node under current material qualified between identity proofs, and holds it on a stale sample", async () => {
+  const f = await thinExecutionFixture(releases);
+  // The last identity proof was read two minutes ago: its short write lease has long lapsed.
+  const read = new Date(Date.now() - 120_000).toISOString();
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_received_at=? WHERE node_id=?",
+  )
+    .bind(read, f.node)
+    .run();
+  expect(await refreshNodeThinStorageMaterial(f.local, f.node)).toEqual({
+    selected: true,
+    qualified: true,
+  });
+  await env.DB.prepare(
+    "UPDATE node_storage_observations SET observed_at=? WHERE node_id=?",
+  )
+    .bind(new Date(Date.now() - 121_000).toISOString(), f.node)
+    .run();
+  // Not observed: the turn that would prove it again needs the node's executor.
+  await expect(refreshNodeThinStorageMaterial(f.local, f.node)).rejects.toThrow(
+    "thin_storage_container_unavailable",
+  );
+});
 it("retains running thin bindings and finite read counters across material change, interruption and authenticated read-only acceptance", async () => {
   const f = await thinExecutionFixture(releases);
   // This controlled existing binding is a D1 authority fixture, not fabricated live storage evidence.

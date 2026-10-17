@@ -373,7 +373,7 @@ export async function reserveThinStorageLease(
     env,
     nodeId,
     Date.now(),
-    "continuing",
+    false,
   );
   if (!current) return closed();
   const row = await readThinStorageLeaseRow(env, nodeId);
@@ -557,7 +557,7 @@ async function buildThinStorageInput(
     env,
     nodeId,
     Date.now(),
-    "continuing",
+    false,
   );
   if (
     !current ||
