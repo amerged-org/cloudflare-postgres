@@ -447,7 +447,6 @@ interface ExecutorOptions {
   run?: typeof runCommand;
   request?: typeof fetch;
   proxy?: typeof startCapabilityProxy;
-  signal?: AbortSignal;
 }
 /** Every mutating step is checkpointed in Cloudflare before dispatch; an unresolved one never repeats. */
 export class QualificationJournal {

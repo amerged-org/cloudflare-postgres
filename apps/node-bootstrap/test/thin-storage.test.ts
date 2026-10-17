@@ -677,7 +677,7 @@ test("the session command used by mutations attempts a real write once and prese
   }
 });
 
-test("a thin turn's own deadline cancels a real subprocess without replay, while an external timeout stays job_cancelled", async () => {
+test("a thin turn's own deadline cancels a real subprocess without replay", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pgcf-thin-turn-deadline-"));
   await chmod(directory, 0o700);
   const marker = join(directory, "attempts"),
@@ -736,51 +736,6 @@ test("a thin turn's own deadline cancels a real subprocess without replay, while
       "x",
       "a timed out subprocess is never rerun",
     );
-    const external = new AbortController(),
-      timer = setTimeout(
-        () =>
-          external.abort(new DOMException("external timeout", "TimeoutError")),
-        100,
-      );
-    try {
-      await assert.rejects(
-        openThinSession(
-          { ...scope, budget_ms: 2000 },
-          { signal: external.signal },
-          command,
-        ),
-        (error: unknown) =>
-          error instanceof BootstrapError && error.code === "job_cancelled",
-      );
-    } finally {
-      clearTimeout(timer);
-    }
-    assert.equal(
-      await readFile(marker, "utf8"),
-      "xx",
-      "external cancellation also makes one attempt",
-    );
-    const concurrent = new AbortController();
-    await assert.rejects(
-      openThinSession(
-        scope,
-        {
-          signal: concurrent.signal,
-          run: async (child) => {
-            try {
-              return await runCommand(child);
-            } catch (error) {
-              concurrent.abort();
-              throw error;
-            }
-          },
-        },
-        command,
-      ),
-      (error: unknown) =>
-        error instanceof BootstrapError && error.code === "job_cancelled",
-    );
-    assert.equal(await readFile(marker, "utf8"), "xxx");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
