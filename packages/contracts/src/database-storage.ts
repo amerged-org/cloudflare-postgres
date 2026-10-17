@@ -305,6 +305,10 @@ export const NodeThinStorageAuthority = z
     inventory_expires_at: z.iso.datetime().optional(),
     inventory_revision: z.number().int().positive().optional(),
     write_allowed: z.boolean(),
+    /** Cloudflare's thin pool reserve rule for this node now: true when its fresh physical sample
+     * leaves the profile's data and metadata reserve free. No database starts or attaches on a
+     * node without room; running writers are never stopped for it. Absent from an executor report. */
+    room: z.boolean().optional(),
     physical: NodePhysicalStorage,
     /** Complete fresh VG inventory, including internal and unknown LVs; absence is physical evidence. */
     physical_lvs: z

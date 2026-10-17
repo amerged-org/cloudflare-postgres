@@ -677,6 +677,7 @@
                     "maximum": 9007199254740991
                   },
                   "write_allowed": { "type": "boolean" },
+                  "room": { "type": "boolean" },
                   "physical": {
                     "type": "object",
                     "properties": {
@@ -4640,6 +4641,7 @@
                             "maximum": 9007199254740991
                           },
                           "write_allowed": { "type": "boolean" },
+                          "room": { "type": "boolean" },
                           "physical": {
                             "type": "object",
                             "properties": {
@@ -6940,6 +6942,7 @@
           "maximum": 9007199254740991
         },
         "write_allowed": { "type": "boolean" },
+        "room": { "type": "boolean" },
         "physical": {
           "type": "object",
           "properties": {
@@ -8552,6 +8555,7 @@
                   "maximum": 9007199254740991
                 },
                 "write_allowed": { "type": "boolean" },
+                "room": { "type": "boolean" },
                 "physical": {
                   "type": "object",
                   "properties": {
