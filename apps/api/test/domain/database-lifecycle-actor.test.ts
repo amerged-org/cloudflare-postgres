@@ -561,6 +561,34 @@ it("recovers the persisted wake after eviction without duplicating the operation
   ).toBe(1);
 });
 
+it("logs every refused admission with the actor's state, so a refusal says why", async () => {
+  // Live, a wake was refused in 24 ms and nothing said which of a dozen paths refused it.
+  const f = await ready();
+  await idle(f);
+  const log = vi.spyOn(console, "log");
+  expect(
+    await actor(f.id).admitWake(f.id, "app", { deadline: Date.now() - 1 }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  const refused = log.mock.calls
+    .map(([line]) => (typeof line === "string" ? line : ""))
+    .filter((line) => line.includes('"admission_refused"'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  // The admission fell back to ensureAwake, which says so in a line of its own.
+  expect(refused.map((line) => line.path)).toEqual([
+    "ensure_awake",
+    "admit_wake",
+  ]);
+  for (const line of refused) {
+    expect(line).toMatchObject({
+      event: "admission_refused",
+      database_id: f.id,
+      sqlstate: "57P03",
+    });
+    expect(line).toHaveProperty("wakeable");
+    expect(line).toHaveProperty("waiters");
+  }
+});
+
 it("expires or cancels waiters and stops shared polling when the final waiter leaves", async () => {
   const f = await ready();
   await idle(f);

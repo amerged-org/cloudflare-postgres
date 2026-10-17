@@ -964,6 +964,48 @@ export class DatabaseActor extends DurableObject<Env> {
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
   ): Promise<DatabaseWakeAdmission> {
+    const result = await this.#admitWake(databaseId, user, options);
+    if (!result.ok) this.refused("admit_wake", databaseId, result.sqlstate);
+    return result;
+  }
+  /** One log line per refused admission with what the actor knew, so a refusal says why. */
+  private refused(path: string, databaseId: unknown, sqlstate: string) {
+    let state: Record<string, unknown> = {};
+    try {
+      // An actor that holds nothing yet stays without tables.
+      const read = this.presence() ? this.admissionState() : undefined,
+        snapshot = read?.snapshot;
+      if (read)
+        state = {
+          generation: snapshot?.generation ?? null,
+          deleted: snapshot?.deleted ?? null,
+          admissible: snapshot?.admissible ?? null,
+          wakeable: snapshot?.wakeable ?? null,
+          cache_capable: snapshot?.cache_capable ?? null,
+          barrier: read.barrier !== undefined,
+          ticket: this.storedTicket()?.state ?? null,
+          wake: this.wake?.operation ?? null,
+          waiters: this.waiters.size,
+        };
+    } catch {
+      // The refusal is logged without the state it could not read.
+    }
+    console.log(
+      JSON.stringify({
+        event: "admission_refused",
+        path,
+        database_id: typeof databaseId === "string" ? databaseId : null,
+        sqlstate,
+        ...state,
+        at_ms: Date.now(),
+      }),
+    );
+  }
+  async #admitWake(
+    databaseId: unknown,
+    user: unknown,
+    options?: { deadline?: number; waiterId?: string },
+  ): Promise<DatabaseWakeAdmission> {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
     if (!id.success) return { ok: false, sqlstate: "3D000" };
@@ -1526,6 +1568,15 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Known routes only. One shared observation loop for a running wake, never application SQL. */
   async ensureAwake(
+    databaseId: unknown,
+    user: unknown,
+    options?: { deadline?: number; waiterId?: string },
+  ): Promise<DatabaseAdmission> {
+    const result = await this.#ensureAwake(databaseId, user, options);
+    if (!result.ok) this.refused("ensure_awake", databaseId, result.sqlstate);
+    return result;
+  }
+  async #ensureAwake(
     databaseId: unknown,
     user: unknown,
     options?: { deadline?: number; waiterId?: string },
