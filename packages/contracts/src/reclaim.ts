@@ -1,47 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { DatabaseId, OperationId, RegionId, RoleName } from "./ids.ts";
-export const RECLAIM_LIMITS = {
-  lease_ms: 5000,
-  clock_skew_ms: 1000,
-  max_token_bytes: 8192,
-  max_envelope_bytes: 2 * 1024 * 1024,
-  max_budget_bytes: 134217728,
-  max_step_bytes: 8388608,
-  snapshot_ms: 2000,
-  max_tasks: 4096,
-} as const;
+import { DatabaseId, RegionId, RoleName } from "./ids.ts";
 const Safe = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   Hash = z.string().regex(/^[a-f0-9]{64}$/);
-/** Flat signed wire schema; no arbitrary cgroup path or PostgreSQL credential is accepted. */
-export const ReclaimClaims = z.strictObject({
-  v: z.literal(1),
-  kid: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/),
-  database_id: DatabaseId,
-  operation_id: OperationId,
-  intent_revision: Safe.positive(),
-  generation: Safe.positive(),
-  storage_generation: Safe.positive(),
-  node_uid: z.uuid(),
-  boot_id: z.uuid(),
-  cluster_uid: z.uuid(),
-  namespace_uid: z.uuid(),
-  cnpg_cluster_uid: z.uuid(),
-  storage_uid: z.uuid(),
-  pvc_uid: z.uuid(),
-  pv_uid: z.uuid(),
-  pod_uid: z.uuid(),
-  container_id: Hash,
-  postgres_image_sha256: Hash,
-  mode: z.enum(["reclaim", "revoked"]),
-  budget_bytes: Safe.max(RECLAIM_LIMITS.max_budget_bytes),
-  step_bytes: Safe.max(RECLAIM_LIMITS.max_step_bytes),
-  memory_request_bytes: Safe.positive(),
-  memory_limit_bytes: Safe.positive(),
-  issued_at: Safe,
-  expires_at: Safe,
-});
-export type ReclaimClaims = z.infer<typeof ReclaimClaims>;
 export const DatabaseRuntimeAttestationV1 = z
   .strictObject({
     v: z.literal(1),

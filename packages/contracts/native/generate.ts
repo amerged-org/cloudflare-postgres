@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Zod and existing protocol implementations are authoritative. Check generated files in CI.
 import { edgeContract, edgeVectors } from "./generate-edge.ts";
-import { ReclaimClaims } from "../src/reclaim.ts";
 import { GatewayAdmissionTarget } from "../src/database-admission.ts";
-import {
-  HostStorageLease,
-  NodeThinStorageLease,
-} from "../src/node-thin-storage.ts";
-import { StorageLvmUuid } from "../src/database-storage.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
-import {
-  StorageWriteClaims,
-  STORAGE_AUTHORITY_PREFIX,
-  STORAGE_AUTHORITY_DOMAIN,
-  STORAGE_AUTHORITY_MAX_LENGTH,
-  STORAGE_AUTHORITY_MAX_SECONDS,
-  STORAGE_AUTHORITY_SKEW_MS,
-  STORAGE_AUTHORITY_KEY_ID_PATTERN,
-} from "../src/storage-write-authority.ts";
 import { format } from "prettier";
 import {
   DATABASE_ID_PATTERN,
@@ -180,9 +165,6 @@ const contract = {
     DEFAULT_DATABASE_CONNECTION_LIMIT,
     DEFAULT_TOTAL_CONNECTION_LIMIT,
     MAX_ACTIVITY_RECORDS,
-    STORAGE_AUTHORITY_MAX_LENGTH,
-    STORAGE_AUTHORITY_MAX_SECONDS,
-    STORAGE_AUTHORITY_SKEW_MS,
   },
   wire: {
     ...edge.wire,
@@ -207,8 +189,6 @@ const contract = {
     fenceNamespace: GATEWAY_FENCE_NAMESPACE,
     fenceLabel: GATEWAY_FENCE_LABEL,
     fenceSelector: GATEWAY_FENCE_SELECTOR,
-    storageAuthorityPrefix: STORAGE_AUTHORITY_PREFIX,
-    storageAuthorityDomain: STORAGE_AUTHORITY_DOMAIN,
   },
   patterns: {
     database: DATABASE_ID_PATTERN.source,
@@ -216,8 +196,6 @@ const contract = {
     role: ROLE_NAME_PATTERN.source,
     operation: OPERATION_ID_PATTERN.source,
     uuid: z.toJSONSchema(gatewayPodUidSchema).pattern,
-    storageAuthorityKid: STORAGE_AUTHORITY_KEY_ID_PATTERN.source,
-    storageLvmUuid: z.toJSONSchema(StorageLvmUuid).pattern,
   },
   reservedRoles: [...RESERVED_ROLE_NAMES],
   reservedRolePrefixes: RESERVED_ROLE_PREFIXES,
@@ -231,10 +209,6 @@ const contract = {
   controlClaims: schema(gatewayControlClaimsSchema),
   activityClaims: schema(gatewayActivityClaimsSchema),
   intent: schema(gatewayIntentSchema),
-  storageWriteClaims: schema(StorageWriteClaims),
-  reclaimClaims: schema(ReclaimClaims),
-  storageHostLease: z.toJSONSchema(HostStorageLease),
-  nodeThinStorageLease: z.toJSONSchema(NodeThinStorageLease),
 };
 const key = new Uint8Array(32).fill(7),
   database = "a".repeat(20),

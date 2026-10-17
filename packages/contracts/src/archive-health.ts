@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 export const ARCHIVE_FAILURE_MS = 10 * 60_000;
-export const WAL_BACKLOG_LIMIT = 32;
 // `only_stats` holds while the role is a member of nothing beyond the two roles it is granted:
 // pg_read_all_stats for this sample and pg_signal_backend, which ends the sessions of a role
 // awaiting removal (see MAINTENANCE_ROLE in maintenance.ts).

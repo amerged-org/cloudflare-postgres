@@ -66,8 +66,6 @@ export const gatewayControlReportSchema = gatewayIntentSchema
     { message: "Retirement requires zero database sessions" },
   );
 export type GatewayControlReport = z.infer<typeof gatewayControlReportSchema>;
-export const gatewayFenceName = (database: string): string =>
-  `gateway-fence-${DatabaseId.parse(database)}`;
 const encoder = new TextEncoder(),
   decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const signingPurpose = "pgcf-gateway-control/v1\n";

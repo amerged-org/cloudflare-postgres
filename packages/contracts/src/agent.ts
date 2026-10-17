@@ -29,7 +29,6 @@ export {
   thinMetadataEstimateBytes,
   thinWriteExposure,
 } from "./database-storage.ts";
-export * from "./storage-write-authority.ts";
 export { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 export {
   NodePhysicalStorage,
