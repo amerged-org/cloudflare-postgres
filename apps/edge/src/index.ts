@@ -265,6 +265,8 @@ export default {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/healthz")
       return Response.json({ status: "ok" });
+    if (url.pathname === "/sql")
+      return (await import("./sql.ts")).serveSql(request, env, ctx);
     if (url.pathname !== "/v2")
       return new Response("Not found", { status: 404 });
     if (

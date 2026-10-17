@@ -165,6 +165,8 @@ The native gateway and controller use rustls-pki-types 1.15.1 (MIT OR Apache-2.0
 directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not shipped.
 The gateway's SCRAM client also uses hmac 0.13.0 (MIT OR Apache-2.0) and zeroize 1.9.1
 (Apache-2.0 OR MIT) directly, with sha2 above; both were already shipped through rustls.
+The native gateway uses ring 0.17.14 (Apache-2.0 AND ISC), already linked through rustls,
+directly for SCRAM-SHA-256 (PBKDF2, HMAC) and nonces in HTTP query mode.
 The controller image also ships the node attach agent `pgcf-attach`, whose direct crates beyond
 the controller's are libc above and httparse 1.10.1 (MIT OR Apache-2.0).
 The scratch artifact includes the actual Cargo dependency notices, Rust notices, generated
@@ -226,7 +228,7 @@ read from the installed package manifests.
 | [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | CLI WebSocket client, bootstrap relay, node-bootstrap transport proxies and the TypeScript regional gateway and agent link; CLI installs the upstream runtime package with its notice. |
 | [yaml](https://github.com/eemeli/yaml) | 2.9.1 | ISC | Parses and generates protected native bootstrap configuration; its installed license ships in the bootstrap image. |
 | [esbuild](https://github.com/evanw/esbuild)                                                             | 0.25.12 | MIT               | Bundles regional entry points and the installable CLI (build only).                  |
-| [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the live acceptance run (also listed above).                        |
+| [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the live acceptance run and the Edge HTTP query mode test (also listed above). |
 | [pg](https://github.com/brianc/node-postgres)                                                           | 8.23.1  | MIT               | PostgreSQL acceptance tools and the TypeScript regional agent's authenticated TLS readiness probes. |
 | [@types/pg](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/pg)                    | 8.23.1  | MIT               | PostgreSQL client types (development only).                                               |
 | [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                                           |

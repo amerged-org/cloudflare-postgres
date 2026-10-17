@@ -42,6 +42,18 @@ and `wake_path` (`warm`, or for a held wake `pool_hit` when it was released to a
 the controller's `miss_reason` and `controller_ms` once its result arrived.
 Roles, addresses, tokens and payload bytes are never logged.
 
+`POST /sql` (`src/sql.rs`) serves the Neon driver's HTTP query mode for the Edge. It checks the
+same single-use route token, fence, revision and writer as a connection, holds a wake ticket's
+request as a held connection is held, and runs the request (one statement, or a transaction
+between `BEGIN` and `COMMIT`) as one extended-protocol pipeline. Its PostgreSQL sessions are
+authenticated with SCRAM-SHA-256 using the password the Edge forwards in the request body; the
+password is wiped after use and never logged or stored. A session is kept after `DISCARD ALL` for
+at most 10 s idle and 60 s in all, reused only for a password that derives its SCRAM StoredKey,
+and closed by fence actions like any idle session. Statement bytes are never resent: a session
+lost after the write answers `08007`. Each request logs one `sql_stages` line with the database
+ID, a fixed `outcome`, `pooled`, `wake_path`, the statement count and `dial_ms`, `auth_ms`,
+`query_ms` and `request_ms`; roles, statements, parameters and passwords are never logged.
+
 `packages/contracts/native/generate.ts` derives native schemas, wire constants and deterministic
 behavior vectors from the shared Zod contracts and TypeScript implementations. The existing
 contracts test command checks the generated files. Rust tests exercise those vectors and real

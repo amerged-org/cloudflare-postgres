@@ -37,8 +37,9 @@ All databases share one hostname, the `host` of every connection URI. The operat
 real hostname of the installation; the examples in this runbook use `db.example.com`. There is no
 TCP listener. The transport is a WebSocket that carries the
 PostgreSQL wire protocol, as in Neon's serverless driver:
-`wss://<host>/v2?database=<id>&user=<role>`. A `postgres://` TCP connection to the hostname, the
-HTTP query endpoint of the Neon driver (`/sql`) and any path other than `/v2` do not work.
+`wss://<host>/v2?database=<id>&user=<role>`. The Neon driver's HTTP query mode is served at
+`https://<host>/sql` ([3.7](#37-http-query-mode-neon)). A `postgres://` TCP connection to the
+hostname and any other path do not work.
 
 A connection names its target twice, and both must agree:
 
@@ -543,8 +544,8 @@ needs one round trip after the upgrade instead of four, also after a wake: a sle
 connection is asked for its password while it waits. The gateway decides from the message that
 carries the StartupMessage, so pass the password as a string (a password function must not wait
 for anything). `pipelineConnect: false` still works and authenticates with SCRAM end to end, at
-three more round trips per connection. A TCP DSN with only the hostname replaced is not enough,
-and HTTP query mode (`neon()`, `poolQueryViaFetch`) is not supported.
+three more round trips per connection. A TCP DSN with only the hostname replaced is not enough.
+For HTTP query mode (`neon()`) see [3.7](#37-http-query-mode-neon).
 
 For `psql` and migration tools build the CLI (`pnpm --filter @pgcf/cli build`) and run
 `node packages/cli/dist/main.js connect --endpoint wss://db.example.com --database <id> --user <role>`;
@@ -667,6 +668,64 @@ a woken database sleeps again after 60 s idle.
 SQL statements on an established connection do not count against the rate limits, so keep
 connections and pool them: a platform that opens a connection per request meets the per-database
 limit first. Counters are per Cloudflare location and eventually consistent.
+
+### 3.7 HTTP query mode (`neon()`)
+
+**Not yet verified** against the live installation: the format below is checked by the actual
+`@neondatabase/serverless` 1.2.0 driver against the Edge and by the gateway's protocol tests, but
+no Dev latency has been measured.
+
+`POST https://<host>/sql` serves the Neon driver's HTTP query mode: `neon()`, its
+`transaction()`, and `Pool.query()` with `poolQueryViaFetch`. One query or one transaction is one
+HTTPS request, with no WebSocket upgrade and no SCRAM exchange by your client. The Edge admits each
+request as it admits a connection; the regional gateway runs it on a PostgreSQL session it keeps
+for a short time per database and role.
+
+```ts
+import { neon, neonConfig } from "@neondatabase/serverless";
+
+// The driver's default rewrites the host to api.<domain>; PGCF serves /sql on the database host.
+neonConfig.fetchEndpoint = (host) => `https://${host}/sql`;
+const sql = neon(connectionUri); // postgres://<role>:<password>@<host>/<database-id>
+
+const items = await sql`SELECT id, name FROM items WHERE owner = ${owner}`;
+const [, total] = await sql.transaction(
+  [sql`INSERT INTO items (owner, name) VALUES (${owner}, ${name})`, sql`SELECT count(*) FROM items`],
+  { isolationLevel: "RepeatableRead" },
+);
+```
+
+| Topic | Behaviour |
+| --- | --- |
+| Password | Sent in the driver's `Neon-Connection-String` header over HTTPS to Cloudflare. The Edge forwards it once, in the request body, over the tunnel to the gateway, which authenticates to PostgreSQL with SCRAM-SHA-256 inside the cluster. It is never logged or stored and is wiped from the gateway's memory after use. |
+| Statements | One statement per query (`a; b` is refused by PostgreSQL with `42601`). Parameters are `$1`, `$2`, ... in text; PostgreSQL infers their types. Results are text, parsed by the driver's type parsers (its `types` option), as with Neon. `arrayMode` and `fullResults` work: the driver applies them itself. |
+| Transactions | `transaction()` runs its statements between `BEGIN` and `COMMIT` in one request, with `isolationLevel`, `readOnly` and `deferrable`. An error rolls the whole transaction back. |
+| Session state | None across requests: each request starts like a new session (the gateway runs `DISCARD ALL` after it). `SET`, temporary tables, advisory locks, `LISTEN` and prepared statements end with the request; a transaction a single query leaves open is rolled back. Use WebSocket mode for interactive transactions and session state. |
+| Not supported | `COPY` (`0A000`); `authToken` / `Authorization` (`0A000`); clients other than the driver must send `Neon-Raw-Text-Output: true` and `Neon-Array-Mode: true`. |
+| Limits | Request body 4 MiB, at most 256 statements per transaction, result rows 10 MiB (`54000`; the session is closed and the outcome is unknown). |
+| Sleeping database | The request waits for the wake as a connection does ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)): at most 60 s, with the same `57P03` and `08006` answers. Set your `fetch` timeout accordingly. |
+| Admission and limits | Every request is one admission. It counts in the same two Edge rate limiters as a connection, in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the example configuration that is 120 requests per 60 s per database and Cloudflare location: the installation must size these limits for HTTP traffic. |
+| Errors | HTTP 400 with PostgreSQL's error fields (`message`, `code`, `severity`, `detail`, `hint`, `position`, ...); the driver throws them as `NeonDbError`. Admission refusals use the codes of [A.4](#a4-sqlstate-at-connect-time). |
+| Unknown outcome | `08007`: the connection to PostgreSQL ended, or the gateway's answer was lost, after the request was sent. PGCF never sends a request twice and does not know whether a write took effect; retry only idempotent requests. |
+| Password change | A kept session is reused only for the password it authenticated with, and at most 60 s after its authentication: an old password can still succeed for up to 60 s after a password change. |
+| Unknown database or role | Answers `28P01` "password authentication failed" at once, while a wrong password is checked by PostgreSQL: unlike the WebSocket path, the response time differs. |
+
+Choose HTTP for one-shot queries and short transactions from a Worker (one round trip each);
+choose WebSocket for interactive transactions, session state, `COPY`, `LISTEN`, and many
+statements in one burst (Neon puts the break-even at two to three queries).
+
+### 3.8 Recommended patterns for Workers
+
+Estimates from the plan's measurements (15-42 ms per statement round trip from a Worker,
+0.47-0.53 s for an 8-statement request on an awake database); **none is measured on PGCF yet**.
+
+| Pattern | How | Expected gain | Cost |
+| --- | --- | --- | --- |
+| Place the Worker near the region | `"placement": { "region": "aws:eu-central-1" }` in the Worker's Wrangler configuration (EU1) | each statement's round trip drops toward 1-5 ms when the distance is geographic: 0.1-0.3 s on an 8-statement request | one more hop for users far from the EU |
+| Batch writes | one `transaction()` in HTTP mode; on WebSocket, one multi-statement query or pipelined queries instead of one round trip each | 3-4 round trips (45-170 ms) | a batch fails or commits as a whole |
+| Close without waiting | `ctx.waitUntil(client.end())` instead of `await client.end()` (WebSocket mode) | one round trip of user-visible time | none |
+| Connect early | on login or navigation, open the connection or send one cheap query (`SELECT 1` over HTTP) before the user's request needs data | hides up to about 0.9 s of a cold wake behind user think time | wakes the database and spends admissions; do it on real user intent only |
+| Hold one socket for a burst | a Durable Object per database and role keeps one WebSocket `Client` open for a short idle window (5-10 s) and closes it when idle | 0.2-0.4 s on every request after the first in a burst | must close when idle, or the database never sleeps and the handshake limit is spent |
 
 ## 4. Capacity and limits you must enforce
 
@@ -946,7 +1005,8 @@ the operator supplies it at handover.** Send:
 - Infrastructure metrics history and measured CPU and RAM per database.
 - Changing a role after creation (expiry, limit, membership), user-chosen passwords, a grants API,
   per-role settings, renaming a database.
-- Cancel requests, replication connections, HTTP query mode, TCP access.
+- Cancel requests, replication connections, TCP access; in HTTP query mode, `COPY` and
+  `authToken`.
 - Budgets, quotas per tenant, compute and storage autoscaling, branching.
 - Maintenance-window notifications.
 - Importing existing databases from another provider; moving them is your task.
@@ -1058,6 +1118,7 @@ outcome and are not replayed.
 | Create, resize, delete, power, restore, roles | `apps/api/src/domain/{databases,lifecycle,restore,restore-catalog,roles,archive,retained-archives}.ts` |
 | Admission, wake, idle, `57P03` | `apps/api/src/database-actor.ts`, `apps/api/src/domain/{startup-admission,placement,storage-capacity,agent-metrics,observations}.ts` |
 | Edge, hints, SQLSTATE, deadline, decoy | `apps/edge/src/*.ts` (the Rust/Wasm port in `apps/edge-rust` applies the same policy) |
+| HTTP query mode | `apps/edge/src/sql.ts`, `apps/native-gateway/src/sql.rs` |
 | Gateway limits, TLS, cancel, startup, idle close | `apps/native-gateway/src/transport.rs`, `packages/native-protocol/src/activity.rs`, `packages/contracts/src/pg-wire.ts`, `packages/contracts/native/protocol.generated.json` |
 | Sleep sequence and refusals | `apps/native-controller/src/power.rs` |
 | PostgreSQL cluster, backup schedule, retention, `pg_hba` | `apps/native-controller/src/manifests.rs`, `infra/postgres/README.md`, `infra/platform/versions.lock.json` |
