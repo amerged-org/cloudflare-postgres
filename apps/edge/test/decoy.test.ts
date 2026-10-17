@@ -5,7 +5,11 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { newDatabaseId } from "@pgcf/contracts";
-import { encodeStartup, encodeSslRequest } from "@pgcf/contracts/pg-wire";
+import {
+  encodeErrorResponse,
+  encodeStartup,
+  encodeSslRequest,
+} from "@pgcf/contracts/pg-wire";
 import { afterEach, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
 import {
@@ -399,4 +403,70 @@ it("startup/auth canaries never enter admission logs", async () => {
   );
   await expect.poll(() => connection.messages.length).toBe(2);
   expect(JSON.stringify(logs.mock.calls)).not.toContain(canary);
+});
+
+const cleartextRequest = Uint8Array.of(0x52, 0, 0, 0, 8, 0, 0, 0, 3);
+const query = Uint8Array.of(0x51, 0, 0, 0, 6, 0x78, 0);
+it("a password pipelined behind the startup is asked for in cleartext and refused as the gateway refuses it", async () => {
+  for (const secret of [text("secret"), new Uint8Array(0)]) {
+    const connection = await unknown();
+    connection.socket.send(
+      join(
+        encodeStartup({ database: connection.database, user: connection.user }),
+        password(join(secret, Uint8Array.of(0))),
+        query,
+      ),
+    );
+    await rejected(connection);
+    expect(connection.messages).toEqual([
+      cleartextRequest,
+      encodeErrorResponse("28P01", "password authentication failed"),
+    ]);
+  }
+});
+it("a pipelined password split across messages is asked for once it is whole", async () => {
+  const connection = await unknown(),
+    secret = password(text("secret\0"));
+  connection.socket.send(
+    join(
+      encodeStartup({ database: connection.database, user: connection.user }),
+      secret.subarray(0, 3),
+    ),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(connection.messages).toHaveLength(0);
+  connection.socket.send(secret.subarray(3));
+  await rejected(connection);
+  expect(connection.messages).toEqual([
+    cleartextRequest,
+    encodeErrorResponse("28P01", "password authentication failed"),
+  ]);
+});
+it("an empty or oversized pipelined password is refused after the cleartext request", async () => {
+  const oversized = password(new Uint8Array(4097)).subarray(0, 64);
+  for (const packet of [oversized, password(Uint8Array.of(0))]) {
+    const connection = await unknown();
+    connection.socket.send(
+      join(
+        encodeStartup({ database: connection.database, user: connection.user }),
+        packet,
+      ),
+    );
+    await rejected(connection);
+    expect(connection.messages).toEqual([
+      cleartextRequest,
+      encodeErrorResponse("28P01", "password authentication failed"),
+    ]);
+  }
+});
+it("a pipelined message that is not a password gets the SCRAM offer", async () => {
+  const connection = await unknown();
+  connection.socket.send(
+    join(
+      encodeStartup({ database: connection.database, user: connection.user }),
+      password(text("a\0b\0")),
+    ),
+  );
+  await rejected(connection);
+  expect(new DataView(connection.messages[0]!.buffer).getUint32(5)).toBe(10);
 });
