@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! What the controller may say about a failure in its log. An error's own text can carry an
+//! What the agent may say about a failure in its log. An error's own text can carry an
 //! address, a role, a path or a server's own words, so the log names a failure by its class and,
 //! where one exists, a status code, never by its message.
 use crate::Error;
 
 /// The class of `error` as a short snake-case code: its kind (`postgres_28p01`, `http_connect`,
-/// `io_connection_refused`, `kubernetes_http_409`, `deadline_exceeded`), or a fixed phrase the
-/// controller wrote itself (`cluster_uid_changed`), or `other`.
+/// `io_connection_refused`, `deadline_exceeded`), or a fixed phrase the agent wrote itself
+/// (`cluster_uid_changed`), or `other`.
 pub fn error_code(error: &Error) -> String {
-    if let Some(error) = error.downcast_ref::<crate::kubernetes::KubernetesError>() {
-        return format!("kubernetes_http_{}", error.status);
-    }
     if error
         .downcast_ref::<tokio::time::error::Elapsed>()
         .is_some()
@@ -90,7 +87,7 @@ fn snake(camel: &str) -> String {
     out
 }
 
-/// A message the controller wrote itself is a short phrase of plain words: letters and single
+/// A message the agent wrote itself is a short phrase of plain words: letters and single
 /// spaces, no digit, no word longer than a name. An address, a number, a path, a token or a
 /// password does not look like one and is not kept.
 fn phrase(message: &str) -> Option<String> {
@@ -134,10 +131,6 @@ mod tests {
     #[test]
     fn typed_failures_are_named_by_their_kind_and_status_never_their_text() {
         assert_eq!(
-            code(crate::kubernetes::KubernetesError { status: 409 }),
-            "kubernetes_http_409"
-        );
-        assert_eq!(
             code(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "10.0.0.7:5432 refused the connection"
@@ -167,8 +160,7 @@ mod tests {
         let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = refused.local_addr().unwrap();
         drop(refused);
-        let http = crate::cluster_http(std::time::Duration::from_secs(2))
-            .unwrap()
+        let http = crate::test_api::plain_http(std::time::Duration::from_secs(2))
             .get(format!("http://{address}/secret-path"))
             .send()
             .await
@@ -190,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn a_controller_phrase_is_kept_and_anything_else_is_other() {
+    fn an_agent_phrase_is_kept_and_anything_else_is_other() {
         assert_eq!(code("Cluster UID changed"), "cluster_uid_changed");
         assert_eq!(
             code("PostgreSQL probe authority invalid"),
@@ -231,8 +223,5 @@ mod tests {
             assert!(clean(&from_io), "{from_io}");
             assert!(!from_io.contains(&secret) && !from_io.contains(&token));
         }
-        assert!(clean(&code(crate::kubernetes::KubernetesError {
-            status: 503
-        })));
     }
 }

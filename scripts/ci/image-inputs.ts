@@ -16,7 +16,6 @@ export interface ImageInputs {
   postgres: boolean;
   storage: boolean;
   rust_gateway: boolean;
-  native_controller: boolean;
   rust_bootstrap_relay: boolean;
   sandbox_controller: boolean;
 }
@@ -26,7 +25,6 @@ const all = (): ImageInputs => ({
   postgres: true,
   storage: true,
   rust_gateway: true,
-  native_controller: true,
   rust_bootstrap_relay: true,
   sandbox_controller: true,
 });
@@ -86,7 +84,6 @@ function validPath(path: string): boolean {
 const nativeSchemaInputs = new Set(
   [
     "protocol",
-    "controller",
     "power",
     "measurements",
     "bootstrap",
@@ -217,7 +214,6 @@ export function selectImageInputs(
     postgres: false,
     storage: false,
     rust_gateway: false,
-    native_controller: false,
     rust_bootstrap_relay: false,
     sandbox_controller: false,
   };
@@ -266,17 +262,12 @@ export function selectImageInputs(
         "infra/platform/versions.lock.json",
       ].includes(path) ||
       rustInputs(path, "packages/native-protocol") ||
-      (nativeSchemaInputs.has(path) &&
-        path !== "packages/contracts/native/controller.generated.json")
+      nativeSchemaInputs.has(path)
     ) {
       result.rust_gateway = true;
-      result.native_controller = true;
       result.rust_bootstrap_relay = true;
       result.sandbox_controller = true;
     }
-    // Only the controller embeds this runtime schema.
-    if (path === "packages/contracts/native/controller.generated.json")
-      result.native_controller = true;
     if (path === ".dockerignore") result.storage = true;
     if (rustInputs(path, "apps/native-gateway")) result.rust_gateway = true;
     if (
@@ -289,11 +280,8 @@ export function selectImageInputs(
       result.rust_bootstrap_relay = true;
     if (rustInputs(path, "apps/native-bootstrap-relay"))
       result.rust_bootstrap_relay = true;
-    if (rustInputs(path, "apps/native-controller"))
-      result.native_controller = true;
     if (path === "apps/native-gateway/license-bundle.sh") {
       result.rust_gateway = true;
-      result.native_controller = true;
       result.rust_bootstrap_relay = true;
       result.sandbox_controller = true;
     }
@@ -404,7 +392,6 @@ const imageJobs = {
   storage_image: ["storage"],
   native_runtime_images: [
     "rust_gateway",
-    "native_controller",
     "rust_bootstrap_relay",
     "sandbox_controller",
   ],
@@ -412,10 +399,9 @@ const imageJobs = {
 type ImageJob = keyof typeof imageJobs;
 const runtimeProfiles = {
   rust_gateway: "rust-gateway",
-  native_controller: "native-controller",
   rust_bootstrap_relay: "rust-bootstrap-relay",
 } as const;
-// The established partial-job receipt bundle covers these three runtimes only.
+// The established partial-job receipt bundle covers these two runtimes only.
 /** One failed image job does not revoke another group's successfully qualified immutable artifacts. */
 export async function changedImageInputsFromSuccessfulRun(
   input: SuccessfulRunInputs,

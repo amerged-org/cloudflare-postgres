@@ -53,8 +53,6 @@ static CLAIM_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
         "controlClaims",
         "activityClaims",
         "intent",
-        "storageWriteClaims",
-        "reclaimClaims",
     ] {
         for (field, value) in CONTRACT[name]["properties"].as_object().unwrap() {
             if let Some(pattern) = value["pattern"].as_str() {
@@ -171,9 +169,3 @@ pub fn valid_schema(name: &str, value: &Value) -> bool {
     }
     true
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod storage;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod reclaim;

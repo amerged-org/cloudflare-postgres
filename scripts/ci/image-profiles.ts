@@ -15,7 +15,6 @@ const profiles = [
   "postgres",
   "storage",
   "rust-gateway",
-  "native-controller",
   "rust-bootstrap-relay",
   "sandbox-controller",
   "sandbox-extension",
@@ -29,7 +28,6 @@ export function imageProfile(value: unknown = "regional"): ImageProfile {
 }
 export const isRustProfile = (profile: ImageProfile) =>
   profile === "rust-gateway" ||
-  profile === "native-controller" ||
   profile === "rust-bootstrap-relay" ||
   profile === "sandbox-controller" ||
   profile === "sandbox-extension";
@@ -183,9 +181,6 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
         : ["licenses/pgcf/LICENSE"]),
     ];
   }
-  if (profile === "native-controller")
-    // One image carries the controller and the node attach agent.
-    return ["pgcf-native-controller", "pgcf-attach", "licenses/pgcf/LICENSE"];
   const binary =
     profile === "rust-gateway"
       ? "pgcf-native-gateway"

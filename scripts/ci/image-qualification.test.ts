@@ -936,13 +936,12 @@ test("storage and Rust profiles bind their own sources without a fictitious runt
   assert.equal(validateDockerfile(storage, "storage"), storageBase);
   for (const profile of [
     "rust-gateway",
-    "native-controller",
     "sandbox-controller",
     "sandbox-extension",
   ] as const) {
     assert.equal(
       validateDockerfile(
-        profile === "rust-gateway" || profile === "native-controller"
+        profile === "rust-gateway"
           ? "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch\n"
           : "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch AS talos-extension\nFROM scratch AS runtime\n",
         profile,
@@ -1004,52 +1003,6 @@ test("storage and Rust profiles bind their own sources without a fictitious runt
     ),
   );
   assert.equal(runtimeChecks("storage")[0]!.entrypoint, "/usr/sbin/thin_check");
-  const controller = runtimeChecks("native-controller")[0]!;
-  const protocol = await readFile(
-    "packages/contracts/native/protocol.generated.json",
-  );
-  const contract = await readFile(
-    "packages/contracts/native/controller.generated.json",
-  );
-  const controllerVersion = {
-    ...version,
-    program: "pgcf-native-controller",
-    protocolSha256: createHash("sha256").update(protocol).digest("hex"),
-    controllerContractSha256: createHash("sha256")
-      .update(contract)
-      .digest("hex"),
-    configurationSchemaRevision: JSON.parse(contract.toString()).constants
-      .CONFIGURATION_SCHEMA_REVISION,
-  };
-  const result = (value: unknown) => ({
-    stdout: JSON.stringify(value),
-    stderr: "",
-    exit: 0,
-  });
-  assert.doesNotThrow(() =>
-    validateRuntimeResult(controller, result(controllerVersion), identity),
-  );
-  assert.throws(
-    () =>
-      validateRuntimeResult(
-        controller,
-        result({
-          ...controllerVersion,
-          controllerContractSha256: "d".repeat(64),
-        }),
-        identity,
-      ),
-    /runtime_generated_input_invalid/,
-  );
-  assert.throws(
-    () =>
-      validateRuntimeResult(
-        controller,
-        result({ ...controllerVersion, configurationSchemaRevision: 0 }),
-        identity,
-      ),
-    /runtime_generated_input_invalid/,
-  );
 });
 
 test("storage assembly refuses extra runtime instructions and the former builder-free topology", async () => {
@@ -1638,9 +1591,6 @@ test("public recipe profile verifies its canonical source inputs and cannot clai
   }
 });
 
-test("the native-controller image qualifies its controller and its node attach agent", () => {
-  assert.deepEqual(rustArtifactPaths("native-controller"), [
-    "pgcf-native-controller",
-    "pgcf-attach",
-  ]);
+test("the gateway image qualifies its one executable", () => {
+  assert.deepEqual(rustArtifactPaths("rust-gateway"), ["pgcf-native-gateway"]);
 });

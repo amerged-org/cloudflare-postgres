@@ -2,7 +2,6 @@
 use crate::{
     Error,
     contracts::{desired_valid, schema_valid, text},
-    kubernetes::bounded,
 };
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, Method, Url};
@@ -102,6 +101,25 @@ fn merge_page_authority(snapshot: &mut DesiredSnapshot, page: &Value) -> Result<
         snapshot.region["storage_nodes"] = held.into_values().collect::<Vec<_>>().into();
     }
     Ok(())
+}
+/// The body of `response`, refused beyond `maximum` bytes.
+pub async fn bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<u8>, Error> {
+    if response
+        .content_length()
+        .is_some_and(|v| v > maximum as u64)
+    {
+        return Err("HTTP response exceeds bound".into());
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(part) = stream.next().await {
+        let part = part?;
+        if part.len() > maximum - bytes.len() {
+            return Err("HTTP response exceeds bound".into());
+        }
+        bytes.extend_from_slice(&part);
+    }
+    Ok(bytes)
 }
 pub fn timestamp() -> Result<String, Error> {
     let now = time::OffsetDateTime::now_utc();
@@ -425,7 +443,7 @@ impl ControlApi {
     /// A client of a plain-HTTP Cloudflare API double.
     pub(crate) fn double(origin: Url) -> Self {
         Self {
-            client: crate::cluster_http(Duration::from_secs(5)).unwrap(),
+            client: crate::test_api::plain_http(Duration::from_secs(5)),
             origin,
             region: "eu-test".into(),
             key: AgentKey::Environment(format!("pgcf_ak_eu-test_{}", "a".repeat(43))),
@@ -466,7 +484,7 @@ fn legacy_report(envelope: &Value) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_server::{Requests, api_double};
+    use crate::test_api::{Requests, api_double};
     /// Authority readings are mutable while one desired pull pages through a stable region.
     fn desired_page(revision: u64, next: Value) -> Value {
         let vectors: Value = serde_json::from_str(include_str!(

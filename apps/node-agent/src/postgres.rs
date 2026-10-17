@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     Error,
-    contracts::{constant, database_valid, namespace, number, present_roles, text},
-    manifests::parameters,
+    contracts::{
+        constant, database_valid, namespace, number, optional_number, present_roles, text,
+    },
 };
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, pem::PemObject};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     net::SocketAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +18,36 @@ use tokio_postgres::{
     config::SslMode,
     types::{Timestamp, ToSql},
 };
+/// The settings PostgreSQL runs a database with, by its size.
+pub fn parameters(db: &Value) -> Value {
+    let size = &db["size"];
+    let memory = number(size, "memory_mib");
+    let request = optional_number(size, "memory_request_mib", memory);
+    json!({"shared_buffers":format!("{}MB",(request/4).max(1)),"effective_cache_size":format!("{}MB",memory/2),"max_connections":number(size,"max_connections").to_string(),"archive_timeout":format!("{}s",number(size,"archive_timeout_seconds"))})
+}
+/// The roles in input order, each only after the roles it is a member of: the first role whose
+/// memberships are all emitted comes next. Without memberships the input order is kept. A cycle,
+/// which PostgreSQL refuses, is emitted as it stands.
+pub fn membership_order<'a>(roles: impl Iterator<Item = &'a Value>) -> Vec<&'a Value> {
+    let mut remaining: Vec<&Value> = roles.collect();
+    let names: HashSet<&str> = remaining.iter().map(|role| text(role, "name")).collect();
+    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let ready = remaining.iter().position(|role| {
+            role["member_of"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .all(|target| emitted.contains(target) || !names.contains(target))
+        });
+        let next = remaining.remove(ready.unwrap_or(0));
+        emitted.insert(text(next, "name"));
+        ordered.push(next);
+    }
+    ordered
+}
 /// PostgreSQL's port inside a database Pod.
 pub const PORT: u16 = 5432;
 pub struct Session {
@@ -120,39 +151,6 @@ async fn connect_at(
     if let Some(socket) = socket {
         config.hostaddr(socket.ip());
     }
-    open(&config, ca).await
-}
-/// A session with a pool slot that serves `db`: TLS verifies the slot's own service name
-/// (`database-rw.pgcf-slot-<hex>.svc`), dialled at the slot Pod's address.
-pub async fn connect_slot(
-    db: &Value,
-    pod: SocketAddr,
-    tls_name: &str,
-    ca: &[u8],
-    role: &str,
-    password: &str,
-) -> Result<Session, Error> {
-    let role_allowed = pgcf_native_protocol::valid_role(role)
-        || Some(role) == constant("MAINTENANCE_ROLE").as_str();
-    if !database_valid(db)
-        || !role_allowed
-        || password.is_empty()
-        || pgcf_native_protocol::wake::slot_namespace_of_tls_name(tls_name).is_none()
-    {
-        return Err("PostgreSQL slot probe authority invalid".into());
-    }
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host(tls_name)
-        .hostaddr(pod.ip())
-        .port(pod.port())
-        .user(role)
-        .password(password)
-        .dbname(text(db, "id"))
-        .application_name("pgcf-readiness")
-        .options("-c statement_timeout=5000")
-        .connect_timeout(Duration::from_secs(5))
-        .ssl_mode(SslMode::Require);
     open(&config, ca).await
 }
 /// Opens a session whose TLS is verified against `ca`; `connect` checks the probe authority.
@@ -285,7 +283,7 @@ pub async fn end_sessions(session: &Session, name: &str) -> Result<bool, Error> 
 /// How far ahead of its expiry a role's credential is no longer one a login can prove: a client
 /// that connects after the check finds it expired.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(10);
-/// Whether a role's credential has expired, or does within `EXPIRY_MARGIN`, by the controller's
+/// Whether a role's credential has expired, or does within `EXPIRY_MARGIN`, by the agent's
 /// clock. PostgreSQL refuses an expired credential, so its login says nothing of the credential.
 fn expiring(role: &Value, now: SystemTime) -> bool {
     let Some(until) = role["valid_until"].as_str().and_then(|until| {
@@ -590,7 +588,7 @@ mod tests {
             .ssl_mode(SslMode::Require);
         (config, ca.pem(), server)
     }
-    /// The wire forms of PostgreSQL's `inet` as the controller's statements meet them: the cast to
+    /// The wire forms of PostgreSQL's `inet` as the agent's statements meet them: the cast to
     /// `text` keeps the netmask, so a comparison with the Pod's address can only hold for `host()`.
     #[test]
     fn a_server_address_with_its_netmask_is_not_the_pods_address() {
@@ -674,10 +672,10 @@ mod tests {
     /// address it reports for itself is the Pod's, printed without a netmask.
     #[tokio::test]
     async fn a_role_login_accepts_the_address_postgresql_reports_for_the_pod() {
-        use crate::test_world::{POD_IP, World};
+        use crate::test_sql::{POD_IP, World};
         let mut w = World::awake().await;
         w.wake(3);
-        let socket = w.reconciler.power.postgres;
+        let socket = w.address();
         let all = roles(&w.db, w.authority.pem.as_bytes(), POD_IP, socket)
             .await
             .unwrap();
@@ -689,64 +687,50 @@ mod tests {
                 .unwrap()
         );
     }
-    /// A slot that serves a database is dialled at its Pod and verified under the slot's own
-    /// service name, never under the tenant's.
-    #[tokio::test]
-    async fn a_slot_session_verifies_the_slot_tls_name_at_the_slot_address() {
-        use crate::test_postgres::{Answer, Authority, Cell, Postgres};
-        let db = crate::test_world::World::awake().await.db;
-        let authority = Authority::new();
-        let answer: crate::test_postgres::Handler =
-            Arc::new(|_, _, _| Answer::Rows(vec![vec![("value", Cell::Text("slot".into()))]]));
-        let slot = "database-rw.pgcf-slot-0a1b2c3d.svc";
-        let server = Postgres::start(&authority, slot, None, answer.clone()).await;
-        let role = text(&db["maintenance"], "role");
-        let password = text(&db["maintenance"], "password");
-        let session = connect_slot(
-            &db,
-            server.address,
-            slot,
-            authority.pem.as_bytes(),
-            role,
-            password,
-        )
-        .await
+    /// The roles are created in the order of their memberships; plain roles keep their order.
+    #[test]
+    fn a_role_is_ordered_after_the_roles_it_is_a_member_of() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/controller-vectors.generated.json"
+        ))
         .unwrap();
-        let rows = session.query("SELECT 1", &[]).await.unwrap();
-        assert_eq!(rows[0].try_get::<_, String>(0).unwrap(), "slot");
-        // A server that presents another name is not the slot.
-        let tenant = Postgres::start(&authority, HOST, None, answer).await;
-        assert!(
-            connect_slot(
-                &db,
-                tenant.address,
-                slot,
-                authority.pem.as_bytes(),
-                role,
-                password
-            )
-            .await
-            .is_err()
+        let v = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "role-membership-order")
+            .unwrap();
+        let names = |db: &Value| -> Vec<String> {
+            membership_order(present_roles(db).filter(|role| role["owner"] != true))
+                .iter()
+                .map(|role| text(role, "name").to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&v["db"]),
+            [
+                "reader_query",
+                "other_job",
+                "base_job",
+                "mid_job",
+                "leaf_job"
+            ]
         );
-        // Only a slot's service name, and only a role the probe may use.
-        for (name, user) in [
-            (format!("database-rw.{}.svc", namespace(&db)), role),
-            (slot.to_string(), "postgres"),
-        ] {
-            assert!(
-                connect_slot(
-                    &db,
-                    server.address,
-                    &name,
-                    authority.pem.as_bytes(),
-                    user,
-                    password
-                )
-                .await
-                .is_err(),
-                "{name} {user}"
-            );
+        // Without memberships the input order stands: plain databases do not move.
+        let mut flat = v["db"].clone();
+        for role in flat["roles"].as_array_mut().unwrap() {
+            role.as_object_mut().unwrap().remove("member_of");
         }
+        assert_eq!(
+            names(&flat),
+            [
+                "reader_query",
+                "leaf_job",
+                "mid_job",
+                "other_job",
+                "base_job"
+            ]
+        );
     }
     /// The role a statement concerns is bound, never part of its text, whatever the role is called.
     #[test]
@@ -906,8 +890,8 @@ mod tests {
     }
     /// A world whose record holds the role `report_job` beside `reader_query`, with the
     /// attributes `extra` states, and whose catalogs hold every role as the record states it.
-    async fn world_with_role(extra: serde_json::Value) -> crate::test_world::World {
-        let mut w = crate::test_world::World::awake().await;
+    async fn world_with_role(extra: serde_json::Value) -> crate::test_sql::World {
+        let mut w = crate::test_sql::World::awake().await;
         w.wake(3);
         let mut role = serde_json::json!({"name":"report_job","owner":false,"password":"q".repeat(43),"revision":3});
         for (key, value) in extra.as_object().unwrap() {
@@ -918,12 +902,12 @@ mod tests {
         w
     }
     /// Whether every present role of the record logs in and holds what the record states.
-    async fn verified(w: &crate::test_world::World) -> Result<bool, Error> {
+    async fn verified(w: &crate::test_sql::World) -> Result<bool, Error> {
         roles(
             &w.db,
             w.authority.pem.as_bytes(),
-            crate::test_world::POD_IP,
-            w.reconciler.power.postgres,
+            crate::test_sql::POD_IP,
+            w.address(),
         )
         .await
     }
@@ -936,13 +920,13 @@ mod tests {
             .replace('Z', ".000Z")
     }
     fn catalog_row(
-        w: &crate::test_world::World,
+        w: &crate::test_sql::World,
         role: &str,
-        change: impl FnOnce(&mut crate::test_world::RoleRow),
+        change: impl FnOnce(&mut crate::test_sql::RoleRow),
     ) {
         change(w.sql.lock().unwrap().roles.get_mut(role).unwrap());
     }
-    fn log_has(w: &crate::test_world::World, needle: &str) -> bool {
+    fn log_has(w: &crate::test_sql::World, needle: &str) -> bool {
         w.log
             .lock()
             .unwrap()
@@ -1046,7 +1030,7 @@ mod tests {
             w.sql.lock().unwrap().roles["report_job"].valid_until,
             Some(at)
         );
-        type Change = Box<dyn Fn(&mut crate::test_world::RoleRow)>;
+        type Change = Box<dyn Fn(&mut crate::test_sql::RoleRow)>;
         let wrong: Vec<(&str, Change)> = vec![
             (
                 "a limit that is not the record's",
@@ -1118,7 +1102,7 @@ mod tests {
         let mut w = world_with_role(serde_json::json!({"connection_limit":5})).await;
         w.db.as_object_mut().unwrap().remove("maintenance");
         assert!(!verified(&w).await.unwrap());
-        let mut plain = crate::test_world::World::awake().await;
+        let mut plain = crate::test_sql::World::awake().await;
         plain.wake(3);
         plain.db.as_object_mut().unwrap().remove("maintenance");
         assert!(verified(&plain).await.unwrap());
@@ -1126,7 +1110,7 @@ mod tests {
     /// A database whose roles are all plain is verified by its logins alone: no catalog is read.
     #[tokio::test]
     async fn a_database_of_plain_roles_reads_no_catalog() {
-        let mut w = crate::test_world::World::awake().await;
+        let mut w = crate::test_sql::World::awake().await;
         w.wake(3);
         assert!(verified(&w).await.unwrap());
         assert!(
@@ -1139,7 +1123,7 @@ mod tests {
     /// A role awaiting removal has no credential: no login is attempted for it.
     #[tokio::test]
     async fn a_role_awaiting_removal_is_not_logged_in() {
-        let mut w = crate::test_world::World::awake().await;
+        let mut w = crate::test_sql::World::awake().await;
         w.wake(3);
         w.db["roles"]
             .as_array_mut()

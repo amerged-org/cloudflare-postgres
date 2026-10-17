@@ -161,12 +161,10 @@ PGCF image. Preserve all upstream notices when packaging a future runtime or Tal
 Its Cloudflare policy consumer also uses pinned reqwest 0.13.5 (MIT OR Apache-2.0), rustls
 0.23.45 (Apache-2.0 OR ISC OR MIT), webpki-roots 1.0.9 (MPL-2.0), time 0.3.55
 (MIT OR Apache-2.0), sha2 0.11.0 (MIT OR Apache-2.0), and jsonschema 0.58.6 (MIT).
-The native gateway and controller use rustls-pki-types 1.15.1 (MIT OR Apache-2.0)
+The native gateway and node agent use rustls-pki-types 1.15.1 (MIT OR Apache-2.0)
 directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not shipped.
 The gateway's SCRAM client also uses hmac 0.13.0 (MIT OR Apache-2.0) and zeroize 1.9.1
 (Apache-2.0 OR MIT) directly, with sha2 above; both were already shipped through rustls.
-The controller image also ships the node attach agent `pgcf-attach`, whose direct crates beyond
-the controller's are libc above and httparse 1.10.1 (MIT OR Apache-2.0).
 The scratch artifact includes the actual Cargo dependency notices, Rust notices, generated
 shared contract bytes and exact Cargo.lock rather than shipping a compiler or test runtime.
 The common boot asset producer uses official Talos imager 1.14.2 (MPL-2.0), with

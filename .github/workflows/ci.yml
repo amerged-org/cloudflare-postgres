@@ -37,7 +37,6 @@ jobs:
       postgres_image: ${{ steps.image_inputs.outputs.postgres }}
       storage_image: ${{ steps.image_inputs.outputs.storage }}
       rust_gateway_image: ${{ steps.image_inputs.outputs.rust_gateway }}
-      native_controller_image: ${{ steps.image_inputs.outputs.native_controller }}
       rust_bootstrap_relay_image: ${{ steps.image_inputs.outputs.rust_bootstrap_relay }}
       sandbox_controller_image: ${{ steps.image_inputs.outputs.sandbox_controller }}
     steps:
@@ -255,22 +254,22 @@ jobs:
             --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETPCAP --cap-add SYS_PTRACE \
             --security-opt seccomp=unconfined --security-opt no-new-privileges \
             "$PGCF_SLOT_TEST_IMAGE"
-      - name: Check the node attach agent against the actual Linux kernel
+      - name: Check the node agent against the actual Linux kernel
         run: |
           PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
-          PGCF_ATTACH_TEST_IMAGE="pgcf-attach-kernel-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          PGCF_ATTACH_TEST_CONTAINER="pgcf-attach-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          trap 'docker rm --force "$PGCF_ATTACH_TEST_CONTAINER" >/dev/null 2>&1 || true' EXIT
-          docker build --platform linux/amd64 --file apps/native-controller/attach-kernel.Dockerfile \
+          PGCF_AGENT_TEST_IMAGE="pgcf-node-agent-kernel-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PGCF_AGENT_TEST_CONTAINER="pgcf-node-agent-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$PGCF_AGENT_TEST_CONTAINER" >/dev/null 2>&1 || true' EXIT
+          docker build --platform linux/amd64 --file apps/node-agent/kernel-test.Dockerfile \
             --build-arg RUST_BUILDER="$PGCF_RUST_BUILDER" --build-arg RUST_VERSION="$PGCF_RUST_VERSION" \
-            --tag "$PGCF_ATTACH_TEST_IMAGE" .
-          timeout 90 docker run --rm --name "$PGCF_ATTACH_TEST_CONTAINER" --network none \
+            --tag "$PGCF_AGENT_TEST_IMAGE" .
+          timeout 90 docker run --rm --name "$PGCF_AGENT_TEST_CONTAINER" --network none \
             --cpus 2 --memory 1g --pids-limit 64 --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,size=16m,mode=1777 \
-            --cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SYS_PTRACE \
+            --cap-drop ALL --cap-add SYS_ADMIN \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-            "$PGCF_ATTACH_TEST_IMAGE"
+            "$PGCF_AGENT_TEST_IMAGE"
       - name: Check the shared sandbox against ordinary containerd and isolated CRI namespaces
         run: node infra/talos/sandbox/run-proof.ts
       - name: Retain safe sandbox failure metadata
@@ -783,7 +782,7 @@ jobs:
 
   native_runtime_images:
     needs: check
-    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true' || vars.PGCF_TALOS_INSTALLER_RELEASE != '') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true' || vars.PGCF_TALOS_INSTALLER_RELEASE != '') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -796,7 +795,6 @@ jobs:
     env:
       IMAGE: ghcr.io/amerged-org/pgcf-regional
       PGCF_BUILD_GATEWAY: ${{ needs.check.outputs.rust_gateway_image }}
-      PGCF_BUILD_CONTROLLER: ${{ needs.check.outputs.native_controller_image }}
       PGCF_BUILD_RELAY: ${{ needs.check.outputs.rust_bootstrap_relay_image }}
       PGCF_BUILD_SANDBOX: ${{ needs.check.outputs.sandbox_controller_image }}
     steps:
@@ -827,10 +825,9 @@ jobs:
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           mkdir -m 700 "$RUNNER_TEMP/pgcf-native-image-gate"
-          for PGCF_PROFILE in rust-gateway native-controller rust-bootstrap-relay sandbox-controller; do
+          for PGCF_PROFILE in rust-gateway rust-bootstrap-relay sandbox-controller; do
             case "$PGCF_PROFILE" in
               rust-gateway) [ "$PGCF_BUILD_GATEWAY" = true ] || continue; PGCF_DOCKERFILE=apps/native-gateway/Dockerfile ;;
-              native-controller) [ "$PGCF_BUILD_CONTROLLER" = true ] || continue; PGCF_DOCKERFILE=apps/native-controller/Dockerfile ;;
               rust-bootstrap-relay) [ "$PGCF_BUILD_RELAY" = true ] || continue; PGCF_DOCKERFILE=apps/native-bootstrap-relay/Dockerfile ;;
               sandbox-controller) [ "$PGCF_BUILD_SANDBOX" = true ] || continue; PGCF_DOCKERFILE=apps/sandbox-controller/Dockerfile ;;
             esac

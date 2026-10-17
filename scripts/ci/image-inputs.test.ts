@@ -18,7 +18,6 @@ const selected = (value: Partial<ImageInputs> = {}): ImageInputs => ({
   postgres: false,
   storage: false,
   rust_gateway: false,
-  native_controller: false,
   rust_bootstrap_relay: false,
   sandbox_controller: false,
   ...value,
@@ -46,7 +45,6 @@ test("workflow retention, test globs, installer delivery and documentation do no
         ".github/workflows/ci.yml",
         "infra/talos/sandbox/README.md",
         "infra/storage/README.md",
-        "apps/native-controller/README.md",
         "apps/node-runtime/tests/kernel_assignment.rs",
         "packages/native-protocol/tests/conformance.rs",
         "packages/contracts/native/generate.ts",
@@ -87,7 +85,6 @@ test("exact Skopeo installer publication run and env do not rebuild native artif
   );
   const native = selected({
     rust_gateway: true,
-    native_controller: true,
     rust_bootstrap_relay: true,
     sandbox_controller: true,
   });
@@ -126,7 +123,6 @@ test("workflow build recipes and consumed native schema bytes still invalidate t
   assert.notEqual(before, after);
   const native = selected({
     rust_gateway: true,
-    native_controller: true,
     rust_bootstrap_relay: true,
     sandbox_controller: true,
   });
@@ -204,7 +200,7 @@ test("management-only changes skip images while exact Native and Regional build 
     selected({ regional: true }),
   );
 });
-test("controller schema changes rebuild its consuming native runtime only", () => {
+test("controller schema changes rebuild no native runtime image", () => {
   assert.deepEqual(
     selectImageInputs(
       ["packages/contracts/native/controller.generated.json"],
@@ -213,7 +209,6 @@ test("controller schema changes rebuild its consuming native runtime only", () =
     selected({
       regional: true,
       node_bootstrap: true,
-      native_controller: true,
     }),
   );
 });
@@ -222,22 +217,9 @@ test("actual storage and native inputs select only their affected runtime artifa
     selectImageInputs(["apps/native-gateway/src/budget.rs"], "push"),
     selected({ rust_gateway: true, rust_bootstrap_relay: true }),
   );
-  assert.deepEqual(
-    selectImageInputs(["apps/native-controller/src/kubernetes.rs"], "push"),
-    selected({ native_controller: true }),
-  );
   assert.equal(
     selectImageInputs(["apps/native-bootstrap-relay/src/main.rs"], "push")
       .rust_bootstrap_relay,
-    true,
-  );
-  assert.equal(
-    (
-      selectImageInputs(
-        ["apps/native-controller/Dockerfile"],
-        "push",
-      ) as unknown as Record<string, unknown>
-    ).native_controller,
     true,
   );
   assert.deepEqual(
@@ -248,7 +230,6 @@ test("actual storage and native inputs select only their affected runtime artifa
     selectImageInputs(["apps/native-gateway/license-bundle.sh"], "push"),
     selected({
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -269,7 +250,6 @@ test("actual storage and native inputs select only their affected runtime artifa
     selectImageInputs(["packages/native-protocol/src/activity.rs"], "push"),
     selected({
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -278,7 +258,6 @@ test("actual storage and native inputs select only their affected runtime artifa
     selectImageInputs(["Cargo.lock"], "push"),
     selected({
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -297,7 +276,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       postgres: true,
       storage: true,
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -308,7 +286,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       regional: true,
       node_bootstrap: true,
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -329,7 +306,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       postgres: true,
       storage: true,
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -345,7 +321,6 @@ test("common Docker inputs and qualification changes invalidate every affected p
       postgres: true,
       storage: true,
       rust_gateway: true,
-      native_controller: true,
       rust_bootstrap_relay: true,
       sandbox_controller: true,
     }),
@@ -358,7 +333,6 @@ test("PostgreSQL inputs stay scoped and manual, unavailable or malformed compari
     postgres: true,
     storage: true,
     rust_gateway: true,
-    native_controller: true,
     rust_bootstrap_relay: true,
     sandbox_controller: true,
   });
@@ -656,7 +630,7 @@ test("a partial CI reuses successful image jobs while rebuilding its failed stor
     const result = await changedImageInputsFromSuccessfulRun(context);
     assert.deepEqual(result.inputs, selected({ storage: true }));
     assert.equal(result.baselines.storage, history.qualified);
-    assert.equal(result.baselines.native_controller, history.failed);
+    assert.equal(result.baselines.rust_gateway, history.failed);
     const approvedRead = context.request;
     context.request = async (url, init) => {
       const reply = await approvedRead(url, init);
@@ -702,7 +676,6 @@ async function nativeReceiptZip(
   try {
     for (const profile of [
       "rust-gateway",
-      "native-controller",
       "rust-bootstrap-relay",
       "sandbox-controller",
     ]) {
@@ -826,7 +799,7 @@ test("partial Native receipts reuse exactly three proved runtimes without baseli
       }),
     );
     assert.equal(result.baselines.sandbox_controller, null);
-    assert.equal(result.baselines.native_controller, history.failed);
+    assert.equal(result.baselines.rust_gateway, history.failed);
     // A mismatched registry/config receipt prevents every partial-runtime baseline.
     context.request = request(await nativeReceiptZip(history, true));
     const unbound = await changedImageInputsFromSuccessfulRun(context);
@@ -835,7 +808,6 @@ test("partial Native receipts reuse exactly three proved runtimes without baseli
       selected({
         storage: true,
         rust_gateway: true,
-        native_controller: true,
         rust_bootstrap_relay: true,
         sandbox_controller: true,
       }),

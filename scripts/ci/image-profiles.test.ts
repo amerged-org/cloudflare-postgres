@@ -45,9 +45,10 @@ test("profile parsing rejects unknown modes and retains immutable upstream build
   assert.equal(imageProfile("sandbox-extension"), "sandbox-extension");
   assert.throws(() => imageProfile("talos-installer"), /profile/i);
   assert.throws(() => imageProfile("native-reclaimer"), /profile/i);
+  assert.throws(() => imageProfile("native-controller"), /profile/i);
   assert.throws(() => imageProfile(null), /profile/i);
   assert.equal(isRustProfile("sandbox-extension"), true);
-  assert.equal(isRustProfile("native-controller"), true);
+  assert.equal(isRustProfile("rust-gateway"), true);
   assert.equal(isRustProfile("node-bootstrap"), false);
   assert.equal(isRustProfile("talos-recipe"), false);
   assert.match(nodeBase, /^node:24\.21\.0-slim@sha256:[a-f0-9]{64}$/);
@@ -249,43 +250,24 @@ test("storage scanning requires its authored modification notice", () => {
 
 test("scratch runtime selection scans all outputs and requires its executable and first-party license", () => {
   const input = files(
-    "pgcf-native-controller",
-    "pgcf-attach",
+    "pgcf-native-gateway",
     "licenses/pgcf/LICENSE",
-    "licenses/provenance/controller.generated.json",
+    "licenses/provenance/protocol.generated.json",
     "unexpected-output",
   );
-  assert.deepEqual(selectOwnedFiles(input, "native-controller"), input);
+  assert.deepEqual(selectOwnedFiles(input, "rust-gateway"), input);
   assert.throws(
-    () => selectOwnedFiles(input.slice(1), "native-controller"),
-    /First-party image output missing/,
+    () => selectOwnedFiles(input.slice(1), "rust-gateway"),
+    /First-party image output missing: pgcf-native-gateway$/,
   );
   assert.throws(
     () =>
       selectOwnedFiles(
         input.filter((file) => file.path !== "licenses/pgcf/LICENSE"),
-        "native-controller",
+        "rust-gateway",
       ),
     /First-party image output missing/,
   );
-});
-
-test("native-controller requires pgcf-native-controller, pgcf-attach and the license", () => {
-  const input = files(
-    "pgcf-native-controller",
-    "pgcf-attach",
-    "licenses/pgcf/LICENSE",
-  );
-  assert.deepEqual(selectOwnedFiles(input, "native-controller"), input);
-  for (const missing of ["pgcf-native-controller", "pgcf-attach"])
-    assert.throws(
-      () =>
-        selectOwnedFiles(
-          input.filter((file) => file.path !== missing),
-          "native-controller",
-        ),
-      new RegExp(`First-party image output missing: ${missing}$`),
-    );
 });
 
 test("sandbox extension selection keeps both binaries and its service and CRI configuration in scan scope", () => {
