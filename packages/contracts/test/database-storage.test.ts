@@ -4,8 +4,6 @@ import {
   DesiredDatabaseStorage,
   ThinStorageProfile,
   thinWriteExposure,
-  thinStorageClassObject,
-  thinVolumeAttributesClassObject,
 } from "../src/database-storage.ts";
 
 describe("qualified thin storage authority", () => {
@@ -74,21 +72,7 @@ describe("qualified thin storage authority", () => {
         drain_seconds: 120,
       }).success,
     ).toBe(false);
-    const parsed = ThinStorageProfile.parse(profile);
-    const object = thinStorageClassObject(parsed, "a".repeat(64));
-    expect(object.parameters.thinProvision).toBe("yes");
-    expect(object.parameters).toHaveProperty(
-      "formatoptions",
-      "-E lazy_itable_init=0,lazy_journal_init=0",
-    );
-    expect(
-      thinVolumeAttributesClassObject(parsed, "a".repeat(64)).parameters
-        .qosBandwithWritePerSec,
-    ).toBe("1048576");
-    expect(object.reclaimPolicy).toBe("Retain");
-    expect(object.metadata).not.toHaveProperty(
-      "annotations.storageclass.kubernetes.io/is-default-class",
-    );
+    expect(ThinStorageProfile.safeParse(profile).success).toBe(true);
     expect(
       ThinStorageProfile.safeParse({ ...profile, metadata_bytes: 1024 ** 2 })
         .success,

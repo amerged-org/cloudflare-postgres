@@ -88,14 +88,14 @@ mod tests {
     const IMAGE: &str = "registry.test/postgres@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     fn record() -> SleepRecord {
         let vectors: Value = serde_json::from_str(include_str!(
-            "../../../packages/contracts/native/power-vectors.generated.json"
+            "../../../packages/contracts/native/controller-vectors.generated.json"
         ))
         .unwrap();
         SleepRecord {
             v: 1,
             system_identifier: "7430000000000000001".into(),
             timeline: 1,
-            configuration_sha256: sleep_fingerprint(&vectors["intents"][0]["db"], IMAGE).unwrap(),
+            configuration_sha256: sleep_fingerprint(&vectors[0]["db"], IMAGE).unwrap(),
             image: IMAGE.into(),
             written_at_ms: 1,
         }

@@ -2,7 +2,6 @@
 import { z } from "zod";
 import { DatabaseRuntimeAttestation } from "./reclaim.ts";
 import { DatabaseAdmissionIntent } from "./database-admission.ts";
-import { ComputePoolPolicy } from "./compute-pool.ts";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
@@ -27,8 +26,6 @@ export {
   thinStorageInventory,
   thinStorageVolumeReclaimed,
   thinStorageClass,
-  thinStorageClassObject,
-  thinVolumeAttributesClassObject,
   thinMetadataEstimateBytes,
   thinWriteExposure,
 } from "./database-storage.ts";
@@ -420,8 +417,6 @@ export type DesiredDatabase = z.infer<typeof DesiredDatabase>;
 
 export const DesiredRegion = z.strictObject({
   id: RegionId,
-  /** Current authoritative region pool template, including assigned per-Pod overhead. */
-  compute_pool: ComputePoolPolicy.nullable().optional(),
   /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
   storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
   /** Authenticated target-region-only source-read custody; omission preserves legacy installations. */
@@ -536,7 +531,7 @@ export const NodeMemorySample = z
     capacity_memory_bytes: MemoryBytes.positive(),
     available_bytes: MemoryBytes.nullable(),
     memory_pressure: z.boolean().nullable(),
-    /** Kubelet Summary `node.cpu.usageNanoCores` from the same sample; absent from older reporters. */
+    /** CPU usage of the whole node in nanocores from the same sample; absent from older reporters. */
     cpu_usage_nano_cores: z
       .number()
       .int()
@@ -544,7 +539,7 @@ export const NodeMemorySample = z
       .max(Number.MAX_SAFE_INTEGER)
       .nullable()
       .optional(),
-    /** Node `status.capacity.cpu` in millicores, paired with the CPU usage gauge. */
+    /** The node's CPU capacity in millicores, paired with the CPU usage gauge. */
     capacity_cpu_millicores: z
       .number()
       .int()
@@ -579,7 +574,7 @@ export const NodeMemoryObservation = z
     (value) =>
       value.memory === null || value.memory.node_uid === value.node_uid,
     {
-      message: "Memory belongs to the authenticated Kubernetes node UID",
+      message: "Memory belongs to the authenticated node UID",
     },
   );
 export type NodeMemoryObservation = z.infer<typeof NodeMemoryObservation>;
@@ -836,20 +831,6 @@ export const ServerLinkMessage = z.discriminatedUnion("type", [
   LinkDesiredHint,
 ]);
 export type ServerLinkMessage = z.infer<typeof ServerLinkMessage>;
-
-// ---------- Kubernetes ----------
-
-export interface K8sObject {
-  apiVersion: string;
-  kind: string;
-  metadata: {
-    name: string;
-    namespace?: string;
-    labels?: Record<string, string>;
-    annotations?: Record<string, string>;
-  };
-  [key: string]: unknown;
-}
 
 // ---------- Authenticated agent measurements ----------
 

@@ -3,10 +3,6 @@ import { readFile, writeFile } from "node:fs/promises";
 import { format } from "prettier";
 import {
   MEASUREMENT_CHECKPOINT_KEY,
-  MEASUREMENT_CURSOR_ANNOTATION,
-  measurementCheckpoint,
-} from "../../../apps/regional/src/agent/measurements.ts";
-import {
   MEASUREMENT_CHECKPOINT_BYTES,
   MEASUREMENT_MAX_OUTBOX,
   MEASUREMENT_COHORT,
@@ -133,115 +129,8 @@ const cases = [
     continuous: true,
   },
 ];
-const identity = {
-  storage: uid(5),
-  namespace: uid(6),
-  cluster: uid(7),
-  fence: uid(8),
-  state: JSON.stringify({
-    namespaceUid: uid(6),
-    clusterUid: uid(7),
-    node: "node-test",
-    archivePath: "s3://test/eu-test/db/g1-op",
-  }),
-};
-const baseline = {
-  sampledAt: at(115000),
-  inventory: [{ name: "gateway", uid: uid(1), ip: "10.0.0.7", restarts: 0 }],
-  keyUid: uid(9),
-  keyVersion: "1",
-  reports: [current],
-};
-const checkpoints = [
-  { name: "empty", data: {} },
-  {
-    name: "persisted_baseline",
-    data: {
-      [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({
-        version: 1,
-        identity,
-        outbox: [],
-        baseline,
-      }),
-    },
-  },
-  {
-    name: "changed_custody",
-    data: {
-      [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({
-        version: 1,
-        identity: { ...identity, storage: uid(99) },
-        outbox: [],
-      }),
-    },
-  },
-  {
-    // A writer that serializes the same storage state in another key order keeps the checkpoint.
-    name: "reserialized_state",
-    data: {
-      [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({
-        version: 1,
-        identity: {
-          ...identity,
-          state: JSON.stringify(
-            Object.fromEntries(
-              Object.entries(JSON.parse(identity.state)).reverse(),
-            ),
-          ),
-        },
-        outbox: [],
-        baseline,
-      }),
-    },
-  },
-  {
-    name: "idle_window_without_baseline",
-    data: {
-      [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({
-        version: 1,
-        identity,
-        outbox: [],
-        idleObservedSince: at(100000),
-      }),
-    },
-  },
-  {
-    name: "unknown_outbox_record",
-    data: {
-      [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({
-        version: 1,
-        identity,
-        outbox: [{}],
-      }),
-    },
-  },
-].map((value) => {
-  try {
-    return {
-      ...value,
-      identity,
-      result: measurementCheckpoint(
-        {
-          apiVersion: "v1",
-          kind: "ConfigMap",
-          metadata: {
-            name: `storage-${database}`,
-            uid: uid(5),
-            resourceVersion: "1",
-          },
-          data: value.data,
-        },
-        identity,
-      ),
-      rejected: false,
-    };
-  } catch {
-    return { ...value, identity, rejected: true };
-  }
-});
 const constants = {
   MEASUREMENT_CHECKPOINT_KEY,
-  MEASUREMENT_CURSOR_ANNOTATION,
   MEASUREMENT_CHECKPOINT_BYTES,
   MEASUREMENT_MAX_OUTBOX,
   MEASUREMENT_COHORT,
@@ -269,7 +158,6 @@ for (const [name, value] of Object.entries({
         ),
       };
     }),
-    checkpoints,
   },
 })) {
   const path = new URL(name, import.meta.url);

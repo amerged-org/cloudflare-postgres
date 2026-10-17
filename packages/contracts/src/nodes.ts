@@ -182,7 +182,7 @@ export const NodeRegionPolicy = z
     node_cpu_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
       .describe(
-        `Per-node CPU warning (alert regional_node_cpu_warning) when any non-lost node reaches it: kubelet Summary node.cpu.usageNanoCores averaged over the node's ten latest consecutive one-minute samples (newest at most 90 s old, all with CPU data and the same capacity) against its status.capacity.cpu. Only reporters that add these optional fields to node memory samples supply CPU (the native regional controller); otherwise CPU is unknown and never warns. ${WARNING}`,
+        `Per-node CPU warning (alert regional_node_cpu_warning) when any non-lost node reaches it: the node's reported CPU usage averaged over its ten latest consecutive one-minute samples (newest at most 90 s old, all with CPU data and the same capacity) against its reported CPU capacity. Only reporters that add these optional fields to node memory samples supply CPU (the node agent); otherwise CPU is unknown and never warns. ${WARNING}`,
       ),
     node_storage_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
@@ -226,7 +226,7 @@ export const NodeRegionPolicy = z
       .nullable()
       .default(null)
       .describe(
-        "actual_ram: Kubernetes memory request of each PostgreSQL container (MiB); smaller size classes are not placed. A change under actual_ram has the same precondition as placement_mode.",
+        "actual_ram: memory reserved for each database's PostgreSQL (MiB); smaller size classes are not placed. A change under actual_ram has the same precondition as placement_mode.",
       ),
     standing_cost_profile: StandingNodeCostProfile.nullable()
       .default(null)

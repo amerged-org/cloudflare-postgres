@@ -604,7 +604,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|v| v["name"] == "role-removal-disable")
+            .find(|v| v["name"] == "role-removal")
             .unwrap();
         assert_eq!(
             configuration_input(&vector["db"], fallback),

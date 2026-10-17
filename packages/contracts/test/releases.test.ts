@@ -3,7 +3,6 @@ import { expect, it } from "vitest";
 import {
   FleetReleaseSpec,
   FleetNodeReleaseObservation,
-  fleetChartObservation,
 } from "../src/releases.ts";
 
 const names = [
@@ -171,55 +170,6 @@ it("forbids a different shared runtime version and contradictory image digest in
   wrong.components[3]!.reference = `registry.example/regional@sha256:${"e".repeat(64)}`;
   expect(FleetReleaseSpec.safeParse(wrong).success).toBe(false);
 });
-it("checks OCI applied history by exact digest while normalizing chart build metadata", () => {
-  const sha = "a".repeat(64),
-    pin = {
-      name: "cilium",
-      kind: "chart" as const,
-      version: "1.20.2",
-      reference: `oci://quay.io/cilium/charts/cilium@sha256:${sha}`,
-      sha256: sha,
-    };
-  const ready = {
-    metadata: { generation: 1 },
-    status: {
-      observedGeneration: 1,
-      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
-    },
-  };
-  const release = {
-      ...ready,
-      status: {
-        ...ready.status,
-        history: [
-          {
-            chartVersion: "1.20.2+a7c12d330dd9",
-            ociDigest: `sha256:${sha}`,
-            status: "deployed",
-          },
-        ],
-      },
-    },
-    source = {
-      ...ready,
-      spec: {
-        url: "oci://quay.io/cilium/charts/cilium",
-        ref: { digest: `sha256:${sha}` },
-      },
-      status: {
-        ...ready.status,
-        artifact: { revision: `1.20.2@sha256:${sha}` },
-      },
-    };
-  expect(fleetChartObservation(pin, release, source, null)).toEqual({
-    name: "cilium",
-    version: "1.20.2",
-    sha256: sha,
-  });
-  release.status.history[0]!.ociDigest = `sha256:${"b".repeat(64)}`;
-  expect(fleetChartObservation(pin, release, source, null)).toBeNull();
-});
-
 it("keeps the pinned cert-manager installation hook qualified without requiring a permanent running Job on every node", () => {
   const value = spec();
   value.components.push({

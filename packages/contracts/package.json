@@ -22,7 +22,6 @@
     "./costs": "./src/costs.ts",
     "./nodes": "./src/nodes.ts",
     "./releases": "./src/releases.ts",
-    "./compute-pool": "./src/compute-pool.ts",
     "./storage-write-authority": "./src/storage-write-authority.ts",
     "./database-storage": "./src/database-storage.ts",
     "./node-thin-storage": "./src/node-thin-storage.ts",

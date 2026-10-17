@@ -5,7 +5,9 @@ import { UsageSample, USAGE_HOUR_MS } from "./usage.ts";
 export const MEASUREMENT_COHORT = 25,
   MEASUREMENT_BODY_BYTES = 64 * 1024;
 export const MEASUREMENT_INTERVAL_MS = 15_000;
-export const MEASUREMENT_CHECKPOINT_BYTES = 48 * 1024,
+/** The agent persists its measurement checkpoint under this name, at most this many bytes. */
+export const MEASUREMENT_CHECKPOINT_KEY = "measurements.json",
+  MEASUREMENT_CHECKPOINT_BYTES = 48 * 1024,
   MEASUREMENT_MAX_OUTBOX = 64;
 export const producer = (report: GatewayActivityReport) =>
   `gw_${report.pod}_${report.processEpoch}_${report.epoch}`;

@@ -352,13 +352,13 @@ pub struct World {
     pub sql: Arc<Mutex<Sql>>,
 }
 impl World {
-    /// A database whose PostgreSQL runs and answers, with the record of the power vectors.
+    /// A database whose PostgreSQL runs and answers, with the record of the first controller vector.
     pub async fn awake() -> Self {
         let vectors: Value = serde_json::from_str(include_str!(
-            "../../../packages/contracts/native/power-vectors.generated.json"
+            "../../../packages/contracts/native/controller-vectors.generated.json"
         ))
         .unwrap();
-        let mut db = vectors["intents"][0]["db"].clone();
+        let mut db = vectors[0]["db"].clone();
         db["creation"]["ever_ready"] = true.into();
         db["creation"]["status"] = "succeeded".into();
         let log: Arc<Mutex<Vec<String>>> = Arc::default();

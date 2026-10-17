@@ -4,11 +4,7 @@ import { format } from "prettier";
 import { ID_ALPHABET } from "../src/ids.ts";
 import { SLEEP_SQL, SLEEP_REFUSALS, WAKE_PHASES } from "../src/sleep.ts";
 import { GATEWAY_RETIRE_HOLD_MS } from "../src/gateway-control.ts";
-import {
-  powerIntentVectors,
-  powerProgressVectors,
-  physicalReclamationVectors,
-} from "./power-vectors.ts";
+import { physicalReclamationVectors } from "./power-vectors.ts";
 const contract = {
   version: 1,
   constants: {
@@ -22,8 +18,6 @@ const contract = {
 for (const [name, value] of Object.entries({
   "power.generated.json": contract,
   "power-vectors.generated.json": {
-    intents: powerIntentVectors(),
-    progress: await powerProgressVectors(),
     reclamation: await physicalReclamationVectors(),
   },
 })) {

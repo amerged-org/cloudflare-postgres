@@ -33,7 +33,7 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
   regional_node_cap_reached:
     "The region reached max_nodes. Raise max_nodes with PUT /v1/regions/{id}/capacity-policy or free a node slot; no node is added while the cap holds.",
   regional_node_stale:
-    "A node stopped reporting or is marked lost. Check the server and its regional controller; if the server is gone, follow the lost-node runbook in docs/operations/recovery.md.",
+    "A node stopped reporting or is marked lost. Check the server and its node agent; if the server is gone, follow the lost-node runbook in docs/operations/recovery.md.",
   infrastructure_backup_failed:
     "The daily D1 backup failed. Read GET /v1/infrastructure-backups for the artifact error_code and fix it; same-day retries run automatically (docs/operations/infrastructure-backups.md).",
   infrastructure_backup_stale:
@@ -45,7 +45,7 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
   regional_node_storage_warning:
     "A node's thin pool or volume group is filling. Grow the pool or free space by deleting or moving databases; see Thin storage admission in docs/operations/recovery.md.",
   database_archive_failing:
-    "WAL archiving of the listed databases is failing. Check R2 reachability, the region's archive credentials and the database's backup plugin; WAL accumulates on the volume until archiving works again.",
+    "WAL archiving of the listed databases is failing. Check R2 reachability and the region's archive credentials; WAL accumulates on the volume until archiving works again.",
   database_base_backup_stale:
     "The listed awake databases have no completed base backup for 36 h of awake time. Check their scheduled backup and R2 access; read backup.status in GET /v1/operational-health?scope=databases.",
   thin_storage_blocked:

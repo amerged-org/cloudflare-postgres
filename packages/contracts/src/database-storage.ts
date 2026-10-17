@@ -207,58 +207,6 @@ export function thinStorageClass(profileSha256: string): string {
   return `pgcf-lvm-thin-v1-${profileSha256.slice(0, 16)}`;
 }
 
-export function thinStorageClassObject(
-  profile: ThinStorageProfile,
-  profileSha256: string,
-) {
-  ThinStorageProfile.parse(profile);
-  return {
-    apiVersion: "storage.k8s.io/v1",
-    kind: "StorageClass",
-    metadata: {
-      name: thinStorageClass(profileSha256),
-      labels: {
-        "pgcf.io/storage-profile": profileSha256.slice(0, 63),
-        "pgcf.io/storage-backend": "lvm-thin-v1",
-      },
-      annotations: { "pgcf.io/storage-profile-sha256": profileSha256 },
-    },
-    provisioner: "local.csi.openebs.io",
-    parameters: {
-      storage: "lvm",
-      vgpattern: "^pgcf$",
-      thinProvision: "yes",
-      fsType: "ext4",
-      // OpenEBS1.10.1 passes this supported SC parameter to mkfs before publishing the volume.
-      formatoptions: "-E lazy_itable_init=0,lazy_journal_init=0",
-    },
-    volumeBindingMode: "WaitForFirstConsumer",
-    allowVolumeExpansion: true,
-    reclaimPolicy: "Retain",
-  };
-}
-
-/** OpenEBS1.10.1 consumes these exact case-sensitive VAC keys, never arbitrary SC keys. */
-export function thinVolumeAttributesClassObject(
-  profile: ThinStorageProfile,
-  profileSha256: string,
-) {
-  const value = ThinStorageProfile.parse(profile);
-  return {
-    apiVersion: "storage.k8s.io/v1",
-    kind: "VolumeAttributesClass",
-    metadata: {
-      name: thinStorageClass(profileSha256),
-      annotations: { "pgcf.io/storage-profile-sha256": profileSha256 },
-    },
-    driverName: "local.csi.openebs.io",
-    parameters: {
-      qosBandwithWritePerSec: String(value.write_bytes_per_second),
-      qosIopsWriteLimit: String(value.write_iops_per_second),
-    },
-  };
-}
-
 /** A slow identity proof stays valid this long after its read started (the slow lease's issue). */
 export const THIN_INVENTORY_MAX_SECONDS = 300;
 /** The node authority an identity proof composes is valid this long from its read. */

@@ -610,9 +610,13 @@ mod tests {
         ))
         .unwrap()
     }
+    /// Checkpoint cases recorded from the TypeScript agent before its deletion.
+    fn checkpoints() -> Value {
+        serde_json::from_str(include_str!("measurement-checkpoints.json")).unwrap()
+    }
     #[test]
-    fn authoritative_typescript_checkpoint_contract() {
-        for value in vectors()["checkpoints"].as_array().unwrap() {
+    fn recorded_checkpoint_cases_parse_as_before() {
+        for value in checkpoints().as_array().unwrap() {
             let result = checkpoint(&json!({"data":value["data"]}), &value["identity"]);
             if value["rejected"] == true {
                 assert!(result.is_err(), "{}", value["name"]);
@@ -650,7 +654,7 @@ mod tests {
     }
     #[test]
     fn process_restart_requires_two_complete_observations_before_idle_recovers() {
-        let vector = &vectors()["checkpoints"][1];
+        let vector = &checkpoints()[1];
         let mut checkpoint = vector["result"].clone();
         let snapshot = snapshot(&checkpoint["baseline"]);
         let mut report = checkpoint["baseline"]["reports"][0].clone();
@@ -710,7 +714,7 @@ mod tests {
     }
     /// A persisted one-pod checkpoint whose baseline report was observed at 115000 ms.
     fn quiet_work() -> (Work, GatewaySnapshot) {
-        let checkpoint = vectors()["checkpoints"][1]["result"].clone();
+        let checkpoint = checkpoints()[1]["result"].clone();
         let snapshot = snapshot(&checkpoint["baseline"]);
         let work = Work {
             db: json!({"id":checkpoint["baseline"]["reports"][0]["database"],"generation":1,"storage":{"backend":"lvm-thin-v1"}}),
