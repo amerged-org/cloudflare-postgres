@@ -109,6 +109,26 @@ scratch_database() {
 	fi
 }
 
+scratch_id() {
+	lvs --noheadings --options lv_tags pgcf 2>/dev/null | tr ',' '\n' | sed -n 's/^ *pgcf\.db\.//p'
+}
+
+# The agent creates /run/pgcf/<id> when it creates the database and at its own start, because /run
+# is empty after a boot.
+socket_directory() {
+	local id owner
+	id=$(scratch_id)
+	if [ "$(wc -w <<<"$id")" -ne 1 ]; then
+		echo "scratch ids: $id"
+		return 1
+	fi
+	owner=$(stat -c '%U:%G:%a' "/run/pgcf/$id") || return 1
+	[ "$owner" = "pgcf-$id:pgcf-gateway:750" ] || {
+		echo "socket directory: $owner"
+		false
+	}
+}
+
 binaries() {
 	local binary
 	for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do
@@ -129,6 +149,26 @@ database_unit_waits_for_recovery() {
 	[ "$(systemctl show --property=TimeoutStartUSec --value pgcf-pg@pgcfboottest0000000.service)" = infinity ]
 }
 
+# The unit starts the postmaster alone: an ExecStartPre= process costs about 35 ms on every wake,
+# so the agent creates the socket directory instead (socket_directory).
+database_unit_has_no_start_pre() {
+	[ -z "$(systemctl show --property=ExecStartPre --value pgcf-pg@pgcfboottest0000000.service)" ]
+}
+
+# systemd nests a slice whose name has a dash inside the slice before the dash. A backup job must
+# not run under the databases' slice and its memory ceiling.
+backup_slice_top_level() {
+	local cgroup
+	cgroup=$(systemd-run --quiet --pipe --wait --collect --slice=pgcfbackup.slice cat /proc/self/cgroup) || return 1
+	case $cgroup in
+	0::/pgcfbackup.slice/*) ;;
+	*)
+		echo "backup job cgroup: $cgroup"
+		false
+		;;
+	esac
+}
+
 check no_failed_units no_failed_units
 check loopback_only loopback_only
 check inbound_dropped inbound_dropped
@@ -138,9 +178,14 @@ if [ "$phase" = 1 ]; then
 	check lvm_partition lvm_partition
 	check database_unit_sandbox database_unit_sandbox
 	check database_unit_waits_for_recovery database_unit_waits_for_recovery
+	check database_unit_has_no_start_pre database_unit_has_no_start_pre
+	check backup_slice_top_level backup_slice_top_level
 fi
 check pool wait_for 120 pool
+# After a reboot the agent has recreated the empty /run/pgcf/<id> of the scratch database.
+[ "$phase" = 1 ] || check socket_directory_after_boot wait_for 30 socket_directory
 check scratch_database scratch_database
+check socket_directory socket_directory
 check loopback_only_after_database loopback_only
 
 if [ "$failures" -eq 0 ]; then

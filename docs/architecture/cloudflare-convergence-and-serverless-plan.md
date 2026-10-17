@@ -1867,7 +1867,7 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 - **Sampling:** commands use `--reportformat json`. Pool status every 5 s (`dmsetup status`, or the read-only `devicemapper` crate). Per-LV `data_percent`, and `df` space and inodes, every 60 s.
 
 **Barman jobs:**
-- Started with `systemd-run --uid=pgcf-<id> --slice=pgcf-backup.slice -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`.
+- Started with `systemd-run --uid=pgcf-<id> --slice=pgcfbackup.slice -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`.
 - Environment: `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION=auto`, `--endpoint-url https://<account>.r2.cloudflarestorage.com`, and TMPDIR on node disk.
 - Base backup: `barman-cloud-backup --gzip --immediate-checkpoint -J 2 --host /run/pgcf/<db> -U pgcf_backup -d postgres <dest> database`.
 

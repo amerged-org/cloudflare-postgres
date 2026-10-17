@@ -11,8 +11,14 @@
 set -Eeuo pipefail
 umask 077
 
-params=${1:?usage: install.sh PARAMS_FILE [--validate-only]}
-work=/run/pgcf-install
+params=${1:?usage: install.sh /ABSOLUTE/PARAMS_FILE [--validate-only]}
+[[ $params == /* ]] || {
+	echo "the parameters file must be an absolute path" >&2
+	exit 2
+}
+# cloud-config.yaml writes install.sh and the parameters into one directory, which is the work
+# directory.
+work=${params%/*}
 ram=$work/ram
 target=$work/target
 
@@ -80,7 +86,9 @@ if [ -n "${PGCF_IPV6}" ] && { [ -z "${PGCF_IPV6_PREFIX}" ] || [ -z "${PGCF_IPV6_
 fi
 [ "${2-}" = --validate-only ] && exit 0
 
-mkdir -p -m 0700 "$work"
+# cloud-init created the directory with its default mode, which `mkdir -p -m` leaves alone.
+mkdir -p "$work"
+chmod 0700 "$work"
 # The progress token travels in a header file, never on a command line.
 printf 'Authorization: Bearer %s\n' "${PGCF_PROGRESS_TOKEN}" >"$work/progress.header"
 
@@ -96,6 +104,7 @@ failed() {
 	trap - ERR
 	echo "pgcf install failed at $step" >&2
 	report failed "$step" || true
+	rm -f "$work/progress.header" "$params"
 	exit 1
 }
 trap failed ERR

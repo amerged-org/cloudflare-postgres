@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -80,6 +90,47 @@ test("install.sh accepts exactly what the renderer produces", () => {
     assert.doesNotMatch(refused.stderr, /e{16}|t{16}/, "no token in the error output");
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function toolPath(name: string): string {
+  const found = spawnSync("sh", ["-c", 'command -v "$0"', name], { encoding: "utf8" }).stdout.trim();
+  assert.ok(found, `${name} is available`);
+  return found;
+}
+
+test("a failed install reports it, leaves a 0700 work directory and removes both token files", () => {
+  const root = mkdtempSync(join(tmpdir(), "pgcf-installer-"));
+  try {
+    // cloud-init's write_files creates the directory that holds install.sh and the parameters with
+    // its default mode; `mkdir -p -m 0700` does not change an existing directory.
+    const work = join(root, "work");
+    mkdirSync(work);
+    chmodSync(work, 0o755);
+    const params = join(work, "params");
+    writeFileSync(params, decodedFile(renderUserData(template, script, longest), "/run/pgcf-install/params"), {
+      mode: 0o600,
+    });
+    // A PATH without awk fails the tool check, the first step after the token files exist.
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    for (const name of ["chmod", "mkdir", "rm"]) symlinkSync(toolPath(name), join(bin, name));
+    const curlLog = join(root, "curl.log");
+    writeFileSync(join(bin, "curl"), `#!/bin/sh\necho "$@" >>"${curlLog}"\n`, { mode: 0o755 });
+
+    const result = spawnSync(toolPath("bash"), [new URL("install.sh", import.meta.url).pathname, params], {
+      encoding: "utf8",
+      env: { PATH: bin },
+    });
+
+    assert.equal(result.status, 1, result.stderr);
+    const requests = readFileSync(curlLog, "utf8");
+    assert.match(requests, /"checkpoint":"failed","detail":"tools"/, "the failure is reported with its step");
+    assert.doesNotMatch(requests, /t{16}/, "the progress token is never on a command line");
+    assert.equal(statSync(work).mode & 0o777, 0o700);
+    assert.deepEqual(readdirSync(work), [], "no token file is left behind");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

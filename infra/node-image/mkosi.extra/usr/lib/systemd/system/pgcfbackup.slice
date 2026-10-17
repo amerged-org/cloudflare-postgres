@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# barman-cloud jobs, each a transient unit the agent starts as the database's own user.
+# barman-cloud jobs, each a transient unit the agent starts as the database's own user. The name has
+# no dash on purpose: systemd nests pgcf-backup.slice inside pgcf.slice, which would put the jobs
+# under the databases' memory ceiling.
 [Unit]
 Description=PGCF backup jobs
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md

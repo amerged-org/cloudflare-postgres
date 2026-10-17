@@ -3,8 +3,10 @@
 # nothing enables this unit, and systemd never restarts it on its own (every start goes through
 # the agent's admission). The agent sets the per-database limits (MemoryMax, MemoryHigh, CPUWeight,
 # IO limits, TasksMax) as persistent unit properties, never by reloading; CPUQuota only after
-# ready, cleared again at stop. It creates the socket directory /run/pgcf/<id> (owner pgcf-<id>,
-# group pgcf-gateway, mode 0750) before the first start after boot and removes it with the database.
+# ready, cleared again at stop (the empty assignment CPUQuota=). It creates the socket directory
+# /run/pgcf/<id> (owner pgcf-<id>, group pgcf-gateway, mode 0750) when it creates the database and
+# at its own start, and removes it with the database; no ExecStartPre= does, which would add a
+# process to every start.
 [Unit]
 Description=PGCF database %i
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md

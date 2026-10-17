@@ -91,7 +91,7 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | --- | --- | --- |
 | `pgcf-pg@<id>.service` | `pgcf-<id>` | One PostgreSQL per database, in `pgcf.slice`; started only by the agent |
 | `pgcf.slice` | | All databases; the agent sets the awake-database memory budget, 80 % of RAM until then |
-| `pgcf-backup.slice` | | barman-cloud jobs (transient units the agent starts); 512 MiB, CPU and IO weight 20 |
+| `pgcfbackup.slice` | | barman-cloud jobs (transient units the agent starts); 512 MiB, CPU and IO weight 20; no dash in the name, because systemd nests `pgcf-backup.slice` inside `pgcf.slice` and the jobs would run under the databases' memory ceiling |
 | `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; host mount namespace (see below); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
@@ -119,10 +119,12 @@ package from creating a default cluster.
 - **User:** `pgcf-<id>`, a fixed uid from the agent's node-local range in `/etc/passwd`. Never
   `DynamicUser`, which recycles uids.
 - **Socket directory:** `/run/pgcf/<id>`, owner `pgcf-<id>`, group `pgcf-gateway`, mode 0750, so
-  only the database and the gateway reach the socket. The agent creates it before the first start
-  after boot and removes it with the database; a start without it fails. It is not a
-  `RuntimeDirectory=`, because systemd resets such a directory's group to the unit's own before
-  every start, and no `ExecStartPre` creates it, because that would add a process to every wake.
+  only the database and the gateway reach the socket. The agent creates it when it creates the
+  database and, for every database, when it starts (`/run` is empty after a boot), and removes it
+  with the database; a start without it fails. It is not a `RuntimeDirectory=`, because systemd
+  resets such a directory's group to the unit's own before every start, and no `ExecStartPre=`
+  creates it, because that process costs about 35 ms on every start (measured on EU1 in the
+  Stage 1 lab).
 - **Mount check:** `AssertPathIsMountPoint=/var/lib/pgcf/db/<id>`: a start on an unmounted volume
   fails (`Condition…` would "succeed" with the unit inactive). `After=` the mount unit only orders
   the stop before the unmount at shutdown; nothing ties the database's life to the mount.
@@ -132,7 +134,10 @@ package from creating a default cluster.
   smallest class (`MemoryMax=256M`, `MemoryHigh=230M`). The agent sets `MemoryMax`, `MemoryHigh` (90 %),
   `CPUWeight`, `IOWriteBandwidthMax`, `IOWriteIOPSMax` and `TasksMax` as persistent unit properties
   (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready and cleared
-  (`CPUQuota=infinity`) at stop: a unit property outlives the stop and would throttle the next start.
+  at stop with the empty assignment `CPUQuota=` (`CPUQuotaPerSecUSec` = `UINT64_MAX` over D-Bus
+  `SetUnitProperties`): a unit property outlives the stop and would throttle the next start.
+  `CPUQuota=infinity` is no value: systemd rejects it ("Invalid CPU quota") and ignores a drop-in
+  that holds it, so the quota stays.
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`,
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
@@ -176,9 +181,11 @@ restart never stops a database, because the databases are independent units.
   100%FREE pgcf`, then `lvchange --errorwhenfull y pgcf/pgcf_thinpool`. On a 33 GiB partition this
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
 - Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
-  the data directory `data` inside. Before a database's first start after boot the agent creates
-  `/run/pgcf/<id>` (owner `pgcf-<id>`, group `pgcf-gateway`, mode 0750); it clears the database's
-  `CPUQuota` whenever the database stops.
+  the data directory `data` inside. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
+  `pgcf-gateway`, mode 0750) when it creates a database and again for every database when it
+  starts, because `/run` is empty after a boot. It clears the database's `CPUQuota` (`CPUQuota=`)
+  whenever the database stops and, when the agent itself starts, for every stopped `pgcf-pg@` unit:
+  a quota that outlived a stop or an agent crash would throttle the next start.
 - Its sockets are `/run/pgcf/agent/gateway.sock` (gateway only) and `/run/pgcf/agent/archive.sock`
   (databases, identified by uid); the archive clients are reached as
   `/usr/libexec/pgcf/pgcf-archive` and `/usr/libexec/pgcf/pgcf-wal-fetch`.
@@ -216,7 +223,9 @@ RAM, verifies the compressed and raw sha256 and sizes before touching the disk, 
 reads it back, moves the backup GPT, writes the network settings, hostname, `resolv.conf` and the
 enrollment seed, reports each checkpoint (`started`, `hardware_ok`, `image_verified`,
 `disk_written`, `configured`, `rebooting`, or `failed` with the step) to the progress URL with the
-progress token from a header file, and reboots.
+progress token from a header file, and reboots. The work directory (the one that holds `install.sh`
+and the parameters) is set to 0700, and the header file and the parameters file are removed when
+the install succeeds and when it fails.
 
 The installer is built on what Stage 1 recorded about Contabo's rescue system (plan 11.1):
 
@@ -257,5 +266,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE and has no start timeout; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume |
-| Second | no failed unit; loopback only; inbound policy drop; the binaries; the pool; `pgcf-agent check` wakes the same scratch database |
+| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
+| Second | no failed unit; loopback only; inbound policy drop; the binaries; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
