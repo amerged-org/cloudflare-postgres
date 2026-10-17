@@ -42,8 +42,6 @@ export interface DatabaseRow extends DatabaseHealthSource {
   storage_protected_operation?: string | null;
   warm_reclaim_policy_json?: string | null;
   runtime_attestation_json?: string | null;
-  /** The controller's report that a hibernated database still holds its own Pod; see parked-tier.ts. */
-  parked_json?: string | null;
   observed_generation: number;
   status_message: string | null;
   archive_path: string;

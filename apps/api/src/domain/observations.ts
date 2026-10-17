@@ -18,10 +18,8 @@ import {
   recordStartupObservationStatement,
   rememberStartAttestationStatement,
   databaseCpuChargeSql,
-  databaseParkedCpuSql,
   computePoolOverheadSql,
 } from "./startup-admission.ts";
-import { nextParkedRecord, readParkedRecord } from "./parked-tier.ts";
 
 import { DatabaseRuntimeAttestation } from "@pgcf/contracts/reclaim";
 import { thinStorageDeletionConfirmedSql } from "./storage-capacity.ts";
@@ -343,15 +341,6 @@ export async function observations(
         DatabaseRow & { admission_revision: number; route_revision: number }
       >();
     if (!row || !observationApplies(row, region.id, observation, now)) continue;
-    const parked = observation.power?.parked;
-    // A Pod that is still alive is never confirmed as an ordinary hibernation: only an idle sleep
-    // records it. Otherwise the report is not applied, the sleep stays unconfirmed and the full
-    // charge stays until a valid one (or the demotion) arrives.
-    if (
-      parked &&
-      !(row.desired_state === "suspended" && row.suspension_reason === "idle")
-    )
-      continue;
     const restoration = await c.env.DB.prepare(
       "SELECT x.operation_id,o.status FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.target_database_id=? AND o.kind='database.restore'",
     )
@@ -481,7 +470,6 @@ export async function observations(
           c.env.DB.prepare(
             `UPDATE databases SET runtime_attestation_json=?,observed_postgres_image=CASE WHEN ?='ready' THEN ? ELSE observed_postgres_image END,observed_postgres_image_id=CASE WHEN ?='ready' THEN ? ELSE observed_postgres_image_id END,
         observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
-      parked_json=CASE WHEN ?=1 THEN ? WHEN ?=1 THEN NULL ELSE parked_json END,
       archiving_health_since=CASE WHEN archiving_health<>(${archiveHealth}) THEN ? ELSE archiving_health_since END,archiving_health=(${archiveHealth}),${backupUpdate},updated_at=?
       WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?
       AND ${runtime ? "EXISTS(SELECT 1 FROM nodes rn WHERE rn.id=databases.node_id AND rn.node_uid=?)" : "1=1"}
@@ -511,24 +499,6 @@ export async function observations(
             observation.message === undefined
               ? null
               : truncateAgentText(observation.message),
-            Number(parked !== undefined),
-            parked === undefined
-              ? null
-              : JSON.stringify(
-                  nextParkedRecord({
-                    ...parked,
-                    generation: observation.generation,
-                    previous: readParkedRecord(row.parked_json),
-                    now,
-                  }),
-                ),
-            // A wake, a deletion or a plain hibernation ends the claim; a report about a start
-            // still in progress or about a fault says nothing about the Pod.
-            Number(
-              observation.state === "ready" ||
-                observation.state === "deleted" ||
-                (observation.state === "hibernated" && parked === undefined),
-            ),
             Number(inactive),
             health,
             body.observed_at,
@@ -557,7 +527,7 @@ export async function observations(
             `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
       SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,
         json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
-          'reserved_memory_mib',s.memory_mib+?+CASE WHEN ${databaseCpuChargeSql("d", "s", true)}=0 THEN 0 ELSE ${computePoolOverheadSql("d", "memory_mib")} END,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)}+${databaseParkedCpuSql("d", "s", true)},
+          'reserved_memory_mib',s.memory_mib+?+CASE WHEN ${databaseCpuChargeSql("d", "s", true)}=0 THEN 0 ELSE ${computePoolOverheadSql("d", "memory_mib")} END,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)},
           'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib*1073741824 ELSE NULL END)
       FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.region_id=?
       AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=? AND kind=? AND generation=?)`,

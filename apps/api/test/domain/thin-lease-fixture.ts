@@ -25,8 +25,8 @@ export type LeaseDatabase =
   | { kind: "live" }
   /** Running and ready, but no Pod is evidenced and none is attested. */
   | { kind: "blocked" }
-  /** An idle sleep that keeps its own Pod; the controller's report is fresh. */
-  | { kind: "parked" }
+  /** An idle sleep the controller confirmed: hibernated. */
+  | { kind: "asleep" }
   /** An idle sleep whose stop operation is still running. */
   | { kind: "stopping" }
   /**
@@ -96,7 +96,7 @@ export async function thinLeaseNode(f: Fixture) {
           pv_uid: crypto.randomUUID(),
         })
       : null;
-    const sleeping = spec.kind === "parked" || spec.kind === "stopping";
+    const sleeping = spec.kind === "asleep" || spec.kind === "stopping";
     const deleted = spec.kind === "deleted";
     const generation = deleted ? 3 : sleeping ? 2 : 1;
     const power = sleeping ? newOperationId() : null;
@@ -120,26 +120,14 @@ export async function thinLeaseNode(f: Fixture) {
         ? spec.confirmed
           ? "deleted"
           : "deleting"
-        : sleeping && spec.kind === "parked"
+        : sleeping && spec.kind === "asleep"
           ? "provisioning"
           : "ready",
-      observed_power: spec.kind === "parked" ? "hibernated" : "awake",
+      observed_power: spec.kind === "asleep" ? "hibernated" : "awake",
       suspension_reason: sleeping ? "idle" : null,
       power_operation: power,
       storage_volume_json: receipt ? JSON.stringify(receipt) : null,
       runtime_attestation_json: null,
-      parked_json:
-        spec.kind === "parked"
-          ? JSON.stringify({
-              v: 1,
-              pod_uid: pod,
-              generation,
-              cpu_millicores: 15,
-              memory_mib: 160,
-              parked_at: iso(now),
-              observed_at: iso(now),
-            })
-          : null,
       // Deleted an hour before its absence was read, or a day before now when it was not.
       deleted_at: deleted
         ? new Date(

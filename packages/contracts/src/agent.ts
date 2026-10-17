@@ -3,7 +3,6 @@ import { z } from "zod";
 import { DatabaseRuntimeAttestation } from "./reclaim.ts";
 import { DatabaseAdmissionIntent } from "./database-admission.ts";
 import { ComputePoolPolicy } from "./compute-pool.ts";
-import { ParkedObservation, ParkedTierPolicy } from "./parked-tier.ts";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
@@ -422,8 +421,6 @@ export const DesiredRegion = z.strictObject({
   id: RegionId,
   /** Current authoritative region pool template, including assigned per-Pod overhead. */
   compute_pool: ComputePoolPolicy.nullable().optional(),
-  /** The region's idle-sleep parking policy, present whenever one is set (enabled or not). */
-  parking: ParkedTierPolicy.optional(),
   /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
   storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
   /** Authenticated target-region-only source-read custody; omission preserves legacy installations. */
@@ -621,8 +618,6 @@ export const DatabaseObservation = z
         revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
         state: z.enum(["hibernated", "awake"]),
         refusal: z.enum(["busy", "archive", "unknown"]).optional(),
-        /** A hibernated observation whose instance Pod is still alive with PostgreSQL stopped. */
-        parked: ParkedObservation.optional(),
       })
       .optional(),
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
@@ -690,13 +685,6 @@ export const DatabaseObservation = z
         message: "Refusal requires an awake error observation",
       });
     if (
-      db.power?.parked &&
-      (db.state !== "hibernated" ||
-        db.power.state !== "hibernated" ||
-        db.power.refusal)
-    )
-      parkedObservationIssue(ctx);
-    if (
       (db.state === "hibernated" && !db.power) ||
       (db.power &&
         (db.power.revision !== db.generation ||
@@ -710,13 +698,6 @@ export const DatabaseObservation = z
       });
   });
 export type DatabaseObservation = z.infer<typeof DatabaseObservation>;
-function parkedObservationIssue(ctx: z.RefinementCtx): void {
-  ctx.addIssue({
-    code: "custom",
-    path: ["power", "parked"],
-    message: "A parked Pod is reported only with a hibernated observation",
-  });
-}
 
 /** A namespace labelled `pgcf.io/database-id` that desired state does not name; reported, never deleted. */
 export const Orphan = z.strictObject({

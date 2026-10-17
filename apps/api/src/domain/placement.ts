@@ -11,7 +11,6 @@ import { thinPoolRoomSql } from "./storage-capacity.ts";
 import {
   startupPhysicalFitSql,
   databaseCpuChargeSql,
-  databaseParkedCpuSql,
   computePoolOverheadSql,
 } from "./startup-admission.ts";
 
@@ -269,7 +268,7 @@ export async function placementNodes(
       ${thinPoolRoomSql("n", "storage_probe", existingDatabaseId === undefined ? undefined : "storage_existing")} thin_storage_available,
       (SELECT json_extract(t.profile_json,'$.maximum_quota_gib') FROM node_thin_storage t WHERE t.node_id=n.id) thin_storage_maximum_quota_gib,
       ${existingDatabaseId === undefined ? "0" : "storage_existing.id IS NOT NULL AND storage_existing.storage_profile_json IS NULL"} thin_storage_retained_thick,
-      COALESCE(SUM(s.memory_mib + ?+${computePoolOverheadSql("d", "memory_mib")}),0) reserved_memory_mib, COALESCE(SUM(${databaseCpuChargeSql()}+${databaseParkedCpuSql()}),0) reserved_cpu_millicores,
+      COALESCE(SUM(s.memory_mib + ?+${computePoolOverheadSql("d", "memory_mib")}),0) reserved_memory_mib, COALESCE(SUM(${databaseCpuChargeSql()}),0) reserved_cpu_millicores,
       COALESCE(SUM(CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib ELSE 0 END),0) reserved_storage_gib
     FROM nodes n LEFT JOIN node_region_policies p ON p.region_id=n.region_id LEFT JOIN databases d ON d.node_id=n.id AND d.observed_state <> 'deleted' LEFT JOIN size_classes s ON s.id=d.size_class_id
     CROSS JOIN (SELECT 1 storage_gib) storage_probe

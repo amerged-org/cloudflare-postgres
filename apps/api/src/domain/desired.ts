@@ -4,7 +4,6 @@ import {
   DesiredDatabase,
   DesiredDatabaseStorage,
   DesiredResponse,
-  ParkedTierPolicy,
   type DesiredCreation,
   type DesiredRecovery,
   type DesiredQuery,
@@ -122,7 +121,7 @@ async function desiredPage(
       : region,
     admissionSnapshotCapable(env.DB, regionId),
     env.DB.prepare(
-      "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json,parked_tier_json FROM node_region_policies WHERE region_id=?",
+      "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json FROM node_region_policies WHERE region_id=?",
     )
       .bind(regionId)
       .first<{
@@ -130,19 +129,12 @@ async function desiredPage(
         maximum_database_memory_mib: number | null;
         postgres_memory_request_mib: number | null;
         compute_pool_json: string | null;
-        parked_tier_json: string | null;
       }>(),
     desiredRegionStorageNodes(env, regionId),
     readDesiredFleetRelease(env.DB, regionId),
     desiredRegionArchiveSources(env, regionId),
   ]);
   if (!regionRow) return undefined;
-  // The region policy is the only switch, and it is served whether enabled or not: a disabled
-  // policy is how the controller learns to demote what it parked. A stored policy that no longer
-  // parses is served as none, which demotes the same way.
-  const parking = policy?.parked_tier_json
-    ? ParkedTierPolicy.safeParse(JSON.parse(policy.parked_tier_json))
-    : undefined;
   const scheduling =
     policy?.placement_mode === "actual_ram"
       ? {
@@ -340,7 +332,6 @@ async function desiredPage(
       ...(policy?.compute_pool_json
         ? { compute_pool: JSON.parse(policy.compute_pool_json) }
         : {}),
-      ...(parking?.success ? { parking: parking.data } : {}),
       ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
       ...(recoverySources === undefined
         ? {}

@@ -37,7 +37,7 @@ it("permits every live thin database of the node through its startup window, nev
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
   const live = await node.add({ kind: "live" }),
     blocked = await node.add({ kind: "blocked" }),
-    parked = await node.add({ kind: "parked" }),
+    asleep = await node.add({ kind: "asleep" }),
     stopping = await node.add({ kind: "stopping" }),
     open = await node.add({ kind: "deleted", confirmed: false }),
     reclaimed = await node.add({
@@ -57,20 +57,20 @@ it("permits every live thin database of the node through its startup window, nev
       node.held.id,
       live.id,
       blocked.id,
-      parked.id,
+      asleep.id,
       stopping.id,
       open.id,
       reclaimed.id,
     ].sort(),
   );
-  // Awake, asleep, parked, stopping or without an evidenced Pod: one shape. The generation is one
+  // Awake, asleep, stopping or without an evidenced Pod: one shape. The generation is one
   // past D1's, above every signed token's, so the guard resumes a retained scope once and carries
   // no token forward; the creation operation stays the same across every wake.
   for (const member of [
     { id: node.held.id, receipt: null },
     live,
     blocked,
-    parked,
+    asleep,
     stopping,
   ]) {
     expect(entries.get(member.id), member.id).toEqual({
@@ -116,7 +116,7 @@ it("permits every live thin database of the node through its startup window, nev
 it("keeps every live permit while the node's reading is stale, denies writes, is blocked or the database was protected", async () => {
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
   const live = await node.add({ kind: "live" }),
-    parked = await node.add({ kind: "parked" });
+    asleep = await node.add({ kind: "asleep" });
   const proof = await node.commit();
   const stale = new Date(Date.now() - 60 * 60_000).toISOString();
   await env.DB.batch([
@@ -132,7 +132,7 @@ it("keeps every live permit while the node's reading is stale, denies writes, is
     ).bind(stale, live.id),
   ]);
   const entries = await node.leaseEntries();
-  for (const id of [node.held.id, live.id, parked.id])
+  for (const id of [node.held.id, live.id, asleep.id])
     expect(entries.get(id), id).toMatchObject({
       desired_state: "running",
       write_blocked: false,
@@ -284,7 +284,7 @@ it("logs what each lease served: the counts and its time, never an entry's secre
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
   await node.add({ kind: "live" });
-  await node.add({ kind: "parked" });
+  await node.add({ kind: "asleep" });
   await node.add({ kind: "deleted", confirmed: true, confirmedAgo: 1000 });
   await node.add({ kind: "deleted", confirmed: false });
   await node.commit();
