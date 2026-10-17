@@ -284,7 +284,8 @@ goal.
 **Stage A (no host-extension release).**
 1. **API release R1:** the host lease serves every live thin database on the node as running with a permit, independent
    of node authority, sampling, qualification, rollout and sleep state, so the guard on EU1 resumes what it froze once
-   and never suspends again; deleted databases keep their drain. The room rule, growth and alert replace the old
+   and never suspends again; a deleted database stays such an entry until its volume is read absent, then its tombstone
+   retires the guard's scope (no delete drain). The room rule, growth and alert replace the old
    headroom predicate. The reclaim route keeps its held 404 until stage B. Verify: no new suspends, every thin LV
    active, the lease served through a rollout. One-time effect: an awake thin database that held a token is restarted
    once (SIGKILL without suspend, WAL crash recovery); deploy when none is awake.
@@ -308,13 +309,24 @@ revision change, a boot mismatch) suspends and kills every covered Pod with the 
 before stage B; the manual resume is in the [recovery runbook](../operations/recovery.md#thin-storage-admission-and-recovery).
 
 **Status.** Stage A implemented test-first and integrated (API R1 and R3, controller, gateway, node bootstrap's turn
-cancel), not deployed; about 26,800 lines deleted and 2,200 added. The API and the native release ship together: the controller's strict
-desired schema refuses the old API's token fields and the old controller refuses `room`, so desired pulls fail between
-the two deploys. Preconditions: `parked_tier` off with no parked database, and no awake thin database (the guard's
-one-time restart). Left for stage B: the guard and its lease, the storage authority keys and legacy bindings the fleet
-patch still writes into the gateway's environment (the gateway ignores them), the start-hold storage columns, the
-protection markers node bootstrap still reports, and the qualification gates `noflush_quiescence` and
-`startup_bound`, which can no longer collect samples.
+cancel), not deployed; about 26,800 lines deleted and 2,200 added. Review fixes (2026-10-17): an unreclaimed deletion is
+a live lease entry, not a drain; an identity proof stays the node's authority for 120 s from its read (growth, AddNode
+and selection read it; turns take 19–29 s against the 10 s guard); the desired page names a thin node from its last
+proof whatever its age; room travels as `storage_nodes[].write_allowed`; a pool holding volumes without a fresh sample
+alarms `thin_pool_unobserved`; the Actor's wake claim needs room and a held connect without room is answered 57P03;
+the controller posts each storage scrape with the inventory of its cycle.
+
+**Ship order.** API first, then the native release as a fleet rollout, forward only. The API's desired page validates
+against the deployed controller's schema (3100aba), so that controller keeps pulling, reporting inventory and fleet
+observations, and the rollout runs; the new controller refuses the old API's page, so the reverse order blinds it.
+Between the two the deployed controller and gateway have no write tokens: they start no thin database (no
+`storage_startup`), route none (no ledger token) and would hibernate an awake one. Preconditions: `parked_tier` off
+with no parked database, no awake thin database, and a thin maintenance window for the rollout (38–49 min on R2.14).
+The API is not rolled back: migrations 0058–0060 drop columns main reads, and main's lease would make the guard
+suspend tokenless volumes again; a problem is fixed forward. Left for stage B: the guard and its lease, the storage
+authority keys and legacy bindings the fleet patch still writes into the gateway's environment (the gateway ignores
+them), the start-hold storage columns, the protection markers node bootstrap still reports, and the qualification
+gates `noflush_quiescence` and `startup_bound`, which can no longer collect samples.
 
 ## Delivery architecture
 

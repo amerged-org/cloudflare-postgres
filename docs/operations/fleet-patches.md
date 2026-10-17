@@ -55,7 +55,9 @@ restart CloudNativePG or OpenEBS Pods.
   that changes the cluster material makes that node's host guard refuse its lease; after 120 s it
   suspends and stops every covered Pod ([recovery](recovery.md#thin-storage-admission-and-recovery)).
   Do not roll out a material change on EU1 before the host release.
-- Deploy the API and the node-bootstrap executor together, outside a rollout.
+- Deploy the API and the node-bootstrap executor together, outside a rollout. The API of decision A
+  ships before its native release, and only while no thin database is awake
+  ([ship order](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)).
 
 The `postgres` stage restarts only databases whose PostgreSQL image, version or configuration schema
 differ from the release's; a release that changes none of them restarts none.
