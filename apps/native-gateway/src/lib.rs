@@ -5,6 +5,7 @@ pub mod control;
 pub mod hold;
 pub mod kubernetes;
 pub mod sessions;
+pub mod sql;
 pub mod targets;
 pub mod telemetry;
 pub mod transport;

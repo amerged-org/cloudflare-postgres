@@ -49,15 +49,15 @@ pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
 /// How long a held wake connection waits for its release, counted from its upgrade.
 pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
 /// The time one write of frontend bytes to PostgreSQL may take.
-const WRITE_BOUND: Duration = Duration::from_secs(10);
+pub(crate) const WRITE_BOUND: Duration = Duration::from_secs(10);
 pub struct Config {
     pub region: String,
     pub keyring: Keyring,
     pub maximum_memory: usize,
     pub database_memory: usize,
 }
-struct Admission {
-    replay: ReplayCache,
+pub(crate) struct Admission {
+    pub(crate) replay: ReplayCache,
     counts: HashMap<String, usize>,
     total: usize,
 }
@@ -130,8 +130,10 @@ pub struct Gateway {
     pub draining: AtomicBool,
     /// The held connections of sleeping databases and their wake tickets.
     pub wakes: Arc<WakeQueue>,
-    admission: Mutex<Admission>,
-    memory: Arc<MemoryBudget>,
+    /// The idle sessions of HTTP SQL.
+    pub sql: crate::sql::Pool,
+    pub(crate) admission: Mutex<Admission>,
+    pub(crate) memory: Arc<MemoryBudget>,
 }
 impl Gateway {
     pub fn new(config: Arc<Config>, pod: String, dial: Arc<dyn PostgresDial>) -> Arc<Self> {
@@ -158,12 +160,13 @@ impl Gateway {
             control,
             draining: AtomicBool::new(false),
             wakes,
+            sql: crate::sql::Pool::default(),
             admission: Mutex::new(Admission::default()),
         })
     }
     /// Reserves the session of an admitted route. `replay` is false only for a held wake
     /// connection, whose route was checked against the replay cache when it was held.
-    fn reserve(
+    pub(crate) fn reserve(
         self: &Arc<Self>,
         claims: &RouteClaims,
         wire: WireBudget,
@@ -211,11 +214,11 @@ impl Gateway {
         ))
     }
 }
-struct SessionLease {
+pub(crate) struct SessionLease {
     gateway: Arc<Gateway>,
     database: String,
-    id: String,
-    target: TargetIdentity,
+    pub(crate) id: String,
+    pub(crate) target: TargetIdentity,
     wire: WireBudget,
 }
 impl Drop for SessionLease {
@@ -371,6 +374,9 @@ pub async fn serve_socket(
             },
         )
         .await;
+    }
+    if path == crate::sql::PATH {
+        return crate::sql::serve(socket, head, gateway, stop, handshake_permit, received).await;
     }
     if !upgrade(&head) {
         return control::reply(
@@ -545,7 +551,7 @@ fn websocket_config() -> WebSocketConfig {
         .max_message_size(Some(MAX_PAYLOAD_BYTES))
 }
 /// The memory one session holds before its first frame, or none within the gateway's bounds.
-fn session_memory(gateway: &Arc<Gateway>, database: &str) -> Option<Lease> {
+pub(crate) fn session_memory(gateway: &Arc<Gateway>, database: &str) -> Option<Lease> {
     let mut base = gateway.memory.lease(database);
     base.grow(SESSION_MEMORY_BYTES).then_some(base)
 }
@@ -568,7 +574,7 @@ async fn memory_refused(
     .await
 }
 /// What the fence shows of a wake ticket.
-enum WakeState {
+pub(crate) enum WakeState {
     /// Running at the ticket's generation and operation, with an admission target of that
     /// generation whose Pod is the writer the watches show. Its route revision is the ticket's or
     /// a later one: Cloudflare's own claim of the wake moves the revision on.
@@ -581,7 +587,7 @@ enum WakeState {
     /// The fence moved past the ticket: another generation or operation, or retirement.
     Stale,
 }
-async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
+pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
     // Global order whenever both are held: fences, then targets.
     let state = gateway.fences.read().await;
     let Some(fence) = state.records.get(&ticket.db) else {
@@ -616,7 +622,7 @@ async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
 }
 /// The route a released wake is admitted under: the ticket's connection at its generation, the
 /// released Pod, and the route revision of the admission target that released it.
-fn admitted_wake(ticket: &WakeClaims, pod: &str, route_revision: u64) -> RouteClaims {
+pub(crate) fn admitted_wake(ticket: &WakeClaims, pod: &str, route_revision: u64) -> RouteClaims {
     let mut claims = ticket.admitted(Some(pod));
     claims.route_revision = Some(route_revision);
     claims
@@ -1045,14 +1051,17 @@ async fn send_client(
 /// A write is done only when its TLS records reached the socket. Under backpressure tokio-rustls
 /// returns from `write_all` with records still queued, which only a later write would send,
 /// while the client already waits for PostgreSQL's reply; callers bound both steps together.
-async fn write_upstream(postgres: &mut TlsStream<TcpStream>, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_upstream(
+    postgres: &mut TlsStream<TcpStream>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     postgres.write_all(bytes).await?;
     postgres.flush().await
 }
 /// Ends a failed PostgreSQL session with close_notify and FIN within 500 ms, so PostgreSQL
 /// sees a clean end of stream instead of an unexpected EOF. A stream with queued TLS records is
 /// only dropped: its close_notify would first deliver bytes to a writer that may have changed.
-async fn close_upstream(postgres: &mut TlsStream<TcpStream>) {
+pub(crate) async fn close_upstream(postgres: &mut TlsStream<TcpStream>) {
     if !postgres.get_ref().1.wants_write() {
         let _ = timeout(Duration::from_millis(500), postgres.shutdown()).await;
     }
@@ -1246,7 +1255,7 @@ async fn startup(
 }
 /// The PostgreSQL a route is dialled at: the Pod it names, under the TLS name and authority the
 /// fence admitted for it (a v4 route), or the database's Service name.
-fn database_target(
+pub(crate) fn database_target(
     database: &str,
     bound: &TargetIdentity,
     admitted: Option<crate::kubernetes::AdmissionTarget>,
@@ -1425,7 +1434,7 @@ async fn relay(
 }
 /// A v3 route names the revision Cloudflare admitted; the running fence must still be it.
 /// Temporary rollout compatibility: a v2 route names no revision and keeps the fence checks.
-fn route_revision_current(state: &FenceState, claims: &RouteClaims) -> bool {
+pub(crate) fn route_revision_current(state: &FenceState, claims: &RouteClaims) -> bool {
     if claims.v == 4 {
         return claims
             .rev
@@ -1448,7 +1457,7 @@ fn route_revision_current(state: &FenceState, claims: &RouteClaims) -> bool {
         })
     })
 }
-fn admitted_runtime_current(
+pub(crate) fn admitted_runtime_current(
     state: &FenceState,
     claims: &RouteClaims,
     target: &TargetIdentity,
@@ -1475,7 +1484,7 @@ fn admitted_runtime_current(
 
 /// A v3 route names the verified primary Pod; the cached writer must be that Pod. The dial still
 /// uses the writer's address and service TLS name.
-fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {
+pub(crate) fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {
     match (claims.rev, claims.pod.as_deref()) {
         (Some(_), Some(pod)) => target.pod_uid == pod,
         (None, None) => true,
