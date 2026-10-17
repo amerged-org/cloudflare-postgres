@@ -188,6 +188,16 @@ async function hostWriter(f: Fixture, databaseId: string) {
     ).json(),
   ).databases.find((database) => database.database_id === databaseId);
 }
+/** The host lease permits a live thin database whatever its token says: no running writer is
+ * stopped for storage, and one writer per volume is the attach agent's holder rule. */
+async function expectPermitted(f: Fixture, databaseId: string) {
+  expect(await hostWriter(f, databaseId)).toMatchObject({
+    desired_state: "running",
+    runtime_authority: null,
+    startup_expires_at: expect.any(Number),
+    write_blocked: false,
+  });
+}
 
 it("grants neither a held token nor startup authority to a proven quiesced current writer", async () => {
   const f = await thinExecutionFixture(releases),
@@ -207,11 +217,7 @@ it("grants neither a held token nor startup authority to a proven quiesced curre
     .bind(held.created.id)
     .run();
   expect(await held.token()).toBeUndefined();
-  expect(await hostWriter(f, held.created.id)).toMatchObject({
-    runtime_authority: null,
-    startup_expires_at: null,
-    write_blocked: true,
-  });
+  await expectPermitted(f, held.created.id);
 });
 
 it("denies every current protected generation but preserves an authorized newer generation's startup", async () => {
@@ -238,11 +244,7 @@ it("denies every current protected generation but preserves an authorized newer 
       .first("storage_protected_generation"),
   ).toBe(held.created.generation);
   expect(await held.token()).toBeUndefined();
-  expect(await hostWriter(f, held.created.id)).toMatchObject({
-    runtime_authority: null,
-    startup_expires_at: null,
-    write_blocked: true,
-  });
+  await expectPermitted(f, held.created.id);
 
   // A newer physical read of IO limits cannot itself authorize resuming the protected generation.
   await identityProof(f, {
@@ -274,22 +276,11 @@ it("denies every current protected generation but preserves an authorized newer 
       "INSERT INTO database_start_admissions(operation_id,database_id,generation,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json) SELECT ?,database_id,?,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json FROM database_start_admissions WHERE database_id=? AND generation=?",
     ).bind(operation, next, held.created.id, held.created.generation),
   ]);
-  expect(await hostWriter(f, held.created.id)).toMatchObject({
-    generation: next,
-    write_blocked: false,
-    startup_operation_id: operation,
-    startup_expires_at: expect.any(Number),
-    runtime_authority: null,
-  });
+  await expectPermitted(f, held.created.id);
   expect((await held.ready({}, next, operation)).status).toBe(200);
   expect(await held.token()).toMatchObject({
     generation: next,
     pod_uid: held.pod,
-  });
-  expect(await hostWriter(f, held.created.id)).toMatchObject({
-    generation: next,
-    write_blocked: false,
-    runtime_authority: expect.stringMatching(/^sa1\./),
   });
 });
 
@@ -401,16 +392,7 @@ it("signs a first token for a held writer the controller attests, before any IO 
     storage_uid: held.receipt.storage_uid,
     write_allowed: true,
   });
-  // The host guard receives the same signed writer.
-  const guard = (await (
-    await request(`/agent/v1/nodes/${f.node}/storage-guard`, f.agent)
-  ).json()) as {
-    databases: { database_id: string; runtime_authority: string | null }[];
-  };
-  expect(
-    guard.databases.find((db) => db.database_id === held.created.id)
-      ?.runtime_authority,
-  ).toMatch(/^sa1\./);
+  await expectPermitted(f, held.created.id);
 });
 
 it("ends held-writer tokens when a post-Ready identity read still finds an active LV without IO limits", async () => {
@@ -428,23 +410,7 @@ it("ends held-writer tokens when a post-Ready identity read still finds an activ
   // Missing and unbounded io.max both reach the API as io: []; neither renews forever.
   await identityProof(f, held.authority);
   expect(await held.token()).toBeUndefined();
-  const guard = (await (
-    await request(`/agent/v1/nodes/${f.node}/storage-guard`, f.agent)
-  ).json()) as {
-    databases: {
-      database_id: string;
-      startup_expires_at: number | null;
-      write_blocked: boolean;
-      runtime_authority: string | null;
-    }[];
-  };
-  expect(
-    guard.databases.find((db) => db.database_id === held.created.id),
-  ).toMatchObject({
-    startup_expires_at: null,
-    write_blocked: true,
-    runtime_authority: null,
-  });
+  await expectPermitted(f, held.created.id);
 });
 
 it("keeps the held-writer allowance across fast renewals that retain pre-Ready inventory", async () => {

@@ -5,7 +5,6 @@ import {
   DesiredDatabaseStorage,
   NodeThinStorageAuthority,
   ThinStorageProfile,
-  base64urlToBytes,
   signStorageWriteAuthority,
   thinStorageAuthorityMatches,
   thinStorageInventory,
@@ -20,7 +19,6 @@ import { thinStorageSamplingProtocolCapable } from "./fleet-releases.ts";
 import { hotLogDue } from "./log-sampling.ts";
 import { parkedRecordFresh, readParkedRecord } from "./parked-tier.ts";
 import {
-  currentStartHoldSql,
   currentStorageStopSql,
   storageDrainReservationStatement,
   nodeThinStorageHeadroomSql,
@@ -867,109 +865,6 @@ export async function storageWriteAuthorityForDatabase(
 }
 
 /**
- * The writer a sleep's window continues: the running authority's own sources at the generation the
- * Pod was started for (the sleep bumped the row's generation from it). The node's single measured
- * Pod, or while no reading has measured one yet, the held writer: the startup hold plus the
- * controller's attestation of that start. Both have to name the same Pod, and a frozen volume or a
- * second measured Pod names none.
- */
-function stoppingWriter(
-  inputs: WriterInputs,
-  database: DatabaseRow,
-  storage: DesiredDatabaseStorage,
-  receipt: DatabaseStorageVolumeReceipt,
-  authority: NodeThinStorageAuthority,
-  qualification: string | null,
-): string | undefined {
-  const volumes = authority.volumes.filter(
-    (volume) =>
-      volume.database_id === database.id &&
-      volume.storage_generation === receipt.storage_generation &&
-      volume.generation <= database.generation,
-  );
-  if (volumes.length > 1) return undefined;
-  const volume = volumes[0];
-  if (
-    volume &&
-    (volume.quiesced ||
-      !volumeMatchesReceipt(volume, storage, receipt) ||
-      volume.io.length > 1)
-  )
-    return undefined;
-  const io = volume?.io[0];
-  if (
-    io &&
-    (io.write_bytes_per_second > storage.write_bytes_per_second ||
-      io.write_iops_per_second > storage.write_iops_per_second)
-  )
-    return undefined;
-  const started = inputs.started.get(database.id);
-  const held =
-    started === undefined
-      ? undefined
-      : heldWriterPod(
-          inputs,
-          database,
-          storage,
-          receipt,
-          authority,
-          qualification,
-          volume,
-          started,
-        );
-  if (io && held && io.pod_uid !== held) return undefined;
-  return io?.pod_uid ?? held;
-}
-
-/**
- * For the host lease only: the writer token of a database whose sleep is being carried out. The
- * desired state is already "suspended" while the controller still has to stop PostgreSQL
- * gracefully in the instance Pod (its sleep proof, then the stop). The guard freezes the volume and
- * kills the tasks of a Pod without a running entry and a token naming it, which would cut that stop
- * short, so until the stop operation of this generation leaves pending or running the Pod the node
- * evidences stays the running writer. The caller has checked the operation.
- */
-async function stoppingStorageWriteAuthority(
-  c: WriterContext,
-  database: DatabaseRow,
-): Promise<string | undefined> {
-  if (database.desired_state !== "suspended") return undefined;
-  const context = await currentWriterContext(c, database);
-  if (!context) return undefined;
-  const { storage, receipt, authority, current } = context;
-  const pod = stoppingWriter(
-    c.inputs,
-    database,
-    storage,
-    receipt,
-    authority,
-    current!.row.qualification_json,
-  );
-  if (!pod) return undefined;
-  return signStorageWriter(c, database, storage, receipt, authority, pod);
-}
-
-/**
- * For the host lease only: the writer token of a database that sleeps parked. The guard freezes
- * the volume and stops the tasks of any Pod whose entry is not a running one with a valid token
- * naming it, so a parked Pod has to be presented as the running writer it physically is.
- * Never used for desired state or headroom responses: nothing else may hold a token for it.
- */
-async function parkedStorageWriteAuthority(
-  c: WriterContext,
-  database: DatabaseRow,
-): Promise<string | undefined> {
-  if (database.desired_state !== "suspended" || !database.parked_json)
-    return undefined;
-  const context = await currentWriterContext(c, database);
-  if (!context) return undefined;
-  const { storage, receipt, authority } = context;
-  const pod = parkedHolder(c, database, storage, receipt, authority);
-  if (!pod) return undefined;
-  return signStorageWriter(c, database, storage, receipt, authority, pod);
-}
-
-/**
  * The writer token of every running thin database of a node: one reading of the node and one read
  * per kind of input, whatever the number of databases. It is the fast sample's token loop.
  * `reading` is the node's reading when the caller holds it already; the fast sample does, from the
@@ -1048,36 +943,23 @@ function hostLeaseScope(
   };
 }
 type LeaseRow = DatabaseRow & {
-  storage_gib: number;
-  stop_operation: string | null;
   host_snapshot_count: number;
-  startup_node_uid: string | null;
-  storage_budget_bytes: number | null;
-  startup_operation: string | null;
+  stop_operation: string | null;
 };
-/** What `storage_guard_served` shows of a signed writer token: the seconds it is still valid, to a
- * tenth, and the first characters of the Pod it names; null for what cannot be read. */
-function tokenSummary(token: string | null, now: number) {
-  try {
-    const claims = JSON.parse(
-      new TextDecoder().decode(base64urlToBytes(token!.split(".")[1]!)!),
-    ) as { exp?: unknown; pod_uid?: unknown };
-    return {
-      life:
-        typeof claims.exp === "number"
-          ? Math.round((claims.exp - now) / 100) / 10
-          : null,
-      pod:
-        typeof claims.pod_uid === "string" ? claims.pod_uid.slice(0, 6) : null,
-    };
-  } catch {
-    return { life: null, pod: null };
-  }
+/** The operation that created a database's archive: one stable id per database, whatever its
+ * generation, so the guard's startup-bound resume of a retained scope happens once. */
+function creationOperation(archivePath: string) {
+  return /-(op_[a-z0-9]{20})$/.exec(archivePath)?.[1] ?? null;
 }
-/** What `storage_guard_served` tells about each live entry, so a persisted log can be lined up
- * with the guard's actions second by second. No token or other secret is part of it. */
-const LEASE_LOG_LIVE_ENTRIES = 20;
 
+/**
+ * The host guard's lease (GET /agent/v1/nodes/:id/storage-guard). Exactly one writer per volume is
+ * the holder rule of the attach agent, never this lease, and no running writer is stopped for
+ * storage. So every live thin database of the node is permitted through its startup window, and
+ * one generation past D1's: the guard resumes a scope it retained once and carries no stale token
+ * forward. Neither the node's reading, its write permission nor the database's sleep enters it.
+ * Deleted databases keep their tombstone and delete drain until the guard retires them.
+ */
 export async function hostStorageLease(
   c: import("../env.ts").ApiContext,
   id: string,
@@ -1088,7 +970,8 @@ export async function hostStorageLease(
     await import("@pgcf/contracts/node-thin-storage");
   const { ApiError } = await import("../app.ts");
   const region = await agentRegion(c),
-    now = Date.now();
+    now = Date.now(),
+    expiresAt = now + 120000;
   const node = await c.env.DB.prepare(
     `SELECT n.node_uid,r.bootstrap_material_revision FROM nodes n JOIN regions r ON r.id=n.region_id WHERE n.id=? AND n.region_id=? AND n.node_uid IS NOT NULL AND n.ready=1 AND n.lost_at IS NULL`,
   )
@@ -1099,22 +982,18 @@ export async function hostStorageLease(
       "not_found",
       "Current physical storage host unavailable",
     );
-  // Every read the lease needs is independent of the others, and none is made per database: the
-  // node's reading, and one batch for its databases and their inputs.
   const scope = hostLeaseScope(id, region.id, now);
   const [current, read] = await Promise.all([
     readCurrentNodeThinStorage(c.env, id, now, "continuing"),
-    readWriterInputs<LeaseRow>(
-      c.env,
-      scope,
-      c.env.DB.prepare(
-        `SELECT d.*,COUNT(*) OVER() host_snapshot_count,s.storage_gib,a.node_uid startup_node_uid,a.storage_budget_bytes,a.operation_id startup_operation,
+    c.env.DB.prepare(
+      `SELECT d.*,COUNT(*) OVER() host_snapshot_count,
  (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation,'status',stop.status) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
- FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON ${currentStartHoldSql()} AND a.node_uid=? WHERE ${scope.sql} ORDER BY d.id`,
-      ).bind(node.node_uid, ...scope.bindings),
-    ),
+ FROM databases d WHERE ${scope.sql} ORDER BY d.id`,
+    )
+      .bind(...scope.bindings)
+      .all<LeaseRow>(),
   ]);
-  const rows = read.rows;
+  const rows = read.results;
   if (rows.some((row) => row.host_snapshot_count !== rows.length))
     throw new ApiError(
       "conflict",
@@ -1136,7 +1015,7 @@ export async function hostStorageLease(
       "conflict",
       "Current qualified physical boot unavailable",
     );
-  const writers = writerContext(c.env, now, read.inputs, current);
+  const authority = current?.authority;
   const databases = [];
   const legacy = [];
   for (const row of rows) {
@@ -1151,17 +1030,40 @@ export async function hostStorageLease(
     const storage = DesiredDatabaseStorage.parse(
       JSON.parse(row.storage_profile_json),
     );
-    const authority = current?.authority;
+    // A volume bound on another node identity was never this host's.
+    if (storage.node_uid !== node.node_uid) continue;
     const receipt = row.storage_volume_json
       ? DatabaseStorageVolumeReceipt.parse(JSON.parse(row.storage_volume_json))
       : null;
+    const identity = {
+      database_id: row.id,
+      authority_revision: current?.row.authority_revision ?? 0,
+      node_uid: storage.node_uid,
+      volume_group_uuid: storage.volume_group_uuid,
+      pool_uuid: storage.pool_uuid,
+      profile_sha256: storage.profile_sha256,
+      runtime_authority: null,
+    };
+    if (row.desired_state !== "deleted") {
+      const startup = creationOperation(row.archive_path);
+      databases.push({
+        ...identity,
+        generation: row.generation + 1,
+        write_blocked: false,
+        desired_state: "running" as const,
+        startup_expires_at: startup ? expiresAt : null,
+        startup_operation_id: startup,
+        volume: receipt,
+        drain: null,
+      });
+      continue;
+    }
     // Tombstones are explicit: only completed deletion and a later complete Native absence
     // read can declare no volume. Missing/paginated rows never authorize protective-scope GC.
     // The absence read stays usable while its inventory is fresh, also once its short write
     // authority lapsed: after the last thin LV CSI removes the pool, and nothing samples it.
     const reclaimed = Boolean(
       row.deleted_at &&
-      row.desired_state === "deleted" &&
       row.observed_state === "deleted" &&
       row.observed_generation === row.generation &&
       receipt &&
@@ -1173,17 +1075,6 @@ export async function hostStorageLease(
         now,
       ),
     );
-    const writerProtected = storageWriterProtected(row, authority);
-    // A parked database (D1: suspended, idle, hibernated) still holds its own Pod with PostgreSQL
-    // stopped. The host guard stops the tasks and freezes the volume of any Pod whose entry is not
-    // running with a valid token naming it, and it retires the previous holder when the next
-    // generation starts without one. So the lease says "running" for this suspended database: no
-    // write can happen (no postmaster, the gateway refuses), and the token exists only while the
-    // controller's report is fresh and the node's own reading evidences exactly that Pod.
-    const parkedAuthority =
-      row.desired_state === "suspended" && row.parked_json
-        ? await parkedStorageWriteAuthority(writers, row)
-        : undefined;
     const stop = row.stop_operation
       ? (JSON.parse(row.stop_operation) as {
           operation_id: string;
@@ -1192,39 +1083,9 @@ export async function hostStorageLease(
           status: string;
         })
       : undefined;
-    // The same holds while a sleep is being carried out: until its stop operation of this
-    // generation is no longer pending or running, the Pod stopping PostgreSQL is the writer.
-    const stoppingAuthority =
-      parkedAuthority === undefined &&
-      stop !== undefined &&
-      stop.kind !== "database.delete" &&
-      stop.generation === row.generation &&
-      (stop.status === "pending" || stop.status === "running")
-        ? await stoppingStorageWriteAuthority(writers, row)
-        : undefined;
-    const presentedRunning = parkedAuthority ?? stoppingAuthority;
-    const runtimeAuthority =
-      presentedRunning ?? (await runningWriterAuthority(writers, row));
-    // Startup authority cannot substitute forever for missing IO evidence of a Ready writer.
-    const readyWithoutWriter =
-      row.desired_state === "running" &&
-      row.observed_state === "ready" &&
-      row.observed_generation === row.generation &&
-      runtimeAuthority === undefined;
-    const admitted =
-      row.desired_state === "running" &&
-      !writerProtected &&
-      !readyWithoutWriter &&
-      row.startup_operation !== null &&
-      row.startup_node_uid === storage.node_uid &&
-      row.storage_budget_bytes !== null &&
-      row.storage_budget_bytes >=
-        Math.max(storage.startup_reserve_bytes, row.storage_gib * 1024 ** 3) &&
-      thinStorageAuthorityMatches(storage, authority, undefined, now);
     let drain:
       import("@pgcf/contracts/node-thin-storage").HostStorageDrain | null =
       null;
-    // A sleep needs no drain: its Pod keeps writing under the token above until the stop ends.
     if (
       stop?.kind === "database.delete" &&
       receipt &&
@@ -1272,29 +1133,13 @@ export async function hostStorageLease(
       }
     }
     databases.push({
-      database_id: row.id,
+      ...identity,
       generation: row.generation,
-      authority_revision: current?.row.authority_revision ?? 0,
-      write_blocked:
-        drain !== null
-          ? true
-          : row.desired_state === "deleted"
-            ? !reclaimed
-            : writerProtected ||
-              readyWithoutWriter ||
-              !current ||
-              current.row.error_code !== null ||
-              current.row.status === "blocked",
-      desired_state: presentedRunning ? "running" : row.desired_state,
-      node_uid: storage.node_uid,
-      volume_group_uuid: storage.volume_group_uuid,
-      pool_uuid: storage.pool_uuid,
-      profile_sha256: storage.profile_sha256,
-      startup_expires_at:
-        admitted && authority ? Date.parse(authority.expires_at) : null,
-      startup_operation_id: admitted ? row.startup_operation : null,
+      write_blocked: drain !== null || !reclaimed,
+      desired_state: row.desired_state,
+      startup_expires_at: null,
+      startup_operation_id: null,
       volume: reclaimed ? null : receipt,
-      runtime_authority: runtimeAuthority ?? null,
       drain,
     });
   }
@@ -1304,22 +1149,14 @@ export async function hostStorageLease(
     boot_id: bootId ?? null,
     material_revision: node.bootstrap_material_revision,
     issued_at: now,
-    expires_at: now + 120000,
+    expires_at: expiresAt,
     legacy,
     databases,
   });
   const served = Date.now();
-  const live = lease.databases.filter(
-    (entry) => entry.desired_state !== "deleted",
-  );
-  // One lease in thirty per node, the first after a silence, and every lease that blocks a live
-  // database: the lines a stop of the guard is read against are never the ones left out.
-  if (
-    hotLogDue("storage_guard_served", id, served) ||
-    live.some((entry) => entry.write_blocked)
-  ) {
-    const parked = new Set(
-      rows.filter((row) => row.parked_json).map((row) => row.id),
+  if (hotLogDue("storage_guard_served", id, served)) {
+    const live = lease.databases.filter(
+      (entry) => entry.desired_state !== "deleted",
     );
     console.log(
       JSON.stringify({
@@ -1327,23 +1164,8 @@ export async function hostStorageLease(
         node_id: id,
         entries: lease.databases.length,
         tombstones: lease.databases.length - live.length,
+        unbound: live.filter((entry) => entry.volume === null).length,
         elapsed_ms: served - started,
-        live: live.slice(0, LEASE_LOG_LIVE_ENTRIES).map((entry) => {
-          const token = tokenSummary(entry.runtime_authority, served);
-          return {
-            id: entry.database_id.slice(0, 6),
-            generation: entry.generation,
-            revision: entry.authority_revision,
-            write_blocked: entry.write_blocked,
-            token: entry.runtime_authority !== null,
-            token_life_s: token.life,
-            token_pod: token.pod,
-            startup_valid:
-              entry.startup_expires_at !== null &&
-              entry.startup_expires_at > served,
-            parked: parked.has(entry.database_id),
-          };
-        }),
       }),
     );
   }

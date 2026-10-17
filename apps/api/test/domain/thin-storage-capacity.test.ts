@@ -795,9 +795,12 @@ it("a retained protected generation emits no startup grant but a real newer reco
     };
   };
   expect((await desired()).storage_startup).toBeUndefined();
-  expect(
-    (await host()).databases.find((db) => db.database_id === id),
-  ).toMatchObject({ startup_operation_id: null, startup_expires_at: null });
+  // The host lease permits the database whatever its holds say, under its creation operation.
+  const permit = (await host()).databases.find((db) => db.database_id === id)!;
+  expect(permit).toMatchObject({
+    startup_operation_id: expect.stringMatching(/^op_/),
+    startup_expires_at: expect.any(Number),
+  });
   expect((await holds()).results).toEqual(retained);
   const resumed = DatabaseWithOperation.parse(
     await (
@@ -818,7 +821,7 @@ it("a retained protected generation emits no startup grant but a real newer reco
   expect(
     (await host()).databases.find((db) => db.database_id === id)
       ?.startup_operation_id,
-  ).toBe(resumed.operation.id);
+  ).toBe(permit.startup_operation_id);
   expect((await holds()).results[0]).toEqual(retained[0]);
 });
 it("an uncertain unready hold stays reserved but cannot restart its protected generation", async () => {
@@ -850,9 +853,10 @@ it("an uncertain unready hold stays reserved but cannot restart its protected ge
   const host = (await response.json()) as {
     databases: { database_id: string; startup_operation_id: string | null }[];
   };
+  // The host lease permits it all the same: no running writer is stopped for storage.
   expect(
     host.databases.find((db) => db.database_id === id)!.startup_operation_id,
-  ).toBeNull();
+  ).toBe(created.operation.id);
   expect(
     await env.DB.prepare(
       "SELECT operation_id,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=?",
@@ -1273,7 +1277,7 @@ it("a protected 4 GiB tenant drains a real delete intent with zero additional RA
       databases: {
         database_id: string;
         desired_state: string;
-        startup_operation_id: null;
+        startup_operation_id: string | null;
         runtime_authority: null;
         drain: null | {
           operation_id: string;
@@ -1283,13 +1287,13 @@ it("a protected 4 GiB tenant drains a real delete intent with zero additional RA
       }[];
     };
   };
-  // A sleep never drains: its Pod stays the writer until the stop ends (here the frozen volume is a
-  // protective stop, so not even that), and no storage hold is reserved for it.
+  // A sleep never drains: the host lease permits the database as a running writer, and no
+  // storage hold is reserved for it.
   const value = (await host()).databases[0]!;
   expect(value).toMatchObject({
     database_id: created.database.id,
-    desired_state: "suspended",
-    startup_operation_id: null,
+    desired_state: "running",
+    startup_operation_id: created.operation.id,
     runtime_authority: null,
     drain: null,
   });

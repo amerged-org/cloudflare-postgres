@@ -336,60 +336,7 @@ it("a_parked_database_can_be_resized_while_it_counts_as_cold", async () => {
   }
 });
 
-it("a_parked_database_gets_a_running_lease_entry_with_a_token_for_the_parked_pod", async () => {
-  const w = await awakeWriter(await thinExecutionFixture(releases));
-  // Awake, the entry is the ordinary running one with the Pod's token.
-  expect(await leaseEntry(w.f, w.id)).toMatchObject({
-    desired_state: "running",
-    generation: 1,
-    runtime_authority: expect.stringMatching(/^sa1\./),
-  });
-  const intent = await parkedWriter(w);
-  const entry = await leaseEntry(w.f, w.id);
-  // The host guard sees a running writer with a valid token naming the parked Pod: it must not
-  // freeze the volume or stop the Pod's tasks. There is no drain and no startup grant.
-  expect(entry).toMatchObject({
-    database_id: w.id,
-    generation: intent.generation,
-    desired_state: "running",
-    write_blocked: false,
-    startup_expires_at: null,
-    startup_operation_id: null,
-    drain: null,
-    volume: w.receipt,
-    runtime_authority: expect.stringMatching(/^sa1\./),
-  });
-  const claims = claimsOf(entry.runtime_authority)!;
-  expect(claims).toMatchObject({
-    database_id: w.id,
-    generation: intent.generation,
-    authority_revision: entry.authority_revision,
-    pod_uid: w.pod,
-    storage_uid: w.receipt.storage_uid,
-    lv_uuid: w.receipt.lv_uuid,
-    pvc_uid: w.receipt.pvc_uid,
-    pv_uid: w.receipt.pv_uid,
-    write_allowed: true,
-  });
-  // D1 still says suspended: only the host lease presents the Pod as the writer it physically is.
-  expect(await databaseRow(w.id)).toMatchObject({
-    desired_state: "suspended",
-    suspension_reason: "idle",
-    observed_power: "hibernated",
-  });
-  // A plain hibernated database stays the ordinary suspended entry, byte for byte.
-  await env.DB.prepare("UPDATE databases SET parked_json=NULL WHERE id=?")
-    .bind(w.id)
-    .run();
-  expect(await leaseEntry(w.f, w.id)).toMatchObject({
-    desired_state: "suspended",
-    startup_expires_at: null,
-    startup_operation_id: null,
-    runtime_authority: null,
-  });
-});
-
-it("the_first_lease_after_a_wake_claim_carries_a_token_for_the_new_generation_and_the_same_pod", async () => {
+it("the_first_desired_pull_after_a_wake_claim_carries_a_token_for_the_new_generation_and_the_same_pod", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases));
   // The controller claims the fast wake: the Pod and everything it runs are unchanged.
   const parked = await parkedWriter(w, "fast");
@@ -403,25 +350,7 @@ it("the_first_lease_after_a_wake_claim_carries_a_token_for_the_new_generation_an
   expect(resumed.status).toBe(202);
   const wake = DatabaseWithOperation.parse(await resumed.json());
   expect(wake.database.generation).toBe(parked.generation + 1);
-  const entry = await leaseEntry(w.f, w.id);
-  // The guard never sees the startup entry of the new generation without a token that names the
-  // Pod it would otherwise retire.
-  expect(entry).toMatchObject({
-    generation: wake.database.generation,
-    desired_state: "running",
-    write_blocked: false,
-    startup_operation_id: wake.operation.id,
-    startup_expires_at: expect.any(Number),
-    drain: null,
-    runtime_authority: expect.stringMatching(/^sa1\./),
-  });
-  expect(claimsOf(entry.runtime_authority)).toMatchObject({
-    generation: wake.database.generation,
-    authority_revision: entry.authority_revision,
-    pod_uid: w.pod,
-    lv_uuid: w.receipt.lv_uuid,
-  });
-  // The controller receives the same signed claims in its first desired pull of the wake.
+  // The controller receives the parked Pod's signed claims in its first desired pull of the wake.
   const record = (await desired(w)).databases.find((d) => d.id === w.id)!;
   expect(claimsOf(record.storage_authority)).toMatchObject({
     generation: wake.database.generation,
@@ -431,171 +360,11 @@ it("the_first_lease_after_a_wake_claim_carries_a_token_for_the_new_generation_an
   expect(
     (await w.ready(wake.database.generation, wake.operation.id)).status,
   ).toBe(200);
-  const awake = await leaseEntry(w.f, w.id);
-  expect(claimsOf(awake.runtime_authority)).toMatchObject({
+  const awake = (await desired(w)).databases.find((d) => d.id === w.id)!;
+  expect(claimsOf(awake.storage_authority)).toMatchObject({
     generation: wake.database.generation,
     pod_uid: w.pod,
   });
-});
-
-it("a_wake_without_the_fast_claim_or_after_a_generation_jump_carries_no_token_for_the_parked_pod", async () => {
-  const resume = async (w: AwakeWriter) => {
-    const response = await request(
-      `/v1/databases/${w.id}/resume`,
-      w.f.integrator,
-      "POST",
-      undefined,
-      crypto.randomUUID(),
-    );
-    expect(response.status).toBe(202);
-    return DatabaseWithOperation.parse(await response.json());
-  };
-  // Parked without the claim: an ordinary wake. The startup entry carries no token, so the guard
-  // retires the parked Pod and lets the controller's replacement start.
-  const plain = await awakeWriter(await thinExecutionFixture(releases));
-  await parkedWriter(plain);
-  const ordinary = await resume(plain);
-  expect(await leaseEntry(plain.f, plain.id)).toMatchObject({
-    generation: ordinary.database.generation,
-    desired_state: "running",
-    startup_operation_id: ordinary.operation.id,
-    startup_expires_at: expect.any(Number),
-    runtime_authority: null,
-  });
-  // Claimed, but the generation moved after the reported sleep (a resize while parked).
-  const w = await awakeWriter(await thinExecutionFixture(releases));
-  const parked = await parkedWriter(w, "fast");
-  const target = "r" + crypto.randomUUID().replaceAll("-", "").slice(0, 20);
-  await env.DB.prepare(
-    `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,enabled,created_at,updated_at)
-    SELECT ?,1024,750,storage_gib,80,sleep_after_seconds,archive_timeout_seconds,backup_retention_days,1,created_at,updated_at FROM size_classes WHERE id=?`,
-  )
-    .bind(target, w.f.size)
-    .run();
-  try {
-    const resized = await request(
-      `/v1/databases/${w.id}`,
-      w.f.integrator,
-      "PATCH",
-      { size_class_id: target },
-      crypto.randomUUID(),
-    );
-    expect(resized.status).toBe(202);
-    // The node's next reading sees the volume at the resized generation, which a wake needs.
-    await w.evidence({ generation: parked.generation + 1 });
-    const wake = await resume(w);
-    expect(wake.database.generation).toBe(parked.generation + 2);
-    expect(await leaseEntry(w.f, w.id)).toMatchObject({
-      generation: wake.database.generation,
-      desired_state: "running",
-      startup_operation_id: wake.operation.id,
-      runtime_authority: null,
-    });
-  } finally {
-    await env.DB.prepare("UPDATE databases SET size_class_id=? WHERE id=?")
-      .bind(w.f.size, w.id)
-      .run();
-    await env.DB.prepare("DELETE FROM size_classes WHERE id=?")
-      .bind(target)
-      .run();
-  }
-});
-
-it("parked_token_requires_io_evidence_for_the_attested_pod_and_a_fresh_controller_observation", async () => {
-  const w = await awakeWriter(await thinExecutionFixture(releases)),
-    parked = await parkedWriter(w);
-  const token = async () => (await leaseEntry(w.f, w.id)).runtime_authority;
-  const refused = async (reason: string) => {
-    const entry = await leaseEntry(w.f, w.id);
-    expect(entry, reason).toMatchObject({
-      desired_state: "suspended",
-      startup_operation_id: null,
-      runtime_authority: null,
-    });
-  };
-  // io.max of the attested Pod is the evidence, read at the sleep's generation ...
-  expect(await token()).toMatch(/^sa1\./);
-  // ... and still the evidence when the identity proof has not yet re-read the volume since.
-  await w.evidence({ generation: 1 });
-  expect(await token()).toMatch(/^sa1\./);
-  await w.evidence({ generation: parked.generation });
-  // No evidence, evidence of another Pod, or of two Pods name no writer.
-  await w.evidence({ io: [] });
-  await refused("no io evidence");
-  await w.evidence({ io: [{ pod_uid: crypto.randomUUID(), ...w.limits }] });
-  await refused("another Pod");
-  await w.evidence({
-    io: [
-      { pod_uid: w.pod, ...w.limits },
-      { pod_uid: crypto.randomUUID(), ...w.limits },
-    ],
-  });
-  await refused("two writers");
-  // Limits above the profile are never evidence.
-  await w.evidence({
-    io: [
-      {
-        pod_uid: w.pod,
-        write_bytes_per_second: w.limits.write_bytes_per_second + 1,
-        write_iops_per_second: w.limits.write_iops_per_second,
-      },
-    ],
-  });
-  await refused("limits above the profile");
-  // A volume the guard froze is not a parked writer.
-  await w.evidence({ quiesced: true, io: [] });
-  await refused("quiesced volume");
-  await w.evidence({ generation: parked.generation });
-  expect(await token()).toMatch(/^sa1\./);
-  // A hint older than 180 s is no longer the controller's word.
-  const aged = (seconds: number) =>
-    env.DB.prepare(
-      "UPDATE databases SET parked_json=json_set(parked_json,'$.observed_at',?) WHERE id=?",
-    )
-      .bind(new Date(Date.now() - seconds * 1000).toISOString(), w.id)
-      .run();
-  await aged(181);
-  await refused("stale controller observation");
-  await aged(170);
-  expect(await token()).toMatch(/^sa1\./);
-  // A Pod the controller never attested for this record is not trusted either.
-  await env.DB.prepare(
-    "UPDATE databases SET parked_json=json_set(parked_json,'$.pod_uid',?) WHERE id=?",
-  )
-    .bind(crypto.randomUUID(), w.id)
-    .run();
-  await refused("hint names a Pod without evidence");
-  await env.DB.prepare(
-    "UPDATE databases SET parked_json=json_set(parked_json,'$.pod_uid',?) WHERE id=?",
-  )
-    .bind(w.pod, w.id)
-    .run();
-  expect(await token()).toMatch(/^sa1\./);
-  // Only an idle sleep: a manual suspend of the parked database is the ordinary stop.
-  await env.DB.prepare(
-    "UPDATE databases SET suspension_reason='manual' WHERE id=?",
-  )
-    .bind(w.id)
-    .run();
-  await refused("manual suspension");
-  await env.DB.prepare(
-    "UPDATE databases SET suspension_reason='idle' WHERE id=?",
-  )
-    .bind(w.id)
-    .run();
-  // Unknown shapes fail closed.
-  await env.DB.prepare(
-    "UPDATE databases SET parked_json=json_set(parked_json,'$.v',2) WHERE id=?",
-  )
-    .bind(w.id)
-    .run();
-  await refused("unknown record version");
-  await env.DB.prepare(
-    "UPDATE databases SET parked_json=json_set(parked_json,'$.v',1) WHERE id=?",
-  )
-    .bind(w.id)
-    .run();
-  expect(await token()).toMatch(/^sa1\./);
 });
 
 it("headroom_tokens_and_desired_records_carry_no_token_for_a_parked_database_before_wake", async () => {
@@ -621,11 +390,8 @@ it("headroom_tokens_and_desired_records_carry_no_token_for_a_parked_database_bef
   expect(
     (await desired(w)).databases.find((d) => d.id === w.id)!.storage_authority,
   ).toBeDefined();
-  // ... but a parked database, whose host lease says running, appears in neither.
+  // ... but a parked database appears in neither.
   await parkedWriter(w);
-  expect(await leaseEntry(f, w.id)).toMatchObject({
-    runtime_authority: expect.stringMatching(/^sa1\./),
-  });
   expect(await tokens()).not.toContain(w.id);
   const record = (await desired(w)).databases.find((d) => d.id === w.id)!;
   expect(record).toMatchObject({ desired_state: "suspended" });

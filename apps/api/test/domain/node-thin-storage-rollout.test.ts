@@ -80,7 +80,8 @@ const qualification = (w: AwakeWriter) =>
   )
     .bind(w.f.node)
     .first<string>("qualification_json");
-/** Everything the guard and the controller are given for the node, as a pause shows it. */
+/** Everything the guard and the controller are given for the node, as a pause shows it: the
+ * host lease keeps permitting the running writer, no rollout stops it. */
 async function paused(w: AwakeWriter, leased = true) {
   expect(await renewal(w)).toMatchObject({
     accepted: false,
@@ -89,7 +90,8 @@ async function paused(w: AwakeWriter, leased = true) {
     tokens: [],
   });
   expect(await leaseEntry(w.f, w.id)).toMatchObject({
-    write_blocked: true,
+    desired_state: "running",
+    write_blocked: false,
     runtime_authority: null,
   });
   const page = await desired(w);
@@ -160,14 +162,15 @@ it("keeps the storage_nodes entry, the storage_samples target and the database t
   ).toMatchObject({ database_id: w.id, write_allowed: true });
 });
 
-it("serves the running entry with its token and the proven boot in the host lease during such a rollout", async () => {
+it("serves the running entry and the proven boot in the host lease during such a rollout", async () => {
   const w = await awake();
   await renewal(w);
   await assignRelease(w.f, releases);
   expect((await lease(w)).boot_id).toBe(w.f.qualified.bootId);
   expect(await leaseEntry(w.f, w.id)).toMatchObject({
+    desired_state: "running",
     write_blocked: false,
-    runtime_authority: expect.stringMatching(/^sa1\./),
+    runtime_authority: null,
   });
 });
 

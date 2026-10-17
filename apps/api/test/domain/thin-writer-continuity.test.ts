@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// A running thin database must never meet the host guard with an entry that has neither a token
-// nor a startup grant: the guard stops the Pod of such an entry at once. These are the moments the
-// node's identity proof, which names the Pod up to a minute and a half after a start, has not
-// caught up with a running database: a start whose first ready report was followed by one without
-// an attestation, a role change that advances the generation without starting anything, and a
-// parked wake. Real D1 fixtures; controlled metadata, no live evidence.
+// The writer token the controller and the gateway read for a running thin database, at the
+// moments the node's identity proof, which names the Pod up to a minute and a half after a start,
+// has not caught up: a start whose first ready report was followed by one without an attestation,
+// a role change that advances the generation without starting anything, and a parked wake. The host
+// lease permits every live database regardless. Real D1 fixtures; controlled metadata, no live
+// evidence.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -124,25 +124,23 @@ const desiredToken = async (w: AwakeWriter) =>
     await (await request("/agent/v1/desired", w.f.agent)).json(),
   ).databases.find((database) => database.id === w.id)?.storage_authority;
 
-/** What the guard is given at this moment, from every source: the lease, the sample, the desired
- * page. Each has to name `pod` at `generation`. */
+/** What the controller and the gateway are given at this moment: the sample's and the desired
+ * page's token, each naming `pod` at `generation`. The host lease permits the database whatever
+ * the token says. */
 async function expectWriter(w: AwakeWriter, generation: number, pod = w.pod) {
   const entry = await leaseEntry(w.f, w.id);
   expect(entry).toMatchObject({
-    generation,
+    generation: generation + 1,
     desired_state: "running",
     write_blocked: false,
-    runtime_authority: expect.stringMatching(/^sa1\./),
-  });
-  expect(claimsOf(entry.runtime_authority)).toMatchObject({
-    database_id: w.id,
-    generation,
-    pod_uid: pod,
-    authority_revision: entry.authority_revision,
-    lv_uuid: w.receipt.lv_uuid,
+    runtime_authority: null,
   });
   const token = (await sampled(w)).find((value) => value.database_id === w.id);
-  expect(claimsOf(token?.token)).toMatchObject({ generation, pod_uid: pod });
+  expect(claimsOf(token?.token)).toMatchObject({
+    generation,
+    pod_uid: pod,
+    lv_uuid: w.receipt.lv_uuid,
+  });
   expect(claimsOf(await desiredToken(w))).toMatchObject({
     generation,
     pod_uid: pod,
@@ -230,13 +228,12 @@ it("carries a parked wake's writer through every lease from the claim to the pro
   );
   const wake = DatabaseWithOperation.parse(await resumed.json());
   expect(wake.database.generation).toBe(generation);
-  // Claimed: the startup grant and the parked Pod's token travel together.
+  // Claimed: the parked Pod's token; the lease's startup operation is the database's own.
   const claimed = await expectWriter(w, generation);
-  expect(claimed.startup_operation_id).toBe(wake.operation.id);
-  // The ready report commits: the grant ends with the start, the held writer takes the token over.
+  // The ready report commits: the held writer takes the token over.
   expect((await w.ready(generation, wake.operation.id)).status).toBe(200);
   const ready = await expectWriter(w, generation);
-  expect(ready.startup_operation_id).toBeNull();
+  expect(ready.startup_operation_id).toBe(claimed.startup_operation_id);
   // Kubelet and CNPG status writes follow within a second, and the controller's next report of
   // the generation has no attestation.
   expect(
@@ -281,13 +278,12 @@ it("claims a parked wake on the proof of the start and carries the parked writer
     generation,
     power_operation: claim.operation,
   });
-  // The startup grant and the parked Pod's token travel together in the first lease of the wake,
-  // from the reading of the earlier generation, so the guard retires nothing.
+  // The parked Pod's token in the first reading of the wake, from the reading of the earlier
+  // generation.
   const claimed = await expectWriter(w, generation);
-  expect(claimed.startup_operation_id).toBe(claim.operation);
   expect((await w.ready(generation, claim.operation)).status).toBe(200);
   const ready = await expectWriter(w, generation);
-  expect(ready.startup_operation_id).toBeNull();
+  expect(ready.startup_operation_id).toBe(claimed.startup_operation_id);
   // The proof prepared at the wake's generation measures the Pod: exact evidence from then on.
   await w.evidence({ generation });
   await expectWriter(w, generation);
@@ -305,12 +301,11 @@ it("names no writer when the node's reading and the controller's attestation nam
       })
     ).status,
   ).toBe(200);
-  const entry = await leaseEntry(w.f, w.id);
-  expect(entry).toMatchObject({
-    generation: 2,
-    write_blocked: true,
+  // The host lease still permits it: one writer is the holder rule's, not a token's.
+  expect(await leaseEntry(w.f, w.id)).toMatchObject({
+    generation: 3,
+    write_blocked: false,
     runtime_authority: null,
-    startup_operation_id: null,
   });
   expect(
     (await sampled(w)).find((token) => token.database_id === w.id),
@@ -368,10 +363,10 @@ it("keeps a start's startup grant, in the lease and in the desired page, across 
   expect(created.status).toBe(201);
   expect((await databaseRow(id)).generation).toBe(2);
   const after = await startup();
-  // The role change started nothing: the grant of the start under way still covers the Pod, now at
-  // the row's generation, and the controller's own check of it sees the same.
+  // The role change started nothing: the grant of the start under way still covers the Pod, one
+  // past the row's generation, and the controller's own check of it sees the same.
   expect(after.entry).toMatchObject({
-    generation: 2,
+    generation: 3,
     write_blocked: false,
     startup_operation_id: before.entry.startup_operation_id,
     startup_expires_at: expect.any(Number),
@@ -396,8 +391,7 @@ it("keeps a parked wake's token and grant across a role change before the contro
   expect(wake.database.generation).toBe(parked.generation + 1);
   expect((await createRole(w, "reader")).status).toBe(201);
   const generation = parked.generation + 2;
-  const entry = await expectWriter(w, generation);
-  expect(entry.startup_operation_id).toBe(wake.operation.id);
+  await expectWriter(w, generation);
   // The controller's report of the generation it applied the role in: ready, same Pod.
   expect((await w.ready(generation, wake.operation.id)).status).toBe(200);
   await expectWriter(w, generation);
@@ -418,12 +412,12 @@ it("does not let a role change release a protective stop", async () => {
     .run();
   expect((await leaseEntry(w.f, w.id)).runtime_authority).toBeNull();
   expect((await createRole(w, "reader")).status).toBe(201);
-  // The generation moved, the stop's marker did not: nothing carries a writer over it.
-  const entry = await leaseEntry(w.f, w.id);
-  expect(entry).toMatchObject({
-    generation: 2,
+  // The generation moved, the stop's marker did not: no token carries a writer over it, and the
+  // host lease permits the database as every other.
+  expect(await leaseEntry(w.f, w.id)).toMatchObject({
+    generation: 3,
+    write_blocked: false,
     runtime_authority: null,
-    startup_operation_id: null,
   });
   expect(
     (await sampled(w)).find((token) => token.database_id === w.id),
@@ -545,7 +539,8 @@ it("does not carry a writer over a role change from a reading that found the vol
   await w.evidence({ quiesced: true });
   expect((await createRole(w, "reader")).status).toBe(201);
   expect(await leaseEntry(w.f, w.id)).toMatchObject({
-    generation: 2,
+    generation: 3,
+    write_blocked: false,
     runtime_authority: null,
   });
   expect(
