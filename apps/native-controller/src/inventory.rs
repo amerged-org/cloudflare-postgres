@@ -130,20 +130,6 @@ fn memory(node: &Value, summary: &Value) -> Option<Value> {
         json!({"node_uid":node["metadata"]["uid"],"observed_at":iso_millis(text(source,"time"))?,"working_set_bytes":working,"capacity_memory_bytes":capacity as u64,"available_bytes":available,"memory_pressure":pressure,"cpu_usage_nano_cores":usage,"capacity_cpu_millicores":capacity_cpu}),
     )
 }
-/// Storage scrapes run off this path; one older than two minutes no longer describes the node.
-fn fresh_storage(
-    samples: &HashMap<String, Value>,
-    uid: &str,
-    now: time::OffsetDateTime,
-) -> Option<Value> {
-    let sample = samples.get(uid)?;
-    let observed = time::OffsetDateTime::parse(
-        text(sample, "observed_at"),
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()?;
-    (observed >= now - time::Duration::seconds(120)).then(|| sample.clone())
-}
 fn stable_node(before: &Value, after: Option<&Value>) -> bool {
     after.is_some_and(|after| {
         after["metadata"]["uid"] == before["metadata"]["uid"]
@@ -154,12 +140,28 @@ fn stable_node(before: &Value, after: Option<&Value>) -> bool {
             && after["metadata"]["deletionTimestamp"].is_null()
     })
 }
+/// One inventory of the region: each Node's capacity and memory, the orphan namespaces, and the
+/// storage scrape of this cycle, read first so the sample Cloudflare's room rule judges is as old
+/// as the scrape, never a cycle older. A failed scrape posts the inventory without storage.
 pub async fn collect(
     kube: &Kubernetes,
     api: &ControlApi,
     desired_ids: &HashSet<String>,
-    storage_samples: &HashMap<String, Value>,
+    fleet: &Value,
 ) -> Result<(), Error> {
+    // The exporter runs vgs/lvs per scrape; this read is off reconcile and wake.
+    let storage_samples = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::node_storage::samples(kube, fleet),
+    )
+    .await
+    {
+        Ok(Ok(samples)) => samples,
+        _ => {
+            eprintln!("{{\"event\":\"node_storage_sample_failed\"}}");
+            HashMap::new()
+        }
+    };
     let (nodes, pods, namespaces) = tokio::try_join!(
         kube.list("Node", None, None),
         kube.list("Pod", None, None),
@@ -210,10 +212,8 @@ pub async fn collect(
             report["node_id"] = node_id.into();
             report["provider_instance_id"] = provider_id.into();
             report["node_uid"] = uid.into();
-            if let Some(sample) =
-                fresh_storage(storage_samples, uid, time::OffsetDateTime::now_utc())
-            {
-                report["storage"] = sample;
+            if let Some(sample) = storage_samples.get(uid) {
+                report["storage"] = sample.clone();
             }
             let summary = kube.stats_summary(name).await.ok();
             let after = kube.read("Node", None, name).await?;
@@ -319,31 +319,6 @@ mod tests {
         assert!(sample["capacity_cpu_millicores"].is_null());
         assert!(sample["cpu_usage_nano_cores"].is_null());
         assert!(contract(&sample));
-    }
-    #[test]
-    fn only_a_storage_scrape_from_the_last_two_minutes_joins_its_node() {
-        let now = time::OffsetDateTime::now_utc();
-        let at = |age: i64| {
-            (now - time::Duration::seconds(age))
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap()
-        };
-        let samples = HashMap::from([
-            (
-                "recent".to_string(),
-                json!({"node_uid":"recent","observed_at":at(119),"physical":null}),
-            ),
-            (
-                "stale".to_string(),
-                json!({"node_uid":"stale","observed_at":at(121),"physical":null}),
-            ),
-        ]);
-        assert_eq!(
-            fresh_storage(&samples, "recent", now).unwrap()["node_uid"],
-            "recent"
-        );
-        assert!(fresh_storage(&samples, "stale", now).is_none());
-        assert!(fresh_storage(&samples, "absent", now).is_none());
     }
     #[test]
     fn missing_memory_is_unknown_and_never_a_free_sample() {

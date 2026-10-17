@@ -617,6 +617,33 @@ mod tests {
         assert!(unknown["physical"].is_null());
     }
     #[tokio::test]
+    async fn an_inventory_carries_the_storage_scrape_of_its_own_cycle() {
+        // Each inventory scrapes the node's storage first and posts that reading, so the sample
+        // Cloudflare's room rule reads is never a cycle older than the post.
+        let server = Server::start().await;
+        let mut node = cluster(&server);
+        node["metadata"]["labels"] = json!({"pgcf.io/node-id":"nod_customer000000000000","pgcf.io/provider-instance-id":"203000001"});
+        node["status"]["capacity"] = json!({"memory":"8Gi","cpu":"4"});
+        node["status"]["allocatable"] = json!({"memory":"7Gi","cpu":"4"});
+        server.put(node);
+        let (api, requests) = crate::test_server::api_double(|_, _| (200, json!({}))).await;
+        let fleet = json!({"release":{"spec":{"components":[{"name":"openebs-lvm","kind":"image","reference":WRAPPER}]}}});
+        let started = crate::api::timestamp().unwrap();
+        crate::inventory::collect(&server.k8s, &api, &std::collections::HashSet::new(), &fleet)
+            .await
+            .unwrap();
+        let posted = requests.lock().unwrap().clone();
+        let (_, inventory) = posted
+            .iter()
+            .find(|(path, body)| {
+                path.starts_with("/agent/v1/observations") && body["coverage"] == "inventory"
+            })
+            .expect("an inventory was posted");
+        let storage = &inventory["nodes"][0]["storage"];
+        assert_eq!(storage["physical"]["thick_allocated_bytes"], 3000);
+        assert!(text(storage, "observed_at") >= started.as_str());
+    }
+    #[tokio::test]
     async fn a_node_replaced_during_the_scrape_yields_unknown_storage() {
         let server = Server::start().await;
         let node = cluster(&server);
