@@ -261,6 +261,8 @@ export function thinVolumeAttributesClassObject(
 
 /** A slow identity proof stays valid this long after its read started (the slow lease's issue). */
 export const THIN_INVENTORY_MAX_SECONDS = 300;
+/** The node authority an identity proof composes is valid this long from its read. */
+export const THIN_AUTHORITY_MAX_SECONDS = 120;
 /** The next identity proof is due this long after the last accepted one. */
 export const THIN_INVENTORY_INTERVAL_SECONDS = 60;
 
@@ -356,7 +358,7 @@ export const NodeThinStorageAuthority = z
       end = Date.parse(value.expires_at);
     if (
       end <= start ||
-      end - start > 120000 ||
+      end - start > THIN_AUTHORITY_MAX_SECONDS * 1000 ||
       (value.write_allowed && value.pool_uuid === null)
     )
       context.addIssue({
@@ -420,9 +422,7 @@ export function thinStorageAuthorityMatches(
     Number.isSafeInteger(now) &&
     Date.parse(authority.observed_at) <= now + 5000 &&
     Date.parse(authority.observed_at) >= now - 120000 &&
-    Date.parse(authority.expires_at) > now &&
-    Date.parse(authority.expires_at) - Date.parse(authority.observed_at) <=
-      storage.guard_seconds * 1000,
+    Date.parse(authority.expires_at) > now,
   );
 }
 

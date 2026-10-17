@@ -4,6 +4,7 @@ import {
   newOperationId,
   timingSafeEqual,
   DatabaseStorageVolumeReceipt,
+  THIN_AUTHORITY_MAX_SECONDS,
   THIN_INVENTORY_MAX_SECONDS,
   thinStorageClass,
   thinStorageInventory,
@@ -283,8 +284,9 @@ export function thinStorageWriteAllowed(
       headroom.metadata,
   );
 }
-/** The authority Cloudflare signs: the identity proof's facts and the fresher reading's physical
- * state, valid one guard from that reading and never past the identity proof. */
+/** The node authority an identity proof records: its facts and its reading's physical state, valid
+ * THIN_AUTHORITY_MAX_SECONDS from that reading and never past the identity proof, so it stays the
+ * node's authority until the next turn, however long the turn took. */
 export function composeThinStorageAuthority(input: {
   identity: NodeThinStorageAuthority;
   inventory: { observed_at: number; expires_at: number; revision: number };
@@ -294,7 +296,6 @@ export function composeThinStorageAuthority(input: {
     physical: NodePhysicalStorage;
   };
   revision: number;
-  guardSeconds: number;
   writeAllowed: boolean;
 }) {
   return NodeThinStorageAuthority.parse({
@@ -304,7 +305,7 @@ export function composeThinStorageAuthority(input: {
     captured_at: input.reading.captured_at,
     expires_at: iso(
       Math.min(
-        input.reading.observed_at + input.guardSeconds * 1000,
+        input.reading.observed_at + THIN_AUTHORITY_MAX_SECONDS * 1000,
         input.inventory.expires_at,
       ),
     ),
@@ -806,8 +807,8 @@ async function acceptIdentityProof(
     )
       return block("thin_storage_action_unconfirmed");
   }
-  // Receipt identity is judged at the proof's lease issue with a guard-length view. The 95 s
-  // executor lease is not runtime write authority and must not turn known receipts into new LVs.
+  // Receipt identity is judged at the proof's lease issue. The 95 s executor lease must not turn
+  // known receipts into new LVs.
   const proofAuthority = composeThinStorageAuthority({
       identity: a,
       inventory,
@@ -817,7 +818,6 @@ async function acceptIdentityProof(
         physical: a.physical,
       },
       revision: a.revision,
-      guardSeconds: lease.profile.guard_seconds,
       writeAllowed: a.write_allowed,
     }),
     holds = await storageHolds(
@@ -949,7 +949,6 @@ async function acceptIdentityProof(
         inventory,
         reading,
         revision: row.authority_revision + 1,
-        guardSeconds: lease.profile.guard_seconds,
         writeAllowed,
       }),
       serialized = JSON.stringify(composed),

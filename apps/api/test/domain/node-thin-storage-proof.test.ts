@@ -62,7 +62,7 @@ it("an identity turn holds the executor's 90 s budget instead of the guard", asy
   ).toBe(95_000);
 });
 
-it("records a slow report as an identity proof valid 300 s, even when the authority it composes already expired", async () => {
+it("records a slow report as the node's authority for two minutes from its read, however short the guard", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
   // The previous proof was read a minute ago; nothing renewed it since.
   const earlier = Date.now() - 60_000;
@@ -84,7 +84,7 @@ it("records a slow report as an identity proof valid 300 s, even when the author
   expect(JSON.parse((await row(f)).authority_json)).toMatchObject({
     revision: 3,
     observed_at: iso(issued),
-    expires_at: iso(issued + 10_000),
+    expires_at: iso(issued + 120_000),
     inventory_observed_at: iso(issued),
     inventory_expires_at: iso(issued + 300_000),
     inventory_revision: 3,
@@ -93,7 +93,7 @@ it("records a slow report as an identity proof valid 300 s, even when the author
   expect((await row(f)).status).toBe("ready");
   expect(
     (await readCurrentNodeThinStorage(f.local, f.node))!.authority,
-  ).toBeNull();
+  ).toMatchObject({ revision: 3, write_allowed: true });
   // The next lease names the identity proof's revision.
   await endLease(f);
   const next = await prepareThinStorageLease(f.local, f.node);
@@ -103,6 +103,28 @@ it("records a slow report as an identity proof valid 300 s, even when the author
     revision: 4,
     inventory_revision: 4,
     inventory_observed_at: next!.lease.issued_at,
+  });
+});
+
+it("grows a near-full pool on the turn after a proof that took longer than the guard", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await identityProof(f);
+  await prepareThinStorageLease(f.local, f.node);
+  await leaseIssuedAgo(f, 25_000);
+  // The turn reads the pool with less free than the data reserve and one start.
+  const physical = {
+    ...f.authority.physical,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_used_bytes_upper_bound: 2 * gib - 300 * mib,
+    },
+  };
+  expect(await report(f, { physical })).toMatchObject({ accepted: true });
+  const next = await prepareThinStorageLease(f.local, f.node);
+  expect(next!.lease.action).toMatchObject({
+    kind: "grow",
+    state: "pending",
+    target_data_bytes: 3 * gib,
   });
 });
 
@@ -609,24 +631,15 @@ it("keeps an identity-only turn available after the last deleted volume removes 
     write_allowed: false,
   });
   expect(await confirmed()).toBe(1);
-  const afterWriteExpiry = Date.now() + 20_000;
+  // The proof without a pool is the node's authority, and it never allows a write.
   expect(
-    (await readCurrentNodeThinStorage(env, f.node, afterWriteExpiry))
-      ?.authority,
-  ).toBeNull();
-  const delivered = await desiredRegionStorageNodes(
-    env,
-    f.region,
-    afterWriteExpiry,
-  );
+    (await readCurrentNodeThinStorage(env, f.node))?.authority,
+  ).toMatchObject({ pool_uuid: null, write_allowed: false });
+  const delivered = await desiredRegionStorageNodes(env, f.region);
   expect(delivered).toHaveLength(1);
   expect(delivered[0]).toMatchObject({ pool_uuid: null, write_allowed: false });
-  expect(Date.parse(delivered[0]!.expires_at)).toBeLessThan(afterWriteExpiry);
-  expect(Date.parse(delivered[0]!.inventory_expires_at!)).toBeGreaterThan(
-    afterWriteExpiry,
-  );
   expect(
-    await desiredRegionStorageNodes(env, f.region, afterWriteExpiry + 300_000),
+    await desiredRegionStorageNodes(env, f.region, Date.now() + 300_000),
   ).toEqual([]);
 });
 

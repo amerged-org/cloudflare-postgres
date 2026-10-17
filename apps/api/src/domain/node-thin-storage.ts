@@ -208,9 +208,7 @@ export function nodeReading(row: CurrentNodeThinStorageRow, now: number) {
       Date.parse(row.authority_received_at) >= now - 120000 &&
       Date.parse(row.authority_received_at) <= now + 5000 &&
       Date.parse(value.observed_at) >= now - 120000 &&
-      Date.parse(value.observed_at) <= now + 5000 &&
-      Date.parse(value.expires_at) <=
-        Date.parse(value.observed_at) + profile.guard_seconds * 1000
+      Date.parse(value.observed_at) <= now + 5000
     ) {
       if (Date.parse(value.expires_at) > now)
         authority = {
@@ -220,8 +218,8 @@ export function nodeReading(row: CurrentNodeThinStorageRow, now: number) {
             row.status === "ready" &&
             row.current_qualified === 1,
         };
-      // A slow identity read can outlive its short write lease; an absent pool's fresh identity
-      // still proves deletion. Preserve its original expiry and explicitly deny all write authority.
+      // The identity read stays usable for an absence while its inventory is valid, also once its
+      // authority expired; an absent pool's fresh identity still proves deletion.
       const inventory = thinStorageInventory(value);
       if (
         row.error_code === null &&

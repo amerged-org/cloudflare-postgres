@@ -19,6 +19,7 @@ export {
   DatabaseStorageVolumeReceipt,
   NodeStorageProtectionProof,
   NodeThinStorageAuthority,
+  THIN_AUTHORITY_MAX_SECONDS,
   THIN_INVENTORY_INTERVAL_SECONDS,
   THIN_INVENTORY_MAX_SECONDS,
   ThinStorageProfile,
