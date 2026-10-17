@@ -551,6 +551,23 @@ it("signs same-runtime warm idle without a power transition and requires a bound
       .first("generation"),
   ).toBe(1);
 });
+it("an admission without an outstanding reclaim defers warm idle from memory, not storage", async () => {
+  const f = await qualified();
+  expect((await actor(f.id).ensureAwake(f.id, "app")).ok).toBe(true);
+  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
+    ok: false,
+    reason: "not_idle",
+  });
+  expect(
+    await runInDurableObject(actor(f.id), (_instance, context) =>
+      context.storage.sql
+        .exec(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name IN('database_reclaim','database_admission')",
+        )
+        .toArray(),
+    ),
+  ).toEqual([]);
+});
 it("persists a lost-revocation barrier across eviction and only uses lease expiry without an Ack", async () => {
   const f = await qualified();
   await actor(f.id).requestIdle(f.id, 1);

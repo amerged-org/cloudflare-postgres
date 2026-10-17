@@ -456,14 +456,11 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     );
     await runInDurableObject(
       actor as unknown as DurableObjectStub,
-      (_instance, state) => {
-        state.storage.sql.exec(
-          "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
-        );
-        state.storage.sql.exec(
-          "INSERT INTO database_admission VALUES(1,?,12000)",
-          Math.floor(Date.now() / 60000),
-        );
+      (instance) => {
+        Reflect.set(instance, "admissions", {
+          minute: Math.floor(Date.now() / 60000),
+          attempts: 12000,
+        });
       },
     );
     const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
