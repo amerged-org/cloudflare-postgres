@@ -13,16 +13,14 @@ import {
   BASE_BACKUP_MAX_AGE_MS,
   heartbeatHealth,
 } from "./operational-health.ts";
-import { NODE_OBSERVATION_MAX_AGE_MS } from "./placement.ts";
+import {
+  AVERAGE_WINDOW_SECONDS,
+  NODE_OBSERVATION_MAX_AGE_MS,
+} from "./placement.ts";
 import { cronErrorCode, readCronHealth } from "./cron-health.ts";
 import type { Env } from "../env.ts";
-import {
-  MEMORY_SAMPLE_MAX_AGE_MS,
-  regionalRamWindowSql,
-} from "./memory-capacity.ts";
+import { regionalRamWindowSql } from "./memory-capacity.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
-import { NODE_STORAGE_SAMPLE_MAX_AGE_MS } from "./node-storage.ts";
-import { thinPoolExhaustionSql } from "./storage-capacity.ts";
 
 interface AlertRow {
   kind: InfraAlertKind;
@@ -53,44 +51,51 @@ const retryMs = 60_000;
 function ppmSql(used: string, total: string): string {
   return `((${used})*1000/(${total}))*1000+((((${used})*1000)%(${total}))*1000)/(${total})`;
 }
-const physical = (path: string) => `json_extract(o.physical_json,'$.${path}')`;
+const stamp = (anchor: string, offset: string) =>
+  `strftime('%Y-%m-%dT%H:%M:%fZ',${anchor},'${offset}')`;
+/**
+ * A node's load over the 30 minutes up to its newest sample, from samples that span at least ten of
+ * them: `ratio` is the parts per million of one sample `s`. A node without that history is unknown.
+ */
+const averagedLoad = (ratio: string) =>
+  `SELECT n.id,(SELECT SUM(${ratio})/COUNT(*) FROM node_samples s WHERE s.node_id=n.id
+        AND s.observed_at>=${stamp("latest.observed_at", `-${AVERAGE_WINDOW_SECONDS} seconds`)} AND s.observed_at<=latest.observed_at) utilization_ppm
+      FROM nodes n JOIN node_samples latest ON latest.node_id=n.id
+        AND latest.observed_at=(SELECT MAX(observed_at) FROM node_samples WHERE node_id=n.id)
+      WHERE n.region_id=? AND n.lost_at IS NULL AND julianday(latest.observed_at)>=julianday(?)
+        AND EXISTS(SELECT 1 FROM node_samples s WHERE s.node_id=n.id
+          AND s.observed_at>=${stamp("latest.observed_at", `-${AVERAGE_WINDOW_SECONDS} seconds`)}
+          AND s.observed_at<=${stamp("latest.observed_at", "-600 seconds")})`;
 /**
  * Each node's latest fresh utilization in parts per million; a node without one is unknown and absent.
  * Ingest rejects future-dated samples, so only age bounds freshness and a delayed run still sees newer data.
  */
 const nodeUtilization = {
-  // The node's own ten-minute window maintained at ingest, including nodes closed to placement.
+  // Active RAM, as placement reads it, including nodes closed to placement.
   regional_node_ram_warning: {
     column: "node_ram_warning_threshold_ppm",
-    maxAgeMs: MEMORY_SAMPLE_MAX_AGE_MS,
-    sql: `SELECT n.id,n.memory_utilization_ppm utilization_ppm FROM nodes n
-      WHERE n.region_id=? AND n.node_uid IS NOT NULL AND n.lost_at IS NULL AND n.memory_window_valid=1
-        AND n.memory_utilization_ppm IS NOT NULL AND julianday(n.memory_window_observed_at)>=julianday(?)`,
+    maxAgeMs: NODE_OBSERVATION_MAX_AGE_MS,
+    sql: averagedLoad(
+      "(s.memory_total_bytes-s.memory_available_bytes)*1000000/s.memory_total_bytes",
+    ),
   },
-  // The same ten consecutive minutes as RAM; every sample needs CPU data and one unchanged capacity.
+  // CPU load: busy time over all cores.
   regional_node_cpu_warning: {
     column: "node_cpu_warning_threshold_ppm",
-    maxAgeMs: MEMORY_SAMPLE_MAX_AGE_MS,
-    sql: `SELECT n.id,MIN(1000000,SUM(m.cpu_usage_nano_cores)/(10*MAX(m.capacity_cpu_millicores))) utilization_ppm
-      FROM nodes n JOIN node_memory_samples latest ON latest.node_id=n.id AND latest.node_uid=n.node_uid
-        AND latest.minute=(SELECT MAX(minute) FROM node_memory_samples WHERE node_id=n.id AND node_uid=n.node_uid)
-      JOIN node_memory_samples m ON m.node_id=n.id AND m.node_uid=n.node_uid
-        AND m.minute BETWEEN latest.minute-9 AND latest.minute
-      WHERE n.region_id=? AND n.lost_at IS NULL AND julianday(latest.observed_at)>=julianday(?)
-      GROUP BY n.id HAVING COUNT(*)=10 AND COUNT(m.cpu_usage_nano_cores)=10
-        AND MIN(m.capacity_cpu_millicores)=MAX(m.capacity_cpu_millicores)`,
+    maxAgeMs: NODE_OBSERVATION_MAX_AGE_MS,
+    sql: averagedLoad("s.cpu_busy_millicores*1000/s.cpu_cores"),
   },
   // A thin pool consumes its volume group by design, so pool data or metadata fill governs it.
   regional_node_storage_warning: {
     column: "node_storage_warning_threshold_ppm",
-    maxAgeMs: NODE_STORAGE_SAMPLE_MAX_AGE_MS,
-    sql: `SELECT n.id,CASE WHEN json_type(o.physical_json,'$.thin_pool')='object' THEN MAX(
-          ${ppmSql(physical("thin_pool.data_used_bytes_upper_bound"), physical("thin_pool.data_total_bytes"))},
-          ${ppmSql(physical("thin_pool.metadata_used_bytes_upper_bound"), physical("thin_pool.metadata_total_bytes"))})
-        ELSE ${ppmSql(`${physical("total_bytes")}-${physical("free_bytes")}`, physical("total_bytes"))} END utilization_ppm
-      FROM node_storage_observations o JOIN nodes n ON n.id=o.node_id AND n.node_uid=o.node_uid
-      WHERE n.region_id=? AND n.ready=1 AND n.lost_at IS NULL AND o.physical_json IS NOT NULL
-        AND julianday(o.observed_at)>=julianday(?)`,
+    maxAgeMs: NODE_OBSERVATION_MAX_AGE_MS,
+    sql: `SELECT n.id,MAX(
+          ${ppmSql("latest.pool_data_used_bytes", "latest.pool_data_total_bytes")},
+          ${ppmSql("latest.pool_metadata_used_bytes", "latest.pool_metadata_total_bytes")}) utilization_ppm
+      FROM nodes n JOIN node_samples latest ON latest.node_id=n.id
+        AND latest.observed_at=(SELECT MAX(observed_at) FROM node_samples WHERE node_id=n.id)
+      WHERE n.region_id=? AND n.lost_at IS NULL AND latest.pool_data_total_bytes IS NOT NULL
+        AND julianday(latest.observed_at)>=julianday(?)`,
   },
 } as const;
 type NodeWarningKind = keyof typeof nodeUtilization;
@@ -651,6 +656,12 @@ interface Subject {
   id: string;
   detail: string | null;
 }
+interface SubjectRow {
+  kind: InfraAlertKind;
+  state: "failing" | "unresolved";
+  subject: string;
+  detail: string | null;
+}
 type RegionSubjects = Map<
   InfraAlertKind,
   { failing: Subject[]; unresolved: number }
@@ -693,33 +704,20 @@ async function readRegionSubjects(
             OR (d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
               WHERE a.region_id=d.region_id AND a.kind='database_base_backup_stale' AND a.active=1)
               AND NOT ${backupGood}))
-        ORDER BY state,${baseline},d.id LIMIT 64)
-      UNION ALL SELECT * FROM (SELECT 'thin_storage_blocked',
-          CASE WHEN x.exhausted IS NOT NULL THEN 'failing' ELSE 'unresolved' END state,t.node_id,x.exhausted
-        FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id
-          LEFT JOIN (SELECT t.node_id,${thinPoolExhaustionSql()} exhausted FROM node_thin_storage t
-            LEFT JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid) x
-            ON x.node_id=t.node_id,p
-        WHERE n.region_id=p.region AND n.lost_at IS NULL
-          AND (x.exhausted IS NOT NULL
-            OR (t.status<>'ready' AND t.node_id IN(SELECT json_extract(s.value,'$.node_id')
-              FROM infrastructure_alerts a,json_each(a.payload,'$.thin_storage') s
-              WHERE a.region_id=n.region_id AND a.kind='thin_storage_blocked' AND a.active=1)))
-        ORDER BY state,t.node_id LIMIT 16)`,
+        ORDER BY state,${baseline},d.id LIMIT 64)`,
     )
     .bind(
       regionId,
       new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
       new Date(now - BASE_BACKUP_MAX_AGE_MS).toISOString(),
     )
-    .all<{
-      kind: InfraAlertKind;
-      state: "failing" | "unresolved";
-      subject: string;
-      detail: string | null;
-    }>();
+    .all<SubjectRow>();
+  return collectSubjects(result.results);
+}
+
+function collectSubjects(rows: readonly SubjectRow[]): RegionSubjects {
   const subjects: RegionSubjects = new Map();
-  for (const row of result.results) {
+  for (const row of rows) {
     const entry = subjects.get(row.kind) ?? { failing: [], unresolved: 0 };
     if (row.state === "failing")
       entry.failing.push({ id: row.subject, detail: row.detail });
@@ -727,6 +725,65 @@ async function readRegionSubjects(
     subjects.set(row.kind, entry);
   }
   return subjects;
+}
+
+/** A node refusing this many wakes for awake capacity within the window is an alert. */
+export const CAPACITY_REFUSAL_COUNT = 5;
+export const CAPACITY_REFUSAL_WINDOW_MS = 600_000;
+/** The share of a volume's space or inodes from which the database is warned, and warned loudly. */
+export const VOLUME_WARNING_PERCENT = 80;
+export const VOLUME_CRITICAL_PERCENT = 90;
+
+/**
+ * What the node samples and volume reports say of a region (plan 4.10): thin pools without room,
+ * nodes that refuse wakes, and volumes that fill. As in `readRegionSubjects`, `unresolved` rows are
+ * the subjects an active episode names that are not yet known to be fine.
+ */
+async function readNodeSubjects(
+  db: D1Database,
+  regionId: string,
+  now: number,
+): Promise<RegionSubjects> {
+  const measured = "(v.observed_at>=p.fresh AND v.fs_used_bytes IS NOT NULL)",
+    reached = (percent: number) =>
+      `(v.fs_used_bytes*100>=${percent}*v.fs_total_bytes OR v.inodes_used*100>=${percent}*v.inodes_total)`,
+    named = (kind: string) =>
+      `d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
+        WHERE a.region_id=d.region_id AND a.kind='${kind}' AND a.active=1)`,
+    volume = (kind: string, failing: string) =>
+      `SELECT * FROM (SELECT '${kind}' kind,CASE WHEN ${failing} THEN 'failing' ELSE 'unresolved' END state,d.id subject,NULL detail
+        FROM node_volumes v JOIN databases d ON d.id=v.database_id AND d.node_id=v.node_id
+          AND d.storage_generation=v.storage_generation AND d.deleted_at IS NULL,p
+        WHERE d.region_id=p.region AND (${failing} OR (${named(kind)} AND NOT ${measured}))
+        ORDER BY state,d.id LIMIT 64)`;
+  const result = await db
+    .prepare(
+      `WITH p AS (SELECT ? region,? fresh,? refused_since),
+      latest AS (SELECT s.* FROM p,nodes rn JOIN node_samples s ON s.node_id=rn.id
+        AND s.observed_at=(SELECT MAX(observed_at) FROM node_samples WHERE node_id=rn.id) WHERE rn.region_id=p.region)
+      SELECT * FROM (SELECT 'thin_storage_blocked' kind,'failing' state,n.id subject,
+          CASE WHEN l.observed_at IS NULL OR l.observed_at<p.fresh OR l.pool_data_total_bytes IS NULL
+            THEN 'thin_pool_unobserved' ELSE 'thin_pool_no_room' END detail
+        FROM nodes n,p LEFT JOIN latest l ON l.node_id=n.id
+        WHERE n.region_id=p.region AND n.lost_at IS NULL
+          AND CASE WHEN l.observed_at IS NULL OR l.observed_at<p.fresh OR l.pool_data_total_bytes IS NULL
+            THEN EXISTS(SELECT 1 FROM databases h WHERE h.node_id=n.id AND NOT(h.desired_state='deleted' AND h.observed_state='deleted'))
+            ELSE l.room=0 END
+        ORDER BY n.id LIMIT 16)
+      UNION ALL SELECT * FROM (SELECT 'regional_node_capacity_refusals','failing',n.id,NULL
+        FROM nodes n,p WHERE n.region_id=p.region AND n.lost_at IS NULL
+          AND (SELECT COALESCE(SUM(capacity_refusals),0) FROM node_samples WHERE node_id=n.id AND observed_at>p.refused_since)>=${CAPACITY_REFUSAL_COUNT}
+        ORDER BY n.id LIMIT 64)
+      UNION ALL ${volume("database_volume_warning", `(${measured} AND ${reached(VOLUME_WARNING_PERCENT)} AND NOT ${reached(VOLUME_CRITICAL_PERCENT)})`)}
+      UNION ALL ${volume("database_volume_critical", `(${measured} AND ${reached(VOLUME_CRITICAL_PERCENT)})`)}`,
+    )
+    .bind(
+      regionId,
+      new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
+      new Date(now - CAPACITY_REFUSAL_WINDOW_MS).toISOString(),
+    )
+    .all<SubjectRow>();
+  return collectSubjects(result.results);
 }
 
 const subjectObservation = (
@@ -750,6 +807,9 @@ const HEALTH_KINDS = [
   "database_archive_failing",
   "database_base_backup_stale",
   "thin_storage_blocked",
+  "regional_node_capacity_refusals",
+  "database_volume_warning",
+  "database_volume_critical",
 ] as const satisfies readonly InfraAlertKind[];
 const pendingOf = (
   episodes: Iterable<AlertRow>,
@@ -814,12 +874,15 @@ async function regionHealthAlerts(
         : { state: "resolved" };
     };
   const current = await storedEpisodes(env.DB, regionId);
-  // The database and Thin storage reads fail on their own: the node and backup kinds above still
+  // The database and node reads fail on their own: the node and backup kinds above still
   // evaluate, and the unread kinds are unknown (retained) for this minute.
   let subjects: RegionSubjects | undefined,
     readFailure: { error: unknown } | undefined;
   try {
-    subjects = await readRegionSubjects(env.DB, regionId, now);
+    subjects = new Map([
+      ...(await readRegionSubjects(env.DB, regionId, now)),
+      ...(await readNodeSubjects(env.DB, regionId, now)),
+    ]);
   } catch (error) {
     readFailure = { error };
   }
@@ -862,6 +925,24 @@ async function regionHealthAlerts(
           node_id: subject.id,
           error_code: subject.detail,
         })),
+      })),
+    ],
+    [
+      "regional_node_capacity_refusals",
+      subjectOf("regional_node_capacity_refusals", (failing) => ({
+        node_ids: failing.map((subject) => subject.id),
+      })),
+    ],
+    [
+      "database_volume_warning",
+      subjectOf("database_volume_warning", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
+      })),
+    ],
+    [
+      "database_volume_critical",
+      subjectOf("database_volume_critical", (failing) => ({
+        database_ids: failing.map((subject) => subject.id),
       })),
     ],
   ];

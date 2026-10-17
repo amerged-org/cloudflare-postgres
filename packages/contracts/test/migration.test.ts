@@ -852,3 +852,158 @@ describe("0001_init.sql", () => {
     expect(() => insert(newProjectId())).not.toThrow();
   });
 });
+
+it("adds per-database resources, node samples and the capacity alert kinds while preserving databases and episodes", () => {
+  const directory = new URL("../../../apps/api/migrations/", import.meta.url);
+  const apply = (below: string) => {
+    for (const file of readdirSync(directory)
+      .sort()
+      .filter(
+        (name) =>
+          name.endsWith(".sql") && name > "0001_init.sql" && name < below,
+      ))
+      db.exec(readFileSync(new URL(file, directory), "utf8"));
+  };
+  apply("0064");
+  const id = newDatabaseId();
+  insertDatabase(id);
+  const kept = JSON.stringify({
+    kind: "regional_node_stale",
+    occurred_at: NOW,
+  });
+  run(
+    "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES('eu-1','regional_node_stale',1,?,?)",
+    crypto.randomUUID(),
+    kept,
+  );
+  const episodes = db.prepare("SELECT * FROM infrastructure_alerts").all();
+  const databases = db.prepare("SELECT * FROM databases").all();
+  const alert = (kind: string) =>
+    run(
+      "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES('eu-1',?,1,?,?)",
+      kind,
+      crypto.randomUUID(),
+      JSON.stringify({ kind, occurred_at: NOW }),
+    );
+  expect(() => alert("database_volume_warning")).toThrow(/CHECK/);
+  db.exec(
+    readFileSync(new URL("0064_placement_resources.sql", directory), "utf8"),
+  );
+  expect(db.prepare("SELECT * FROM infrastructure_alerts").all()).toEqual(
+    episodes,
+  );
+  for (const kind of [
+    "regional_node_capacity_refusals",
+    "database_volume_warning",
+    "database_volume_critical",
+  ])
+    alert(kind);
+  expect(() => alert("regional_node_disk_warning")).toThrow(/CHECK/);
+  // The databases keep their columns and gain empty resources and no placement time.
+  expect(db.prepare("SELECT * FROM databases").all()).toEqual(
+    databases.map((row) => ({
+      ...row,
+      own_memory_mib: null,
+      own_cpu_millicores: null,
+      own_storage_gib: null,
+      placed_at: null,
+    })),
+  );
+  // A database's own values replace its class's in the view; null takes the class's.
+  const effective = () =>
+    db.prepare("SELECT * FROM database_resources WHERE database_id=?").get(id);
+  expect(effective()).toEqual({
+    database_id: id,
+    memory_mib: 512,
+    cpu_millicores: 500,
+    storage_gib: 10,
+  });
+  run(
+    "UPDATE databases SET own_memory_mib=1024,own_storage_gib=12 WHERE id=?",
+    id,
+  );
+  expect(effective()).toEqual({
+    database_id: id,
+    memory_mib: 1024,
+    cpu_millicores: 500,
+    storage_gib: 12,
+  });
+  for (const set of [
+    "own_memory_mib=1000",
+    "own_memory_mib=0",
+    "own_cpu_millicores=99",
+    "own_storage_gib=0",
+  ])
+    expect(
+      () => run(`UPDATE databases SET ${set} WHERE id=?`, id),
+      set,
+    ).toThrow(/CHECK/);
+  // Samples are whole or without a pool, and never more available than total.
+  const sample = (columns: Record<string, number | string | null>) => {
+    const row: Record<string, number | string | null> = {
+      node_id: nodeId,
+      observed_at: NOW,
+      memory_total_bytes: 1000,
+      memory_available_bytes: 400,
+      cpu_cores: 4,
+      cpu_busy_millicores: 1000,
+      pool_data_total_bytes: 100,
+      pool_data_used_bytes: 10,
+      pool_metadata_total_bytes: 10,
+      pool_metadata_used_bytes: 1,
+      pool_nominal_bytes: 50,
+      room: 1,
+      ...columns,
+    };
+    return run(
+      `INSERT INTO node_samples(${Object.keys(row).join(",")}) VALUES(${Object.keys(
+        row,
+      )
+        .map(() => "?")
+        .join(",")})`,
+      ...Object.values(row),
+    );
+  };
+  sample({});
+  expect(() => sample({})).toThrow(/UNIQUE|PRIMARY/);
+  const invalid: Record<string, number | string | null>[] = [
+    { observed_at: "2026-10-02T10:47:00.000Z", memory_available_bytes: 1001 },
+    { observed_at: "2026-10-02T10:48:00.000Z", cpu_busy_millicores: 4001 },
+    { observed_at: "2026-10-02T10:49:00.000Z", room: 2 },
+    { observed_at: "2026-10-02T10:50:00.000Z", pool_data_used_bytes: null },
+    { observed_at: "2026-10-02T10:51:00.000Z", capacity_refusals: -1 },
+  ];
+  for (const bad of invalid)
+    expect(() => sample(bad), JSON.stringify(bad)).toThrow(/CHECK/);
+  sample({
+    observed_at: "2026-10-02T10:52:00.000Z",
+    pool_data_total_bytes: null,
+    pool_data_used_bytes: null,
+    pool_metadata_total_bytes: null,
+    pool_metadata_used_bytes: null,
+    pool_nominal_bytes: null,
+  });
+  // A volume reports its filesystem and inodes together, or neither while unmounted.
+  const volume = (columns: Record<string, number | string | null>) =>
+    run(
+      "INSERT INTO node_volumes(node_id,database_id,storage_generation,observed_at,fs_total_bytes,fs_used_bytes,inodes_total,inodes_used) VALUES(?,?,?,?,?,?,?,?)",
+      nodeId,
+      id,
+      1,
+      NOW,
+      ...Object.values({
+        fs_total_bytes: 100,
+        fs_used_bytes: 10,
+        inodes_total: 1000,
+        inodes_used: 10,
+        ...columns,
+      }),
+    );
+  expect(() => volume({ fs_used_bytes: null })).toThrow(/CHECK/);
+  volume({
+    fs_total_bytes: null,
+    fs_used_bytes: null,
+    inodes_total: null,
+    inodes_used: null,
+  });
+});

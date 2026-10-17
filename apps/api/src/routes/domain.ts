@@ -91,6 +91,7 @@ const exampleDatabase = {
   node_id: "nod_abcdefghij1234567890",
   name: "orders",
   size_class_id: "small",
+  resources: { memory_mib: 1024, cpu_millicores: 500, storage_gib: 5 },
   sleep_after_seconds: 300,
   effective_sleep_after_seconds: 300,
   desired_state: "running",

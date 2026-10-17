@@ -11,13 +11,17 @@ import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { keyring } from "../crypto/keyring.ts";
 import { databaseInsertStatement, hint } from "./databases.ts";
-import { startupReservationStatement } from "./startup-admission.ts";
 import {
   generateMaintenanceCredential,
   maintenanceCreationStatement,
 } from "./maintenance.ts";
-import { choosePlacement, databaseMemoryPolicyAllows } from "./placement.ts";
-import { startupPlacementNodes } from "./node-capacity.ts";
+import { choosePlacement, placementNodes } from "./placement.ts";
+import {
+  assertResourcesAllowed,
+  effectiveResources,
+  ownResources,
+  regionBounds,
+} from "./resources.ts";
 import {
   databaseForRequest,
   databaseView,
@@ -146,17 +150,14 @@ export async function restoreDatabase(
         throw new ApiError("conflict", "Restore target region is unavailable", {
           reason: "region_unavailable",
         });
-      if (
-        !(await databaseMemoryPolicyAllows(
-          c.env.DB,
-          targetRegionId,
-          size.memory_mib,
-        ))
-      )
-        throw new ApiError(
-          "invalid_request",
-          "Source size class exceeds the target's configured per-database memory maximum",
-        );
+      // The target keeps what the source runs with: its size class and its own resources.
+      const own = ownResources(source),
+        effective = effectiveResources(size, own);
+      assertResourcesAllowed(
+        effective,
+        own,
+        await regionBounds(c.env.DB, targetRegionId),
+      );
       const selected = regionArchive(c.env, sourceRegion),
         prefix = validatedArchivePrefix(
           source,
@@ -205,11 +206,12 @@ export async function restoreDatabase(
         c.env.CREDENTIAL_KEYS,
         targetId,
       );
-      const node = choosePlacement(
-        await startupPlacementNodes(c.env.DB, targetRegionId, size.id),
-        targetRegionId,
-        size,
-      );
+      const decidedAt = Date.now(),
+        node = choosePlacement(
+          await placementNodes(c.env.DB, targetRegionId, decidedAt),
+          effective,
+          decidedAt,
+        );
       const archive = archiveDestinationPath(
         region.backup_bucket,
         region.id,
@@ -259,7 +261,10 @@ export async function restoreDatabase(
           },
           size,
           region,
+          resources: own,
           nodeId: node?.id ?? null,
+          pendingMemoryMib: node?.pending_memory_mib,
+          decidedAt,
           id: targetId,
           archivePath: archive,
           now,
@@ -304,17 +309,6 @@ export async function restoreDatabase(
         c.env.DB.prepare(
           "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.restore','pending',project_id,id,generation,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
         ).bind(op, now, now, targetId, source.project_id, now),
-        ...(node
-          ? [
-              startupReservationStatement(c.env.DB, {
-                databaseId: targetId,
-                operationId: op,
-                generation: 1,
-                nodeId: node.id,
-                now,
-              }),
-            ]
-          : []),
         c.env.DB.prepare(
           "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,target_time,created_at) SELECT id,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
         ).bind(

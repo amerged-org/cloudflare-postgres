@@ -19,10 +19,10 @@ import { cleanupRetainedArchives } from "../../src/domain/retained-archives.ts";
 import { keyring } from "../../src/crypto/keyring.ts";
 import type { RoleRow } from "../../src/domain/rows.ts";
 import { archiveDestinationPath, newNodeId } from "@pgcf/contracts";
-import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
-import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
 import { placePendingDatabases } from "../../src/domain/node-capacity.ts";
 import { withAdmissionMutation } from "../../src/domain/admission-mutations.ts";
+import { addNode } from "./fixtures.ts";
+import { reports, seedSamples, steady } from "./node-samples.ts";
 const keys: string[] = [];
 afterEach(async () => {
   if (keys.length) await env.ARCHIVE.delete(keys.splice(0));
@@ -122,57 +122,14 @@ it("keeps a fresh restore target denied and refuses restore creation while its p
     { kind: "project", id: f.project },
   );
 });
-it("holds startup RAM for a placed restore and admits an unplaced restore later with its original operation", async () => {
-  const uid = crypto.randomUUID(),
-    provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!),
-    capacity = 24 * 2 ** 30;
-  const seed = async (
-    node: Awaited<ReturnType<typeof fixture>>,
-    available = 4 * 2 ** 30,
-  ) => {
-    const now = Date.now();
-    for (let i = 9; i >= 0; i--) {
-      const time = now - i * 60_000,
-        observed_at = new Date(time).toISOString();
-      await recordNodeMemoryObservation(
-        env.DB,
-        node.region,
-        {
-          node_id: node.node,
-          provider_instance_id: provider,
-          node_uid: uid,
-          memory: {
-            node_uid: uid,
-            observed_at,
-            working_set_bytes: Math.ceil(capacity * 0.2),
-            capacity_memory_bytes: capacity,
-            available_bytes: available,
-            memory_pressure: false,
-          },
-        },
-        observed_at,
-        time,
-      );
-    }
-  };
-  const f = await archived(async (node) => {
-    await env.DB.prepare(
-      "UPDATE nodes SET node_uid=?,provider_instance_id=?,allocatable_cpu_millicores=12000,allocatable_memory_mib=? WHERE id=?",
-    )
-      .bind(uid, provider, capacity / 2 ** 20, node.node)
-      .run();
-    await configureNodeRegionPolicy(env.DB, {
-      region_id: node.region,
-      max_nodes: 5,
-      purchases_enabled: false,
-      order: null,
-      placement_mode: "actual_ram",
-      maximum_database_memory_mib: 4096,
-      postgres_memory_request_mib: 128,
-    });
-    await seed(node);
-  });
-  await seed(f, 1024 * 2 ** 20);
+it("places a restore where a node has room and keeps one that no node can take waiting, with its original operation", async () => {
+  const f = await archived();
+  const nodeOf = (id: string) =>
+    env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
+      .bind(id)
+      .first("node_id");
+  // The only node runs at 90 % active RAM: the restore waits for capacity.
+  await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
   const delayed = await request(
     `/v1/databases/${f.id}/restore`,
     f.integrator,
@@ -184,33 +141,21 @@ it("holds startup RAM for a placed restore and admits an unplaced restore later 
     target_database: { id: string };
     operation: { id: string };
   };
-  expect(
-    await env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
-      .bind(pending.target_database.id)
-      .first("node_id"),
-  ).toBeNull();
-  expect(
-    await env.DB.prepare(
-      "SELECT count(*) FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(pending.target_database.id)
-      .first("count(*)"),
-  ).toBe(0);
-  await seed(f);
+  expect(await nodeOf(pending.target_database.id)).toBeNull();
+  expect(await placePendingDatabases(env.DB, f.region)).toEqual([]);
+  // A node with room reports: the waiting restore is placed on it, still with its operation.
+  const spare = await addNode(f.region);
   expect(await placePendingDatabases(env.DB, f.region)).toEqual([
     pending.target_database.id,
   ]);
+  expect(await nodeOf(pending.target_database.id)).toBe(spare);
   expect(
     await env.DB.prepare(
-      "SELECT operation_id,generation,budget_bytes FROM database_start_admissions WHERE database_id=?",
+      "SELECT id FROM operations WHERE database_id=? AND kind='database.restore'",
     )
       .bind(pending.target_database.id)
-      .first(),
-  ).toEqual({
-    operation_id: pending.operation.id,
-    generation: 1,
-    budget_bytes: 1024 * 2 ** 20,
-  });
+      .first("id"),
+  ).toBe(pending.operation.id);
   const placed = await request(
     `/v1/databases/${f.id}/restore`,
     f.integrator,
@@ -218,20 +163,34 @@ it("holds startup RAM for a placed restore and admits an unplaced restore later 
     { name: "placed-admission", mode: "full" },
   );
   expect(placed.status).toBe(202);
-  const target = (await placed.json()) as {
-    target_database: { id: string };
-    operation: { id: string };
-  };
   expect(
-    await env.DB.prepare(
-      "SELECT operation_id,generation,budget_bytes FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(target.target_database.id)
-      .first(),
-  ).toEqual({
-    operation_id: target.operation.id,
-    generation: 1,
-    budget_bytes: 1024 * 2 ** 20,
+    await nodeOf(
+      ((await placed.json()) as { target_database: { id: string } })
+        .target_database.id,
+    ),
+  ).toBe(spare);
+});
+it("restores with the resources of its source", async () => {
+  const f = await archived();
+  await env.DB.prepare(
+    "UPDATE databases SET own_memory_mib=1024,own_storage_gib=12 WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  const restored = await request(
+    `/v1/databases/${f.id}/restore`,
+    f.integrator,
+    "POST",
+    { name: "same-resources", mode: "full" },
+  );
+  expect(restored.status).toBe(202);
+  const target = (await restored.json()) as {
+    target_database: { id: string; resources: unknown };
+  };
+  expect(target.target_database.resources).toEqual({
+    memory_mib: 1024,
+    cpu_millicores: 500,
+    storage_gib: 12,
   });
 });
 it("restores a source catalog into a separate target region without changing source placement or credentials", async () => {
@@ -255,6 +214,7 @@ it("restores a source catalog into a separate target region without changing sou
       crypto.randomUUID(),
     ),
   ]);
+  await reports(targetNode);
   const mapping = {
     ARCHIVE_BINDINGS: JSON.stringify({
       [f.region]: { binding: "ARCHIVE", bucket: env.ARCHIVE_BUCKET_NAME },

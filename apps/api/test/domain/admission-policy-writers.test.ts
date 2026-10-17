@@ -13,6 +13,7 @@ import {
 } from "../../src/domain/admission-mutations.ts";
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
 import { fixture, cleanupFixtures, request } from "./fixtures.ts";
+import { reports } from "./node-samples.ts";
 import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
 afterEach(async () => {
   await env.DB.prepare("DELETE FROM region_archive_sources").run();
@@ -69,6 +70,7 @@ it("archive-source custody rotation fences only established referencing restore 
       at,
     )
     .run();
+  await reports(node);
   const createTarget = async (name: string) => {
     const response = await request("/v1/databases", f.integrator, "POST", {
       project_id: f.project,

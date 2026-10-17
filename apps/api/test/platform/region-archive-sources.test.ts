@@ -14,6 +14,7 @@ import {
   observation,
   observedBody,
 } from "../domain/fixtures.ts";
+import { reports } from "../domain/node-samples.ts";
 import {
   encryptCustodyDocument,
   decryptCustodyDocument,
@@ -211,12 +212,13 @@ it("rotates established restore configuration once and preserves source data, ar
     keys.push(key!);
     await env.ARCHIVE.put(key!, value!);
   }
-  const now = new Date().toISOString();
+  const now = new Date().toISOString(),
+    targetNode = newNodeId();
   await env.DB.prepare(
     "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?)",
   )
     .bind(
-      newNodeId(),
+      targetNode,
       f.foreign,
       "restore-target",
       now,
@@ -225,6 +227,7 @@ it("rotates established restore configuration once and preserves source data, ar
       crypto.randomUUID(),
     )
     .run();
+  await reports(targetNode);
   const restored = await request(
     `/v1/databases/${source.database.id}/restore`,
     f.integrator,

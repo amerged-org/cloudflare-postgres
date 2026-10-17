@@ -10,39 +10,33 @@ import {
   observation,
   request,
 } from "./fixtures.ts";
+import { reports } from "./node-samples.ts";
 
 afterEach(cleanupFixtures);
 describe("pending capacity on real D1", () => {
-  it("atomically places low-request classes while preserving hard CPU limits and Barman overhead", async () => {
-    const f = await fixture(128, 0);
-    await env.DB.prepare(
-      "UPDATE size_classes SET cpu_millicores=250,cpu_request_millicores=25 WHERE id=?",
-    )
-      .bind(f.size)
-      .run();
+  it("places waiting databases together once the node reports room, with their effective resources", async () => {
+    const f = await fixture(0);
     const first = DatabaseWithOperation.parse(
       await (await f.create("share-first")).json(),
     );
     const second = DatabaseWithOperation.parse(
       await (await f.create("share-second")).json(),
     );
-    await env.DB.prepare(
-      "UPDATE nodes SET allocatable_memory_mib=4096,allocatable_cpu_millicores=350,storage_gib_total=30 WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
+    expect(first.database.node_id).toBeNull();
+    await reports(f.node);
     await Promise.all([
       placePendingDatabases(env.DB, f.region),
       placePendingDatabases(env.DB, f.region),
     ]);
     const rows = await env.DB.prepare(
-      "SELECT id,node_id FROM databases WHERE id IN(?,?)",
+      "SELECT id,node_id,placed_at FROM databases WHERE id IN(?,?)",
     )
       .bind(first.database.id, second.database.id)
-      .all<{ id: string; node_id: string | null }>();
+      .all<{ id: string; node_id: string | null; placed_at: string | null }>();
     expect(rows.results.filter((row) => row.node_id === f.node)).toHaveLength(
       2,
     );
+    for (const row of rows.results) expect(row.placed_at).not.toBeNull();
     const events = await env.DB.prepare(
       "SELECT resource_snapshot FROM lifecycle_events WHERE database_id IN(?,?) AND kind='created'",
     )
@@ -51,36 +45,32 @@ describe("pending capacity on real D1", () => {
     expect(events.results).toHaveLength(2);
     for (const row of events.results)
       expect(JSON.parse(row.resource_snapshot)).toMatchObject({
-        cpu_millicores: 250,
-        reserved_cpu_millicores: 125,
+        memory_mib: 512,
+        cpu_millicores: 500,
+        storage_allocated_bytes: 5 * 2 ** 30,
       });
   });
 
-  it("rejects a captured pending placement when its CPU scheduling request changes before the atomic write", async () => {
-    const f = await fixture(128, 0);
-    await env.DB.prepare(
-      "UPDATE size_classes SET cpu_millicores=250,cpu_request_millicores=25 WHERE id=?",
-    )
-      .bind(f.size)
-      .run();
+  it("rejects a captured pending placement when another placement lands on the node before the atomic write", async () => {
+    const f = await fixture(0);
     const first = DatabaseWithOperation.parse(
-      await (await f.create("stale-share")).json(),
+      await (await f.create("captured")).json(),
     );
-    await env.DB.prepare(
-      "UPDATE nodes SET allocatable_memory_mib=4096,allocatable_cpu_millicores=350,storage_gib_total=30 WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
+    const second = DatabaseWithOperation.parse(
+      await (await f.create("racing")).json(),
+    );
+    await reports(f.node);
     let raced = false;
     const db = {
       prepare: env.DB.prepare.bind(env.DB),
       batch: async (statements: D1PreparedStatement[]) => {
         if (!raced) {
           raced = true;
+          // The racing database takes its place first; the captured decision no longer holds.
           await env.DB.prepare(
-            "UPDATE size_classes SET cpu_request_millicores=50 WHERE id=?",
+            "UPDATE databases SET node_id=?,placed_at=? WHERE id=?",
           )
-            .bind(f.size)
+            .bind(f.node, new Date().toISOString(), second.database.id)
             .run();
         }
         return env.DB.batch(statements);
@@ -103,7 +93,7 @@ describe("pending capacity on real D1", () => {
   });
 
   it("retains one pending create and its credentials without emitting unplaced desired state", async () => {
-    const f = await fixture(128, 0);
+    const f = await fixture(0);
     const first = await f.create("waiting", f.integrator, "pending-once");
     expect(first.status).toBe(202);
     const created = DatabaseWithOperation.parse(await first.json());
@@ -137,11 +127,7 @@ describe("pending capacity on real D1", () => {
         )
       ).json(),
     ).toEqual({ accepted: 0 });
-    await env.DB.prepare(
-      "UPDATE nodes SET allocatable_memory_mib=4096,storage_gib_total=30 WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
+    await reports(f.node);
     expect(await placePendingDatabases(env.DB, f.region)).toEqual([
       created.database.id,
     ]);
@@ -159,19 +145,16 @@ describe("pending capacity on real D1", () => {
     );
     expect(await placePendingDatabases(env.DB, f.region)).toEqual([]);
   });
-  it("rechecks headroom atomically when pending placements compete", async () => {
-    const f = await fixture(128, 0);
+  it("rechecks room atomically when pending placements compete", async () => {
+    const f = await fixture(0);
     const first = DatabaseWithOperation.parse(
       await (await f.create("first")).json(),
     );
     const second = DatabaseWithOperation.parse(
       await (await f.create("second")).json(),
     );
-    await env.DB.prepare(
-      "UPDATE nodes SET allocatable_memory_mib=4096,allocatable_cpu_millicores=700,storage_gib_total=30 WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
+    // 1,024 MiB hold one 512 MiB database under 80 %, not two.
+    await reports(f.node, 1024);
     await Promise.all([
       placePendingDatabases(env.DB, f.region),
       placePendingDatabases(env.DB, f.region),

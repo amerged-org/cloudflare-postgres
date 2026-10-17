@@ -9,6 +9,10 @@ import {
 } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import {
+  DatabaseEffectiveResources,
+  DatabaseResourcesCreate,
+} from "./database-resources.ts";
+import {
   ApiKeyId,
   DatabaseId,
   NodeId,
@@ -27,7 +31,7 @@ import {
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.1.0";
+export const API_CONTRACT_VERSION = "1.2.0";
 
 /** ISO-8601 UTC timestamp exactly as Date#toISOString renders it. */
 export const Timestamp = z.iso
@@ -456,6 +460,9 @@ export const Database = z
     node_id: NodeId.nullable(),
     name: DatabaseName,
     size_class_id: SizeClassId,
+    resources: DatabaseEffectiveResources.describe(
+      "The memory, CPU and storage the database runs with: its own values set through PUT /v1/databases/{id}/resources, else its size class's.",
+    ),
     sleep_after_seconds: DatabaseSleepAfter,
     effective_sleep_after_seconds: z
       .number()
@@ -464,7 +471,7 @@ export const Database = z
       .max(2_592_000)
       .nullable()
       .describe(
-        "The idle-sleep threshold: seconds without client activity before the database sleeps, its own sleep_after_seconds, else its size class's; null when the database is always warm. A database with a qualified warm-reclaim policy (/v1/databases/{id}/warm-reclaim) keeps its warm-idle path instead.",
+        "The idle-sleep threshold: seconds without client activity before the database sleeps, its own sleep_after_seconds, else its size class's; null when the database is always warm.",
       ),
     desired_state: DesiredState,
     observed_state: ObservedState,
@@ -502,6 +509,9 @@ export const DatabaseCreate = z
     name: DatabaseName,
     size_class_id: SizeClassId,
     sleep_after_seconds: DatabaseSleepAfter.optional(),
+    resources: DatabaseResourcesCreate.describe(
+      "The database's own memory, CPU and storage instead of its size class's. Admin keys only (403 otherwise).",
+    ).optional(),
   })
   .meta({ id: "DatabaseCreate" });
 export type DatabaseCreate = z.infer<typeof DatabaseCreate>;

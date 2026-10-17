@@ -826,7 +826,6 @@ export class DatabaseActor extends DurableObject<Env> {
                 now,
                 user,
                 mutation.guard(id),
-                true,
               ),
             );
             // Committed at the ticket's generation: the region may pull it now, ahead of the

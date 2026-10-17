@@ -39,37 +39,6 @@ function holdReceiptMatchesCurrentSql(hold: string, database: string) {
   );
   return `(${hold}.storage_volume_json IS NOT NULL AND ${database}.storage_volume_json IS NOT NULL AND json_extract(${hold}.storage_volume_json,'$.storage_generation')=${database}.storage_generation AND (${same.slice(0, 4).join(" AND ")}) AND (${same.slice(4, 8).join(" AND ")}) AND (${same.slice(8).join(" AND ")}))`;
 }
-/** Insert this SELECT in the same admitted INSERT/placement UPDATE, never after it. */
-export function selectedStorageProfileSql(nodeAlias = "n"): string {
-  const node = identifier(nodeAlias);
-  return `(SELECT json_object('backend','lvm-thin-v1',
-    'storage_class','pgcf-lvm-thin-v1-'||substr(t.profile_sha256,1,16),
-    'volume_attributes_class','pgcf-lvm-thin-v1-'||substr(t.profile_sha256,1,16),
-    'profile_revision',t.profile_revision,'profile_sha256',t.profile_sha256,
-    'node_uid',t.node_uid,'volume_group_uuid',t.volume_group_uuid,
-    'pool_uuid',json_extract(t.authority_json,'$.pool_uuid'),
-    'startup_reserve_bytes',${field("startup_reserve_bytes")},
-    'write_bytes_per_second',${field("write_bytes_per_second")},
-    'write_iops_per_second',${field("write_iops_per_second")},
-    'guard_seconds',${field("guard_seconds")},'drain_seconds',${field("drain_seconds")})
-    FROM node_thin_storage t WHERE t.node_id=${node}.id AND t.node_uid=${node}.node_uid)`;
-}
-
-/** Existing thick filesystems keep their allocation. Only a selected thin volume may grow logically. */
-export function storageResizeAllowedSql(
-  databaseAlias = "databases",
-  sizeAlias = "s",
-): string {
-  const database = identifier(databaseAlias),
-    size = identifier(sizeAlias);
-  return `(${size}.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=${database}.size_class_id)
-    OR (${database}.storage_profile_json IS NOT NULL
-      AND ${size}.storage_gib>(SELECT old.storage_gib FROM size_classes old WHERE old.id=${database}.size_class_id)
-      AND EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=${database}.node_id
-        AND t.node_uid=json_extract(${database}.storage_profile_json,'$.node_uid')
-        AND ${size}.storage_gib<=${field("maximum_quota_gib")})))`;
-}
-
 /** Physical fields of the node's latest sample `o` (node_storage_observations). */
 const sampled = (path: string) => `json_extract(o.physical_json,'$.${path}')`;
 const sampledDataFree = `(${sampled("thin_pool.data_total_bytes")}-${sampled("thin_pool.data_used_bytes_upper_bound")})`,
@@ -77,44 +46,6 @@ const sampledDataFree = `(${sampled("thin_pool.data_total_bytes")}-${sampled("th
 /** The node's latest physical sample, read at most two minutes ago. */
 const freshSampleSql = `julianday(o.observed_at)>=julianday('now','-120 seconds') AND julianday(o.observed_at)<=julianday('now','+5 seconds')`;
 
-/**
- * The thin pool reserve rule, Cloudflare's one storage decision at every start and attach: the
- * node's thin storage has no error and its latest physical sample, at most 120 s old, leaves the
- * profile's data and metadata reserve free in the pool. `databaseAlias` judges that database's own
- * pool; without it the rule is for a new volume: the node takes new databases and has a volume to
- * spare. No logical size is accounted: thin volumes overprovision the pool, and dm-thin fails a
- * write into a full pool, so PostgreSQL acknowledges no commit it could not write. Running writers
- * are never stopped by this rule.
- */
-export function thinPoolRoomSql(
-  nodeAlias = "n",
-  sizeAlias = "s",
-  databaseAlias?: string,
-): string {
-  const node = identifier(nodeAlias),
-    size = identifier(sizeAlias),
-    database = databaseAlias === undefined ? null : identifier(databaseAlias);
-  const owner =
-    database === null
-      ? `t.allow_new_databases=1 AND t.status='ready'
-        AND (SELECT COUNT(*) FROM databases v WHERE v.node_id=t.node_id AND v.storage_profile_json IS NOT NULL
-          AND NOT(v.desired_state='deleted' AND v.observed_state='deleted'))<${field("maximum_volumes")}`
-      : allOf(
-          `json_extract(${database}.storage_profile_json,'$.backend')='lvm-thin-v1'`,
-          `json_extract(${database}.storage_profile_json,'$.node_uid')=t.node_uid`,
-          `json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=t.volume_group_uuid`,
-          `json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(t.authority_json,'$.pool_uuid')`,
-        );
-  return `EXISTS(SELECT 1 FROM node_thin_storage t JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid
-    WHERE ${allOf(
-      `t.node_id=${node}.id`,
-      `t.node_uid=${node}.node_uid`,
-      thinPoolNodeRoomSql(),
-      `typeof(${size}.storage_gib)='integer'`,
-      `${size}.storage_gib BETWEEN 1 AND ${field("maximum_quota_gib")}`,
-      owner,
-    )})`;
-}
 /** The node part of the room rule over its thin storage `t` and its latest sample `o`: what the
  * desired page serves as storage_nodes[].write_allowed for the databases the node holds. */
 export function thinPoolNodeRoomSql(): string {
@@ -127,58 +58,6 @@ export function thinPoolNodeRoomSql(): string {
     `${sampledDataFree}>=${field("data_reserve_bytes")}`,
     `${sampledMetadataFree}>=${field("metadata_reserve_bytes")}`,
   );
-}
-
-/**
- * Why the thin storage alert fires for a node's pool, over its thin storage `t` and its latest
- * sample `o` (absent in an outer join): no fresh sample of a pool that holds thin volumes, since
- * nothing then sees it fill; or no room now. The pool does not grow; a filling pool is the
- * storage warning's. NULL while the pool is fine.
- */
-export function thinPoolExhaustionSql(): string {
-  return `CASE WHEN o.node_id IS NULL OR json_type(o.physical_json,'$.thin_pool') IS NOT 'object' OR NOT(${freshSampleSql}) THEN
-      CASE WHEN EXISTS(SELECT 1 FROM databases v WHERE v.node_id=t.node_id AND v.storage_profile_json IS NOT NULL
-        AND v.storage_volume_json IS NOT NULL AND NOT(v.desired_state='deleted' AND v.observed_state='deleted'))
-      THEN 'thin_pool_unobserved' ELSE NULL END
-    WHEN ${sampledDataFree}<${field("data_reserve_bytes")} OR ${sampledMetadataFree}<${field("metadata_reserve_bytes")} THEN 'thin_pool_no_room'
-    ELSE NULL END`;
-}
-
-/** New placements retain the old thick behavior only on nodes with no selected thin policy. */
-export function nodeStoragePlacementSql(
-  nodeAlias = "n",
-  sizeAlias = "s",
-  databaseAlias?: string,
-): string {
-  const node = identifier(nodeAlias),
-    size = identifier(sizeAlias),
-    database = databaseAlias === undefined ? null : identifier(databaseAlias);
-  const exclusion = database === null ? "" : `AND d.id<>${database}.id`;
-  const thick = `${node}.storage_gib_total IS NOT NULL AND ${node}.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=${node}.id AND d.observed_state<>'deleted' ${exclusion}),0)>=${size}.storage_gib`;
-  const retained =
-    database === null
-      ? "0=1"
-      : `${database}.storage_profile_json IS NULL AND ${size}.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=${database}.size_class_id)`;
-  return `((NOT EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=${node}.id) AND (${thick}))
-    OR (EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=${node}.id) AND ((${retained}) OR ${thinPoolRoomSql(node, size, database ?? undefined)})))`;
-}
-
-/** Wake allocates no new extents for a retained thick filesystem; a thin start needs room. */
-export function databaseStorageStartupSql(
-  databaseAlias = "databases",
-  nodeAlias = "n",
-  sizeAlias = "s",
-): string {
-  const database = identifier(databaseAlias);
-  return `(${database}.storage_profile_json IS NULL OR ${thinPoolRoomSql(nodeAlias, sizeAlias, database)})`;
-}
-
-/** The room rule of a wake of `databases` (the row an UPDATE changes): a thin database wakes only
- * while its pool has room; a retained thick filesystem allocates nothing new. */
-export function databaseWakeRoomSql(databaseAlias = "databases"): string {
-  const database = identifier(databaseAlias);
-  return `(${database}.storage_profile_json IS NULL OR EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=${database}.size_class_id
-    WHERE n.id=${database}.node_id AND ${thinPoolRoomSql("n", "s", database)}))`;
 }
 
 /** No receipt can be inferred for an older grant. A deleted obligation can instead be

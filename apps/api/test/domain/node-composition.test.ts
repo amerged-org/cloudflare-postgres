@@ -344,8 +344,9 @@ describe("node composition with actual Workers/D1", () => {
   });
   it("makes an autoscale dry run from real headroom without creating a reservation", async () => {
     const f = await configured();
+    // The node's memory is all in use: no node can take the smallest size class.
     await env.DB.prepare(
-      "UPDATE nodes SET allocatable_memory_mib=128 WHERE id=?",
+      "UPDATE node_samples SET memory_available_bytes=0 WHERE node_id=?",
     )
       .bind(f.node)
       .run();

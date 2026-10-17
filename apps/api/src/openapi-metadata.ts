@@ -94,6 +94,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Set a database's idle time before it sleeps",
     "project",
   ),
+  "PUT /v1/databases/{id}/resources": route(
+    "setDatabaseResources",
+    "Set a database's own memory, CPU and storage",
+    "admin",
+  ),
   "DELETE /v1/databases/{id}": route(
     "deleteDatabase",
     "Delete a database and retain its eligible archive",

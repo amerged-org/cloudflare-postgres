@@ -127,11 +127,11 @@ Thin storage is enabled per node. Existing thick volumes keep their backend and 
 volume keeps its class, Node UID, volume-group UUID and pool UUID; logical quota growth is
 forward-only within the configured finite maximum.
 
-- Room: a start needs a thin pool without error, a storage observation at most 120 s old, free
-  data at least the profile's `data_reserve_bytes` and free metadata at least
-  `metadata_reserve_bytes`. Without room Cloudflare refuses create, resume, restart, restore and
-  wake. Logical quota totals do not reserve extents. `thin_storage_blocked` fires when the pool has
-  no room. The pool does not grow.
+- Room: the node refuses a create, restore, wake and start when its pool has no room (its own room
+  rule: a pool sample at most 10 s old, free data at least the reserve, metadata below 75 %).
+  Cloudflare places no new database or restore on a node whose pool is at 80 % of its data or 50 %
+  of its metadata, or whose sold storage reached four times its data. Logical quota totals do not
+  reserve extents. `thin_storage_blocked` fires when the pool has no room. The pool does not grow.
 - A full pool fails writes at once (`--errorwhenfull y`). PostgreSQL then stops with PANIC and no
   commit is acknowledged without durable WAL. Free pool space by deleting databases on the node;
   the next start recovers from WAL.

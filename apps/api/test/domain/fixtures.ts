@@ -15,6 +15,7 @@ import {
   randomString,
 } from "@pgcf/contracts";
 import { createApp } from "../../src/app.ts";
+import { reportStatement } from "./node-samples.ts";
 
 const fixtures: {
   projects: string[];
@@ -83,7 +84,7 @@ export async function cleanupFixtures(): Promise<void> {
 
 /** The database mutations that refuse a request without an Idempotency-Key, as `METHOD path`. */
 const KEYED_DATABASE_MUTATION =
-  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/(?:resource-profile|idle-time))$/;
+  /^(?:(?:POST|PATCH|DELETE) \/v1\/databases(?:\/[a-z][a-z0-9]{19}(?:\/(?:suspend|resume|restore))?)?|PUT \/v1\/databases\/[a-z][a-z0-9]{19}\/(?:resource-profile|idle-time|resources))$/;
 export async function request(
   path: string,
   key: string,
@@ -124,6 +125,55 @@ export async function refusal(response: Response) {
     reason: error.details?.reason ?? null,
     retryAfter: response.headers.get("Retry-After"),
   };
+}
+/**
+ * A node that has reported, now: `memory` MiB of RAM, idle, 8 cores, and a thin pool of `storage`
+ * GiB that placement may use. Without memory or storage the node has no sample, or no pool.
+ */
+function nodeStatements(
+  node: string,
+  region: string,
+  name: string,
+  memory: number,
+  storage: number | null,
+  now: string,
+): D1PreparedStatement[] {
+  return [
+    env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES (?,?,?,1,?,2000,?,128,100,?,?,?,?)",
+    ).bind(
+      node,
+      region,
+      name,
+      memory,
+      storage,
+      now,
+      now,
+      now,
+      crypto.randomUUID(),
+    ),
+    ...(memory > 0 ? [reportStatement(node, memory, storage)] : []),
+  ];
+}
+/** Another node in the fixture's region, reporting now; see `nodeStatements`. */
+export async function addNode(
+  region: string,
+  memory = 4096,
+  storage: number | null = 30,
+): Promise<string> {
+  const node = newNodeId(),
+    now = new Date().toISOString();
+  await env.DB.batch(
+    nodeStatements(
+      node,
+      region,
+      "node-" + randomString("abcdefghijklmnopqrstuvwxyz0123456789", 8),
+      memory,
+      storage,
+      now,
+    ),
+  );
+  return node;
 }
 export async function fixture(memory = 4096, storage: number | null = 30) {
   const now = new Date().toISOString(),
@@ -193,19 +243,7 @@ export async function fixture(memory = 4096, storage: number | null = 30) {
     );
   }
   statements.push(
-    env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES (?,?,?,1,?,2000,?,128,100,?,?,?,?)",
-    ).bind(
-      node,
-      region,
-      nodeName,
-      memory,
-      storage,
-      now,
-      now,
-      now,
-      crypto.randomUUID(),
-    ),
+    ...nodeStatements(node, region, nodeName, memory, storage, now),
   );
   await env.DB.batch(statements);
   fixtures.push({

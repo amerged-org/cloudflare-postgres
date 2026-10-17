@@ -19,16 +19,16 @@ authority on what still blocks go-live; operator procedures are in the other run
 
 ## Read first
 
-| Topic | State on 2026-10-15 |
-| --- | --- |
-| Runtime | The Kubernetes runtime this handover describes was retired on 2026-10-17. No node executes databases until the Debian node runtime passes Stage 5 of the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md); this handover is rewritten in Stage 6. |
-| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met** yet: the pool of free PostgreSQL instances that targets it is live on EU1 since 2026-10-17, and its first live hit answered the first SaaS request after 1.09 s (Go-live path: *Cold request under one second*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
-| Redundancy | One customer node (EU1), one PostgreSQL instance per database, no replica, no second node. Losing EU1 stops every database until it is restored from R2 onto new capacity ([7](#7-failure-and-recovery)). |
-| Capacity numbers | The density test that measures how many databases may be awake has not run (Go-live path: *Density on EU1*). The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the arithmetic the admission code applies, not measured capacity. |
-| New databases | Thin storage is live on EU1 and new databases are placed on Thin volumes; open defects of Thin starts and idle sleeps are listed in the ULTRA plan (go-live path and after go-live). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced ([2.1](#21-create)). |
-| Alerts | Recorded, not delivered: no email recipient or sender is configured (Go-live path: *Alerts*). You receive no alerts from PGCF ([6](#6-alerts-and-operations)). |
-| Your key | Project-scoped key isolation and rotation have not been exercised live (Go-live path: *Integrator access and catalog*). |
-| Maintenance | Fleet patches reboot the single customer node and visibly interrupt databases. From the canary on the EU stack is production (`pgcf-api-dev` and `eu-dev` are only names): such reboots then need the owner's go and an announced window, but no announcement channel is defined ([7.1](#71-what-happens-in-each-situation)). |
+| Topic                             | State on 2026-10-15                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime                           | The Kubernetes runtime this handover describes was retired on 2026-10-17. No node executes databases until the Debian node runtime passes Stage 5 of the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md); this handover is rewritten in Stage 6.                                                                                                                       |
+| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met** yet: the pool of free PostgreSQL instances that targets it is live on EU1 since 2026-10-17, and its first live hit answered the first SaaS request after 1.09 s (Go-live path: _Cold request under one second_). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
+| Redundancy                        | One customer node (EU1), one PostgreSQL instance per database, no replica, no second node. Losing EU1 stops every database until it is restored from R2 onto new capacity ([7](#7-failure-and-recovery)).                                                                                                                                                                                          |
+| Capacity numbers                  | The density test that measures how many databases may be awake has not run (Go-live path: _Density on EU1_). The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the arithmetic the admission code applies, not measured capacity.                                                                                                                                                     |
+| New databases                     | Thin storage is live on EU1 and new databases are placed on Thin volumes; open defects of Thin starts and idle sleeps are listed in the ULTRA plan (go-live path and after go-live). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced ([2.1](#21-create)).                                                                             |
+| Alerts                            | Recorded, not delivered: no email recipient or sender is configured (Go-live path: _Alerts_). You receive no alerts from PGCF ([6](#6-alerts-and-operations)).                                                                                                                                                                                                                                     |
+| Your key                          | Project-scoped key isolation and rotation have not been exercised live (Go-live path: _Integrator access and catalog_).                                                                                                                                                                                                                                                                            |
+| Maintenance                       | Fleet patches reboot the single customer node and visibly interrupt databases. From the canary on the EU stack is production (`pgcf-api-dev` and `eu-dev` are only names): such reboots then need the owner's go and an announced window, but no announcement channel is defined ([7.1](#71-what-happens-in-each-situation)).                                                                      |
 
 ## 1. The model
 
@@ -44,10 +44,10 @@ hostname and any other path do not work.
 
 A connection names its target twice, and both must agree:
 
-| Where | Value | Checked by |
-| --- | --- | --- |
-| Query string of the WebSocket URL | `database=<id>` and `user=<role>`, exactly one each | Edge Worker: refuses an unregistered database or role before any wake; once the database is awake it signs a route token that lives 30 s |
-| `database` and `user` of the PostgreSQL StartupMessage | the same two values | Regional gateway: comparison with the signed route; a mismatch ends with SQLSTATE `28000` before PostgreSQL is dialled |
+| Where                                                  | Value                                               | Checked by                                                                                                                               |
+| ------------------------------------------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Query string of the WebSocket URL                      | `database=<id>` and `user=<role>`, exactly one each | Edge Worker: refuses an unregistered database or role before any wake; once the database is awake it signs a route token that lives 30 s |
+| `database` and `user` of the PostgreSQL StartupMessage | the same two values                                 | Regional gateway: comparison with the signed route; a mismatch ends with SQLSTATE `28000` before PostgreSQL is dialled                   |
 
 `<id>` is the 20-character database ID the API returned (`^[a-z][a-z0-9]{19}$`, random, not derived
 from the name). It is also the PostgreSQL database name. The `name` you give a database is an API
@@ -76,18 +76,28 @@ A size class fixes the resources and policies of a database. The operator define
 (`PUT /v1/size-classes/{id}`, admin); you read them with `GET /v1/size-classes` and pass the ID at
 creation or resize. Disabled classes (`enabled: false`) are listed but refused.
 
-| Field | Bounds in the contract | Meaning |
-| --- | --- | --- |
-| `memory_mib` | 256 to 1,048,576 in steps of 256 | PostgreSQL container limit; `effective_cache_size` is half of it; `shared_buffers` is a quarter of the region's PostgreSQL memory request |
-| `cpu_millicores`, `cpu_request_millicores` | 100 to 256,000; request optional and at most the limit | CPU limit and scheduling request (the request defaults to the limit) |
-| `storage_gib` | 1 to 65,536 | Hard volume size |
-| `max_connections` | 10 to 10,000 | PostgreSQL `max_connections` |
-| `sleep_after_seconds` | 60 to 2,592,000, or `null` | Idle time before hibernation of a database that sets none of its own; `null` is always warm |
-| `archive_timeout_seconds` | 30 to 3,600 | PostgreSQL `archive_timeout`: bounds how old unarchived WAL can get |
-| `backup_retention_days` | 1 to 3,650 | Barman retention window; also how long a deleted database stays restorable |
+| Field                                      | Bounds in the contract                                 | Meaning                                                                                                                                   |
+| ------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `memory_mib`                               | 256 to 1,048,576 in steps of 256                       | PostgreSQL container limit; `effective_cache_size` is half of it; `shared_buffers` is a quarter of the region's PostgreSQL memory request |
+| `cpu_millicores`, `cpu_request_millicores` | 100 to 256,000; request optional and at most the limit | CPU limit and scheduling request (the request defaults to the limit)                                                                      |
+| `storage_gib`                              | 1 to 65,536                                            | Hard volume size                                                                                                                          |
+| `max_connections`                          | 10 to 10,000                                           | PostgreSQL `max_connections`                                                                                                              |
+| `sleep_after_seconds`                      | 60 to 2,592,000, or `null`                             | Idle time before hibernation of a database that sets none of its own; `null` is always warm                                               |
+| `archive_timeout_seconds`                  | 30 to 3,600                                            | PostgreSQL `archive_timeout`: bounds how old unarchived WAL can get                                                                       |
+| `backup_retention_days`                    | 1 to 3,650                                             | Barman retention window; also how long a deleted database stays restorable                                                                |
 
 A class that databases reference cannot change its resources or policies (`409`); a class that a
 resource profile revision references cannot change at all. New values need a new class.
+
+**Resources of one database.** The class supplies a database's memory, CPU and storage, and an
+**admin key** may give one database its own: in `resources` on `POST /v1/databases`, or with
+`PUT /v1/databases/{id}/resources` (an integrator key gets `403`). Every `Database` reports the
+values it runs with in `resources` (`memory_mib`, `cpu_millicores`, `storage_gib`). A `PUT` sets all
+three fields, and `null` hands one back to the class. Memory is a multiple of 256 MiB up to the
+region's per-database maximum; CPU is at least 100 millicores and at most the cores of the region's
+largest node; storage is at least the database's current size and never shrinks. The change is a
+resize ([2.5](#25-resize)), and a change of class keeps the database's own values. A restore
+creates its database with the source's resources.
 
 The API refuses a class whose memory exceeds the region's per-database maximum (`400`; 4,096 MiB
 on this installation). It does **not** refuse a class that no node can host, for example a
@@ -95,21 +105,21 @@ on this installation). It does **not** refuse a class that no node can host, for
 creates of such a class are accepted and then wait unplaced. Ask the operator which classes are
 placeable. The plan records eight enabled classes, six of them test classes, and a 256 MiB class
 that keeps backups for one day; the owner has not yet approved the production catalog (Go-live path:
-*Integrator access and catalog*).
+_Integrator access and catalog_).
 
 ### 1.4 Projects and keys
 
 There are two key scopes:
 
-| | Integrator key | Admin key |
-| --- | --- | --- |
-| Bound to | exactly one project | nothing |
-| Databases, roles, operations, archive summary, usage | its own project; a resource of another project is reported as `404`, never `403` | all projects |
-| Connection URI | **includes the role password** | never includes a password (`includes_password: false`) |
-| Size classes | list | list and define |
-| Regions | list `{id, provider_region}` of those that accept placement | list the full records, create, read |
-| Projects | list and read its own; delete its own once it holds no live database (this also revokes the project's keys) | create, list, delete |
-| API keys, nodes, capacity policy, costs, operational health, infrastructure backups, fleet | `403` | yes |
+|                                                                                            | Integrator key                                                                                              | Admin key                                              |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Bound to                                                                                   | exactly one project                                                                                         | nothing                                                |
+| Databases, roles, operations, archive summary, usage                                       | its own project; a resource of another project is reported as `404`, never `403`                            | all projects                                           |
+| Connection URI                                                                             | **includes the role password**                                                                              | never includes a password (`includes_password: false`) |
+| Size classes                                                                               | list                                                                                                        | list and define                                        |
+| Regions                                                                                    | list `{id, provider_region}` of those that accept placement                                                 | list the full records, create, read                    |
+| Projects                                                                                   | list and read its own; delete its own once it holds no live database (this also revokes the project's keys) | create, list, delete                                   |
+| API keys, nodes, capacity policy, costs, operational health, infrastructure backups, fleet | `403`                                                                                                       | yes                                                    |
 
 A key is `pgcf_sk_<12 characters>_<43 characters>`, sent as `Authorization: Bearer <key>`. PGCF
 stores only an HMAC of it; the full key appears once, in the creation response. A lost response
@@ -140,7 +150,7 @@ open work.
 ## 2. Lifecycle API
 
 The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
-the version of the API contract (`1.1.0` for this document): it changes when the contract changes
+the version of the API contract (`1.2.0` for this document): it changes when the contract changes
 and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
 state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
 Its operation IDs are listed below. Examples assume:
@@ -167,7 +177,7 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
   it is echoed, and `error.request_id` repeats it. Every response also carries a fresh
   `X-PGCF-Diagnostic-Id`. Quote both when you escalate ([7.6](#76-escalation)).
 - **Asynchronous writes** return `202` with `{database, operation}` (restore: `{target_database,
-  operation}`) and `Location: /v1/operations/{id}`.
+operation}`) and `Location: /v1/operations/{id}`.
 - **Idempotency.** Send `Idempotency-Key` (`^[A-Za-z0-9._~-]{1,128}$`) on every mutation, generate
   it once per logical operation and persist it with your intent before sending. It is
   **required** (`400` without it) on creating, resizing, deleting, suspending, resuming and
@@ -188,29 +198,30 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
   package is private and not published) and strict about response shapes; call the HTTP API
   directly or vendor it. It uses a 30 s timeout by default and never retries a write.
 
-| Operation ID | Call | Notes |
-| --- | --- | --- |
-| `createDatabase` | `POST /v1/databases` | 202 |
-| `listDatabases` | `GET /v1/databases` | filters `project_id`, `region_id`, `node_id`, `desired_state`, `observed_state` and `name` (exact, case-sensitive; unique among the live databases of a project, so one match inside your project); excludes deleted |
-| `getDatabase` | `GET /v1/databases/{id}` | also returns a deleted database (`desired_state: deleted`) |
-| `resizeDatabase` | `PATCH /v1/databases/{id}` | body `{size_class_id}` only; no rename |
-| `setDatabaseIdleTime` | `PUT /v1/databases/{id}/idle-time` | body `{sleep_after_seconds}`; 200 with the database, no operation ([3.5](#35-idle-sleep-and-wake-on-connect)); `Idempotency-Key` required |
-| `deleteDatabase` | `DELETE /v1/databases/{id}` | 202 |
-| `suspendDatabase`, `resumeDatabase` | `POST /v1/databases/{id}/suspend`, `/resume` | 202 |
-| `restoreDatabase` | `POST /v1/databases/{id}/restore` | 202, creates a new database |
-| `listDatabaseRoles`, `createDatabaseRole` | `GET`, `POST /v1/databases/{id}/roles` | at most 100 roles; optional `valid_until`, `connection_limit`, `member_of`, `bypass_rls` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required |
-| `resetDatabaseRolePassword` | `POST /v1/databases/{id}/roles/{name}/reset-password` | `Idempotency-Key` required |
-| `deleteDatabaseRole` | `DELETE /v1/databases/{id}/roles/{name}` | 202, operation `database.role.delete` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required |
-| `getDatabaseConnectionUri` | `GET /v1/databases/{id}/roles/{name}/connection-uri` | password included for integrator keys |
-| `getDatabaseOperation` | `GET /v1/operations/{id}` | |
-| `listDatabaseOperations` | `GET /v1/databases/{id}/operations` | newest first, the view of `getDatabaseOperation`; also the operations PGCF starts itself; a deleted database stays listable |
-| `listRegions` | `GET /v1/regions` | `{id, provider_region}` of the regions that accept placement ([1.2](#12-regions)) |
-| `getDatabaseArchive` | `GET /v1/databases/{id}/archive` | counts only |
-| `getDatabaseBackups` | `GET /v1/databases/{id}/backups` | the restorable window and the restorable base backups ([2.7](#27-backups-restorable-window-and-restore)) |
-| `getUsage` | `GET /v1/usage` | [5](#5-metering) |
-| `listSizeClasses` | `GET /v1/size-classes` | |
-| `listProjects`, `getProject`, `deleteProject` | `/v1/projects`, `/v1/projects/{id}` | |
-| `getDatabaseResourceProfile`, `assignDatabaseResourceProfile` | `GET`, `PUT /v1/databases/{id}/resource-profile` | operator-defined profile revisions; an assignment is a resize |
+| Operation ID                                                  | Call                                                  | Notes                                                                                                                                                                                                                   |
+| ------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createDatabase`                                              | `POST /v1/databases`                                  | 202                                                                                                                                                                                                                     |
+| `listDatabases`                                               | `GET /v1/databases`                                   | filters `project_id`, `region_id`, `node_id`, `desired_state`, `observed_state` and `name` (exact, case-sensitive; unique among the live databases of a project, so one match inside your project); excludes deleted    |
+| `getDatabase`                                                 | `GET /v1/databases/{id}`                              | also returns a deleted database (`desired_state: deleted`)                                                                                                                                                              |
+| `resizeDatabase`                                              | `PATCH /v1/databases/{id}`                            | body `{size_class_id}` only; no rename                                                                                                                                                                                  |
+| `setDatabaseResources`                                        | `PUT /v1/databases/{id}/resources`                    | admin key only (`403` otherwise); body `{memory_mib, cpu_millicores, storage_gib}`, each a value or `null` for the size class's ([1.3](#13-size-classes)); 202 with the operation, a resize; `Idempotency-Key` required |
+| `setDatabaseIdleTime`                                         | `PUT /v1/databases/{id}/idle-time`                    | body `{sleep_after_seconds}`; 200 with the database, no operation ([3.5](#35-idle-sleep-and-wake-on-connect)); `Idempotency-Key` required                                                                               |
+| `deleteDatabase`                                              | `DELETE /v1/databases/{id}`                           | 202                                                                                                                                                                                                                     |
+| `suspendDatabase`, `resumeDatabase`                           | `POST /v1/databases/{id}/suspend`, `/resume`          | 202                                                                                                                                                                                                                     |
+| `restoreDatabase`                                             | `POST /v1/databases/{id}/restore`                     | 202, creates a new database                                                                                                                                                                                             |
+| `listDatabaseRoles`, `createDatabaseRole`                     | `GET`, `POST /v1/databases/{id}/roles`                | at most 100 roles; optional `valid_until`, `connection_limit`, `member_of`, `bypass_rls` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required                                                    |
+| `resetDatabaseRolePassword`                                   | `POST /v1/databases/{id}/roles/{name}/reset-password` | `Idempotency-Key` required                                                                                                                                                                                              |
+| `deleteDatabaseRole`                                          | `DELETE /v1/databases/{id}/roles/{name}`              | 202, operation `database.role.delete` ([2.3](#23-roles-connection-uri-and-passwords)); `Idempotency-Key` required                                                                                                       |
+| `getDatabaseConnectionUri`                                    | `GET /v1/databases/{id}/roles/{name}/connection-uri`  | password included for integrator keys                                                                                                                                                                                   |
+| `getDatabaseOperation`                                        | `GET /v1/operations/{id}`                             |                                                                                                                                                                                                                         |
+| `listDatabaseOperations`                                      | `GET /v1/databases/{id}/operations`                   | newest first, the view of `getDatabaseOperation`; also the operations PGCF starts itself; a deleted database stays listable                                                                                             |
+| `listRegions`                                                 | `GET /v1/regions`                                     | `{id, provider_region}` of the regions that accept placement ([1.2](#12-regions))                                                                                                                                       |
+| `getDatabaseArchive`                                          | `GET /v1/databases/{id}/archive`                      | counts only                                                                                                                                                                                                             |
+| `getDatabaseBackups`                                          | `GET /v1/databases/{id}/backups`                      | the restorable window and the restorable base backups ([2.7](#27-backups-restorable-window-and-restore))                                                                                                                |
+| `getUsage`                                                    | `GET /v1/usage`                                       | [5](#5-metering)                                                                                                                                                                                                        |
+| `listSizeClasses`                                             | `GET /v1/size-classes`                                |                                                                                                                                                                                                                         |
+| `listProjects`, `getProject`, `deleteProject`                 | `/v1/projects`, `/v1/projects/{id}`                   |                                                                                                                                                                                                                         |
+| `getDatabaseResourceProfile`, `assignDatabaseResourceProfile` | `GET`, `PUT /v1/databases/{id}/resource-profile`      | operator-defined profile revisions; an assignment is a resize                                                                                                                                                           |
 
 ### 2.1 Create
 
@@ -223,7 +234,10 @@ pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \
 
 What happens: the database record (generation 1), the owner role `app` with a server-generated
 password and an internal maintenance role (`pgcf_maintenance`, reserved) are written; the
-placement step picks a node whose fresh observations fit the class. The first base backup is
+placement step picks the node that is the fullest of those that stay under 80 % active RAM and 80 %
+CPU load, each as the highest 30-minute average of the last seven days, and whose thin pool is
+open (data below 80 %, metadata below 50 %, sold storage within four times its data). A database
+placed in the last 30 minutes counts at its full memory until its own average exists. The first base backup is
 requested at once and WAL archiving starts with the first start. The idle time
 (`effective_sleep_after_seconds`) counts from readiness.
 
@@ -232,7 +246,7 @@ requested at once and WAL archiving starts with the first start. The idle time
   `pending` or `provisioning` until then. Connecting earlier returns `57P03` immediately.
 - Measured on EU1 (the plan's "EU acceptance" row, thick storage, standard runtime): ready in
   30.7 s, first SQL through Cloudflare 0.57 s, base backup and WAL in R2 after 20.7 s. On Thin
-  storage (Go-live path: *Thin acceptance*, 2026-10-15) a create took 260.4 s to ready, first SQL
+  storage (Go-live path: _Thin acceptance_, 2026-10-15) a create took 260.4 s to ready, first SQL
   through Cloudflare 0.93 s and base backup and WAL in R2 84.5 s.
 - **No capacity.** If no node qualifies, the call still returns `202`: `node_id` is `null`,
   `observed_state` is `pending` and `status_message` is `Waiting for verified regional capacity`.
@@ -248,11 +262,11 @@ requested at once and WAL archiving starts with the first start. The idle time
 
 `GET /v1/operations/{id}` returns `{id, kind, status, database_id, generation, error, ...}`.
 
-| `status` | Meaning |
-| --- | --- |
-| `pending`, `running` | accepted; the regional controller has not finished |
-| `succeeded` | the observed state matches the intent |
-| `failed` | `error.code` and `error.message` say why; see [A.3](#a3-operation-error-codes) |
+| `status`             | Meaning                                                                        |
+| -------------------- | ------------------------------------------------------------------------------ |
+| `pending`, `running` | accepted; the regional controller has not finished                             |
+| `succeeded`          | the observed state matches the intent                                          |
+| `failed`             | `error.code` and `error.message` say why; see [A.3](#a3-operation-error-codes) |
 
 Poll with a short interval at first and a longer one afterwards; there is no event stream or
 webhook (open work). Kinds you start: `database.create`, `database.restore` (it belongs to the new
@@ -266,12 +280,12 @@ The `Database` object: `desired_state` (`running`, `suspended`, `deleted`), `obs
 configuration is applied when they are equal), `status_message`, `node_id` (`null` while
 unplaced), `health` and `storage`:
 
-| Field | Meaning |
-| --- | --- |
-| `health.archiving` | `ok`, `failing`, `unknown`, with `since` |
-| `health.backup` | `status` is `ok` while the last completed base backup is at most 36 h old, `stale` when older, `failing` when the region reports failing or its last failure is newer than its last completion, `unknown` without a report within 180 s or without a completed backup; `last_base_backup_at` is when that backup finished, `null` while unknown |
-| `health.disk` | `status` is `warning` from 90 % used and `unknown` without a usage sample within 180 s; `used_ratio` is used divided by allocated bytes of the newest sample, `null` when it measured nothing |
-| `storage` | `{used_bytes, allocated_bytes, observed_at}` of the newest sample the region's agent reported, with `null` figures where it measured nothing; the whole object is `null` before the first sample. It is not cut off by age: judge `observed_at` yourself |
+| Field              | Meaning                                                                                                                                                                                                                                                                                                                                         |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `health.archiving` | `ok`, `failing`, `unknown`, with `since`                                                                                                                                                                                                                                                                                                        |
+| `health.backup`    | `status` is `ok` while the last completed base backup is at most 36 h old, `stale` when older, `failing` when the region reports failing or its last failure is newer than its last completion, `unknown` without a report within 180 s or without a completed backup; `last_base_backup_at` is when that backup finished, `null` while unknown |
+| `health.disk`      | `status` is `warning` from 90 % used and `unknown` without a usage sample within 180 s; `used_ratio` is used divided by allocated bytes of the newest sample, `null` when it measured nothing                                                                                                                                                   |
+| `storage`          | `{used_bytes, allocated_bytes, observed_at}` of the newest sample the region's agent reported, with `null` figures where it measured nothing; the whole object is `null` before the first sample. It is not cut off by age: judge `observed_at` yourself                                                                                        |
 
 `null` and `unknown` mean not known, never fine and never zero. These are the very figures the
 operator reads in `GET /v1/operational-health?scope=databases`: one source, two views.
@@ -311,12 +325,12 @@ pgcf -X POST "$PGCF_API/v1/databases/<database-id>/roles" -H 'Content-Type: appl
   -d '{"name":"report_a1b2c3","valid_until":"2030-01-01T10:00:00.000Z","connection_limit":5,"member_of":["reader"]}'
 ```
 
-| Field | Meaning | Limits |
-| --- | --- | --- |
-| `valid_until` | PostgreSQL `VALID UNTIL`: from this time the role cannot log in | a [timestamp](#20-conventions) in the future when the request executes, no maximum; PostgreSQL applies it at whole seconds, truncated, so `…:05.678Z` expires at `…:05.000Z` and a value whose whole second has already begun is refused with `400` |
-| `connection_limit` | PostgreSQL `CONNECTION LIMIT`: concurrent sessions of the role; one more gets `53300` "too many connections for role" | 1 to 10,000; omitted means unlimited |
-| `member_of` | the role is a member of these roles and inherits their privileges (`INHERIT`; `SET ROLE` to them stays possible, as for any PostgreSQL membership) | at most 8 distinct live roles of this database; never `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*` or the role itself; otherwise `400` |
-| `bypass_rls` | PostgreSQL `BYPASSRLS`: the role ignores row-level security policies, also `FORCE ROW LEVEL SECURITY`; it still needs table privileges. Typical use: an export or backup role | boolean, default `false` |
+| Field              | Meaning                                                                                                                                                                       | Limits                                                                                                                                                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `valid_until`      | PostgreSQL `VALID UNTIL`: from this time the role cannot log in                                                                                                               | a [timestamp](#20-conventions) in the future when the request executes, no maximum; PostgreSQL applies it at whole seconds, truncated, so `…:05.678Z` expires at `…:05.000Z` and a value whose whole second has already begun is refused with `400` |
+| `connection_limit` | PostgreSQL `CONNECTION LIMIT`: concurrent sessions of the role; one more gets `53300` "too many connections for role"                                                         | 1 to 10,000; omitted means unlimited                                                                                                                                                                                                                |
+| `member_of`        | the role is a member of these roles and inherits their privileges (`INHERIT`; `SET ROLE` to them stays possible, as for any PostgreSQL membership)                            | at most 8 distinct live roles of this database; never `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*` or the role itself; otherwise `400`                                                                                                               |
+| `bypass_rls`       | PostgreSQL `BYPASSRLS`: the role ignores row-level security policies, also `FORCE ROW LEVEL SECURITY`; it still needs table privileges. Typical use: an export or backup role | boolean, default `false`                                                                                                                                                                                                                            |
 
 `GET /v1/databases/{id}/roles` returns all four on every role (`null`, `[]`, `false` when not
 set). A role past its `valid_until` stays listed and counts toward the 100 roles until you delete
@@ -381,8 +395,8 @@ existing operation.
 
 `resume` also works as a **pre-wake** of an idle-hibernated database: it is the supported way to
 wake before traffic (poll the operation, then run `SELECT 1`). When the node cannot take the
-start (no fresh memory sample within 90 s, `MemoryPressure`, or no CPU, RAM or storage headroom),
-`resume` answers `409 conflict` with reason `node_capacity` and `Retry-After: 30`: retry later or
+start (no report within 180 s, no room in its thin pool, or less memory available than the
+database's memory plus the node's 600 MiB floor), `resume` answers `409 conflict` with reason `node_capacity` and `Retry-After: 30`: retry later or
 free capacity. A `409` with reason `generation_changed` is a change that raced the request and is
 retried at once.
 
@@ -393,13 +407,14 @@ retried at once.
 - A running database moves to the new limits by replacing its Pod, so its sessions end. One
   earlier Dev resize to 512 MiB and 250 m took 28 s with data and volume unchanged. A
   hibernated database changes immediately and starts on the new class at its next wake.
-- The target class must be enabled, within the region's memory maximum and, for a running
-  database, fit the node now: `503 capacity_exhausted` ("Current node has insufficient memory, CPU
-  or storage") otherwise.
-- Storage may only grow, and only on a Thin volume up to the node's per-database quota
-  ([4.3](#43-thin-storage)); shrinking is `400` ("Storage shrink is not supported"), and a storage
-  change on a retained thick volume is `400` too. Growth through the API is **not yet verified
-  live**.
+- The target class must be enabled and within the region's memory maximum. A running database that
+  grows must fit the node now, else `503 capacity_exhausted` ("Current node has insufficient
+  memory, CPU or storage"): its active RAM would reach 80 % with the extra memory, its CPU would
+  exceed the node's cores, or its storage would take the node's sold storage past four times its
+  pool. A smaller or equal size needs no room, and a hibernated database takes any size at once and
+  needs room at its next wake.
+- Storage may only grow; shrinking is `400` ("Storage shrink is not supported"). Growth through the
+  API is **not yet verified live**.
 - The operator can roll a new revision of a resource profile out to every database assigned to
   it; that changes your database's `size_class_id` (a hibernated one at its next wake). Read it
   with `GET /v1/databases/{id}/resource-profile`.
@@ -472,13 +487,13 @@ relationship that the operator configures (not applicable with one region).
 
 **The ID mapping you must keep.**
 
-| | Source | Restored target |
-| --- | --- | --- |
-| Database ID and PostgreSQL database name | `<source-id>` | **new** `<target-id>` |
-| `name` | the old label | the `name` of the request; it must differ from every live database of the project (`409` otherwise) |
-| Project, size class, region | | the same (region unless `region_id` is given) |
-| Role names, passwords and attributes (`valid_until`, `connection_limit`, `member_of`, `bypass_rls`) | | the same names, passwords and attributes registered at the time of the call (from the retained record for a deleted source); a role awaiting its removal is not copied, and an expired role is copied expired |
-| Data, grants, sequences | | from the backup, as of `target_time` or the end of the archive |
+|                                                                                                     | Source        | Restored target                                                                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database ID and PostgreSQL database name                                                            | `<source-id>` | **new** `<target-id>`                                                                                                                                                                                         |
+| `name`                                                                                              | the old label | the `name` of the request; it must differ from every live database of the project (`409` otherwise)                                                                                                           |
+| Project, size class, region                                                                         |               | the same (region unless `region_id` is given)                                                                                                                                                                 |
+| Role names, passwords and attributes (`valid_until`, `connection_limit`, `member_of`, `bypass_rls`) |               | the same names, passwords and attributes registered at the time of the call (from the retained record for a deleted source); a role awaiting its removal is not copied, and an expired role is copied expired |
+| Data, grants, sequences                                                                             |               | from the backup, as of `target_time` or the end of the archive                                                                                                                                                |
 
 The source keeps running until you delete it. Persist `source_id -> target_id`, the restore
 operation ID and its idempotency key. To switch, read the target's connection URI, make your pool
@@ -489,15 +504,15 @@ the source without reconciling them. A stale ID fails with `28P01` ([A.4](#a4-sq
 The restore is ready when its operation is `succeeded`: recovery has promoted, roles and settings
 match and the temporary restore administrator is gone. Compare your markers before cutover.
 
-| `409` reason | Meaning |
-| --- | --- |
-| `archive_expired` | deleted source past `deleted_at + backup_retention_days`, or its cleanup has begun |
-| `no_recovery_point` | no complete base backup ends at or before `target_time`, or its WAL chain has a gap |
-| `archive_unusable` | the v1 catalog reads at most 16,000 objects and 64 base backups per database, and the listing was incomplete, invalid or beyond that bound |
-| `name_in_use` | a live database of the project already has the target `name`; choose another |
-| `source_unavailable` | the source's class is disabled, its region record is gone or its credentials are unavailable |
-| `region_unavailable` | the `region_id` of the request names no region |
-| `generation_changed` | the source, its retained archive or the placement changed under the request; retry |
+| `409` reason         | Meaning                                                                                                                                    |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `archive_expired`    | deleted source past `deleted_at + backup_retention_days`, or its cleanup has begun                                                         |
+| `no_recovery_point`  | no complete base backup ends at or before `target_time`, or its WAL chain has a gap                                                        |
+| `archive_unusable`   | the v1 catalog reads at most 16,000 objects and 64 base backups per database, and the listing was incomplete, invalid or beyond that bound |
+| `name_in_use`        | a live database of the project already has the target `name`; choose another                                                               |
+| `source_unavailable` | the source's class is disabled, its region record is gone or its credentials are unavailable                                               |
+| `region_unavailable` | the `region_id` of the request names no region                                                                                             |
+| `generation_changed` | the source, its retained archive or the placement changed under the request; retry                                                         |
 
 A restore needs capacity like a create; without it the target waits unplaced and the operation
 stays `pending`. Restore duration is **not measured**: the plan records no recovery time.
@@ -533,7 +548,8 @@ pool.Client = class extends Client {
     this.neonConfig.forceDisablePgSSL = true; // TLS is the WebSocket; see 3.3
     // pipelineConnect keeps its default "password" and coalesceWrites its default true; see below
     // The driver prepends wss://; return host and path only, with both hints.
-    this.neonConfig.wsProxy = (host) => `${host}/v2?${new URLSearchParams({ database, user })}`;
+    this.neonConfig.wsProxy = (host) =>
+      `${host}/v2?${new URLSearchParams({ database, user })}`;
   }
 };
 ```
@@ -597,21 +613,21 @@ Edge and gateway only relay it.
 
 Measured wake times through Cloudflare (standard runtime, CNPG hibernation):
 
-| Series | First row after connect |
-| --- | --- |
-| Gate 0, 3 cold wakes, 2026-10-12, retained 1 GiB database | **8.1–9.4 s** |
-| The same wake before the wake orchestration (R1.2 baseline) | 9.6–11.2 s |
-| Earlier 20-wake series (p50 / p95 / max) | 8.4 / 9.2 / 9.7 s |
-| Already awake database, first row | 0.47–0.96 s (0.54–0.61 s in the warm rounds) |
+| Series                                                      | First row after connect                      |
+| ----------------------------------------------------------- | -------------------------------------------- |
+| Gate 0, 3 cold wakes, 2026-10-12, retained 1 GiB database   | **8.1–9.4 s**                                |
+| The same wake before the wake orchestration (R1.2 baseline) | 9.6–11.2 s                                   |
+| Earlier 20-wake series (p50 / p95 / max)                    | 8.4 / 9.2 / 9.7 s                            |
+| Already awake database, first row                           | 0.47–0.96 s (0.54–0.61 s in the warm rounds) |
 
 **The sub-second goal is not met yet.** The path to it is the pool: a cold
 database's volume is attached to an already running, free PostgreSQL instance on its node, so the
 next connection does not wait for a new Pod. Its first live hit through Cloudflare (2026-10-17)
 answered the first SaaS request after 1.09 s; p95, misses and databases idle for an hour are not
-measured yet (Go-live path: *Cold request under one second*). A wake that finds no free instance
+measured yet (Go-live path: _Cold request under one second_). A wake that finds no free instance
 takes the hibernated wake above. PGCF publishes the result only in the ULTRA plan's Done table, as the
 first row measured stage by stage from one start, with every run labelled hit or miss (demoted,
-hibernated); update this section from that row when *Sub-second wake* closes.
+hibernated); update this section from that row when _Sub-second wake_ closes.
 
 What the Edge does: it waits at most **60 s** for a wake (`ADMISSION_DEADLINE_MS`), coalesces all
 connections of one database into one wake and admits at most 32 waiters per database. Giving up
@@ -620,27 +636,27 @@ database ready.
 
 Recommended policy (derived from those numbers, not a PGCF guarantee):
 
-| Setting | Value | Reason |
-| --- | --- | --- |
-| Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus login and startup (0.1–0.4 s); a cold Thin wake without a free pool instance takes about 22 s, a pool hit about 1.1 s |
-| Statement timeout | separate from the connect timeout | a connect timeout does not bound a query |
-| Retry `57P03`, `08006`, `53300` | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | transient by definition |
-| Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never | configuration or credentials; fix, do not loop |
-| After a dropped connection | reconnect; never replay a write unless it is idempotent | PGCF never replays SQL; whether an in-flight `COMMIT` took effect is unknown to you and to PGCF |
-| Latency-sensitive paths | pre-wake with `POST /resume`, keep the database awake longer (`sleep_after_seconds`), or use an always-warm class (`sleep_after_seconds: null`) | removes the wake from the request |
+| Setting                                           | Value                                                                                                                                           | Reason                                                                                                                                        |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Connect timeout                                   | at least 65 s; 70 s used above                                                                                                                  | 60 s Edge deadline plus login and startup (0.1–0.4 s); a cold Thin wake without a free pool instance takes about 22 s, a pool hit about 1.1 s |
+| Statement timeout                                 | separate from the connect timeout                                                                                                               | a connect timeout does not bound a query                                                                                                      |
+| Retry `57P03`, `08006`, `53300`                   | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total                                                               | transient by definition                                                                                                                       |
+| Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never                                                                                                                                           | configuration or credentials; fix, do not loop                                                                                                |
+| After a dropped connection                        | reconnect; never replay a write unless it is idempotent                                                                                         | PGCF never replays SQL; whether an in-flight `COMMIT` took effect is unknown to you and to PGCF                                               |
+| Latency-sensitive paths                           | pre-wake with `POST /resume`, keep the database awake longer (`sleep_after_seconds`), or use an always-warm class (`sleep_after_seconds: null`) | removes the wake from the request                                                                                                             |
 
 A `57P03` that arrives immediately, in well under a second, is not a wake timeout. At the 60 s
 mark the Edge aborts the admission and answers `08006` ("connection admission interrupted"); the
 Actor's own deadline answers `57P03` and can win that race. To tell the causes apart read
 `GET /v1/databases/{id}`:
 
-| `desired_state` / `observed_state` / `status_message` | Cause | Action |
-| --- | --- | --- |
-| `suspended`, `suspension_reason: manual` | manual suspension | `POST /resume` |
-| `running`, `pending` or `provisioning` | creation, restore, resize or resume in progress | poll the operation |
-| `running`, `node_id: null`, `Waiting for verified regional capacity` | no node fits yet | wait; set a deadline |
-| `error` | the regional controller reports a failure | escalate |
-| `hibernated` (idle) and `57P03` at once | the wake could not start: no fresh memory sample, `MemoryPressure`, no CPU, RAM or storage headroom (the usual causes), a lost node, or an admission change in flight; no wake operation starts | back off and retry; shed load |
+| `desired_state` / `observed_state` / `status_message`                | Cause                                                                                                                                                                                           | Action                        |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `suspended`, `suspension_reason: manual`                             | manual suspension                                                                                                                                                                               | `POST /resume`                |
+| `running`, `pending` or `provisioning`                               | creation, restore, resize or resume in progress                                                                                                                                                 | poll the operation            |
+| `running`, `node_id: null`, `Waiting for verified regional capacity` | no node fits yet                                                                                                                                                                                | wait; set a deadline          |
+| `error`                                                              | the regional controller reports a failure                                                                                                                                                       | escalate                      |
+| `hibernated` (idle) and `57P03` at once                              | the wake could not start: no fresh memory sample, `MemoryPressure`, no CPU, RAM or storage headroom (the usual causes), a lost node, or an admission change in flight; no wake operation starts | back off and retry; shed load |
 
 ### 3.5 Idle sleep and wake on connect
 
@@ -649,8 +665,7 @@ A database hibernates when it has had **no busy session and no client activity f
 `PUT /v1/databases/{id}/idle-time`; `null` hands it back to the class), else its class's; a class
 with `null` is always warm (`effective_sleep_after_seconds` is then `null`). The `PUT` is accepted
 in every state but deleted, also during a resize; it creates no operation and no new generation,
-and the value applies from the next idle check. A database with a qualified warm-reclaim policy
-(`/v1/databases/{id}/warm-reclaim`) keeps its warm-idle path instead. A session is busy while
+and the value applies from the next idle check. A session is busy while
 it is authenticating, in a transaction (including `idle in transaction`), running a statement, in
 `COPY`, or when its state is uncertain; a prepared transaction also stops the sleep (`power_busy`).
 A merely open, idle connection is not busy and does not keep the database awake: the gateway
@@ -665,16 +680,16 @@ a woken database sleeps again after 60 s idle.
 
 ### 3.6 Connection limits
 
-| Limit | Value | Where |
-| --- | --- | --- |
-| Server sessions | the class's `max_connections`; PostgreSQL reserves a few for superusers and PGCF's own maintenance and instance-manager sessions (exact count not recorded) | PostgreSQL; refusal is `53300` |
-| Sessions of one role | the role's `connection_limit` when set ([2.3](#23-roles-connection-uri-and-passwords)); PGCF's own readiness check logs in once per role for a moment and accepts a role that is at its limit | PostgreSQL; refusal is `53300` "too many connections for role" |
-| Sessions per database through one gateway | 200 (2,000 per gateway); beyond that the connection fails as `08006` | gateway constants |
-| New connections per database, all roles and networks | 120 per 60 s in the example Edge configuration; the plan records the same figure as the deployed handshake limit | Edge rate limiter; refusal is `53300` |
-| New connections per database, role and source network | 120 per 60 s in the example Edge configuration; the deployed value is installation configuration and **not recorded in this repository** | Edge rate limiter; refusal is `53300` |
-| New connections per database and role from a same-account Worker on a service binding (no `CF-Connecting-IP`) | 1,200 per 60 s in the example Edge configuration, in a limiter of its own; such a caller never counts in the two public limiters above | Edge rate limiter; refusal is `53300` |
-| Admissions per database per minute | 12,000 | DatabaseActor |
-| Waiters during one wake | 32 per database | DatabaseActor |
+| Limit                                                                                                         | Value                                                                                                                                                                                         | Where                                                          |
+| ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| Server sessions                                                                                               | the class's `max_connections`; PostgreSQL reserves a few for superusers and PGCF's own maintenance and instance-manager sessions (exact count not recorded)                                   | PostgreSQL; refusal is `53300`                                 |
+| Sessions of one role                                                                                          | the role's `connection_limit` when set ([2.3](#23-roles-connection-uri-and-passwords)); PGCF's own readiness check logs in once per role for a moment and accepts a role that is at its limit | PostgreSQL; refusal is `53300` "too many connections for role" |
+| Sessions per database through one gateway                                                                     | 200 (2,000 per gateway); beyond that the connection fails as `08006`                                                                                                                          | gateway constants                                              |
+| New connections per database, all roles and networks                                                          | 120 per 60 s in the example Edge configuration; the plan records the same figure as the deployed handshake limit                                                                              | Edge rate limiter; refusal is `53300`                          |
+| New connections per database, role and source network                                                         | 120 per 60 s in the example Edge configuration; the deployed value is installation configuration and **not recorded in this repository**                                                      | Edge rate limiter; refusal is `53300`                          |
+| New connections per database and role from a same-account Worker on a service binding (no `CF-Connecting-IP`) | 1,200 per 60 s in the example Edge configuration, in a limiter of its own; such a caller never counts in the two public limiters above                                                        | Edge rate limiter; refusal is `53300`                          |
+| Admissions per database per minute                                                                            | 12,000                                                                                                                                                                                        | DatabaseActor                                                  |
+| Waiters during one wake                                                                                       | 32 per database                                                                                                                                                                               | DatabaseActor                                                  |
 
 SQL statements on an established connection do not count against the rate limits, so keep
 connections and pool them: a platform that opens a connection per request meets the per-database
@@ -701,25 +716,28 @@ const sql = neon(connectionUri); // postgres://<role>:<password>@<host>/<databas
 
 const items = await sql`SELECT id, name FROM items WHERE owner = ${owner}`;
 const [, total] = await sql.transaction(
-  [sql`INSERT INTO items (owner, name) VALUES (${owner}, ${name})`, sql`SELECT count(*) FROM items`],
+  [
+    sql`INSERT INTO items (owner, name) VALUES (${owner}, ${name})`,
+    sql`SELECT count(*) FROM items`,
+  ],
   { isolationLevel: "RepeatableRead" },
 );
 ```
 
-| Topic | Behaviour |
-| --- | --- |
-| Password | Sent in the driver's `Neon-Connection-String` header over HTTPS to Cloudflare. The Edge forwards it once, in the request body, over the tunnel to the gateway, which authenticates to PostgreSQL with SCRAM-SHA-256 inside the cluster, with the same login and limits as a pipelined WebSocket password ([3.2](#32-what-the-gateway-does-and-does-not-support)). It is never logged or stored and is zeroized in the gateway's memory after use. |
-| Statements | One statement per query (`a; b` is refused by PostgreSQL with `42601`). Parameters are `$1`, `$2`, ... in text; PostgreSQL infers their types. Results are text, parsed by the driver's type parsers (its `types` option), as with Neon. `arrayMode` and `fullResults` work: the driver applies them itself. |
-| Transactions | `transaction()` runs its statements between `BEGIN` and `COMMIT` in one request, with `isolationLevel`, `readOnly` and `deferrable`. An error rolls the whole transaction back. |
-| Session state | None across requests: each request starts like a new session (the gateway runs `DISCARD ALL` after it). `SET`, temporary tables, advisory locks, `LISTEN` and prepared statements end with the request; a transaction a single query leaves open is rolled back. Use WebSocket mode for interactive transactions and session state. |
-| Not supported | `COPY` (`0A000`); `authToken` / `Authorization` (`0A000`); clients other than the driver must send `Neon-Raw-Text-Output: true` and `Neon-Array-Mode: true`. |
-| Limits | Request body 4 MiB, at most 256 statements per transaction, answer 10 MiB of JSON (`54000`; the session is closed and the outcome is unknown). |
-| Sleeping database | The request waits for the wake as a connection does ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)): at most 60 s, with the same `57P03` and `08006` answers. Set your `fetch` timeout accordingly. |
-| Admission and limits | Every request is one admission. It counts in the same Edge rate limiters as a connection (a service-binding caller in its own limiter), in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the example configuration that is 120 requests per 60 s per database and Cloudflare location: the installation must size these limits for HTTP traffic. |
-| Errors | HTTP 400 with PostgreSQL's error fields (`message`, `code`, `severity`, `detail`, `hint`, `position`, ...); the driver throws them as `NeonDbError`. Admission refusals use the codes of [A.4](#a4-sqlstate-at-connect-time). |
-| Unknown outcome | `08007`: the connection to PostgreSQL ended, or the gateway's answer was lost, after the request was sent. PGCF never sends a request twice and does not know whether a write took effect; retry only idempotent requests. |
-| Password change | A kept session is reused only for the password it authenticated with, and at most 60 s after its authentication: an old password can still succeed for up to 60 s after a password change. |
-| Unknown database or role | Answers `28P01` "password authentication failed" at once, while a wrong password is checked by PostgreSQL: unlike the WebSocket path, the response time differs. |
+| Topic                    | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Password                 | Sent in the driver's `Neon-Connection-String` header over HTTPS to Cloudflare. The Edge forwards it once, in the request body, over the tunnel to the gateway, which authenticates to PostgreSQL with SCRAM-SHA-256 inside the cluster, with the same login and limits as a pipelined WebSocket password ([3.2](#32-what-the-gateway-does-and-does-not-support)). It is never logged or stored and is zeroized in the gateway's memory after use.             |
+| Statements               | One statement per query (`a; b` is refused by PostgreSQL with `42601`). Parameters are `$1`, `$2`, ... in text; PostgreSQL infers their types. Results are text, parsed by the driver's type parsers (its `types` option), as with Neon. `arrayMode` and `fullResults` work: the driver applies them itself.                                                                                                                                                  |
+| Transactions             | `transaction()` runs its statements between `BEGIN` and `COMMIT` in one request, with `isolationLevel`, `readOnly` and `deferrable`. An error rolls the whole transaction back.                                                                                                                                                                                                                                                                               |
+| Session state            | None across requests: each request starts like a new session (the gateway runs `DISCARD ALL` after it). `SET`, temporary tables, advisory locks, `LISTEN` and prepared statements end with the request; a transaction a single query leaves open is rolled back. Use WebSocket mode for interactive transactions and session state.                                                                                                                           |
+| Not supported            | `COPY` (`0A000`); `authToken` / `Authorization` (`0A000`); clients other than the driver must send `Neon-Raw-Text-Output: true` and `Neon-Array-Mode: true`.                                                                                                                                                                                                                                                                                                  |
+| Limits                   | Request body 4 MiB, at most 256 statements per transaction, answer 10 MiB of JSON (`54000`; the session is closed and the outcome is unknown).                                                                                                                                                                                                                                                                                                                |
+| Sleeping database        | The request waits for the wake as a connection does ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)): at most 60 s, with the same `57P03` and `08006` answers. Set your `fetch` timeout accordingly.                                                                                                                                                                                                                                                 |
+| Admission and limits     | Every request is one admission. It counts in the same Edge rate limiters as a connection (a service-binding caller in its own limiter), in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the example configuration that is 120 requests per 60 s per database and Cloudflare location: the installation must size these limits for HTTP traffic. |
+| Errors                   | HTTP 400 with PostgreSQL's error fields (`message`, `code`, `severity`, `detail`, `hint`, `position`, ...); the driver throws them as `NeonDbError`. Admission refusals use the codes of [A.4](#a4-sqlstate-at-connect-time).                                                                                                                                                                                                                                 |
+| Unknown outcome          | `08007`: the connection to PostgreSQL ended, or the gateway's answer was lost, after the request was sent. PGCF never sends a request twice and does not know whether a write took effect; retry only idempotent requests.                                                                                                                                                                                                                                    |
+| Password change          | A kept session is reused only for the password it authenticated with, and at most 60 s after its authentication: an old password can still succeed for up to 60 s after a password change.                                                                                                                                                                                                                                                                    |
+| Unknown database or role | Answers `28P01` "password authentication failed" at once, while a wrong password is checked by PostgreSQL: unlike the WebSocket path, the response time differs.                                                                                                                                                                                                                                                                                              |
 
 Choose HTTP for one-shot queries and short transactions from a Worker (one round trip each);
 choose WebSocket for interactive transactions, session state, `COPY`, `LISTEN`, and many
@@ -730,13 +748,13 @@ statements in one burst (Neon puts the break-even at two to three queries).
 Estimates from the plan's measurements (15-42 ms per statement round trip from a Worker,
 0.47-0.53 s for an 8-statement request on an awake database); **none is measured on PGCF yet**.
 
-| Pattern | How | Expected gain | Cost |
-| --- | --- | --- | --- |
-| Place the Worker near the region | `"placement": { "region": "aws:eu-central-1" }` in the Worker's Wrangler configuration (EU1) | each statement's round trip drops toward 1-5 ms when the distance is geographic: 0.1-0.3 s on an 8-statement request | one more hop for users far from the EU |
-| Batch writes | one `transaction()` in HTTP mode; on WebSocket, one multi-statement query or pipelined queries instead of one round trip each | 3-4 round trips (45-170 ms) | a batch fails or commits as a whole |
-| Close without waiting | `ctx.waitUntil(client.end())` instead of `await client.end()` (WebSocket mode) | one round trip of user-visible time | none |
-| Connect early | on login or navigation, open the connection or send one cheap query (`SELECT 1` over HTTP) before the user's request needs data | hides up to about 0.9 s of a cold wake behind user think time | wakes the database and spends admissions; do it on real user intent only |
-| Hold one socket for a burst | a Durable Object per database and role keeps one WebSocket `Client` open for a short idle window (5-10 s) and closes it when idle | 0.2-0.4 s on every request after the first in a burst | must close when idle, or the database never sleeps and the handshake limit is spent |
+| Pattern                          | How                                                                                                                               | Expected gain                                                                                                        | Cost                                                                                |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Place the Worker near the region | `"placement": { "region": "aws:eu-central-1" }` in the Worker's Wrangler configuration (EU1)                                      | each statement's round trip drops toward 1-5 ms when the distance is geographic: 0.1-0.3 s on an 8-statement request | one more hop for users far from the EU                                              |
+| Batch writes                     | one `transaction()` in HTTP mode; on WebSocket, one multi-statement query or pipelined queries instead of one round trip each     | 3-4 round trips (45-170 ms)                                                                                          | a batch fails or commits as a whole                                                 |
+| Close without waiting            | `ctx.waitUntil(client.end())` instead of `await client.end()` (WebSocket mode)                                                    | one round trip of user-visible time                                                                                  | none                                                                                |
+| Connect early                    | on login or navigation, open the connection or send one cheap query (`SELECT 1` over HTTP) before the user's request needs data   | hides up to about 0.9 s of a cold wake behind user think time                                                        | wakes the database and spends admissions; do it on real user intent only            |
+| Hold one socket for a burst      | a Durable Object per database and role keeps one WebSocket `Client` open for a short idle window (5-10 s) and closes it when idle | 0.2-0.4 s on every request after the first in a burst                                                                | must close when idle, or the database never sleeps and the handshake limit is spent |
 
 ## 4. Capacity and limits you must enforce
 
@@ -746,11 +764,11 @@ quotas per tenant, compute autoscaling or branching in v1. The limits below are 
 
 ### 4.1 Region policy (installation configuration, read 2026-10-15)
 
-| Setting | Value |
-| --- | --- |
-| Placement mode | `actual_ram`: starts are admitted against fresh measured RAM, not reservations |
-| Per-database memory maximum | 4,096 MiB, steps of 256 |
-| Node (EU1) | 6 vCPU, 12 GB; the plan records 5,000 m CPU and 10,819 MiB allocatable |
+| Setting                                          | Value                                                                           |
+| ------------------------------------------------ | ------------------------------------------------------------------------------- |
+| Placement mode                                   | `actual_ram`: starts are admitted against fresh measured RAM, not reservations  |
+| Per-database memory maximum                      | 4,096 MiB, steps of 256                                                         |
+| Node (EU1)                                       | 6 vCPU, 12 GB; the plan records 5,000 m CPU and 10,819 MiB allocatable          |
 | Prestarted sandbox slots (region `compute_pool`) | one slot, 100 m and 64 MiB per slot; this overhead is charged to every database |
 
 ### 4.2 Awake databases: CPU and RAM admission
@@ -771,7 +789,7 @@ their real memory shows in the measurement.
 Worked example from the plan's density section (5,000 m allocatable, P = 650 m at the first
 post-upgrade observation): a 256 MiB class with a 250 m request costs 450 m, so at most nine are
 awake at once; a 1 GiB class with a 500 m limit and no request costs 700 m. P is observed per
-node and changes with the release. **Treat these as arithmetic until *Density on EU1*
+node and changes with the release. **Treat these as arithmetic until _Density on EU1_
 measures them.** Over the limit a wake gets `57P03` at once and a create waits unplaced; by design no Pod
 is created without headroom.
 
@@ -785,12 +803,12 @@ loop.
 New databases use Thin LVM volumes on EU1. The profile in force (installation configuration, read
 2026-10-15; the plan records the 16 GiB data pool growing to 64 GiB and the 64-volume bound):
 
-| Setting | Value |
-| --- | --- |
-| Quota per database (`maximum_quota_gib`) | **32 GiB**: a class above that is never placed |
-| Thin volumes per node (`maximum_volumes`) | **64**, counting sleeping databases and volumes still being reclaimed |
-| Data pool | 16 GiB at first, grown automatically (steps of at least 8 GiB, when a queued start needs room) up to 64 GiB; metadata 1 GiB |
-| Reserves | 2 GiB data reserve, 1 GiB startup reserve, 4 GiB volume-group reserve |
+| Setting                                   | Value                                                                                                                       |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Quota per database (`maximum_quota_gib`)  | **32 GiB**: a class above that is never placed                                                                              |
+| Thin volumes per node (`maximum_volumes`) | **64**, counting sleeping databases and volumes still being reclaimed                                                       |
+| Data pool                                 | 16 GiB at first, grown automatically (steps of at least 8 GiB, when a queued start needs room) up to 64 GiB; metadata 1 GiB |
+| Reserves                                  | 2 GiB data reserve, 1 GiB startup reserve, 4 GiB volume-group reserve                                                       |
 
 A volume is sized by `storage_gib` for good: it is the logical quota, it does not shrink, and a
 sleeping database keeps it. The admission rule is conservative: the pool's **free** space must be
@@ -838,15 +856,15 @@ pgcf -G "$PGCF_API/v1/usage" \
 - A metric is a number or `null`; `null` is **unknown, never zero**, and its name is in `gaps`. An
   hour that is not computed yet carries `rollup_pending`.
 
-| Metric | Meaning |
-| --- | --- |
-| `provisioned_seconds`, `awake_seconds` | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension |
-| `memory_mib_seconds`, `cpu_millicore_seconds` | the class's memory and CPU **limits** times awake seconds; not measured consumption |
-| `reserved_cpu_millicore_seconds` | request plus sidecar (plus prestarted slot overhead) times awake seconds; zero while confirmed hibernated |
-| `reserved_memory_mib_seconds` | class memory plus the 128 MiB sidecar request times **provisioned** seconds: sleeping time is included, because the hibernation snapshot does not reduce it |
-| `reserved_storage_byte_seconds` | quota times provisioned seconds; **null for Thin volumes** (their snapshot carries no physical allocation), with the gap named |
-| `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the agent's filesystem samples in the period (bytes used; PVC capacity) |
-| `backup_bytes_max` | maximum archive size in R2 measured in the period |
+| Metric                                                               | Meaning                                                                                                                                                                       |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provisioned_seconds`, `awake_seconds`                               | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension                                                       |
+| `memory_mib_seconds`, `cpu_millicore_seconds`                        | the class's memory and CPU **limits** times awake seconds; not measured consumption                                                                                           |
+| `reserved_cpu_millicore_seconds`                                     | request plus sidecar (plus prestarted slot overhead) times awake seconds; zero while confirmed hibernated                                                                     |
+| `reserved_memory_mib_seconds`                                        | class memory plus the 128 MiB sidecar request times **provisioned** seconds: sleeping time is included, because the hibernation snapshot does not reduce it                   |
+| `reserved_storage_byte_seconds`                                      | quota times provisioned seconds; **null for Thin volumes** (their snapshot carries no physical allocation), with the gap named                                                |
+| `storage_used_bytes_max`, `storage_allocated_bytes`                  | maximum of the agent's filesystem samples in the period (bytes used; PVC capacity)                                                                                            |
+| `backup_bytes_max`                                                   | maximum archive size in R2 measured in the period                                                                                                                             |
 | `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway counters of the hour, summed over its measurement intervals (none spans two hours); `null` with `traffic_coverage` when an interval of the hour is missing or unknown |
 
 For compute time price `awake_seconds` and `memory_mib_seconds`; for storage use
@@ -884,26 +902,28 @@ any price.
 ## 6. Alerts and operations
 
 Alerts are infrastructure alerts for the **operator**. You do not receive them, and delivery is not
-configured yet (the Go-live path's *Alerts* step needs a Resend key, a verified sender and a
+configured yet (the Go-live path's _Alerts_ step needs a Resend key, a verified sender and a
 recipient, or an alert webhook). The operator reads their state in `GET /v1/operational-health?scope=regions`.
 
 One episode exists per region and kind. A new episode gets a new `event_id`, is delivered at least
 once with retries at least 60 s apart and a five-second deadline, and clears only when its
 measurement is fresh and below the threshold.
 
-| Kind | Fires when | Threshold (capacity policy, read 2026-10-15) |
-| --- | --- | --- |
-| `regional_node_ram_warning` | any node's 10-minute working-set average reaches the threshold | `node_ram_warning_threshold_ppm` = 850,000 (85 %) |
-| `regional_node_cpu_warning` | any node's 10-minute CPU average reaches it; unknown without native-controller samples | `node_cpu_warning_threshold_ppm` = 900,000 |
-| `regional_node_storage_warning` | the node's thin-pool data or metadata fill (or volume-group allocation) reaches it | `node_storage_warning_threshold_ppm` = 800,000 |
-| `regional_ram_warning` | regional RAM utilisation reaches it | `ram_warning_threshold_ppm` = `null` (off) |
-| `regional_node_cap_reached` | allocated nodes reach `max_nodes` | `cap_warning_enabled` = off |
-| `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed |
-| `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 backup fails, or none completed for 36 h | fixed |
-| `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed (from the release with migration `0052`) |
-| `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count | fixed (same release) |
-| `thin_storage_blocked` | a node's thin pool has no data or metadata room, or a pool that holds thin volumes has no fresh sample (`thin_pool_*`) | fixed (same release) |
-| `control_cron_stalled`, `control_cron_step_failing` | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs | fixed (same release) |
+| Kind                                                          | Fires when                                                                                                                                   | Threshold (capacity policy, read 2026-10-15)      |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `regional_node_ram_warning`                                   | any node's 30-minute average of active RAM reaches the threshold                                                                             | `node_ram_warning_threshold_ppm` = 850,000 (85 %) |
+| `regional_node_cpu_warning`                                   | any node's 30-minute average CPU load reaches it                                                                                             | `node_cpu_warning_threshold_ppm` = 900,000        |
+| `regional_node_storage_warning`                               | the node's thin-pool data or metadata fill reaches it (placement closes a pool at 80 % data or 50 % metadata)                                | `node_storage_warning_threshold_ppm` = 800,000    |
+| `regional_ram_warning`                                        | regional RAM utilisation reaches it                                                                                                          | `ram_warning_threshold_ppm` = `null` (off)        |
+| `regional_node_cap_reached`                                   | allocated nodes reach `max_nodes`                                                                                                            | `cap_warning_enabled` = off                       |
+| `regional_node_stale`                                         | a node's observation is older than 180 s, or the node is marked lost                                                                         | fixed                                             |
+| `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 backup fails, or none completed for 36 h                                                                                        | fixed                                             |
+| `database_archive_failing`                                    | a running, awake database reports `health.archiving: failing`                                                                                | fixed (from the release with migration `0052`)    |
+| `database_base_backup_stale`                                  | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count         | fixed (same release)                              |
+| `thin_storage_blocked`                                        | a node's newest sample says its thin pool has no room, or a node that holds databases has no sample of its pool within 180 s (`thin_pool_*`) | fixed                                             |
+| `regional_node_capacity_refusals`                             | a node refused 5 or more wakes for awake capacity (`57P03`) in 10 minutes                                                                    | fixed                                             |
+| `database_volume_warning`, `database_volume_critical`         | a database volume's space or inodes are at least 80 % (below 90 %), or at least 90 %, used                                                   | fixed                                             |
+| `control_cron_stalled`, `control_cron_step_failing`           | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs                                                          | fixed (same release)                              |
 
 Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
 disables) set with `PUT /v1/regions/{id}/capacity-policy`. The minute cron evaluates the first
@@ -919,7 +939,7 @@ and an earlier failure in the minute cron silently skips alerting.
 
 The control plane itself is protected by a daily encrypted D1 export in R2, read back in full
 ([infrastructure backups](infrastructure-backups.md)); restoring it has not been exercised. The plan records completed runs on 2026-10-13 and 2026-10-15; 2026-10-14 failed all three attempts and is
-open (Go-live path: *Backups*). These backups are not your database backups.
+open (Go-live path: _Backups_). These backups are not your database backups.
 
 What you can watch yourselves: per database `health.archiving`, `health.backup`, `health.disk`,
 `storage` and `observed_state: error` ([2.2](#22-operations-and-readiness)), connection errors by
@@ -931,17 +951,17 @@ disk verdicts for every project at once.
 
 ### 7.1 What happens in each situation
 
-| Situation | Effect on your database | Data | You do |
-| --- | --- | --- | --- |
-| Idle sleep | PostgreSQL stops after quiesce and the Pod is removed; the next connection wakes it, into a free pool instance on its node when one is free | WAL archived first, volume kept | reconnect |
-| Manual suspend | refused with `57P03` until resume | as above | `POST /resume` |
-| Planned maintenance: fleet patch or rollout | new placement is closed during it, so creates wait; the single customer node reboots and its databases "may experience visible maintenance downtime"; the control node is patched after the customer node. A release that changes kernel, Thin driver or host extension is announced as an outage of all Thin databases. From the canary on, reboots of EU1 or control need the owner's go and an announced window (the plan: a reboot of EU1 or control stops every awake database and there is no region-wide maintenance lock). The announcement channel is not defined in the repository | kept | plan around the window; ask the operator for it |
-| Node reboot (crash, or a patch) | every database Pod on the node stops; PostgreSQL crash-recovers from the local volume when the node and the regional controller are back; Thin databases additionally wait until the node reports a fresh storage sample with pool room on the new boot; hibernated databases are not touched. No duration is measured for databases | kept (local volume) | retry with backoff; check `observed_state` |
-| Control node reboot or outage | running databases keep running; Thin starts and wakes wait until EU1's storage sample, read through the Kubernetes API server on the control node, is fresh again. **Not yet verified live** | kept | wait |
-| Archiving failing (`health.archiving: failing`, for example an R2 problem) | connections keep working; WAL accumulates on the volume until archiving works again, and a full volume stops writes (standard PostgreSQL behaviour, not tested here) | recoverable window goes stale | escalate at once |
-| Volume full | PostgreSQL cannot write | kept | free space; for Thin, resize to a larger class ([2.5](#25-resize)) |
-| **EU1 lost** | **all databases are down.** Their local volumes are gone with the server | only what reached R2 | [7.4](#74-eu1-lost) |
-| Cloudflare unavailable | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake databases keep running and wakes fail | kept | wait |
+| Situation                                                                  | Effect on your database                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Data                            | You do                                                             |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------ |
+| Idle sleep                                                                 | PostgreSQL stops after quiesce and the Pod is removed; the next connection wakes it, into a free pool instance on its node when one is free                                                                                                                                                                                                                                                                                                                                                                                                                                                  | WAL archived first, volume kept | reconnect                                                          |
+| Manual suspend                                                             | refused with `57P03` until resume                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | as above                        | `POST /resume`                                                     |
+| Planned maintenance: fleet patch or rollout                                | new placement is closed during it, so creates wait; the single customer node reboots and its databases "may experience visible maintenance downtime"; the control node is patched after the customer node. A release that changes kernel, Thin driver or host extension is announced as an outage of all Thin databases. From the canary on, reboots of EU1 or control need the owner's go and an announced window (the plan: a reboot of EU1 or control stops every awake database and there is no region-wide maintenance lock). The announcement channel is not defined in the repository | kept                            | plan around the window; ask the operator for it                    |
+| Node reboot (crash, or a patch)                                            | every database Pod on the node stops; PostgreSQL crash-recovers from the local volume when the node and the regional controller are back; Thin databases additionally wait until the node reports a fresh storage sample with pool room on the new boot; hibernated databases are not touched. No duration is measured for databases                                                                                                                                                                                                                                                         | kept (local volume)             | retry with backoff; check `observed_state`                         |
+| Control node reboot or outage                                              | running databases keep running; Thin starts and wakes wait until EU1's storage sample, read through the Kubernetes API server on the control node, is fresh again. **Not yet verified live**                                                                                                                                                                                                                                                                                                                                                                                                 | kept                            | wait                                                               |
+| Archiving failing (`health.archiving: failing`, for example an R2 problem) | connections keep working; WAL accumulates on the volume until archiving works again, and a full volume stops writes (standard PostgreSQL behaviour, not tested here)                                                                                                                                                                                                                                                                                                                                                                                                                         | recoverable window goes stale   | escalate at once                                                   |
+| Volume full                                                                | PostgreSQL cannot write                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | kept                            | free space; for Thin, resize to a larger class ([2.5](#25-resize)) |
+| **EU1 lost**                                                               | **all databases are down.** Their local volumes are gone with the server                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | only what reached R2            | [7.4](#74-eu1-lost)                                                |
+| Cloudflare unavailable                                                     | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake databases keep running and wakes fail                                                                                                                                                                                                                                                                                                                                                                                                                    | kept                            | wait                                                               |
 
 ### 7.2 Recovery point
 
@@ -974,7 +994,7 @@ capacity being available; neither is quantified.
    (AddNode `recover`) needs no purchase; replacing a destroyed server does and needs the owner's
    costed go (**EU2 has not been bought**). Both need the EU installation profile, which does not
    exist yet, and the manual network-proof path; no node-loss runbook with checked preconditions
-   exists yet (Go-live path: *Recovery*).
+   exists yet (Go-live path: _Recovery_).
 3. For each database, restore from R2 ([2.7](#27-backups-restorable-window-and-restore)). Every
    restored database has a **new ID**: update your mapping, connection strings and `wsProxy`
    hints for each.
@@ -1023,20 +1043,20 @@ the operator supplies it at handover.** Send:
 
 ## 9. Items for written confirmation
 
-The Go-live path's *Handover* step requires this document to state the following and your written
+The Go-live path's _Handover_ step requires this document to state the following and your written
 confirmation. The state column says what is measured and what is derived or open.
 
-| Item | Where | State |
-| --- | --- | --- |
-| RPO per class | [7.2](#72-recovery-point) | derived: `archive_timeout_seconds` plus upload time; one measured sample (66.7 s with a 60 s timeout); no per-class measurement |
-| PITR window per class | [2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point) | derived from `backup_retention_days`; the window of each database is readable through `GET /v1/databases/{id}/backups`; no measured full-window restore |
-| Pool hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | one live hit measured (1.09 s to the first answer, 2026-10-17); p95 and misses not measured; the hibernated wake is 8.1–9.4 s |
-| `57P03` meanings and retry rule | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee |
-| Connection limits | [3.6](#36-connection-limits) | stated; the deployed per-role and per-network values are not recorded in the repository |
-| Role deletion: unroutable at once, removal confirmed by PostgreSQL, hibernated database applies it at its next wake | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code and its tests; **not yet run against the live cluster** (live acceptance pending) |
-| Outage classes and maintenance windows | [7.1](#71-what-happens-in-each-situation) | classes stated; no window schedule and no announcement channel is defined |
-| New IDs after restore or node loss | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) | stated |
-| Capacity caps | [4](#4-capacity-and-limits-you-must-enforce) | arithmetic only; measured caps follow *Density on EU1* |
+| Item                                                                                                                | Where                                                                                        | State                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RPO per class                                                                                                       | [7.2](#72-recovery-point)                                                                    | derived: `archive_timeout_seconds` plus upload time; one measured sample (66.7 s with a 60 s timeout); no per-class measurement                         |
+| PITR window per class                                                                                               | [2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point)                  | derived from `backup_retention_days`; the window of each database is readable through `GET /v1/databases/{id}/backups`; no measured full-window restore |
+| Pool hit and miss latency                                                                                           | [3.4](#34-timeouts-and-retries-for-a-sleeping-database)                                      | one live hit measured (1.09 s to the first answer, 2026-10-17); p95 and misses not measured; the hibernated wake is 8.1–9.4 s                           |
+| `57P03` meanings and retry rule                                                                                     | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee                                                                |
+| Connection limits                                                                                                   | [3.6](#36-connection-limits)                                                                 | stated; the deployed per-role and per-network values are not recorded in the repository                                                                 |
+| Role deletion: unroutable at once, removal confirmed by PostgreSQL, hibernated database applies it at its next wake | [2.3](#23-roles-connection-uri-and-passwords)                                                | stated from the code and its tests; **not yet run against the live cluster** (live acceptance pending)                                                  |
+| Outage classes and maintenance windows                                                                              | [7.1](#71-what-happens-in-each-situation)                                                    | classes stated; no window schedule and no announcement channel is defined                                                                               |
+| New IDs after restore or node loss                                                                                  | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost)                        | stated                                                                                                                                                  |
+| Capacity caps                                                                                                       | [4](#4-capacity-and-limits-you-must-enforce)                                                 | arithmetic only; measured caps follow _Density on EU1_                                                                                                  |
 
 ## Appendix A. Error reference
 
@@ -1044,38 +1064,38 @@ confirmation. The state column says what is measured and what is derived or open
 
 Every error body is `{"error": {"code", "message", "request_id", "details"?}}`.
 
-| Status | `error.code` | When | Retry |
-| --- | --- | --- | --- |
-| 400 | `invalid_request` | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a database or role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink or change on thick, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a `member_of` entry that is not a live role of the database (or is `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*`), deleting `app` or `pgcf_maintenance` | no |
-| 401 | `unauthorized` | key missing, malformed, unknown, revoked, or its project deleted | no |
-| 403 | `forbidden` | integrator key on an admin route | no |
-| 404 | `not_found` | unknown ID, an ID of another project, unknown route, a role route of a deleted database | no |
-| 409 | `conflict` | the request is refused for the cause in `error.details.reason` (table below) | by reason |
-| 409 | `idempotency_conflict` | same key, different request; replay of a credential-creating call | no |
-| 409 | `idempotency_in_progress` | same key still executing | yes, shortly (`Retry-After`) |
-| 503 | `capacity_exhausted` | resize or profile assignment: the node lacks memory, CPU or storage now | later (`Retry-After`) |
-| 500 | `internal` | unexpected failure | yes, with the same key |
-| 429 | `rate_limited` | defined by the contract; the API emits none today | |
+| Status | `error.code`              | When                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Retry                        |
+| ------ | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| 400    | `invalid_request`         | validation or unknown field, malformed JSON, body above 64 KiB, wrong `Content-Type`, bad ID, cursor or `Idempotency-Key`, a missing `Idempotency-Key` on a database or role mutation, unknown or disabled class or region, class above the memory maximum, `target_time` in the future, storage shrink or change on thick, usage range not aligned or over 31 days, a role `valid_until` that is not in the future, a `member_of` entry that is not a live role of the database (or is `app`, `pgcf_maintenance`, `pg_*`, `cnpg_*`), deleting `app` or `pgcf_maintenance` | no                           |
+| 401    | `unauthorized`            | key missing, malformed, unknown, revoked, or its project deleted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | no                           |
+| 403    | `forbidden`               | integrator key on an admin route                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | no                           |
+| 404    | `not_found`               | unknown ID, an ID of another project, unknown route, a role route of a deleted database                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | no                           |
+| 409    | `conflict`                | the request is refused for the cause in `error.details.reason` (table below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | by reason                    |
+| 409    | `idempotency_conflict`    | same key, different request; replay of a credential-creating call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | no                           |
+| 409    | `idempotency_in_progress` | same key still executing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | yes, shortly (`Retry-After`) |
+| 503    | `capacity_exhausted`      | resize, resources or profile assignment: the node lacks memory, CPU or storage now                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | later (`Retry-After`)        |
+| 500    | `internal`                | unexpected failure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | yes, with the same key       |
+| 429    | `rate_limited`            | defined by the contract; the API emits none today                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |                              |
 
 The stable reasons of a `409 conflict` (and of `node_capacity`) come in two kinds. A **retryable**
 reason clears without a change to the request and the answer carries `Retry-After`; repeat the
 request under the same `Idempotency-Key`. A **terminal** reason needs a different request or a
 different resource first.
 
-| `details.reason` | Kind | Cause | `Retry-After` |
-| --- | --- | --- | --- |
-| `mutation_in_progress` | retryable | another change to the same database holds it for the moment (a wake, an idle sleep or its compensation, a maintenance step) | 1 s |
-| `generation_changed` | retryable | the database, or what a create or restore was based on, changed between the read and the write ("Database changed; retry the request") | 1 s |
-| `not_ready` | retryable | the database has not applied its latest generation or is not running yet ("Database configuration is not ready") | 5 s |
-| `node_capacity` | retryable | the node lacks memory, CPU or storage for a resize, or for a resume ([2.4](#24-suspend-and-resume)) | 30 s |
-| `name_in_use` | terminal | a live database of the project already has this name (create, restore) | |
-| `database_deleted` | terminal | the database is deleted | |
-| `project_not_empty` | terminal | the project still holds databases that are not yet confirmed deleted | |
-| `role_exists` | terminal | the role name exists | |
-| `role_limit` | terminal | the database holds 100 roles; a role awaiting its removal counts | |
-| `role_being_deleted` | terminal | a role of that name is awaiting its removal; create it again once PostgreSQL has dropped it | |
-| `role_has_members` | terminal | other live roles are `member_of` this role; delete the members first | |
-| `archive_expired`, `archive_unusable`, `no_recovery_point`, `source_unavailable`, `region_unavailable` | terminal | restore refusals ([2.7](#27-backups-restorable-window-and-restore)) | |
+| `details.reason`                                                                                       | Kind      | Cause                                                                                                                                  | `Retry-After` |
+| ------------------------------------------------------------------------------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| `mutation_in_progress`                                                                                 | retryable | another change to the same database holds it for the moment (a wake, an idle sleep or its compensation, a maintenance step)            | 1 s           |
+| `generation_changed`                                                                                   | retryable | the database, or what a create or restore was based on, changed between the read and the write ("Database changed; retry the request") | 1 s           |
+| `not_ready`                                                                                            | retryable | the database has not applied its latest generation or is not running yet ("Database configuration is not ready")                       | 5 s           |
+| `node_capacity`                                                                                        | retryable | the node lacks memory, CPU or storage for a resize, or for a resume ([2.4](#24-suspend-and-resume))                                    | 30 s          |
+| `name_in_use`                                                                                          | terminal  | a live database of the project already has this name (create, restore)                                                                 |               |
+| `database_deleted`                                                                                     | terminal  | the database is deleted                                                                                                                |               |
+| `project_not_empty`                                                                                    | terminal  | the project still holds databases that are not yet confirmed deleted                                                                   |               |
+| `role_exists`                                                                                          | terminal  | the role name exists                                                                                                                   |               |
+| `role_limit`                                                                                           | terminal  | the database holds 100 roles; a role awaiting its removal counts                                                                       |               |
+| `role_being_deleted`                                                                                   | terminal  | a role of that name is awaiting its removal; create it again once PostgreSQL has dropped it                                            |               |
+| `role_has_members`                                                                                     | terminal  | other live roles are `member_of` this role; delete the members first                                                                   |               |
+| `archive_expired`, `archive_unusable`, `no_recovery_point`, `source_unavailable`, `region_unavailable` | terminal  | restore refusals ([2.7](#27-backups-restorable-window-and-restore))                                                                    |               |
 
 A `409 conflict` of an operator route (regions, nodes, fleet, profiles, capacity) carries a reason
 only where it is one of these, for example `mutation_in_progress`; otherwise the message is all
@@ -1091,25 +1111,25 @@ there is.
 
 ### A.3 Operation error codes
 
-| `error.code` | Meaning |
-| --- | --- |
-| `superseded` | a newer intent (resize, delete or power change) replaced it; not a platform fault |
-| `operation_timeout` | no progress for 20 minutes ("Regional operation exceeded 20 minutes") |
-| `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running |
-| `role_not_droppable` | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
+| `error.code`                                                    | Meaning                                                                                                                                                                                           |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `superseded`                                                    | a newer intent (resize, delete or power change) replaced it; not a platform fault                                                                                                                 |
+| `operation_timeout`                                             | no progress for 20 minutes ("Regional operation exceeded 20 minutes")                                                                                                                             |
+| `power_busy`, `power_archive`, `power_unknown`, `power_timeout` | a suspend or hibernation was refused or timed out; the database returned to running                                                                                                               |
+| `role_not_droppable`                                            | `database.role.delete`: the role owns objects or holds privileges, so PostgreSQL cannot drop it; it stays unable to log in until they are removed ([2.3](#23-roles-connection-uri-and-passwords)) |
 
 ### A.4 SQLSTATE at connect time
 
-| SQLSTATE | Message | Cause | Action |
-| --- | --- | --- | --- |
-| `3D000` | database does not exist | the `database` hint is missing or not a well-formed ID | fix the configuration |
-| `28P01` | authentication failed / password authentication failed | a malformed role; or an unknown database, unknown role, deleted role or deleted database (indistinguishable from a wrong password by design); or a role past its `valid_until` (it does not wake a hibernated database); or a wrong password | check ID, role, `valid_until` and password revision; do not loop |
-| `28000` | startup does not match the authorized route | StartupMessage `database` or `user` differs from the URL hints | fix the client |
-| `08P01` | duplicate connection admission hint / protocol violation | repeated `database` or `user`, or a malformed startup | fix the client |
-| `0A000` | replication connections are not supported / unsupported frontend protocol | | fix the client |
-| `57P03` | database is not accepting connections | not admissible now: manual suspension, provisioning, no capacity for a wake, error state, more than 32 waiters, or the wake did not finish within the 60 s deadline; see the table in [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | per cause |
-| `53300` | connection rate limit exceeded / database connection rate limit exceeded / connection admission unavailable; or PostgreSQL "too many clients" / "too many connections for role" | Edge rate limiters, admission limit, `max_connections`, or the role's `connection_limit` | back off; pool |
-| `08006` | gateway connection failed / connection admission interrupted | the 60 s deadline passed during a wake (the usual outcome), you aborted, the per-database gateway limit was hit, or the gateway was unreachable | retry; the wake continues |
+| SQLSTATE | Message                                                                                                                                                                         | Cause                                                                                                                                                                                                                                         | Action                                                           |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `3D000`  | database does not exist                                                                                                                                                         | the `database` hint is missing or not a well-formed ID                                                                                                                                                                                        | fix the configuration                                            |
+| `28P01`  | authentication failed / password authentication failed                                                                                                                          | a malformed role; or an unknown database, unknown role, deleted role or deleted database (indistinguishable from a wrong password by design); or a role past its `valid_until` (it does not wake a hibernated database); or a wrong password  | check ID, role, `valid_until` and password revision; do not loop |
+| `28000`  | startup does not match the authorized route                                                                                                                                     | StartupMessage `database` or `user` differs from the URL hints                                                                                                                                                                                | fix the client                                                   |
+| `08P01`  | duplicate connection admission hint / protocol violation                                                                                                                        | repeated `database` or `user`, or a malformed startup                                                                                                                                                                                         | fix the client                                                   |
+| `0A000`  | replication connections are not supported / unsupported frontend protocol                                                                                                       |                                                                                                                                                                                                                                               | fix the client                                                   |
+| `57P03`  | database is not accepting connections                                                                                                                                           | not admissible now: manual suspension, provisioning, no capacity for a wake, error state, more than 32 waiters, or the wake did not finish within the 60 s deadline; see the table in [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | per cause                                                        |
+| `53300`  | connection rate limit exceeded / database connection rate limit exceeded / connection admission unavailable; or PostgreSQL "too many clients" / "too many connections for role" | Edge rate limiters, admission limit, `max_connections`, or the role's `connection_limit`                                                                                                                                                      | back off; pool                                                   |
+| `08006`  | gateway connection failed / connection admission interrupted                                                                                                                    | the 60 s deadline passed during a wake (the usual outcome), you aborted, the per-database gateway limit was hit, or the gateway was unreachable                                                                                               | retry; the wake continues                                        |
 
 ### A.5 Closing an established connection
 
@@ -1121,23 +1141,23 @@ outcome and are not replayed.
 
 ## Appendix B. Where each statement comes from
 
-| Topic | Source |
-| --- | --- |
-| Routes, auth, error lists, idempotency, operation metadata | `apps/api/src/routes/*.ts`, `apps/api/src/openapi*.ts`, `apps/api/src/app.ts`, `apps/api/src/middleware/*.ts` |
-| Contracts (IDs, size classes, states, usage, costs, alerts) | `packages/contracts/src/{ids,api,errors,auth,usage,costs,infrastructure-alerts,nodes,sizing,database-storage}.ts` |
-| Create, resize, delete, power, restore, roles | `apps/api/src/domain/{databases,lifecycle,restore,restore-catalog,roles,archive,retained-archives}.ts` |
-| Admission, wake, idle, `57P03` | `apps/api/src/database-actor.ts`, `apps/api/src/domain/{startup-admission,placement,storage-capacity,agent-metrics,observations}.ts` |
-| Edge, hints, SQLSTATE, deadline, decoy | `apps/edge/src/*.ts` (the Rust/Wasm port in `apps/edge-rust` applies the same policy) |
-| HTTP query mode | `apps/edge/src/sql.ts`, `apps/native-gateway/src/sql.rs` |
-| Gateway limits, TLS, cancel, startup, idle close | `apps/native-gateway/src/transport.rs`, `packages/native-protocol/src/activity.rs`, `packages/contracts/src/pg-wire.ts`, `packages/contracts/native/protocol.generated.json` |
-| Sleep sequence and refusals | `apps/node-agent/src/sleep.rs`, `packages/contracts/src/sleep.ts` |
-| PostgreSQL cluster, backup schedule, retention, `pg_hba` | the retired runtime on the `archive/kubernetes-runtime` branch |
-| Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, [README](../../README.md) |
-| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/node-agent/src/measurements.rs` |
-| Alerts, health | `apps/api/src/domain/{operational-health,infrastructure-alerts,cron-health}.ts`, `apps/api/src/{cron,cron-watchdog}.ts`, `docs/operations/infrastructure-backups.md` |
-| Recovery, maintenance | `docs/operations/recovery.md` |
-| Measured numbers and open steps | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) |
-| Region policy, alert thresholds (installation values) | `GET /v1/regions/{id}/capacity-policy` of the live installation, not the repository |
+| Topic                                                       | Source                                                                                                                                                                       |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Routes, auth, error lists, idempotency, operation metadata  | `apps/api/src/routes/*.ts`, `apps/api/src/openapi*.ts`, `apps/api/src/app.ts`, `apps/api/src/middleware/*.ts`                                                                |
+| Contracts (IDs, size classes, states, usage, costs, alerts) | `packages/contracts/src/{ids,api,errors,auth,usage,costs,infrastructure-alerts,nodes,sizing,database-storage}.ts`                                                            |
+| Create, resize, delete, power, restore, roles               | `apps/api/src/domain/{databases,lifecycle,restore,restore-catalog,roles,archive,retained-archives}.ts`                                                                       |
+| Admission, wake, idle, `57P03`                              | `apps/api/src/database-actor.ts`, `apps/api/src/domain/{startup-admission,placement,storage-capacity,agent-metrics,observations}.ts`                                         |
+| Edge, hints, SQLSTATE, deadline, decoy                      | `apps/edge/src/*.ts` (the Rust/Wasm port in `apps/edge-rust` applies the same policy)                                                                                        |
+| HTTP query mode                                             | `apps/edge/src/sql.ts`, `apps/native-gateway/src/sql.rs`                                                                                                                     |
+| Gateway limits, TLS, cancel, startup, idle close            | `apps/native-gateway/src/transport.rs`, `packages/native-protocol/src/activity.rs`, `packages/contracts/src/pg-wire.ts`, `packages/contracts/native/protocol.generated.json` |
+| Sleep sequence and refusals                                 | `apps/node-agent/src/sleep.rs`, `packages/contracts/src/sleep.ts`                                                                                                            |
+| PostgreSQL cluster, backup schedule, retention, `pg_hba`    | the retired runtime on the `archive/kubernetes-runtime` branch                                                                                                               |
+| Client configuration                                        | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, [README](../../README.md)                                                                             |
+| Metering                                                    | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/node-agent/src/measurements.rs`    |
+| Alerts, health                                              | `apps/api/src/domain/{operational-health,infrastructure-alerts,cron-health}.ts`, `apps/api/src/{cron,cron-watchdog}.ts`, `docs/operations/infrastructure-backups.md`         |
+| Recovery, maintenance                                       | `docs/operations/recovery.md`                                                                                                                                                |
+| Measured numbers and open steps                             | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md)                                                                                              |
+| Region policy, alert thresholds (installation values)       | `GET /v1/regions/{id}/capacity-policy` of the live installation, not the repository                                                                                          |
 
 ## Appendix C. What the served OpenAPI document states in words
 
@@ -1147,14 +1167,14 @@ and `info.version` is the contract version. A JSON Schema cannot state the rules
 involve several fields, the stored state or the time of the request. The document says each in the
 description of the schema or the operation; the code is authoritative.
 
-| Rule | Where the document says it | Refusal |
-| --- | --- | --- |
-| An `integrator` key requires `project_id` and an `admin` key must omit it | `ApiKeyCreate` | `400` |
-| `memory_mib` of a size class is a multiple of 256 and `cpu_request_millicores` does not exceed `cpu_millicores` | `SizeClass`, `SizeClassUpsert` | `400` |
-| `postgres`, `streaming_replica`, `pg_*` and `cnpg_*` are not role names, and `pgcf_maintenance` cannot be created | `RoleName`, `RoleCreate` | `400` |
-| `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `RoleCreate` | `400` |
-| A usage request names exactly one scope; both boundaries are aligned to the granularity and at most 31 days apart | `getUsage` | `400` |
-| A request body is JSON of at most 64 KiB with `Content-Type: application/json` whenever there is a body | `info.description` | `400` |
-| Idempotency keys are kept 24 hours per API key; a request that failed is not retained | `Idempotency-Key` of each mutation | |
-| A deleted database is read with `200` and `desired_state: deleted` | `getDatabase` | |
-| An operator route's `409` carries a `details.reason` only where it is one of the listed reasons | [A.1](#a1-http) | |
+| Rule                                                                                                                                                                                                  | Where the document says it         | Refusal |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- | ------- |
+| An `integrator` key requires `project_id` and an `admin` key must omit it                                                                                                                             | `ApiKeyCreate`                     | `400`   |
+| `memory_mib` of a size class is a multiple of 256 and `cpu_request_millicores` does not exceed `cpu_millicores`                                                                                       | `SizeClass`, `SizeClassUpsert`     | `400`   |
+| `postgres`, `streaming_replica`, `pg_*` and `cnpg_*` are not role names, and `pgcf_maintenance` cannot be created                                                                                     | `RoleName`, `RoleCreate`           | `400`   |
+| `valid_until` must lie in the future when the request executes (not on a replay); every `member_of` entry is a live role of this database that is neither `app`, `pgcf_maintenance` nor being deleted | `RoleCreate`                       | `400`   |
+| A usage request names exactly one scope; both boundaries are aligned to the granularity and at most 31 days apart                                                                                     | `getUsage`                         | `400`   |
+| A request body is JSON of at most 64 KiB with `Content-Type: application/json` whenever there is a body                                                                                               | `info.description`                 | `400`   |
+| Idempotency keys are kept 24 hours per API key; a request that failed is not retained                                                                                                                 | `Idempotency-Key` of each mutation |         |
+| A deleted database is read with `200` and `desired_state: deleted`                                                                                                                                    | `getDatabase`                      |         |
+| An operator route's `409` carries a `details.reason` only where it is one of the listed reasons                                                                                                       | [A.1](#a1-http)                    |         |

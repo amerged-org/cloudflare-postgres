@@ -46,8 +46,8 @@
           {
             "path": "apps/api/src/domain/node-capacity.ts",
             "symbol": "placePendingDatabases",
-            "line": 64,
-            "sha256": "85f6dff2c13a2bd7704ec631200576d9a3a44ac44e4c33f3e2602f15a89f4c9c"
+            "line": 36,
+            "sha256": "5ce4831c16987acece8dbf7d851a438f76a2a77a2cfa16281dc0143f28174866"
           }
         ]
       },
