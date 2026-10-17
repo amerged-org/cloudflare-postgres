@@ -22,6 +22,7 @@ import {
   StandingNodeCostProfile,
 } from "@pgcf/contracts/nodes";
 import { regionalRamExpansionSql } from "./memory-capacity.ts";
+import { assertReinstallAllowed } from "./reinstall-guard.ts";
 
 export class NodeStateError extends Error {
   readonly code:
@@ -376,6 +377,7 @@ export async function assertNodeRecoveryAuthority(
       "conflict",
       "Recovery requires the exact lost predecessor and exclusive instance authority",
     );
+  await assertReinstallAllowed(db, request.predecessor_node_id);
 }
 function automaticCapacityOrderKey(key: string): boolean {
   return ["capacity-ram-", "capacity-order-", "capacity-headroom-"].some(
@@ -427,6 +429,8 @@ export async function reserveNodeAddition(
       "configuration_required",
       "Order must match the configured provider selection",
     );
+  if (request.mode === "recover")
+    await assertReinstallAllowed(db, request.predecessor_node_id);
   const nodeId = newNodeId(),
     operationId = newOperationId(),
     now = new Date().toISOString();

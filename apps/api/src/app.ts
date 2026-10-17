@@ -23,6 +23,7 @@ import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodes } from "./routes/nodes.ts";
+import { registerLifecycle } from "./routes/lifecycle.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
 import { NodeStateError } from "./domain/node-state.ts";
 
@@ -44,6 +45,10 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/costs",
   "/v1/operational-health",
   "/v1/nodes/:id/mark-lost",
+  "/v1/nodes/:id/loss",
+  "/v1/nodes/:id/reinstall-override",
+  "/v1/databases/:id/move",
+  "/v1/databases/:id/moves",
   "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",
@@ -328,6 +333,7 @@ export function createApp(): ApiApp {
   registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
+  registerLifecycle(app);
   registerInfrastructureBackups(app);
   registerOperationalHealth(app);
   registerRegionConfiguration(app);

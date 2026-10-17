@@ -22,7 +22,6 @@ import {
   configureNodeRegionPolicy,
   readNodeAddition,
   reserveNodeAddition,
-  markNodeLost,
   approveStandingNodePurchase,
 } from "../domain/node-state.ts";
 import {
@@ -30,6 +29,7 @@ import {
   stopCancelledNodeAdditionWorkflow,
 } from "../domain/cancel-provider-addition.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
+import { declareNodeLost, runNodeFencingCron } from "../domain/node-loss.ts";
 import { readNodeStorageObservation } from "../domain/node-storage.ts";
 
 export async function getNodeStorage(
@@ -172,22 +172,12 @@ export async function markLostNode(
   raw: NodeMarkLost,
 ): Promise<Response> {
   await requireScope(c, "admin");
-  const row = await c.env.DB.prepare(
-    "SELECT node_uid,lost_at FROM nodes WHERE id=?",
-  )
-    .bind(id)
-    .first<{ node_uid: string | null; lost_at: string | null }>();
-  if (!row) throw new ApiError("not_found", "Node not found");
-  if (row.lost_at !== null)
-    return c.json(await markNodeLost(c.env.DB, id, raw));
-  return c.json(
-    await withAdmissionMutation(
-      c.env,
-      [],
-      (mutation) => markNodeLost(c.env.DB, id, raw, mutation),
-      { kind: "node", id },
-    ),
+  const loss = await declareNodeLost(c.env, id, raw);
+  // The first fencing step does not wait for the next minute.
+  c.executionCtx.waitUntil(
+    runNodeFencingCron(c.env, Date.now()).catch(() => undefined),
   );
+  return c.json(loss);
 }
 export async function listNodeAdditions(c: ApiContext): Promise<Response> {
   await requireScope(c, "admin");

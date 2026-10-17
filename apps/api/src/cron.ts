@@ -6,6 +6,8 @@ import { recoverAdmissionMutations } from "./domain/admission-mutations.ts";
 import { recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
+import { runBackupRetention } from "./domain/backup-retention.ts";
+import { runNodeFencingCron } from "./domain/node-loss.ts";
 import { runFleetUpdates } from "./domain/fleet-updates.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runInfrastructureBackupCron } from "./domain/infrastructure-backups.ts";
@@ -116,6 +118,7 @@ export async function runCron(
   await attempt("admission_recovery", undefined, () =>
     recoverAdmissionMutations(env, now),
   );
+  await attempt("node_fencing", undefined, () => runNodeFencingCron(env, now));
   await attempt("resource_profile_rollouts", undefined, () =>
     runResourceProfileRollouts(env, now),
   );
@@ -281,6 +284,9 @@ export async function runCron(
   await attempt("node_capacity", undefined, () => runNodeCapacityCron(env));
   await attempt("retained_archives", undefined, () =>
     cleanupRetainedArchives(env, now),
+  );
+  await attempt("backup_retention", undefined, () =>
+    runBackupRetention(env, now),
   );
   await attempt("fleet_updates", undefined, () => runFleetUpdates(env, now));
 

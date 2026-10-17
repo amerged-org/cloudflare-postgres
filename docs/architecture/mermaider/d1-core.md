@@ -127,5 +127,6 @@ erDiagram
 - [apps/api/migrations/0060_drop_storage_protection.sql:1](../../../apps/api/migrations/0060_drop_storage_protection.sql#L1)
 - [apps/api/migrations/0061_database_sleep_after.sql:1](../../../apps/api/migrations/0061_database_sleep_after.sql#L1)
 - [apps/api/migrations/0062_drop_kubernetes_runtime.sql:1](../../../apps/api/migrations/0062_drop_kubernetes_runtime.sql#L1)
+- [apps/api/migrations/0065_lifecycle.sql:1](../../../apps/api/migrations/0065_lifecycle.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.
