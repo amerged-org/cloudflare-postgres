@@ -15,13 +15,15 @@
 //!    the overhead to stay within the budget.
 //! 3. The start cap: fewer than `start_concurrency` starts are in flight.
 //!
-//! A start counts as in flight from its admission until `Admitter::finish` reports it ready or
-//! failed. A start that meets all three rules begins; otherwise it waits in a FIFO queue for up to
-//! `queue_wait_ms` and is then refused (`Refusal::NoHeadroom`, with the policy's retry hint). The
-//! queue is strict: a start behind a larger one waits, even when it would fit.
+//! A start counts as in flight from its admission until its permit reports it ready or failed
+//! (`Admitter::finish`), or its unit is reported stopped. A start that meets all three rules
+//! begins; otherwise it waits in a FIFO queue for up to `queue_wait_ms` and is then refused
+//! (`Refusal::NoHeadroom`, with the policy's retry hint). The queue is strict: a start behind a
+//! larger one waits, even when it would fit.
 //!
-//! While a start waits, and only if policy enables it (decision D2), the node puts one idle but
-//! awake database to sleep early for each waiting start (`Admitter::early_sleep`).
+//! While a start waits for memory, and only if policy enables it (decision D2), the node puts one
+//! idle but awake database to sleep early for each such start (`Admitter::early_sleep`). A start
+//! that waits for the start cap alone gets none: a sleeper frees memory, not a start slot.
 use crate::units::{ActiveState, UnitState};
 use serde::Deserialize;
 use std::{
@@ -228,9 +230,16 @@ impl Running {
     }
 }
 
+/// The identity of one start the admitter let begin. A permit ends only the start it was given
+/// for, never a later start of the same database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grant(u64);
+
 /// An awake database as the admitter keeps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Awake {
+    /// The start that made it awake.
+    pub grant: Grant,
     pub memory_mib: u64,
     /// Its start is in flight.
     pub starting: bool,
@@ -265,6 +274,13 @@ pub fn early_sleep_candidate<'a>(
         .map(|(id, _)| id)
 }
 
+/// A database to put to sleep early, and the waiting start it makes room for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EarlySleep {
+    pub database: String,
+    pub for_database: String,
+}
+
 /// What the node reports of its awake set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -293,6 +309,7 @@ pub struct Admitter {
     awake: HashMap<String, Awake>,
     queue: VecDeque<Waiter>,
     next_ticket: u64,
+    next_grant: u64,
 }
 impl Admitter {
     pub fn new(policy: Policy) -> Self {
@@ -301,12 +318,19 @@ impl Admitter {
             awake: HashMap::new(),
             queue: VecDeque::new(),
             next_ticket: 0,
+            next_grant: 0,
         }
+    }
+
+    fn grant(&mut self) -> Grant {
+        self.next_grant += 1;
+        Grant(self.next_grant)
     }
 
     /// The admitter of an agent that starts while databases run: a unit that is activating is a
     /// start in flight, an active one is awake. Their last client activity is unknown; it counts
-    /// as `now`.
+    /// as `now`. Whoever waits for an activating unit reports its end through the start's permit
+    /// (`Admission::spawn` returns one for each).
     pub fn rebuild(
         policy: Policy,
         running: impl IntoIterator<Item = Running>,
@@ -314,9 +338,11 @@ impl Admitter {
     ) -> Self {
         let mut admitter = Self::new(policy);
         for unit in running {
+            let grant = admitter.grant();
             admitter.awake.insert(
                 unit.database,
                 Awake {
+                    grant,
                     memory_mib: unit.memory_mib,
                     starting: unit.starting,
                     always_warm: unit.always_warm,
@@ -337,12 +363,14 @@ impl Admitter {
         self.awake.values().filter(|awake| awake.starting)
     }
 
-    /// Whether the memory rule and the start cap let a start of `memory_mib` begin now.
-    fn fits(&self, facts: &Facts, memory_mib: u64) -> bool {
+    /// Whether the start cap lets one more start begin.
+    fn cap_free(&self) -> bool {
+        self.starting().count() < self.policy.admission.start_concurrency
+    }
+
+    /// Whether the memory rule lets a start of `memory_mib` begin now.
+    fn memory_fits(&self, facts: &Facts, memory_mib: u64) -> bool {
         let rules = &self.policy.admission;
-        if self.starting().count() >= rules.start_concurrency {
-            return false;
-        }
         match rules.memory_rule {
             MemoryRule::Measured => {
                 let needed_mib = self
@@ -365,10 +393,17 @@ impl Admitter {
         }
     }
 
+    /// Whether the memory rule and the start cap let a start of `memory_mib` begin now.
+    fn fits(&self, facts: &Facts, memory_mib: u64) -> bool {
+        self.cap_free() && self.memory_fits(facts, memory_mib)
+    }
+
     fn begin(&mut self, request: Request, now: Instant) {
+        let grant = self.grant();
         self.awake.insert(
             request.database,
             Awake {
+                grant,
                 memory_mib: request.memory_mib,
                 starting: true,
                 always_warm: request.always_warm,
@@ -480,10 +515,32 @@ impl Admitter {
         }
     }
 
-    /// A start that was in flight is over: ready (the database is awake and used now) or failed
-    /// (it is not awake).
-    pub fn finish(&mut self, database: &str, ready: bool, now: Instant) {
-        let Some(awake) = self.awake.get_mut(database).filter(|awake| awake.starting) else {
+    /// The start the database is awake under, if it is awake.
+    pub fn grant_of(&self, database: &str) -> Option<Grant> {
+        self.awake.get(database).map(|awake| awake.grant)
+    }
+
+    /// The starts in flight, sorted by database.
+    pub fn starts(&self) -> Vec<(String, Grant)> {
+        let mut starts: Vec<_> = self
+            .awake
+            .iter()
+            .filter(|(_, awake)| awake.starting)
+            .map(|(database, awake)| (database.clone(), awake.grant))
+            .collect();
+        starts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        starts
+    }
+
+    /// The start under `grant` is over: ready (the database is awake and used now) or failed (its
+    /// unit is not awake). A grant that is not the database's current one belongs to an earlier
+    /// start of it, which ended already, and changes nothing.
+    pub fn finish(&mut self, database: &str, grant: Grant, ready: bool, now: Instant) {
+        let Some(awake) = self
+            .awake
+            .get_mut(database)
+            .filter(|awake| awake.starting && awake.grant == grant)
+        else {
             return;
         };
         if ready {
@@ -514,16 +571,16 @@ impl Admitter {
     }
 
     /// The database to put to sleep early for a waiting start that has none yet (D2), if policy
-    /// enables it and a database qualifies. Each waiting start gets at most one, whenever it is
-    /// asked; the database counts as sleeping early until `stopped`.
-    pub fn early_sleep(&mut self, now: Instant) -> Option<String> {
+    /// enables it and a database qualifies. Only a start the memory rule holds back qualifies for
+    /// one: a sleeper frees memory, and ends no wait for the start cap. Each waiting start gets at
+    /// most one, whenever it is asked; the database counts as sleeping early until `stopped`.
+    pub fn early_sleep(&mut self, now: Instant, facts: &Facts) -> Option<EarlySleep> {
         if !self.policy.early_sleep.enabled {
             return None;
         }
-        let waiter = self
-            .queue
-            .iter()
-            .position(|waiter| waiter.sleeper.is_none())?;
+        let waiter = self.queue.iter().position(|waiter| {
+            waiter.sleeper.is_none() && !self.memory_fits(facts, waiter.request.memory_mib)
+        })?;
         let min_idle = Duration::from_secs(self.policy.early_sleep.min_idle_seconds);
         let database = early_sleep_candidate(
             self.awake.iter().map(|(id, awake)| (id.as_str(), awake)),
@@ -535,7 +592,10 @@ impl Admitter {
             awake.early_sleeping = true;
         }
         self.queue[waiter].sleeper = Some(database.clone());
-        Some(database)
+        Some(EarlySleep {
+            database,
+            for_database: self.queue[waiter].request.database.clone(),
+        })
     }
 
     /// The sleep proof of an early sleep was refused (the database is busy, or its archive does not
@@ -578,10 +638,11 @@ pub enum AdmitError {
 enum Event {
     Ask {
         request: Request,
-        reply: oneshot::Sender<Result<Permit, AdmitError>>,
+        reply: Reply,
     },
     Finish {
         database: String,
+        grant: Grant,
         ready: bool,
     },
     Stopped(String),
@@ -592,31 +653,41 @@ enum Event {
     Snapshot(oneshot::Sender<Snapshot>),
 }
 
-/// The right to start one database. The start is in flight until the permit reports it ready;
-/// a permit dropped otherwise reports it failed, so no start is ever left counted, whatever
-/// happens to the caller that held it.
+/// The right to start one database. The start is in flight until the permit reports it ready or
+/// failed.
+///
+/// A permit that is dropped reports nothing. Its caller may have stopped waiting while systemd is
+/// still starting the unit (`Units::start` leaves the start running when its future is dropped,
+/// and a start can outlast any deadline), and a database the admitter forgot would leave the start
+/// cap, the memory in flight, the reserved budget and the awake set while it still takes them.
+/// So it stays counted until its unit is reported stopped (`Admission::stopped`). A caller whose
+/// deadline passed keeps the permit while it waits for the unit (`Units::wait_started`), or stops
+/// the unit first and then reports it failed.
 #[derive(Debug)]
 pub struct Permit {
     database: String,
+    grant: Grant,
     /// How long the start waited in the queue.
     pub waited: Duration,
-    events: Option<mpsc::UnboundedSender<Event>>,
+    events: mpsc::UnboundedSender<Event>,
 }
 impl Permit {
-    fn finish(&mut self, ready: bool) {
-        if let Some(events) = self.events.take() {
-            let database = std::mem::take(&mut self.database);
-            let _ = events.send(Event::Finish { database, ready });
-        }
+    fn end(self, ready: bool) {
+        let _ = self.events.send(Event::Finish {
+            database: self.database,
+            grant: self.grant,
+            ready,
+        });
     }
     /// PostgreSQL accepts connections.
-    pub fn ready(mut self) {
-        self.finish(true);
+    pub fn ready(self) {
+        self.end(true);
     }
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.finish(false);
+    /// The start failed and the unit is not awake: its start job ended without `done`, or the unit
+    /// was stopped (`Units::stop`) or read inactive or failed. Never for a unit that may still be
+    /// starting or running.
+    pub fn failed(self) {
+        self.end(false);
     }
 }
 
@@ -627,16 +698,28 @@ pub struct Admission {
 }
 impl Admission {
     /// Runs the loop on the current tokio runtime. `facts` is called whenever the loop decides.
-    /// The second value delivers the databases to put to sleep early. The loop ends when the last
-    /// handle and the last permit are gone.
+    /// The second value delivers the databases to put to sleep early. The third holds the permit
+    /// of every start that was in flight in the rebuilt admitter, sorted by database: its holder
+    /// waits for the unit (`Units::wait_started`) and reports the start ready or failed. The loop
+    /// ends when the last handle and the last permit are gone.
     pub fn spawn(
         admitter: Admitter,
         facts: impl FnMut() -> Facts + Send + 'static,
-    ) -> (Self, mpsc::UnboundedReceiver<String>) {
+    ) -> (Self, mpsc::UnboundedReceiver<EarlySleep>, Vec<Permit>) {
         let (events, inbox) = mpsc::unbounded_channel();
         let (early, sleepers) = mpsc::unbounded_channel();
+        let resumed = admitter
+            .starts()
+            .into_iter()
+            .map(|(database, grant)| Permit {
+                database,
+                grant,
+                waited: Duration::ZERO,
+                events: events.clone(),
+            })
+            .collect();
         tokio::spawn(run(admitter, facts, events.downgrade(), inbox, early));
-        (Self { events }, sleepers)
+        (Self { events }, sleepers, resumed)
     }
 
     /// Asks for a start; returns when it may begin or is refused. A caller that drops the future
@@ -649,7 +732,7 @@ impl Admission {
         answer.await.map_err(|_| AdmitError::Stopped)?
     }
 
-    /// A database's unit stopped.
+    /// A database's unit stopped, for any reason, whatever its start's permit says or did not say.
     pub fn stopped(&self, database: &str) {
         let _ = self.events.send(Event::Stopped(database.to_string()));
     }
@@ -689,16 +772,30 @@ enum Wake {
     Closed,
 }
 
+type Reply = oneshot::Sender<Result<Permit, AdmitError>>;
+
+/// The permit of the start the admitter has just let begin for `database`.
 fn permit(
     handle: &mpsc::WeakUnboundedSender<Event>,
+    admitter: &Admitter,
     database: String,
     waited: Duration,
 ) -> Result<Permit, AdmitError> {
+    let grant = admitter.grant_of(&database).ok_or(AdmitError::Stopped)?;
     Ok(Permit {
         database,
+        grant,
         waited,
-        events: Some(handle.upgrade().ok_or(AdmitError::Stopped)?),
+        events: handle.upgrade().ok_or(AdmitError::Stopped)?,
     })
+}
+
+/// Answers a caller. A permit nobody receives belongs to a start that never began: it reports
+/// itself failed, since the dropped caller cannot.
+fn deliver(reply: Reply, result: Result<Permit, AdmitError>) {
+    if let Err(Ok(unclaimed)) = reply.send(result) {
+        unclaimed.failed();
+    }
 }
 
 /// The loop: one task owns the admitter, so every decision is serialized.
@@ -707,9 +804,8 @@ async fn run(
     mut facts: impl FnMut() -> Facts,
     handle: mpsc::WeakUnboundedSender<Event>,
     mut inbox: mpsc::UnboundedReceiver<Event>,
-    sleepers: mpsc::UnboundedSender<String>,
+    sleepers: mpsc::UnboundedSender<EarlySleep>,
 ) {
-    type Reply = oneshot::Sender<Result<Permit, AdmitError>>;
     let mut waiting: HashMap<Ticket, (String, Reply)> = HashMap::new();
     loop {
         let woke = if admitter.queue.is_empty() {
@@ -729,32 +825,45 @@ async fn run(
             }
         };
         let now = Instant::now();
+        // A caller that dropped its future no longer waits, and its wake may be asked again at
+        // once: it leaves the queue before anything else is decided.
+        waiting.retain(|ticket, (_, reply)| {
+            let waits = !reply.is_closed();
+            if !waits {
+                admitter.cancel(*ticket);
+            }
+            waits
+        });
         // The facts are read while starts wait, and for a start that asks; an event that only
         // records something (activity, a stop with nobody waiting) costs no read.
         let current = (!admitter.queue.is_empty()).then(&mut facts);
+        let mut known = current;
         match woke {
             Wake::Closed => break,
             Wake::Recheck => {}
             Wake::Event(Event::Ask { request, reply }) => {
                 let database = request.database.clone();
-                let current = current.unwrap_or_else(&mut facts);
+                let current = *known.get_or_insert_with(&mut facts);
                 match admitter.request(now, &current, request) {
                     Decision::Done(Ok(admitted)) => {
-                        let _ = reply.send(permit(&handle, database, admitted.waited));
+                        let result = permit(&handle, &admitter, database, admitted.waited);
+                        deliver(reply, result);
                     }
                     Decision::Done(Err(refused)) => {
-                        let _ = reply.send(Err(AdmitError::Refused(refused)));
+                        deliver(reply, Err(AdmitError::Refused(refused)));
                     }
                     Decision::Queued(ticket) => {
                         waiting.insert(ticket, (database, reply));
                     }
-                    Decision::Duplicate => {
-                        let _ = reply.send(Err(AdmitError::Duplicate));
-                    }
+                    Decision::Duplicate => deliver(reply, Err(AdmitError::Duplicate)),
                 }
             }
-            Wake::Event(Event::Finish { database, ready }) => {
-                admitter.finish(&database, ready, now);
+            Wake::Event(Event::Finish {
+                database,
+                grant,
+                ready,
+            }) => {
+                admitter.finish(&database, grant, ready, now);
             }
             Wake::Event(Event::Stopped(database)) => admitter.stopped(&database),
             Wake::Event(Event::Activity(database, at)) => admitter.activity(&database, at),
@@ -769,30 +878,25 @@ async fn run(
                 let _ = reply.send(admitter.snapshot());
             }
         }
-        // A caller that dropped its future no longer waits.
-        waiting.retain(|ticket, (_, reply)| {
-            let waits = !reply.is_closed();
-            if !waits {
-                admitter.cancel(*ticket);
-            }
-            waits
-        });
         // Nobody waited before this event: whatever it queued was just decided.
         let outcomes = current.map_or_else(Vec::new, |current| admitter.poll(now, &current));
         for (ticket, outcome) in outcomes {
             if let Some((database, reply)) = waiting.remove(&ticket) {
-                // A permit nobody receives is dropped, and reports its start failed.
-                let _ = reply.send(match outcome {
-                    Ok(admitted) => permit(&handle, database, admitted.waited),
+                let result = match outcome {
+                    Ok(admitted) => permit(&handle, &admitter, database, admitted.waited),
                     Err(refused) => Err(AdmitError::Refused(refused)),
-                });
+                };
+                deliver(reply, result);
             }
         }
-        while !sleepers.is_closed() {
-            let Some(database) = admitter.early_sleep(now) else {
-                break;
-            };
-            let _ = sleepers.send(database);
+        if !admitter.queue.is_empty() {
+            let current = *known.get_or_insert_with(&mut facts);
+            while !sleepers.is_closed() {
+                let Some(sleep) = admitter.early_sleep(now, &current) else {
+                    break;
+                };
+                let _ = sleepers.send(sleep);
+            }
         }
     }
 }
@@ -869,6 +973,23 @@ mod tests {
     }
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+    /// Ends the start the database is awake under; a database that is not awake has no start.
+    fn finish(admitter: &mut Admitter, database: &str, ready: bool, now: Instant) {
+        let grant = admitter.grant_of(database).unwrap_or(Grant(u64::MAX));
+        admitter.finish(database, grant, ready, now);
+    }
+    fn sleep(database: &str, for_database: &str) -> EarlySleep {
+        EarlySleep {
+            database: database.into(),
+            for_database: for_database.into(),
+        }
+    }
+    /// The database put to sleep early for a waiting start, while the node is short of memory.
+    fn sleeper(admitter: &mut Admitter, now: Instant) -> Option<String> {
+        admitter
+            .early_sleep(now, &facts(100))
+            .map(|sleep| sleep.database)
     }
 
     // ---------- the room rule ----------
@@ -1048,7 +1169,7 @@ mod tests {
         let c = queue(&mut admitter, t0, &facts(1623), request("c", 512));
         assert_eq!(admitter.poll(t0, &facts(1623)), vec![]);
         // Once a is ready its memory is no longer a promise: the available memory shows it.
-        admitter.finish("a", true, t0);
+        finish(&mut admitter, "a", true, t0);
         // Now only b is in flight: 600 + 256 + 512.
         assert_eq!(admitter.poll(t0, &facts(1367)), vec![]);
         assert_eq!(
@@ -1063,7 +1184,7 @@ mod tests {
         let mut admitter = Admitter::new(policy());
         admitter.request(t0, &facts(856), request("a", 256));
         assert_eq!(admitter.snapshot().awake, ["a"]);
-        admitter.finish("a", false, t0);
+        finish(&mut admitter, "a", false, t0);
         assert_eq!(admitter.snapshot().awake, Vec::<String>::new());
         assert_eq!(admitter.snapshot().starting, 0);
         // It may ask again, and nothing of the failed start is counted.
@@ -1072,10 +1193,29 @@ mod tests {
             admitted(Duration::ZERO)
         );
         // Finishing a start that is not in flight changes nothing.
-        admitter.finish("a", true, t0);
-        admitter.finish("a", false, t0);
-        admitter.finish("never", false, t0);
+        finish(&mut admitter, "a", true, t0);
+        finish(&mut admitter, "a", false, t0);
+        finish(&mut admitter, "never", false, t0);
         assert_eq!(admitter.snapshot().awake, ["a"]);
+    }
+
+    #[test]
+    fn a_permit_of_an_earlier_start_ends_nothing_of_a_later_one() {
+        let t0 = Instant::now();
+        let mut admitter = Admitter::new(policy());
+        admitter.request(t0, &facts(100_000), request("a", 256));
+        let earlier = admitter.grant_of("a").unwrap();
+        // The unit stopped (a stop order cancelled the start) and the wake was asked again.
+        admitter.stopped("a");
+        assert_eq!(admitter.grant_of("a"), None);
+        admitter.request(t0, &facts(100_000), request("a", 256));
+        let later = admitter.grant_of("a").unwrap();
+        assert_ne!(earlier, later);
+        admitter.finish("a", earlier, false, t0);
+        admitter.finish("a", earlier, true, t0);
+        assert_eq!(admitter.snapshot(), snapshot_of(&["a"], 256, 1, 0));
+        admitter.finish("a", later, true, t0);
+        assert_eq!(admitter.snapshot(), snapshot_of(&["a"], 256, 0, 0));
     }
 
     // ---------- the start cap ----------
@@ -1095,7 +1235,7 @@ mod tests {
         assert_eq!(admitter.poll(t0, &plenty), vec![]);
         assert_eq!(admitter.snapshot().starting, 4);
         // A ready start leaves the flight, which lets the next one begin.
-        admitter.finish("db0", true, t0 + secs(2));
+        finish(&mut admitter, "db0", true, t0 + secs(2));
         assert_eq!(
             admitter.poll(t0 + secs(2), &plenty),
             vec![(fifth, ok(secs(2)))]
@@ -1122,7 +1262,7 @@ mod tests {
             admitter.request(t0, &plenty, request("c", 256)),
             Decision::Queued(_)
         ));
-        admitter.finish("a", false, t0);
+        finish(&mut admitter, "a", false, t0);
         let outcomes = admitter.poll(t0, &plenty);
         assert_eq!(outcomes.len(), 1, "the cap lets one of the two begin");
         assert_eq!(admitter.snapshot().awake, ["b"]);
@@ -1141,7 +1281,7 @@ mod tests {
                 let database = format!("db{n}");
                 match admitter.request(t0, &facts(0), request(&database, size)) {
                     Decision::Done(Ok(_)) => {
-                        admitter.finish(&database, true, t0);
+                        finish(&mut admitter, &database, true, t0);
                         admitted_count += 1;
                     }
                     Decision::Queued(ticket) => {
@@ -1185,7 +1325,7 @@ mod tests {
         admitter.request(t0, &facts(0), request("a", 256));
         admitter.request(t0, &facts(0), request("b", 256));
         let c = queue(&mut admitter, t0, &facts(0), request("c", 256));
-        admitter.finish("a", true, t0);
+        finish(&mut admitter, "a", true, t0);
         assert_eq!(admitter.poll(t0, &facts(0)), vec![]);
         admitter.stopped("a");
         assert_eq!(admitter.poll(t0, &facts(0)), vec![(c, ok(Duration::ZERO))]);
@@ -1443,6 +1583,35 @@ mod tests {
     }
 
     #[test]
+    fn the_starts_in_flight_are_listed_by_database_with_their_own_grants() {
+        let t0 = Instant::now();
+        let running = |database: &str, starting| Running {
+            database: database.into(),
+            memory_mib: 256,
+            starting,
+            always_warm: false,
+        };
+        let admitter = Admitter::rebuild(
+            policy(),
+            [
+                running("s2", true),
+                running("up", false),
+                running("s1", true),
+            ],
+            t0,
+        );
+        let starts = admitter.starts();
+        assert_eq!(
+            starts.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["s1", "s2"]
+        );
+        assert_eq!(Some(starts[0].1), admitter.grant_of("s1"));
+        assert_eq!(Some(starts[1].1), admitter.grant_of("s2"));
+        assert_ne!(starts[0].1, starts[1].1);
+        assert!(Admitter::new(policy()).starts().is_empty());
+    }
+
+    #[test]
     fn a_unit_that_holds_memory_becomes_a_running_database() {
         use crate::units::{ActiveState, UnitState};
         let unit = |active, memory_max_bytes| UnitState {
@@ -1524,7 +1693,7 @@ mod tests {
         let mut admitter = Admitter::new(policy());
         admitter.request(t0, &facts(100_000), request("b", 512));
         admitter.request(t0, &facts(100_000), request("a", 256));
-        admitter.finish("b", true, t0);
+        finish(&mut admitter, "b", true, t0);
         admitter.request(t0, &facts(100), request("c", 256));
         assert_eq!(
             admitter.snapshot(),
@@ -1541,6 +1710,7 @@ mod tests {
 
     fn idle_since(at: Instant) -> Awake {
         Awake {
+            grant: Grant(0),
             memory_mib: 256,
             starting: false,
             always_warm: false,
@@ -1620,31 +1790,84 @@ mod tests {
         let t0 = Instant::now();
         let now = t0 + secs(60);
         let mut admitter = idle_node(t0);
-        assert_eq!(admitter.early_sleep(now), None, "no start waits");
+        assert_eq!(sleeper(&mut admitter, now), None, "no start waits");
         let w1 = queue(&mut admitter, now, &facts(100), request("w1", 256));
-        assert_eq!(admitter.early_sleep(now).as_deref(), Some("a"));
-        assert_eq!(admitter.early_sleep(now), None, "w1 has its sleeper");
+        assert_eq!(
+            admitter.early_sleep(now, &facts(100)),
+            Some(sleep("a", "w1")),
+            "the event names the wake it serves"
+        );
+        assert_eq!(sleeper(&mut admitter, now), None, "w1 has its sleeper");
         let w2 = queue(&mut admitter, now, &facts(100), request("w2", 256));
         assert_eq!(
-            admitter.early_sleep(now).as_deref(),
-            Some("b"),
+            admitter.early_sleep(now, &facts(100)),
+            Some(sleep("b", "w2")),
             "a already sleeps"
         );
         // The sleeper stopped, and w1 still waits (the memory did not suffice): no second one.
         admitter.stopped("a");
-        assert_eq!(admitter.early_sleep(now), None);
+        assert_eq!(sleeper(&mut admitter, now), None);
         // A third waiting start gets the last one.
         admitter.request(now, &facts(100), request("w3", 256));
-        assert_eq!(admitter.early_sleep(now).as_deref(), Some("c"));
+        assert_eq!(sleeper(&mut admitter, now).as_deref(), Some("c"));
         admitter.request(now, &facts(100), request("w4", 256));
         assert_eq!(
-            admitter.early_sleep(now),
+            sleeper(&mut admitter, now),
             None,
             "nobody left to put to sleep"
         );
         // A start that gave up does not hand its sleeper to another.
         assert!(admitter.cancel(w1) && admitter.cancel(w2));
-        assert_eq!(admitter.early_sleep(now), None);
+        assert_eq!(sleeper(&mut admitter, now), None);
+    }
+
+    #[test]
+    fn a_wait_for_the_start_cap_alone_puts_no_database_to_sleep() {
+        let t0 = Instant::now();
+        let now = t0 + secs(60);
+        let idle = |database: &str| Running {
+            database: database.into(),
+            memory_mib: 256,
+            starting: false,
+            always_warm: false,
+        };
+        let starting = |n: usize| Running {
+            starting: true,
+            ..idle(&format!("s{n}"))
+        };
+        // Three idle databases, and four starts in flight that fill the cap; memory is plentiful.
+        let mut admitter = Admitter::rebuild(
+            policy(),
+            [idle("a"), idle("b"), idle("c")]
+                .into_iter()
+                .chain((0..4).map(starting)),
+            t0,
+        );
+        queue(&mut admitter, now, &facts(100_000), request("w", 256));
+        assert_eq!(
+            admitter.early_sleep(now, &facts(100_000)),
+            None,
+            "a sleeper frees no start slot, so it cannot end this wait"
+        );
+    }
+
+    #[test]
+    fn only_a_start_the_memory_rule_holds_back_gets_a_sleeper() {
+        let t0 = Instant::now();
+        let now = t0 + secs(60);
+        let mut admitter = idle_node(t0);
+        // 1000 MiB are available: 1024 MiB do not fit (600 + 1024), 256 MiB would (600 + 256).
+        let tight = facts(1000);
+        queue(&mut admitter, now, &tight, request("big", 1024));
+        queue(&mut admitter, now, &tight, request("small", 256));
+        assert_eq!(admitter.early_sleep(now, &tight), Some(sleep("a", "big")));
+        assert_eq!(
+            admitter.early_sleep(now, &tight),
+            None,
+            "small waits behind big, not for memory"
+        );
+        // Once the sleeper's memory is back, nothing holds big back and nobody else sleeps for it.
+        assert_eq!(admitter.early_sleep(now, &facts(2000)), None);
     }
 
     #[test]
@@ -1653,22 +1876,22 @@ mod tests {
         let now = t0 + secs(60);
         let mut admitter = idle_node(t0);
         queue(&mut admitter, now, &facts(100), request("w", 256));
-        assert_eq!(admitter.early_sleep(now).as_deref(), Some("a"));
-        assert_eq!(admitter.early_sleep(now), None, "w has its sleeper");
+        assert_eq!(sleeper(&mut admitter, now).as_deref(), Some("a"));
+        assert_eq!(sleeper(&mut admitter, now), None, "w has its sleeper");
         // a was busy: it counts as used now, and w may have another.
         admitter.early_sleep_refused("a", now);
-        assert_eq!(admitter.early_sleep(now).as_deref(), Some("b"));
+        assert_eq!(sleeper(&mut admitter, now).as_deref(), Some("b"));
         admitter.early_sleep_refused("b", now);
-        assert_eq!(admitter.early_sleep(now).as_deref(), Some("c"));
+        assert_eq!(sleeper(&mut admitter, now).as_deref(), Some("c"));
         admitter.early_sleep_refused("c", now);
         assert_eq!(
-            admitter.early_sleep(now),
+            sleeper(&mut admitter, now),
             None,
             "all three were used just now"
         );
-        assert_eq!(admitter.early_sleep(now + secs(29)), None);
+        assert_eq!(sleeper(&mut admitter, now + secs(29)), None);
         // Thirty seconds later the one refused first is idle long enough again.
-        assert_eq!(admitter.early_sleep(now + secs(30)).as_deref(), Some("a"));
+        assert_eq!(sleeper(&mut admitter, now + secs(30)).as_deref(), Some("a"));
         // A database that is not asleep early, or not awake, is left alone.
         admitter.early_sleep_refused("nobody", now);
         assert_eq!(admitter.snapshot().awake, ["a", "b", "c"]);
@@ -1682,12 +1905,12 @@ mod tests {
         let mut admitter = idle_node(t0);
         admitter.set_policy(off);
         admitter.request(t0 + secs(60), &facts(100), request("w", 256));
-        assert_eq!(admitter.early_sleep(t0 + secs(60)), None);
+        assert_eq!(sleeper(&mut admitter, t0 + secs(60)), None);
         // On, but every database was used within the last 30 s: none qualifies yet.
         let mut admitter = idle_node(t0);
         admitter.request(t0, &facts(100), request("w", 256));
-        assert_eq!(admitter.early_sleep(t0 + secs(29)), None);
-        assert_eq!(admitter.early_sleep(t0 + secs(30)).as_deref(), Some("a"));
+        assert_eq!(sleeper(&mut admitter, t0 + secs(29)), None);
+        assert_eq!(sleeper(&mut admitter, t0 + secs(30)).as_deref(), Some("a"));
     }
 
     #[test]
@@ -1701,7 +1924,7 @@ mod tests {
         admitter.set_always_warm("c", true);
         admitter.request(now, &facts(100), request("w", 256));
         // a was used 10 s ago, c is always warm, b was last used at 10 s (the older report lost).
-        assert_eq!(admitter.early_sleep(now).as_deref(), Some("b"));
+        assert_eq!(sleeper(&mut admitter, now).as_deref(), Some("b"));
         // Unknown databases are ignored.
         admitter.activity("nobody", now);
         admitter.set_always_warm("nobody", true);
@@ -1809,9 +2032,17 @@ mod tests {
                 room: Arc::new(AtomicBool::new(true)),
             }
         }
-        fn run(&self, policy: Policy) -> (Admission, mpsc::UnboundedReceiver<String>) {
+        fn run(&self, policy: Policy) -> (Admission, mpsc::UnboundedReceiver<EarlySleep>) {
+            let (admission, early, resumed) = self.resume(Admitter::new(policy));
+            assert!(resumed.is_empty(), "a new admitter has no start to resume");
+            (admission, early)
+        }
+        fn resume(
+            &self,
+            admitter: Admitter,
+        ) -> (Admission, mpsc::UnboundedReceiver<EarlySleep>, Vec<Permit>) {
             let node = self.clone();
-            Admission::spawn(Admitter::new(policy), move || Facts {
+            Admission::spawn(admitter, move || Facts {
                 mem_available_bytes: node.memory_mib.load(Ordering::SeqCst) * MIB_U64,
                 pool: node.room.load(Ordering::SeqCst).then(pool),
             })
@@ -1848,7 +2079,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_permit_that_is_dropped_reports_its_start_failed() {
+    async fn a_permit_that_reports_its_start_failed_frees_the_start_slot() {
         let mut one = policy();
         one.admission.start_concurrency = 1;
         let (admission, _early) = Node::new(10_000).run(one);
@@ -1859,7 +2090,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!second.is_finished(), "the cap holds b back");
-        drop(first);
+        first.failed();
         let permit = second.await.unwrap().unwrap();
         assert_eq!(permit.waited, secs(1));
         assert_eq!(
@@ -1959,7 +2190,7 @@ mod tests {
             admission.snapshot().await,
             Some(snapshot_of(&["b"], 256, 1, 0))
         );
-        drop(permit);
+        permit.failed();
         assert_eq!(admission.snapshot().await, Some(snapshot_of(&[], 0, 0, 0)));
     }
 
@@ -1974,7 +2205,7 @@ mod tests {
             let admission = admission.clone();
             async move { admission.admit(request("w", 256)).await }
         });
-        assert_eq!(early.recv().await.as_deref(), Some("x"));
+        assert_eq!(early.recv().await, Some(sleep("x", "w")));
         // The sleeper stops and the memory comes back: the waiting start begins.
         admission.stopped("x");
         node.memory_mib.store(10_000, Ordering::SeqCst);
@@ -2004,14 +2235,155 @@ mod tests {
         };
         // The first start waits, x is chosen and refuses; that start gives up after 20 s.
         let _first = wait_for("w1");
-        assert_eq!(early.recv().await.as_deref(), Some("x"));
+        assert_eq!(early.recv().await, Some(sleep("x", "w1")));
         admission.early_sleep_refused("x");
         tokio::time::sleep(Duration::from_secs(15)).await;
         let _second = wait_for("w2");
         tokio::time::sleep(Duration::from_secs(14)).await;
         assert!(early.try_recv().is_err(), "x counts as used for 30 s");
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(early.try_recv().ok().as_deref(), Some("x"));
+        assert_eq!(early.try_recv().ok(), Some(sleep("x", "w2")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_asked_again_after_its_waiter_gave_up_is_not_a_duplicate() {
+        let node = Node::new(100);
+        let (admission, _early) = node.run(policy());
+        let first = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.admit(request("a", 256)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        first.abort();
+        let _ = first.await;
+        // The gateway redelivers the wake before the loop looks at the queue again.
+        let again = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.admit(request("a", 256)).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!again.is_finished(), "it waits like the first one did");
+        node.memory_mib.store(856, Ordering::SeqCst);
+        assert!(again.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_dropped_without_an_outcome_keeps_its_start_counted() {
+        let mut policy = reserved();
+        policy.admission.awake_budget_mib = 528;
+        let (admission, _early) = Node::new(0).run(policy);
+        // The caller's deadline passed while systemd was still starting the unit: the permit goes
+        // away, the unit does not.
+        drop(admission.admit(request("slow", 256)).await.unwrap());
+        assert_eq!(
+            admission.snapshot().await,
+            Some(snapshot_of(&["slow"], 256, 1, 0))
+        );
+        admission.admit(request("b", 256)).await.unwrap().ready();
+        let c = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.admit(request("c", 256)).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !c.is_finished(),
+            "slow still holds its reservation: three units do not fit two"
+        );
+        // The unit was seen stopped.
+        admission.stopped("slow");
+        assert!(c.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_found_in_flight_at_the_agents_start_is_ended_by_its_permit() {
+        let mut one = policy();
+        one.admission.start_concurrency = 1;
+        let running = |database: &str, starting| Running {
+            database: database.into(),
+            memory_mib: 256,
+            starting,
+            always_warm: true,
+        };
+        let admitter = Admitter::rebuild(
+            one,
+            [running("warm", true), running("up", false)],
+            Instant::now(),
+        );
+        let (admission, _early, mut resumed) = Node::new(10_000).resume(admitter);
+        assert_eq!(resumed.len(), 1, "one permit for the one start in flight");
+        let warm = resumed.pop().unwrap();
+        assert_eq!(warm.waited, Duration::ZERO);
+        assert_eq!(
+            admission.snapshot().await,
+            Some(snapshot_of(&["up", "warm"], 512, 1, 0))
+        );
+        // The start cap of one is taken by the start the agent found.
+        let waiting = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.admit(request("other", 256)).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished());
+        // The unit became active: the start is over and the next one begins.
+        warm.ready();
+        let permit = waiting.await.unwrap().unwrap();
+        assert_eq!(permit.waited, secs(1));
+        assert_eq!(
+            admission.snapshot().await,
+            Some(snapshot_of(&["other", "up", "warm"], 768, 1, 0))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_found_in_flight_that_failed_leaves_the_awake_set() {
+        let admitter = Admitter::rebuild(
+            policy(),
+            [Running {
+                database: "x".into(),
+                memory_mib: 256,
+                starting: true,
+                always_warm: false,
+            }],
+            Instant::now(),
+        );
+        let (admission, _early, mut resumed) = Node::new(10_000).resume(admitter);
+        resumed.pop().unwrap().failed();
+        assert_eq!(admission.snapshot().await, Some(snapshot_of(&[], 0, 0, 0)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_of_a_stopped_start_ends_nothing_of_the_next_start() {
+        let (admission, _early) = Node::new(10_000).run(policy());
+        let earlier = admission.admit(request("a", 256)).await.unwrap();
+        // A stop order cancelled the start; the wake came again before the old start path ended.
+        admission.stopped("a");
+        let later = admission.admit(request("a", 256)).await.unwrap();
+        earlier.failed();
+        assert_eq!(
+            admission.snapshot().await,
+            Some(snapshot_of(&["a"], 256, 1, 0))
+        );
+        later.ready();
+        assert_eq!(
+            admission.snapshot().await,
+            Some(snapshot_of(&["a"], 256, 0, 0))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_nobody_receives_reports_its_start_failed() {
+        use futures_util::FutureExt;
+        let (admission, _early) = Node::new(10_000).run(policy());
+        // The caller asks and leaves before the loop answers.
+        assert!(
+            admission
+                .admit(request("gone", 256))
+                .now_or_never()
+                .is_none()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(admission.snapshot().await, Some(snapshot_of(&[], 0, 0, 0)));
+        admission.admit(request("gone", 256)).await.unwrap().ready();
     }
 
     #[tokio::test(start_paused = true)]
