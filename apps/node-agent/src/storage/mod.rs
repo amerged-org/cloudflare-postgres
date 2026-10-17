@@ -9,13 +9,18 @@
 // `Storage` and the kernel calls are Linux only, like the attach path's `mount`; the decisions
 // they use compile everywhere and are tested everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// `pgcf_storage_lab` is set by RUSTFLAGS, not declared in the manifest.
+#![allow(unexpected_cfgs)]
 mod command;
 mod commands;
 mod error;
 #[cfg(target_os = "linux")]
 mod host;
 mod ids;
-#[cfg(all(test, target_os = "linux"))]
+// The lab tests change the machine: they exist only when the lab run sets `--cfg
+// pgcf_storage_lab` (see the module), so that the unprivileged kernel step, which runs every
+// ignored test, never meets them.
+#[cfg(all(test, target_os = "linux", pgcf_storage_lab))]
 mod lab_tests;
 mod lvm;
 mod mountinfo;
@@ -47,13 +52,16 @@ pub struct Config {
     pub device: PathBuf,
     pub group: String,
     pub pool: String,
-    /// Each volume is mounted at `<mount_root>/<database id>`.
+    /// Each volume is mounted at `<mount_root>/<database id>`: the directory is the database's, so
+    /// one storage generation of it is mounted at a time.
     pub mount_root: PathBuf,
     /// The LVM metadata area of the physical volume: about 95,000 volumes (Stage 1).
     pub pv_metadata_bytes: u64,
     pub pool_metadata_bytes: u64,
-    /// The sum of nominal volume sizes stays at or below this many times the pool's data size
-    /// (plan 4.3's plan default; it is not part of the node policy on the link).
+    /// The node's own ceiling: the sum of nominal volume sizes stays at or below this many times
+    /// the pool's data size (plan 4.3's default). It is not part of the node policy on the link,
+    /// so the cap Cloudflare enforces when it places a database or accepts a resize must not
+    /// exceed it, or the node refuses what Cloudflare accepted.
     pub logical_cap_factor: u64,
 }
 

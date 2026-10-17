@@ -5,7 +5,7 @@
 use super::{
     CommandRunner, Config, Error, NoRoom, Output, Policy, PoolSample, ReserveAction, SystemRunner,
     VolumeId,
-    commands::{self, FS_TAG, RESERVE_FREED_TAG},
+    commands::{self, FS_TAG, RESERVE_FREED_TAG, SUSPECT_TAG},
     host,
     ids::dm_name,
     lvm::{self, GroupStep, LogicalVolume, PoolStep},
@@ -18,6 +18,7 @@ use std::{
     io::ErrorKind,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
+    slice,
     sync::{Mutex, MutexGuard, PoisonError},
     time::Instant,
 };
@@ -25,13 +26,34 @@ use std::{
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
 const EXTENT_BYTES: u64 = 4 << 20;
 
-/// Why a volume may go (plan invariant 7: only explicit orders remove anything).
+/// Why a volume may go (plan invariant 7: only explicit orders remove anything). Each carries the
+/// storage generation the persisted desired state or order names, which the volume's own
+/// generation must not pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Removal {
-    /// The desired state of its database is `deleted`.
-    DatabaseDeleted,
-    /// A `superseded` order for its storage generation; `remove_volume` is the order's flag.
-    Superseded { remove_volume: bool },
+    /// The desired state of its database is `deleted` at this storage generation.
+    DatabaseDeleted { storage_generation: u64 },
+    /// A `superseded` order for this storage generation or an older one; `remove_volume` is the
+    /// order's flag.
+    Superseded {
+        storage_generation: u64,
+        remove_volume: bool,
+    },
+}
+
+impl Removal {
+    /// Whether the order lets the volume of `id` go.
+    fn releases(self, id: &VolumeId) -> bool {
+        match self {
+            Removal::DatabaseDeleted { storage_generation } => {
+                id.generation() <= storage_generation
+            }
+            Removal::Superseded {
+                storage_generation,
+                remove_volume,
+            } => remove_volume && id.generation() <= storage_generation,
+        }
+    }
 }
 
 /// Every volume of the node and the sum of the pool's nominal sizes.
@@ -43,11 +65,12 @@ pub struct Inventory {
 }
 
 impl Inventory {
-    /// Mounted volumes on which ext4 recorded an error: those a full pool leaves behind.
+    /// The volumes a full pool may have left damaged: those mounted while the pool took no
+    /// writes, and those on which ext4 recorded an error.
     pub fn damaged(&self) -> Vec<&VolumeInfo> {
         self.volumes
             .iter()
-            .filter(|volume| volume.mount.is_some_and(|mount| mount.fs_errors))
+            .filter(|volume| volume.needs_repair())
             .collect()
     }
 }
@@ -107,6 +130,7 @@ impl<R: CommandRunner> Storage<R> {
     fn mounts(&self) -> Result<Vec<Mount>, Error> {
         mountinfo::parse(&host::mount_table()?)
     }
+    /// A database has one directory, the unit's mount point, whatever generation is mounted.
     fn mount_dir(&self, id: &VolumeId) -> PathBuf {
         self.config.mount_root.join(id.database())
     }
@@ -117,6 +141,23 @@ impl<R: CommandRunner> Storage<R> {
             .iter()
             .rev()
             .find(|mount| mount.mount_point == dir && mount.source == device)
+    }
+    /// The filesystem on top at this volume's directory, whichever volume it is.
+    fn top_mount<'a>(&self, id: &VolumeId, mounts: &'a [Mount]) -> Option<&'a Mount> {
+        let dir = self.mount_dir(id);
+        mounts.iter().rev().find(|mount| mount.mount_point == dir)
+    }
+    /// The volume whose device-mapper node is `source`.
+    fn volume_of_device(&self, source: &str) -> Option<VolumeId> {
+        let prefix = format!("/dev/mapper/{}", dm_name(&self.config.group, ""));
+        VolumeId::from_lv_name(source.strip_prefix(&prefix)?)
+    }
+    /// Why `top` keeps `id` from its directory.
+    fn occupied(&self, id: &VolumeId, top: &Mount) -> Error {
+        match self.volume_of_device(&top.source) {
+            Some(other) if other.database() == id.database() => Error::OtherGeneration,
+            _ => Error::Unexpected("another filesystem at the volume's directory"),
+        }
     }
     /// The volume's LV if it is this database's thin volume.
     fn volume<'a>(
@@ -137,6 +178,17 @@ impl<R: CommandRunner> Storage<R> {
             return Err(Error::Unexpected("a volume that is not this database's"));
         }
         Ok(())
+    }
+    /// The thin volumes that are a database's. Any other thin volume counts toward the cap and is
+    /// not reported.
+    fn database_volumes<'a>(
+        &'a self,
+        lvs: &'a [LogicalVolume],
+    ) -> impl Iterator<Item = (VolumeId, &'a LogicalVolume)> {
+        lvs.iter().filter(|lv| lv.is_thin()).filter_map(|lv| {
+            let id = VolumeId::from_lv_name(&lv.name)?;
+            self.owned(lv, &id).ok().map(|()| (id, lv))
+        })
     }
 
     /// First boot and every start of the agent: the volume group and the pool exist as plan 4.3
@@ -170,19 +222,63 @@ impl<R: CommandRunner> Storage<R> {
         Ok(())
     }
 
-    /// Reads the pool now (plan 4.3: every 5 s) and keeps the reading for `room`.
+    /// Reads the pool now and keeps the reading for `room`. A read that fails leaves no reading,
+    /// so `room` answers `Unobserved` rather than the last healthy sample.
+    fn read_pool(&self) -> Result<PoolSample, Error> {
+        let sample = self.run(commands::dm_status_pool()).and_then(|status| {
+            let table = self.run(commands::dm_table_pool())?;
+            parse_pool(
+                &self.config.group,
+                &self.config.pool,
+                &status.stdout,
+                &table.stdout,
+                Instant::now(),
+            )
+        });
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = sample.as_ref().ok().cloned();
+        sample
+    }
+
+    /// Reads the pool (plan 4.3: every 5 s) and keeps the reading for `room`. A reading that shows
+    /// a pool without writes tags every mounted volume as suspect first (`mark_suspects`).
     pub fn poll_pool(&self) -> Result<PoolSample, Error> {
-        let status = self.run(commands::dm_status_pool())?;
-        let table = self.run(commands::dm_table_pool())?;
-        let sample = parse_pool(
-            &self.config.group,
-            &self.config.pool,
-            &status.stdout,
-            &table.stdout,
-            Instant::now(),
-        )?;
-        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(sample.clone());
+        let sample = self.read_pool()?;
+        if !sample.writable() {
+            self.mark_suspects(&self.lock())?;
+        }
         Ok(sample)
+    }
+
+    /// `poll_pool` inside a change, which holds the lock.
+    fn sample_pool(&self, held: &MutexGuard<'_, ()>) -> Result<PoolSample, Error> {
+        let sample = self.read_pool()?;
+        if !sample.writable() {
+            self.mark_suspects(held)?;
+        }
+        Ok(sample)
+    }
+
+    /// While the pool takes no writes, a mounted ext4 loses metadata blocks without recording an
+    /// error: only a later write notices, and PostgreSQL stops at its first failed WAL write and
+    /// makes none. So the pool's state, not ext4's error count, decides which volumes may be
+    /// damaged: every volume mounted now. The tag is LVM metadata, so it outlives the agent and
+    /// the node, and it stays until `recover_volume` has repaired the volume.
+    fn mark_suspects(&self, _held: &MutexGuard<'_, ()>) -> Result<(), Error> {
+        let lvs = self.read_lvs()?;
+        let mounts = self.mounts()?;
+        let unmarked: Vec<VolumeId> = self
+            .database_volumes(&lvs)
+            .filter(|(id, lv)| !lv.has_tag(SUSPECT_TAG) && self.mount_of(id, &mounts).is_some())
+            .map(|(id, _)| id)
+            .collect();
+        if !unmarked.is_empty() {
+            self.run(commands::volumes_add_tag(
+                &self.config,
+                &unmarked,
+                SUSPECT_TAG,
+            ))?;
+        }
+        Ok(())
     }
 
     /// The room rule of plan 4.6 on the latest `poll_pool` reading.
@@ -192,20 +288,20 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// Every volume with its pool use, mount, space and inodes: the volume report of plan 4.3,
-    /// read every 60 s.
+    /// read every 60 s. A volume that is not active holds chunks no tool reports, so it fails the
+    /// inventory instead of reporting none.
     pub fn inventory(&self) -> Result<Inventory, Error> {
         let lvs = self.read_lvs()?;
         let mapped = parse_thin_mapped(&self.run(commands::dm_status_thin())?.stdout)?;
         let mounts = self.mounts()?;
-        let thin = || lvs.iter().filter(|lv| lv.is_thin());
         let mut volumes = Vec::new();
-        for lv in thin() {
-            // A thin volume that is not a database's counts toward the cap and is not reported.
-            let Some(id) = VolumeId::from_lv_name(&lv.name).filter(|id| self.owned(lv, id).is_ok())
-            else {
-                continue;
-            };
+        for (id, lv) in self.database_volumes(&lvs) {
             let name = dm_name(&self.config.group, &lv.name);
+            let pool_used_bytes = mapped
+                .iter()
+                .find(|(device, _)| *device == name)
+                .map(|(_, bytes)| *bytes)
+                .ok_or(Error::Unexpected("a volume that is not active"))?;
             let mount = match self.mount_of(&id, &mounts) {
                 Some(mount) => Some(MountInfo {
                     usage: host::fs_usage(&mount.mount_point)?,
@@ -216,19 +312,33 @@ impl<R: CommandRunner> Storage<R> {
             volumes.push(VolumeInfo {
                 id,
                 size_bytes: lv.size_bytes,
-                pool_used_bytes: mapped
-                    .iter()
-                    .find(|(device, _)| *device == name)
-                    .map_or(0, |(_, bytes)| *bytes),
+                pool_used_bytes,
                 formatted: lv.has_tag(FS_TAG),
                 reserve_released: lv.has_tag(RESERVE_FREED_TAG),
+                suspect: lv.has_tag(SUSPECT_TAG),
                 mount,
             });
         }
         Ok(Inventory {
             volumes,
-            nominal_bytes: thin().map(|lv| lv.size_bytes).sum(),
+            nominal_bytes: lvs
+                .iter()
+                .filter(|lv| lv.is_thin())
+                .map(|lv| lv.size_bytes)
+                .sum(),
         })
+    }
+
+    /// Whether the volume must be repaired (`recover_volume`) before its database starts again:
+    /// the one question a wake asks about a volume, without reading every volume's space.
+    pub fn needs_repair(&self, id: &VolumeId) -> Result<bool, Error> {
+        if self.volume(&self.read_lvs()?, id)?.has_tag(SUSPECT_TAG) {
+            return Ok(true);
+        }
+        match self.mount_of(id, &self.mounts()?) {
+            Some(mount) => Ok(host::ext4_errors(mount.minor)? > 0),
+            None => Ok(false),
+        }
     }
 
     /// The logical cap of plan 4.3: nominal sizes stay at or below a multiple of the pool.
@@ -258,7 +368,8 @@ impl<R: CommandRunner> Storage<R> {
 
     /// Creates the database's volume, its ext4 and its mount, or finishes what an earlier call
     /// left: the room rule and the logical cap hold for a new volume, an existing one is never
-    /// formatted twice, and one of another size is an error.
+    /// formatted twice, and one of another size is an error. Another generation of the database
+    /// that is mounted refuses the create before anything is made.
     pub fn create_volume(
         &self,
         id: &VolumeId,
@@ -266,47 +377,60 @@ impl<R: CommandRunner> Storage<R> {
         policy: &Policy,
     ) -> Result<(), Error> {
         check_size(size_bytes)?;
-        let _guard = self.lock();
+        let guard = self.lock();
+        let device = commands::device(&self.config, id);
+        let mounts = self.mounts()?;
+        if let Some(top) = self
+            .top_mount(id, &mounts)
+            .filter(|top| top.source != device)
+        {
+            return Err(self.occupied(id, top));
+        }
         let lvs = self.read_lvs()?;
-        let sample = self.poll_pool()?;
+        let sample = self.sample_pool(&guard)?;
         pool::room(Some(&sample), Instant::now(), policy).map_err(Error::NoRoom)?;
-        let formatted = match self.volume(&lvs, id) {
+        let (formatted, suspect) = match self.volume(&lvs, id) {
             Ok(lv) if lv.size_bytes != size_bytes => {
                 return Err(Error::Unexpected("a volume of another size"));
             }
-            Ok(lv) => lv.has_tag(FS_TAG),
+            Ok(lv) => (lv.has_tag(FS_TAG), lv.has_tag(SUSPECT_TAG)),
             Err(Error::Missing) => {
                 self.within_cap(&sample, &lvs, size_bytes)?;
                 self.run(commands::volume_create(&self.config, id, size_bytes))?;
-                false
+                (false, false)
             }
             Err(error) => return Err(error),
         };
         if !formatted {
-            if self
-                .mounts()?
-                .iter()
-                .any(|mount| mount.source == commands::device(&self.config, id))
-            {
+            if mounts.iter().any(|mount| mount.source == device) {
                 return Err(Error::Mounted);
             }
             self.run(commands::mkfs(&self.config, id))?;
-            self.run(commands::volume_add_tag(&self.config, id, FS_TAG))?;
+            self.run(commands::volumes_add_tag(
+                &self.config,
+                slice::from_ref(id),
+                FS_TAG,
+            ))?;
         }
-        self.attach(id, &self.mounts()?)
+        self.attach(id, suspect)
     }
 
-    /// Mounts the formatted volume at its directory with mode 0700, unless it is.
-    fn attach(&self, id: &VolumeId, mounts: &[Mount]) -> Result<(), Error> {
+    /// Mounts the formatted volume at its directory with mode 0700, unless it is. The directory
+    /// is the database's, so a filesystem of another volume on it, another generation's included,
+    /// refuses the mount. A volume tagged as suspect is not mounted: `recover_volume` repairs it
+    /// first.
+    fn attach(&self, id: &VolumeId, suspect: bool) -> Result<(), Error> {
         let (dir, device) = (self.mount_dir(id), commands::device(&self.config, id));
-        if let Some(mount) = mounts.iter().rev().find(|mount| mount.mount_point == dir) {
-            return if mount.source == device {
+        // The table is read now: an earlier attach of the same call has changed it.
+        if let Some(top) = self.top_mount(id, &self.mounts()?) {
+            return if top.source == device {
                 Ok(())
             } else {
-                Err(Error::Unexpected(
-                    "another filesystem at the volume's directory",
-                ))
+                Err(self.occupied(id, top))
             };
+        }
+        if suspect {
+            return Err(Error::NeedsRepair);
         }
         // Traversable but not listable: a database reaches its own directory only.
         fs::DirBuilder::new()
@@ -336,53 +460,85 @@ impl<R: CommandRunner> Storage<R> {
     }
 
     /// Grows the volume and its filesystem online (plan 3.5: storage never shrinks). The logical
-    /// cap holds; a sleeping database's volume is mounted first, as `resize2fs` needs it.
+    /// cap holds; a sleeping database's volume is mounted first, as `resize2fs` needs it. A
+    /// reserve that was freed goes back by the usual rule once the volume has room again, and a
+    /// suspect volume is repaired before it grows.
     pub fn grow_volume(&self, id: &VolumeId, size_bytes: u64) -> Result<(), Error> {
         check_size(size_bytes)?;
-        let _guard = self.lock();
+        let guard = self.lock();
         let lvs = self.read_lvs()?;
-        let current = self.formatted(&lvs, id)?.size_bytes;
+        let lv = self.formatted(&lvs, id)?;
+        if lv.has_tag(SUSPECT_TAG) {
+            return Err(Error::NeedsRepair);
+        }
+        let (current, released) = (lv.size_bytes, lv.has_tag(RESERVE_FREED_TAG));
         if size_bytes < current {
             return Err(Error::Shrink);
         }
-        if size_bytes > current {
-            self.within_cap(&self.poll_pool()?, &lvs, size_bytes - current)?;
+        // The resize writes: not into a pool that takes none.
+        let sample = self.sample_pool(&guard)?;
+        if !sample.writable() {
+            return Err(Error::NoRoom(NoRoom::Unwritable));
         }
-        self.attach(id, &self.mounts()?)?;
+        if size_bytes > current {
+            self.within_cap(&sample, &lvs, size_bytes - current)?;
+        }
+        self.attach(id, false)?;
         if size_bytes > current {
             self.run(commands::volume_extend(&self.config, id, size_bytes))?;
         }
         self.run(commands::resize_fs(&self.config, id))?;
+        if released {
+            let usage = host::fs_usage(&self.mount_dir(id))?;
+            self.apply_reserve(id, usage.reserve_action(true, false), true)?;
+        }
         Ok(())
     }
 
     pub fn mount_volume(&self, id: &VolumeId) -> Result<(), Error> {
         let _guard = self.lock();
-        self.formatted(&self.read_lvs()?, id)?;
-        self.attach(id, &self.mounts()?)
+        let lvs = self.read_lvs()?;
+        let suspect = self.formatted(&lvs, id)?.has_tag(SUSPECT_TAG);
+        self.attach(id, suspect)
     }
 
-    /// After a boot: mounts every formatted volume, as sleeping databases keep theirs mounted.
-    /// A volume that does not mount is returned and the others still are.
-    pub fn mount_all(&self) -> Result<Vec<(VolumeId, Error)>, Error> {
+    /// After a boot: mounts the formatted volume of every database in `current`, as sleeping
+    /// databases keep theirs mounted. `current` is the storage generation the persisted desired
+    /// state names for each database: an older generation that has not been removed yet is never
+    /// mounted, and the unit would start its data. A volume that does not mount is returned and
+    /// the others still are. One that does not exist, or whose create stopped before its
+    /// filesystem, is the create's to finish.
+    pub fn mount_all(&self, current: &[VolumeId]) -> Result<Vec<(VolumeId, Error)>, Error> {
         let _guard = self.lock();
         let lvs = self.read_lvs()?;
-        let mounts = self.mounts()?;
         let mut failures = Vec::new();
-        for lv in lvs.iter().filter(|lv| lv.is_thin() && lv.has_tag(FS_TAG)) {
-            let Some(id) = VolumeId::from_lv_name(&lv.name) else {
-                continue;
+        for id in current {
+            let lv = match self.volume(&lvs, id) {
+                Ok(lv) if lv.has_tag(FS_TAG) => lv,
+                Ok(_) | Err(Error::Missing) => continue,
+                Err(error) => {
+                    failures.push((id.clone(), error));
+                    continue;
+                }
             };
-            if let Err(error) = self.owned(lv, &id).and_then(|()| self.attach(&id, &mounts)) {
-                failures.push((id, error));
+            if let Err(error) = self.attach(id, lv.has_tag(SUSPECT_TAG)) {
+                failures.push((id.clone(), error));
             }
         }
         Ok(failures)
     }
 
-    fn detach(&self, id: &VolumeId, mounts: &[Mount]) -> Result<(), Error> {
-        if self.mount_of(id, mounts).is_none() {
+    /// Unmounts the volume's own filesystem. What is on top at its directory must be that
+    /// filesystem; `umount` would take whatever is on top.
+    fn detach(&self, id: &VolumeId) -> Result<(), Error> {
+        let mounts = self.mounts()?;
+        let Some(own) = self.mount_of(id, &mounts) else {
             return Ok(());
+        };
+        if self.top_mount(id, &mounts) != Some(own) {
+            return Err(Error::Unexpected(
+                "another filesystem above the volume's mount",
+            ));
         }
         // No force and no lazy detach: a filesystem that something holds stays mounted.
         host::unmount(&self.mount_dir(id)).map_err(|error| match error.raw_os_error() {
@@ -393,30 +549,22 @@ impl<R: CommandRunner> Storage<R> {
 
     pub fn unmount_volume(&self, id: &VolumeId) -> Result<(), Error> {
         let _guard = self.lock();
-        self.detach(id, &self.mounts()?)
+        self.detach(id)
     }
 
     /// Removes the volume of a deleted database or of a superseded generation, and its chunks
-    /// return to the pool. Never a volume that is mounted, one that is not a database volume,
-    /// or one the order does not release.
+    /// return to the pool. Never a volume that is mounted, one that is not a database volume, or
+    /// one the order does not release. The database's directory goes with its last volume.
     pub fn remove_volume(&self, id: &VolumeId, removal: Removal) -> Result<(), Error> {
-        if removal
-            == (Removal::Superseded {
-                remove_volume: false,
-            })
-        {
+        if !removal.releases(id) {
             return Err(Error::NotAuthorised);
         }
         let _guard = self.lock();
-        let dir = self.mount_dir(id);
-        match self.volume(&self.read_lvs()?, id) {
+        let lvs = self.read_lvs()?;
+        match self.volume(&lvs, id) {
             Ok(_) => {
                 let device = commands::device(&self.config, id);
-                if self
-                    .mounts()?
-                    .iter()
-                    .any(|mount| mount.source == device || mount.mount_point == dir)
-                {
+                if self.mounts()?.iter().any(|mount| mount.source == device) {
                     return Err(Error::Mounted);
                 }
                 self.run(commands::volume_remove(&self.config, id))?;
@@ -425,7 +573,13 @@ impl<R: CommandRunner> Storage<R> {
             Err(Error::Missing) => {}
             Err(error) => return Err(error),
         }
-        match fs::remove_dir(&dir) {
+        let others = self
+            .database_volumes(&lvs)
+            .any(|(other, _)| other.database() == id.database() && other != *id);
+        if others {
+            return Ok(());
+        }
+        match fs::remove_dir(self.mount_dir(id)) {
             Err(error) if error.kind() != ErrorKind::NotFound => Err(error.into()),
             _ => Ok(()),
         }
@@ -440,56 +594,151 @@ impl<R: CommandRunner> Storage<R> {
         Ok(())
     }
 
-    /// Frees or restores the root-only 1 % reserve (`usage::FsUsage::reserve_action`). The tag
-    /// goes first when freeing and last when restoring, so a stop between the two steps leaves a
-    /// volume that the next sample frees or restores again.
-    pub fn set_reserve(&self, id: &VolumeId, action: ReserveAction) -> Result<(), Error> {
+    /// Frees or restores the root-only 1 % reserve by `FsUsage::reserve_action` on the volume's
+    /// space now, and returns what it did. `write_failed` is whether the database's unit ended on
+    /// its own after a failed write: the one fact the caller knows and the volume does not.
+    pub fn set_reserve(&self, id: &VolumeId, write_failed: bool) -> Result<ReserveAction, Error> {
         let _guard = self.lock();
+        let lvs = self.read_lvs()?;
+        let released = self.formatted(&lvs, id)?.has_tag(RESERVE_FREED_TAG);
+        let mounts = self.mounts()?;
+        let mount = self.mount_of(id, &mounts).ok_or(Error::NotMounted)?;
+        let action = host::fs_usage(&mount.mount_point)?.reserve_action(released, write_failed);
+        self.apply_reserve(id, action, released)?;
+        Ok(action)
+    }
+
+    /// The tag goes first when freeing and last when restoring, so a stop between the two steps
+    /// leaves a volume that the next sample frees or restores again.
+    fn apply_reserve(
+        &self,
+        id: &VolumeId,
+        action: ReserveAction,
+        released: bool,
+    ) -> Result<(), Error> {
         match action {
-            ReserveAction::Keep => Ok(()),
+            ReserveAction::Keep => {}
             ReserveAction::Release => {
-                let lvs = self.read_lvs()?;
-                if !self.formatted(&lvs, id)?.has_tag(RESERVE_FREED_TAG) {
-                    self.run(commands::volume_add_tag(
+                if !released {
+                    self.run(commands::volumes_add_tag(
                         &self.config,
-                        id,
+                        slice::from_ref(id),
                         RESERVE_FREED_TAG,
                     ))?;
                 }
                 self.run(commands::reserve(&self.config, id, 0))?;
-                Ok(())
             }
             ReserveAction::Restore => {
-                let lvs = self.read_lvs()?;
-                let tagged = self.formatted(&lvs, id)?.has_tag(RESERVE_FREED_TAG);
                 self.run(commands::reserve(&self.config, id, 1))?;
-                if tagged {
+                if released {
                     self.run(commands::volume_delete_tag(
                         &self.config,
                         id,
                         RESERVE_FREED_TAG,
                     ))?;
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Full-pool recovery of one volume (plan 4.3), once its database's unit is stopped: unmounts
-    /// it, repairs it with `e2fsck -p` and mounts it again. The pool must take writes with space
-    /// above the reserve, as the repair writes. Waking the database is the caller's, through
-    /// admission.
+    /// it, repairs it with `e2fsck -p`, takes it off the suspects and mounts it again. The pool
+    /// must take writes with space above the reserve, as the repair writes. Waking the database
+    /// is the caller's, through admission.
+    ///
+    /// A pool without writes can leave the journal with committed transactions while the
+    /// filesystem's `needs_recovery` flag is clear. `-p` then refuses (4); the journal is replayed
+    /// by setting the flag, and `-p` runs again. Anything it still refuses needs an operator.
     pub fn recover_volume(&self, id: &VolumeId, policy: &Policy) -> Result<(), Error> {
-        let _guard = self.lock();
-        self.formatted(&self.read_lvs()?, id)?;
-        let sample = self.poll_pool()?;
+        let guard = self.lock();
+        let lvs = self.read_lvs()?;
+        let suspect = self.formatted(&lvs, id)?.has_tag(SUSPECT_TAG);
+        let sample = self.sample_pool(&guard)?;
         pool::room(Some(&sample), Instant::now(), policy).map_err(Error::NoRoom)?;
-        self.detach(id, &self.mounts()?)?;
-        // 0: clean, 1: errors corrected. Anything else needs an operator.
-        let output = self.runner.run(&commands::fsck(&self.config, id))?;
-        if !matches!(output.code, 0 | 1) {
-            return Err(Error::Fsck(output.code));
+        self.detach(id)?;
+        let mut code = self.runner.run(&commands::fsck(&self.config, id))?.code;
+        if code == 4 {
+            self.run(commands::replay_journal(&self.config, id))?;
+            code = self.runner.run(&commands::fsck(&self.config, id))?.code;
         }
-        self.attach(id, &self.mounts()?)
+        // 0: clean, 1: errors corrected. Anything else needs an operator.
+        if !matches!(code, 0 | 1) {
+            return Err(Error::Fsck(code));
+        }
+        if suspect {
+            self.run(commands::volume_delete_tag(&self.config, id, SUSPECT_TAG))?;
+        }
+        self.attach(id, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+
+    /// Answers the pool commands with `dmsetup` output recorded from a pool, until told to fail.
+    struct Recorded(AtomicBool);
+
+    impl CommandRunner for Recorded {
+        fn run(&self, command: &[String]) -> io::Result<Output> {
+            if self.0.load(Ordering::Relaxed) {
+                return Ok(Output {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "device-mapper: status ioctl failed".into(),
+                });
+            }
+            let stdout = match command.get(1).map(String::as_str) {
+                Some("status") => include_str!("fixtures/dm-status-pool.txt"),
+                Some("table") => include_str!("fixtures/dm-table-pool.txt"),
+                _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+            };
+            Ok(Output {
+                code: 0,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_failed_pool_read_leaves_no_reading_to_admit_on() {
+        let policy = Policy {
+            reserve_bytes: 1 << 20,
+            metadata_no_room_percent: 75,
+            sample_max_age: Duration::from_secs(10),
+        };
+        let storage = Storage::new(Recorded(AtomicBool::new(false)), Config::default());
+        assert_eq!(storage.room(&policy), Err(NoRoom::Unobserved));
+        storage.poll_pool().unwrap();
+        assert_eq!(storage.room(&policy), Ok(()));
+        // The pool cannot be read now: the reading from before no longer admits a wake.
+        storage.runner.0.store(true, Ordering::Relaxed);
+        assert!(matches!(storage.poll_pool(), Err(Error::Command { .. })));
+        assert_eq!(storage.room(&policy), Err(NoRoom::Unobserved));
+    }
+
+    #[test]
+    fn an_order_releases_the_volumes_of_its_generation_and_older_ones_only() {
+        let volume = |generation| VolumeId::new("a1b2c3d4e5f6g7h8i9j0", generation).unwrap();
+        let deleted = Removal::DatabaseDeleted {
+            storage_generation: 2,
+        };
+        assert!(deleted.releases(&volume(1)) && deleted.releases(&volume(2)));
+        assert!(!deleted.releases(&volume(3)));
+        let superseded = |remove_volume| Removal::Superseded {
+            storage_generation: 2,
+            remove_volume,
+        };
+        assert!(superseded(true).releases(&volume(1)) && superseded(true).releases(&volume(2)));
+        assert!(!superseded(true).releases(&volume(3)));
+        // Without `remove_volume` the order keeps the volume.
+        assert!(!superseded(false).releases(&volume(1)));
     }
 }

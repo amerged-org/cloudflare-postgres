@@ -35,6 +35,11 @@ impl PoolSample {
     pub fn free_data_bytes(&self) -> u64 {
         self.data_total_bytes.saturating_sub(self.data_used_bytes)
     }
+    /// The pool takes writes. Otherwise every write to a volume fails, and a mounted ext4 can lose
+    /// metadata without recording an error.
+    pub fn writable(&self) -> bool {
+        self.mode == PoolMode::ReadWrite && !self.needs_check
+    }
     /// The `pool` object of the contract's `NodeSample`. `nominal_bytes` is the sum of every
     /// volume's nominal size (from the volume inventory).
     pub fn to_contract(&self, observed_at: &str, nominal_bytes: u64) -> Value {
@@ -214,7 +219,7 @@ pub fn room(sample: Option<&PoolSample>, now: Instant, policy: &Policy) -> Resul
     if now.saturating_duration_since(sample.observed) > policy.sample_max_age {
         return Err(NoRoom::Stale);
     }
-    if sample.mode != PoolMode::ReadWrite || sample.needs_check {
+    if !sample.writable() {
         return Err(NoRoom::Unwritable);
     }
     if sample.free_data_bytes() < policy.reserve_bytes {
@@ -397,7 +402,9 @@ mod tests {
             |s| s.needs_check = true,
         ] {
             let mut s = sample(t0);
+            assert!(s.writable());
             change(&mut s);
+            assert!(!s.writable());
             assert_eq!(room(Some(&s), t0, &no_reserve), Err(NoRoom::Unwritable));
         }
     }

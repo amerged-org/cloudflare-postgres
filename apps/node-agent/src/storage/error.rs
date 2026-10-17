@@ -28,7 +28,8 @@ pub enum Error {
     NoRoom(NoRoom),
     /// The sum of nominal volume sizes would pass the logical cap of plan 4.3.
     LogicalCap { nominal_bytes: u64, cap_bytes: u64 },
-    /// A `superseded` order without `remove_volume` does not let a volume go.
+    /// The order does not let the volume go: a `superseded` order without `remove_volume`, or one
+    /// for an older storage generation than the volume's.
     NotAuthorised,
     /// The volume does not exist.
     Missing,
@@ -36,6 +37,12 @@ pub enum Error {
     Mounted,
     /// The volume is not mounted.
     NotMounted,
+    /// Another storage generation of the database holds its directory: a database has one
+    /// directory (the unit's mount point), so its generations take turns at it.
+    OtherGeneration,
+    /// The pool took no writes while the volume was mounted, so the volume may have lost some:
+    /// `recover_volume` first, then mount or grow it.
+    NeedsRepair,
     /// Something still holds the filesystem.
     Busy,
     /// Storage only grows (plan 3.5).
@@ -67,6 +74,10 @@ impl fmt::Display for Error {
             Error::Missing => write!(f, "no such volume"),
             Error::Mounted => write!(f, "the volume is mounted"),
             Error::NotMounted => write!(f, "the volume is not mounted"),
+            Error::OtherGeneration => {
+                write!(f, "another generation holds the database's directory")
+            }
+            Error::NeedsRepair => write!(f, "the volume may have lost writes and needs repair"),
             Error::Busy => write!(f, "the filesystem is busy"),
             Error::Shrink => write!(f, "a volume never shrinks"),
             Error::Fsck(code) => write!(f, "e2fsck could not repair the filesystem ({code})"),

@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 pub const WARNING_PERCENT: u64 = 80;
 /// A volume at this share raises the critical alert.
 pub const CRITICAL_PERCENT: u64 = 90;
+/// A database whose unit failed a write with less than this left for users has run out: one WAL
+/// segment is the least that crash recovery and the next checkpoint need.
+pub const WAL_SEGMENT_BYTES: u64 = 16 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Alert {
@@ -31,7 +34,8 @@ pub struct FsUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveAction {
     Keep,
-    /// The tenant has no space left: let PostgreSQL's crash recovery and the tenant's deletes run.
+    /// The database stopped on a failed write and the tenant has no space left: let PostgreSQL's
+    /// crash recovery and the tenant's deletes run.
     Release,
     /// Use dropped, or the volume grew: back to 1 %.
     Restore,
@@ -70,13 +74,13 @@ impl FsUsage {
     pub fn inode_alert(&self) -> Option<Alert> {
         alert(self.inode_percent())
     }
-    pub fn space_full(&self) -> bool {
-        self.space_percent() >= 100
-    }
     /// `released` is whether the reserve was freed earlier (the volume carries a tag for it, as
     /// the filesystem cannot tell its root-only reserve from the share ext4 keeps for itself).
-    pub fn reserve_action(&self, released: bool) -> ReserveAction {
-        if self.space_full() {
+    /// `write_failed` is whether the database's unit ended on its own after a failed write. The
+    /// reserve is freed once both that and the lack of space hold (plan 4.3): a tenant who is
+    /// still running would spend it, and crash recovery after it would have none.
+    pub fn reserve_action(&self, released: bool, write_failed: bool) -> ReserveAction {
+        if write_failed && self.available_bytes < WAL_SEGMENT_BYTES {
             ReserveAction::Release
         } else if released && self.space_percent() < WARNING_PERCENT {
             ReserveAction::Restore
@@ -111,6 +115,9 @@ pub struct VolumeInfo {
     /// Its ext4 was made.
     pub formatted: bool,
     pub reserve_released: bool,
+    /// The pool took no writes while the volume was mounted: it may have lost some (the volume
+    /// carries a tag for it). Only `recover_volume` mounts it again.
+    pub suspect: bool,
     pub mount: Option<MountInfo>,
 }
 
@@ -124,6 +131,11 @@ pub struct MountInfo {
 impl VolumeInfo {
     pub fn mounted(&self) -> bool {
         self.mount.is_some()
+    }
+    /// The volume needs the stop, unmount, repair and mount of `recover_volume` before its
+    /// database starts again.
+    pub fn needs_repair(&self) -> bool {
+        self.suspect || self.mount.is_some_and(|mount| mount.fs_errors)
     }
     /// One entry of the contract's `NodeVolumeReport`.
     pub fn to_contract(&self) -> Value {
@@ -177,10 +189,8 @@ mod tests {
     #[test]
     fn the_share_is_rounded_up_so_that_one_free_block_is_still_full() {
         assert_eq!(full().space_percent(), 100);
-        assert!(full().space_full());
         let released = FsUsage::from_blocks(1024, 120_787, 3_932, 1_311, 2_048, 2_035);
         assert_eq!(released.space_percent(), 99);
-        assert!(!released.space_full());
         assert_eq!(usage(800, 200, 0).space_percent(), 80);
         assert_eq!(usage(801, 199, 0).space_percent(), 81);
         assert_eq!(usage(0, 0, 0).space_percent(), 100);
@@ -204,29 +214,79 @@ mod tests {
     }
 
     #[test]
-    fn the_reserve_is_freed_when_the_tenant_has_no_space_and_given_back_when_use_drops() {
-        assert_eq!(full().reserve_action(false), ReserveAction::Release);
+    fn the_reserve_is_freed_once_the_database_failed_a_write_and_the_tenant_has_no_space() {
+        assert_eq!(full().reserve_action(false, true), ReserveAction::Release);
         // Releasing again is harmless; it covers a stop between the tag and the tune2fs.
-        assert_eq!(full().reserve_action(true), ReserveAction::Release);
+        assert_eq!(full().reserve_action(true, true), ReserveAction::Release);
+        // A database that still runs would spend the reserve, and crash recovery would find none.
+        assert_eq!(full().reserve_action(false, false), ReserveAction::Keep);
+        // 500 MiB of a 100 GiB volume are still available: the share reads 100 %, the tenant
+        // can still write, and a stop for another reason does not free the reserve.
+        let nearly = FsUsage {
+            total_bytes: 100 << 30,
+            used_bytes: (99 << 30) - (500 << 20),
+            available_bytes: 500 << 20,
+            inodes_total: 1000,
+            inodes_used: 10,
+        };
+        assert_eq!(nearly.space_percent(), 100);
+        assert_eq!(nearly.reserve_action(false, true), ReserveAction::Keep);
+        // Less than a WAL segment is left: the tenant has run out.
+        let spent = FsUsage {
+            available_bytes: WAL_SEGMENT_BYTES - 1,
+            ..nearly
+        };
+        assert_eq!(spent.reserve_action(false, true), ReserveAction::Release);
         // Freed, and still almost full: keep it freed.
         let released = FsUsage::from_blocks(1024, 120_787, 3_932, 1_311, 2_048, 2_035);
-        assert_eq!(released.reserve_action(true), ReserveAction::Keep);
+        assert_eq!(released.reserve_action(true, false), ReserveAction::Keep);
         // Use dropped below the warning level (a delete, or a resize): back to 1 %.
         assert_eq!(
-            usage(790, 210, 0).reserve_action(true),
+            usage(790, 210, 0).reserve_action(true, false),
             ReserveAction::Restore
         );
-        assert_eq!(usage(800, 200, 0).reserve_action(true), ReserveAction::Keep);
+        assert_eq!(
+            usage(800, 200, 0).reserve_action(true, false),
+            ReserveAction::Keep
+        );
         // Never freed: nothing to give back.
         assert_eq!(
-            usage(100, 900, 0).reserve_action(false),
+            usage(100, 900, 0).reserve_action(false, false),
             ReserveAction::Keep
         );
         // Out of inodes is not helped by the reserve.
-        assert_eq!(
-            usage(100, 900, 100).reserve_action(false),
-            ReserveAction::Keep
-        );
+        let no_inodes = FsUsage {
+            available_bytes: 1 << 30,
+            inodes_used: 1000,
+            ..nearly
+        };
+        assert_eq!(no_inodes.reserve_action(false, true), ReserveAction::Keep);
+    }
+
+    #[test]
+    fn a_volume_needs_repair_when_the_pool_failed_under_it_or_ext4_recorded_an_error() {
+        let id = VolumeId::new("a1b2c3d4e5f6g7h8i9j0", 1).unwrap();
+        let volume = |suspect: bool, mount: Option<MountInfo>| VolumeInfo {
+            id: id.clone(),
+            size_bytes: 128 << 20,
+            pool_used_bytes: 0,
+            formatted: true,
+            reserve_released: false,
+            suspect,
+            mount,
+        };
+        let mounted = |fs_errors: bool| {
+            Some(MountInfo {
+                usage: full(),
+                fs_errors,
+            })
+        };
+        assert!(!volume(false, mounted(false)).needs_repair());
+        assert!(!volume(false, None).needs_repair());
+        // A volume the pool failed under has no recorded error, and may be unmounted since.
+        assert!(volume(true, mounted(false)).needs_repair());
+        assert!(volume(true, None).needs_repair());
+        assert!(volume(false, mounted(true)).needs_repair());
     }
 
     #[test]
@@ -238,6 +298,7 @@ mod tests {
             pool_used_bytes: 9_699_328,
             formatted: true,
             reserve_released: false,
+            suspect: false,
             mount: Some(MountInfo {
                 usage: full(),
                 fs_errors: false,

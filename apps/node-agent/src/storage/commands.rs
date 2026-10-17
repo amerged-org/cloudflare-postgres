@@ -21,6 +21,9 @@ pub const LV_FIELDS: &str =
 pub const FS_TAG: &str = "pgcf.fs";
 /// The tag of a volume whose filesystem has no root-only reserve (plan 4.3, full volume).
 pub const RESERVE_FREED_TAG: &str = "pgcf.reserve0";
+/// The tag of a volume that was mounted while the pool took no writes (plan 4.3, full pool): it
+/// stays until the volume is repaired, so a restart of the agent or of the node keeps it.
+pub const SUSPECT_TAG: &str = "pgcf.suspect";
 
 fn report(program: &str, fields: &str, target: Option<&str>) -> Vec<String> {
     let mut words = vec![program.to_string()];
@@ -108,14 +111,11 @@ pub fn volume_create(config: &Config, id: &VolumeId, size_bytes: u64) -> Vec<Str
         &pool_path(config),
     ])
 }
-pub fn volume_add_tag(config: &Config, id: &VolumeId, tag: &str) -> Vec<String> {
-    words([
-        "lvchange",
-        "--quiet",
-        "--addtag",
-        tag,
-        &volume_path(config, id),
-    ])
+/// One `lvchange` for all of `ids`, as the pool-full marking tags every mounted volume at once.
+pub fn volumes_add_tag(config: &Config, ids: &[VolumeId], tag: &str) -> Vec<String> {
+    let mut command = words(["lvchange", "--quiet", "--addtag", tag]);
+    command.extend(ids.iter().map(|id| volume_path(config, id)));
+    command
 }
 pub fn volume_delete_tag(config: &Config, id: &VolumeId, tag: &str) -> Vec<String> {
     words([
@@ -173,6 +173,20 @@ pub fn resize_fs(config: &Config, id: &VolumeId) -> Vec<String> {
 }
 pub fn fsck(config: &Config, id: &VolumeId) -> Vec<String> {
     words(["e2fsck", "-p", &device(config, id)])
+}
+/// Sets the filesystem's `needs_recovery` flag so that `e2fsck -p` replays the journal. After a
+/// full pool the journal can hold committed transactions while the flag is clear, because the
+/// write that would have set it was lost; `-p` then ends with 4 and "run journal anyway" is a
+/// question only an operator may answer. The flag answers exactly that question, and a damaged
+/// journal still stops `-p`.
+pub fn replay_journal(config: &Config, id: &VolumeId) -> Vec<String> {
+    words([
+        "debugfs",
+        "-w",
+        "-R",
+        "feature needs_recovery",
+        &device(config, id),
+    ])
 }
 pub fn reserve(config: &Config, id: &VolumeId, percent: u8) -> Vec<String> {
     words(["tune2fs", "-m", &percent.to_string(), &device(config, id)])
@@ -244,8 +258,14 @@ mod tests {
              --addtag pgcf.db.a1b2c3d4e5f6g7h8i9j0 --addtag pgcf.gen.3 pgcf/pgcf_thinpool"
         );
         assert_eq!(
-            line(volume_add_tag(&config, &id(), FS_TAG)),
+            line(volumes_add_tag(&config, &[id()], FS_TAG)),
             "lvchange --quiet --addtag pgcf.fs pgcf/db_a1b2c3d4e5f6g7h8i9j0_g3"
+        );
+        let other = VolumeId::new("k1l2m3n4o5p6q7r8s9t0", 1).unwrap();
+        assert_eq!(
+            line(volumes_add_tag(&config, &[id(), other], SUSPECT_TAG)),
+            "lvchange --quiet --addtag pgcf.suspect pgcf/db_a1b2c3d4e5f6g7h8i9j0_g3 \
+             pgcf/db_k1l2m3n4o5p6q7r8s9t0_g1"
         );
         assert_eq!(
             line(volume_delete_tag(&config, &id(), RESERVE_FREED_TAG)),
@@ -278,6 +298,10 @@ mod tests {
             format!("resize2fs {device}")
         );
         assert_eq!(line(fsck(&config, &id())), format!("e2fsck -p {device}"));
+        assert_eq!(
+            line(replay_journal(&config, &id())),
+            format!("debugfs -w -R feature needs_recovery {device}")
+        );
         assert_eq!(
             line(reserve(&config, &id(), 0)),
             format!("tune2fs -m 0 {device}")
