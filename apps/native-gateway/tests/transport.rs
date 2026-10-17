@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Real loopback WebSocket and TLS sockets; this is protocol conformance, not Dev SQL acceptance.
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_gateway::{
@@ -184,6 +187,125 @@ impl PostgresDial for TestDial {
         })
     }
 }
+/// How the PostgreSQL double authenticates `app` after the StartupMessage.
+#[derive(Clone)]
+enum Double {
+    /// A stand-in exchange the client completes itself: an `R 10` and an opaque `p` message.
+    Opaque,
+    /// SCRAM-SHA-256 for this password, as PostgreSQL runs it.
+    Scram(&'static str),
+    /// SCRAM-SHA-256 for this password, with a server signature that is not the verifier's.
+    Forged(&'static str),
+}
+const SALT: &[u8] = b"pgcf test salt";
+fn backend(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![tag];
+    bytes.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+    bytes.extend_from_slice(body);
+    bytes
+}
+/// AuthenticationOk through ReadyForQuery, as PostgreSQL sends it after a login.
+fn authenticated() -> Vec<u8> {
+    let mut bytes = backend(b'R', &[0, 0, 0, 0]);
+    bytes.extend(backend(b'S', b"server_version\x0017.6\0"));
+    bytes.extend(backend(b'K', &[0, 0, 0, 7, 1, 2, 3, 4]));
+    bytes.extend(backend(b'Z', b"I"));
+    bytes
+}
+/// PostgreSQL's own answer to a password it does not accept.
+fn postgres_refusal() -> Vec<u8> {
+    backend(
+        b'E',
+        b"SFATAL\0VFATAL\0C28P01\0Mpassword authentication failed for user \"app\"\0Fauth.c\0L323\0Rauth_failed\0\0",
+    )
+}
+fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    let mut block = hmac(password, &[salt, &1u32.to_be_bytes()].concat());
+    let mut result = block.clone();
+    for _ in 1..iterations {
+        block = hmac(password, &block);
+        result.iter_mut().zip(&block).for_each(|(a, b)| *a ^= b);
+    }
+    result
+}
+async fn frontend(tls: &mut tokio_rustls::server::TlsStream<TcpStream>) -> Vec<u8> {
+    assert_eq!(tls.read_u8().await.unwrap(), b'p');
+    let length = tls.read_u32().await.unwrap() as usize;
+    let mut body = vec![0; length - 4];
+    tls.read_exact(&mut body).await.unwrap();
+    body
+}
+impl Double {
+    /// Runs the exchange; false when the double refused the client and closed.
+    async fn authenticate(&self, tls: &mut tokio_rustls::server::TlsStream<TcpStream>) -> bool {
+        use sha2::Digest;
+        let password = match self {
+            Double::Opaque => {
+                tls.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 10])
+                    .await
+                    .unwrap();
+                let mut password = [0; 11];
+                tls.read_exact(&mut password).await.unwrap();
+                assert_eq!(&password, b"p\0\0\0\x0aopaque");
+                tls.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                    .await
+                    .unwrap();
+                return true;
+            }
+            Double::Scram(password) | Double::Forged(password) => *password,
+        };
+        tls.write_all(&backend(
+            b'R',
+            b"\0\0\0\x0aSCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
+        ))
+        .await
+        .unwrap();
+        let initial = frontend(tls).await;
+        let end = initial.iter().position(|v| *v == 0).unwrap();
+        assert_eq!(&initial[..end], b"SCRAM-SHA-256");
+        let first = std::str::from_utf8(&initial[end + 5..]).unwrap();
+        let bare = first.strip_prefix("n,,").unwrap();
+        let client_nonce = bare.strip_prefix("n=,r=").unwrap();
+        let nonce = format!("{client_nonce}server");
+        let server_first = format!("r={nonce},s={},i=4096", STANDARD.encode(SALT));
+        tls.write_all(&backend(
+            b'R',
+            &[&11u32.to_be_bytes()[..], server_first.as_bytes()].concat(),
+        ))
+        .await
+        .unwrap();
+        let client_final = String::from_utf8(frontend(tls).await).unwrap();
+        let (without_proof, proof) = client_final.rsplit_once(",p=").unwrap();
+        assert_eq!(without_proof, format!("c=biws,r={nonce}"));
+        let salted = pbkdf2(password.as_bytes(), SALT, 4096);
+        let client_key = hmac(&salted, b"Client Key");
+        let stored = Sha256::digest(&client_key);
+        let message = format!("{bare},{server_first},{without_proof}");
+        let signature = hmac(&stored, message.as_bytes());
+        let proof = STANDARD.decode(proof).unwrap();
+        let recovered: Vec<u8> = proof.iter().zip(&signature).map(|(a, b)| a ^ b).collect();
+        if proof.len() != 32 || Sha256::digest(&recovered)[..] != stored[..] {
+            tls.write_all(&postgres_refusal()).await.unwrap();
+            let _ = tls.shutdown().await;
+            return false;
+        }
+        let mut verifier = hmac(&hmac(&salted, b"Server Key"), message.as_bytes());
+        if matches!(self, Double::Forged(_)) {
+            verifier[0] ^= 1;
+        }
+        let mut answer = backend(
+            b'R',
+            &[
+                &12u32.to_be_bytes()[..],
+                format!("v={}", STANDARD.encode(verifier)).as_bytes(),
+            ]
+            .concat(),
+        );
+        answer.extend(authenticated());
+        tls.write_all(&answer).await.unwrap();
+        true
+    }
+}
 struct Fixture {
     gateway: Arc<Gateway>,
     port: u16,
@@ -211,13 +333,18 @@ impl Fixture {
         Self::build(
             HashMap::from([(DATABASE.into(), fence("running", 1))]),
             true,
+            Double::Opaque,
         )
         .await
     }
     async fn with_fences(fences: HashMap<String, Fence>) -> Self {
-        Self::build(fences, false).await
+        Self::build(fences, false, Double::Opaque).await
     }
-    async fn build(fences: HashMap<String, Fence>, congested: bool) -> Self {
+    /// A PostgreSQL that authenticates `app` with SCRAM-SHA-256 for this password.
+    async fn scram(fences: HashMap<String, Fence>, double: Double) -> Self {
+        Self::build(fences, false, double).await
+    }
+    async fn build(fences: HashMap<String, Fence>, congested: bool, double: Double) -> Self {
         let identity = generate_simple_self_signed(vec![
             format!("database-rw.pgcf-db-{DATABASE}.svc"),
             wake::slot_tls_name(SLOT),
@@ -280,11 +407,10 @@ impl Fixture {
         let upstream_task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
-                tokio::select! {_=shutdown.changed()=>break,accepted=upstream.accept()=>{let(mut tcp,_)=accepted.unwrap();let(acceptor,send,closed)=(acceptor.clone(),send.clone(),closed.clone());tasks.spawn(async move{
+                tokio::select! {_=shutdown.changed()=>break,accepted=upstream.accept()=>{let(mut tcp,_)=accepted.unwrap();let(acceptor,send,closed,double)=(acceptor.clone(),send.clone(),closed.clone(),double.clone());tasks.spawn(async move{
                         let mut request=[0;8];tcp.read_exact(&mut request).await.unwrap();assert_eq!(request,[0,0,0,8,4,210,22,47]);tcp.write_all(b"S").await.unwrap();let mut tls=acceptor.accept(tcp).await.unwrap();
                         let length=tls.read_u32().await.unwrap()as usize;let mut raw=vec![0;length-4];tls.read_exact(&mut raw).await.unwrap();let mut startup_bytes=(length as u32).to_be_bytes().to_vec();startup_bytes.extend(raw);send.send(startup_bytes).await.unwrap();
-                        tls.write_all(&[b'R',0,0,0,8,0,0,0,10]).await.unwrap();let mut password=[0;11];tls.read_exact(&mut password).await.unwrap();assert_eq!(&password,b"p\0\0\0\x0aopaque");
-                        tls.write_all(&[b'R',0,0,0,8,0,0,0,0,b'Z',0,0,0,5,b'I']).await.unwrap();
+                        if !double.authenticate(&mut tls).await{return;}
                         // Before each message: close_notify reads as end of stream, a bare TCP close as an error.
                         loop{if congested{tokio::time::sleep(Duration::from_millis(200)).await;}let mut header=[0;5];match tls.read(&mut header[..1]).await{Ok(1)=>{},end=>{let _=closed.try_send(matches!(end,Ok(0)));break;}}if tls.read_exact(&mut header[1..]).await.is_err(){break;}let length=u32::from_be_bytes(header[1..].try_into().unwrap())as usize;let mut body=vec![0;length-4];if tls.read_exact(&mut body).await.is_err(){break;}let mut bytes=header.to_vec();bytes.extend(body);if send.send(bytes).await.is_err(){break;}
                 // After a Terminate the double keeps reading to observe how the gateway ends TLS.
@@ -2233,5 +2359,307 @@ async fn conn_stages_names_warm_pool_hit_and_pool_miss_with_wait_and_reason() {
     );
     held_count(&fixture, 0).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.stop().await;
+}
+const PASSWORD: &str = "zN4kQ8-cleartext-canary-7rT2";
+/// What a client that pipelines its password writes behind its StartupMessage.
+fn password_message(password: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![b'p'];
+    bytes.extend_from_slice(&((password.len() + 5) as u32).to_be_bytes());
+    bytes.extend_from_slice(password);
+    bytes.push(0);
+    bytes
+}
+/// AuthenticationCleartextPassword.
+const CLEARTEXT_REQUEST: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
+fn running() -> HashMap<String, Fence> {
+    HashMap::from([(DATABASE.into(), fence("running", 1))])
+}
+async fn next_message(client: &mut Client) -> Vec<u8> {
+    timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .to_vec()
+}
+/// The decoys' refusal: what an unknown route answers to any password.
+async fn refused_as_the_decoys_refuse(client: &mut Client) {
+    assert_eq!(
+        next_message(client).await,
+        pgcf_native_protocol::startup::error_response("28P01", "password authentication failed")
+    );
+    match timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+    {
+        Some(Ok(Message::Close(Some(frame)))) => {
+            assert_eq!(u16::from(frame.code), 1000);
+            assert_eq!(frame.reason.as_str(), "connection refused");
+        }
+        other => panic!("not the decoys' close: {other:?}"),
+    }
+}
+#[tokio::test]
+async fn a_password_pipelined_behind_the_startup_is_asked_for_and_proven_to_postgres_with_scram() {
+    let mut fixture = Fixture::scram(running(), Double::Scram(PASSWORD)).await;
+    let mut client = fixture.connect(1500).await;
+    client
+        .send(Message::Binary(
+            [
+                startup("app"),
+                password_message(PASSWORD.as_bytes()),
+                query(),
+            ]
+            .concat()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    // PostgreSQL hears the StartupMessage alone: the password stays with the gateway.
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    // AuthenticationOk through ReadyForQuery arrive as one message.
+    assert_eq!(next_message(&mut client).await, authenticated());
+    // The pipelined query reaches PostgreSQL after the login and is answered.
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    assert_eq!(next_message(&mut client).await, [b'Z', 0, 0, 0, 5, b'I']);
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_pipelined_password_split_across_messages_is_completed_before_postgres_hears_it() {
+    let mut fixture = Fixture::scram(running(), Double::Scram(PASSWORD)).await;
+    let mut client = fixture.connect(1501).await;
+    let password = password_message(PASSWORD.as_bytes());
+    client
+        .send(Message::Binary(
+            [startup("app"), password[..3].to_vec()].concat().into(),
+        ))
+        .await
+        .unwrap();
+    // Whether it is a password shows only once the message is whole.
+    assert!(
+        timeout(Duration::from_millis(150), client.next())
+            .await
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "PostgreSQL heard of a password not yet complete"
+    );
+    client
+        .send(Message::Binary(password[3..].to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    assert_eq!(next_message(&mut client).await, authenticated());
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_wrong_pipelined_password_is_refused_as_the_decoys_refuse_it() {
+    let fixture = Fixture::scram(running(), Double::Scram(PASSWORD)).await;
+    let mut client = fixture.connect(1502).await;
+    client
+        .send(Message::Binary(
+            [startup("app"), password_message(b"wrong")].concat().into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    refused_as_the_decoys_refuse(&mut client).await;
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn an_empty_or_oversized_pipelined_password_never_reaches_postgres() {
+    let mut fixture = Fixture::scram(running(), Double::Scram(PASSWORD)).await;
+    let mut oversized = password_message(&vec![b'x'; 4096]);
+    oversized.truncate(64);
+    for (id, password) in [(1503, password_message(b"")), (1505, oversized)] {
+        let mut client = fixture.connect(id).await;
+        client
+            .send(Message::Binary([startup("app"), password].concat().into()))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+        refused_as_the_decoys_refuse(&mut client).await;
+    }
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "a refused password's StartupMessage reached PostgreSQL"
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_postgres_that_cannot_prove_the_verifier_is_never_trusted_with_the_session() {
+    let mut fixture = Fixture::scram(running(), Double::Forged(PASSWORD)).await;
+    let mut client = fixture.connect(1506).await;
+    client
+        .send(Message::Binary(
+            [
+                startup("app"),
+                password_message(PASSWORD.as_bytes()),
+                query(),
+            ]
+            .concat()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    let failure = next_message(&mut client).await;
+    assert_eq!(failure[0], b'E');
+    assert!(String::from_utf8_lossy(&failure).contains("C08006"));
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "the pipelined query reached an unproven PostgreSQL"
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_held_wake_asks_for_the_pipelined_password_at_once_and_logs_in_after_release() {
+    let mut fixture = Fixture::scram(sleeping(), Double::Scram(PASSWORD)).await;
+    let mut client = fixture.upgrade(&wake_token(1507, 2)).await.unwrap();
+    client
+        .send(Message::Binary(
+            [
+                startup("app"),
+                password_message(PASSWORD.as_bytes()),
+                query(),
+            ]
+            .concat()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    // Asked for while held: only the query's round trip remains after the release.
+    assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+    untouched(&mut fixture).await;
+    release(&fixture, 2, true).await;
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    assert_eq!(next_message(&mut client).await, authenticated());
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_cleartext_password_never_reaches_a_log_line() {
+    if std::env::var_os("PGCF_CLEARTEXT_LOG_CHILD").is_none() {
+        // The gateway logs to stdout, so a child test process runs the connections below.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_cleartext_password_never_reaches_a_log_line",
+                "--nocapture",
+            ])
+            .env("PGCF_CLEARTEXT_LOG_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("conn_stages"));
+        assert!(!stdout.contains(PASSWORD));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(PASSWORD));
+        return;
+    }
+    let fixture = Fixture::scram(running(), Double::Scram(PASSWORD)).await;
+    for (id, password) in [(1508, PASSWORD), (1509, "zN4kQ8-cleartext-canary-7rT2x")] {
+        let mut client = fixture.connect(id).await;
+        client
+            .send(Message::Binary(
+                [startup("app"), password_message(password.as_bytes())]
+                    .concat()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut client).await, CLEARTEXT_REQUEST);
+        let _ = next_message(&mut client).await;
+        let _ = client.close(None).await;
+    }
+    fixture.ended().await;
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_pipelined_message_that_is_not_a_password_keeps_scram_end_to_end() {
+    // A SASLInitialResponse holds a NUL inside; the double's stand-in holds none at its end.
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.connect(1510).await;
+    client
+        .send(Message::Binary(
+            [startup("app"), b"p\0\0\0\x0aopaque".to_vec()]
+                .concat()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    let mut received = Vec::new();
+    while received.len() < 24 {
+        received.extend(next_message(&mut client).await);
+    }
+    assert_eq!(
+        received,
+        [
+            b'R', 0, 0, 0, 8, 0, 0, 0, 10, b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'
+        ]
+    );
+    client.close(None).await.unwrap();
     fixture.stop().await;
 }

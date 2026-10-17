@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
+    auth::{self, Login, Pipelined},
     budget::{BudgetedStream, Lease, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, MemoryBudget, WireBudget},
     control::{self, Control, HttpHead},
     hold::{Held, Verdict, WakeQueue},
@@ -41,6 +42,7 @@ use tokio_tungstenite::{
         protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
     },
 };
+use zeroize::Zeroizing;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type WebSocket = WebSocketStream<BudgetedStream>;
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
@@ -823,7 +825,6 @@ async fn serve_held(
             message = websocket.next() => match message {
                 Some(Ok(Message::Binary(bytes))) => {
                     started.leases.push(wire.take_message().inspect_err(|_| stages.outcome = "websocket_error")?);
-                    started.initial.extend_from_slice(&bytes);
                     started.rest.extend_from_slice(&bytes);
                 }
                 Some(Ok(Message::Ping(value))) => send_client(&mut websocket, Message::Pong(value), &mut stages).await?,
@@ -887,16 +888,17 @@ async fn serve_held(
     {
         // The session is measured from its reservation; what the client sent while held is its.
         let mut metrics = gateway.measurements.lock().unwrap();
-        metrics.ingress(&session.id, started.initial.len());
+        metrics.ingress(&session.id, started.startup.len() + started.rest.len());
         metrics.client_activity(&session.id);
     }
     let mut early = None;
     let dialed = tokio::select! {
-        result=timeout(STARTUP_BOUND,dial_started(&claims,&session,epoch,&mut stages,&mut early))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        result=timeout(STARTUP_BOUND,async{take_password(&mut websocket,&mut started,&session,&mut stages).await?;dial_started(&claims,&session,epoch,&mut stages,&mut early).await})=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
         _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
     let Ok(postgres) = dialed else {
+        // A refused password was answered and its socket closed: this send then fails unseen.
         let _ = send_error(&mut websocket, "08006", "database connection failed").await;
         return Ok(());
     };
@@ -924,11 +926,16 @@ struct Admitted<'a> {
 }
 /// The client's StartupMessage, with what it sent behind it, checked against the route.
 struct Started {
-    /// The StartupMessage and the bytes behind it, written to PostgreSQL first.
-    initial: Vec<u8>,
+    /// The StartupMessage, written to PostgreSQL first.
+    startup: Vec<u8>,
     leases: Vec<Lease>,
-    /// The bytes behind the StartupMessage.
-    rest: Vec<u8>,
+    /// The bytes behind the StartupMessage; once a pipelined password is taken, those behind it.
+    rest: Zeroizing<Vec<u8>>,
+    /// Whether the client pipelined its password in the message of its StartupMessage, so the
+    /// gateway asked for it with AuthenticationCleartextPassword and logs in to PostgreSQL itself;
+    /// none while the PasswordMessage that began there is incomplete.
+    cleartext: Option<bool>,
+    password: Option<auth::Password>,
 }
 /// Writes the checked StartupMessage to the dialled writer while the fence and the writer still
 /// admit it, then relays the session.
@@ -951,13 +958,21 @@ async fn run_session(
     let wire = &session.wire;
     let target = &session.target;
     let Started {
-        initial,
+        startup,
         leases: initial_leases,
         rest,
+        password,
+        ..
     } = started;
     let result = async {
         let mut activity = PostgresActivity::new();
         activity.observe_frontend(&rest);
+        // A client that logs in itself sends what it pipelined with its StartupMessage; for one
+        // the gateway logs in for, those bytes wait for the login.
+        let mut initial = startup;
+        if password.is_none() {
+            initial.extend_from_slice(&rest);
+        }
         update(gateway, id, &activity, true, false);
         let state = gateway.fences.read().await;
         if state.bound_epoch(&claims.db) != epoch || !state.admits(&claims.db) {
@@ -977,13 +992,57 @@ async fn run_session(
         stages.written = Some(Instant::now());
         drop(physical);
         drop(state);
-        drop(initial_leases);
+        let mut held = None;
+        if let Some(password) = password {
+            let login = tokio::select! {
+                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
+                _=stop.changed()=>Err("gateway_draining"),
+                _=actions.changed()=>Err("fenced"),
+            };
+            drop(password);
+            let answer = match login {
+                Err(outcome) => {
+                    stages.outcome = outcome;
+                    let _ = send_error(websocket, "08006", "database connection failed").await;
+                    return Err("login failed".into());
+                }
+                Ok(Login::Authenticated(answer)) => answer,
+                Ok(Login::Refused) => {
+                    stages.outcome = "authentication_failed";
+                    refuse(websocket).await;
+                    return Err("password refused".into());
+                }
+                Ok(Login::Failed(answer)) => {
+                    stages.outcome = "postgres_refused";
+                    let _ = send_client(websocket, Message::Binary(answer.into()), stages).await;
+                    let _ = timeout(Duration::from_millis(500), websocket.close(None)).await;
+                    return Err("login refused".into());
+                }
+            };
+            activity.observe_backend(&answer);
+            {
+                let mut metrics = gateway.measurements.lock().unwrap();
+                if activity.authenticated() {
+                    metrics.authenticate(id);
+                }
+                metrics.egress(id, answer.len());
+            }
+            update(gateway, id, &activity, true, false);
+            send_client(websocket, Message::Binary(answer.into()), stages).await?;
+            stages.first_backend = Some(Instant::now());
+            if !rest.is_empty() {
+                held = Some((rest.to_vec(), initial_leases));
+            }
+        } else {
+            drop(initial_leases);
+        }
         wire.allow_relay();
         relay(
             websocket,
             &mut postgres,
             session,
             &mut activity,
+            held,
             actions,
             stop,
             stages,
@@ -1029,6 +1088,103 @@ async fn close(socket: &mut WebSocket, code: CloseCode, reason: &str) {
         })),
     )
     .await;
+}
+/// Refuses a password as the decoys refuse it: their 28P01 and their close.
+async fn refuse(socket: &mut WebSocket) {
+    let _ = timeout(
+        Duration::from_millis(500),
+        socket.send(Message::Binary(auth::refusal().into())),
+    )
+    .await;
+    close(socket, CloseCode::Normal, "connection refused").await;
+}
+/// AuthenticationCleartextPassword, for a client that pipelined its password.
+async fn ask_password(
+    socket: &mut WebSocket,
+    gateway: &Gateway,
+    id: &str,
+    stages: &mut Stages,
+) -> Result<(), Failure> {
+    socket
+        .send(Message::Binary(auth::CLEARTEXT_REQUEST.to_vec().into()))
+        .await
+        .inspect_err(|_| stages.outcome = "websocket_error")?;
+    gateway
+        .measurements
+        .lock()
+        .unwrap()
+        .egress(id, auth::CLEARTEXT_REQUEST.len());
+    Ok(())
+}
+/// Completes a password the client began to pipeline behind its StartupMessage and takes it out
+/// of the bytes for PostgreSQL. One the gateway cannot accept is refused as the decoys refuse it,
+/// before PostgreSQL hears of the connection.
+async fn take_password(
+    socket: &mut WebSocket,
+    started: &mut Started,
+    session: &SessionLease,
+    stages: &mut Stages,
+) -> Result<(), Failure> {
+    if started.cleartext == Some(false) || started.password.is_some() {
+        return Ok(());
+    }
+    loop {
+        let taken = auth::take_password(&mut started.rest);
+        if started.cleartext.is_none() && !matches!(taken, Pipelined::Incomplete) {
+            let asked = !matches!(taken, Pipelined::Absent | Pipelined::Sasl);
+            if asked {
+                ask_password(socket, &session.gateway, &session.id, stages).await?;
+            }
+            started.cleartext = Some(asked);
+        }
+        match taken {
+            Pipelined::Absent | Pipelined::Sasl => return Ok(()),
+            Pipelined::Password(password) => {
+                started.password = Some(password);
+                return Ok(());
+            }
+            Pipelined::Refused => {
+                stages.outcome = "authentication_failed";
+                refuse(socket).await;
+                return Err("password refused".into());
+            }
+            Pipelined::Incomplete => {}
+        }
+        match socket.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                started.leases.push(
+                    session
+                        .wire
+                        .take_message()
+                        .inspect_err(|_| stages.outcome = "websocket_error")?,
+                );
+                {
+                    let mut metrics = session.gateway.measurements.lock().unwrap();
+                    metrics.ingress(&session.id, bytes.len());
+                    metrics.client_activity(&session.id);
+                }
+                started.rest.extend_from_slice(&bytes);
+            }
+            Some(Ok(Message::Ping(value))) => {
+                send_client(socket, Message::Pong(value), stages).await?
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Text(_))) => {
+                stages.outcome = "text_frame";
+                let _ = session.wire.take_message()?;
+                close(socket, CloseCode::Unsupported, "binary frames required").await;
+                return Err("text password".into());
+            }
+            Some(Err(_)) => {
+                stages.outcome = "websocket_error";
+                return Err("password failed".into());
+            }
+            _ => {
+                stages.outcome = "client_closed";
+                return Err("password closed".into());
+            }
+        }
+    }
 }
 /// Sends one message to the client within 10 s; a failure ends the connection.
 async fn send_client(
@@ -1134,7 +1290,7 @@ async fn read_startup(
                 Event::Startup {
                     database,
                     user,
-                    mut raw,
+                    raw,
                     rest,
                     ..
                 } => {
@@ -1149,11 +1305,16 @@ async fn read_startup(
                         .await?;
                         return Err("startup route mismatch".into());
                     }
-                    raw.extend_from_slice(&rest);
+                    let cleartext = auth::asks_password(&rest);
+                    if cleartext == Some(true) {
+                        ask_password(socket, gateway, id, stages).await?;
+                    }
                     return Ok(Started {
-                        initial: raw,
+                        startup: raw,
                         leases,
-                        rest,
+                        rest: Zeroizing::new(rest),
+                        cleartext,
+                        password: None,
                     });
                 }
             }
@@ -1232,7 +1393,7 @@ async fn startup(
     stages: &mut Stages,
     early: &mut Option<EarlyDial>,
 ) -> Result<(TlsStream<TcpStream>, Started), Failure> {
-    let started = read_startup(
+    let mut started = read_startup(
         socket,
         claims,
         &session.gateway,
@@ -1241,6 +1402,7 @@ async fn startup(
         stages,
     )
     .await?;
+    take_password(socket, &mut started, session, stages).await?;
     let postgres = dial_started(claims, session, epoch, stages, early).await?;
     Ok((postgres, started))
 }
@@ -1329,11 +1491,15 @@ fn certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
     }
     false
 }
+/// `held` is what the client sent that waits for the session to run: the bytes it pipelined
+/// behind a password the gateway logged in with.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     websocket: &mut WebSocket,
     postgres: &mut TlsStream<TcpStream>,
     session: &SessionLease,
     activity: &mut PostgresActivity,
+    mut held: Option<(Vec<u8>, Vec<Lease>)>,
     actions: &mut watch::Receiver<Action>,
     stop: &mut watch::Receiver<bool>,
     stages: &mut Stages,
@@ -1343,7 +1509,6 @@ async fn relay(
     let target = &session.target;
     let wire = &session.wire;
     let mut read = vec![0u8; MAX_FRAME_BYTES];
-    let mut held: Option<(Vec<u8>, Lease)> = None;
     let mut alive = true;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.tick().await;
@@ -1401,7 +1566,7 @@ async fn relay(
                         activity.observe_frontend(&bytes);update(gateway,id,activity,true,false);
                         if held.is_some(){stages.outcome="database_retired";close(websocket,CloseCode::Restart,"database retired").await;break;}
                         if forward_if_running(gateway,database,target,postgres,&bytes,stages).await?{drop(lease);}
-                        else{held=Some((bytes.to_vec(),lease));}
+                        else{held=Some((bytes.to_vec(),vec![lease]));}
                     },
                     Some(Ok(Message::Pong(_)))=>alive=true,
                     Some(Ok(Message::Ping(value)))=>send_client(websocket,Message::Pong(value),stages).await?,
