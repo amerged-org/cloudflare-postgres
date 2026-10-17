@@ -2237,7 +2237,7 @@ it("the longer collection window cannot authorize another physical Node UID", as
   expect((await readFleetPatch(f.runtime, f.op)).revision).toBe(0);
 });
 
-it("a qualified release needs thin write authority only from database members and already selected nodes", async () => {
+it("a qualified release needs observed thin storage only from database members and already selected nodes", async () => {
   const f = await fixture();
   await configureNodeRegionPolicy(env.DB, {
     region_id: f.region,
@@ -2251,13 +2251,13 @@ it("a qualified release needs thin write authority only from database members an
   )
     .bind(f.node)
     .first<string>("operation_id"))!;
-  // A control/relay member without placement keeps an existing selection bound to its authority.
+  // A control/relay member without placement keeps an existing selection bound to its storage.
   await env.DB.batch([
     env.DB.prepare(
       "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
     ).bind(f.node),
     env.DB.prepare(
-      "UPDATE node_thin_storage SET status='blocked' WHERE node_id=?",
+      "UPDATE node_thin_storage SET status='blocked',error_code='thin_storage_report_unqualified' WHERE node_id=?",
     ).bind(f.node),
   ]);
   expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("pending");
@@ -2278,6 +2278,53 @@ it("a qualified release needs thin write authority only from database members an
     mismatches: ["unobserved/current_material_storage"],
   });
   expect(await refreshFleetPatchRegionStorage(env, op)).toBe(false);
+  expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
+});
+
+it("a rollout converges a thin member whose storage has no error and a fresh physical sample, whatever its write authority", async () => {
+  const f = await fixture();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 2,
+    purchases_enabled: false,
+    order: null,
+  });
+  releases.push((await standingPostjoinFixture(f.region)).id);
+  const op = (await env.DB.prepare(
+    "SELECT operation_id FROM fleet_patch_operations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first<string>("operation_id"))!;
+  const sampled = (ageMs: number) => {
+    const at = new Date(Date.now() - ageMs).toISOString();
+    return env.DB.prepare(
+      "INSERT INTO node_storage_observations(node_id,node_uid,observed_at,received_at,physical_json) SELECT id,node_uid,?,?,NULL FROM nodes WHERE id=? ON CONFLICT(node_id) DO UPDATE SET observed_at=excluded.observed_at,received_at=excluded.received_at",
+    )
+      .bind(at, at, f.node)
+      .run();
+  };
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET status='blocked',error_code=NULL,authority_received_at='2000-01-01T00:00:00.000Z' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  await sampled(0);
+  expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("converged");
+  expect(await restoreFleetPatchPlacements(env, op)).toBe(true);
+  // A stale sample, or an error of the node's thin storage, holds the rollout.
+  await sampled(121_000);
+  expect(await readFleetNodeRelease(env.DB, f.node)).toMatchObject({
+    state: "pending",
+    mismatches: ["unobserved/current_material_storage"],
+  });
+  expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
+  await sampled(0);
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET error_code='thin_storage_report_unqualified' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("pending");
   expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
 });
 

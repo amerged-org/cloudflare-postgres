@@ -190,8 +190,8 @@ export async function configureNodeRegionPolicy(
   const admission = mutation?.scopeGuard();
   const statement = db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled,parked_tier_json)
-    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,?,?,?,COALESCE(?,0),? FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled)
+    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
       AND (${admission?.sql ?? "1=1"})
       AND (?=0 OR ((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT compute_pool_json FROM node_region_policies WHERE region_id=r.id) IS ?))
       AND (?=1 OR (SELECT ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=r.id) IS ?)
@@ -220,8 +220,7 @@ export async function configureNodeRegionPolicy(
       node_ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_ram_warning_threshold_ppm ELSE node_region_policies.node_ram_warning_threshold_ppm END,
       node_cpu_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_cpu_warning_threshold_ppm ELSE node_region_policies.node_cpu_warning_threshold_ppm END,
       node_storage_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_storage_warning_threshold_ppm ELSE node_region_policies.node_storage_warning_threshold_ppm END,
-      cap_warning_enabled=CASE WHEN ?=1 THEN excluded.cap_warning_enabled ELSE node_region_policies.cap_warning_enabled END,
-      parked_tier_json=CASE WHEN ?=1 THEN excluded.parked_tier_json ELSE node_region_policies.parked_tier_json END`,
+      cap_warning_enabled=CASE WHEN ?=1 THEN excluded.cap_warning_enabled ELSE node_region_policies.cap_warning_enabled END`,
     )
     .bind(
       policy.max_nodes ?? null,
@@ -252,7 +251,6 @@ export async function configureNodeRegionPolicy(
       policy.cap_warning_enabled === undefined
         ? null
         : Number(policy.cap_warning_enabled),
-      policy.parked_tier == null ? null : canonical(policy.parked_tier),
       policy.region_id,
       ...(admission?.bindings ?? []),
       Number(expectedRuntime !== undefined),
@@ -283,7 +281,6 @@ export async function configureNodeRegionPolicy(
       Number(policy.node_cpu_warning_threshold_ppm !== undefined),
       Number(policy.node_storage_warning_threshold_ppm !== undefined),
       Number(policy.cap_warning_enabled !== undefined),
-      Number(policy.parked_tier !== undefined),
     );
   const result = mutation
     ? (await mutation.batch([statement]))[0]!

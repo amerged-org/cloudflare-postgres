@@ -3,18 +3,11 @@
 // controlled metadata; the live latency of the endpoint is measured on Dev, not here.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 import { countStatements } from "./d1-statements.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
-import { claimsOf } from "./parked-tier-fixture.ts";
-import { gib, mib, nonce, post, sample } from "./thin-renewal-fixture.ts";
-import {
-  HOST_LEASE_TOMBSTONE_RETENTION_MS,
-  runningWriterTokens,
-} from "../../src/domain/node-thin-storage.ts";
-import type { Env } from "../../src/env.ts";
+import { HOST_LEASE_TOMBSTONE_RETENTION_MS } from "../../src/domain/node-thin-storage.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -27,11 +20,24 @@ afterEach(async () => {
       .run();
 });
 
-it("names every database the guard acts on with its writer or its explicit block", async () => {
+/** The operation a database's archive path was created by: one stable id per database. */
+const creation = (archive: string) => archive.slice(-23);
+async function archiveOf(id: string) {
+  return (await env.DB.prepare("SELECT archive_path FROM databases WHERE id=?")
+    .bind(id)
+    .first<string>("archive_path"))!;
+}
+async function generationOf(id: string) {
+  return (await env.DB.prepare("SELECT generation FROM databases WHERE id=?")
+    .bind(id)
+    .first<number>("generation"))!;
+}
+
+it("permits every live thin database of the node through its startup window, never by a token or a block", async () => {
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
   const live = await node.add({ kind: "live" }),
     blocked = await node.add({ kind: "blocked" }),
-    parked = await node.add({ kind: "parked" }),
+    asleep = await node.add({ kind: "asleep" }),
     stopping = await node.add({ kind: "stopping" }),
     open = await node.add({ kind: "deleted", confirmed: false }),
     reclaimed = await node.add({
@@ -51,56 +57,37 @@ it("names every database the guard acts on with its writer or its explicit block
       node.held.id,
       live.id,
       blocked.id,
-      parked.id,
+      asleep.id,
       stopping.id,
       open.id,
       reclaimed.id,
     ].sort(),
   );
-  // A new database on its startup hold: no volume yet, no token, and the guard may start it.
-  expect(entries.get(node.held.id)).toMatchObject({
-    desired_state: "running",
-    write_blocked: false,
-    volume: null,
-    runtime_authority: null,
-    startup_operation_id: expect.stringMatching(/^op_/),
-    startup_expires_at: expect.any(Number),
-  });
-  // A live writer carries the token that names its evidenced Pod.
-  const running = entries.get(live.id)!;
-  expect(running).toMatchObject({
-    desired_state: "running",
-    write_blocked: false,
-    volume: live.receipt,
-    startup_operation_id: null,
-    startup_expires_at: null,
-  });
-  expect(claimsOf(running.runtime_authority)).toMatchObject({
-    database_id: live.id,
-    pod_uid: live.pod,
-    lv_uuid: live.receipt!.lv_uuid,
-    write_allowed: true,
-  });
-  // A running database whose Pod nobody evidences is explicitly blocked.
-  expect(entries.get(blocked.id)).toMatchObject({
-    desired_state: "running",
-    write_blocked: true,
-    runtime_authority: null,
-    startup_expires_at: null,
-  });
-  // A parked sleep and a sleep whose stop is still running are presented as the running writer
-  // they physically are, under the token of the Pod the node evidences.
-  for (const sleeper of [parked, stopping]) {
-    const entry = entries.get(sleeper.id)!;
-    expect(entry).toMatchObject({
-      desired_state: "running",
+  // Awake, asleep, stopping or without an evidenced Pod: one shape. The generation is one
+  // past D1's, above every signed token's, so the guard resumes a retained scope once and carries
+  // no token forward; the creation operation stays the same across every wake.
+  for (const member of [
+    { id: node.held.id, receipt: null },
+    live,
+    blocked,
+    asleep,
+    stopping,
+  ]) {
+    expect(entries.get(member.id), member.id).toEqual({
+      database_id: member.id,
+      generation: (await generationOf(member.id)) + 1,
+      authority_revision: expect.any(Number),
       write_blocked: false,
-      volume: sleeper.receipt,
-    });
-    expect(claimsOf(entry.runtime_authority)).toMatchObject({
-      database_id: sleeper.id,
-      pod_uid: sleeper.pod,
-      generation: sleeper.generation,
+      desired_state: "running",
+      node_uid: node.f.uid,
+      volume_group_uuid: node.f.authority.volume_group_uuid,
+      pool_uuid: node.f.authority.pool_uuid,
+      profile_sha256: node.f.authority.profile_sha256,
+      startup_expires_at: lease.expires_at,
+      startup_operation_id: creation(await archiveOf(member.id)),
+      volume: member.receipt,
+      runtime_authority: null,
+      drain: null,
     });
   }
   // A deletion whose absence is not read yet keeps its volume and blocks writes; one the node's
@@ -110,6 +97,7 @@ it("names every database the guard acts on with its writer or its explicit block
     write_blocked: true,
     volume: open.receipt,
     runtime_authority: null,
+    startup_operation_id: null,
     drain: null,
   });
   expect(entries.get(reclaimed.id)).toMatchObject({
@@ -123,6 +111,48 @@ it("names every database the guard acts on with its writer or its explicit block
   expect(
     new Set(lease.databases.map((entry) => entry.authority_revision)).size,
   ).toBe(1);
+}, 60_000);
+
+it("keeps every live permit while the node's reading is stale, denies writes or is blocked", async () => {
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  const live = await node.add({ kind: "live" }),
+    asleep = await node.add({ kind: "asleep" });
+  const proof = await node.commit();
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_json=?,authority_received_at=?,status='blocked',error_code='thin_storage_pool_full' WHERE node_id=?",
+  )
+    .bind(
+      JSON.stringify({ ...proof, write_allowed: false }),
+      stale,
+      node.f.node,
+    )
+    .run();
+  const entries = await node.leaseEntries();
+  for (const id of [node.held.id, live.id, asleep.id])
+    expect(entries.get(id), id).toMatchObject({
+      desired_state: "running",
+      write_blocked: false,
+      runtime_authority: null,
+      startup_operation_id: creation(await archiveOf(id)),
+    });
+}, 60_000);
+
+it("names the same startup operation across sleeps and wakes, one generation past D1's", async () => {
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  const live = await node.add({ kind: "live" });
+  await node.commit();
+  const before = (await node.leaseEntries()).get(live.id)!;
+  // A sleep and a wake each advance the row's generation.
+  await env.DB.prepare(
+    "UPDATE databases SET generation=generation+2,desired_state='running' WHERE id=?",
+  )
+    .bind(live.id)
+    .run();
+  const after = (await node.leaseEntries()).get(live.id)!;
+  expect(after.generation).toBe(before.generation + 2);
+  expect(after.generation).toBe((await generationOf(live.id)) + 1);
+  expect(after.startup_operation_id).toBe(before.startup_operation_id);
 }, 60_000);
 
 /** A thin node with `live` running databases the proof evidences and `deleted` ones whose volume
@@ -139,10 +169,9 @@ async function crowdedNode(live: number, deleted: number) {
   return { node, proof: await node.commit() };
 }
 
-// What the guard polls every second costs a fixed number of D1 statements: the agent, the node and
-// its reading, and one batch for every database's rows and inputs. The bound is the design's own
-// count (six) plus the one conditional read of the physical boot.
-const LEASE_STATEMENT_BOUND = 7;
+// What the guard polls every second costs a fixed number of D1 statements: the agent, the node,
+// its reading and its databases, plus the one conditional read of the physical boot.
+const LEASE_STATEMENT_BOUND = 5;
 it("costs the same D1 statements for three databases as for forty and a hundred deleted ones", async () => {
   const few = await crowdedNode(3, 5),
     many = await crowdedNode(40, 100);
@@ -151,54 +180,10 @@ it("costs the same D1 statements for three databases as for forty and a hundred 
   expect(small.result.databases).toHaveLength(3 + 5 + 1);
   expect(large.result.databases).toHaveLength(40 + 100 + 1);
   expect(
-    large.result.databases.filter((entry) => entry.runtime_authority),
-  ).toHaveLength(40);
+    large.result.databases.filter((entry) => entry.startup_operation_id),
+  ).toHaveLength(41);
   expect(large.statements).toBe(small.statements);
   expect(large.statements).toBeLessThanOrEqual(LEASE_STATEMENT_BOUND);
-  expect(large.roundTrips).toBe(small.roundTrips);
-}, 120_000);
-
-// The accepted sample's whole handler, its token issuance included.
-const SAMPLE_STATEMENT_BOUND = 15;
-it("issues the tokens of forty databases with the statements of three", async () => {
-  const counted = async (live: number, deleted: number) => {
-    const { node, proof } = await crowdedNode(live, deleted),
-      f = node.f;
-    const physical = {
-      ...proof.physical,
-      thin_pool: {
-        ...proof.physical.thin_pool!,
-        data_used_bytes_upper_bound: gib,
-        metadata_used_bytes_upper_bound: mib,
-      },
-    };
-    const first = await nonce(f);
-    const result = await countStatements(() =>
-      post(
-        f,
-        sample(f, first, {
-          physical,
-          lvs: [
-            {
-              name: "pgcf_thinpool",
-              segtype: "thin-pool",
-              size_bytes: 16 * gib,
-            },
-          ],
-          lv_count: 1,
-        }),
-      ),
-    );
-    const response = NodeStorageHeadroomResponse.parse(result.result.body);
-    expect(response.accepted).toBe(true);
-    return { ...result, tokens: response.tokens };
-  };
-  const small = await counted(3, 5),
-    large = await counted(40, 100);
-  expect(small.tokens).toHaveLength(3);
-  expect(large.tokens).toHaveLength(40);
-  expect(large.statements).toBe(small.statements);
-  expect(large.statements).toBeLessThanOrEqual(SAMPLE_STATEMENT_BOUND);
   expect(large.roundTrips).toBe(small.roundTrips);
 }, 120_000);
 
@@ -292,12 +277,11 @@ function servedLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
   });
 }
 
-it("logs what each lease served: the counts, its time and one compact line per live entry", async () => {
+it("logs what each lease served: the counts and its time, never an entry's secret", async () => {
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
-  const live = await node.add({ kind: "live" }),
-    blocked = await node.add({ kind: "blocked" }),
-    parked = await node.add({ kind: "parked" });
+  await node.add({ kind: "live" });
+  await node.add({ kind: "asleep" });
   await node.add({ kind: "deleted", confirmed: true, confirmedAgo: 1000 });
   await node.add({ kind: "deleted", confirmed: false });
   await node.commit();
@@ -309,123 +293,19 @@ it("logs what each lease served: the counts, its time and one compact line per l
     "elapsed_ms",
     "entries",
     "event",
-    "live",
     "node_id",
     "tombstones",
+    "unbound",
   ]);
+  // The held start of the fixture has no volume bound yet.
   expect(line).toMatchObject({
     entries: lease.databases.length,
     tombstones: 2,
+    unbound: 1,
   });
   expect(Number.isInteger(line.elapsed_ms)).toBe(true);
   expect(Number(line.elapsed_ms)).toBeGreaterThanOrEqual(0);
-  const summary = new Map(
-    (line.live as Record<string, unknown>[]).map((entry) => [
-      entry.id as string,
-      entry,
-    ]),
-  );
-  // Live entries only, named by the first six characters of the database ID.
-  expect(summary.size).toBe(4);
-  const byId = new Map(
-    lease.databases.map((entry) => [entry.database_id, entry]),
-  );
-  const shown = (id: string) => summary.get(id.slice(0, 6))!;
-  expect(shown(node.held.id)).toEqual({
-    id: node.held.id.slice(0, 6),
-    generation: 1,
-    revision: lease.databases[0]!.authority_revision,
-    write_blocked: false,
-    token: false,
-    token_life_s: null,
-    token_pod: null,
-    startup_valid: true,
-    parked: false,
-  });
-  for (const member of [live, parked]) {
-    const entry = shown(member.id);
-    expect(entry).toMatchObject({
-      generation: byId.get(member.id)!.generation,
-      revision: byId.get(member.id)!.authority_revision,
-      write_blocked: false,
-      token: true,
-      token_pod: member.pod.slice(0, 6),
-      startup_valid: false,
-      parked: member === parked,
-    });
-    // The life of the token left when the line was written, to a tenth of a second.
-    expect(entry.token_life_s as number).toBeGreaterThan(0);
-    expect(entry.token_life_s as number).toBeLessThanOrEqual(120);
-  }
-  expect(shown(blocked.id)).toMatchObject({
-    write_blocked: true,
-    token: false,
-    token_life_s: null,
-    startup_valid: false,
-  });
-  // No token and no other secret is ever part of the line.
-  const text = JSON.stringify(line);
-  for (const entry of lease.databases)
-    if (entry.runtime_authority)
-      expect(text.includes(entry.runtime_authority)).toBe(false);
-  expect(text.includes(node.f.agent)).toBe(false);
-}, 60_000);
-
-it("logs at most twenty live entries and says how many there were", async () => {
-  const log = vi.spyOn(console, "log").mockImplementation(() => {});
-  const node = await thinLeaseNode(await thinExecutionFixture(releases));
-  for (let i = 0; i < 24; i++) await node.add({ kind: "live" });
-  await node.commit();
-  await node.lease();
-  const line = servedLines(log, node.f.node)[0]!;
-  expect(line.entries).toBe(25);
-  expect((line.live as unknown[]).length).toBe(20);
-}, 60_000);
-
-/** A sample the node's pool answers with room to write, after `crowdedNode`'s proof. */
-function roomySample(
-  f: Awaited<ReturnType<typeof crowdedNode>>["node"]["f"],
-  proof: Awaited<ReturnType<typeof crowdedNode>>["proof"],
-  at: string | null,
-  usedBytes = gib,
-) {
-  return sample(f, at, {
-    physical: {
-      ...proof.physical,
-      thin_pool: {
-        ...proof.physical.thin_pool!,
-        data_used_bytes_upper_bound: usedBytes,
-        metadata_used_bytes_upper_bound: mib,
-      },
-    },
-    lvs: [
-      { name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 16 * gib },
-    ],
-    lv_count: 1,
-  });
-}
-const nodeReads = (sql: string[]) =>
-  sql.filter((text) =>
-    text.startsWith("SELECT t.*,n.region_id,n.k8s_node_name"),
-  );
-
-it("reads the node once for a sample and signs its tokens from the row its own write left", async () => {
-  const { node, proof } = await crowdedNode(3, 2),
-    f = node.f;
-  const first = await nonce(f);
-  const counted = await countStatements(() =>
-    post(f, roomySample(f, proof, first)),
-  );
-  const response = NodeStorageHeadroomResponse.parse(counted.result.body);
-  expect(response.accepted).toBe(true);
-  expect(response.tokens).toHaveLength(3);
-  // The node and the qualification join under it are read before the compare-and-set and not
-  // again after it; the compare-and-set carries its own predicate.
-  expect(nodeReads(counted.sql)).toHaveLength(1);
-  // What reading the written row back signs is what the sample signed.
-  expect(response.tokens).toEqual(
-    await runningWriterTokens(env as Env, f.node, f.region, Date.now()),
-  );
+  expect(JSON.stringify(line).includes(node.f.agent)).toBe(false);
 }, 60_000);
 
 function guardLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
@@ -448,64 +328,4 @@ it("writes one lease line in thirty per node and the first after a silence", asy
   expect(guardLines(log, node.f.node)).toHaveLength(4);
   await node.lease();
   expect(guardLines(log, node.f.node)).toHaveLength(4);
-}, 60_000);
-
-it("writes every lease that blocks a live database", async () => {
-  const log = vi.spyOn(console, "log").mockImplementation(() => {});
-  const node = await thinLeaseNode(await thinExecutionFixture(releases));
-  await node.add({ kind: "live" });
-  await node.add({ kind: "blocked" });
-  await node.commit();
-  for (let i = 0; i < 5; i++) await node.lease();
-  expect(guardLines(log, node.f.node)).toHaveLength(5);
-}, 60_000);
-
-function acceptedLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
-  return log.mock.calls.flatMap(([value]) => {
-    if (typeof value !== "string") return [];
-    const event = JSON.parse(value) as Record<string, unknown>;
-    return event.event === "thin_storage_sample_accepted" &&
-      event.node_id === nodeId
-      ? [event]
-      : [];
-  });
-}
-
-it("writes one accepted-sample line in thirty per node, and every one that withholds writes or fails", async () => {
-  const log = vi.spyOn(console, "log").mockImplementation(() => {});
-  const { node, proof } = await crowdedNode(2, 0),
-    f = node.f;
-  let next = await nonce(f);
-  const accept = async (usedBytes = gib) => {
-    const answer = NodeStorageHeadroomResponse.parse(
-      (await post(f, roomySample(f, proof, next, usedBytes))).body,
-    );
-    expect(answer.accepted).toBe(true);
-    next = answer.nonce;
-    return answer;
-  };
-  vi.useFakeTimers({ toFake: ["Date"] });
-  for (let i = 0; i < 61; i++) {
-    await accept();
-    vi.setSystemTime(Date.now() + 100);
-  }
-  // The 1st, 31st and 61st accepted sample.
-  expect(acceptedLines(log, f.node)).toHaveLength(3);
-  // A sample that leaves the node without room is always written.
-  const blocked = await accept(16 * gib - mib);
-  expect(blocked.authority!.write_allowed).toBe(false);
-  expect(acceptedLines(log, f.node)).toHaveLength(4);
-  // One that fails after its compare-and-set is written, and its fields are the same.
-  await accept();
-  expect(acceptedLines(log, f.node)).toHaveLength(4);
-  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
-  vi.spyOn(prototype, "batch").mockRejectedValueOnce(
-    new Error("d1_unavailable"),
-  );
-  expect((await post(f, roomySample(f, proof, next))).status).toBe(500);
-  const lines = acceptedLines(log, f.node);
-  expect(lines).toHaveLength(5);
-  expect(Object.keys(lines.at(-1)!).sort()).toEqual(
-    Object.keys(lines[0]!).sort(),
-  );
 }, 60_000);

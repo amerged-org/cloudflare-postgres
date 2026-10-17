@@ -55,7 +55,6 @@ export const agentRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /agent/v1/nodes/{id}/compute-pool": [400, 401, 404, 500],
   "POST /agent/v1/nodes/{id}/compute-pool": [400, 401, 404, 409, 500],
   "GET /agent/v1/nodes/{id}/storage-guard": [400, 401, 404, 409, 500],
-  "POST /agent/v1/nodes/{id}/storage-headroom": [400, 401, 404, 409, 500],
   "GET /agent/v1/nodes/{id}/reclaim": [400, 401, 404, 409, 500],
   "POST /agent/v1/nodes/{id}/reclaim-observations": [400, 401, 404, 409, 500],
   "POST /agent/v1/fleet-observations": [400, 401, 404, 409, 500],

@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// A thin database on real D1 fixtures that an idle sleep can park: the controller attests its Pod and
-// the node proof evidences that Pod's io.max. Controlled metadata; no live qualification or Dev evidence.
+// An awake thin database on real D1 fixtures: the controller attests its Pod and the node proof
+// evidences that Pod's io.max. Controlled metadata; no live qualification or Dev evidence.
 import { env } from "cloudflare:workers";
 import { expect } from "vitest";
 import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
-  StorageWriteClaims,
-  base64urlToBytes,
   newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
-import {
-  HostStorageLease,
-  NodeStorageHeadroomResponse,
-} from "@pgcf/contracts/node-thin-storage";
+import { HostStorageLease } from "@pgcf/contracts/node-thin-storage";
 import { observation, observedBody, request } from "./fixtures.ts";
 import {
   type Fixture,
@@ -22,14 +17,9 @@ import {
   identityProof,
   lvs,
   mib,
-  nonce,
-  post,
-  sample,
-} from "./thin-renewal-fixture.ts";
+} from "./thin-proof-fixture.ts";
 import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
 import type { DatabaseRow } from "../../src/domain/rows.ts";
-
-export const PARKED = { cpu_millicores: 15, memory_mib: 160 } as const;
 
 /** A ready, awake thin database: its receipt is bound, its Pod attested and io.max evidenced. */
 export async function awakeWriter(f: Fixture) {
@@ -220,79 +210,6 @@ export async function idleIntent(w: AwakeWriter) {
   return { operation, generation: before.generation + 1 };
 }
 
-/** The controller's confirmed idle sleep; `parked` is absent for a plain hibernation. */
-export function hibernated(
-  w: AwakeWriter,
-  intent: { operation: string; generation: number },
-  parked?: {
-    pod_uid: string;
-    cpu_millicores: number;
-    memory_mib: number;
-    wake?: "fast";
-  },
-) {
-  return request(
-    "/agent/v1/observations",
-    w.f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(w.id, intent.generation, "hibernated"),
-        power: {
-          operation: intent.operation,
-          revision: intent.generation,
-          state: "hibernated",
-          ...(parked ? { parked } : {}),
-        },
-        archive: { continuous: false, ready_wal_files: null },
-      },
-    ]),
-  );
-}
-export const parkedPod = (w: AwakeWriter) => ({
-  pod_uid: w.pod,
-  ...PARKED,
-});
-
-/**
- * An idle sleep that the controller confirmed as parked, through the real observation route. The
- * node's identity proof has read the volume again at the sleep's generation by then, and the
- * parked Pod's io.max is still there: the proof counts every instance Pod as a writer. With
- * `read: false` the proof has not read again yet: it still names the generation the Pod ran at.
- */
-export async function parkedWriter(
-  w: AwakeWriter,
-  wake?: "fast",
-  options: { read?: boolean } = {},
-) {
-  const intent = await idleIntent(w);
-  if (options.read !== false)
-    await w.evidence({ generation: intent.generation });
-  const response = await hibernated(w, intent, {
-    ...parkedPod(w),
-    ...(wake === undefined ? {} : { wake }),
-  });
-  expect(await response.json()).toEqual({ accepted: 1 });
-  return intent;
-}
-/** One fast sample of the awake writer's node: what the controller posts and Cloudflare answers. */
-export async function renewal(w: AwakeWriter) {
-  const response = await post(
-    w.f,
-    sample(w.f, await nonce(w.f), {
-      physical: {
-        ...w.physical,
-        thin_pool: {
-          ...w.physical.thin_pool!,
-          data_used_bytes_upper_bound: 64 * mib,
-          metadata_used_bytes_upper_bound: mib,
-        },
-      },
-    }),
-  );
-  expect(response.status).toBe(200);
-  return NodeStorageHeadroomResponse.parse(response.body);
-}
 export async function leaseEntry(f: Fixture, id: string) {
   const response = await request(
     `/agent/v1/nodes/${f.node}/storage-guard`,
@@ -302,12 +219,4 @@ export async function leaseEntry(f: Fixture, id: string) {
   return HostStorageLease.parse(await response.json()).databases.find(
     (entry) => entry.database_id === id,
   )!;
-}
-export function claimsOf(token: string | null | undefined) {
-  if (!token) return undefined;
-  return StorageWriteClaims.parse(
-    JSON.parse(
-      new TextDecoder().decode(base64urlToBytes(token.split(".")[1]!)!),
-    ),
-  );
 }

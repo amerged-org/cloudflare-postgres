@@ -5,14 +5,8 @@ import {
   NodeThinStorageAuthority,
   THIN_INVENTORY_INTERVAL_SECONDS,
   THIN_INVENTORY_MAX_SECONDS,
-  thinStorageSamplePeriodMilliseconds,
   thinStorageVolumeReclaimed,
 } from "../src/database-storage.ts";
-import {
-  NodeStorageHeadroomResponse,
-  NodeStorageHeadroomSample,
-  ThinStorageSampleTarget,
-} from "../src/node-thin-storage.ts";
 import { DesiredRegion } from "../src/agent.ts";
 
 const uid = (n: number) =>
@@ -83,12 +77,9 @@ function composed(overrides: Record<string, unknown> = {}) {
 }
 
 describe("thin write authority from an identity proof and a fresher reading", () => {
-  it("publishes the inventory constants and the guard-derived sample period", () => {
+  it("publishes the inventory constants", () => {
     expect(THIN_INVENTORY_MAX_SECONDS).toBe(300);
     expect(THIN_INVENTORY_INTERVAL_SECONDS).toBe(60);
-    expect(thinStorageSamplePeriodMilliseconds(10)).toBe(2000);
-    expect(thinStorageSamplePeriodMilliseconds(120)).toBe(24_000);
-    expect(() => thinStorageSamplePeriodMilliseconds(0)).toThrow();
   });
 
   it("never lets the composed authority outlive or predate its identity proof", () => {
@@ -153,126 +144,8 @@ describe("thin write authority from an identity proof and a fresher reading", ()
   });
 });
 
-describe("headroom samples against a Cloudflare nonce", () => {
-  const sample = () => ({
-    nonce: "0123456789abcdef0123456789abcdef",
-    node_uid: uid(4),
-    captured_at: at(160_100),
-    physical,
-    lvs: [
-      {
-        name: "pgcf_thinpool",
-        segtype: "thin-pool",
-        size_bytes: 8 * 1024 ** 3,
-      },
-      {
-        name: "pvc-11111111-1111-4111-8111-111111111111",
-        segtype: "thin",
-        size_bytes: 5 * 1024 ** 3,
-      },
-    ],
-    lv_count: 2,
-    witnesses: {
-      cluster_uid: uid(5),
-      boot_id: uid(7),
-      volume_group_uuid: vg,
-      driver_pod_uid: uid(6),
-      driver_image: image,
-    },
-    scrape_milliseconds: 180,
-  });
-
-  it("accepts one complete exporter scrape, or none with a null nonce", () => {
-    expect(NodeStorageHeadroomSample.parse(sample())).toEqual(sample());
-    expect(
-      NodeStorageHeadroomSample.safeParse({ ...sample(), nonce: null }).success,
-    ).toBe(true);
-    expect(
-      NodeStorageHeadroomSample.parse({ ...sample(), qualification_run: null })
-        .qualification_run,
-    ).toBeNull();
-    expect(
-      NodeStorageHeadroomSample.parse({
-        ...sample(),
-        qualification_run: `op_${"q".repeat(20)}`,
-      }).qualification_run,
-    ).toBe(`op_${"q".repeat(20)}`);
-    for (const invalid of [
-      // The LV series must number exactly the volume group's LV count.
-      { lv_count: 3 },
-      { nonce: "0123456789ABCDEF0123456789abcdef" },
-      { nonce: "0123456789abcdef" },
-      { qualification_run: "not-a-run" },
-      // The scrape belongs to the witnessed volume group.
-      {
-        witnesses: { ...sample().witnesses, volume_group_uuid: pool },
-      },
-      { lvs: [...sample().lvs, sample().lvs[1]], lv_count: 3 },
-      {
-        physical: {
-          ...physical,
-          thin_pool: { ...physical.thin_pool, name: "other" },
-        },
-      },
-    ])
-      expect(
-        NodeStorageHeadroomSample.safeParse({ ...sample(), ...invalid })
-          .success,
-        JSON.stringify(invalid),
-      ).toBe(false);
-  });
-
-  it("renews or refuses explicitly and always hands out the next nonce", () => {
-    const renewed = {
-      accepted: true,
-      reason: null,
-      nonce: "fedcba9876543210fedcba9876543210",
-      period_milliseconds: 2000,
-      authority: NodeThinStorageAuthority.parse(composed()),
-      tokens: [{ database_id: "a".repeat(20), token: "sa1.e30.e30" }],
-    };
-    expect(NodeStorageHeadroomResponse.parse(renewed)).toEqual(renewed);
-    const refused = {
-      ...renewed,
-      accepted: false,
-      reason: "thin_storage_sample_witness_changed",
-      authority: null,
-      tokens: [],
-    };
-    expect(NodeStorageHeadroomResponse.parse(refused)).toEqual(refused);
-    for (const invalid of [
-      { ...refused, authority: renewed.authority },
-      { ...refused, tokens: renewed.tokens },
-      { ...renewed, reason: "thin_storage_sample_witness_changed" },
-      { ...refused, reason: null },
-      { ...refused, reason: "witness_changed" },
-    ])
-      expect(NodeStorageHeadroomResponse.safeParse(invalid).success).toBe(
-        false,
-      );
-    // A qualification run's sample is recorded without authority or tokens.
-    expect(
-      NodeStorageHeadroomResponse.safeParse({
-        ...renewed,
-        authority: null,
-        tokens: [],
-      }).success,
-    ).toBe(true);
-  });
-
-  it("names each sampled node once in the desired region, with its period and qualification run", () => {
-    const target = {
-      node_id: `nod_${"n".repeat(20)}`,
-      name: "native-test-node",
-      node_uid: uid(4),
-      period_milliseconds: 2000,
-      qualification_run: null,
-    };
-    expect(ThinStorageSampleTarget.parse(target)).toEqual(target);
-    expect(
-      ThinStorageSampleTarget.safeParse({ ...target, period_milliseconds: 100 })
-        .success,
-    ).toBe(false);
+describe("the desired region's storage nodes", () => {
+  it("serves each storage node's thin pool room bit beside its identities", () => {
     const region = {
       id: "eu-test",
       backup: {
@@ -281,23 +154,21 @@ describe("headroom samples against a Cloudflare nonce", () => {
         region: "auto",
       },
     };
+    for (const room of [true, false])
+      expect(
+        DesiredRegion.parse({ ...region, storage_nodes: [composed({ room })] })
+          .storage_nodes![0]!.room,
+      ).toBe(room);
+    // Absent while a page is composed for a controller that predates the bit.
+    expect(
+      DesiredRegion.parse({ ...region, storage_nodes: [composed()] })
+        .storage_nodes![0],
+    ).not.toHaveProperty("room");
     expect(
       DesiredRegion.safeParse({
         ...region,
-        storage_samples: [
-          target,
-          {
-            ...target,
-            node_id: `nod_${"m".repeat(20)}`,
-            node_uid: uid(9),
-            qualification_run: `op_${"q".repeat(20)}`,
-          },
-        ],
+        storage_nodes: [composed({ room: "yes" })],
       }).success,
-    ).toBe(true);
-    expect(
-      DesiredRegion.safeParse({ ...region, storage_samples: [target, target] })
-        .success,
     ).toBe(false);
   });
 });

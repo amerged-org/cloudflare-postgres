@@ -8,7 +8,7 @@ import {
 } from "../crypto/bootstrap-credentials.ts";
 import { loadNodeHostConfiguration } from "./node-host-configuration.ts";
 import {
-  readCurrentNodeThinStorage,
+  thinStorageObservation,
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import { prepareThinStorageLease } from "./node-thin-storage-execution.ts";
@@ -82,13 +82,20 @@ export async function refreshNodeThinStorageMaterial(
     revision: host.revision,
     sha256: host.sha256,
   });
-  const admitted = await readCurrentNodeThinStorage(env, nodeId);
-  if (
-    ref.revision === row.material_revision &&
-    admitted?.row.status === "ready" &&
-    admitted.authority?.write_allowed
-  )
-    return { selected: true, qualified: true };
+  // Current material, the last identity proof accepted under it and the node observed now.
+  const settled = async () => {
+    const current = await env.DB.prepare(
+      "SELECT material_revision,status FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(nodeId)
+      .first<{ material_revision: number; status: string }>();
+    return (
+      current?.material_revision === ref.revision &&
+      current.status === "ready" &&
+      (await thinStorageObservation(env.DB, nodeId)).observed
+    );
+  };
+  if (await settled()) return { selected: true, qualified: true };
   if (row.lease_expires_at && Date.parse(row.lease_expires_at) > Date.now())
     return { selected: true, qualified: false };
   if (ref.revision !== row.material_revision) {
@@ -109,22 +116,10 @@ export async function refreshNodeThinStorageMaterial(
       .run();
     if (updated.meta.changes !== 1) return failed();
   }
-  let current = await readCurrentNodeThinStorage(env, nodeId);
-  if (current?.authority?.write_allowed && current.row.status === "ready")
-    return { selected: true, qualified: true };
   const input = await prepareThinStorageLease(env, nodeId, false);
   if (input)
     await env.NODE_BOOTSTRAP.get(
       env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
     ).thinStorage(nodeId);
-  current = await readCurrentNodeThinStorage(env, nodeId);
-  return {
-    selected: true,
-    qualified: Boolean(
-      current?.row.material_revision === ref.revision &&
-      current.row.status === "ready" &&
-      current.authority?.write_allowed &&
-      current.authority.data_accounting_complete,
-    ),
-  };
+  return { selected: true, qualified: await settled() };
 }

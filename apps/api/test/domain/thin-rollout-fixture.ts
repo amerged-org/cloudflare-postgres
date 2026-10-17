@@ -3,12 +3,12 @@
 // next region and assignment revision and the next pool policy in one batch (createFleetRollout),
 // and later the patch of that assignment rewriting the node's host custody. No live evidence.
 import { env } from "cloudflare:workers";
-import { newNodeId, newOperationId } from "@pgcf/contracts";
+import { newOperationId } from "@pgcf/contracts";
 import { ComputePoolPolicy } from "@pgcf/contracts/compute-pool";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { ensureNodeHostConfiguration } from "../../src/domain/node-host-configuration.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
-import type { Fixture } from "./thin-renewal-fixture.ts";
+import type { Fixture } from "./thin-proof-fixture.ts";
 
 type Change = (spec: FleetReleaseSpec) => FleetReleaseSpec;
 const digest = () => crypto.randomUUID().replaceAll("-", "").repeat(2);
@@ -252,85 +252,4 @@ export async function assignRelease(
   };
   if (options.patch) await startPatch(f, assigned, options.patch);
   return assigned;
-}
-
-/** The controller pulled the assignment and reported it: the node's observation names its revision. */
-export async function observeAssignment(f: Fixture) {
-  const at = new Date().toISOString();
-  await env.DB.prepare(
-    "UPDATE fleet_node_release_observations SET assignment_revision=(SELECT revision FROM fleet_node_releases WHERE node_id=?1),observed_at=?2,received_at=?2 WHERE node_id=?1",
-  )
-    .bind(f.node, at)
-    .run();
-}
-
-/** Another physical member of the node's region, patched to `release` as a whole. */
-export async function addMember(
-  f: Fixture,
-  release: { id: string; sha: string },
-) {
-  const id = newNodeId(),
-    uid = crypto.randomUUID(),
-    at = new Date().toISOString(),
-    revision = (await env.DB.prepare(
-      "SELECT revision FROM fleet_region_releases WHERE region_id=?",
-    )
-      .bind(f.region)
-      .first<number>("revision"))!;
-  await env.DB.batch([
-    env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES (?,?,?,1,4096,2000,30,128,100,?,?,?,?)",
-    ).bind(id, f.region, `member-${id.replaceAll("_", "-")}`, at, at, at, uid),
-    env.DB.prepare(
-      "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) VALUES(?,?,?,'control_relay',1,?)",
-    ).bind(
-      id,
-      uid,
-      await env.DB.prepare(
-        "SELECT release_id FROM fleet_region_releases WHERE region_id=?",
-      )
-        .bind(f.region)
-        .first<string>("release_id"),
-      at,
-    ),
-  ]);
-  await completePatch(f, id, uid, release, 1, revision);
-  return { id, uid };
-}
-
-/** A patch of `release` for any member, later than every earlier one: confirmed `complete` unless said. */
-export async function completePatch(
-  f: Fixture,
-  nodeId: string,
-  nodeUid: string,
-  release: { id: string; sha: string },
-  assignment: number,
-  region: number,
-  { stage, state, error }: PatchState = {
-    stage: "complete",
-    state: "confirmed",
-  },
-) {
-  const at = new Date().toISOString();
-  await env.DB.prepare(
-    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,error_code,created_at,updated_at,deadline_at)
-    SELECT ?,?,region_id,?,cluster_uid,?,?,?,?,material_revision,address,cluster_nodes_json,1,?,?,?,?,?,? FROM fleet_patch_operations WHERE node_id=? LIMIT 1`,
-  )
-    .bind(
-      newOperationId(),
-      nodeId,
-      nodeUid,
-      release.id,
-      release.sha,
-      assignment,
-      region,
-      stage,
-      state,
-      error ?? null,
-      at,
-      at,
-      new Date(Date.now() + 3_600_000).toISOString(),
-      f.node,
-    )
-    .run();
 }

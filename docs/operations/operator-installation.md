@@ -287,7 +287,7 @@ represents an absent limit.
 | `node_cpu_warning_threshold_ppm` | Optional warning when any node's ten-minute average CPU usage reaches it against node CPU capacity; null disables it. Needs a reporter that sends the CPU sample fields: the native controller shipped with R2. Otherwise CPU stays unknown. |
 | `node_storage_warning_threshold_ppm` | Optional warning when any node's fresh LVM sample reaches it: thin-pool data or metadata fill, otherwise volume-group allocation; null disables it. |
 | `cap_warning_enabled` | Opt-in notice for an operator-selected finite cap; false by default. |
-| `parked_tier` | Optional [parked sleep tier](../architecture/parked-instances.md): `enabled`, `ttl_seconds` (how long a database stays parked), `max_per_node` (the oldest demote to full hibernation first) and the parked requests. Omitted keeps it, `null` removes it, `enabled:false` demotes every parked database. |
+| `parked_tier` | Optional parked sleep tier, deleted by [decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17) (switch it off first): `enabled`, `ttl_seconds` (how long a database stays parked), `max_per_node` (the oldest demote to full hibernation first) and the parked requests. Omitted keeps it, `null` removes it, `enabled:false` demotes every parked database. |
 
 The configured RAM threshold applies to automatic new paid orders in both placement modes.
 Retain ten fresh aligned consecutive minutes for every eligible customer node, each with stable
@@ -372,7 +372,7 @@ unfinished older resize explicitly; stale observations cannot acknowledge the cu
 
 Physical storage reporting does not enable thin allocation: Thin storage is selected per node
 and needs a release-bound qualification receipt
-([recovery](recovery.md#thin-storage-admission-and-protective-recovery)). Retained thick
+([recovery](recovery.md#thin-storage-admission-and-recovery)). Retained thick
 volumes keep their backend and quota debit. A missing/old/mismatched sample stays unknown, and
 `thin_pool:null` means no thin pool exists, not free thin capacity.
 

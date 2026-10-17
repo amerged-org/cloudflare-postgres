@@ -16,8 +16,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -28,8 +28,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -40,8 +40,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           },
           {
             "path": "apps/api/src/domain/node-capacity.ts",
@@ -58,8 +58,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           },
           {
             "path": "apps/api/src/workflows/add-node.ts",
@@ -88,8 +88,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           },
           {
             "path": "apps/api/src/domain/prepare-node-installation.ts",
@@ -124,8 +124,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           },
           {
             "path": "apps/api/src/domain/node-proof.ts",
@@ -160,8 +160,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           },
           {
             "path": "apps/api/src/domain/fleet-patches.ts",
@@ -190,8 +190,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           },
           {
             "path": "apps/api/src/domain/bootstrap-jobs.ts",
@@ -208,8 +208,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -220,8 +220,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       }
@@ -236,8 +236,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -250,8 +250,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -264,8 +264,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -278,8 +278,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -292,8 +292,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -306,8 +306,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -320,8 +320,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -334,8 +334,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -348,8 +348,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -362,8 +362,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -376,8 +376,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -390,8 +390,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -404,8 +404,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       },
@@ -418,8 +418,8 @@
           {
             "path": "apps/api/src/workflows/add-node.ts",
             "symbol": "AddNode",
-            "line": 418,
-            "sha256": "ffbd86571835133a68cea4ace0bfce9e1edda1345087a8b4029f445e10451c05"
+            "line": 417,
+            "sha256": "b5afb42736e75687de58732cbbabcb377d0ae0bf2222e03a22c30fe464b6b6a6"
           }
         ]
       }

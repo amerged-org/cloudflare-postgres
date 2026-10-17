@@ -291,37 +291,3 @@ it("requires an exact predecessor UID and provider for explicit existing-instanc
     }).success,
   ).toBe(false);
 });
-
-it("bounds the parked tier policy and omits it unless set", () => {
-  const fresh = NodeRegionPolicy.parse({ region_id: "eu-test" });
-  expect(fresh).not.toHaveProperty("parked_tier");
-  const tier = {
-    enabled: true,
-    ttl_seconds: 600,
-    max_per_node: 8,
-    postgres_cpu_millicores: 10,
-    postgres_memory_mib: 96,
-    sidecar_cpu_millicores: 5,
-    sidecar_memory_mib: 64,
-  };
-  expect(
-    NodeRegionPolicy.parse({ region_id: "eu-test", parked_tier: tier })
-      .parked_tier,
-  ).toEqual(tier);
-  expect(
-    NodeRegionPolicy.parse({ region_id: "eu-test", parked_tier: null })
-      .parked_tier,
-  ).toBeNull();
-  // A restarted fenced container hits its 3,600 s startup-probe kill, so the TTL stays below it.
-  for (const bad of [
-    { ...tier, ttl_seconds: 3301 },
-    { ...tier, ttl_seconds: 59 },
-    { ...tier, max_per_node: 65 },
-    { ...tier, postgres_memory_mib: 0 },
-    { ...tier, unknown: 1 },
-  ])
-    expect(
-      NodeRegionPolicy.safeParse({ region_id: "eu-test", parked_tier: bad })
-        .success,
-    ).toBe(false);
-});

@@ -22,6 +22,7 @@ import {
 } from "./memory-capacity.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
 import { NODE_STORAGE_SAMPLE_MAX_AGE_MS } from "./node-storage.ts";
+import { thinPoolExhaustionSql } from "./storage-capacity.ts";
 
 interface AlertRow {
   kind: InfraAlertKind;
@@ -525,9 +526,6 @@ export async function deliverAlertRows(
   return { delivered, pending: rows.length - delivered };
 }
 
-/** A protective stop raises database_storage_protected once it has lasted this long. */
-export const STORAGE_PROTECTION_ALERT_MS = 5 * 60_000;
-
 type EventDetail = Partial<
   Pick<
     InfraAlert,
@@ -677,7 +675,7 @@ async function readRegionSubjects(
       AND ${baseline}>=p.backup_before)`;
   const result = await db
     .prepare(
-      `WITH p AS (SELECT ? region,? fresh,? backup_before,? protected_before)
+      `WITH p AS (SELECT ? region,? fresh,? backup_before)
       SELECT * FROM (SELECT 'database_archive_failing' kind,
           CASE WHEN d.observed_state='ready' AND d.observed_power='awake' AND d.archiving_health='failing' THEN 'failing' ELSE 'unresolved' END state,
           d.id subject,NULL detail
@@ -697,29 +695,21 @@ async function readRegionSubjects(
               AND NOT ${backupGood}))
         ORDER BY state,${baseline},d.id LIMIT 64)
       UNION ALL SELECT * FROM (SELECT 'thin_storage_blocked',
-          CASE WHEN t.status='blocked' THEN 'failing' ELSE 'unresolved' END state,t.node_id,t.error_code
-        FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id,p
+          CASE WHEN t.status='blocked' OR x.exhausted IS NOT NULL THEN 'failing' ELSE 'unresolved' END state,t.node_id,COALESCE(t.error_code,x.exhausted)
+        FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id
+          LEFT JOIN (SELECT o.node_id,o.node_uid,${thinPoolExhaustionSql()} exhausted FROM node_storage_observations o JOIN node_thin_storage t ON t.node_id=o.node_id) x
+            ON x.node_id=t.node_id AND x.node_uid=t.node_uid,p
         WHERE n.region_id=p.region AND n.lost_at IS NULL
-          AND (t.status='blocked'
+          AND (t.status='blocked' OR x.exhausted IS NOT NULL
             OR (t.status<>'ready' AND t.node_id IN(SELECT json_extract(s.value,'$.node_id')
               FROM infrastructure_alerts a,json_each(a.payload,'$.thin_storage') s
               WHERE a.region_id=n.region_id AND a.kind='thin_storage_blocked' AND a.active=1)))
-        ORDER BY state,t.node_id LIMIT 16)
-      UNION ALL SELECT * FROM (SELECT 'database_storage_protected',
-          CASE WHEN d.storage_protected_at<=p.protected_before THEN 'failing' ELSE 'unresolved' END state,
-          d.id,d.storage_protected_at
-        FROM databases d,p WHERE d.region_id=p.region AND d.deleted_at IS NULL AND d.desired_state='running'
-          AND d.storage_protected_at IS NOT NULL AND d.storage_protected_generation=d.generation
-          AND (d.storage_protected_at<=p.protected_before
-            OR d.id IN(SELECT n.value FROM infrastructure_alerts a,json_each(a.payload,'$.database_ids') n
-              WHERE a.region_id=d.region_id AND a.kind='database_storage_protected' AND a.active=1))
-        ORDER BY state,d.storage_protected_at,d.id LIMIT 64)`,
+        ORDER BY state,t.node_id LIMIT 16)`,
     )
     .bind(
       regionId,
       new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
       new Date(now - BASE_BACKUP_MAX_AGE_MS).toISOString(),
-      new Date(now - STORAGE_PROTECTION_ALERT_MS).toISOString(),
     )
     .all<{
       kind: InfraAlertKind;
@@ -759,7 +749,6 @@ const HEALTH_KINDS = [
   "database_archive_failing",
   "database_base_backup_stale",
   "thin_storage_blocked",
-  "database_storage_protected",
 ] as const satisfies readonly InfraAlertKind[];
 const pendingOf = (
   episodes: Iterable<AlertRow>,
@@ -872,12 +861,6 @@ async function regionHealthAlerts(
           node_id: subject.id,
           error_code: subject.detail,
         })),
-      })),
-    ],
-    [
-      "database_storage_protected",
-      subjectOf("database_storage_protected", (failing) => ({
-        database_ids: failing.map((subject) => subject.id),
       })),
     ],
   ];

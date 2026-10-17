@@ -4,28 +4,18 @@ import { afterEach, expect, it, vi } from "vitest";
 import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
-  NodeThinStorageAuthority,
   newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
-import {
-  HostStorageLease,
-  NodeStorageHeadroomResponse,
-} from "@pgcf/contracts/node-thin-storage";
+import { HostStorageLease } from "@pgcf/contracts/node-thin-storage";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import {
-  dispatchThinPoolAction,
-  prepareThinStorageLease,
-} from "../../src/domain/node-thin-storage-execution.ts";
+import { prepareThinStorageLease } from "../../src/domain/node-thin-storage-execution.ts";
 import {
   desiredRegionStorageNodes,
   readCurrentNodeThinStorage,
 } from "../../src/domain/node-thin-storage.ts";
-import {
-  storageProtectionStatements,
-  thinStorageDeletionConfirmedSql,
-} from "../../src/domain/storage-capacity.ts";
+import { thinStorageDeletionConfirmedSql } from "../../src/domain/storage-capacity.ts";
 import {
   type Fixture,
   gib,
@@ -33,12 +23,9 @@ import {
   iso,
   lvs,
   mib,
-  nonce,
-  post,
   report,
   row,
-  sample,
-} from "./thin-renewal-fixture.ts";
+} from "./thin-proof-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -66,13 +53,6 @@ async function endLease(f: Fixture) {
     .bind(iso(Date.now() - 1000), f.node)
     .run();
 }
-const used = (f: Fixture, bytes: number) => ({
-  ...f.authority.physical,
-  thin_pool: {
-    ...f.authority.physical.thin_pool!,
-    data_used_bytes_upper_bound: bytes,
-  },
-});
 
 it("an identity turn holds the executor's 90 s budget instead of the guard", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
@@ -114,25 +94,13 @@ it("records a slow report as an identity proof valid 300 s, even when the author
   expect(
     (await readCurrentNodeThinStorage(f.local, f.node))!.authority,
   ).toBeNull();
-  // The next fast sample renews from that proof.
-  const renewed = NodeStorageHeadroomResponse.parse(
-    (await post(f, sample(f, await nonce(f)))).body,
-  );
-  expect(renewed.authority).toMatchObject({
-    revision: 4,
-    inventory_revision: 3,
-    inventory_observed_at: iso(issued),
-  });
-  expect(
-    (await readCurrentNodeThinStorage(f.local, f.node))!.authority?.revision,
-  ).toBe(4);
-  // The next lease names the identity proof's revision; fast renewals never overtake it.
+  // The next lease names the identity proof's revision.
   await endLease(f);
   const next = await prepareThinStorageLease(f.local, f.node);
   expect(next!.lease.authority_revision).toBe(3);
-  expect(await report(f)).toMatchObject({ accepted: true, revision: 5 });
+  expect(await report(f)).toMatchObject({ accepted: true, revision: 4 });
   expect(JSON.parse((await row(f)).authority_json)).toMatchObject({
-    revision: 5,
+    revision: 4,
     inventory_revision: 4,
     inventory_observed_at: next!.lease.issued_at,
   });
@@ -159,288 +127,6 @@ it("logs how long an accepted identity turn took, from its lease to its acceptan
   });
   expect(Number(events[0]!.turn_ms)).toBeGreaterThanOrEqual(30_000);
   expect(Number(events[0]!.turn_ms)).toBeLessThan(40_000);
-});
-
-it("keeps a fast reading taken after the identity lease was issued", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  await identityProof(f);
-  await prepareThinStorageLease(f.local, f.node);
-  const issued = await leaseIssuedAgo(f, 4000);
-  const renewed = NodeStorageHeadroomResponse.parse(
-    (await post(f, sample(f, await nonce(f), { physical: used(f, 512 * mib) })))
-      .body,
-  );
-  expect(renewed.authority!.revision).toBe(3);
-  // The executor's reading is anchored at its lease's issue, before the sample's nonce.
-  expect(await report(f, { physical: used(f, 256 * mib) })).toMatchObject({
-    accepted: true,
-    revision: 4,
-  });
-  const stored = NodeThinStorageAuthority.parse(
-    JSON.parse((await row(f)).authority_json),
-  );
-  expect(stored).toMatchObject({
-    revision: 4,
-    observed_at: renewed.authority!.observed_at,
-    expires_at: renewed.authority!.expires_at,
-    inventory_observed_at: iso(issued),
-    inventory_revision: 3,
-  });
-  expect(stored.physical.thin_pool!.data_used_bytes_upper_bound).toBe(
-    512 * mib,
-  );
-});
-
-it("recomposes after a real D1 renewal without repeating custody and inventory validation", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  await identityProof(f);
-  await prepareThinStorageLease(f.local, f.node, false);
-  await leaseIssuedAgo(f, 4000);
-  const freshNonce = await nonce(f),
-    queries: string[] = [];
-  let batches = 0;
-  // Instrument native D1 calls to schedule an actual authenticated renewal at the CAS boundary.
-  // Every SQL statement and response still comes from D1; there are no synthetic database results.
-  const db = new Proxy(env.DB, {
-    get(target, key) {
-      if (key === "prepare")
-        return (sql: string) => {
-          queries.push(sql);
-          return target.prepare(sql);
-        };
-      if (key === "batch")
-        return async (statements: D1PreparedStatement[]) => {
-          if (++batches === 1)
-            expect(
-              NodeStorageHeadroomResponse.parse(
-                (
-                  await post(
-                    f,
-                    sample(f, freshNonce, { physical: used(f, 512 * mib) }),
-                  )
-                ).body,
-              ).accepted,
-            ).toBe(true);
-          return target.batch(statements);
-        };
-      const value = Reflect.get(target, key, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  expect(await report({ ...f, local: { ...f.local, DB: db } })).toMatchObject({
-    accepted: true,
-    revision: 4,
-    write_allowed: true,
-  });
-  expect(batches).toBe(2);
-  // One input read builds the executor report, one validates it. The retry only reads the node row.
-  expect(
-    queries.filter((sql) =>
-      sql.includes("FROM databases d LEFT JOIN database_start_admissions h"),
-    ),
-  ).toHaveLength(2);
-  expect(
-    JSON.parse((await row(f)).authority_json).physical.thin_pool
-      .data_used_bytes_upper_bound,
-  ).toBe(512 * mib);
-});
-
-it("never grants writes from a fresher reading when the identity proof itself has no headroom", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  await identityProof(f);
-  await prepareThinStorageLease(f.local, f.node, false);
-  await leaseIssuedAgo(f, 4000);
-  expect(
-    NodeStorageHeadroomResponse.parse(
-      (await post(f, sample(f, await nonce(f)))).body,
-    ).authority!.write_allowed,
-  ).toBe(true);
-  const physical = used(f, 2 * gib - 128 * mib);
-  expect(await report(f, { physical, write_allowed: false })).toMatchObject({
-    accepted: true,
-    write_allowed: false,
-  });
-  expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
-  expect(
-    await env.DB.prepare(
-      "SELECT inventory_physical_json FROM node_thin_storage WHERE node_id=?",
-    )
-      .bind(f.node)
-      .first("inventory_physical_json"),
-  ).toBe(JSON.stringify(physical));
-});
-
-it("blocks an unconfirmed sampled pool growth that exceeds the identity proof's own pool", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  await identityProof(f);
-  await prepareThinStorageLease(f.local, f.node, false);
-  await leaseIssuedAgo(f, 4000);
-  const physical = {
-    ...used(f, 2 * gib - 128 * mib),
-    free_bytes: f.authority.physical.free_bytes - gib,
-    thin_pool: {
-      ...used(f, 2 * gib - 128 * mib).thin_pool,
-      data_total_bytes: 3 * gib,
-    },
-  };
-  expect(
-    NodeStorageHeadroomResponse.parse(
-      (await post(f, sample(f, await nonce(f), { physical }))).body,
-    ).accepted,
-  ).toBe(true);
-  await expect(
-    report(f, {
-      physical: used(f, 2 * gib - 128 * mib),
-      write_allowed: false,
-    }),
-  ).rejects.toMatchObject({ code: "conflict" });
-  expect(await row(f)).toMatchObject({
-    status: "blocked",
-    error_code: "thin_storage_headroom_inconsistent",
-    sample_observed_at: null,
-    sample_data_used_bytes: null,
-  });
-});
-
-it("accepts pool growth with unchanged data when percentage rounding raises the used upper bound", async () => {
-  const f = await thinExecutionFixture(releases, {
-    guard_seconds: 10,
-    initial_data_bytes: 20 * gib,
-    growth_bytes: 4 * gib,
-  });
-  const physical = (size: number, percent: number) => ({
-    ...f.authority.physical,
-    free_bytes: f.authority.physical.free_bytes - size + 2 * gib,
-    thin_pool: {
-      ...f.authority.physical.thin_pool!,
-      data_total_bytes: size,
-      data_used_bytes_upper_bound: Math.ceil((size * (percent + 0.01)) / 100),
-    },
-  });
-  const before = physical(20 * gib, 99),
-    after = physical(24 * gib, 82.5);
-  await identityProof(f, { physical: before });
-  expect(
-    NodeStorageHeadroomResponse.parse(
-      (await post(f, sample(f, await nonce(f), { physical: before }))).body,
-    ).accepted,
-  ).toBe(true);
-  const input = await prepareThinStorageLease(f.local, f.node);
-  expect(input!.lease.action).toMatchObject({
-    kind: "grow",
-    target_data_bytes: 24 * gib,
-  });
-  await dispatchThinPoolAction(
-    f.local,
-    f.node,
-    input!.lease.action!.nonce,
-    f.authority.driver_pod_uid,
-    f.qualified.bootId,
-  );
-  expect(after.thin_pool.data_used_bytes_upper_bound).toBeGreaterThan(
-    before.thin_pool.data_used_bytes_upper_bound,
-  );
-  expect(await report(f, { physical: after })).toMatchObject({
-    accepted: true,
-    write_allowed: true,
-  });
-  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
-});
-
-it("blocks a 28 GiB sampled pool when the dispatched growth and final identity proof confirm only 24 GiB", async () => {
-  const f = await thinExecutionFixture(releases, {
-    guard_seconds: 10,
-    initial_data_bytes: 20 * gib,
-    growth_bytes: 4 * gib,
-  });
-  const physical = (size: number) => ({
-    ...f.authority.physical,
-    free_bytes: f.authority.physical.free_bytes - size + 2 * gib,
-    thin_pool: {
-      ...f.authority.physical.thin_pool!,
-      data_total_bytes: size,
-      data_used_bytes_upper_bound: Math.ceil(19.8 * gib),
-    },
-  });
-  const before = physical(20 * gib);
-  await identityProof(f, { physical: before });
-  expect(
-    NodeStorageHeadroomResponse.parse(
-      (await post(f, sample(f, await nonce(f), { physical: before }))).body,
-    ).accepted,
-  ).toBe(true);
-  const input = await prepareThinStorageLease(f.local, f.node);
-  expect(input!.lease.action).toMatchObject({
-    kind: "grow",
-    target_data_bytes: 24 * gib,
-  });
-  await leaseIssuedAgo(f, 4000);
-  await dispatchThinPoolAction(
-    f.local,
-    f.node,
-    input!.lease.action!.nonce,
-    f.authority.driver_pod_uid,
-    f.qualified.bootId,
-  );
-  expect(
-    NodeStorageHeadroomResponse.parse(
-      (
-        await post(
-          f,
-          sample(f, await nonce(f), { physical: physical(28 * gib) }),
-        )
-      ).body,
-    ).accepted,
-  ).toBe(true);
-  await expect(
-    report(f, { physical: physical(24 * gib) }),
-  ).rejects.toMatchObject({ code: "conflict" });
-  expect(await row(f)).toMatchObject({
-    status: "blocked",
-    error_code: "thin_storage_headroom_inconsistent",
-    sample_observed_at: null,
-    sample_data_used_bytes: null,
-  });
-});
-
-it("blocks the node when an identity proof reads more data than the newest earlier sample and its allowance", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  await identityProof(f);
-  const sampled = async (bytes: number) =>
-    NodeStorageHeadroomResponse.parse(
-      (await post(f, sample(f, await nonce(f), { physical: used(f, bytes) })))
-        .body,
-    );
-  expect((await sampled(64 * mib)).accepted).toBe(true);
-  await prepareThinStorageLease(f.local, f.node);
-  expect(
-    await env.DB.prepare(
-      "SELECT lease_sample_data_used_bytes,lease_sample_observed_at=sample_observed_at same FROM node_thin_storage WHERE node_id=?",
-    )
-      .bind(f.node)
-      .first(),
-  ).toEqual({ lease_sample_data_used_bytes: 64 * mib, same: 1 });
-  // Less used than the sample (a discard) is consistent.
-  expect(await report(f, { physical: used(f, 32 * mib) })).toMatchObject({
-    accepted: true,
-  });
-  expect((await sampled(64 * mib)).accepted).toBe(true);
-  await prepareThinStorageLease(f.local, f.node);
-  // Without a writer or a startup hold nothing could add 1 GiB since the sample.
-  await expect(report(f, { physical: used(f, gib) })).rejects.toMatchObject({
-    code: "conflict",
-  });
-  expect(await row(f)).toMatchObject({
-    status: "blocked",
-    error_code: "thin_storage_headroom_inconsistent",
-  });
-  expect(
-    await env.DB.prepare(
-      "SELECT lease_id FROM node_thin_storage WHERE node_id=?",
-    )
-      .bind(f.node)
-      .first("lease_id"),
-  ).toBeNull();
 });
 
 /** A placed thin database with a bound receipt whose LV the proof below may or may not show. */
@@ -551,19 +237,17 @@ async function firstVolumeIdentity() {
   return { f, created, receipt, physical, proof };
 }
 
-it("binds a first volume under non-write authority before a fresh sample deduplicates its startup reserve", async () => {
-  const { f, created, receipt, physical, proof } = await firstVolumeIdentity();
+it("binds a first volume's receipt from its identity proof, the pool's reserve the only requirement", async () => {
+  const { f, created, receipt, proof } = await firstVolumeIdentity();
   const input = await prepareThinStorageLease(f.local, f.node, false);
   expect(input!.lease.required_data_free_bytes).toBe(
-    f.profile.data_reserve_bytes + 5 * gib,
+    f.profile.data_reserve_bytes,
   );
-  // The executor used the issued hold-only requirement. The first identity must not turn the
-  // new full LV and its still-unbound hold into permission before their exact receipts land.
   expect(await report(f, { ...proof, write_allowed: true })).toMatchObject({
     accepted: true,
-    write_allowed: false,
+    write_allowed: true,
   });
-  expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
   const installed = await env.DB.prepare(
     "SELECT d.storage_volume_json current_receipt,h.storage_volume_json held_receipt FROM databases d JOIN database_start_admissions h ON h.database_id=d.id WHERE d.id=?",
   )
@@ -571,36 +255,10 @@ it("binds a first volume under non-write authority before a fresh sample dedupli
     .first<{ current_receipt: string; held_receipt: string }>();
   expect(JSON.parse(installed!.current_receipt)).toEqual(receipt);
   expect(JSON.parse(installed!.held_receipt)).toEqual(receipt);
-  const sampled = NodeStorageHeadroomResponse.parse(
-    (
-      await post(
-        f,
-        sample(f, await nonce(f), {
-          physical,
-          lvs: [
-            {
-              name: "pgcf_thinpool",
-              segtype: "thin-pool",
-              size_bytes: 8 * gib,
-            },
-            {
-              name: receipt.volume_handle,
-              segtype: "thin",
-              size_bytes: 5 * gib,
-            },
-          ],
-          lv_count: 2,
-        }),
-      )
-    ).body,
-  );
-  expect(sampled.accepted).toBe(true);
-  expect(sampled.authority?.write_allowed).toBe(true);
-  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
 });
 
-it("does not authorize a first volume when its actual receipt installation is ignored", async () => {
-  const { f, created, receipt, physical, proof } = await firstVolumeIdentity();
+it("binds no receipt the database row refused to install", async () => {
+  const { f, created, proof } = await firstVolumeIdentity();
   await prepareThinStorageLease(f.local, f.node, false);
   await env.DB.exec(
     `CREATE TRIGGER ignore_first_volume_receipt BEFORE UPDATE OF storage_volume_json ON databases WHEN OLD.id='${created.database.id}' BEGIN SELECT RAISE(IGNORE); END`,
@@ -608,7 +266,6 @@ it("does not authorize a first volume when its actual receipt installation is ig
   try {
     expect(await report(f, { ...proof, write_allowed: true })).toMatchObject({
       accepted: true,
-      write_allowed: false,
     });
     const installed = await env.DB.prepare(
       "SELECT d.storage_volume_json current_receipt,h.storage_volume_json held_receipt FROM databases d JOIN database_start_admissions h ON h.database_id=d.id WHERE d.id=?",
@@ -616,33 +273,6 @@ it("does not authorize a first volume when its actual receipt installation is ig
       .bind(created.database.id)
       .first();
     expect(installed).toEqual({ current_receipt: null, held_receipt: null });
-    const sampled = NodeStorageHeadroomResponse.parse(
-      (
-        await post(
-          f,
-          sample(f, await nonce(f), {
-            physical,
-            lvs: [
-              {
-                name: "pgcf_thinpool",
-                segtype: "thin-pool",
-                size_bytes: 8 * gib,
-              },
-              {
-                name: receipt.volume_handle,
-                segtype: "thin",
-                size_bytes: 5 * gib,
-              },
-            ],
-            lv_count: 2,
-          }),
-        )
-      ).body,
-    );
-    expect(sampled.accepted).toBe(true);
-    expect(sampled.authority?.write_allowed).toBe(false);
-    expect(sampled.tokens).toEqual([]);
-    expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
   } finally {
     await env.DB.exec("DROP TRIGGER ignore_first_volume_receipt");
   }
@@ -675,7 +305,7 @@ it("reinitializes only a positively complete empty thin inventory after the pool
   );
 });
 
-it("retains full advisory LV exposure after write expiry without turning retained identity into write permission", async () => {
+it("keeps the reserve requirement after write expiry; only a new identity proof allows writes again", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
     bound = await boundDatabase(f),
     physical = {
@@ -704,7 +334,7 @@ it("retains full advisory LV exposure after write expiry without turning retaine
   ).toBeNull();
   const input = await prepareThinStorageLease(f.local, f.node, false);
   expect(input?.lease.required_data_free_bytes).toBe(
-    f.profile.data_reserve_bytes + 5 * gib,
+    f.profile.data_reserve_bytes,
   );
   expect(input?.lease.action).toBeNull();
   expect(
@@ -713,7 +343,7 @@ it("retains full advisory LV exposure after write expiry without turning retaine
       physical,
       write_allowed: false,
     }),
-  ).toMatchObject({ accepted: true, write_allowed: false });
+  ).toMatchObject({ accepted: true, write_allowed: true });
 });
 
 it("refuses a stale database generation during an identity turn without blocking the node", async () => {
@@ -790,35 +420,13 @@ it("refuses as stale an identity proof whose only unaccounted LV is the new volu
       write_allowed: false,
     }),
   ).rejects.toMatchObject({ code: "conflict" });
-  // Nothing installed, nothing blocked: the executor retries with the current list, and samples keep
-  // renewing the previous identity with the new LV inside the unbound startup hold.
+  // Nothing installed, nothing blocked: the executor retries with the current list.
   expect(await row(f)).toMatchObject({
     authority_revision: before.authority_revision,
     authority_json: before.authority_json,
     status: "ready",
     error_code: null,
   });
-  const renewed = NodeStorageHeadroomResponse.parse(
-    (
-      await post(
-        f,
-        sample(f, await nonce(f), {
-          physical,
-          lvs: [
-            {
-              name: "pgcf_thinpool",
-              segtype: "thin-pool",
-              size_bytes: 2 * gib,
-            },
-            { name: fresh.name, segtype: "thin", size_bytes: fresh.size_bytes },
-          ],
-          lv_count: 2,
-        }),
-      )
-    ).body,
-  );
-  expect(renewed.accepted).toBe(true);
-  expect(renewed.authority?.write_allowed).toBe(true);
 });
 
 it("refuses as stale an identity proof that could not yet see the volume of a listed database", async () => {
@@ -902,7 +510,7 @@ it("deduplicates two startup holds for the same proved volume during a 95 s iden
   proof.physical.thin_pool.data_total_bytes = 8 * gib;
   await identityProof(f, proof);
   const input = await prepareThinStorageLease(f.local, f.node, false);
-  expect(input!.lease.required_data_free_bytes).toBe(5 * gib + 256 * mib);
+  expect(input!.lease.required_data_free_bytes).toBe(256 * mib);
   await leaseIssuedAgo(f, 30_000);
   expect(await report(f, proof)).toMatchObject({
     accepted: true,
@@ -1020,14 +628,6 @@ it("keeps an identity-only turn available after the last deleted volume removes 
   expect(
     await desiredRegionStorageNodes(env, f.region, afterWriteExpiry + 300_000),
   ).toEqual([]);
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET material_revision=material_revision+1 WHERE node_id=?",
-  )
-    .bind(f.node)
-    .run();
-  expect(
-    await desiredRegionStorageNodes(env, f.region, afterWriteExpiry),
-  ).toEqual([]);
 });
 
 it("the host lease retires a deleted volume from the absence read even after its pool and write authority are gone", async () => {
@@ -1106,84 +706,6 @@ it("still blocks a missing pool while a non-deleted thin database references it"
   expect(await row(f)).toMatchObject({
     status: "blocked",
     error_code: "thin_storage_retained_pool_missing",
-  });
-});
-
-it("records a protective stop from an identity proof whose composed authority already expired", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { created, receipt, physical } = await boundDatabase(f),
-    read = Date.now() - 30_000;
-  const proof = NodeThinStorageAuthority.parse({
-    ...f.authority,
-    revision: 3,
-    physical,
-    observed_at: iso(read),
-    captured_at: iso(read),
-    expires_at: iso(read + 10_000),
-    inventory_observed_at: iso(read),
-    inventory_expires_at: iso(read + 300_000),
-    inventory_revision: 3,
-    write_allowed: false,
-    physical_lvs: [
-      lvs.pool,
-      lvs.data,
-      lvs.meta,
-      {
-        name: receipt.volume_handle,
-        lv_uuid: receipt.lv_uuid,
-        size_bytes: 5 * gib,
-        segtype: "thin",
-      },
-    ],
-    volumes: [
-      {
-        database_id: created.database.id,
-        generation: 1,
-        storage_generation: 1,
-        storage_uid: receipt.storage_uid,
-        namespace_uid: receipt.namespace_uid,
-        cluster_uid: receipt.cluster_uid,
-        volume_handle: receipt.volume_handle,
-        lv_uuid: receipt.lv_uuid,
-        pvc_uid: receipt.pvc_uid,
-        pv_uid: receipt.pv_uid,
-        storage_class: thinStorageClass(f.authority.profile_sha256),
-        volume_attributes_class: thinStorageClass(f.authority.profile_sha256),
-        io: [],
-      },
-    ],
-    protections: [
-      {
-        database_id: created.database.id,
-        generation: 1,
-        operation_id: created.operation.id,
-        storage_uid: receipt.storage_uid,
-        namespace_uid: receipt.namespace_uid,
-        cluster_uid: receipt.cluster_uid,
-        node_uid: f.uid,
-        profile_sha256: f.authority.profile_sha256,
-        requested_at: read,
-        hibernation_on: true,
-        pods_absent: true,
-      },
-    ],
-  });
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET authority_revision=3,authority_json=?,authority_received_at=? WHERE node_id=?",
-  )
-    .bind(JSON.stringify(proof), iso(Date.now()), f.node)
-    .run();
-  await env.DB.batch(storageProtectionStatements(env.DB, proof));
-  expect(
-    await env.DB.prepare(
-      "SELECT storage_protected_at,storage_protected_operation,observed_power FROM databases WHERE id=?",
-    )
-      .bind(created.database.id)
-      .first(),
-  ).toEqual({
-    storage_protected_at: iso(read),
-    storage_protected_operation: created.operation.id,
-    observed_power: "hibernated",
   });
 });
 

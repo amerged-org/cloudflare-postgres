@@ -395,15 +395,14 @@ async function nodeReleaseStatus(
     differences.push("unobserved/current_material_runtime");
   }
   if (state === "converged") {
-    const { readCurrentNodeThinStorage } =
-        await import("./node-thin-storage.ts"),
-      storage = await readCurrentNodeThinStorage({ DB: db }, row.node_id);
+    const { thinStorageObservation } = await import("./node-thin-storage.ts"),
+      storage = await thinStorageObservation(db, row.node_id);
     // A receipt binds members that take databases; control/relay without placement stays thick.
     if (
       ((desired?.spec.thin_storage_qualification &&
         row.database_placement_enabled === 1) ||
-        storage) &&
-      !storage?.authority?.write_allowed
+        storage.selected) &&
+      !storage.observed
     ) {
       state = "pending";
       differences.push("unobserved/current_material_storage");
@@ -908,65 +907,6 @@ export async function thinStorageSamplingCapable(
     await db
       .prepare(
         `SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")}`,
-      )
-      .bind(regionId)
-      .first(),
-  );
-}
-/**
- * The strict desired schemas are served only to controllers that parse them: the region's release
- * declares the sampling protocol and every assigned member's newest completed patch was of a
- * release that declares it, with no later patch of any state of a release that does not. A patch
- * that halted after `regional` installed its controller never completed, and its controller may
- * run. A rollout between two releases that declare the protocol changes no controller schema, so
- * it does not close the wire. A new protocol version is a new number: all that declare version 1
- * count alike.
- */
-export function thinStorageSamplingProtocolSql(region: string) {
-  if (!/^[a-z][a-z0-9_]*$/.test(region))
-    throw new Error("invalid_sampling_region_alias");
-  const members =
-      "SELECT count(*) FROM nodes pn,fleet_node_releases pa WHERE pa.node_id=pn.id AND pn.region_id=pf.region_id AND pn.lost_at IS NULL",
-    // The rowid of a patch is its creation order.
-    newest = `(SELECT max(pp.rowid) FROM fleet_patch_operations pp,fleet_releases pr WHERE ${allOf(
-      "pr.id=pp.release_id",
-      "pp.node_id=pn.id",
-      "pp.node_uid=pn.node_uid",
-      "pp.stage='complete'",
-      "pp.state='confirmed'",
-      "pp.error_code IS NULL",
-      "pr.thin_sampling_version=1",
-    )})`,
-    since = `COALESCE((SELECT max(px.rowid) FROM fleet_patch_operations px,fleet_releases pxr WHERE ${allOf(
-      "pxr.id=px.release_id",
-      "px.node_id=pn.id",
-      "px.node_uid=pn.node_uid",
-      "pxr.thin_sampling_version IS NOT 1",
-    )}),0)`,
-    capable = `SELECT count(*) FROM nodes pn,fleet_node_releases pa WHERE ${allOf(
-      "pa.node_id=pn.id",
-      "pn.region_id=pf.region_id",
-      "pn.lost_at IS NULL",
-      "pa.node_uid=pn.node_uid",
-      "pa.release_id=pf.release_id",
-      `${newest}>${since}`,
-    )}`;
-  return `EXISTS(SELECT 1 FROM fleet_region_releases pf,fleet_releases ps WHERE ${allOf(
-    `pf.region_id=${region}.id`,
-    "ps.id=pf.release_id",
-    "ps.thin_sampling_version=1",
-    `(${members})>0`,
-    `(${capable})=(${members})`,
-  )})`;
-}
-export async function thinStorageSamplingProtocolCapable(
-  db: D1Database,
-  regionId: string,
-) {
-  return Boolean(
-    await db
-      .prepare(
-        `SELECT 1 FROM regions pr WHERE pr.id=? AND ${thinStorageSamplingProtocolSql("pr")}`,
       )
       .bind(regionId)
       .first(),

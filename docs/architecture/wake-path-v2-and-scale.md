@@ -323,7 +323,7 @@ fixture's):
   which the driver container lacks, and the opening and closing LVM reports must bracket them. Collapsing
   the bracket would accept a volume created between its PVC and its LV with incomplete accounting and
   stop every writer of the node, so the floor of this design is wave, driver exec, wave, driver exec. The
-  reads and their order are in [thin-authority-renewal.md](thin-authority-renewal.md) section 5. Peak
+  reads and their order were in section 5 of `thin-authority-renewal.md` (deleted; Git history keeps it). Peak
   concurrent relay connections per turn are 10 (were 7), against the relay's limit of 32 connections.
 - (b) The controller posts a waking database's observation only when it carries the power operation or a
   ready, deleted or hibernated state, and the desired page carries no marker, so the API cannot see

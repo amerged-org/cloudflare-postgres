@@ -45,10 +45,8 @@ import {
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import {
-  storageProtectionStatements,
   storageHoldVolumeStatements,
   knownStorageHoldVolume,
-  thinLogicalVolumeExposures,
   currentStorageStopSql,
 } from "./storage-capacity.ts";
 import {
@@ -58,10 +56,6 @@ import {
 import { bootstrapTransportSigningKey } from "./bootstrap-relay.ts";
 import { readBootstrapRelayIdentity } from "./node-inspection.ts";
 import type { DatabaseRow } from "./rows.ts";
-import {
-  withAdmissionMutation,
-  type AdmissionMutation,
-} from "./admission-mutations.ts";
 const closed = (): never => {
   throw new ApiError(
     "conflict",
@@ -205,9 +199,6 @@ function retainedPoolAuthority(
     : null;
 }
 
-/** A start waits for the node's next inventory this long after its hold was granted. A start that
- * is older is stuck on something else, and a stuck start must not keep identity turns running. */
-export const THIN_START_WAIT_SECONDS = 120;
 export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM (
   SELECT h.operation_id FROM database_start_admissions h WHERE h.node_id=node_thin_storage.node_id AND h.node_uid=node_thin_storage.node_uid AND h.storage_budget_bytes>0
 ) storage_hold WHERE NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
@@ -219,7 +210,7 @@ export async function storageHolds(
   now = Date.now(),
 ) {
   const rows = await env.DB.prepare(
-    `SELECT h.operation_id,h.database_id,h.generation,h.storage_budget_bytes,h.granted_at,h.ready_at,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
+    `SELECT h.operation_id,h.database_id,h.generation,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
   )
     .bind(nodeId, nodeUid)
     .all<{
@@ -227,8 +218,6 @@ export async function storageHolds(
       database_id: string;
       generation: number;
       storage_budget_bytes: number;
-      granted_at: string;
-      ready_at: string | null;
       storage_volume_json: string | null;
       binding_json: string | null;
       storage_profile_json: string | null;
@@ -258,57 +247,20 @@ export async function storageHolds(
   return {
     bytes,
     count: rows.results.length,
-    /** Starts the controller has not reported ready yet: each waits for the next inventory, which
-     * carries its new Pod's io.max, and the controller cannot ready the database before that. */
-    waiting: rows.results
-      .filter(
-        (hold) =>
-          hold.ready_at === null &&
-          now - Date.parse(hold.granted_at) <= THIN_START_WAIT_SECONDS * 1000,
-      )
-      .map(({ database_id, generation }) => ({ database_id, generation })),
     newVolumes: unknownVolumes,
     ids: new Set(rows.results.map((r) => r.database_id)),
     operations: rows.results.map((r) => r.operation_id),
     exposures,
   };
 }
-export function minimumHeadroom(
-  profile: NodeThinStorageLease["profile"],
-  authority: NodeThinStorageAuthority | null,
-  holds: {
-    bytes: number;
-    newVolumes: number;
-    ids: ReadonlySet<string>;
-    exposures?: ReadonlyMap<string, number>;
-  },
-) {
-  const retained = authority
-    ? thinLogicalVolumeExposures(authority)
-    : new Map();
-  const unknown = {
-    data: Number.MAX_SAFE_INTEGER,
-    metadata: Number.MAX_SAFE_INTEGER,
+/** The free data and metadata a thin pool keeps: the profile's reserves, the same rule as
+ * `thinPoolRoomSql`. Volumes are not accounted at their logical size: they overprovision the pool,
+ * which grows before it runs out. */
+export function minimumHeadroom(profile: NodeThinStorageLease["profile"]) {
+  return {
+    data: profile.data_reserve_bytes,
+    metadata: profile.metadata_reserve_bytes,
   };
-  if (!retained) return unknown;
-  for (const [key, bytes] of holds.exposures ?? [])
-    retained.set(key, Math.max(retained.get(key) ?? 0, bytes));
-  const bytes =
-      [...retained.values()].reduce((sum, value) => sum + value, 0) +
-      (holds.exposures ? 0 : holds.bytes),
-    chunks = Math.ceil(bytes / 65536);
-  if (!Number.isSafeInteger(bytes)) return unknown;
-  const required = {
-    data: profile.data_reserve_bytes + bytes,
-    metadata:
-      profile.metadata_reserve_bytes +
-      4 * Math.ceil(chunks / 126) * 4096 +
-      holds.newVolumes * 16384,
-  };
-  return Number.isSafeInteger(required.data) &&
-    Number.isSafeInteger(required.metadata)
-    ? required
-    : unknown;
 }
 /** Cloudflare's write decision for one reading under one identity proof; the rule the slow report
  * has always been held to: complete data accounting, the profile's geometry and free data and
@@ -373,7 +325,7 @@ export async function nextThinStartupBytes(
 ) {
   return (
     (await env.DB.prepare(
-      `SELECT MAX(MAX(s.storage_gib*1073741824,?)) bytes FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN nodes n ON n.id=? WHERE (d.region_id=? AND (d.deleted_at IS NULL OR d.desired_state='deleted') AND s.storage_gib<=?) AND ((d.desired_state='running' AND d.node_id IS NULL AND ?=1 AND n.schedulable=1 AND n.database_placement_enabled=1 AND n.database_placement_closed_at IS NULL) OR (d.node_id=n.id AND ((d.desired_state='running' AND d.storage_protected_generation=d.generation AND d.storage_protected_at IS NOT NULL) OR (d.storage_volume_json IS NOT NULL AND EXISTS(SELECT 1 FROM operations stop WHERE ${currentStorageStopSql()}))))) AND NOT EXISTS(SELECT 1 FROM database_start_admissions h WHERE h.database_id=d.id AND h.storage_budget_bytes>0)`,
+      `SELECT MAX(MAX(s.storage_gib*1073741824,?)) bytes FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN nodes n ON n.id=? WHERE (d.region_id=? AND (d.deleted_at IS NULL OR d.desired_state='deleted') AND s.storage_gib<=?) AND ((d.desired_state='running' AND d.node_id IS NULL AND ?=1 AND n.schedulable=1 AND n.database_placement_enabled=1 AND n.database_placement_closed_at IS NULL) OR (d.node_id=n.id AND ((d.storage_volume_json IS NOT NULL AND EXISTS(SELECT 1 FROM operations stop WHERE ${currentStorageStopSql()}))))) AND NOT EXISTS(SELECT 1 FROM database_start_admissions h WHERE h.database_id=d.id AND h.storage_budget_bytes>0)`,
     )
       .bind(
         profile.startup_reserve_bytes,
@@ -407,7 +359,7 @@ export async function reserveThinStorageLease(
     env,
     nodeId,
     Date.now(),
-    "continuing",
+    false,
   );
   if (!current) return closed();
   const row = await readThinStorageLeaseRow(env, nodeId);
@@ -431,7 +383,7 @@ export async function reserveThinStorageLease(
     advisory,
     current.authority ? Date.now() : Date.parse(advisory?.observed_at ?? now),
   );
-  const required = minimumHeadroom(profile, advisory, holds);
+  const required = minimumHeadroom(profile);
   // A queued first start cannot obtain its bounded hold until the measured pool fits it.
   // Grow the existing finite pool for one eligible request; this is not a physical quota debit
   // for established databases and never creates a VPS order below the regional RAM trigger.
@@ -527,7 +479,7 @@ export async function reserveThinStorageLease(
   ).toISOString();
   // The newest sample accepted before this lease bounds what its own LVM reading may show.
   const result = await env.DB.prepare(
-    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=?,lease_sample_observed_at=sample_observed_at,lease_sample_data_used_bytes=sample_data_used_bytes WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}
+    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=? WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}
       AND (?=0 OR (NOT EXISTS(SELECT 1 FROM database_start_admissions a WHERE a.node_id=node_thin_storage.node_id AND a.storage_budget_bytes>0)
         AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.node_id=node_thin_storage.node_id AND d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.storage_profile_json IS NOT NULL)))`,
   )
@@ -575,26 +527,23 @@ export async function thinStorageStatus(env: Env, nodeId: string) {
 export async function thinStorageInput(
   env: Env,
   nodeId: string,
-  required?: { data: number; metadata: number },
 ): Promise<NodeThinStorageInput> {
   return buildThinStorageInput(
     env,
     nodeId,
     await readThinStorageLeaseRow(env, nodeId),
-    required,
   );
 }
 async function buildThinStorageInput(
   env: Env,
   nodeId: string,
   row: Awaited<ReturnType<typeof readThinStorageLeaseRow>>,
-  required?: { data: number; metadata: number },
 ): Promise<NodeThinStorageInput> {
   const current = await readCurrentNodeThinStorage(
     env,
     nodeId,
     Date.now(),
-    "continuing",
+    false,
   );
   if (
     !current ||
@@ -648,25 +597,7 @@ async function buildThinStorageInput(
         storage_budget_bytes: number | null;
       }
     >();
-  const advisory =
-    current.authority ??
-    current.reclamation ??
-    retainedPoolAuthority(current.row);
-  const requiredHeadroom =
-    required ??
-    minimumHeadroom(
-      current.profile,
-      advisory,
-      await storageHolds(
-        env,
-        nodeId,
-        row.node_uid,
-        advisory,
-        current.authority
-          ? Date.now()
-          : Date.parse(advisory?.observed_at ?? row.updated_at),
-      ),
-    );
+  const requiredHeadroom = minimumHeadroom(current.profile);
   const callback = new URL(
     `/internal/v1/node-thin-storage/${nodeId}`,
     env.NODE_BOOTSTRAP_CALLBACK_URL,
@@ -780,26 +711,6 @@ export async function dispatchThinPoolAction(
   return { dispatched: true };
 }
 
-/** Temporary full-volume exposure across both identity reads and exact captured holds.
- * io.max's metadata/swap bypass cannot justify a rate-only physical growth bound. */
-function thinWriteAllowance(
-  writers: readonly (NodeThinStorageAuthority | null)[],
-  holds: { bytes: number; exposures?: ReadonlyMap<string, number> },
-) {
-  const exposure = new Map(holds.exposures);
-  for (const authority of writers) {
-    if (!authority) continue;
-    const retained = thinLogicalVolumeExposures(authority);
-    if (!retained) return Number.MAX_SAFE_INTEGER;
-    for (const [key, bytes] of retained)
-      exposure.set(key, Math.max(exposure.get(key) ?? 0, bytes));
-  }
-  const total =
-    [...exposure.values()].reduce((sum, value) => sum + value, 0) +
-    (holds.exposures ? 0 : holds.bytes);
-  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
-}
-
 /** The slow report is an identity proof: its read started at the lease's issue, it stays usable
  * THIN_INVENTORY_MAX_SECONDS and it carries its own revision. Cloudflare composes the authority from
  * it and the fresher of its reading and the current one, even when that authority already expired. */
@@ -844,7 +755,7 @@ async function acceptIdentityProof(
   // the executor's refused callback became a transient failure.
   const block = async (code: string): Promise<never> => {
     await env.DB.prepare(
-      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
+      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
     )
       .bind(code, nodeId, row.lease_id, row.lease_revision)
       .run();
@@ -916,8 +827,7 @@ async function acceptIdentityProof(
       proofAuthority,
       issued,
     ),
-    headroom = minimumHeadroom(lease.profile, a, holds),
-    pool = a.physical.thin_pool,
+    headroom = minimumHeadroom(lease.profile),
     proofWriteAllowed = thinStorageWriteAllowed(
       lease.profile,
       a,
@@ -985,37 +895,6 @@ async function acceptIdentityProof(
     )
       return block("thin_storage_report_identity_changed");
   }
-  const stored = retainedPoolAuthority(row);
-  // The proof's own reading must not exceed the newest sample before its lease plus what Cloudflare
-  // allowed since: the sampler or a writer's limit was wrong, so the node stops being renewed.
-  if (
-    pool &&
-    row.lease_sample_observed_at !== null &&
-    row.lease_sample_data_used_bytes !== null
-  ) {
-    const allowed =
-      row.lease_sample_data_used_bytes + thinWriteAllowance([stored, a], holds);
-    // Both LVM readers round percentages to hundredths and charge another hundredth. The
-    // conservative upper bound can rise after growth without a write; compare its lower bound.
-    const proofUsedLowerBound = Math.max(
-      0,
-      pool.data_used_bytes_upper_bound -
-        Math.ceil(pool.data_total_bytes / 5000),
-    );
-    if (proofUsedLowerBound > allowed) {
-      console.error(
-        JSON.stringify({
-          event: "thin_storage_headroom_inconsistent",
-          node_id: nodeId,
-          sample_observed_at: row.lease_sample_observed_at,
-          sample_data_used_bytes: row.lease_sample_data_used_bytes,
-          proof_data_used_bytes: pool.data_used_bytes_upper_bound,
-          allowed_bytes: allowed,
-        }),
-      );
-      return block("thin_storage_headroom_inconsistent");
-    }
-  }
   const receipts: {
     database: (typeof lease.databases)[number];
     storage: NonNullable<(typeof lease.databases)[number]["storage"]>;
@@ -1056,40 +935,15 @@ async function acceptIdentityProof(
     }),
     reportedVolumes = JSON.stringify(a.volumes),
     heldOperations = JSON.stringify(holds.operations);
-  // Validate custody, inventory and receipts once. A fast renewal changes only the reading and
-  // revision; after a conflict the one row read below is enough to compose with that fresh sample.
+  // Validate custody, inventory and receipts once; after a conflict the one row read below is
+  // enough to try again.
   for (let attempt = 0; attempt < 3; attempt++) {
-    const current = retainedPoolAuthority(row),
-      freshPool = current?.physical.thin_pool,
-      fresher =
-        current &&
-        pool &&
-        freshPool &&
-        current.pool_uuid === a.pool_uuid &&
-        current.profile_revision === a.profile_revision &&
-        freshPool.metadata_total_bytes === pool.metadata_total_bytes &&
-        freshPool.data_total_bytes >= pool.data_total_bytes &&
-        Date.parse(current.observed_at) > issued
-          ? current
-          : null;
-    // The executor reads the final post-action geometry. A larger later sample cannot describe the
-    // same non-shrinking pool, even with a dispatched growth; never use its inflated free space.
-    if (fresher && freshPool!.data_total_bytes > pool!.data_total_bytes)
-      return block("thin_storage_headroom_inconsistent");
-    const reading = fresher
-        ? {
-            observed_at: Date.parse(fresher.observed_at),
-            captured_at: fresher.captured_at,
-            physical: fresher.physical,
-          }
-        : {
-            observed_at: issued,
-            captured_at: a.captured_at,
-            physical: a.physical,
-          },
-      writeAllowed =
-        proofWriteAllowed &&
-        thinStorageWriteAllowed(lease.profile, a, reading.physical, headroom),
+    const reading = {
+        observed_at: issued,
+        captured_at: a.captured_at,
+        physical: a.physical,
+      },
+      writeAllowed = proofWriteAllowed,
       composed = composeThinStorageAuthority({
         identity: a,
         inventory,
@@ -1102,86 +956,42 @@ async function acceptIdentityProof(
       received = new Date(Date.now()).toISOString(),
       accepted = `EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.authority_revision=? AND t.authority_json=?)`,
       bindings = [nodeId, composed.revision, serialized];
-    const protectionSubjects = [
-      ...new Set([
-        ...composed.protections.map((proof) => proof.database_id),
-        ...composed.volumes
-          .filter((volume) => volume.quiesced === true)
-          .map((volume) => volume.database_id),
-      ]),
+    const statements = [
+      env.DB.prepare(
+        `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,inventory_physical_json=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql} AND NOT EXISTS(SELECT 1 FROM json_each(?) volume WHERE NOT EXISTS(SELECT 1 FROM databases d WHERE d.id=json_extract(volume.value,'$.database_id') AND d.node_id=node_thin_storage.node_id AND d.generation=json_extract(volume.value,'$.generation') AND d.storage_generation=json_extract(volume.value,'$.storage_generation')))`,
+      ).bind(
+        composed.revision,
+        serialized,
+        received,
+        JSON.stringify(a.physical),
+        qualification,
+        writeAllowed ? "ready" : "blocked",
+        nodeId,
+        row.lease_revision,
+        row.authority_revision,
+        row.profile_revision,
+        heldOperations,
+        reportedVolumes,
+      ),
     ];
-    const protectedAdmissions = protectionSubjects.length
-      ? (
-          await env.DB.prepare(
-            `SELECT id FROM databases WHERE node_id=? AND id IN(SELECT value FROM json_each(?))
-      AND desired_state='running' AND deleted_at IS NULL
-      AND (storage_protected_at IS NULL OR storage_protected_generation IS NOT generation OR storage_protected_operation IS NULL
-        OR observed_state<>'provisioning'
-        OR EXISTS(SELECT 1 FROM json_each(?) changed_proof WHERE json_extract(changed_proof.value,'$.database_id')=databases.id
-          AND json_extract(changed_proof.value,'$.operation_id') IS NOT NULL
-          AND (json_extract(changed_proof.value,'$.operation_id') IS NOT storage_protected_operation
-            OR observed_power<>'hibernated' OR observed_generation<>generation)))`,
-          )
-            .bind(
-              nodeId,
-              JSON.stringify(protectionSubjects),
-              JSON.stringify(composed.protections),
-            )
-            .all<{ id: string }>()
-        ).results.map((record) => record.id)
-      : [];
-    const execute = async (mutation?: AdmissionMutation) => {
-      const guards = new Map(
-        protectedAdmissions.map((id) => [id, mutation!.guard(id)]),
-      );
-      const allGuards = [...guards.values()],
-        allGuardSql = allGuards.length
-          ? allGuards.map((guard) => `(${guard.sql})`).join(" AND ")
-          : "1=1",
-        statements = [
-          env.DB.prepare(
-            `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,inventory_physical_json=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql} AND NOT EXISTS(SELECT 1 FROM json_each(?) volume WHERE NOT EXISTS(SELECT 1 FROM databases d WHERE d.id=json_extract(volume.value,'$.database_id') AND d.node_id=node_thin_storage.node_id AND d.generation=json_extract(volume.value,'$.generation') AND d.storage_generation=json_extract(volume.value,'$.storage_generation'))) AND (${allGuardSql})`,
-          ).bind(
-            composed.revision,
-            serialized,
-            received,
-            JSON.stringify(a.physical),
-            qualification,
-            writeAllowed ? "ready" : "blocked",
-            nodeId,
-            row.lease_revision,
-            row.authority_revision,
-            row.profile_revision,
-            heldOperations,
-            reportedVolumes,
-            ...allGuards.flatMap((guard) => guard.bindings),
-          ),
-        ];
-      for (const { database, storage, value } of receipts)
-        statements.push(
-          env.DB.prepare(
-            `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,
-          ).bind(
-            value,
-            database.id,
-            nodeId,
-            database.generation,
-            database.storage_generation,
-            storage.node_uid,
-            storage.pool_uuid,
-            value,
-            ...bindings,
-          ),
-        );
+    for (const { database, storage, value } of receipts)
       statements.push(
-        ...storageHoldVolumeStatements(env.DB, composed),
-        ...storageProtectionStatements(env.DB, composed, guards),
+        env.DB.prepare(
+          `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,
+        ).bind(
+          value,
+          database.id,
+          nodeId,
+          database.generation,
+          database.storage_generation,
+          storage.node_uid,
+          storage.pool_uuid,
+          value,
+          ...bindings,
+        ),
       );
-      return mutation ? mutation.batch(statements) : env.DB.batch(statements);
-    };
-    const results = protectedAdmissions.length
-      ? await withAdmissionMutation(env, protectedAdmissions, execute)
-      : await execute();
+    statements.push(...storageHoldVolumeStatements(env.DB, composed));
+    const results = await env.DB.batch(statements);
     if (results[0]!.meta.changes === 1) {
       // From the lease's issue to the acceptance: the executor's turn as the control plane saw it.
       console.log(
@@ -1229,8 +1039,6 @@ async function acceptIdentityProof(
           "boot_id",
           "configuration_boot_id",
           "error_code",
-          "lease_sample_observed_at",
-          "lease_sample_data_used_bytes",
         ] as const
       ).some((field) => after[field] !== validated[field])
     )
@@ -1391,30 +1199,10 @@ export async function issueThinStorageTransport(
 
 /** Ask the node's NodeBootstrap for an identity turn now instead of at its cadence. The starts that
  * wait for it, if any, supersede a running turn that read their databases before they began. */
-export async function requestThinStorageTurn(
-  env: Env,
-  nodeId: string,
-  waiting: readonly { database_id: string; generation: number }[] = [],
-) {
+export async function requestThinStorageTurn(env: Env, nodeId: string) {
   await env.NODE_BOOTSTRAP.get(
     env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
-  ).thinStorageDue(nodeId, waiting);
-}
-/** A thin database just placed on a node, or starting there again, needs the node's next identity
- * proof: only a proof reads a new volume into its receipt or measures the Pod writing to it, and the
- * first write token waits for that. Ask for the turn now instead of at the next cadence. */
-export async function requestThinStorageTurnsFor(
-  env: Env,
-  databaseIds: readonly string[],
-) {
-  if (databaseIds.length === 0) return;
-  const nodes = await env.DB.prepare(
-    "SELECT DISTINCT d.node_id FROM databases d JOIN node_thin_storage t ON t.node_id=d.node_id WHERE d.id IN(SELECT value FROM json_each(?)) AND d.storage_profile_json IS NOT NULL",
-  )
-    .bind(JSON.stringify(databaseIds))
-    .all<{ node_id: string }>();
-  for (const { node_id } of nodes.results)
-    await requestThinStorageTurn(env, node_id).catch(() => undefined);
+  ).thinStorageDue(nodeId);
 }
 export async function processNodeThinStorage(env: Env, nodeId: string) {
   const input = await prepareThinStorageLease(env, nodeId);

@@ -39,9 +39,6 @@ export async function cleanupFixtures(): Promise<void> {
         "DELETE FROM thin_storage_qualification_runs WHERE region_id IN(?,?)",
       ).bind(region, foreign),
       env.DB.prepare(
-        "UPDATE databases SET storage_protected_operation=NULL WHERE project_id IN(?,?)",
-      ).bind(project, other),
-      env.DB.prepare(
         "DELETE FROM fleet_patch_operations WHERE bootstrap_operation_id IN(SELECT operation_id FROM node_bootstrap_jobs WHERE region_id IN(?,?))",
       ).bind(region, foreign),
       env.DB.prepare(

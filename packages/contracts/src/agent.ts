@@ -3,7 +3,6 @@ import { z } from "zod";
 import { DatabaseRuntimeAttestation } from "./reclaim.ts";
 import { DatabaseAdmissionIntent } from "./database-admission.ts";
 import { ComputePoolPolicy } from "./compute-pool.ts";
-import { ParkedObservation, ParkedTierPolicy } from "./parked-tier.ts";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
@@ -12,11 +11,8 @@ import { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 import { NodeStorageSample } from "./node-physical-storage.ts";
 import {
   DesiredDatabaseStorage,
-  DesiredStorageStartup,
   NodeThinStorageAuthority,
 } from "./database-storage.ts";
-import { STORAGE_AUTHORITY_MAX_LENGTH } from "./storage-write-authority.ts";
-import { ThinStorageSampleTarget } from "./node-thin-storage.ts";
 export {
   DesiredDatabaseStorage,
   DesiredStorageStartup,
@@ -28,7 +24,6 @@ export {
   ThinStorageProfile,
   thinStorageAuthorityMatches,
   thinStorageInventory,
-  thinStorageSamplePeriodMilliseconds,
   thinStorageVolumeReclaimed,
   thinStorageClass,
   thinStorageClassObject,
@@ -279,9 +274,6 @@ export const DesiredDatabase = z
     pg_major: z.literal(PG_MAJOR),
     postgres: DesiredPostgres.optional(),
     storage: DesiredDatabaseStorage.optional(),
-    /** CF-only signed, short-lived write gate; never part of power/configuration fingerprints. */
-    storage_authority: z.string().max(STORAGE_AUTHORITY_MAX_LENGTH).optional(),
-    storage_startup: DesiredStorageStartup.optional(),
     size: DesiredSize,
     roles: z
       .array(z.union([DesiredRole, DesiredRoleRemoval]))
@@ -429,19 +421,8 @@ export const DesiredRegion = z.strictObject({
   id: RegionId,
   /** Current authoritative region pool template, including assigned per-Pod overhead. */
   compute_pool: ComputePoolPolicy.nullable().optional(),
-  /** The region's idle-sleep parking policy, present whenever one is set (enabled or not). */
-  parking: ParkedTierPolicy.optional(),
   /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
   storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
-  /** Nodes whose controller posts headroom samples, each once; omitted while none is selected. */
-  storage_samples: z
-    .array(ThinStorageSampleTarget)
-    .max(1000)
-    .refine(
-      (rows) => new Set(rows.map((row) => row.node_id)).size === rows.length,
-      { message: "Each node is sampled once" },
-    )
-    .optional(),
   /** Authenticated target-region-only source-read custody; omission preserves legacy installations. */
   recovery_sources: RecoverySourceCredentialsMap.optional(),
   backup: z.strictObject({
@@ -637,8 +618,6 @@ export const DatabaseObservation = z
         revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
         state: z.enum(["hibernated", "awake"]),
         refusal: z.enum(["busy", "archive", "unknown"]).optional(),
-        /** A hibernated observation whose instance Pod is still alive with PostgreSQL stopped. */
-        parked: ParkedObservation.optional(),
       })
       .optional(),
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
@@ -706,13 +685,6 @@ export const DatabaseObservation = z
         message: "Refusal requires an awake error observation",
       });
     if (
-      db.power?.parked &&
-      (db.state !== "hibernated" ||
-        db.power.state !== "hibernated" ||
-        db.power.refusal)
-    )
-      parkedObservationIssue(ctx);
-    if (
       (db.state === "hibernated" && !db.power) ||
       (db.power &&
         (db.power.revision !== db.generation ||
@@ -726,13 +698,6 @@ export const DatabaseObservation = z
       });
   });
 export type DatabaseObservation = z.infer<typeof DatabaseObservation>;
-function parkedObservationIssue(ctx: z.RefinementCtx): void {
-  ctx.addIssue({
-    code: "custom",
-    path: ["power", "parked"],
-    message: "A parked Pod is reported only with a hibernated observation",
-  });
-}
 
 /** A namespace labelled `pgcf.io/database-id` that desired state does not name; reported, never deleted. */
 export const Orphan = z.strictObject({

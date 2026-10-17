@@ -266,7 +266,7 @@ qualification receipt, and retained thick volumes keep their quota debit.
 
 `pgcf-lvm` stays the thick StorageClass for retained volumes and is never switched in place.
 Thin volumes use a separate StorageClass per qualified profile that the Native executor creates
-when it activates a node's thin selection ([recovery](../../docs/operations/recovery.md#thin-storage-admission-and-protective-recovery)).
+when it activates a node's thin selection ([recovery](../../docs/operations/recovery.md#thin-storage-admission-and-recovery)).
 The pinned [driver implementation](https://github.com/openebs/lvm-localpv/blob/e8a234cbfeef5fa16fde1330c8de2d91e31831f1/pkg/lvm/lvm_util.go)
 creates `pgcf_thinpool` from the first thin volume's requested size and does not implement
 automatic pool growth, so the executor initializes the pool with explicit sizing and grows it

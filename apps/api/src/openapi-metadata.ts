@@ -608,11 +608,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read current signed host storage guard state",
     "agent",
   ),
-  "POST /agent/v1/nodes/{id}/storage-headroom": route(
-    "reportAgentStorageHeadroom",
-    "Submit a nonce-bound physical storage headroom sample",
-    "agent",
-  ),
   "GET /agent/v1/nodes/{id}/reclaim": route(
     "getAgentReclaimIntents",
     "Read current qualified memory reclaim intents",

@@ -263,16 +263,6 @@ export function thinVolumeAttributesClassObject(
 export const THIN_INVENTORY_MAX_SECONDS = 300;
 /** The next identity proof is due this long after the last accepted one. */
 export const THIN_INVENTORY_INTERVAL_SECONDS = 60;
-/** Cloudflare's headroom sample period for a guard: guard_seconds × 200 ms (2 s at a 10 s guard). */
-export function thinStorageSamplePeriodMilliseconds(guardSeconds: number) {
-  if (
-    !Number.isSafeInteger(guardSeconds) ||
-    guardSeconds < 1 ||
-    guardSeconds > 120
-  )
-    throw new Error("invalid_thin_guard_seconds");
-  return guardSeconds * 200;
-}
 
 export const NodeThinStorageAuthority = z
   .strictObject({
@@ -305,6 +295,10 @@ export const NodeThinStorageAuthority = z
     inventory_expires_at: z.iso.datetime().optional(),
     inventory_revision: z.number().int().positive().optional(),
     write_allowed: z.boolean(),
+    /** Cloudflare's thin pool reserve rule for this node now: true when its fresh physical sample
+     * leaves the profile's data and metadata reserve free. No database starts or attaches on a
+     * node without room; running writers are never stopped for it. Absent from an executor report. */
+    room: z.boolean().optional(),
     physical: NodePhysicalStorage,
     /** Complete fresh VG inventory, including internal and unknown LVs; absence is physical evidence. */
     physical_lvs: z

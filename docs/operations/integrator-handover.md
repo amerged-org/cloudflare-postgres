@@ -589,7 +589,7 @@ Measured wake times through Cloudflare (standard runtime, CNPG hibernation):
 
 **The sub-second goal is not met.** The path to it is the parked sleep tier: after an idle sleep
 the database's instance Pod stays and only PostgreSQL stops, so the next connection unfences the
-Pod instead of creating a new one ([design](../architecture/parked-instances.md)). It is
+Pod instead of creating a new one (replaced by the [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design)). It is
 implemented and not measured (Go-live path: *Sub-second wake*); the design budgets 1.3 to 2.2 s
 for the first implementation and about 1.1 to 1.2 s with direct SQL readiness, so below 1 s needs
 further removals. A demoted (fully hibernated) database takes the 8.1–9.4 s wake. PGCF publishes the result only in the ULTRA plan's Done table, as the

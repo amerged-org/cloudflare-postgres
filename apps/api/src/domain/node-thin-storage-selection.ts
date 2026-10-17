@@ -205,7 +205,7 @@ export async function configureNodeThinStorage(
     // The next lease keeps the dispatched action, which Native confirms by readback or refuses.
     const retried = await env.DB.batch([
       env.DB.prepare(
-        `UPDATE node_thin_storage SET status='selected',error_code=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL WHERE node_id=? AND profile_revision=? AND lease_revision=? AND action_json=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now'))
+        `UPDATE node_thin_storage SET status='selected',error_code=NULL WHERE node_id=? AND profile_revision=? AND lease_revision=? AND action_json=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now'))
        AND EXISTS(SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")})`,
       ).bind(
         nodeId,
@@ -331,7 +331,7 @@ export async function configureNodeThinStorage(
   const next = body.expected_revision + 1;
   const statement = old
     ? env.DB.prepare(
-        `UPDATE node_thin_storage SET profile_revision=?,profile_sha256=?,profile_json=?,address=?,material_revision=?,qualified_driver_image=?,allow_new_databases=?,status='selected',error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL,inventory_physical_json=NULL,updated_at=?
+        `UPDATE node_thin_storage SET profile_revision=?,profile_sha256=?,profile_json=?,address=?,material_revision=?,qualified_driver_image=?,allow_new_databases=?,status='selected',error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL,inventory_physical_json=NULL,updated_at=?
     WHERE (node_id=? AND profile_revision=? AND node_uid=? AND cluster_uid=? AND volume_group_uuid=?)
       AND (profile_json=? AND profile_sha256=? AND COALESCE(json_extract(authority_json,'$.inventory_revision'),json_extract(authority_json,'$.revision')) IS ? AND action_json IS ? AND lease_revision=?)
       AND (error_code IS ? AND qualification_json IS ? AND material_revision=? AND address=? AND qualified_driver_image IS ?)

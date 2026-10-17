@@ -10,7 +10,6 @@ import {
 import {
   databaseStorageStartupSql,
   coveredStorageHoldSql,
-  type StartReading,
 } from "./storage-capacity.ts";
 const maximumInteger = Number.MAX_SAFE_INTEGER;
 const mib = 1024 * 1024;
@@ -63,49 +62,10 @@ export function databaseCpuChargeSql(
   const database = identifier(databaseAlias),
     size = identifier(sizeAlias);
   const sleeping = stoppedSleeperSql(database, acceptingStopInCurrentBatch);
-  const protectedStop = `(${database}.desired_state='running' AND ${database}.deleted_at IS NULL
-    AND ${database}.observed_power='hibernated' AND ${database}.observed_generation=${database}.generation)
-    AND (${database}.storage_profile_json IS NOT NULL AND ${database}.storage_volume_json IS NOT NULL
-    AND ${database}.storage_protected_at IS NOT NULL AND ${database}.storage_protected_generation=${database}.generation)
-    AND EXISTS(SELECT 1 FROM nodes stopped_node WHERE stopped_node.id=${database}.node_id
-      AND stopped_node.node_uid=json_extract(${database}.storage_profile_json,'$.node_uid') AND stopped_node.lost_at IS NULL)
-    AND EXISTS(SELECT 1 FROM operations protected_operation WHERE protected_operation.id=${database}.storage_protected_operation
-      AND protected_operation.database_id=${database}.id AND protected_operation.project_id=${database}.project_id
-      AND protected_operation.generation<=${database}.generation)`;
-  return `(CASE WHEN (${sleeping}) OR (${protectedStop}) THEN 0
+  return `(CASE WHEN (${sleeping}) THEN 0
     ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END)`;
 }
 
-/**
- * The scheduling request of the Pod a parked database still holds, on top of `databaseCpuChargeSql`
- * (which stays 0 for it, so every "confirmed cold" predicate keeps its meaning). It applies only to
- * a confirmed stopped sleeper with the controller's hint, and an unusable hint charges the full
- * request: the node is never reported freer than it may be.
- */
-export function databaseParkedCpuSql(
-  databaseAlias = "d",
-  sizeAlias = "s",
-  acceptingStopInCurrentBatch = false,
-): string {
-  const database = identifier(databaseAlias),
-    size = identifier(sizeAlias),
-    parked = `json_extract(${database}.parked_json,'$.cpu_millicores')`;
-  return `(CASE WHEN ${database}.parked_json IS NOT NULL AND (${stoppedSleeperSql(database, acceptingStopInCurrentBatch)})
-    THEN CASE WHEN json_extract(${database}.parked_json,'$.v')=1 AND typeof(${parked})='integer' AND ${parked}>=0 THEN ${parked}
-      ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END
-    ELSE 0 END)`;
-}
-
-/**
- * The Pods that parked databases of this node still hold. A separate sibling term, never nested in
- * the charge sum: D1 allows an expression tree of depth 100 and the resize statement that embeds
- * the node headroom is exactly that deep, so the sum of charges must stay untouched.
- */
-function parkedNodeCpuSql(node: string, excluded: string): string {
-  return `COALESCE((SELECT SUM(${databaseParkedCpuSql("parked_database", "parked_size")})
-        FROM databases parked_database JOIN size_classes parked_size ON parked_size.id=parked_database.size_class_id
-        WHERE parked_database.node_id=${node}.id AND parked_database.parked_json IS NOT NULL ${excluded.replaceAll("cpu_database", "parked_database")}),0)`;
-}
 /** Every start competes in the same atomic SQL budget, including waking an existing database. */
 export function nodeCpuHeadroomSql(
   nodeAlias = "n",
@@ -131,7 +91,7 @@ export function nodeCpuHeadroomSql(
       -COALESCE((SELECT SUM(${databaseCpuChargeSql("cpu_database", "cpu_size")})
         FROM databases cpu_database JOIN size_classes cpu_size ON cpu_size.id=cpu_database.size_class_id
         WHERE cpu_database.node_id=${node}.id AND cpu_database.observed_state<>'deleted' ${excluded}),0)
-      >=${targetCharge}+${parkedNodeCpuSql(node, excluded)}
+      >=${targetCharge}
     AND typeof(${computePoolOverheadSql(node, "cpu_millicores")})='integer'
     AND ${computePoolOverheadSql(node, "cpu_millicores")} BETWEEN 0 AND ${maximumInteger})`;
 }
@@ -184,13 +144,12 @@ export function startupHeadroomSql(nodeAlias = "n", sizeAlias = "s"): string {
 
 export function databaseStartupHeadroomSql(
   databaseAlias = "databases",
-  reading: StartReading = "current",
 ): string {
   const database = identifier(databaseAlias);
   return `EXISTS(
     SELECT 1 FROM nodes n JOIN size_classes s ON s.id=${database}.size_class_id
     WHERE n.id=${database}.node_id AND n.region_id=${database}.region_id
-      AND ${nodeCpuHeadroomSql("n", "s", database)} AND ${startupHeadroomSql()} AND ${databaseStorageStartupSql(database, "n", "s", reading)})`;
+      AND ${nodeCpuHeadroomSql("n", "s", database)} AND ${startupHeadroomSql()} AND ${databaseStorageStartupSql(database, "n", "s")})`;
 }
 
 /** Append after the admitted database mutation and its operation INSERT in the same D1 batch.

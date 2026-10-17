@@ -7,12 +7,7 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
-import {
-  DesiredResponse,
-  ThinStorageProfile,
-  newOperationId,
-} from "@pgcf/contracts";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
+import { ThinStorageProfile, newOperationId } from "@pgcf/contracts";
 import {
   FleetReleaseSpec,
   type FleetReleaseComponent,
@@ -25,7 +20,6 @@ import {
   thinStorageQualificationFromRun,
   type ThinQualificationGates,
   type ThinQualificationRun,
-  type ThinQualificationSetup,
 } from "@pgcf/contracts/thin-qualification";
 import { createApp } from "../../src/app.ts";
 import { NodeBootstrap } from "../../src/bootstrap-container.ts";
@@ -49,7 +43,6 @@ import {
   prepareThinQualificationTurn,
   recordThinQualificationCheckpoint,
   recordThinQualificationReport,
-  thinQualificationInput,
 } from "../../src/domain/thin-qualification.ts";
 
 const releases: string[] = [];
@@ -287,7 +280,7 @@ async function qualificationSetup(sampling = true) {
     },
   };
 }
-it("refuses qualification and hides its targets before the sampling release converges", async () => {
+it("refuses qualification before the sampling release converges", async () => {
   const f = await qualificationSetup(false);
   expect(
     (await f.start({ node_uid: f.uid, address: "192.0.2.18", profile })).status,
@@ -300,15 +293,6 @@ it("refuses qualification and hides its targets before the sampling release conv
     at: new Date().toISOString(),
   });
   await insertRunning(f, "data_full", material.setup);
-  await env.DB.prepare(
-    "UPDATE node_region_policies SET compute_pool_json=NULL WHERE region_id=?",
-  )
-    .bind(f.region)
-    .run();
-  const old = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  expect(old.region).not.toHaveProperty("storage_samples");
 });
 async function insertRunning(
   f: Awaited<ReturnType<typeof qualificationSetup>>,
@@ -425,107 +409,15 @@ async function journalConfirmed(id: string, key: string) {
   });
 }
 /** The controller's headroom sample of the run's node, witnessed by the run's setup identity. */
-function qualificationSample(
-  f: Awaited<ReturnType<typeof qualificationSetup>>,
-  setup: ThinQualificationSetup,
-  nonce: string | null,
-  witnesses: object = {},
-) {
-  return {
-    nonce,
-    qualification_run: f.samplingRunId,
-    node_uid: f.uid,
-    captured_at: new Date().toISOString(),
-    physical: {
-      volume_group_uuid: setup.identity.volume_group_uuid,
-      total_bytes: setup.identity.volume_group_bytes,
-      free_bytes: setup.volume_group_free_bytes,
-      thick_allocated_bytes: setup.thick.thick_allocated_bytes,
-      thin_pool: null,
-    },
-    lvs: [],
-    lv_count: 0,
-    witnesses: {
-      cluster_uid: setup.identity.cluster_uid,
-      boot_id: setup.identity.boot_id,
-      volume_group_uuid: setup.identity.volume_group_uuid,
-      driver_pod_uid: setup.identity.driver_pod_uid,
-      driver_image: setup.identity.driver_image,
-      ...witnesses,
-    },
-    scrape_milliseconds: 250,
-  };
-}
-async function postSample(
-  f: Awaited<ReturnType<typeof qualificationSetup>>,
-  body: unknown,
-) {
-  const response = await request(
-    `/agent/v1/nodes/${f.node}/storage-headroom`,
-    f.agent,
-    "POST",
-    body,
-  );
-  expect(response.status).toBe(200);
-  return NodeStorageHeadroomResponse.parse(await response.json());
-}
-it("refuses an implicit product sample during qualification before handing out a qualification nonce", async () => {
-  const f = await qualificationSetup(),
-    setup = thinQualificationFixture(profile, {
-      node_uid: f.uid,
-      cluster_uid: f.clusterUid,
-      host_extension_image: hostImage,
-      kernel_version: "6.18.51-talos",
-      at: new Date().toISOString(),
-    }).setup,
-    id = await insertRunning(f, "noflush_quiescence", setup);
-  const before = await run(id);
-  const { qualification_run: context, ...legacy } = qualificationSample(
-    f,
-    setup,
-    null,
-  );
-  expect(context).toBe(id);
-  const response = await request(
-    `/agent/v1/nodes/${f.node}/storage-headroom`,
-    f.agent,
-    "POST",
-    legacy,
-  );
-  expect(response.status).toBe(409);
-  expect(await run(id)).toEqual(before);
-  const product = await request(
-    `/agent/v1/nodes/${f.node}/storage-headroom`,
-    f.agent,
-    "POST",
-    { ...legacy, qualification_run: null },
-  );
-  expect(product.status).toBe(409);
-  expect(await run(id)).toEqual(before);
-  const stale = await request(
-    `/agent/v1/nodes/${f.node}/storage-headroom`,
-    f.agent,
-    "POST",
-    {
-      ...qualificationSample(f, setup, null),
-      qualification_run: `op_${"q".repeat(20)}`,
-    },
-  );
-  expect(stale.status).toBe(409);
-  expect(await run(id)).toEqual(before);
-});
 /** One accepted sample: a first nonce, then the scrape that answers it. */
-async function sampled(
-  f: Awaited<ReturnType<typeof qualificationSetup>>,
-  setup: ThinQualificationSetup,
-) {
-  const first = await postSample(f, qualificationSample(f, setup, null));
-  const accepted = await postSample(
-    f,
-    qualificationSample(f, setup, first.nonce),
-  );
-  expect(accepted).toMatchObject({ accepted: true, authority: null });
-  return accepted;
+/** One sample of the run's node as the qualification's sample table holds it. */
+async function recordedSample(id: string) {
+  const at = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds) VALUES(?,?,?,?,1)",
+  )
+    .bind(id, crypto.randomUUID().replaceAll("-", ""), at, at)
+    .run();
 }
 async function unleased(f: Awaited<ReturnType<typeof qualificationSetup>>) {
   const id = await insertRunning(f, "setup");
@@ -962,11 +854,11 @@ it("decides every gate from its evidence and seals the receipt only after verifi
   ] as const) {
     await renewLease(id);
     if (gate === "noflush_quiescence" || gate === "startup_bound") {
-      // Cloudflare measures its own accepted samples inside the journaled window.
+      // The gate judges the samples recorded inside its journaled window.
       const [from, to] = THIN_QUALIFICATION_SAMPLE_WINDOWS[gate];
       await journalConfirmed(id, from);
-      await sampled(f, sample.setup);
-      await sampled(f, sample.setup);
+      await recordedSample(id);
+      await recordedSample(id);
       await journalConfirmed(id, to);
     }
     await recordThinQualificationReport(env, id, {
@@ -1235,337 +1127,4 @@ it("ends the measurements when database placement reopens during a run and still
   expect(await prepareThinQualificationTurn(env, id, "cleanup")).toMatchObject({
     run: { id, step: "cleanup" },
   });
-});
-
-it("records a running qualification's samples against its setup identity and renews nothing", async () => {
-  const observation = vi.spyOn(console, "log").mockImplementation(() => {});
-  const f = await qualificationSetup(),
-    setup = thinQualificationFixture(profile, {
-      node_uid: f.uid,
-      cluster_uid: f.clusterUid,
-      host_extension_image: hostImage,
-      kernel_version: "6.18.51-talos",
-      at: new Date().toISOString(),
-    }).setup;
-  // Desired state serializes a real pool template or none; the fixture's placeholder is neither.
-  await env.DB.prepare(
-    "UPDATE node_region_policies SET compute_pool_json=NULL WHERE region_id=?",
-  )
-    .bind(f.region)
-    .run();
-  // Before setup there is no identity to check samples against.
-  const pending = await insertRunning(f, "setup");
-  const desired = async () =>
-    DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    ).region.storage_samples;
-  expect(await desired()).toBeUndefined();
-  await env.DB.prepare(
-    "UPDATE thin_storage_qualification_runs SET status='failed',step='complete',lease_id=NULL,lease_expires_at=NULL,completed_at=? WHERE id=?",
-  )
-    .bind(new Date().toISOString(), pending)
-    .run();
-  const id = await insertRunning(f, "noflush_quiescence", setup);
-  expect(await desired()).toEqual([
-    {
-      node_id: f.node,
-      name: f.nodeName,
-      node_uid: f.uid,
-      period_milliseconds: profile.guard_seconds * 200,
-      qualification_run: id,
-    },
-  ]);
-  await journalConfirmed(id, "noflush_quiescence:suspend");
-  const first = await postSample(f, qualificationSample(f, setup, null));
-  expect(first).toMatchObject({
-    accepted: false,
-    reason: "thin_storage_sample_nonce_invalid",
-    period_milliseconds: profile.guard_seconds * 200,
-  });
-  const issued = String((await run(id)).sample_nonce_issued_at);
-  const accepted = await postSample(
-    f,
-    qualificationSample(f, setup, first.nonce),
-  );
-  expect(accepted).toMatchObject({
-    accepted: true,
-    reason: null,
-    authority: null,
-    tokens: [],
-  });
-  const recorded = await env.DB.prepare(
-    "SELECT nonce,observed_at,received_at,scrape_milliseconds FROM thin_storage_qualification_samples WHERE run_id=?",
-  )
-    .bind(id)
-    .all<{
-      nonce: string;
-      observed_at: string;
-      received_at: string;
-      scrape_milliseconds: number;
-    }>();
-  expect(recorded.results).toHaveLength(1);
-  expect(recorded.results[0]).toMatchObject({
-    nonce: first.nonce,
-    observed_at: issued,
-    scrape_milliseconds: 250,
-  });
-  expect(recorded.results[0]!.received_at >= issued).toBe(true);
-  // A witness the setup did not read, or a reused nonce, records nothing.
-  expect(
-    await postSample(
-      f,
-      qualificationSample(f, setup, accepted.nonce, {
-        driver_pod_uid: crypto.randomUUID(),
-      }),
-    ),
-  ).toMatchObject({
-    accepted: false,
-    reason: "thin_storage_sample_witness_changed",
-  });
-  expect(
-    await postSample(f, qualificationSample(f, setup, first.nonce)),
-  ).toMatchObject({
-    accepted: false,
-    reason: "thin_storage_sample_nonce_invalid",
-  });
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
-    )
-      .bind(id)
-      .first<number>("n"),
-  ).toBe(1);
-  // An ended run's evidence never changes.
-  await env.DB.prepare(
-    "UPDATE thin_storage_qualification_runs SET status='failed',step='complete',lease_id=NULL,lease_expires_at=NULL,completed_at=? WHERE id=?",
-  )
-    .bind(new Date().toISOString(), id)
-    .run();
-  await expect(
-    env.DB.prepare(
-      "INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds) VALUES(?,?,?,?,1)",
-    )
-      .bind(id, "f".repeat(32), issued, issued)
-      .run(),
-  ).rejects.toThrow("thin_storage_qualification_terminal");
-  expect(
-    observation.mock.calls.some(([value]) => {
-      if (typeof value !== "string") return false;
-      const event = JSON.parse(value) as Record<string, unknown>;
-      return (
-        event.event === "thin_storage_sample_accepted" &&
-        event.node_id === f.node
-      );
-    }),
-  ).toBe(false);
-});
-
-it("records qualification samples only inside a journaled window with an active turn lease", async () => {
-  const f = await qualificationSetup(),
-    setup = thinQualificationFixture(profile, {
-      node_uid: f.uid,
-      cluster_uid: f.clusterUid,
-      host_extension_image: hostImage,
-      kernel_version: "6.18.51-talos",
-      at: new Date().toISOString(),
-    }).setup,
-    id = await insertRunning(f, "noflush_quiescence", setup);
-  const count = () =>
-    env.DB.prepare(
-      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
-    )
-      .bind(id)
-      .first<number>("n");
-
-  await sampled(f, setup);
-  expect(await count()).toBe(0);
-  await journalConfirmed(id, "noflush_quiescence:suspend");
-  await sampled(f, setup);
-  expect(await count()).toBe(1);
-
-  await env.DB.prepare(
-    "UPDATE thin_storage_qualification_runs SET lease_expires_at=? WHERE id=?",
-  )
-    .bind(new Date(Date.now() - 1000).toISOString(), id)
-    .run();
-  await sampled(f, setup);
-  expect(await count()).toBe(1);
-
-  await renewLease(id);
-  await journalConfirmed(id, "noflush_quiescence:frozen");
-  await sampled(f, setup);
-  expect(await count()).toBe(1);
-});
-
-it("does not judge a startup sample answered after the bulk load as evidence during the load", async () => {
-  const f = await qualificationSetup(),
-    evidence = thinQualificationFixture(profile, {
-      node_uid: f.uid,
-      cluster_uid: f.clusterUid,
-      host_extension_image: hostImage,
-      kernel_version: "6.18.51-talos",
-      at: new Date().toISOString(),
-    }),
-    id = await insertRunning(f, "startup_bound", evidence.setup);
-  await journalConfirmed(id, "startup_bound:ready");
-  const first = await postSample(
-      f,
-      qualificationSample(f, evidence.setup, null),
-    ),
-    issued = String((await run(id)).sample_nonce_issued_at);
-  await journalConfirmed(id, "startup_bound:loaded");
-  expect(
-    await postSample(f, qualificationSample(f, evidence.setup, first.nonce)),
-  ).toMatchObject({ accepted: true, authority: null, tokens: [] });
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
-    )
-      .bind(id)
-      .first<number>("n"),
-  ).toBe(0);
-
-  // Existing evidence from before the window fix is filtered in the gate's SQL read too.
-  const journal = JSON.parse(String((await run(id)).journal_json)) as {
-    entries: { key: string; received_at: string }[];
-  };
-  const loaded = journal.entries.find(
-    (entry) => entry.key === "startup_bound:loaded",
-  )!;
-  await env.DB.prepare(
-    "INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds) VALUES(?,?,?,?,1)",
-  )
-    .bind(
-      id,
-      "d".repeat(32),
-      issued,
-      new Date(Date.parse(loaded.received_at) + 1).toISOString(),
-    )
-    .run();
-  await recordThinQualificationReport(env, id, {
-    step: "startup_bound",
-    evidence: observedPart(evidence.evidence.startup_bound),
-  });
-  const failed = await run(id);
-  expect(failed.error_code).toBe("thin_qualification_startup_bound_failed");
-  expect(
-    (JSON.parse(String(failed.gates_json)) as ThinQualificationGates)
-      .startup_bound?.evidence,
-  ).not.toHaveProperty("longest_sample_interval_milliseconds");
-});
-
-it("stops qualification sampling and measurement custody when its sampling release loses confirmation", async () => {
-  const f = await qualificationSetup(),
-    setup = thinQualificationFixture(profile, {
-      node_uid: f.uid,
-      cluster_uid: f.clusterUid,
-      host_extension_image: hostImage,
-      kernel_version: "6.18.51-talos",
-      at: new Date().toISOString(),
-    }).setup,
-    id = await insertRunning(f, "noflush_quiescence", setup);
-  await journalConfirmed(id, "noflush_quiescence:suspend");
-  const first = await postSample(f, qualificationSample(f, setup, null));
-  await env.DB.prepare(
-    "UPDATE fleet_patch_operations SET state='halted',error_code='patch_command_failed' WHERE node_id=?",
-  )
-    .bind(f.node)
-    .run();
-  const refusal = await thinQualificationInput(env, id).then(
-    () => null,
-    (error: Error) => error.message,
-  );
-  expect(refusal).toContain("lease or identity changed");
-  const response = await request(
-    `/agent/v1/nodes/${f.node}/storage-headroom`,
-    f.agent,
-    "POST",
-    qualificationSample(f, setup, first.nonce),
-  );
-  expect(response.status).toBe(404);
-  expect(await run(id)).toMatchObject({ sample_nonce: first.nonce });
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
-    )
-      .bind(id)
-      .first<number>("n"),
-  ).toBe(0);
-
-  await env.DB.prepare(
-    "UPDATE thin_storage_qualification_runs SET step='cleanup' WHERE id=?",
-  )
-    .bind(id)
-    .run();
-  expect(await thinQualificationInput(env, id)).toMatchObject({
-    run: { id, step: "cleanup" },
-  });
-});
-
-it("fails startup_bound without an accepted sample during the bulk load and judges noflush only while suspended", async () => {
-  const f = await qualificationSetup(),
-    evidence = thinQualificationFixture(profile, {
-      node_uid: f.uid,
-      cluster_uid: f.clusterUid,
-      host_extension_image: hostImage,
-      kernel_version: "6.18.51-talos",
-      at: new Date().toISOString(),
-    });
-  const id = await insertRunning(f, "noflush_quiescence", evidence.setup);
-  // A sample before the writer was suspended does not count.
-  await sampled(f, evidence.setup);
-  await journalConfirmed(id, "noflush_quiescence:suspend");
-  await journalConfirmed(id, "noflush_quiescence:frozen");
-  // Real D1 checkpoints may arrive in the same millisecond; give this empty window a
-  // deterministic positive duration without changing the product clock or waiting.
-  const journal = JSON.parse(String((await run(id)).journal_json)) as {
-    entries: { key: string; received_at: string }[];
-  };
-  const suspended = journal.entries.find(
-    (entry) => entry.key === "noflush_quiescence:suspend",
-  )!;
-  journal.entries.find(
-    (entry) => entry.key === "noflush_quiescence:frozen",
-  )!.received_at = new Date(
-    Date.parse(suspended.received_at) + 1,
-  ).toISOString();
-  await env.DB.prepare(
-    "UPDATE thin_storage_qualification_runs SET journal_json=? WHERE id=?",
-  )
-    .bind(JSON.stringify(journal), id)
-    .run();
-  const noflush = observedPart(evidence.evidence.noflush_quiescence);
-  expect(
-    await recordThinQualificationReport(env, id, {
-      step: "noflush_quiescence",
-      evidence: noflush,
-    }),
-  ).toMatchObject({ step: "cleanup" });
-  const ended = await run(id);
-  expect(ended.error_code).toBe("thin_qualification_noflush_quiescence_failed");
-  expect(
-    (JSON.parse(String(ended.gates_json)) as ThinQualificationGates)
-      .noflush_quiescence?.evidence.suspended_samples,
-  ).toBe(0);
-  await env.DB.prepare(
-    "UPDATE thin_storage_qualification_runs SET status='failed',step='complete',lease_id=NULL,lease_expires_at=NULL,completed_at=? WHERE id=?",
-  )
-    .bind(new Date().toISOString(), id)
-    .run();
-  const startup = await insertRunning(f, "startup_bound", evidence.setup);
-  await journalConfirmed(startup, "startup_bound:ready");
-  await journalConfirmed(startup, "startup_bound:loaded");
-  const observed = observedPart(evidence.evidence.startup_bound);
-  expect(
-    await recordThinQualificationReport(env, startup, {
-      step: "startup_bound",
-      evidence: observed,
-    }),
-  ).toMatchObject({ step: "cleanup" });
-  const failed = await run(startup);
-  expect(failed.error_code).toBe("thin_qualification_startup_bound_failed");
-  expect(
-    (JSON.parse(String(failed.gates_json)) as ThinQualificationGates)
-      .startup_bound?.evidence,
-  ).not.toHaveProperty("longest_sample_interval_milliseconds");
 });
