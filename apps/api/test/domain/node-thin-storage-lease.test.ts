@@ -90,14 +90,15 @@ it("permits every live thin database of the node through its startup window, nev
       drain: null,
     });
   }
-  // A deletion whose absence is not read yet keeps its volume and blocks writes; one the node's
+  // A deletion whose absence is not read yet stays a live writer with its volume; one the node's
   // fresh read found absent says so explicitly, and the guard may forget its scope.
   expect(entries.get(open.id)).toMatchObject({
-    desired_state: "deleted",
-    write_blocked: true,
+    generation: (await generationOf(open.id)) + 1,
+    desired_state: "running",
+    write_blocked: false,
     volume: open.receipt,
     runtime_authority: null,
-    startup_operation_id: null,
+    startup_operation_id: creation(await archiveOf(open.id)),
     drain: null,
   });
   expect(entries.get(reclaimed.id)).toMatchObject({
@@ -136,6 +137,63 @@ it("keeps every live permit while the node's reading is stale, denies writes or 
       runtime_authority: null,
       startup_operation_id: creation(await archiveOf(id)),
     });
+}, 60_000);
+
+it("serves a deletion the node has not read absent as a live writer, whatever the node's reading, so the guard never suspends its volume", async () => {
+  const node = await thinLeaseNode(await thinExecutionFixture(releases));
+  const open = await node.add({ kind: "deleted", confirmed: false });
+  const proof = await node.commit();
+  // The deletion's stop is still running.
+  await env.DB.prepare(
+    "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) VALUES(?,'database.delete','running',?,?,?,?,?)",
+  )
+    .bind(
+      `op_${"d".repeat(20)}`,
+      node.f.project,
+      open.id,
+      open.generation,
+      new Date().toISOString(),
+      new Date().toISOString(),
+    )
+    .run();
+  // The proof as an identity turn records it: read at its lease's issue, a 25 s turn ago, and
+  // valid one 10 s guard from that issue, so it has expired by the time it is accepted.
+  const issued = Date.now() - 25_000,
+    at = (ms: number) => new Date(ms).toISOString();
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_json=?,authority_received_at=? WHERE node_id=?",
+  )
+    .bind(
+      JSON.stringify({
+        ...proof,
+        observed_at: at(issued),
+        expires_at: at(issued + 10_000),
+        inventory_observed_at: at(issued),
+        inventory_expires_at: at(issued + 300_000),
+      }),
+      at(Date.now()),
+      node.f.node,
+    )
+    .run();
+  const lease = await node.lease();
+  expect(
+    lease.databases.find((entry) => entry.database_id === open.id),
+  ).toEqual({
+    database_id: open.id,
+    generation: open.generation + 1,
+    authority_revision: expect.any(Number),
+    write_blocked: false,
+    desired_state: "running",
+    node_uid: node.f.uid,
+    volume_group_uuid: node.f.authority.volume_group_uuid,
+    pool_uuid: node.f.authority.pool_uuid,
+    profile_sha256: node.f.authority.profile_sha256,
+    startup_expires_at: lease.expires_at,
+    startup_operation_id: creation(await archiveOf(open.id)),
+    volume: open.receipt,
+    runtime_authority: null,
+    drain: null,
+  });
 }, 60_000);
 
 it("names the same startup operation across sleeps and wakes, one generation past D1's", async () => {
@@ -212,7 +270,7 @@ it("names a deleted database only while a protective scope of it may still need 
       confirmed: true,
       confirmedAgo: 400 * 24 * 60 * minute,
     });
-  // A deletion the node has not read absent yet keeps its protection, however old it is.
+  // A deletion the node has not read absent yet stays a live writer, however old it is.
   const unconfirmed = await node.add({ kind: "deleted", confirmed: false });
   // A database that never had a volume bound never had a token: no guard holds a scope for it.
   const neverBound = await node.add({
@@ -240,8 +298,8 @@ it("names a deleted database only while a protective scope of it may still need 
       volume: null,
     });
   expect(entries.get(unconfirmed.id)).toMatchObject({
-    desired_state: "deleted",
-    write_blocked: true,
+    desired_state: "running",
+    write_blocked: false,
     volume: unconfirmed.receipt,
   });
   for (const gone of [beyond, ancient, neverBound, neverBoundConfirmed])
@@ -297,10 +355,11 @@ it("logs what each lease served: the counts and its time, never an entry's secre
     "tombstones",
     "unbound",
   ]);
-  // The held start of the fixture has no volume bound yet.
+  // The held start of the fixture has no volume bound yet; the unconfirmed deletion is still a
+  // live writer, so only the confirmed one is a tombstone.
   expect(line).toMatchObject({
     entries: lease.databases.length,
-    tombstones: 2,
+    tombstones: 1,
     unbound: 1,
   });
   expect(Number.isInteger(line.elapsed_ms)).toBe(true);

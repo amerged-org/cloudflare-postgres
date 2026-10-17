@@ -11,13 +11,7 @@ import type { Env } from "../env.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { allOf } from "./sql-conjunction.ts";
 import { hotLogDue } from "./log-sampling.ts";
-import {
-  currentStorageStopSql,
-  storageDrainReservationStatement,
-  thinPoolRoomSql,
-  thinPoolNodeRoomSql,
-  knownStorageHoldVolume,
-} from "./storage-capacity.ts";
+import { thinPoolNodeRoomSql } from "./storage-capacity.ts";
 
 export interface NodeThinStorageRow {
   node_id: string;
@@ -298,7 +292,7 @@ export const HOST_LEASE_TOMBSTONE_RETENTION_MS = 60 * 60_000;
  * signed scope of the guard may still exist for. A scope exists only for a database a token was
  * signed for, which needs a bound volume receipt (`currentWriterContext`), and it ends with the
  * guard's retirement, which the retention above covers. A deleted database's entry also stays
- * while its deletion is unconfirmed: it blocks writes and carries the delete drain.
+ * while its deletion is unconfirmed, served as a live writer.
  */
 function hostLeaseScope(
   nodeId: string,
@@ -315,10 +309,7 @@ function hostLeaseScope(
     ],
   };
 }
-type LeaseRow = DatabaseRow & {
-  host_snapshot_count: number;
-  stop_operation: string | null;
-};
+type LeaseRow = DatabaseRow & { host_snapshot_count: number };
 /** The operation that created a database's archive: one stable id per database, whatever its
  * generation, so the guard's startup-bound resume of a retained scope happens once. */
 function creationOperation(archivePath: string) {
@@ -330,8 +321,10 @@ function creationOperation(archivePath: string) {
  * the holder rule of the attach agent, never this lease, and no running writer is stopped for
  * storage. So every live thin database of the node is permitted through its startup window, and
  * one generation past D1's: the guard resumes a scope it retained once and carries no stale token
- * forward. Neither the node's reading, its write permission nor the database's sleep enters it.
- * Deleted databases keep their tombstone and delete drain until the guard retires them.
+ * forward. Neither the node's reading, its write permission, the database's sleep nor its
+ * deletion enters it: a deleted database stays a live writer until the node's fresh read finds its
+ * volume absent, and only then becomes the tombstone (deleted, writable, no volume) the guard
+ * retires its scope on. The guard never suspends a volume, which may hold another writer by then.
  */
 export async function hostStorageLease(
   c: import("../env.ts").ApiContext,
@@ -359,9 +352,7 @@ export async function hostStorageLease(
   const [current, read] = await Promise.all([
     readCurrentNodeThinStorage(c.env, id, now, false),
     c.env.DB.prepare(
-      `SELECT d.*,COUNT(*) OVER() host_snapshot_count,
- (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation,'status',stop.status) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
- FROM databases d WHERE ${scope.sql} ORDER BY d.id`,
+      `SELECT d.*,COUNT(*) OVER() host_snapshot_count FROM databases d WHERE ${scope.sql} ORDER BY d.id`,
     )
       .bind(...scope.bindings)
       .all<LeaseRow>(),
@@ -388,7 +379,6 @@ export async function hostStorageLease(
       "conflict",
       "Current qualified physical boot unavailable",
     );
-  const authority = current?.authority;
   const databases = [];
   const legacy = [];
   for (const row of rows) {
@@ -417,98 +407,49 @@ export async function hostStorageLease(
       profile_sha256: storage.profile_sha256,
       runtime_authority: null,
     };
-    if (row.desired_state !== "deleted") {
-      const startup = creationOperation(row.archive_path);
-      databases.push({
-        ...identity,
-        generation: row.generation + 1,
-        write_blocked: false,
-        desired_state: "running" as const,
-        startup_expires_at: startup ? expiresAt : null,
-        startup_operation_id: startup,
-        volume: receipt,
-        drain: null,
-      });
-      continue;
-    }
     // Tombstones are explicit: only completed deletion and a later complete Native absence
-    // read can declare no volume. Missing/paginated rows never authorize protective-scope GC.
-    // The absence read stays usable while its inventory is fresh, also once its short write
-    // authority lapsed: after the last thin LV CSI removes the pool, and nothing samples it.
+    // read can declare no volume. The absence read stays usable while its inventory is fresh,
+    // also once its short write authority lapsed: after the last thin LV CSI removes the pool.
     const reclaimed = Boolean(
+      row.desired_state === "deleted" &&
       row.deleted_at &&
       row.observed_state === "deleted" &&
       row.observed_generation === row.generation &&
       receipt &&
       thinStorageVolumeReclaimed(
         storage,
-        authority ?? current?.reclamation,
+        current?.authority ?? current?.reclamation,
         receipt.lv_uuid,
         Date.parse(row.deleted_at),
         now,
       ),
     );
-    const stop = row.stop_operation
-      ? (JSON.parse(row.stop_operation) as {
-          operation_id: string;
-          kind: "database.suspend" | "database.hibernate" | "database.delete";
-          generation: number;
-          status: string;
-        })
-      : undefined;
-    let drain:
-      import("@pgcf/contracts/node-thin-storage").HostStorageDrain | null =
-      null;
-    if (stop?.kind === "database.delete" && receipt && current && authority) {
-      await storageDrainReservationStatement(c.env.DB, {
-        databaseId: row.id,
-        operationId: stop.operation_id,
+    if (reclaimed) {
+      databases.push({
+        ...identity,
         generation: row.generation,
-        nodeId: id,
-        now: new Date(now).toISOString(),
-      }).run();
-      const hold = await c.env.DB.prepare(
-        `SELECT h.storage_budget_bytes,h.storage_volume_json FROM database_start_admissions h JOIN databases d ON d.id=h.database_id JOIN nodes n ON n.id=d.node_id JOIN size_classes s ON s.id=d.size_class_id JOIN operations stop ON stop.id=h.operation_id WHERE h.operation_id=? AND h.budget_bytes=0 AND h.generation=d.generation AND h.node_id=n.id AND h.node_uid=n.node_uid AND ${currentStorageStopSql()} AND ${thinPoolRoomSql("n", "s", "d")}`,
-      )
-        .bind(stop.operation_id)
-        .first<{
-          storage_budget_bytes: number;
-          storage_volume_json: string | null;
-        }>();
-      if (
-        hold &&
-        knownStorageHoldVolume({
-          binding: hold.storage_volume_json,
-          current: row.storage_volume_json ?? null,
-          profile: row.storage_profile_json,
-          storageGeneration: row.storage_generation ?? 1,
-          databaseId: row.id,
-          authority,
-          now,
-        }) !== null
-      ) {
-        drain = {
-          operation_id: stop.operation_id,
-          kind: stop.kind,
-          generation: stop.generation,
-          authority_revision: authority.revision,
-          expires_at: Math.min(
-            Date.parse(authority.expires_at),
-            now + current.profile.drain_seconds * 1000,
-          ),
-          budget_bytes: hold.storage_budget_bytes,
-        };
-      }
+        write_blocked: false,
+        desired_state: "deleted" as const,
+        startup_expires_at: null,
+        startup_operation_id: null,
+        volume: null,
+        drain: null,
+      });
+      continue;
     }
+    // Live, asleep or deleted with its volume still present: one writable shape. The controller's
+    // stop ends the writer of a sleep or a deletion; the guard never suspends the volume, which
+    // another Pod or a pool slot may be writing by now.
+    const startup = creationOperation(row.archive_path);
     databases.push({
       ...identity,
-      generation: row.generation,
-      write_blocked: drain !== null || !reclaimed,
-      desired_state: row.desired_state,
-      startup_expires_at: null,
-      startup_operation_id: null,
-      volume: reclaimed ? null : receipt,
-      drain,
+      generation: row.generation + 1,
+      write_blocked: false,
+      desired_state: "running" as const,
+      startup_expires_at: startup ? expiresAt : null,
+      startup_operation_id: startup,
+      volume: receipt,
+      drain: null,
     });
   }
   const lease = HostStorageLease.parse({

@@ -16,7 +16,6 @@ import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
   thinPoolRoomSql,
   storageHoldVolumeStatements,
-  storageDrainReservationStatement,
   thinStorageDeletionConfirmedSql,
 } from "../../src/domain/storage-capacity.ts";
 import {
@@ -767,7 +766,7 @@ it("a ready thin startup retains its quota runway until later Native proof inclu
   expect((await release()).meta.changes).toBe(1);
 }, 15000);
 
-it("a 4 GiB tenant with a frozen volume drains a real delete intent with zero additional RAM and no startup grant, and a suspend never drains", async () => {
+it("a 4 GiB tenant's sleep and deletion never drain or reserve a hold: the lease keeps the frozen volume a running writer until it is read absent", async () => {
   const f = await thinFixture(8 * gib, 8 * gib);
   await env.DB.prepare("UPDATE size_classes SET memory_mib=4096 WHERE id=?")
     .bind(f.size)
@@ -855,39 +854,6 @@ it("a 4 GiB tenant with a frozen volume drains a real delete intent with zero ad
       .bind(stop.operation.id)
       .first(),
   ).toBeNull();
-  await storageDrainReservationStatement(env.DB, {
-    databaseId: created.database.id,
-    operationId: created.operation.id,
-    generation: 2,
-    nodeId: f.node,
-    now: new Date().toISOString(),
-  }).run();
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(created.database.id)
-      .first("n"),
-  ).toBe(1);
-  const wrong = NodeThinStorageAuthority.parse({
-    ...a,
-    revision: 4,
-    physical_lvs: a.physical_lvs.map((v) => ({
-      ...v,
-      lv_uuid: "OTHERX-1234-1234-1234-1234-1234-ABCDEF",
-    })),
-    active_lv_uuids: ["OTHERX-1234-1234-1234-1234-1234-ABCDEF"],
-    volumes: a.volumes.map((v) => ({
-      ...v,
-      lv_uuid: "OTHERX-1234-1234-1234-1234-1234-ABCDEF",
-    })),
-  });
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET authority_revision=4,authority_json=? WHERE node_id=?",
-  )
-    .bind(JSON.stringify(wrong), f.node)
-    .run();
-  expect((await host()).databases[0]!.drain).toBeNull();
   await accepted(f, a);
   const deleted = DatabaseWithOperation.parse(
     await (
@@ -906,15 +872,12 @@ it("a 4 GiB tenant with a frozen volume drains a real delete intent with zero ad
     revision: 5,
     volumes: a.volumes.map((v) => ({ ...v, generation: 3 })),
   });
+  // Not read absent yet: the deletion stays a running writer, with no drain and no hold.
   expect((await host()).databases[0]!).toMatchObject({
-    desired_state: "deleted",
-    startup_operation_id: null,
+    desired_state: "running",
+    startup_operation_id: created.operation.id,
     runtime_authority: null,
-    drain: {
-      operation_id: deleted.operation.id,
-      kind: "database.delete",
-      budget_bytes: 5 * gib,
-    },
+    drain: null,
   });
   expect(
     await env.DB.prepare(
@@ -923,24 +886,13 @@ it("a 4 GiB tenant with a frozen volume drains a real delete intent with zero ad
       .bind(created.database.id)
       .first("n"),
   ).toBe(memoryBefore);
-  const expired = {
-    ...a,
-    observed_at: new Date(Date.now() - 30000).toISOString(),
-    expires_at: new Date(Date.now() - 1).toISOString(),
-  };
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET authority_json=? WHERE node_id=?",
-  )
-    .bind(JSON.stringify(expired), f.node)
-    .run();
-  expect((await host()).databases[0]!.drain).toBeNull();
   expect(
     await env.DB.prepare(
-      "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=?",
+      "SELECT 1 FROM database_start_admissions WHERE operation_id=?",
     )
-      .bind(created.database.id)
-      .first("n"),
-  ).toBe(2);
+      .bind(deleted.operation.id)
+      .first(),
+  ).toBeNull();
 });
 
 it("the existing hold-ledger migration preserves uncertain and acknowledged RAM rows while zero RAM is stop-only", async () => {

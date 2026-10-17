@@ -17,7 +17,7 @@ afterEach(async () => {
       .run();
 });
 
-it("a sleeping database stays permitted until it is deleted, and its deletion drains as before", async () => {
+it("a sleeping database stays permitted, and so does its deletion until its volume is read absent", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases));
   const intent = await idleIntent(w);
   expect(await leaseEntry(w.f, w.id)).toMatchObject({
@@ -37,24 +37,19 @@ it("a sleeping database stays permitted until it is deleted, and its deletion dr
   );
   expect(response.status).toBe(202);
   const deleted = DatabaseWithOperation.parse(await response.json());
-  expect(await leaseEntry(w.f, w.id)).toMatchObject({
-    generation: deleted.database.generation,
-    desired_state: "deleted",
+  const writer = {
+    generation: deleted.database.generation + 1,
+    desired_state: "running",
+    write_blocked: false,
+    volume: w.receipt,
     runtime_authority: null,
     drain: null,
-  });
-  // Once the node reads the volume quiesced at the deletion's generation, the deletion drains.
+  };
+  expect(await leaseEntry(w.f, w.id)).toMatchObject(writer);
+  // The node reading the volume quiesced changes nothing: the guard never suspends it.
   await w.evidence({
     generation: deleted.database.generation,
     quiesced: true,
   });
-  expect(await leaseEntry(w.f, w.id)).toMatchObject({
-    desired_state: "deleted",
-    runtime_authority: null,
-    drain: {
-      operation_id: deleted.operation.id,
-      kind: "database.delete",
-      generation: deleted.database.generation,
-    },
-  });
+  expect(await leaseEntry(w.f, w.id)).toMatchObject(writer);
 });

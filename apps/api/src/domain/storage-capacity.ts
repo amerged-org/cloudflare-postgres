@@ -56,38 +56,6 @@ export function currentStorageStopSql(
     o = identifier(operationAlias);
   return `(${o}.database_id=${d}.id AND ${o}.project_id=${d}.project_id AND ${o}.generation=${d}.generation AND (${o}.status IN('pending','running') OR (${o}.status='failed' AND ${o}.error_code='operation_timeout')) AND ((${d}.desired_state='suspended' AND ${o}.id=${d}.power_operation AND ((${o}.kind='database.suspend' AND ${d}.suspension_reason='manual') OR (${o}.kind='database.hibernate' AND ${d}.suspension_reason='idle'))) OR (${d}.desired_state='deleted' AND ${o}.kind='database.delete' AND ${d}.observed_state<>'deleted'))) `;
 }
-/** Storage-only runway for old writers. No RAM/CPU startup admission and no tenant start. */
-export function storageDrainReservationStatement(
-  db: D1Database,
-  input: {
-    databaseId: string;
-    operationId: string;
-    generation: number;
-    nodeId: string;
-    now: string;
-  },
-) {
-  return db
-    .prepare(
-      `INSERT INTO database_start_admissions(operation_id,database_id,generation,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json)
- SELECT stop.id,d.id,d.generation,n.id,n.node_uid,0,?,COALESCE((SELECT MAX(m.observed_at) FROM node_memory_samples m WHERE m.node_id=n.id AND m.node_uid=n.node_uid),(SELECT MAX(old.grant_sample_observed_at) FROM database_start_admissions old WHERE old.node_id=n.id AND old.node_uid=n.node_uid)),MAX(json_extract(d.storage_profile_json,'$.startup_reserve_bytes'),s.storage_gib*1073741824),d.storage_volume_json
- FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id JOIN operations stop ON stop.id=? JOIN node_thin_storage t ON t.node_id=n.id
- WHERE (d.id=? AND d.generation=? AND n.id=? AND n.node_uid=t.node_uid AND n.lost_at IS NULL)
- AND ${currentStorageStopSql()}
- AND ${thinPoolRoomSql("n", "s", "d")}
- AND EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.volumes') v WHERE json_extract(v.value,'$.database_id')=d.id AND json_extract(v.value,'$.generation')=d.generation AND json_extract(v.value,'$.storage_generation')=d.storage_generation AND json_extract(v.value,'$.quiesced')=1 AND json_extract(v.value,'$.lv_uuid')=json_extract(d.storage_volume_json,'$.lv_uuid'))
- AND COALESCE((SELECT MAX(m.observed_at) FROM node_memory_samples m WHERE m.node_id=n.id AND m.node_uid=n.node_uid),(SELECT MAX(old.grant_sample_observed_at) FROM database_start_admissions old WHERE old.node_id=n.id AND old.node_uid=n.node_uid)) IS NOT NULL
- ON CONFLICT(operation_id) DO NOTHING`,
-    )
-    .bind(
-      input.now,
-      input.operationId,
-      input.databaseId,
-      input.generation,
-      input.nodeId,
-    );
-}
-
 /** Physical exposure may be shared only by separately captured holds for one currently proved LV. */
 export function knownStorageHoldVolume(input: {
   binding: string | null;
