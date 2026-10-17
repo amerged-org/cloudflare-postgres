@@ -22,6 +22,7 @@
 //!
 //! While a start waits, and only if policy enables it (decision D2), the node puts one idle but
 //! awake database to sleep early for each waiting start (`Admitter::early_sleep`).
+use crate::units::{ActiveState, UnitState};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
@@ -207,6 +208,24 @@ pub struct Running {
     /// Its unit is activating: the start is in flight.
     pub starting: bool,
     pub always_warm: bool,
+}
+
+impl Running {
+    /// The running database a unit stands for, if the unit holds memory: its memory size is the
+    /// unit's ceiling, rounded up to whole MiB. `always_warm` is the desired state's.
+    pub fn from_unit(unit: &UnitState, always_warm: bool) -> Option<Self> {
+        if !unit.active.awake() {
+            return None;
+        }
+        Some(Self {
+            database: unit.database.clone(),
+            memory_mib: unit
+                .memory_max_bytes
+                .map_or(0, |bytes| bytes.div_ceil(1024 * 1024)),
+            starting: unit.active == ActiveState::Activating,
+            always_warm,
+        })
+    }
 }
 
 /// An awake database as the admitter keeps it.
@@ -1421,6 +1440,64 @@ mod tests {
             admitter.request(t0, &facts(0), request("c", 256)),
             Decision::Queued(_)
         ));
+    }
+
+    #[test]
+    fn a_unit_that_holds_memory_becomes_a_running_database() {
+        use crate::units::{ActiveState, UnitState};
+        let unit = |active, memory_max_bytes| UnitState {
+            database: "abcdefghij0123456789".into(),
+            active,
+            main_pid: Some(1234),
+            invocation_id: None,
+            uid: Some(200_001),
+            memory_max_bytes,
+        };
+        let running = |active, memory_max_bytes, always_warm| {
+            Running::from_unit(&unit(active, memory_max_bytes), always_warm)
+        };
+        let expected = |starting, always_warm| Running {
+            database: "abcdefghij0123456789".into(),
+            memory_mib: 512,
+            starting,
+            always_warm,
+        };
+        let bytes = Some(512 * MIB_U64);
+        assert_eq!(
+            running(ActiveState::Active, bytes, false),
+            Some(expected(false, false))
+        );
+        assert_eq!(
+            running(ActiveState::Activating, bytes, true),
+            Some(expected(true, true))
+        );
+        // A unit that is stopping still holds its memory, and is not starting.
+        assert_eq!(
+            running(ActiveState::Deactivating, bytes, false),
+            Some(expected(false, false))
+        );
+        // One that holds none is not awake.
+        for active in [
+            ActiveState::Inactive,
+            ActiveState::Failed,
+            ActiveState::Maintenance,
+        ] {
+            assert_eq!(running(active, bytes, false), None, "{active:?}");
+        }
+        // The ceiling rounds up to whole MiB. A unit without a ceiling stays in the set, with
+        // no memory counted: the image's unit always has one.
+        assert_eq!(
+            running(ActiveState::Active, Some(512 * MIB_U64 + 1), false)
+                .unwrap()
+                .memory_mib,
+            513
+        );
+        assert_eq!(
+            running(ActiveState::Active, None, false)
+                .unwrap()
+                .memory_mib,
+            0
+        );
     }
 
     #[test]
