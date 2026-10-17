@@ -1415,7 +1415,7 @@ impl World {
     pub fn node_storage(&mut self, room: bool) {
         let now = now_ms();
         let storage = &self.db["storage"];
-        self.snapshot.region["storage_nodes"] = json!([{"name":NODE,"node_uid":node_uid(),"cluster_uid":kube_system(),"volume_group_uuid":storage["volume_group_uuid"],"pool_uuid":storage["pool_uuid"],"profile_sha256":storage["profile_sha256"],"profile_revision":1,"storage_class":storage["storage_class"],"write_allowed":true,"observed_at":iso_ms(now),"expires_at":iso_ms(now + 9_000),"room":room}]);
+        self.snapshot.region["storage_nodes"] = json!([{"name":NODE,"node_uid":node_uid(),"cluster_uid":kube_system(),"volume_group_uuid":storage["volume_group_uuid"],"pool_uuid":storage["pool_uuid"],"profile_sha256":storage["profile_sha256"],"profile_revision":1,"storage_class":storage["storage_class"],"write_allowed":room,"observed_at":iso_ms(now),"expires_at":iso_ms(now + 9_000)}]);
     }
     /// CNPG hibernated the database's Cluster: its Pod is gone and the volume closed.
     pub fn hibernated_by_cnpg(&mut self) {

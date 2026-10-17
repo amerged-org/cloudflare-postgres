@@ -1076,7 +1076,7 @@ impl Reconciler {
             return self.power.suspend(db, None).await;
         }
         if !db["storage"].is_null()
-            && authority["room"] != true
+            && authority["write_allowed"] != true
             && starts_postgres(prior_cluster.as_ref(), db, &self.postgres_image)
         {
             return Ok(Some(observation(
@@ -1787,12 +1787,13 @@ impl Reconciler {
         })
     }
     /// Whether the database's node has thin pool room for a start (Cloudflare's reserve rule):
-    /// its storage row in the snapshot stands for `node`, as the watch holds it, and says so.
+    /// its storage row in the snapshot stands for `node`, as the watch holds it, and its
+    /// `write_allowed` says so.
     pub(crate) fn room(&self, db: &Value, snapshot: &DesiredSnapshot, node: &Value) -> bool {
         snapshot.region["storage_nodes"]
             .as_array()
             .and_then(|nodes| nodes.iter().find(|n| n["name"] == db["node"]))
-            .is_some_and(|row| storage_guard(db, node, row).is_ok() && row["room"] == true)
+            .is_some_and(|row| storage_guard(db, node, row).is_ok() && row["write_allowed"] == true)
     }
     /// The Node and the host authority the database stands on. The pass has asserted the identity
     /// of the cluster before it asks.

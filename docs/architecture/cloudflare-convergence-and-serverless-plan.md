@@ -159,7 +159,7 @@ wrong volume.
 - **No silent full pool:** a start or attach happens only while the node's thin pool has room: no thin error, the
   database's pool UUID, a storage observation at most 120 s old, free data at least the profile's
   `data_reserve_bytes` and free metadata at least `metadata_reserve_bytes`. Cloudflare checks it on create, resume,
-  restart and restore placement and on the wake of a miss, and serves it to the controller (`storage_nodes[].room`),
+  restart and restore placement and on the wake of a miss, and serves it to the controller as `storage_nodes[].write_allowed` (a field the deployed controller already parses),
   which checks it before a pool attach and before lifting hibernation. A wake claim that arrives after a pool hit's
   answer records the hit and does not refuse it again.
 - **Growth and alert:** the capacity cron requests the existing pool growth (`lvextend` of data and metadata) when free

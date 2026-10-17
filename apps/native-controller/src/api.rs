@@ -79,11 +79,11 @@ fn merge_page_authority(snapshot: &mut DesiredSnapshot, page: &Value) -> Result<
             crate::contracts::integer(current, "revision")?,
             crate::contracts::integer(&row, "revision")?,
         );
-        // Room is judged when a page is read; one "no room" of the pull stands.
+        // Room (`write_allowed`) is judged when a page is read; one "no room" of the pull stands.
         let without_room = |row: &Value| {
             let mut row = row.clone();
             if let Some(fields) = row.as_object_mut() {
-                fields.remove("room");
+                fields.remove("write_allowed");
             }
             row
         };
@@ -92,8 +92,8 @@ fn merge_page_authority(snapshot: &mut DesiredSnapshot, page: &Value) -> Result<
         }
         if new > old {
             *current = row;
-        } else if old == new && current["room"] != row["room"] {
-            current["room"] = false.into();
+        } else if old == new && current["write_allowed"] != row["write_allowed"] {
+            current["write_allowed"] = false.into();
         }
     }
     if snapshot.region.get("storage_nodes").is_some()
@@ -526,7 +526,7 @@ mod tests {
                         "a0000000000000000001".into()
                     },
                 );
-                page["region"]["storage_nodes"][0]["room"] = if path.contains("after=") {
+                page["region"]["storage_nodes"][0]["write_allowed"] = if path.contains("after=") {
                     second
                 } else {
                     first
@@ -536,7 +536,7 @@ mod tests {
             })
             .await;
             let snapshot = api.desired(None).await.unwrap();
-            assert_eq!(snapshot.region["storage_nodes"][0]["room"], false);
+            assert_eq!(snapshot.region["storage_nodes"][0]["write_allowed"], false);
         }
     }
     #[tokio::test]

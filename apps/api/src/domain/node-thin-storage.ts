@@ -241,7 +241,8 @@ export function nodeReading(row: CurrentNodeThinStorageRow, now: number) {
 
 /**
  * Every thin node of a region with an identity proof, as the desired page serves it: the last
- * accepted proof's identities and inventory, however old, and the node's room now. The controller
+ * accepted proof's identities and inventory, however old, and the node's room now as its
+ * `write_allowed`. The controller
  * needs the identities to bind volumes and to judge a start; whatever needs a recent read (a
  * volume's absence, a binding) checks the proof's own times. Room comes only from the node's
  * minute physical sample (`thinPoolNodeRoomSql`), so a stalled identity turn never stops a start
@@ -265,7 +266,7 @@ export async function desiredRegionStorageNodes(
   );
   return rows.results.flatMap((row, index) => {
     const proof = readings[index]?.identity;
-    return proof ? [{ ...proof, room: row.room === 1 }] : [];
+    return proof ? [{ ...proof, write_allowed: row.room === 1 }] : [];
   });
 }
 

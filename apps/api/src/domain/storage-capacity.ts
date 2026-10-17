@@ -194,7 +194,7 @@ export function thinPoolRoomSql(
     )})`;
 }
 /** The node part of the room rule over its thin storage `t` and its latest sample `o`: what the
- * desired page serves as storage_nodes[].room for the databases the node holds. */
+ * desired page serves as storage_nodes[].write_allowed for the databases the node holds. */
 export function thinPoolNodeRoomSql(): string {
   return allOf(
     "t.error_code IS NULL",

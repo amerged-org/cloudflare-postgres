@@ -88,7 +88,7 @@ it("keeps serving the node's storage entry and room while a rollout changes a pi
   const node = (await desired(w)).region.storage_nodes?.find(
     (entry) => entry.node_id === w.f.node,
   );
-  expect(node).toMatchObject({ node_uid: w.f.uid, room: true });
+  expect(node).toMatchObject({ node_uid: w.f.uid, write_allowed: true });
   expect(await leaseEntry(w.f, w.id)).toMatchObject({
     desired_state: "running",
     write_blocked: false,
@@ -116,14 +116,20 @@ it("serves the node's storage entry from its last proof however long identity tu
     (await desired(w)).region.storage_nodes?.find(
       (entry) => entry.node_id === w.f.node,
     );
-  expect(await node()).toMatchObject({ node_uid: w.f.uid, room: true });
+  expect(await node()).toMatchObject({
+    node_uid: w.f.uid,
+    write_allowed: true,
+  });
   // Without a minute sample for three minutes the node has no room, and keeps its entry.
   await env.DB.prepare(
     "UPDATE node_storage_observations SET observed_at=? WHERE node_id=?",
   )
     .bind(iso(Date.now() - 180_000), w.f.node)
     .run();
-  expect(await node()).toMatchObject({ node_uid: w.f.uid, room: false });
+  expect(await node()).toMatchObject({
+    node_uid: w.f.uid,
+    write_allowed: false,
+  });
 });
 
 it("leases and accepts an identity turn under the new assignment, before and after its patch rewrote the host custody", async () => {
