@@ -348,12 +348,10 @@ async function thinNode(
 ) {
   const at = new Date().toISOString();
   await env.DB.prepare(
-    `INSERT INTO node_thin_storage(node_id,node_uid,cluster_uid,address,volume_group_uuid,profile_revision,profile_sha256,profile_json,material_revision,status,error_code,created_at,updated_at)
-    SELECT id,node_uid,?,?,?,1,?,?,1,?,?,?,? FROM nodes WHERE id=?`,
+    `INSERT INTO node_thin_storage(node_id,node_uid,volume_group_uuid,profile_revision,profile_sha256,profile_json,status,error_code,created_at,updated_at)
+    SELECT id,node_uid,?,1,?,?,?,?,?,? FROM nodes WHERE id=?`,
   )
     .bind(
-      crypto.randomUUID(),
-      "192.0.2.10",
       thinVg,
       "a".repeat(64),
       JSON.stringify(profile),
@@ -519,48 +517,6 @@ it("alarms a thin pool that holds volumes while its node reports no fresh sample
   });
 });
 
-it("alarms a blocked Thin node with its error code, keeps the episode while it requalifies and clears it once ready", async () => {
-  const f = await fixture(),
-    now = Date.now(),
-    hook = receiver(),
-    set = (status: string, code: string | null) =>
-      env.DB.prepare(
-        "UPDATE node_thin_storage SET status=?,error_code=? WHERE node_id=?",
-      )
-        .bind(status, code, f.node)
-        .run();
-  await thinNode(f, { status: "ready", code: null });
-  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
-  expect(await status(f, "thin_storage_blocked")).toBeUndefined();
-  await set("blocked", "thin_storage_report_unqualified");
-  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
-  expect(hook.events).toHaveLength(1);
-  expect(hook.events[0]!.event).toMatchObject({
-    kind: "thin_storage_blocked",
-    thin_storage: [
-      { node_id: f.node, error_code: "thin_storage_report_unqualified" },
-    ],
-    action: INFRA_ALERT_ACTIONS.thin_storage_blocked,
-  });
-  await set("qualifying", null);
-  await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
-  expect(await status(f, "thin_storage_blocked")).toMatchObject({
-    active: true,
-  });
-  await set("ready", null);
-  await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
-  expect(await status(f, "thin_storage_blocked")).toMatchObject({
-    active: false,
-  });
-  // Only the pool reserve is short: no error code.
-  await set("blocked", null);
-  await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
-  expect(hook.events).toHaveLength(2);
-  expect(hook.events[1]!.event.thin_storage).toEqual([
-    { node_id: f.node, error_code: null },
-  ]);
-});
-
 it("still judges nodes when the database reads fail and keeps the unread kinds as they were", async () => {
   const f = await fixture(),
     now = Date.now(),
@@ -631,16 +587,20 @@ it("still judges every region's nodes and databases when the backup health read 
     .bind(ago(now, 1000), f.node)
     .run();
   vi.spyOn(console, "error").mockImplementation(() => {});
+  // The backup health read is the first one of the run; only it fails.
+  let first = true;
   const broken = new Proxy(env.DB, {
     get(target, key) {
       if (key === "prepare")
         return (sql: string) => {
           if (
-            sql.startsWith(
-              "SELECT id FROM regions WHERE bootstrap_material_revision>0",
-            )
-          )
+            first &&
+            sql ===
+              "SELECT * FROM infrastructure_backup_config WHERE singleton=1"
+          ) {
+            first = false;
             throw new Error("injected_backup_health_failure");
+          }
           return target.prepare(sql);
         };
       const value: unknown = Reflect.get(target, key, target);

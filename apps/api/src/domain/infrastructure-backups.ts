@@ -1,31 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import {
-  base64urlToBytes,
-  bytesToBase64url,
-  timingSafeEqual,
-} from "@pgcf/contracts";
+import { base64urlToBytes, bytesToBase64url } from "@pgcf/contracts";
 import {
   InfrastructureBackupConfig,
   InfrastructureBackupConfigInput,
   InfrastructureBackupArtifactIdentity,
   InfrastructureBackupArtifactStatus,
-  InfrastructureBackupDeferral,
   InfrastructureBackupPreparedArtifact,
   InfrastructureBackupRunStatus,
   InfrastructureBackupHealth,
-  type InfrastructureBackupInput,
 } from "@pgcf/contracts/infrastructure-backups";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import { regionArchive } from "./archive-bindings.ts";
-import { currentOperatorAuthority } from "./node-operator.ts";
-import { NODE_OBSERVATION_MAX_AGE_MS } from "./placement.ts";
 import {
-  loadCurrentRegionMaterialReference,
-  loadRegionJoinBundle,
-} from "../crypto/bootstrap-credentials.ts";
-import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
+  encryptSource,
+  measureSource,
+  verifyEnvelope,
+} from "./infrastructure-backup-envelope.ts";
 
 export const INFRASTRUCTURE_BACKUP_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_RUN_MS = 2 * 60 * 60 * 1000;
@@ -33,13 +25,6 @@ const MAX_RUN_MS = 2 * 60 * 60 * 1000;
 // a fleet rollout, must not use all three.
 const RETRY_DELAY_MS = 90 * 60 * 1000;
 const MAX_DAILY_ATTEMPTS = 3;
-/** A fleet patch operation that changed this recently still holds a due attempt back. */
-const PATCH_SETTLE_MS = 15 * 60 * 1000;
-/** A thin start granted this recently and not yet ready is in flight; an older one is stuck. */
-const THIN_START_WINDOW_MS = 15 * 60 * 1000;
-/** The export request waits at most this long, polling this often, for such a start to be ready. */
-const START_WAIT_MS = 5 * 60 * 1000;
-const START_POLL_MS = 5000;
 type ConfigRow = {
   enabled: number;
   d1_account_id: string | null;
@@ -85,10 +70,6 @@ function pickBackupIdentity(
     day: value.day,
     region_id: value.region_id,
     source_id: value.source_id,
-    node_id: value.node_id,
-    node_uid: value.node_uid,
-    cluster_uid: value.cluster_uid,
-    material_revision: value.material_revision,
   });
 }
 function configView(row: ConfigRow | null | undefined) {
@@ -178,9 +159,10 @@ export async function readInfrastructureBackupRun(db: D1Database, id: string) {
     .first<RunRow>();
   if (!row)
     throw new ApiError("not_found", "Infrastructure backup run not found");
+  // Earlier runs also hold receipts of regional etcd snapshots; they stay in D1 and are not read.
   const artifacts = await db
     .prepare(
-      "SELECT * FROM infrastructure_backup_artifacts WHERE run_id=? ORDER BY id",
+      "SELECT * FROM infrastructure_backup_artifacts WHERE run_id=? AND kind='d1' ORDER BY id",
     )
     .bind(id)
     .all<ArtifactRow>();
@@ -209,60 +191,6 @@ export async function infrastructureBackupStatus(db: D1Database, id?: string) {
     ),
   });
 }
-/** The latest time a due attempt was held back; last_at older than a few minutes means it no longer is. */
-export async function infrastructureBackupDeferral(db: D1Database) {
-  const row = await db
-    .prepare(
-      "SELECT day,reason,first_at,last_at,checks FROM infrastructure_backup_deferrals ORDER BY last_at DESC LIMIT 1",
-    )
-    .first();
-  return row ? InfrastructureBackupDeferral.parse(row) : null;
-}
-/**
- * A thin database start in flight: its admission holds thin storage (storage_budget_bytes, the
- * test every reader of the admissions uses), has no ready_at, and its database carries no
- * protection marker of this generation. One granted longer ago than THIN_START_WINDOW_MS is
- * stuck, not in flight. Thick and standard-runtime starts do not renew against the write guard.
- */
-async function thinStartInFlight(db: D1Database, now: number) {
-  return !!(await db
-    .prepare(
-      `SELECT 1 held FROM database_start_admissions a
-      JOIN databases d ON d.id=a.database_id AND d.generation=a.generation
-      WHERE a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND a.granted_at>?
-        AND d.deleted_at IS NULL
-      LIMIT 1`,
-    )
-    .bind(new Date(now - THIN_START_WINDOW_MS).toISOString())
-    .first());
-}
-/**
- * Why a due attempt must wait, or null. The capture uses the relay and the control database that
- * a running fleet patch is using too, and the D1 export makes that database unavailable for the
- * whole of its job, which a thin start in flight must not meet. A wait takes no attempt number.
- * A patch counts while it is unfinished (not complete or host_ready, not halted, before its
- * deadline, on a node that is not lost) and for PATCH_SETTLE_MS after its last change, which also
- * bridges the gap between the operations of one rollout. Not detectable here: a start that
- * begins after this check (the export request checks again) and awake thin databases under writes.
- */
-async function backupHeldBack(db: D1Database, now: number) {
-  const patch = await db
-    .prepare(
-      `SELECT 1 held FROM fleet_patch_operations p
-      WHERE (p.stage NOT IN('complete','host_ready') AND p.state<>'halted' AND p.deadline_at>?
-        AND p.node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))
-        OR p.updated_at>? LIMIT 1`,
-    )
-    .bind(
-      new Date(now).toISOString(),
-      new Date(now - PATCH_SETTLE_MS).toISOString(),
-    )
-    .first();
-  if (patch) return "deferred_by_patch" as const;
-  return (await thinStartInFlight(db, now))
-    ? ("deferred_by_thin_start" as const)
-    : null;
-}
 export async function assertBackupRun(env: Env, id: string, now = Date.now()) {
   // A notification PUT carries both revisions atomically. Read them in the same transaction
   // so an intervening carry cannot make a valid capture look revoked.
@@ -273,7 +201,7 @@ export async function assertBackupRun(env: Env, id: string, now = Date.now()) {
       id,
     ),
     env.DB.prepare(
-      "SELECT * FROM infrastructure_backup_artifacts WHERE run_id=? ORDER BY id",
+      "SELECT * FROM infrastructure_backup_artifacts WHERE run_id=? AND kind='d1' ORDER BY id",
     ).bind(id),
     env.DB.prepare(
       "SELECT * FROM infrastructure_backup_config WHERE singleton=1",
@@ -318,20 +246,7 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
           now - Date.parse(previous.completed_at!) >= RETRY_DELAY_MS
         ? previous.attempt + 1
         : 0;
-  // A held-back attempt is not inserted: it takes no attempt number and uses none of the day's.
-  const held = attempt ? await backupHeldBack(env.DB, now) : null;
-  if (held) {
-    try {
-      await env.DB.prepare(
-        `INSERT INTO infrastructure_backup_deferrals(day,reason,first_at,last_at,checks) VALUES(?,?,?,?,1)
-        ON CONFLICT(day,reason) DO UPDATE SET last_at=excluded.last_at,checks=checks+1`,
-      )
-        .bind(day, held, at, at)
-        .run();
-    } catch {
-      /* The record is for operators: a failed write never stops the Cron that alerting follows. */
-    }
-  } else if (attempt) {
+  if (attempt) {
     // One attempt at a time across days, so a retry never competes with another capture. The run
     // takes the configuration revision in the same statement that inserts it: a notification PUT
     // landing after the read above would otherwise leave the new run revoked at birth.
@@ -373,7 +288,7 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
     /* Do not blindly repeat an uncertain create; next Cron reads this exact Workflow id. */
   }
 }
-/** Artifact membership is fixed before exports; unavailable existing clusters fail the run. */
+/** Artifact membership is fixed before the export. */
 export async function initializeInfrastructureBackup(env: Env, id: string) {
   const { row, config, artifacts } = await assertBackupRun(env, id);
   if (artifacts.length) return artifacts;
@@ -386,34 +301,13 @@ export async function initializeInfrastructureBackup(env: Env, id: string) {
       day: row.day,
       region_id: config.d1_region_id,
       source_id: config.d1_database_id,
-      node_id: null,
-      node_uid: null,
-      cluster_uid: null,
-      material_revision: null,
     },
   ];
-  const clusters = await env.DB.prepare(
-    "SELECT id FROM regions WHERE EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=regions.id AND c.purpose='join_bundle' AND c.revision=regions.bootstrap_material_revision) AND EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL) ORDER BY id",
-  ).all<{ id: string }>();
-  for (const region of clusters.results) {
-    const source = await snapshotSource(env, region.id);
-    identities.push({
-      id: `etcd-${region.id}`,
-      kind: "etcd",
-      day: row.day,
-      region_id: region.id,
-      source_id: source.authority.binding.cluster_uid,
-      node_id: source.id,
-      node_uid: source.uid,
-      cluster_uid: source.authority.binding.cluster_uid,
-      material_revision: source.authority.binding.material_revision,
-    });
-  }
   await env.DB.batch(
     identities.map((artifact) =>
       env.DB.prepare(
-        `INSERT INTO infrastructure_backup_artifacts(run_id,id,kind,day,region_id,source_id,node_id,node_uid,cluster_uid,material_revision,status,object_key)
-      VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?) ON CONFLICT(run_id,id) DO NOTHING`,
+        `INSERT INTO infrastructure_backup_artifacts(run_id,id,kind,day,region_id,source_id,status,object_key)
+      VALUES(?,?,?,?,?,?,'pending',?) ON CONFLICT(run_id,id) DO NOTHING`,
       ).bind(
         id,
         artifact.id,
@@ -421,10 +315,6 @@ export async function initializeInfrastructureBackup(env: Env, id: string) {
         artifact.day,
         artifact.region_id,
         artifact.source_id,
-        artifact.node_id,
-        artifact.node_uid,
-        artifact.cluster_uid,
-        artifact.material_revision,
         `infrastructure/v1/${row.day}/${id}/${artifact.id}.pgcfenc`,
       ),
     ),
@@ -436,90 +326,18 @@ export async function initializeInfrastructureBackup(env: Env, id: string) {
     .run();
   return (await readInfrastructureBackupRun(env.DB, id)).artifacts;
 }
-async function snapshotSource(
-  env: Env,
-  regionId: string,
-  expected?: ArtifactRow,
-) {
-  const cutoff = new Date(
-      Date.now() - NODE_OBSERVATION_MAX_AGE_MS,
-    ).toISOString(),
-    future = new Date(Date.now() + 5000).toISOString();
-  const sources = await env.DB.prepare(
-    `SELECT n.id,n.node_uid,o.facts_json,f.spec_json FROM nodes n
-    JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
-    JOIN fleet_releases f ON f.id=a.release_id JOIN fleet_node_release_observations o ON o.node_id=n.id AND o.node_uid=n.node_uid
-      AND o.assignment_revision=a.revision AND o.agent_key_hash=r.agent_key_hash
-    WHERE n.region_id=? AND n.ready=1 AND n.lost_at IS NULL AND o.observed_at>=? AND o.observed_at<=? ORDER BY n.id`,
-  )
-    .bind(regionId, cutoff, future)
-    .all<{
-      id: string;
-      node_uid: string;
-      facts_json: string;
-      spec_json: string;
-    }>();
-  for (const node of sources.results) {
-    if (
-      expected &&
-      (node.id !== expected.node_id || node.node_uid !== expected.node_uid)
-    )
-      continue;
-    const facts = JSON.parse(node.facts_json) as {
-        kubernetes_control_plane?: boolean;
-        kubernetes_image_provenance?: { control_plane: boolean };
-        components: { name: string; runtime_image_sha256?: string }[];
-      },
-      spec = JSON.parse(node.spec_json) as {
-        components: { name: string; reference: string; sha256: string }[];
-      };
-    if (
-      facts.kubernetes_control_plane !== true &&
-      facts.kubernetes_image_provenance?.control_plane !== true
-    )
-      continue;
-    const pin = spec.components.find((c) => c.name === "image/cilium/cilium"),
-      live = facts.components.find((c) => c.name === "image/cilium/cilium");
-    if (
-      !pin ||
-      !/^[a-f0-9]{64}$/.test(pin.sha256) ||
-      !live?.runtime_image_sha256 ||
-      !/^[a-f0-9]{64}$/.test(live.runtime_image_sha256) ||
-      (await normalizeRuntimeImageManifest(
-        pin.reference,
-        pin.sha256,
-        live.runtime_image_sha256,
-        {},
-      )) !== pin.sha256
-    )
-      continue;
-    const authority = await currentOperatorAuthority(
-      env,
-      node.id,
-      node.node_uid,
-      expected?.material_revision ?? undefined,
-    );
-    if (expected && authority.binding.cluster_uid !== expected.cluster_uid)
-      throw new Error("infrastructure_backup_cluster_changed");
-    return {
-      id: node.id,
-      uid: node.node_uid,
-      authority,
-      cilium_image: pin.reference,
-      cilium_image_id:
-        pin.reference.split("@")[0] + "@sha256:" + live.runtime_image_sha256,
-    };
-  }
-  throw new Error("infrastructure_backup_snapshot_source_unavailable");
-}
-export async function infrastructureBackupKey(secret: string) {
+/** The encryption key derived from the active CREDENTIAL_KEYS version, or from `kid` when given. */
+export async function infrastructureBackupKey(secret: string, kid?: string) {
   const config = z
     .strictObject({
       active: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
       keys: z.record(z.string(), z.string()),
     })
     .parse(JSON.parse(secret));
-  const raw = base64urlToBytes(config.keys[config.active] ?? "");
+  const selected = kid ?? config.active,
+    raw = base64urlToBytes(
+      Object.hasOwn(config.keys, selected) ? config.keys[selected]! : "",
+    );
   if (raw?.length !== 32)
     throw new Error("infrastructure_backup_key_unavailable");
   const key = await crypto.subtle.importKey(
@@ -534,128 +352,23 @@ export async function infrastructureBackupKey(secret: string) {
       name: "HKDF",
       hash: "SHA-256",
       salt: new TextEncoder().encode("pgcf-infrastructure-backup-v1"),
-      info: new TextEncoder().encode(config.active),
+      info: new TextEncoder().encode(selected),
     },
     key,
     256,
   );
-  return { kid: config.active, key: bytesToBase64url(new Uint8Array(bits)) };
-}
-async function scopedToken(env: Env, run: RunRow, artifact: ArtifactRow) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(env.BOOTSTRAP_TOKEN),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  return bytesToBase64url(
-    new Uint8Array(
-      await crypto.subtle.sign(
-        "HMAC",
-        key,
-        new TextEncoder().encode(
-          `infrastructure-backup|${run.id}|${artifact.id}|${artifact.node_id}|${artifact.node_uid}|${artifact.cluster_uid}|${artifact.material_revision}|${run.expires_at}`,
-        ),
-      ),
-    ),
-  );
-}
-export async function authorizeBackupOperator(
-  env: Env,
-  runId: string,
-  artifactId: string,
-  authorization: string | undefined,
-) {
-  const { row, artifacts } = await assertBackupRun(env, runId),
-    artifact = artifacts.find((a) => a.id === artifactId && a.kind === "etcd");
-  if (
-    !artifact ||
-    !timingSafeEqual(
-      authorization ?? "",
-      `Bearer ${await scopedToken(env, row, artifact)}`,
-    )
-  )
-    throw new ApiError(
-      "unauthorized",
-      "Backup capability is invalid or expired",
-    );
-  const authority = await currentOperatorAuthority(
-    env,
-    artifact.node_id!,
-    artifact.node_uid!,
-    artifact.material_revision!,
-  );
-  if (authority.binding.cluster_uid !== artifact.cluster_uid)
-    throw new ApiError("conflict", "Backup cluster authority changed");
-  return artifact;
-}
-export async function prepareInfrastructureBackupInput(
-  env: Env,
-  id: string,
-  d1Url: string,
-): Promise<InfrastructureBackupInput> {
-  const { row, artifacts } = await assertBackupRun(env, id),
-    inputs: InfrastructureBackupInput["artifacts"] = [];
-  for (const artifact of artifacts) {
-    const identity = pickBackupIdentity(artifact);
-    if (artifact.kind === "d1") {
-      inputs.push({ ...identity, d1_url: d1Url });
-      continue;
-    }
-    const source = await snapshotSource(env, artifact.region_id, artifact),
-      material = JSON.parse(source.authority.material) as {
-        kubeconfig: string;
-        talos_admin_config: string;
-      };
-    const url = new URL(
-      `/internal/v1/infrastructure-backups/${id}/${artifact.id}/kubernetes`,
-      env.NODE_BOOTSTRAP_CALLBACK_URL,
-    );
-    inputs.push({
-      ...identity,
-      source: {
-        node_id: source.id,
-        node_uid: source.uid,
-        node_address: source.authority.address,
-        binding: source.authority.binding,
-        kubeconfig: material.kubeconfig,
-        talosconfig: material.talos_admin_config,
-        operator_url: url.href,
-        operator_token: await scopedToken(env, row, artifact),
-        cilium_image: source.cilium_image,
-        cilium_image_id: source.cilium_image_id,
-      },
-    });
-  }
-  return {
-    run_id: id,
-    artifacts: inputs,
-    encryption: await infrastructureBackupKey(env.CREDENTIAL_KEYS),
-  };
+  return { kid: selected, key: bytesToBase64url(new Uint8Array(bits)) };
 }
 /** The export endpoint only reads the existing D1 database; signed URLs never enter status or logs. */
 export async function exportControlD1(
   env: Env,
   id: string,
   fetcher: typeof fetch = fetch,
-  start = { pollMs: START_POLL_MS, limitMs: START_WAIT_MS },
 ) {
   const { config, row } = await assertBackupRun(env, id);
   if (!env.INFRASTRUCTURE_BACKUP_CF_TOKEN)
     throw new Error("infrastructure_backup_export_secret_missing");
   const url = `https://api.cloudflare.com/client/v4/accounts/${config.d1_account_id}/d1/database/${config.d1_database_id}/export`;
-  // The Cron checked a minute or more ago. The export blocks the database the start's write
-  // authority renews against, so wait here, before the request, for a start now in flight. A
-  // start that never becomes ready, or a check that fails, must not stop the backup: after the
-  // limit, or at once, the export goes on.
-  for (
-    let waited = 0;
-    waited < start.limitMs &&
-    (await thinStartInFlight(env.DB, Date.now()).catch(() => false));
-    waited += start.pollMs
-  )
-    await new Promise((resolve) => setTimeout(resolve, start.pollMs));
   let bookmark: string | undefined;
   for (let poll = 0; poll < 120; poll++) {
     // D1 itself may reject queries while its export is running. Poll the same provider job
@@ -747,6 +460,161 @@ export async function recordPreparedBackups(
       .run();
   }
 }
+const PART_BYTES = 8 * 1024 * 1024;
+/** Bounded parts over the R2 binding; no public large-body API or uncertain PUT replay. */
+export async function uploadInfrastructureArtifact(
+  bucket: R2Bucket,
+  key: string,
+  stream: ReadableStream<Uint8Array>,
+  metadata: Record<string, string>,
+) {
+  const upload = await bucket.createMultipartUpload(key, {
+      customMetadata: metadata,
+      httpMetadata: { contentType: "application/octet-stream" },
+    }),
+    reader = stream.getReader(),
+    parts: R2UploadedPart[] = [];
+  let buffer = new Uint8Array(PART_BYTES),
+    filled = 0,
+    part = 1;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      for (let offset = 0; offset < next.value.length;) {
+        const count = Math.min(PART_BYTES - filled, next.value.length - offset);
+        buffer.set(next.value.subarray(offset, offset + count), filled);
+        filled += count;
+        offset += count;
+        if (filled === PART_BYTES) {
+          parts.push(await upload.uploadPart(part++, buffer));
+          buffer = new Uint8Array(PART_BYTES);
+          filled = 0;
+        }
+      }
+    }
+    if (filled)
+      parts.push(await upload.uploadPart(part, buffer.subarray(0, filled)));
+    if (!parts.length) throw new Error("infrastructure_backup_stream_empty");
+    await upload.complete(parts);
+  } catch (error) {
+    // A lost completion can already have committed this unique object. Observe before any cleanup.
+    const committed = await bucket.head(key);
+    if (!committed) {
+      await upload.abort().catch(() => {});
+      throw error;
+    }
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+}
+/**
+ * Encrypts the export at `sourceUrl` into the artifact's unique R2 object and records the prepared
+ * receipt. The source is read twice: once to measure it for the envelope, once to encrypt it. The
+ * plaintext is never stored and never held whole.
+ */
+export async function captureInfrastructureArtifact(
+  env: Env,
+  id: string,
+  artifactId: string,
+  sourceUrl: string,
+  fetcher: typeof fetch = fetch,
+) {
+  const { artifacts } = await assertBackupRun(env, id),
+    artifact = artifacts.find((value) => value.id === artifactId);
+  if (!artifact || artifact.status !== "pending")
+    throw new Error("infrastructure_backup_artifact_identity_changed");
+  const source = async () => {
+    const response = await fetcher(sourceUrl, {
+      redirect: "error",
+      signal: AbortSignal.timeout(300_000),
+    });
+    if (!response.ok || !response.body) {
+      await response.body?.cancel();
+      throw new Error("infrastructure_backup_source_refused");
+    }
+    return response.body;
+  };
+  const encryption = await infrastructureBackupKey(env.CREDENTIAL_KEYS),
+    identity = {
+      ...pickBackupIdentity(artifact),
+      run_id: id,
+      kid: encryption.kid,
+      ...(await measureSource(await source())),
+    };
+  const bucket = await backupArchive(env, artifact.region_id);
+  // An object under this run's unique key is never overwritten.
+  if (await bucket.head(artifact.object_key))
+    throw new Error("infrastructure_backup_object_exists");
+  await assertBackupRun(env, id);
+  const encrypted = encryptSource(await source(), encryption.key, identity);
+  await uploadInfrastructureArtifact(
+    bucket,
+    artifact.object_key,
+    encrypted.stream,
+    { run_id: id, artifact_id: artifact.id, kid: encryption.kid },
+  );
+  await recordPreparedBackups(env, id, [
+    { ...identity, ...(await encrypted.receipt) },
+  ]);
+}
+/** Reads the whole committed object back and authenticates it against its prepared receipt. */
+export async function verifyInfrastructureArtifact(
+  env: Env,
+  id: string,
+  artifactId: string,
+) {
+  const { artifacts } = await assertBackupRun(env, id),
+    artifact = artifacts.find((value) => value.id === artifactId);
+  if (!artifact || artifact.status !== "prepared")
+    throw new Error("infrastructure_backup_artifact_identity_changed");
+  const prepared = InfrastructureBackupPreparedArtifact.parse({
+    ...pickBackupIdentity(artifact),
+    run_id: id,
+    kid: artifact.kid,
+    plaintext_sha256: artifact.plaintext_sha256,
+    plaintext_bytes: artifact.plaintext_bytes,
+    encrypted_sha256: artifact.encrypted_sha256,
+    encrypted_bytes: artifact.encrypted_bytes,
+  });
+  const bucket = await backupArchive(env, artifact.region_id),
+    object = await bucket.get(artifact.object_key);
+  if (
+    !object ||
+    object.size !== prepared.encrypted_bytes ||
+    object.customMetadata?.run_id !== id ||
+    object.customMetadata.artifact_id !== artifact.id ||
+    object.customMetadata.kid !== prepared.kid
+  ) {
+    await object?.body.cancel();
+    throw new Error("infrastructure_backup_r2_identity_changed");
+  }
+  // The tag of the same object version, read before the whole object.
+  const tail = await bucket.get(artifact.object_key, {
+    range: { suffix: 16 },
+    onlyIf: { etagMatches: object.etag },
+  });
+  if (!tail || !("body" in tail)) {
+    await object.body.cancel();
+    throw new Error("infrastructure_backup_r2_identity_changed");
+  }
+  const encryption = await infrastructureBackupKey(
+    env.CREDENTIAL_KEYS,
+    prepared.kid,
+  );
+  await verifyEnvelope(
+    object.body,
+    encryption.key,
+    prepared,
+    new Uint8Array(await tail.arrayBuffer()),
+  );
+  await completeBackupArtifact(env, id, artifact.id);
+  return {
+    encrypted_bytes: prepared.encrypted_bytes,
+    encrypted_sha256: prepared.encrypted_sha256,
+    readback_verified: true,
+  };
+}
 export async function completeBackupArtifact(
   env: Env,
   id: string,
@@ -795,7 +663,7 @@ export async function finishInfrastructureBackup(
 export async function infrastructureBackupHealth(env: Env, now = Date.now()) {
   const config = await readInfrastructureBackupConfig(env.DB),
     expected: {
-      kind: "d1" | "etcd";
+      kind: "d1";
       region_id: string;
       source_id: string | null;
     }[] = [];
@@ -805,44 +673,13 @@ export async function infrastructureBackupHealth(env: Env, now = Date.now()) {
       region_id: config.d1_region_id,
       source_id: config.d1_database_id,
     });
-  const clusters = await env.DB.prepare(
-    "SELECT id FROM regions WHERE bootstrap_material_revision>0 AND EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=regions.id AND c.purpose='join_bundle' AND c.revision=regions.bootstrap_material_revision) AND EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL)",
-  ).all<{ id: string }>();
-  for (const region of clusters.results) {
-    let clusterUid: string | null = null;
-    if (config.enabled) {
-      try {
-        const reference = await loadCurrentRegionMaterialReference(
-          env.DB,
-          region.id,
-          "join_bundle",
-        );
-        clusterUid = (
-          await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, reference)
-        ).kube_system_uid;
-      } catch {
-        /* Unknown current custody must never adopt an older cluster's successful archive. */
-      }
-    }
-    expected.push({
-      kind: "etcd",
-      region_id: region.id,
-      source_id: clusterUid,
-    });
-  }
   return Promise.all(
     expected.map(async (identity) => {
       // Only a complete attempt counts, so a retry's own receipts neither clear nor reopen a failed episode.
       const completed = await env.DB.prepare(
-        "SELECT MAX(a.completed_at) at FROM infrastructure_backup_artifacts a JOIN infrastructure_backup_runs r ON r.id=a.run_id AND r.status='complete' WHERE a.kind=? AND a.region_id=? AND a.source_id=? AND (?='d1' OR a.cluster_uid=?) AND a.status='complete'",
+        "SELECT MAX(a.completed_at) at FROM infrastructure_backup_artifacts a JOIN infrastructure_backup_runs r ON r.id=a.run_id AND r.status='complete' WHERE a.kind=? AND a.region_id=? AND a.source_id=? AND a.status='complete'",
       )
-        .bind(
-          identity.kind,
-          identity.region_id,
-          identity.source_id,
-          identity.kind,
-          identity.source_id,
-        )
+        .bind(identity.kind, identity.region_id, identity.source_id)
         .first<string>("at");
       const failed = await env.DB.prepare(
         "SELECT r.completed_at,r.error_code FROM infrastructure_backup_runs r WHERE r.status='failed' ORDER BY r.day DESC,r.attempt DESC LIMIT 1",

@@ -10,8 +10,8 @@ import {
   type ContaboFirewall,
   type ContaboInstance,
   type ContaboMutationResult,
+  contaboClient,
 } from "../providers/contabo.ts";
-import { contaboClient } from "./bootstrap-relay.ts";
 import { assertNodeRecoveryAuthority, readNodeAddition } from "./node-state.ts";
 
 type Provider = Pick<
@@ -214,20 +214,6 @@ export async function ensureNodeInstallationFirewall(
     !["running", "stopped", "uninstalled", "rescue"].includes(actual.status)
   )
     return null;
-  const relay = await provider.getInstance(
-    env.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID,
-    request(),
-  );
-  if (
-    !hasAllocatedContaboHardware(relay) ||
-    relay.id !== env.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID ||
-    relay.id === actual.id ||
-    relay.tenantId !== actual.tenantId ||
-    relay.customerId !== actual.customerId
-  )
-    return refuse(
-      "Installation provider ownership differs from the configured relay",
-    );
   let claim = await readClaim(env.DB, operationId);
   if (claim) sameClaim(claim, addition, actual);
   const confirmedFirewall = async (confirmed: Allocation) => {

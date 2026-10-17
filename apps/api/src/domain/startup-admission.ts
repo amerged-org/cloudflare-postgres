@@ -21,15 +21,6 @@ const identifier = (value: string) => {
 const policyMode = (region: string) =>
   `COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=${region}),'reserved')`;
 
-/** Assigned host allowance only; idle pool consumption is already in actual Node samples. */
-export function computePoolOverheadSql(
-  ownerAlias: string,
-  resource: "cpu_millicores" | "memory_mib",
-): string {
-  const owner = identifier(ownerAlias);
-  return `COALESCE(json_extract((SELECT compute_pool_json FROM node_region_policies WHERE region_id=${owner}.region_id),'$.per_slot_${resource}'),0)`;
-}
-
 /** A database whose owned runtime stop is confirmed: the one predicate behind every "cold" decision. */
 function stoppedSleeperSql(
   database: string,
@@ -63,7 +54,7 @@ export function databaseCpuChargeSql(
     size = identifier(sizeAlias);
   const sleeping = stoppedSleeperSql(database, acceptingStopInCurrentBatch);
   return `(CASE WHEN (${sleeping}) THEN 0
-    ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END)`;
+    ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores} END)`;
 }
 
 /** Every start competes in the same atomic SQL budget, including waking an existing database. */
@@ -79,7 +70,7 @@ export function nodeCpuHeadroomSql(
         ? ""
         : `AND cpu_database.id<>${identifier(excludeDatabaseAlias)}.id`,
     target = `COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)`,
-    targetCharge = `${target}+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(node, "cpu_millicores")}`;
+    targetCharge = `${target}+${SIDECAR.requestCpuMillicores}`;
   return `((${node}.ready=1 AND ${node}.schedulable=1 AND ${node}.lost_at IS NULL AND ${node}.node_uid IS NOT NULL)
     AND (julianday(${node}.last_observed_at)>=julianday('now','-180 seconds')
     AND julianday(${node}.last_observed_at)<=julianday('now','+5 seconds'))
@@ -91,9 +82,7 @@ export function nodeCpuHeadroomSql(
       -COALESCE((SELECT SUM(${databaseCpuChargeSql("cpu_database", "cpu_size")})
         FROM databases cpu_database JOIN size_classes cpu_size ON cpu_size.id=cpu_database.size_class_id
         WHERE cpu_database.node_id=${node}.id AND cpu_database.observed_state<>'deleted' ${excluded}),0)
-      >=${targetCharge}
-    AND typeof(${computePoolOverheadSql(node, "cpu_millicores")})='integer'
-    AND ${computePoolOverheadSql(node, "cpu_millicores")} BETWEEN 0 AND ${maximumInteger})`;
+      >=${targetCharge})`;
 }
 
 /** A single startup must fit the permanent physical/allocatable budget even with no concurrent holds. */
@@ -104,7 +93,7 @@ export function startupPhysicalFitSql(
   const node = identifier(nodeAlias),
     size = identifier(sizeAlias),
     maximumMib = Math.floor(maximumInteger / mib),
-    peak = `(${size}.memory_mib+${SIDECAR.limitMemoryMib}+${computePoolOverheadSql(node, "memory_mib")})*${mib}`;
+    peak = `(${size}.memory_mib+${SIDECAR.limitMemoryMib})*${mib}`;
   return `(${policyMode(`${node}.region_id`)}='reserved' OR (
     (${node}.node_uid IS NOT NULL
     AND typeof(${node}.allocatable_memory_mib)='integer'
@@ -112,9 +101,7 @@ export function startupPhysicalFitSql(
     AND typeof(${node}.platform_reserved_memory_mib)='integer'
     AND ${node}.platform_reserved_memory_mib BETWEEN 0 AND ${node}.allocatable_memory_mib)
     AND (typeof(${size}.memory_mib)='integer'
-    AND ${size}.memory_mib BETWEEN 1 AND ${maximumMib - SIDECAR.limitMemoryMib}
-    AND typeof(${computePoolOverheadSql(node, "memory_mib")})='integer'
-    AND ${computePoolOverheadSql(node, "memory_mib")} BETWEEN 0 AND ${maximumMib}-${size}.memory_mib-${SIDECAR.limitMemoryMib})
+    AND ${size}.memory_mib BETWEEN 1 AND ${maximumMib - SIDECAR.limitMemoryMib})
     AND EXISTS(SELECT 1 FROM node_memory_samples physical WHERE physical.node_id=${node}.id AND physical.node_uid=${node}.node_uid
       AND physical.observed_at=(SELECT MAX(latest.observed_at) FROM node_memory_samples latest WHERE latest.node_id=${node}.id AND latest.node_uid=${node}.node_uid)
       AND typeof(physical.capacity_memory_bytes)='integer' AND physical.capacity_memory_bytes BETWEEN 1 AND ${maximumInteger}
@@ -126,7 +113,7 @@ export function startupPhysicalFitSql(
 export function startupHeadroomSql(nodeAlias = "n", sizeAlias = "s"): string {
   const node = identifier(nodeAlias),
     size = identifier(sizeAlias);
-  const peak = `(${size}.memory_mib+${SIDECAR.limitMemoryMib}+${computePoolOverheadSql(node, "memory_mib")})*${mib}`;
+  const peak = `(${size}.memory_mib+${SIDECAR.limitMemoryMib})*${mib}`;
   return `(${policyMode(`${node}.region_id`)}='reserved' OR (
     ${node}.ready=1 AND ${node}.schedulable=1 AND ${node}.lost_at IS NULL AND ${node}.node_uid IS NOT NULL
     AND ${startupPhysicalFitSql(node, size)}
@@ -174,7 +161,7 @@ export function startupReservationStatement(
   return db
     .prepare(
       `INSERT INTO database_start_admissions(operation_id,database_id,generation,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json)
-     SELECT o.id,d.id,d.generation,n.id,n.node_uid,(s.memory_mib+?+${computePoolOverheadSql("n", "memory_mib")})*${mib},?,
+     SELECT o.id,d.id,d.generation,n.id,n.node_uid,(s.memory_mib+?)*${mib},?,
        (SELECT MAX(m.observed_at) FROM node_memory_samples m WHERE m.node_id=n.id AND m.node_uid=n.node_uid),
        CASE WHEN d.storage_profile_json IS NULL THEN 0 ELSE MAX(json_extract(d.storage_profile_json,'$.startup_reserve_bytes'),s.storage_gib*1073741824) END,CASE WHEN d.storage_profile_json IS NULL THEN NULL ELSE d.storage_volume_json END
      FROM databases d JOIN operations o ON o.database_id=d.id AND o.project_id=d.project_id

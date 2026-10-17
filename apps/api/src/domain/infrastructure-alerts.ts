@@ -695,13 +695,13 @@ async function readRegionSubjects(
               AND NOT ${backupGood}))
         ORDER BY state,${baseline},d.id LIMIT 64)
       UNION ALL SELECT * FROM (SELECT 'thin_storage_blocked',
-          CASE WHEN t.status='blocked' OR x.exhausted IS NOT NULL THEN 'failing' ELSE 'unresolved' END state,t.node_id,COALESCE(t.error_code,x.exhausted)
+          CASE WHEN x.exhausted IS NOT NULL THEN 'failing' ELSE 'unresolved' END state,t.node_id,x.exhausted
         FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id
           LEFT JOIN (SELECT t.node_id,${thinPoolExhaustionSql()} exhausted FROM node_thin_storage t
             LEFT JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid) x
             ON x.node_id=t.node_id,p
         WHERE n.region_id=p.region AND n.lost_at IS NULL
-          AND (t.status='blocked' OR x.exhausted IS NOT NULL
+          AND (x.exhausted IS NOT NULL
             OR (t.status<>'ready' AND t.node_id IN(SELECT json_extract(s.value,'$.node_id')
               FROM infrastructure_alerts a,json_each(a.payload,'$.thin_storage') s
               WHERE a.region_id=n.region_id AND a.kind='thin_storage_blocked' AND a.active=1)))

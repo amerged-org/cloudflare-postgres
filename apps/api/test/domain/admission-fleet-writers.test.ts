@@ -14,7 +14,6 @@ import {
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
 import { admissionSnapshotCapable } from "../../src/domain/fleet-releases.ts";
 import { FleetReleaseSpec } from "@pgcf/contracts";
-import generatedPool from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
 
 afterEach(async () => {
   await cleanupFixtures();
@@ -98,7 +97,7 @@ it("a current ready observation closes admission before publishing a contradicto
   }
 });
 
-it("current node and region release assignments fence all regional admissions before changing compatibility", async () => {
+it("current node and region release assignments fence all regional admissions", async () => {
   const f = await admissionSnapshotFixture();
   await publishDatabaseAdmission(env, f.id);
   await env.DB.exec(
@@ -137,10 +136,6 @@ it("current node and region release assignments fence all regional admissions be
       route_revision: f.proof.route_revision + 2,
       mutation_id: null,
     });
-    const reply = await env.DATABASE_ACTOR.get(
-      env.DATABASE_ACTOR.idFromName(f.id),
-    ).admit(f.id, "app");
-    expect(reply.ok && reply.target?.route_revision).toBeUndefined();
   } finally {
     await env.DB.exec("DROP TRIGGER fleet_node_admission");
     await env.DB.exec("DROP TRIGGER fleet_region_admission");
@@ -342,78 +337,5 @@ it("a reported controller rollback fences cached admission and removes the incom
     ).toBe(false);
   } finally {
     await env.DB.exec("DROP TRIGGER fleet_observation_admission");
-  }
-});
-
-it("a regional runtime template change fences existing admissions before changing its node policy", async () => {
-  const f = await admissionSnapshotFixture();
-  await publishDatabaseAdmission(env, f.id);
-  await env.DB.exec(
-    `CREATE TRIGGER regional_pool_admission BEFORE INSERT ON node_region_policies WHEN NEW.region_id='${f.region}' AND NEW.compute_pool_json IS NOT NULL AND NOT EXISTS(SELECT 1 FROM node_region_policies WHERE region_id=NEW.region_id) AND NOT EXISTS(SELECT 1 FROM admission_scope_fences s WHERE s.kind='region' AND s.scope_id=NEW.region_id AND s.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'runtime template lacks admission fence'); END`,
-  );
-  try {
-    const response = await request(
-      `/v1/regions/${f.region}/capacity-policy`,
-      f.admin,
-      "PUT",
-      {
-        region_id: f.region,
-        max_nodes: 2,
-        purchases_enabled: false,
-        order: null,
-        compute_pool: {
-          ...generatedPool.lease.policy,
-          profile: {
-            ...generatedPool.lease.policy.profile,
-            release_id: f.releaseId,
-          },
-        },
-      },
-    );
-    expect(response.status).toBe(200);
-    expect(
-      await env.DB.prepare(
-        "SELECT admission_revision FROM database_admission_epochs WHERE database_id=?",
-      )
-        .bind(f.id)
-        .first("admission_revision"),
-    ).toBe(f.proof.admission_epoch + 1);
-    const before = await env.DB.prepare(
-      "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
-    )
-      .bind(f.id)
-      .first();
-    expect(
-      (
-        await request(
-          `/v1/regions/${f.region}/capacity-policy`,
-          f.admin,
-          "PUT",
-          {
-            region_id: f.region,
-            max_nodes: 2,
-            purchases_enabled: false,
-            order: null,
-            compute_pool: {
-              ...generatedPool.lease.policy,
-              target_slots: 0,
-              profile: {
-                ...generatedPool.lease.policy.profile,
-                release_id: f.releaseId,
-              },
-            },
-          },
-        )
-      ).status,
-    ).toBe(200);
-    expect(
-      await env.DB.prepare(
-        "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
-      )
-        .bind(f.id)
-        .first(),
-    ).toEqual(before);
-  } finally {
-    await env.DB.exec("DROP TRIGGER regional_pool_admission");
   }
 });

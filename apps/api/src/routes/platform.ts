@@ -17,8 +17,6 @@ import {
   RegionCreate,
   RegionCreated,
   RegionId,
-  RegionBootstrapMaterialUpdate,
-  RegionBootstrapMaterialStatus,
   SizeClass,
   SizeClassId,
   SizeClassUpsert,
@@ -26,15 +24,6 @@ import {
 } from "@pgcf/contracts";
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
-import {
-  RegionMaterialRotationStage,
-  RegionMaterialRotationActivate,
-  RegionMaterialRotationStaged,
-} from "@pgcf/contracts/region-material-rotation";
-import {
-  stageRegionBootstrapRotation,
-  activateRegionBootstrapRotation,
-} from "../domain/region-material-revisions.ts";
 import {
   createApiKey,
   deleteApiKey,
@@ -52,8 +41,6 @@ import {
   getRegion,
   listNodes,
   listRegions,
-  getRegionBootstrapMaterial,
-  updateRegionBootstrapMaterial,
 } from "../platform/regions.ts";
 import { listSizeClasses, upsertSizeClass } from "../platform/size-classes.ts";
 
@@ -248,87 +235,6 @@ export function registerPlatform(app: ApiApp): void {
       ),
     },
     listRegions,
-  );
-  register(
-    app,
-    {
-      method: "get",
-      path: "/v1/regions/{id}/bootstrap-material",
-      security,
-      tags: ["Regions"],
-      request: { params: z.object({ id: RegionId }) },
-      responses: response(RegionBootstrapMaterialStatus, 200),
-    },
-    async (c) =>
-      getRegionBootstrapMaterial(c, RegionId.parse(c.req.param("id"))),
-  );
-  register(
-    app,
-    {
-      method: "post",
-      path: "/v1/regions/{id}/bootstrap-material",
-      security,
-      tags: ["Regions"],
-      description:
-        "Synchronizes only Kubernetes version metadata after independently verified administrator readback; immutable credentials and historical references remain unchanged.",
-      request: {
-        params: z.object({ id: RegionId }),
-        body: body(RegionBootstrapMaterialUpdate),
-      },
-      responses: response(RegionBootstrapMaterialStatus, 200),
-    },
-    async (c) =>
-      updateRegionBootstrapMaterial(
-        c,
-        RegionId.parse(c.req.param("id")),
-        RegionBootstrapMaterialUpdate.parse(await c.req.json()),
-      ),
-  );
-  register(
-    app,
-    {
-      method: "post",
-      path: "/v1/regions/{id}/bootstrap-material/stage",
-      security,
-      tags: ["Regions"],
-      description:
-        "Stages private complete matching next-revision cluster custody. Does not activate it, execute rotation or authorize bootstrap.",
-      request: {
-        headers,
-        params: z.object({ id: RegionId }),
-        body: body(RegionMaterialRotationStage),
-      },
-      responses: response(RegionMaterialRotationStaged, 200),
-    },
-    async (c) =>
-      stageRegionBootstrapRotation(
-        c,
-        RegionId.parse(c.req.param("id")),
-        RegionMaterialRotationStage.parse(await c.req.json()),
-      ),
-  );
-  register(
-    app,
-    {
-      method: "post",
-      path: "/v1/regions/{id}/bootstrap-material/activate",
-      security,
-      tags: ["Regions"],
-      description:
-        "Activates exact staged custody after fresh complete trusted-admin or reviewed Native readback and explicit retired-authority evidence. This is a trusted administrator boundary, not cryptographic attestation or physical rotation.",
-      request: {
-        headers,
-        params: z.object({ id: RegionId }),
-        body: body(RegionMaterialRotationActivate),
-      },
-      responses: response(RegionBootstrapMaterialStatus, 200),
-    },
-    async (c) =>
-      activateRegionBootstrapRotation(
-        c,
-        RegionId.parse(c.req.param("id")),
-        RegionMaterialRotationActivate.parse(await c.req.json()),
-      ),
   );
   register(
     app,

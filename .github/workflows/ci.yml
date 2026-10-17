@@ -181,8 +181,6 @@ jobs:
           node packages/contracts/native/generate-controller.ts --check
           node packages/contracts/native/generate-power.ts --check
           node packages/contracts/native/generate-measurements.ts --check
-          node packages/contracts/native/generate-bootstrap.ts --check
-          node packages/contracts/native/generate-reclaim.ts --check
           cargo fmt --all -- --check
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -203,7 +201,6 @@ jobs:
           node --test infra/talos/sandbox/*.test.ts
           node --test scripts/ci/*.test.ts
           node --test scripts/operations/publish-talos-installer.test.mjs scripts/operations/publish-fleet-images.test.mjs
-          node packages/contracts/native/generate-compute-pool.ts --check
       - name: Bind the already-tested Rust Edge artifact
         run: |
           node --input-type=module <<'JS'

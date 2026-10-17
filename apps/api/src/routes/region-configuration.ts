@@ -67,7 +67,7 @@ export function registerRegionConfiguration(app: ApiApp): void {
       tags: ["Regions"],
       security: [{ bearerAuth: [] }],
       description:
-        "Atomically updates routing against the expected configuration digest. Provider identity, backup configuration and bootstrap credentials are preserved. Idempotency replay returns the current configuration without reapplying the mutation.",
+        "Atomically updates routing against the expected configuration digest. Provider identity, backup configuration and the agent credential are preserved. Idempotency replay returns the current configuration without reapplying the mutation.",
       request: {
         params: parameters,
         headers: z.object({ "Idempotency-Key": IdempotencyKey.optional() }),

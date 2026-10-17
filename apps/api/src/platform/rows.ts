@@ -3,13 +3,11 @@ import {
   ApiKey,
   Node,
   NodeInventory,
-  NodeLatestPatch,
   Project,
   Region,
   SizeClass,
 } from "@pgcf/contracts";
 import type { FleetNodeReleaseStatus } from "@pgcf/contracts/releases";
-import type { FleetPatchStatus } from "@pgcf/contracts/fleet-patches";
 export type Row = Record<string, unknown>;
 export const projectRow = (row: Row): Project =>
   Project.parse({
@@ -69,7 +67,6 @@ export function nodeInventoryRow(
     role: "control_relay" | "customer" | null;
     observationState: "current" | "stale" | "unobserved";
   },
-  patch: FleetPatchStatus | undefined,
 ): NodeInventory {
   const facts =
     fleet.observationState === "unobserved"
@@ -96,6 +93,5 @@ export function nodeInventoryRow(
           : null,
       agent_image_sha256: runtime,
     },
-    latest_patch: patch ? NodeLatestPatch.strip().parse(patch) : null,
   });
 }

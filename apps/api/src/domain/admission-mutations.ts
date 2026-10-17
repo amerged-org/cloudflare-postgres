@@ -142,47 +142,6 @@ export class AdmissionMutation {
     return result.slice(0, statements.length);
   }
 }
-/** Close only the explicitly declared scopes, in a stable order, before one atomic business batch. */
-export async function withAdmissionMutationScopes<T>(
-  env: Env,
-  scopes: AdmissionScope[],
-  execute: (group: {
-    guard: AdmissionSqlGuard;
-    batch: (statements: D1PreparedStatement[]) => Promise<D1Result[]>;
-  }) => Promise<T>,
-): Promise<T> {
-  const ordered = [
-    ...new Map(
-      scopes.map((scope) => [scope.kind + ":" + scope.id, scope]),
-    ).values(),
-  ].sort((a, b) => (a.kind + ":" + a.id < b.kind + ":" + b.id ? -1 : 1));
-  if (!ordered.length) throw new Error("database_admission_scope_missing");
-  const mutations: AdmissionMutation[] = [];
-  const next = (index: number): Promise<T> => {
-    const scope = ordered[index];
-    if (scope)
-      return withAdmissionMutation(
-        env,
-        [],
-        async (mutation) => {
-          mutations.push(mutation);
-          return next(index + 1);
-        },
-        scope,
-      );
-    const guards = mutations.map((mutation) => mutation.scopeGuard());
-    return execute({
-      guard: {
-        sql: guards.map((guard) => `(${guard.sql})`).join(" AND "),
-        bindings: guards.flatMap((guard) => guard.bindings),
-      },
-      batch: (statements) =>
-        AdmissionMutation.batchScopes(mutations, statements),
-    });
-  };
-  return next(0);
-}
-
 /** Trusted callers close Actors before a guarded authoritative write; no callback is retried. */
 export async function withAdmissionMutation<T>(
   env: Env,

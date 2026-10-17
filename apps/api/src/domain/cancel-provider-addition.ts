@@ -3,10 +3,10 @@ import { z } from "zod";
 import type { NodeAddition } from "@pgcf/contracts/nodes";
 import type { Env } from "../env.ts";
 import {
+  contaboClient,
   hasAllocatedContaboHardware,
   type ContaboClient,
 } from "../providers/contabo.ts";
-import { contaboClient } from "./bootstrap-relay.ts";
 import {
   NodeStateError,
   readNodeAddition,

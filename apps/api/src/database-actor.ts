@@ -13,31 +13,12 @@ import {
   roleExpiryInstant,
 } from "@pgcf/contracts";
 import { z } from "zod";
-import {
-  ReclaimClaims,
-  ReclaimObservation,
-  RECLAIM_LIMITS,
-  signReclaimIntent,
-  DatabaseRuntimeAttestation,
-  reclaimScopeFromRuntime,
-} from "@pgcf/contracts/reclaim";
+import { DatabaseRuntimeAttestation } from "@pgcf/contracts/reclaim";
 import { roleRevisionHash } from "@pgcf/contracts/route-token";
-import { nodeProofSigningKey } from "./domain/node-proof-session.ts";
 import {
   routeTokenV3Sql,
   admissionSnapshotSql,
 } from "./domain/fleet-releases.ts";
-import { warmReclaimCandidate } from "./domain/warm-reclaim.ts";
-interface ReclaimState {
-  revision: number;
-  claims: ReclaimClaims | null;
-  token: string | null;
-  revoked: boolean;
-  acknowledged_revision: number;
-  reclaim_expires_at: number;
-  last_admitted_at: number;
-  configuration_fingerprint: string | null;
-}
 
 import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
@@ -221,11 +202,6 @@ export class DatabaseActor extends DurableObject<Env> {
    * durable write; eviction restarts the count, and the Edge rate limiters still bound the rate.
    */
   private admissions = { minute: 0, attempts: 0 };
-  /**
-   * When this instance last admitted a connection. It is written durably (last_admitted_at) only
-   * by an admission that revokes an outstanding reclaim; warm idle takes the later of the two.
-   */
-  private admittedAt = 0;
   private admissionState() {
     const presence = this.presence();
     if (!presence) return undefined;
@@ -309,7 +285,6 @@ export class DatabaseActor extends DurableObject<Env> {
       ...intent,
       started_at: Date.now(),
     });
-    await this.revokeReclaimLocked();
     return true;
   }
   /** Repairs interruption before a D1 reservation existed; a positive CAS fences late reservations too. */
@@ -465,321 +440,6 @@ export class DatabaseActor extends DurableObject<Env> {
     };
     return { ok: true, region: snapshot.region, target };
   }
-  /** Whether the reclaim table exists; a read never creates it, so an admission writes nothing. */
-  private reclaimTable = false;
-  private reclaimState(): ReclaimState {
-    this.reclaimTable ||=
-      this.ctx.storage.sql
-        .exec(
-          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='database_reclaim'",
-        )
-        .toArray().length === 1;
-    const stored = this.reclaimTable
-      ? this.ctx.storage.sql
-          .exec<{ state: string }>(
-            "SELECT state FROM database_reclaim WHERE singleton=1",
-          )
-          .toArray()[0]
-      : undefined;
-    return stored
-      ? (JSON.parse(stored.state) as ReclaimState)
-      : {
-          revision: 0,
-          claims: null,
-          token: null,
-          revoked: true,
-          acknowledged_revision: 0,
-          reclaim_expires_at: 0,
-          last_admitted_at: 0,
-          configuration_fingerprint: null,
-        };
-  }
-  private saveReclaim(value: ReclaimState): void {
-    if (!this.reclaimTable) {
-      this.ctx.storage.sql.exec(
-        "CREATE TABLE IF NOT EXISTS database_reclaim(singleton INTEGER PRIMARY KEY CHECK(singleton=1),state TEXT NOT NULL)",
-      );
-      this.reclaimTable = true;
-    }
-    this.ctx.storage.sql.exec(
-      "INSERT INTO database_reclaim(singleton,state) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET state=excluded.state",
-      JSON.stringify(value),
-    );
-  }
-  private async revokeReclaimLocked(): Promise<ReclaimState> {
-    const state = this.reclaimState();
-    if (!state.claims || state.revoked) return state;
-    const now = Date.now(),
-      claims: ReclaimClaims = {
-        ...state.claims,
-        intent_revision: state.revision + 1,
-        mode: "revoked",
-        budget_bytes: 0,
-        step_bytes: 0,
-        issued_at: now,
-        expires_at: now + RECLAIM_LIMITS.lease_ms,
-      };
-    // Persist revocation before signing/publishing. Interruption can never renew the previous grant.
-    const next: ReclaimState = {
-      ...state,
-      revision: claims.intent_revision,
-      claims,
-      revoked: true,
-      token: null,
-    };
-    this.saveReclaim(next);
-    try {
-      const key = await nodeProofSigningKey(this.env);
-      claims.kid = key.kid;
-      next.token = await signReclaimIntent(claims, key.privateKey, now);
-      this.saveReclaim(next);
-    } catch {
-      /* The previous lease still expires; missing signing authority never reopens it. */
-    }
-    return next;
-  }
-  async revokeWarmReclaim(databaseId: string): Promise<void> {
-    this.identity(DatabaseId.parse(databaseId));
-    await this.gate("revokeWarmReclaim", () => this.revokeReclaimLocked());
-  }
-  /** Mutations revoke reclaim under the same real acknowledgement/expiry rule, without activity. */
-  async revokeBeforeChange(
-    databaseId: string,
-    deadline = Date.now() + 30000,
-  ): Promise<boolean> {
-    this.identity(DatabaseId.parse(databaseId));
-    return this.revokeBeforeAdmission(
-      databaseId,
-      Math.min(deadline, Date.now() + 30000),
-      false,
-    );
-  }
-  private async revokeBeforeAdmission(
-    databaseId: string,
-    deadline: number,
-    recordAdmission = true,
-  ): Promise<boolean> {
-    this.identity(databaseId);
-    if (recordAdmission) this.admittedAt = Date.now();
-    // Without an outstanding reclaim there is nothing to revoke or wait for: the admission passes
-    // without the gate and without a durable write.
-    if (!this.reclaimOutstanding()) return true;
-    await this.gate("revokeBeforeAdmission", async () => {
-      const state = this.reclaimState();
-      if (recordAdmission) {
-        state.last_admitted_at = Math.max(
-          state.last_admitted_at,
-          this.admittedAt,
-        );
-        this.saveReclaim(state);
-      }
-      await this.revokeReclaimLocked();
-    });
-    while (Date.now() < deadline) {
-      const state = this.reclaimState();
-      if (
-        !state.claims ||
-        state.acknowledged_revision >= state.revision ||
-        Date.now() >= state.reclaim_expires_at + RECLAIM_LIMITS.clock_skew_ms
-      )
-        return true;
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(25, deadline - Date.now())),
-      );
-    }
-    return false;
-  }
-  /** A reclaim grant that is live, or revoked without an Ack while its lease may still run. */
-  private reclaimOutstanding(): boolean {
-    const state = this.reclaimState();
-    return (
-      state.claims !== null &&
-      (!state.revoked ||
-        (state.acknowledged_revision < state.revision &&
-          Date.now() < state.reclaim_expires_at + RECLAIM_LIMITS.clock_skew_ms))
-    );
-  }
-  /** Trusted node publisher RPC. The reclaimer receives only this short-lived signed scope. */
-  async reclaimIntent(databaseId: string): Promise<string | null> {
-    this.identity(DatabaseId.parse(databaseId));
-    return this.gate("reclaimIntent", async () => {
-      const state = this.reclaimState();
-      if (!state.claims) return null;
-      if (state.revoked)
-        return state.claims.expires_at > Date.now() ? state.token : null;
-      const current = await warmReclaimCandidate(this.env, databaseId),
-        activity = this.ctx.storage.sql
-          .exec<{
-            revision: number;
-            observed_at: string;
-            last_activity_at: string;
-            active_connections: number;
-          }>("SELECT * FROM database_activity WHERE singleton=1")
-          .toArray()[0],
-        runtime = current?.runtime,
-        now = Date.now();
-      if (
-        !current ||
-        !runtime ||
-        !activity ||
-        activity.revision !== runtime.generation ||
-        Date.parse(activity.observed_at) < now - 30000 ||
-        activity.active_connections !== 0 ||
-        now -
-          Math.max(
-            Date.parse(activity.last_activity_at),
-            state.last_admitted_at,
-            this.admittedAt,
-          ) <
-          current.policy.idle_after_seconds * 1000 ||
-        state.configuration_fingerprint !== runtime.configuration_fingerprint ||
-        !this.sameReclaimRuntime(state.claims, runtime)
-      ) {
-        return (await this.revokeReclaimLocked()).token;
-      }
-      if (state.claims.expires_at > now + RECLAIM_LIMITS.snapshot_ms)
-        return state.token;
-      const key = await nodeProofSigningKey(this.env),
-        claims: ReclaimClaims = {
-          ...state.claims,
-          kid: key.kid,
-          intent_revision: state.revision + 1,
-          issued_at: now,
-          expires_at: now + RECLAIM_LIMITS.lease_ms,
-        };
-      const next: ReclaimState = {
-        ...state,
-        revision: claims.intent_revision,
-        claims,
-        token: null,
-        reclaim_expires_at: claims.expires_at,
-      };
-      this.saveReclaim(next);
-      next.token = await signReclaimIntent(claims, key.privateKey, now);
-      this.saveReclaim(next);
-      return next.token;
-    });
-  }
-  private sameReclaimRuntime(
-    claims: ReclaimClaims,
-    runtime: DatabaseRuntimeAttestation,
-  ): boolean {
-    return (
-      [
-        "database_id",
-        "generation",
-        "storage_generation",
-        "node_uid",
-        "boot_id",
-        "cluster_uid",
-        "namespace_uid",
-        "cnpg_cluster_uid",
-        "storage_uid",
-        "pvc_uid",
-        "pv_uid",
-        "pod_uid",
-        "container_id",
-        "postgres_image_sha256",
-        "memory_request_bytes",
-        "memory_limit_bytes",
-      ] as const
-    ).every((key) => claims[key] === runtime[key]);
-  }
-  /** A revoked acknowledgement permits admission even while one previously started bounded syscall finishes. */
-  async recordReclaimObservation(
-    databaseId: string,
-    raw: unknown,
-  ): Promise<boolean> {
-    this.identity(DatabaseId.parse(databaseId));
-    const parsed = ReclaimObservation.safeParse(raw);
-    if (!parsed.success) return false;
-    return this.gate("recordReclaimObservation", async () => {
-      const state = this.reclaimState(),
-        claims = state.claims,
-        ack = parsed.data,
-        now = Date.now();
-      if (
-        !claims ||
-        ack.database_id !== databaseId ||
-        ack.operation_id !== claims.operation_id ||
-        ack.intent_revision !== state.revision ||
-        ack.generation !== claims.generation ||
-        ack.storage_generation !== claims.storage_generation ||
-        ack.pod_uid !== claims.pod_uid ||
-        ack.container_id !== claims.container_id ||
-        ack.observed_at < now - RECLAIM_LIMITS.snapshot_ms ||
-        ack.observed_at > now + RECLAIM_LIMITS.clock_skew_ms ||
-        ack.observed_at < claims.issued_at - RECLAIM_LIMITS.clock_skew_ms
-      )
-        return false;
-      if (ack.outcome === "revoked") {
-        if (!state.revoked || claims.mode !== "revoked") return false;
-        state.acknowledged_revision = state.revision;
-        this.saveReclaim(state);
-      }
-      return true;
-    });
-  }
-  private async enterWarmIdle(
-    databaseId: string,
-    revision: number,
-    lastActivity: number,
-  ): Promise<{ operation: string; revision: number } | null> {
-    const current = await warmReclaimCandidate(this.env, databaseId);
-    if (!current) return null;
-    const state = this.reclaimState(),
-      now = Date.now();
-    if (
-      now - Math.max(lastActivity, state.last_admitted_at, this.admittedAt) <
-      current.policy.idle_after_seconds * 1000
-    )
-      return null;
-    if (
-      state.claims &&
-      !state.revoked &&
-      this.sameReclaimRuntime(state.claims, current.runtime) &&
-      state.configuration_fingerprint ===
-        current.runtime.configuration_fingerprint
-    )
-      return { operation: state.claims.operation_id, revision };
-    if (state.claims && !state.revoked) {
-      await this.revokeReclaimLocked();
-      return null;
-    }
-    if (
-      state.claims &&
-      state.acknowledged_revision < state.revision &&
-      now < state.reclaim_expires_at + RECLAIM_LIMITS.clock_skew_ms
-    )
-      return null;
-    const key = await nodeProofSigningKey(this.env),
-      configuration_fingerprint = current.runtime.configuration_fingerprint,
-      runtime = reclaimScopeFromRuntime(current.runtime);
-    const claims: ReclaimClaims = {
-      ...runtime,
-      kid: key.kid,
-      operation_id: newOperationId(),
-      intent_revision: state.revision + 1,
-      mode: "reclaim",
-      budget_bytes: current.policy.budget_bytes,
-      step_bytes: current.policy.step_bytes,
-      issued_at: now,
-      expires_at: now + RECLAIM_LIMITS.lease_ms,
-    };
-    const next: ReclaimState = {
-      ...state,
-      revision: claims.intent_revision,
-      claims,
-      token: null,
-      revoked: false,
-      reclaim_expires_at: claims.expires_at,
-      configuration_fingerprint,
-    };
-    this.saveReclaim(next);
-    next.token = await signReclaimIntent(claims, key.privateKey, now);
-    this.saveReclaim(next);
-    return { operation: claims.operation_id, revision };
-  }
   private initializeSchema(): void {
     if (this.hasSchema) return;
     this.ctx.storage.sql.exec(
@@ -887,13 +547,6 @@ export class DatabaseActor extends DurableObject<Env> {
           next = current;
         }
       }
-      if (
-        previous &&
-        (next.deleted ||
-          next.revision !== previous.revision ||
-          JSON.stringify(next.roles) !== JSON.stringify(previous.roles))
-      )
-        await this.revokeReclaimLocked();
       this.ctx.storage.sql.exec(
         "INSERT INTO database_presence(singleton,database_id,revision,updated_at,roles,deleted) VALUES(1,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,updated_at=excluded.updated_at,roles=excluded.roles,deleted=excluded.deleted",
         next.database_id,
@@ -922,8 +575,6 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "3D000" };
       if (!roleAdmitted(snapshot, role.data))
         return { ok: false, sqlstate: "28P01" };
-      if (!(await this.revokeBeforeAdmission(id.data, Date.now() + 30000)))
-        return { ok: false, sqlstate: "57P03" };
       const cached = this.snapshotAdmission(role.data);
       if (cached) return cached;
       const row = await this.env.DB.prepare(DATABASE_ADMISSION_QUERY)
@@ -1018,17 +669,7 @@ export class DatabaseActor extends DurableObject<Env> {
         return await this.ensureAwake(id.data, role.data, options);
       const failure = this.earlyAdmission(id.data, role.data, read!.presence);
       if (failure) return failure;
-      // A revocation awaits the gate, and the state may change meanwhile: only then is it read
-      // again. Without one, nothing ran between the read and this admission.
-      const revoking = this.reclaimOutstanding();
-      if (
-        !(await this.revokeBeforeAdmission(
-          id.data,
-          Math.min(options?.deadline ?? Infinity, Date.now() + 30000),
-        ))
-      )
-        return { ok: false, sqlstate: "57P03" };
-      const state = revoking ? this.admissionState()! : read!;
+      const state = read!;
       if (state.barrier) {
         if (state.barrier.mutation_id !== this.ticketMutation)
           return { ok: false, sqlstate: "57P03" };
@@ -1654,8 +1295,6 @@ export class DatabaseActor extends DurableObject<Env> {
     );
     if (deadline <= Date.now()) return { ok: false, sqlstate: "57P03" };
     try {
-      if (!(await this.revokeBeforeAdmission(id.data, deadline)))
-        return { ok: false, sqlstate: "57P03" };
       const current = await this.known(id.data, role.data);
       if ("ok" in current) return current;
       if (
@@ -1890,7 +1529,6 @@ export class DatabaseActor extends DurableObject<Env> {
     }
     return this.gate("recordActivity", async () => {
       try {
-        if (activity.active_connections > 0) await this.revokeReclaimLocked();
         return (
           this.ctx.storage.sql.exec(
             "INSERT INTO database_activity(singleton,revision,observed_at,last_activity_at,active_connections) VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,observed_at=excluded.observed_at,last_activity_at=excluded.last_activity_at,active_connections=excluded.active_connections WHERE excluded.revision>database_activity.revision OR (excluded.revision=database_activity.revision AND excluded.observed_at>database_activity.observed_at AND excluded.last_activity_at>=database_activity.last_activity_at)",
@@ -1908,8 +1546,7 @@ export class DatabaseActor extends DurableObject<Env> {
 
   /**
    * A refusal that needs no gate: no current report, a row that moved on, or a database busy or
-   * idle for less than its sleep threshold. Undefined when the database may be idle or has a warm
-   * reclaim policy, which decides on its own thresholds.
+   * idle for less than its sleep threshold. Undefined when the database may be idle.
    */
   private async idleRefusal(
     databaseId: string,
@@ -1947,11 +1584,10 @@ export class DatabaseActor extends DurableObject<Env> {
     )
       return { ok: false, reason: "changed" };
     if (
-      row.warm_reclaim_policy_json === null &&
-      (activity.active_connections !== 0 ||
-        row.effective_sleep_after_seconds === null ||
-        Date.now() - Date.parse(activity.last_activity_at) <
-          row.effective_sleep_after_seconds * 1000)
+      activity.active_connections !== 0 ||
+      row.effective_sleep_after_seconds === null ||
+      Date.now() - Date.parse(activity.last_activity_at) <
+        row.effective_sleep_after_seconds * 1000
     )
       return { ok: false, reason: "not_idle" };
     return undefined;
@@ -2003,23 +1639,6 @@ export class DatabaseActor extends DurableObject<Env> {
         row.observed_power !== "awake"
       )
         return { ok: false, reason: "changed" };
-      const warm = await warmReclaimCandidate(this.env, databaseId);
-      if (
-        warm &&
-        activity.active_connections === 0 &&
-        Date.now() - Date.parse(activity.last_activity_at) >=
-          warm.policy.idle_after_seconds * 1000
-      ) {
-        const intent = await this.enterWarmIdle(
-          databaseId,
-          revision,
-          Date.parse(activity.last_activity_at),
-        );
-        return intent
-          ? { ok: true, ...intent }
-          : { ok: false, reason: "not_idle" };
-      }
-      if (warm) return { ok: false, reason: "not_idle" };
       if (
         activity.active_connections !== 0 ||
         row.effective_sleep_after_seconds === null ||
@@ -2027,7 +1646,6 @@ export class DatabaseActor extends DurableObject<Env> {
           row.effective_sleep_after_seconds * 1000
       )
         return { ok: false, reason: "not_idle" };
-      await this.revokeReclaimLocked();
       const operation = newOperationId(),
         now = new Date().toISOString();
       const result = await withAdmissionMutation(

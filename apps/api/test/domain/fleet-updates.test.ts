@@ -209,7 +209,7 @@ it("keeps an absent policy disabled and requires admin, exact baseline and polic
     ).status,
   ).toBe(400);
 });
-it("concurrent Cron turns claim once, deduplicate supported proposals and never patch or qualify", async () => {
+it("concurrent Cron turns claim once, deduplicate supported proposals and never qualify", async () => {
   const f = await setup();
   await enable(f);
   const now = Date.parse("2026-10-09T12:00:00.000Z"),
@@ -251,11 +251,6 @@ it("concurrent Cron turns claim once, deduplicate supported proposals and never 
     eligible: false,
     reasons: expect.arrayContaining(["qualification_channel_unavailable"]),
   });
-  expect(
-    await env.DB.prepare(
-      "SELECT count(*) count FROM fleet_patch_operations",
-    ).first("count"),
-  ).toBe(0);
   expect(await runFleetUpdates(env, now + 3600_001, feed)).toMatchObject({
     discovered: 0,
   });

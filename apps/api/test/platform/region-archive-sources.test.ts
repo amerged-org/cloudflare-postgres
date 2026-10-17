@@ -17,7 +17,7 @@ import {
 import {
   encryptCustodyDocument,
   decryptCustodyDocument,
-} from "../../src/crypto/bootstrap-credentials.ts";
+} from "../../src/crypto/custody.ts";
 
 const keys: string[] = [];
 afterEach(async () => {

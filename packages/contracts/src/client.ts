@@ -18,12 +18,6 @@ import { ApiKeyString } from "./auth.ts";
 import { ErrorBody, type ErrorCode } from "./errors.ts";
 import { DatabaseId, NodeId, OperationId, RoleName } from "./ids.ts";
 import {
-  NodeOperatorKubernetesQuery,
-  nodeOperatorKubernetesPath,
-  parseNodeOperatorKubernetesBinding,
-  type NodeOperatorKubernetesBinding,
-} from "./node-operator.ts";
-import {
   NodeAddition,
   NodeAdditionRequest,
   NodeLoss,
@@ -65,11 +59,6 @@ export interface PgcfClientOptions {
 }
 
 /** Private request options for a caller-owned WebSocket connector; never log the headers. */
-export interface OperatorKubernetesRequest {
-  url: string;
-  headers: { Authorization: string };
-}
-
 function input<T extends z.ZodType>(schema: T, value: unknown): z.output<T> {
   const parsed = schema.safeParse(value);
   if (!parsed.success) throw new PgcfClientError("invalid_request");
@@ -428,39 +417,5 @@ export class PgcfClient {
       NodeLoss,
       input(NodeMarkLost, body),
     );
-  }
-
-  operatorKubernetesRequest(
-    nodeId: string,
-    nodeUid: string,
-  ): OperatorKubernetesRequest {
-    const query = input(NodeOperatorKubernetesQuery, { node_uid: nodeUid });
-    const url = new URL(
-      nodeOperatorKubernetesPath(input(NodeId, nodeId)),
-      this.#base,
-    );
-    url.protocol = "wss:";
-    url.searchParams.set("node_uid", query.node_uid);
-    return {
-      url: url.href,
-      headers: { Authorization: `Bearer ${this.#apiKey}` },
-    };
-  }
-
-  parseOperatorKubernetesResponse(
-    headers: Pick<Headers, "get">,
-    expectedNodeUid: string,
-  ): NodeOperatorKubernetesBinding {
-    const expected = input(NodeOperatorKubernetesQuery, {
-      node_uid: expectedNodeUid,
-    });
-    try {
-      const binding = parseNodeOperatorKubernetesBinding(headers);
-      if (binding.node_uid !== expected.node_uid)
-        throw new PgcfClientError("invalid_response", 101);
-      return binding;
-    } catch {
-      throw new PgcfClientError("invalid_response", 101);
-    }
   }
 }

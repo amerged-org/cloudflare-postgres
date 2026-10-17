@@ -3,19 +3,11 @@
 // depend on one another are issued together. Real D1 harness; no live evidence.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
-import { DesiredResponse } from "@pgcf/contracts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
-import { awakeWriter } from "./thin-writer-fixture.ts";
-import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 
-const releases: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
-  for (const id of releases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -88,38 +80,4 @@ it("the desired page reads the region's independent data together", async () => 
   ).toBe(true);
   open();
   expect((await response).status).toBe(200);
-}, 30_000);
-
-it("the desired page reads a thin node's identity proof once for its region and its databases", async () => {
-  const w = await awakeWriter(await thinExecutionFixture(releases));
-  let reads = 0;
-  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
-  const original = prototype.prepare;
-  vi.spyOn(prototype, "prepare").mockImplementation(function (
-    this: D1Database,
-    sql: string,
-  ) {
-    const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
-      new Proxy(statement, {
-        get(target, property) {
-          if (property === "bind")
-            return (...values: unknown[]) => wrap(target.bind(...values));
-          if (property === "first" && sql.startsWith("SELECT t.*,n.region_id"))
-            return (...args: unknown[]) => {
-              reads++;
-              return Reflect.apply(target.first, target, args);
-            };
-          const value = Reflect.get(target, property);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-      });
-    return wrap(original.call(this, sql));
-  });
-  const page = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", w.f.agent)).json(),
-  );
-  const record = page.databases.find((database) => database.id === w.id)!;
-  expect(record.storage).toBeDefined();
-  expect(page.region.storage_nodes).toHaveLength(1);
-  expect(reads).toBe(1);
 }, 30_000);

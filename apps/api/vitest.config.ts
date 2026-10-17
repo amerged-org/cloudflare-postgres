@@ -1,37 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-import { randomBytes, randomUUID, generateKeyPairSync } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
-import { thinRelayRuntime } from "./test/thin-relay-runtime.ts";
 
-const reclaimPair = generateKeyPairSync("ed25519"),
-  reclaimPrivate = reclaimPair.privateKey
-    .export({ type: "pkcs8", format: "der" })
-    .toString("base64url"),
-  reclaimPublic = reclaimPair.publicKey
-    .export({ type: "spki", format: "der" })
-    .subarray(12)
-    .toString("base64url");
 export default defineConfig({
   plugins: [
     cloudflareTest(async () => ({
       remoteBindings: false,
       wrangler: { configPath: "./wrangler.test.jsonc" },
       miniflare: {
-        serviceBindings: {
-          THIN_RELAY_TEST_RUNTIME: thinRelayRuntime({
-            "test-cf": reclaimPublic,
-          }),
-        },
         bindings: {
           API_KEY_PEPPER: randomBytes(32).toString("base64url"),
           BOOTSTRAP_TOKEN: randomUUID(),
-          BOOTSTRAP_RELAY_SIGNING_KEYS: JSON.stringify({
-            active: "test-cf",
-            keys: { "test-cf": reclaimPrivate },
-          }),
-          BOOTSTRAP_VERIFIER_KEYS: JSON.stringify({ "test-cf": reclaimPublic }),
           CREDENTIAL_KEYS: JSON.stringify({
             active: "v1",
             keys: { v1: randomBytes(32).toString("base64url") },

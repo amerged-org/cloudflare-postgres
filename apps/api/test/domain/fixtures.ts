@@ -28,33 +28,9 @@ export async function cleanupFixtures(): Promise<void> {
     const [region, foreign] = fixture.regions;
     const databaseScope =
       "database_id IN(SELECT id FROM databases WHERE project_id IN(?,?))";
-    // Fixture qualification runs keep their own "-base" release; it goes with the runs.
-    const qualified = await env.DB.prepare(
-      "SELECT DISTINCT release_id FROM thin_storage_qualification_runs WHERE region_id IN(?,?) AND release_id LIKE '%-base'",
-    )
-      .bind(region, foreign)
-      .all<{ release_id: string }>();
     await env.DB.batch([
       env.DB.prepare(
-        "DELETE FROM thin_storage_qualification_runs WHERE region_id IN(?,?)",
-      ).bind(region, foreign),
-      env.DB.prepare(
-        "DELETE FROM fleet_patch_operations WHERE bootstrap_operation_id IN(SELECT operation_id FROM node_bootstrap_jobs WHERE region_id IN(?,?))",
-      ).bind(region, foreign),
-      env.DB.prepare(
-        "DELETE FROM node_bootstrap_jobs WHERE region_id IN(?,?)",
-      ).bind(region, foreign),
-      env.DB.prepare(
         "DELETE FROM node_provider_mutations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
-      ).bind(region, foreign),
-      env.DB.prepare(
-        "DELETE FROM node_network_mutations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
-      ).bind(region, foreign),
-      env.DB.prepare(
-        "DELETE FROM node_network_firewalls WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
-      ).bind(region, foreign),
-      env.DB.prepare(
-        "DELETE FROM node_network_preparations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
       ).bind(region, foreign),
       env.DB.prepare("DELETE FROM node_additions WHERE region_id IN(?,?)").bind(
         region,
@@ -102,12 +78,6 @@ export async function cleanupFixtures(): Promise<void> {
       ),
       env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(fixture.size),
     ]);
-    for (const { release_id } of qualified.results)
-      await env.DB.prepare(
-        `DELETE FROM fleet_releases WHERE id=? AND NOT EXISTS(SELECT 1 FROM thin_storage_qualification_runs WHERE release_id=?)`,
-      )
-        .bind(release_id, release_id)
-        .run();
   }
 }
 

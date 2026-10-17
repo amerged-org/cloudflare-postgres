@@ -34,14 +34,12 @@ import {
 import { startAddNode } from "../platform/nodes.ts";
 import {
   startupHeadroomSql,
-  computePoolOverheadSql,
   startupReservationStatement,
   nodeCpuHeadroomSql,
 } from "./startup-admission.ts";
 
 import {
   nodeStoragePlacementSql,
-  thinPoolGrowthNeededSql,
   selectedStorageProfileSql,
 } from "./storage-capacity.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
@@ -113,7 +111,7 @@ export async function placePendingDatabases(
           AND ${nodeDatabasePlacementGuard()}
           AND ${startupHeadroomSql()}
           AND n.platform_reserved_cpu_millicores IS NOT NULL)
-          AND (${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?+${computePoolOverheadSql("d", "memory_mib")}) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?+${computePoolOverheadSql("n", "memory_mib")}`)}
+          AND (${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?`)}
           AND ${nodeCpuHeadroomSql()})
           AND ${nodeStoragePlacementSql()}
           AND (s.memory_mib=? AND s.cpu_millicores=?
@@ -142,7 +140,7 @@ export async function placePendingDatabases(
       db
         .prepare(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-        SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?+${computePoolOverheadSql("databases", "cpu_millicores")},'$.reserved_memory_mib',?+${computePoolOverheadSql("databases", "memory_mib")}) FROM databases
+        SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?,'$.reserved_memory_mib',?) FROM databases
         WHERE changes()=1 AND id=? AND node_id=? AND updated_at=?`,
         )
         .bind(
@@ -180,21 +178,6 @@ export async function placePendingDatabases(
   return placed;
 }
 
-/** Each thin node of the region whose pool should grow gets its pool action turn now. */
-async function requestThinPoolGrowth(env: Env, regionId: string) {
-  const nodes = await env.DB.prepare(
-    `SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
-    JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid
-    WHERE n.region_id=? AND n.lost_at IS NULL AND t.error_code IS NULL AND ${thinPoolGrowthNeededSql()} ORDER BY t.node_id`,
-  )
-    .bind(regionId)
-    .all<{ node_id: string }>();
-  if (!nodes.results.length) return;
-  const { requestThinStorageTurn } =
-    await import("./node-thin-storage-execution.ts");
-  for (const { node_id } of nodes.results)
-    await requestThinStorageTurn(env, node_id).catch(() => undefined);
-}
 export async function runNodeCapacity(
   env: Env,
   regionId: string,
@@ -214,7 +197,6 @@ export async function runNodeCapacity(
       placement_mode: "reserved" | "actual_ram";
     }>();
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
-  if (!dryRun) await requestThinPoolGrowth(env, regionId);
   if (placed.length) {
     await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify(
       placed,

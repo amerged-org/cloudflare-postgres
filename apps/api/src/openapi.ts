@@ -4,15 +4,9 @@ import {
   RETRYABLE_ERROR_REASONS,
   TIMESTAMP_PATTERN,
 } from "@pgcf/contracts";
-import { NODE_OPERATOR_KUBERNETES_HEADERS } from "@pgcf/contracts/node-operator";
 import { ApiError, type ApiApp } from "./app.ts";
 import type { Env } from "./env.ts";
 import { routeMetadata, type DocumentationAuth } from "./openapi-metadata.ts";
-import {
-  agentRouteErrors,
-  registerCallbackDocumentation,
-} from "./openapi-callbacks.ts";
-import { registerFleetImageDocumentation } from "./openapi-fleet-images.ts";
 import {
   publicRouteErrors,
   idempotentPublicRoutes,
@@ -23,7 +17,7 @@ import {
 type Document = ReturnType<ApiApp["getOpenAPI31Document"]>;
 type PathItem = NonNullable<Document["paths"]>[string];
 type Operation = NonNullable<PathItem["get"]>;
-type Scope = "public" | "agent" | "internal";
+type Scope = "public" | "agent";
 const methods = ["get", "head", "post", "put", "patch", "delete"] as const;
 const scopes = [
   [
@@ -40,13 +34,16 @@ const scopes = [
     ].join("\n\n"),
   ],
   ["agent", "/agent/v1/openapi.json", "PGCF regional agent API", undefined],
-  [
-    "internal",
-    "/internal/v1/openapi.json",
-    "PGCF operation callback API",
-    undefined,
-  ],
 ] as const;
+/** Agent auth is regional; handler reads and state fences determine the remaining refusals. */
+const agentRouteErrors: Readonly<Record<string, readonly number[]>> = {
+  "GET /agent/v1/desired": [400, 401, 404, 409, 500],
+  "POST /agent/v1/observations": [400, 401, 500],
+  "GET /agent/v1/link": [401, 500],
+  "POST /agent/v1/activity": [400, 401, 404, 409, 500],
+  "POST /agent/v1/usage": [400, 401, 404, 500],
+  "POST /agent/v1/fleet-observations": [400, 401, 404, 409, 500],
+};
 const errors: Record<number, string> = {
   400: "Invalid request",
   401: "Invalid or missing credentials",
@@ -64,8 +61,6 @@ const authDescription: Record<DocumentationAuth, string> = {
   admin: "Requires an administrator API key.",
   agent:
     "Requires the current regional agent bearer, rather than a management API key.",
-  callback:
-    "Requires the current bearer scoped to this operation, session or execution lease, rather than a management or regional agent key.",
 };
 const responseHeaders = {
   "X-Request-Id": {
@@ -148,12 +143,8 @@ function conformToContracts(value: unknown): void {
 
 function inScope(scope: Scope, path: string): boolean {
   return scope === "public"
-    ? path.startsWith("/v1/") ||
-        path === "/healthz" ||
-        path === "/fleet-images/v1/raw/{digest}"
-    : scope === "agent"
-      ? path.startsWith("/agent/")
-      : path.startsWith("/internal/") || path === "/source-control";
+    ? path.startsWith("/v1/") || path === "/healthz"
+    : path.startsWith("/agent/");
 }
 
 function workerVersion(env: Env): WorkerVersionMetadata {
@@ -179,9 +170,6 @@ function describeOperation(key: string, operation: Operation): void {
     );
   operation.operationId ??= metadata.operationId;
   operation.summary ??= metadata.summary;
-  if (key === "POST /v1/regions/{id}/bootstrap-material")
-    operation.description =
-      "Synchronizes Kubernetes and optional Talos version metadata after independently verified administrator readback; immutable credentials and historical references remain unchanged.";
   const authentication =
     key === "POST /v1/api-keys"
       ? "Requires an administrator API key, except for the one-time bootstrap bearer that creates the first administrator key. Bootstrap creation ignores Idempotency-Key."
@@ -195,11 +183,7 @@ function describeOperation(key: string, operation: Operation): void {
       ? []
       : [
           {
-            [metadata.auth === "agent"
-              ? "AgentBearer"
-              : metadata.auth === "callback"
-                ? "CallbackBearer"
-                : "bearerAuth"]: [],
+            [metadata.auth === "agent" ? "AgentBearer" : "bearerAuth"]: [],
           },
         ];
   const statuses =
@@ -257,18 +241,6 @@ function describeOperation(key: string, operation: Operation): void {
     response.headers = { ...responseHeaders, ...response.headers };
     if (status === "409" || status === "503")
       response.headers["Retry-After"] = retryAfterHeader;
-    if (operation.responses?.default) {
-      response.headers["Cache-Control"] = {
-        description:
-          "Local API responses use no-store; upstream handshake responses retain their own cache policy",
-        schema: { type: "string" },
-      };
-      response.headers["X-Content-Type-Options"] = {
-        description:
-          "Local API responses use nosniff; upstream handshake headers are passed through",
-        schema: { type: "string" },
-      };
-    }
     const location = locationResponses[key]?.[status];
     if (location)
       response.headers.Location = {
@@ -294,12 +266,6 @@ function describeOperation(key: string, operation: Operation): void {
     const response = operation.responses["101"];
     if (!("$ref" in response)) {
       delete response.content;
-      if (key === "GET /v1/nodes/{id}/operator/kubernetes")
-        for (const name of Object.values(NODE_OPERATOR_KUBERNETES_HEADERS))
-          (response.headers ??= {})[name] = {
-            description: "Fenced Kubernetes relay target identity",
-            schema: { type: "string" },
-          };
     }
   }
   if (key === "GET /agent/v1/link")
@@ -361,14 +327,6 @@ function scopedComponents(document: Document): void {
 }
 
 export function registerApiDocuments(app: ApiApp): void {
-  app.openAPIRegistry.registerComponent("securitySchemes", "CallbackBearer", {
-    type: "http",
-    scheme: "bearer",
-    description:
-      "Ephemeral bearer scoped to the selected operation, callback session or current execution lease.",
-  });
-  registerCallbackDocumentation(app);
-  registerFleetImageDocumentation(app);
   for (const [scope, path, title, description] of scopes) {
     app.openAPIRegistry.registerPath({
       method: "get",

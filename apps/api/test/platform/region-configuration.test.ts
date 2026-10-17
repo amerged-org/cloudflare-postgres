@@ -51,7 +51,7 @@ it("refuses region creation when the gateway endpoint is missing /pg", async () 
   }
 });
 
-it("repairs legacy routing through the admin API while preserving unrelated configuration and custody", async () => {
+it("repairs legacy routing through the admin API while preserving unrelated configuration", async () => {
   const state = await fixture();
   const region = `r-${crypto.randomUUID().slice(0, 8)}`;
   createdRegions.push(region);
@@ -75,12 +75,6 @@ it("repairs legacy routing through the admin API while preserving unrelated conf
   expect(before.region.gateway_url.endsWith("/pg")).toBe(false);
   const original = await row(region);
   const foreign = await row(state.foreign);
-  const custody = await env.DB.prepare(
-    "SELECT * FROM region_bootstrap_credentials WHERE region_id=?",
-  )
-    .bind(region)
-    .all();
-  expect(custody.results).toHaveLength(1);
   const idem = crypto.randomUUID();
   const result = await request(
     path(region),
@@ -102,15 +96,6 @@ it("repairs legacy routing through the admin API while preserving unrelated conf
   });
   expect(stored!.updated_at).not.toBe(original!.updated_at);
   expect(await row(state.foreign)).toEqual(foreign);
-  expect(
-    (
-      await env.DB.prepare(
-        "SELECT * FROM region_bootstrap_credentials WHERE region_id=?",
-      )
-        .bind(region)
-        .all()
-    ).results,
-  ).toEqual(custody.results);
   const receipt = await env.DB.prepare(
     "SELECT state,resource_id,response_status FROM idempotency_keys WHERE key=?",
   )
@@ -239,7 +224,7 @@ it("requires administrator scope for reads and writes and prevents protected-fie
   expect(await row(state.region)).toEqual(original);
 });
 
-it("keeps heartbeat activity outside the configuration CAS and fences bootstrap identity changes", async () => {
+it("keeps heartbeat activity outside the configuration CAS and fences agent credential changes", async () => {
   const state = await fixture();
   const before = await configuration(state.region, state.admin);
   const heartbeat = new Date(Date.now() + 1000).toISOString();
@@ -255,10 +240,8 @@ it("keeps heartbeat activity outside the configuration CAS and fences bootstrap 
   ).toBe(200);
   expect((await row(state.region))!.agent_last_seen_at).toBe(heartbeat);
   const next = await configuration(state.region, state.admin);
-  await env.DB.prepare(
-    "UPDATE regions SET bootstrap_material_revision=bootstrap_material_revision+1 WHERE id=?",
-  )
-    .bind(state.region)
+  await env.DB.prepare("UPDATE regions SET agent_key_hash=? WHERE id=?")
+    .bind("e".repeat(64), state.region)
     .run();
   const changed = await row(state.region);
   expect(

@@ -6,9 +6,6 @@
  * assertProjectAccess/databaseForRequest hide foreign project resources as 404, not 403.
  */
 export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
-  // serveFleetImage returns empty 404 for invalid/unapproved digests; only GET evaluates Range.
-  "GET /fleet-images/v1/raw/{digest}": [404, 416, 500],
-  "HEAD /fleet-images/v1/raw/{digest}": [404, 500],
   "GET /healthz": [],
   "GET /v1/openapi.json": [500],
 
@@ -24,15 +21,6 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /v1/regions": [400, 401, 403, 409, 500],
   "GET /v1/regions": [400, 401, 500],
   "GET /v1/regions/{id}": [400, 401, 403, 404, 500],
-  // readRegionBootstrapMaterial fences revision/provenance around the sealed material reads.
-  "GET /v1/regions/{id}/bootstrap-material": [400, 401, 403, 404, 409, 500],
-  "POST /v1/regions/{id}/bootstrap-material": [400, 401, 403, 404, 409, 500],
-  "POST /v1/regions/{id}/bootstrap-material/stage": [
-    400, 401, 403, 404, 409, 500,
-  ],
-  "POST /v1/regions/{id}/bootstrap-material/activate": [
-    400, 401, 403, 404, 409, 500,
-  ],
   // inventoryRows rejects a Node UID change between its bounded base and fleet reads.
   "GET /v1/nodes": [400, 401, 403, 409, 500],
   "GET /v1/nodes/{id}": [400, 401, 403, 404, 409, 500],
@@ -75,46 +63,6 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/nodes/additions/{id}": [400, 401, 403, 404, 409, 500],
   "POST /v1/nodes/additions/{id}/approve": [400, 401, 403, 404, 409, 500],
   "POST /v1/nodes/additions/{id}/cancel": [400, 401, 403, 404, 409, 500],
-  "POST /v1/nodes/additions/{id}/bootstrap": [400, 401, 403, 404, 409, 500],
-  "GET /v1/nodes/additions/{id}/bootstrap": [400, 401, 403, 404, 500],
-  "POST /v1/nodes/additions/{id}/verify": [400, 401, 403, 404, 409, 500],
-  "GET /v1/nodes/{id}/operator/kubernetes": [400, 401, 403, 404, 409, 500],
-
-  // Missing observations are 200/null; only a missing selected policy is 404.
-  "GET /v1/nodes/{id}/compute-pool/observations": [400, 401, 403, 404, 500],
-  "GET /v1/nodes/{id}/compute-pool": [400, 401, 403, 404, 500],
-  "PUT /v1/nodes/{id}/compute-pool": [400, 401, 403, 404, 409, 500],
-  "GET /v1/nodes/{id}/storage-profile": [400, 401, 403, 404, 500],
-  "PUT /v1/nodes/{id}/storage-profile": [400, 401, 403, 404, 409, 500],
-  // A missing/unqualified start target fails the fresh-node guard with 409, not 404.
-  "POST /v1/nodes/{id}/thin-qualifications": [400, 401, 403, 409, 500],
-  "GET /v1/thin-qualifications/{id}": [400, 401, 403, 404, 500],
-  "POST /v1/thin-qualifications/{id}/resume": [400, 401, 403, 404, 409, 500],
-  "POST /v1/thin-qualifications/{id}/cancel": [400, 401, 403, 404, 409, 500],
-  // Warm-reclaim policy is an administrator boundary despite its database URL.
-  "GET /v1/databases/{id}/warm-reclaim": [400, 401, 403, 404, 500],
-  "PUT /v1/databases/{id}/warm-reclaim": [400, 401, 403, 404, 409, 500],
-  "GET /v1/nodes/{id}/warm-reclaim-qualification": [400, 401, 403, 404, 500],
-  "PUT /v1/nodes/{id}/warm-reclaim-qualification": [
-    400, 401, 403, 404, 409, 500,
-  ],
-  "GET /v1/nodes/{id}/host-configuration": [400, 401, 403, 404, 500],
-  "PUT /v1/nodes/{id}/host-configuration": [400, 401, 403, 404, 409, 500],
-  "PUT /v1/regions/{id}/installation-profile": [400, 401, 403, 404, 409, 500],
-  // The encrypted installation profile can fail its own custody/integrity check with 409.
-  "GET /v1/regions/{id}/installation-profile": [400, 401, 403, 404, 409, 500],
-  "POST /v1/nodes/additions/{id}/installation-binding": [
-    400, 401, 403, 404, 409, 500,
-  ],
-  "GET /v1/nodes/additions/{id}/installation-binding": [
-    400, 401, 403, 404, 500,
-  ],
-  "GET /v1/nodes/additions/{id}/inspection": [400, 401, 403, 404, 500],
-  "GET /v1/nodes/additions/{id}/proof/source": [400, 401, 403, 404, 500],
-  "GET /v1/nodes/additions/{id}/proof/preparation/journal": [
-    400, 401, 403, 404, 500,
-  ],
-  "GET /v1/nodes/additions/{id}/proof/{mode}": [400, 401, 403, 404, 500],
 
   "GET /v1/regions/{id}/configuration": [400, 401, 403, 404, 500],
   "PUT /v1/regions/{id}/configuration": [400, 401, 403, 404, 409, 500],
@@ -126,16 +74,6 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/regions/{id}/release": [400, 401, 403, 404, 500],
   "PUT /v1/nodes/{id}/release": [400, 401, 403, 404, 409, 500],
   "GET /v1/nodes/{id}/release": [400, 401, 403, 404, 500],
-  "POST /v1/nodes/{id}/patches": [400, 401, 403, 404, 409, 500],
-  "GET /v1/fleet/patches": [400, 401, 403, 500],
-  "GET /v1/fleet/patches/{operation_id}": [400, 401, 403, 404, 500],
-  "POST /v1/fleet/patches/{operation_id}/resume": [
-    400, 401, 403, 404, 409, 500,
-  ],
-  "POST /v1/fleet/patches/{operation_id}/halt": [400, 401, 403, 404, 409, 500],
-  "POST /v1/fleet/rollouts": [400, 401, 403, 404, 409, 500],
-  // readFleetRollout catches authority disagreement into a 200 response with state=blocked.
-  "GET /v1/fleet/rollouts/{id}": [400, 401, 403, 404, 500],
   "GET /v1/fleet/update-policy": [400, 401, 403, 500],
   "PUT /v1/fleet/update-policy": [400, 401, 403, 404, 409, 500],
   "GET /v1/fleet/update-candidates": [400, 401, 403, 500],
@@ -182,8 +120,6 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "DELETE /v1/projects/{id}",
   "PUT /v1/size-classes/{id}",
   "POST /v1/regions",
-  "POST /v1/regions/{id}/bootstrap-material/stage",
-  "POST /v1/regions/{id}/bootstrap-material/activate",
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",
@@ -196,17 +132,10 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "DELETE /v1/databases/{id}/roles/{name}",
   "POST /v1/costs/node-facts",
   "POST /v1/nodes/additions",
-  "PUT /v1/nodes/{id}/compute-pool",
-  "PUT /v1/nodes/{id}/storage-profile",
-  "POST /v1/nodes/{id}/thin-qualifications",
-  "PUT /v1/databases/{id}/warm-reclaim",
-  "PUT /v1/nodes/{id}/warm-reclaim-qualification",
   "PUT /v1/regions/{id}/configuration",
   "PUT /v1/fleet/releases/{id}",
   "PUT /v1/regions/{id}/release",
   "PUT /v1/nodes/{id}/release",
-  "POST /v1/nodes/{id}/patches",
-  "POST /v1/fleet/rollouts",
   "PUT /v1/fleet/update-policy",
   "POST /v1/fleet/update-candidates/{id}/reject",
   "POST /v1/fleet/update-candidates/{id}/resume",
@@ -222,9 +151,6 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
  */
 export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/nodes/additions",
-  "POST /v1/nodes/{id}/patches",
-  "POST /v1/fleet/rollouts",
-  "POST /v1/nodes/{id}/thin-qualifications",
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",

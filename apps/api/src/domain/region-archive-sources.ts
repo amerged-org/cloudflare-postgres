@@ -13,7 +13,7 @@ import { withAdmissionMutation } from "./admission-mutations.ts";
 import {
   decryptCustodyDocument,
   encryptCustodyDocument,
-} from "../crypto/bootstrap-credentials.ts";
+} from "../crypto/custody.ts";
 
 interface SourceRow {
   target_region_id: string;
