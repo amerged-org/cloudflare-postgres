@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! In-process TLS PostgreSQL wire double for controller tests. It completes startup without a
-//! password and answers extended-protocol queries with canned rows, so the controller's real SQL
-//! runs against a socket. Stopping it closes the listener, which then refuses connections like a
-//! Pod whose postmaster is gone.
+//! In-process TLS PostgreSQL wire double for agent tests. It completes startup without a
+//! password and answers extended-protocol queries with canned rows, so the agent's real SQL
+//! runs against a socket.
 //!
 //! Its cells carry PostgreSQL's own types and wire forms, not the nearest Rust value: a handler
-//! that returns `Text` where PostgreSQL returns `inet` hides the decode the controller really
+//! that returns `Text` where PostgreSQL returns `inet` hides the decode the agent really
 //! performs. The forms below were read from PostgreSQL 18.6 of the product image (`\gdesc` and
-//! the text output of every statement the controller issues): `current_database()` is `name`,
+//! the text output of every statement the agent issues): `current_database()` is `name`,
 //! `inet_server_addr()` is `inet` whose cast to `text` keeps the netmask (`10.0.0.7/32`) while
 //! `host()` drops it, `EXTRACT(EPOCH ...)::text` is a numeric with six decimals, an LSN and a WAL
 //! file name use upper-case hexadecimal, and `pg_stat_clear_snapshot()` is `void`.
@@ -233,10 +232,6 @@ impl Postgres {
             }
         });
         Self { address, task }
-    }
-    /// Closes the listener: later connections are refused. Sessions already open end with it.
-    pub fn stop(&self) {
-        self.task.abort();
     }
 }
 fn cstring(bytes: &[u8], at: &mut usize) -> String {

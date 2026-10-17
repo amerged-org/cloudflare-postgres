@@ -1197,35 +1197,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgcf-native-controller"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "futures-util",
- "hmac",
- "httparse",
- "jsonschema",
- "libc",
- "pgcf-native-gateway",
- "pgcf-native-protocol",
- "rcgen",
- "reqwest",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-rustls",
- "tokio-tungstenite",
- "webpki-roots 1.0.9",
- "x509-parser",
-]
-
-[[package]]
 name = "pgcf-native-gateway"
 version = "0.1.0"
 dependencies = [
@@ -1255,10 +1226,33 @@ dependencies = [
  "base64 0.23.1",
  "hmac",
  "regex",
- "ring",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "pgcf-node-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "jsonschema",
+ "libc",
+ "pgcf-native-protocol",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-rustls",
+ "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2122,12 +2116,8 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
- "rustls",
- "rustls-pki-types",
  "tokio",
- "tokio-rustls",
  "tungstenite",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -2226,8 +2216,6 @@ dependencies = [
  "httparse",
  "log",
  "rand",
- "rustls",
- "rustls-pki-types",
  "sha1",
  "thiserror",
 ]
@@ -2468,15 +2456,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.9",
 ]
 
 [[package]]

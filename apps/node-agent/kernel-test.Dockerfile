@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Isolated kernel test environment for the node agent only; not a published image.
+# Supply the immutable compiler image and Rust version from infra/platform/versions.lock.json.
+ARG RUST_BUILDER
+FROM ${RUST_BUILDER} AS test
+ARG RUST_VERSION
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/edge-rust/ apps/edge-rust/
+COPY apps/native-gateway/ apps/native-gateway/
+COPY apps/node-agent/ apps/node-agent/
+COPY packages/native-protocol/ packages/native-protocol/
+COPY packages/contracts/native/ packages/contracts/native/
+RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
+ && cargo test --no-run --locked -p pgcf-node-agent --lib \
+ && find target/debug/deps -maxdepth 1 -type f -name 'pgcf_node_agent-*' -perm -111 \
+    -exec cp '{}' /usr/local/bin/pgcf-node-agent-kernel-test ';' \
+ && test -x /usr/local/bin/pgcf-node-agent-kernel-test
+ENTRYPOINT ["/usr/local/bin/pgcf-node-agent-kernel-test"]
+CMD ["--ignored", "--test-threads=1"]

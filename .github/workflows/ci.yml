@@ -163,22 +163,22 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           overwrite: false
-      - name: Check the node attach agent against the actual Linux kernel
+      - name: Check the node agent against the actual Linux kernel
         run: |
           PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
-          PGCF_ATTACH_TEST_IMAGE="pgcf-attach-kernel-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          PGCF_ATTACH_TEST_CONTAINER="pgcf-attach-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          trap 'docker rm --force "$PGCF_ATTACH_TEST_CONTAINER" >/dev/null 2>&1 || true' EXIT
-          docker build --platform linux/amd64 --file apps/native-controller/attach-kernel.Dockerfile \
+          PGCF_AGENT_TEST_IMAGE="pgcf-node-agent-kernel-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PGCF_AGENT_TEST_CONTAINER="pgcf-node-agent-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$PGCF_AGENT_TEST_CONTAINER" >/dev/null 2>&1 || true' EXIT
+          docker build --platform linux/amd64 --file apps/node-agent/kernel-test.Dockerfile \
             --build-arg RUST_BUILDER="$PGCF_RUST_BUILDER" --build-arg RUST_VERSION="$PGCF_RUST_VERSION" \
-            --tag "$PGCF_ATTACH_TEST_IMAGE" .
-          timeout 90 docker run --rm --name "$PGCF_ATTACH_TEST_CONTAINER" --network none \
+            --tag "$PGCF_AGENT_TEST_IMAGE" .
+          timeout 90 docker run --rm --name "$PGCF_AGENT_TEST_CONTAINER" --network none \
             --cpus 2 --memory 1g --pids-limit 64 --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,size=16m,mode=1777 \
-            --cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SYS_PTRACE \
+            --cap-drop ALL --cap-add SYS_ADMIN \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-            "$PGCF_ATTACH_TEST_IMAGE"
+            "$PGCF_AGENT_TEST_IMAGE"
 
   external_probe:
     if: github.event_name == 'workflow_dispatch' && inputs.external_probe && github.ref == 'refs/heads/main' && github.event.repository.private == false

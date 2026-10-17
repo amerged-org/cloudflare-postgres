@@ -21,11 +21,10 @@ Pinned Rust, Edge build and CI toolchain versions are in [infra/platform/version
 **Barman license note:** the upstream package metadata declares `GPL-3.0-only`, while the README
 and source headers say GPL version 3 or later. Record the declaration at the pinned release.
 
-## Native Rust gateway and controller
+## Native Rust gateway and node agent
 
-The native gateway (`apps/native-gateway`), the native controller (`apps/native-controller`, whose
-reusable parts move into the node agent) and the shared protocol crate
-(`packages/native-protocol`) are first-party Apache-2.0. Each `Cargo.toml` pins its direct crates
+The native gateway (`apps/native-gateway`), the node agent library (`apps/node-agent`) and the
+shared protocol crate (`packages/native-protocol`) are first-party Apache-2.0. Each `Cargo.toml` pins its direct crates
 exactly; `Cargo.lock` binds their archive checksums and transitive versions. No upstream source
 is vendored here.
 
@@ -33,10 +32,9 @@ The gateway's direct crates are httparse 1.10.1, time 0.3.55, futures-util 0.3.3
 serde_json 1.0.151, reqwest 0.13.5, tokio-rustls 0.26.6, rustls-pki-types 1.15.1, sha2 0.11.0,
 hmac 0.13.0 and base64 0.23.1 (all `MIT OR Apache-2.0`), zeroize 1.9.1 (`Apache-2.0 OR MIT`),
 rustls 0.23.45 (`Apache-2.0 OR ISC OR MIT`), and tokio 1.53.2 and tokio-tungstenite 0.30.0
-(MIT). The protocol crate adds regex 1.13.1 (`MIT OR Apache-2.0`) and, outside Wasm, ring 0.17.14
-(`Apache-2.0 AND ISC`). The controller adds x509-parser 0.18.1, tokio-postgres 0.7.18 and libc
-0.2.190 (`MIT OR Apache-2.0`), jsonschema 0.58.6 and tokio-postgres-rustls 0.14.0 (MIT), and
-webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). Tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`).
+(MIT). The protocol crate adds regex 1.13.1 (`MIT OR Apache-2.0`). The node agent adds
+x509-parser 0.18.1, tokio-postgres 0.7.18 and libc 0.2.190 (`MIT OR Apache-2.0`), jsonschema
+0.58.6 and tokio-postgres-rustls 0.14.0 (MIT), and webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). Tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`).
 rustls-pki-types is used directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not
 used. The gateway's SCRAM client uses hmac and zeroize directly, with sha2.
 
