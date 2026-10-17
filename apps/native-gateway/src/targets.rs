@@ -212,6 +212,14 @@ impl Targets {
         .then(|| cid.into())
     }
     fn current_ca(&self, database: &str) -> Option<CaIdentity> {
+        self.watched_ca(database).map(|(identity, _)| identity)
+    }
+    /// The database's TLS authority as the watch shows it, while that watch is current.
+    pub fn ca_material(&self, database: &str) -> Option<Vec<u8>> {
+        self.watched_ca(database)
+            .map(|(_, material)| material.as_bytes().to_vec())
+    }
+    fn watched_ca(&self, database: &str) -> Option<(CaIdentity, &str)> {
         if !self
             .maps_observed
             .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
@@ -232,14 +240,17 @@ impl Targets {
         let material = map["data"]["ca.crt"]
             .as_str()
             .filter(|ca| !ca.is_empty() && ca.len() <= 65536)?;
-        Some(CaIdentity {
-            ca_secret_uid: uid.into(),
-            ca_secret_resource_version: rv.into(),
-            ca_sha256: Sha256::digest(material.as_bytes())
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
-        })
+        Some((
+            CaIdentity {
+                ca_secret_uid: uid.into(),
+                ca_secret_resource_version: rv.into(),
+                ca_sha256: Sha256::digest(material.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            },
+            material,
+        ))
     }
     /// The intent of this database's fence and the target the controller last published in it,
     /// whatever the fence's mode.

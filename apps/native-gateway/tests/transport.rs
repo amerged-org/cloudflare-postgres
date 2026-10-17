@@ -2122,6 +2122,8 @@ async fn a_released_slot_target_is_dialled_with_the_slot_tls_name_and_pinned_ca(
         dialled[0].ca_sha256.as_deref(),
         wake_target(2, true)["ca_sha256"].as_str()
     );
+    // The authority comes from the watch, not from a request to the API server.
+    assert_eq!(dialled[0].ca.as_deref(), Some(CA_MATERIAL.as_bytes()));
     // The session keeps running on the slot.
     client.send(Message::Binary(query().into())).await.unwrap();
     assert_eq!(
