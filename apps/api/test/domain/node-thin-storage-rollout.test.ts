@@ -95,6 +95,37 @@ it("keeps serving the node's storage entry and room while a rollout changes a pi
   });
 });
 
+it("serves the node's storage entry from its last proof however long identity turns stall, its room from the minute sample", async () => {
+  const w = await awake();
+  // The last identity proof was read ten minutes ago: its authority and inventory have lapsed.
+  const read = Date.now() - 10 * 60_000;
+  await identityProof(w.f, {
+    ...w.reading(),
+    observed_at: iso(read),
+    captured_at: iso(read),
+    expires_at: iso(read + 10_000),
+    inventory_observed_at: iso(read),
+    inventory_expires_at: iso(read + 300_000),
+  });
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_received_at=? WHERE node_id=?",
+  )
+    .bind(iso(read), w.f.node)
+    .run();
+  const node = async () =>
+    (await desired(w)).region.storage_nodes?.find(
+      (entry) => entry.node_id === w.f.node,
+    );
+  expect(await node()).toMatchObject({ node_uid: w.f.uid, room: true });
+  // Without a minute sample for three minutes the node has no room, and keeps its entry.
+  await env.DB.prepare(
+    "UPDATE node_storage_observations SET observed_at=? WHERE node_id=?",
+  )
+    .bind(iso(Date.now() - 180_000), w.f.node)
+    .run();
+  expect(await node()).toMatchObject({ node_uid: w.f.uid, room: false });
+});
+
 it("leases and accepts an identity turn under the new assignment, before and after its patch rewrote the host custody", async () => {
   const f = await thinExecutionFixture(releases);
   await identityProof(f);

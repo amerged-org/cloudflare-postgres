@@ -177,68 +177,75 @@ export async function readCurrentNodeThinStorage(
 }
 
 /**
- * What a row says at `now`: its profile, the authority it hands out and the one that still proves
- * an absence. A pure function of the row, so a row the caller has just written itself reads the
- * same as the same row read back.
+ * What a row says at `now`: its profile, the node's stored identity proof, the authority it hands
+ * out and the one that still proves an absence. A pure function of the row, so a row the caller
+ * has just written itself reads the same as the same row read back.
  */
 export function nodeReading(row: CurrentNodeThinStorageRow, now: number) {
   const profile = ThinStorageProfile.parse(JSON.parse(row.profile_json));
   const parsed = NodeThinStorageAuthority.safeParse(
     row.authority_json ? JSON.parse(row.authority_json) : null,
   );
+  let identity: NodeThinStorageAuthority | null = null;
   let authority: NodeThinStorageAuthority | null = null;
   let reclamation: NodeThinStorageAuthority | null = null;
-  if (parsed.success) {
-    const value = parsed.data;
+  // The last accepted proof of this node, this profile and this driver, whatever its age.
+  if (
+    parsed.success &&
+    row.ready === 1 &&
+    row.lost_at === null &&
+    row.current_node_uid === row.node_uid &&
+    parsed.data.node_id === row.node_id &&
+    parsed.data.name === row.k8s_node_name &&
+    parsed.data.node_uid === row.node_uid &&
+    parsed.data.cluster_uid === row.cluster_uid &&
+    parsed.data.volume_group_uuid === row.volume_group_uuid &&
+    parsed.data.profile_revision === row.profile_revision &&
+    parsed.data.profile_sha256 === row.profile_sha256 &&
+    parsed.data.revision === row.authority_revision &&
+    parsed.data.driver_image === row.qualified_driver_image &&
+    parsed.data.driver_image === profile.driver_image
+  )
+    identity = parsed.data;
+  if (
+    identity &&
+    row.authority_received_at !== null &&
+    Date.parse(row.authority_received_at) >= now - 120000 &&
+    Date.parse(row.authority_received_at) <= now + 5000 &&
+    Date.parse(identity.observed_at) >= now - 120000 &&
+    Date.parse(identity.observed_at) <= now + 5000
+  ) {
+    if (Date.parse(identity.expires_at) > now)
+      authority = {
+        ...identity,
+        write_allowed:
+          identity.write_allowed &&
+          row.status === "ready" &&
+          row.current_qualified === 1,
+      };
+    // The identity read stays usable for an absence while its inventory is valid, also once its
+    // authority expired; an absent pool's fresh identity still proves deletion.
+    const inventory = thinStorageInventory(identity);
     if (
-      row.ready === 1 &&
-      row.lost_at === null &&
-      row.current_node_uid === row.node_uid &&
-      value.node_id === row.node_id &&
-      value.name === row.k8s_node_name &&
-      value.node_uid === row.node_uid &&
-      value.cluster_uid === row.cluster_uid &&
-      value.volume_group_uuid === row.volume_group_uuid &&
-      value.profile_revision === row.profile_revision &&
-      value.profile_sha256 === row.profile_sha256 &&
-      value.revision === row.authority_revision &&
-      value.driver_image === row.qualified_driver_image &&
-      value.driver_image === profile.driver_image &&
-      row.authority_received_at !== null &&
-      Date.parse(row.authority_received_at) >= now - 120000 &&
-      Date.parse(row.authority_received_at) <= now + 5000 &&
-      Date.parse(value.observed_at) >= now - 120000 &&
-      Date.parse(value.observed_at) <= now + 5000
-    ) {
-      if (Date.parse(value.expires_at) > now)
-        authority = {
-          ...value,
-          write_allowed:
-            value.write_allowed &&
-            row.status === "ready" &&
-            row.current_qualified === 1,
-        };
-      // The identity read stays usable for an absence while its inventory is valid, also once its
-      // authority expired; an absent pool's fresh identity still proves deletion.
-      const inventory = thinStorageInventory(value);
-      if (
-        row.error_code === null &&
-        row.current_qualified === 1 &&
-        value.data_accounting_complete &&
-        inventory.observed_at >= now - 120000 &&
-        inventory.observed_at <= now + 5000 &&
-        inventory.expires_at > now
-      )
-        reclamation = { ...value, write_allowed: false };
-    }
+      row.error_code === null &&
+      row.current_qualified === 1 &&
+      identity.data_accounting_complete &&
+      inventory.observed_at >= now - 120000 &&
+      inventory.observed_at <= now + 5000 &&
+      inventory.expires_at > now
+    )
+      reclamation = { ...identity, write_allowed: false };
   }
-  return { row, profile, authority, reclamation };
+  return { row, profile, identity, authority, reclamation };
 }
 
 /**
- * Every thin node of a region with a current identity proof, as the desired page serves it: the
- * proof's identities and inventory, which bind and confirm volumes, and the node's room. No native
- * proof means no entry; ordinary regional physical metrics cannot fill this gap.
+ * Every thin node of a region with an identity proof, as the desired page serves it: the last
+ * accepted proof's identities and inventory, however old, and the node's room now. The controller
+ * needs the identities to bind volumes and to judge a start; whatever needs a recent read (a
+ * volume's absence, a binding) checks the proof's own times. Room comes only from the node's
+ * minute physical sample (`thinPoolNodeRoomSql`), so a stalled identity turn never stops a start
+ * on a pool with room. A node without an accepted proof has no entry.
  */
 export async function desiredRegionStorageNodes(
   env: Pick<Env, "DB">,
@@ -257,7 +264,7 @@ export async function desiredRegionStorageNodes(
     ),
   );
   return rows.results.flatMap((row, index) => {
-    const proof = readings[index]?.authority ?? readings[index]?.reclamation;
+    const proof = readings[index]?.identity;
     return proof ? [{ ...proof, room: row.room === 1 }] : [];
   });
 }

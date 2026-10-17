@@ -638,9 +638,10 @@ it("keeps an identity-only turn available after the last deleted volume removes 
   const delivered = await desiredRegionStorageNodes(env, f.region);
   expect(delivered).toHaveLength(1);
   expect(delivered[0]).toMatchObject({ pool_uuid: null, write_allowed: false });
+  // Once its inventory lapsed the proof still names the node's identities in the desired page.
   expect(
     await desiredRegionStorageNodes(env, f.region, Date.now() + 300_000),
-  ).toEqual([]);
+  ).toMatchObject([{ pool_uuid: null, revision: delivered[0]!.revision }]);
 });
 
 it("the host lease retires a deleted volume from the absence read even after its pool and write authority are gone", async () => {
