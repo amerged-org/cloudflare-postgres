@@ -306,7 +306,7 @@ test("native Pool clients keep interleaved database, role and trace hints separa
     assert.equal(neonConfig.wsProxy, globalProxy);
     assert.equal(neonConfig.wsProxy, globalProxy);
     assert.equal(clientA.neonConfig.useSecureWebSocket, true);
-    assert.equal(clientA.neonConfig.pipelineConnect, false);
+    assert.equal(clientA.neonConfig.pipelineConnect, "password");
     assert.equal(clientA.neonConfig.forceDisablePgSSL, true);
   } finally {
     await Promise.all([a.end(), b.end(), plain.end()]);
@@ -561,7 +561,7 @@ test("named startup mismatch pools keep admitted hints while changing only actua
       assert(!url.href.includes(password));
       assert(!url.href.includes(encodeURIComponent(password)));
       assert.equal(client.neonConfig.useSecureWebSocket, true);
-      assert.equal(client.neonConfig.pipelineConnect, false);
+      assert.equal(client.neonConfig.pipelineConnect, "password");
       assert.equal(client.neonConfig.forceDisablePgSSL, true);
       assert.throws(() => new pool.Client({ connectionString: uri }), {
         message: "connection_metadata_invalid",

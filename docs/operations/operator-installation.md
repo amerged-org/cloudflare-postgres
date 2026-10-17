@@ -68,6 +68,11 @@ The deployed Edge Worker is the TypeScript `apps/edge`; the management API and D
 in TypeScript. Start the private deployment configuration from `apps/edge/wrangler.example.jsonc`
 and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit namespaces,
 regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret.
+The example also sets `minify: true`, a `BINDING_CONNECTION_RATE_LIMITER` rate limit with a
+namespace of its own for same-account Workers on a service binding (without it every such caller
+is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
+which must equal the API Worker's value; the hint places only DatabaseActor objects created after
+it is set.
 
 The Rust/Wasm replacement lives in `apps/edge-rust`. The common CI workflow builds it; it is not
 deployed. Build the selected source once using the Rust toolchain and `rustEdge` tools from
@@ -608,8 +613,8 @@ approve sufficient regional capacity before committing an integrator's databases
 ### Connection and cold starts
 
 PGCF’s public transport is verified WSS; a TCP DSN hostname swap is insufficient. Use the
-established Neon serverless `Pool`/`Client` WebSocket mode with `pipelineConnect=false` and a
-`wsProxy` URL containing `/v2?database=<URL-encoded-PGCF-ID>&user=<URL-encoded-role>`; see
+established Neon serverless `Pool`/`Client` WebSocket mode with its default
+`pipelineConnect: "password"` and a `wsProxy` URL containing `/v2?database=<URL-encoded-PGCF-ID>&user=<URL-encoded-role>`; see
 [the connection contract](../../README.md). Keep PostgreSQL authentication and TLS. Hints scope
 admission; they are not credentials.
 

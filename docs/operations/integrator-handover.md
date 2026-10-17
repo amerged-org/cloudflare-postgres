@@ -662,6 +662,7 @@ a woken database sleeps again after 60 s idle.
 | Sessions per database through one gateway | 200 (2,000 per gateway); beyond that the connection fails as `08006` | gateway constants |
 | New connections per database, all roles and networks | 120 per 60 s in the example Edge configuration; the plan records the same figure as the deployed handshake limit | Edge rate limiter; refusal is `53300` |
 | New connections per database, role and source network | 120 per 60 s in the example Edge configuration; the deployed value is installation configuration and **not recorded in this repository** | Edge rate limiter; refusal is `53300` |
+| New connections per database and role from a same-account Worker on a service binding (no `CF-Connecting-IP`) | 1,200 per 60 s in the example Edge configuration, in a limiter of its own; such a caller never counts in the two public limiters above | Edge rate limiter; refusal is `53300` |
 | Admissions per database per minute | 12,000 | DatabaseActor |
 | Waiters during one wake | 32 per database | DatabaseActor |
 
@@ -704,7 +705,7 @@ const [, total] = await sql.transaction(
 | Not supported | `COPY` (`0A000`); `authToken` / `Authorization` (`0A000`); clients other than the driver must send `Neon-Raw-Text-Output: true` and `Neon-Array-Mode: true`. |
 | Limits | Request body 4 MiB, at most 256 statements per transaction, result rows 10 MiB (`54000`; the session is closed and the outcome is unknown). |
 | Sleeping database | The request waits for the wake as a connection does ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)): at most 60 s, with the same `57P03` and `08006` answers. Set your `fetch` timeout accordingly. |
-| Admission and limits | Every request is one admission. It counts in the same two Edge rate limiters as a connection, in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the example configuration that is 120 requests per 60 s per database and Cloudflare location: the installation must size these limits for HTTP traffic. |
+| Admission and limits | Every request is one admission. It counts in the same Edge rate limiters as a connection (a service-binding caller in its own limiter), in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the example configuration that is 120 requests per 60 s per database and Cloudflare location: the installation must size these limits for HTTP traffic. |
 | Errors | HTTP 400 with PostgreSQL's error fields (`message`, `code`, `severity`, `detail`, `hint`, `position`, ...); the driver throws them as `NeonDbError`. Admission refusals use the codes of [A.4](#a4-sqlstate-at-connect-time). |
 | Unknown outcome | `08007`: the connection to PostgreSQL ended, or the gateway's answer was lost, after the request was sent. PGCF never sends a request twice and does not know whether a write took effect; retry only idempotent requests. |
 | Password change | A kept session is reused only for the password it authenticated with, and at most 60 s after its authentication: an old password can still succeed for up to 60 s after a password change. |

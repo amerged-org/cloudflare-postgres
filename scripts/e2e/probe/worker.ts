@@ -175,7 +175,8 @@ function routedPool(
       )
         throw new Error("connection_metadata_invalid");
       this.neonConfig.useSecureWebSocket = true;
-      this.neonConfig.pipelineConnect = false;
+      // The driver's default: startup, password and first query in one message (one round trip).
+      this.neonConfig.pipelineConnect = "password";
       this.neonConfig.forceDisablePgSSL = true;
       this.neonConfig.wsProxy = (host) => {
         if (host !== target.host)
