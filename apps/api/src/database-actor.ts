@@ -216,8 +216,19 @@ export class DatabaseActor extends DurableObject<Env> {
   private ticketMutation: string | undefined;
   /** The ticket claim in flight, by operation; claims run one at a time. */
   private claim: { operation: string; done: Promise<void> } | undefined;
+  /**
+   * Admission attempts in the current minute. They are counted in memory, so a connect makes no
+   * durable write; eviction restarts the count, and the Edge rate limiters still bound the rate.
+   */
+  private admissions = { minute: 0, attempts: 0 };
+  /**
+   * When this instance last admitted a connection. It is written durably (last_admitted_at) only
+   * by an admission that revokes an outstanding reclaim; warm idle takes the later of the two.
+   */
+  private admittedAt = 0;
   private admissionState() {
-    if (!this.presence()) return undefined;
+    const presence = this.presence();
+    if (!presence) return undefined;
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_snapshot(singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot TEXT,barrier TEXT)",
     );
@@ -227,6 +238,7 @@ export class DatabaseActor extends DurableObject<Env> {
       )
       .toArray()[0];
     return {
+      presence,
       snapshot: row?.snapshot
         ? DatabaseAdmissionSnapshot.parse(JSON.parse(row.snapshot))
         : undefined,
@@ -428,8 +440,10 @@ export class DatabaseActor extends DurableObject<Env> {
       },
     };
   }
-  private snapshotAdmission(user: string): DatabaseAdmission | undefined {
-    const state = this.admissionState();
+  private snapshotAdmission(
+    user: string,
+    state = this.admissionState(),
+  ): DatabaseAdmission | undefined {
     if (state?.barrier) return { ok: false, sqlstate: "57P03" };
     const snapshot = state?.snapshot;
     if (!snapshot?.cache_capable) return undefined;
@@ -451,15 +465,22 @@ export class DatabaseActor extends DurableObject<Env> {
     };
     return { ok: true, region: snapshot.region, target };
   }
+  /** Whether the reclaim table exists; a read never creates it, so an admission writes nothing. */
+  private reclaimTable = false;
   private reclaimState(): ReclaimState {
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS database_reclaim(singleton INTEGER PRIMARY KEY CHECK(singleton=1),state TEXT NOT NULL)",
-    );
-    const stored = this.ctx.storage.sql
-      .exec<{ state: string }>(
-        "SELECT state FROM database_reclaim WHERE singleton=1",
-      )
-      .toArray()[0];
+    this.reclaimTable ||=
+      this.ctx.storage.sql
+        .exec(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='database_reclaim'",
+        )
+        .toArray().length === 1;
+    const stored = this.reclaimTable
+      ? this.ctx.storage.sql
+          .exec<{ state: string }>(
+            "SELECT state FROM database_reclaim WHERE singleton=1",
+          )
+          .toArray()[0]
+      : undefined;
     return stored
       ? (JSON.parse(stored.state) as ReclaimState)
       : {
@@ -474,6 +495,12 @@ export class DatabaseActor extends DurableObject<Env> {
         };
   }
   private saveReclaim(value: ReclaimState): void {
+    if (!this.reclaimTable) {
+      this.ctx.storage.sql.exec(
+        "CREATE TABLE IF NOT EXISTS database_reclaim(singleton INTEGER PRIMARY KEY CHECK(singleton=1),state TEXT NOT NULL)",
+      );
+      this.reclaimTable = true;
+    }
     this.ctx.storage.sql.exec(
       "INSERT INTO database_reclaim(singleton,state) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET state=excluded.state",
       JSON.stringify(value),
@@ -533,10 +560,17 @@ export class DatabaseActor extends DurableObject<Env> {
     recordAdmission = true,
   ): Promise<boolean> {
     this.identity(databaseId);
+    if (recordAdmission) this.admittedAt = Date.now();
+    // Without an outstanding reclaim there is nothing to revoke or wait for: the admission passes
+    // without the gate and without a durable write.
+    if (!this.reclaimOutstanding()) return true;
     await this.gate("revokeBeforeAdmission", async () => {
       const state = this.reclaimState();
       if (recordAdmission) {
-        state.last_admitted_at = Date.now();
+        state.last_admitted_at = Math.max(
+          state.last_admitted_at,
+          this.admittedAt,
+        );
         this.saveReclaim(state);
       }
       await this.revokeReclaimLocked();
@@ -554,6 +588,16 @@ export class DatabaseActor extends DurableObject<Env> {
       );
     }
     return false;
+  }
+  /** A reclaim grant that is live, or revoked without an Ack while its lease may still run. */
+  private reclaimOutstanding(): boolean {
+    const state = this.reclaimState();
+    return (
+      state.claims !== null &&
+      (!state.revoked ||
+        (state.acknowledged_revision < state.revision &&
+          Date.now() < state.reclaim_expires_at + RECLAIM_LIMITS.clock_skew_ms))
+    );
   }
   /** Trusted node publisher RPC. The reclaimer receives only this short-lived signed scope. */
   async reclaimIntent(databaseId: string): Promise<string | null> {
@@ -585,6 +629,7 @@ export class DatabaseActor extends DurableObject<Env> {
           Math.max(
             Date.parse(activity.last_activity_at),
             state.last_admitted_at,
+            this.admittedAt,
           ) <
           current.policy.idle_after_seconds * 1000 ||
         state.configuration_fingerprint !== runtime.configuration_fingerprint ||
@@ -685,7 +730,7 @@ export class DatabaseActor extends DurableObject<Env> {
     const state = this.reclaimState(),
       now = Date.now();
     if (
-      now - Math.max(lastActivity, state.last_admitted_at) <
+      now - Math.max(lastActivity, state.last_admitted_at, this.admittedAt) <
       current.policy.idle_after_seconds * 1000
     )
       return null;
@@ -925,11 +970,15 @@ export class DatabaseActor extends DurableObject<Env> {
     if (!role.success) return { ok: false, sqlstate: "28P01" };
     this.identity(id.data);
     try {
-      const snapshot = this.admissionState()?.snapshot;
+      const read = this.admissionState();
+      const snapshot = read?.snapshot;
       if (!snapshot?.cache_capable || snapshot.wakeable === undefined)
         return await this.ensureAwake(id.data, role.data, options);
-      const failure = this.earlyAdmission(id.data, role.data);
+      const failure = this.earlyAdmission(id.data, role.data, read!.presence);
       if (failure) return failure;
+      // A revocation awaits the gate, and the state may change meanwhile: only then is it read
+      // again. Without one, nothing ran between the read and this admission.
+      const revoking = this.reclaimOutstanding();
       if (
         !(await this.revokeBeforeAdmission(
           id.data,
@@ -937,12 +986,12 @@ export class DatabaseActor extends DurableObject<Env> {
         ))
       )
         return { ok: false, sqlstate: "57P03" };
-      const state = this.admissionState()!;
+      const state = revoking ? this.admissionState()! : read!;
       if (state.barrier) {
         if (state.barrier.mutation_id !== this.ticketMutation)
           return { ok: false, sqlstate: "57P03" };
       } else {
-        const admitted = this.snapshotAdmission(role.data);
+        const admitted = this.snapshotAdmission(role.data, state);
         if (admitted?.ok) return admitted;
       }
       const current = state.snapshot!;
@@ -1257,34 +1306,28 @@ export class DatabaseActor extends DurableObject<Env> {
   private earlyAdmission(
     databaseId: unknown,
     user: unknown,
+    presence?: DatabasePresence,
   ): DatabaseAdmission | undefined {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
     if (!id.success) return { ok: false, sqlstate: "3D000" };
     if (!role.success) return { ok: false, sqlstate: "28P01" };
     this.identity(id.data);
-    const snapshot = this.presence();
+    const snapshot = presence ?? this.presence();
     if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
     if (!roleAdmitted(snapshot, role.data))
       return { ok: false, sqlstate: "28P01" };
     const configured = this.env.DATABASE_CONNECTION_LIMIT_PER_MINUTE ?? "12000";
     if (!/^[1-9][0-9]{0,4}$/.test(configured) || Number(configured) > 12000)
       return { ok: false, sqlstate: "53300" };
-    // Only a trusted seeded role can allocate this single bounded admission row.
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
-    );
-    const allowed = this.ctx.storage.sql
-      .exec(
-        `INSERT INTO database_admission(singleton,minute,attempts) VALUES(1,?,1)
-       ON CONFLICT(singleton) DO UPDATE SET minute=excluded.minute,
-       attempts=CASE WHEN database_admission.minute=excluded.minute THEN database_admission.attempts+1 ELSE 1 END
-       WHERE database_admission.minute<>excluded.minute OR database_admission.attempts<? RETURNING attempts`,
-        Math.floor(Date.now() / 60_000),
-        Number(configured),
-      )
-      .toArray();
-    return allowed.length === 1 ? undefined : { ok: false, sqlstate: "53300" };
+    // Only a trusted seeded role is counted; a refused attempt does not count.
+    const minute = Math.floor(Date.now() / 60_000);
+    if (this.admissions.minute !== minute)
+      this.admissions = { minute, attempts: 0 };
+    if (this.admissions.attempts >= Number(configured))
+      return { ok: false, sqlstate: "53300" };
+    this.admissions.attempts++;
+    return undefined;
   }
   /**
    * The durable claim of one wake and its single hint to the region. Claim before notifying: a lost

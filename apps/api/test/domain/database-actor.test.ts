@@ -11,6 +11,7 @@ import { Hono } from "hono";
 import { afterEach, expect, it, vi } from "vitest";
 import type { ApiEnv } from "../../src/env.ts";
 import {
+  databaseActor,
   reconcileDatabaseActors,
   readDatabasePresence,
   syncDatabaseActor,
@@ -222,17 +223,18 @@ it("fresh unknown actors reject hints without creating application tables or que
   expect(count()).toBe(0);
 });
 
-it("rejects a known hint flood at the durable aggregate allowance before D1 or wake", async () => {
+it("rejects a known hint flood at the Actor's per-minute allowance before D1 or wake", async () => {
   const f = await ready();
   const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
-  await runInDurableObject(actor(f.id), (_instance, state) => {
-    state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
+  const admissions = () =>
+    runInDurableObject(actor(f.id), (instance) =>
+      structuredClone(Reflect.get(instance, "admissions")),
     );
-    state.storage.sql.exec(
-      "INSERT INTO database_admission VALUES(1,?,12000)",
-      Math.floor(Date.now() / 60000),
-    );
+  await runInDurableObject(actor(f.id), (instance) => {
+    Reflect.set(instance, "admissions", {
+      minute: Math.floor(Date.now() / 60000),
+      attempts: 12000,
+    });
   });
   const count = admissionQueries();
   const result = await actor(f.id).ensureAwake(f.id, "app");
@@ -242,25 +244,35 @@ it("rejects a known hint flood at the durable aggregate allowance before D1 or w
     ok: false,
     sqlstate: "28P01",
   });
-  expect(count()).toBe(0);
-  expect(
-    await runInDurableObject(actor(f.id), (_instance, state) =>
-      state.storage.sql.exec("SELECT attempts FROM database_admission").one(),
-    ),
-  ).toEqual({ attempts: 12000 });
-  await evictDurableObject(actor(f.id));
-  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+  expect(await actor(f.id).admitWake(f.id, "app")).toEqual({
     ok: false,
     sqlstate: "53300",
   });
   expect(count()).toBe(0);
+  expect((await admissions()).attempts).toBe(12000);
   clock.mockReturnValue(Date.now() + 60000);
   expect((await actor(f.id).ensureAwake(f.id, "app")).ok).toBe(true);
-  expect(
-    await runInDurableObject(actor(f.id), (_instance, state) =>
-      state.storage.sql.exec("SELECT attempts FROM database_admission").one(),
-    ),
-  ).toEqual({ attempts: 1 });
+  expect(await admissions()).toEqual({
+    minute: Math.floor(Date.now() / 60000),
+    attempts: 1,
+  });
+});
+
+it("gets every DatabaseActor with the configured location hint, and none without one", async () => {
+  const f = await ready();
+  const get = vi.spyOn(Object.getPrototypeOf(env.DATABASE_ACTOR), "get");
+  const hinted = { ...env, DATABASE_ACTOR_LOCATION_HINT: "weur" };
+  expect((await databaseActor(hinted, f.id).admitWake(f.id, "app")).ok).toBe(
+    true,
+  );
+  await reconcileDatabaseActors(hinted);
+  expect(get.mock.calls.length).toBeGreaterThan(1);
+  expect(get.mock.calls.map((call) => call[1])).toEqual(
+    get.mock.calls.map(() => ({ locationHint: "weur" })),
+  );
+  get.mockClear();
+  await databaseActor(env, f.id).admitWake(f.id, "app");
+  expect(get.mock.calls.map((call) => call[1])).toEqual([undefined]);
 });
 
 it("a fresh authoritative node loss overrides a warm seeded route without waking it", async () => {
@@ -312,14 +324,11 @@ it("atomically bounds a configured aggregate across valid roles and refuses inva
     { ok: false, sqlstate: "53300" },
   ]);
   expect(
-    await runInDurableObject(actor(f.id), (_instance, state) =>
-      state.storage.sql
-        .exec(
-          "SELECT count(*) count,MAX(attempts) attempts FROM database_admission",
-        )
-        .one(),
+    await runInDurableObject(
+      actor(f.id),
+      (instance) => Reflect.get(instance, "admissions").attempts,
     ),
-  ).toEqual({ count: 1, attempts: 2 });
+  ).toBe(2);
   await runInDurableObject(actor(f.id), (instance) => {
     Reflect.get(instance, "env").DATABASE_CONNECTION_LIMIT_PER_MINUTE = "12001";
   });

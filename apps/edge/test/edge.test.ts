@@ -82,6 +82,7 @@ async function open(
     user?: string;
     query?: string;
     signal?: AbortSignal;
+    cf?: { colo: string };
   } = {},
 ) {
   const ctx = createExecutionContext();
@@ -92,7 +93,7 @@ async function open(
   const response = await worker.fetch(
     new Request(
       `${origin}/v2?${options.query ?? new URLSearchParams({ database: options.database ?? database, user: options.user ?? "app" })}`,
-      { headers, signal: options.signal },
+      { headers, signal: options.signal, cf: options.cf },
     ),
     options.bindings ?? testEnv,
     ctx,
@@ -456,14 +457,11 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     );
     await runInDurableObject(
       actor as unknown as DurableObjectStub,
-      (_instance, state) => {
-        state.storage.sql.exec(
-          "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
-        );
-        state.storage.sql.exec(
-          "INSERT INTO database_admission VALUES(1,?,12000)",
-          Math.floor(Date.now() / 60000),
-        );
+      (instance) => {
+        Reflect.set(instance, "admissions", {
+          minute: Math.floor(Date.now() / 60000),
+          attempts: 12000,
+        });
       },
     );
     const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
@@ -1525,29 +1523,80 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.admit_ms).toBeGreaterThanOrEqual(0);
   });
 
-  it("a caller without CF-Connecting-IP is limited under the binding key and admitted", async () => {
-    expect(connectionRateKey(null)).toBe("binding");
-    const limit = vi.fn(async (options: { key: string }) => ({
-      success: options.key.length > 0,
-    }));
-    const connection = await open({
-      ip: null,
-      bindings: {
-        ...testEnv,
-        CONNECTION_RATE_LIMITER: { limit } as unknown as RateLimit,
+  it("logs the admitting colo and the connection id signed into the route", async () => {
+    await open({ cf: { colo: "FRA" } });
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log).toMatchObject({ event: "conn_admission", colo: "FRA" });
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    expect(
+      await verifyRouteToken((await stats())[0]!.token, {
+        region,
+        keys: keyring.keys,
+      }),
+    ).toMatchObject({ ok: true, claims: { cid: log.cid } });
+    await open();
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).colo).toBeNull();
+  });
+
+  it("gets the DatabaseActor with the configured location hint, and none without one", async () => {
+    const options: unknown[] = [];
+    const namespace = (hint?: string) => ({
+      ...testEnv,
+      ...(hint ? { DATABASE_ACTOR_LOCATION_HINT: hint } : {}),
+      DATABASE_ACTOR: {
+        idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+        get: (id: DurableObjectId, option?: unknown) => {
+          options.push(option);
+          return testEnv.DATABASE_ACTOR.get(id);
+        },
       },
     });
+    await open({ bindings: namespace("weur") });
+    await open({ bindings: namespace() });
+    expect(options).toEqual([{ locationHint: "weur" }, undefined]);
+  });
+
+  it("a caller without CF-Connecting-IP takes the binding limiter's own budget, never a public bucket", async () => {
+    expect(connectionRateKey(null)).toBe("binding");
+    let allow = true;
+    const limiter = () =>
+      ({
+        limit: vi.fn(async () => ({ success: allow })),
+      }) as unknown as RateLimit & { limit: ReturnType<typeof vi.fn> };
+    const binding = limiter(),
+      connection = limiter(),
+      databaseLimit = limiter();
+    const bindings = {
+      ...testEnv,
+      BINDING_CONNECTION_RATE_LIMITER: binding,
+      CONNECTION_RATE_LIMITER: connection,
+      DATABASE_CONNECTION_RATE_LIMITER: databaseLimit,
+    };
+    const connected = await open({ ip: null, bindings });
     expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
       "accepted",
     );
-    expect(limit).toHaveBeenCalledExactlyOnceWith({
+    expect(binding.limit).toHaveBeenCalledExactlyOnceWith({
       key: JSON.stringify([database, "app", "binding"]),
     });
+    expect(connection.limit).not.toHaveBeenCalled();
+    expect(databaseLimit.limit).not.toHaveBeenCalled();
     const startup = encodeStartup({ user: "app", database });
-    connection.socket.send(startup);
+    connected.socket.send(startup);
     await expect
       .poll(async () => (await stats())[0]?.bytes)
       .toEqual([...startup]);
+    allow = false;
+    expect(await errorCode(await open({ ip: null, bindings }))).toBe("53300");
+    allow = true;
+    await open({ bindings });
+    expect(binding.limit).toHaveBeenCalledTimes(2);
+    expect(connection.limit).toHaveBeenCalledTimes(1);
+    expect(databaseLimit.limit).toHaveBeenCalledTimes(1);
   });
 
   it("a wake admission is signed v5 and opens the gateway once", async () => {

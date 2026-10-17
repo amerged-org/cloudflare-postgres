@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { isDatabaseId, isRoleName } from "@pgcf/contracts";
+// Specific modules, never the contracts barrel: a cold isolate evaluates only what it imports.
+import { isDatabaseId, isRoleName } from "@pgcf/contracts/ids";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import {
   parseRouteKeyring,
@@ -71,8 +72,30 @@ async function admit(
   // Shared proxy networks must not couple unrelated database/role routes.
   // These untrusted hints scope admission; PostgreSQL authenticates the user.
   const key = JSON.stringify([hints.database, hints.user, network]);
+  // A same-account Worker on a service binding has a budget of its own per database and role; it
+  // never drains, or is drained by, the public buckets.
+  const limits: [RateLimit, string, string][] =
+    network === "binding"
+      ? [
+          [
+            env.BINDING_CONNECTION_RATE_LIMITER,
+            key,
+            "connection rate limit exceeded",
+          ],
+        ]
+      : [
+          [env.CONNECTION_RATE_LIMITER, key, "connection rate limit exceeded"],
+          [
+            env.DATABASE_CONNECTION_RATE_LIMITER,
+            hints.database,
+            "database connection rate limit exceeded",
+          ],
+        ];
+  // The API creates each database's Actor at the same hint; an existing one never moves.
+  const hint = env.DATABASE_ACTOR_LOCATION_HINT;
   const actor = env.DATABASE_ACTOR.get(
     env.DATABASE_ACTOR.idFromName(hints.database),
+    hint ? { locationHint: hint as DurableObjectLocationHint } : undefined,
   );
   const cancel = () =>
     ctx.waitUntil(
@@ -81,7 +104,7 @@ async function admit(
         .catch(() => false),
     );
   signal.addEventListener("abort", cancel, { once: true });
-  // Both limiters and the Actor's admission run together: none of them waits for another. The
+  // The limiters and the Actor's admission run together: none of them waits for another. The
   // per-database bucket therefore also counts connects that admission refuses.
   const started = Date.now();
   const limited = async (limiter: RateLimit, limitKey: string) =>
@@ -91,39 +114,30 @@ async function admit(
         Date.now() - started,
       );
     });
-  let results: [
-    PromiseSettledResult<RateLimitOutcome>,
-    PromiseSettledResult<RateLimitOutcome>,
-    PromiseSettledResult<DatabaseWakeAdmission>,
-  ];
+  let admission: PromiseSettledResult<DatabaseWakeAdmission>;
+  let outcomes: PromiseSettledResult<RateLimitOutcome>[];
   try {
     check();
-    results = await Promise.allSettled([
-      limited(env.CONNECTION_RATE_LIMITER, key),
-      limited(env.DATABASE_CONNECTION_RATE_LIMITER, hints.database),
+    [admission, ...outcomes] = await Promise.allSettled([
       actor
         .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
         .finally(() => {
           timings.admit_ms = Date.now() - started;
         }),
+      ...limits.map(([limiter, limitKey]) => limited(limiter, limitKey)),
     ]);
   } finally {
     signal.removeEventListener("abort", cancel);
   }
   check();
-  const [connectionLimit, databaseLimit, admission] = results;
-  if (
-    connectionLimit.status === "rejected" ||
-    databaseLimit.status === "rejected"
-  )
+  if (outcomes.some((outcome) => outcome.status === "rejected"))
     throw new AdmissionFailure("53300", "connection admission unavailable");
-  if (!connectionLimit.value.success)
-    throw new AdmissionFailure("53300", "connection rate limit exceeded");
-  if (!databaseLimit.value.success)
-    throw new AdmissionFailure(
-      "53300",
-      "database connection rate limit exceeded",
-    );
+  for (const [index, [, , message]] of limits.entries())
+    if (
+      !(outcomes[index] as PromiseFulfilledResult<RateLimitOutcome>).value
+        .success
+    )
+      throw new AdmissionFailure("53300", message);
   if (admission.status === "rejected") throw admission.reason;
   const admitted = admission.value;
   if (!admitted.ok) {
@@ -290,7 +304,10 @@ export default {
       console.log(
         JSON.stringify({
           event: "conn_admission",
+          // The gateway receives the same cid in the route token.
           cid,
+          // The Cloudflare location that admitted the connection; none on a service binding.
+          colo: request.cf?.colo ?? null,
           database_id: hints?.database ?? null,
           user: hints?.user ?? null,
           region_id: region,

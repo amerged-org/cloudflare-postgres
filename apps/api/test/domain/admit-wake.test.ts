@@ -8,6 +8,8 @@ import {
   publishDatabaseAdmission,
   readDatabaseAdmissionSnapshot,
 } from "../../src/domain/database-admission-snapshot.ts";
+import { DatabaseAdmissionSnapshot } from "../../src/domain/admission-state.ts";
+import { DatabasePresence } from "../../src/database-actor.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import {
   admissionFixtureReleases,
@@ -314,6 +316,32 @@ it("an awake admissible snapshot answers a v4 target", async () => {
   });
   expect(prepare).not.toHaveBeenCalled();
   expect(await ticket(f.id)).toEqual([]);
+});
+
+it("an awake admission writes nothing durable and parses its snapshot once", async () => {
+  const f = await admissionSnapshotFixture();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  // Every application table and row of the Actor: a durable write would change one of them.
+  const durable = () =>
+    runInDurableObject(actor(f.id), (_instance, state) =>
+      state.storage.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name",
+        )
+        .toArray()
+        .map(({ name }) => [
+          name,
+          state.storage.sql.exec(`SELECT * FROM "${name}"`).toArray(),
+        ]),
+    );
+  const before = await durable();
+  const snapshots = vi.spyOn(DatabaseAdmissionSnapshot, "parse");
+  const presences = vi.spyOn(DatabasePresence, "parse");
+  for (let attempt = 0; attempt < 3; attempt++)
+    expect((await actor(f.id).admitWake(f.id, "app")).ok).toBe(true);
+  expect(snapshots).toHaveBeenCalledTimes(3);
+  expect(presences).toHaveBeenCalledTimes(3);
+  expect(await durable()).toEqual(before);
 });
 
 it("a manual suspension is not wakeable and answers 57P03", async () => {

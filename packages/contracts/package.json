@@ -6,6 +6,9 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./ids": "./src/ids.ts",
+    "./database-admission": "./src/database-admission.ts",
+    "./edge-policy": "./src/edge-policy.ts",
     "./usage": "./src/usage.ts",
     "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
