@@ -44,6 +44,12 @@
         "segtype": "thin-pool"
       },
       {
+        "name": "pgcf_anchor",
+        "lv_uuid": "AnAnAn-AnAn-AnAn-AnAn-AnAn-AnAn-AnAnAn",
+        "size_bytes": 4194304,
+        "segtype": "thin"
+      },
+      {
         "name": "pvc-00000000-0000-4000-8000-000000000014",
         "lv_uuid": "V1V1V1-V1V1-V1V1-V1V1-V1V1-V1V1-V1V1V1",
         "size_bytes": 5368709120,
@@ -87,6 +93,7 @@
       }
     ],
     "active_lv_uuids": [
+      "AnAnAn-AnAn-AnAn-AnAn-AnAn-AnAn-AnAnAn",
       "PlPlPl-PlPl-PlPl-PlPl-PlPl-PlPl-PlPlPl",
       "TkTkTk-TkTk-TkTk-TkTk-TkTk-TkTk-TkTkTk",
       "V1V1V1-V1V1-V1V1-V1V1-V1V1-V1V1-V1V1V1",

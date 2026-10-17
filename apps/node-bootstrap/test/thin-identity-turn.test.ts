@@ -223,6 +223,30 @@ test("a writer without a readable io.max is reported without a reading, never a 
     assert.deepEqual(volume.io, []);
 });
 
+test("a pool keeps one never-written thin LV of its own, so deleting the last database cannot empty it", async () => {
+  // lvm-localpv removes pgcf_thinpool as soon as its last thin LV is destroyed.
+  const world = identityWorld();
+  world.lvs = world.lvs.filter((lv) => lv.name !== "pgcf_anchor");
+  const { report } = await identityTurn(world);
+  const anchors = report.authority.physical_lvs.filter(
+    (lv) => lv.name === "pgcf_anchor",
+  );
+  assert.equal(anchors.length, 1);
+  assert.equal(anchors[0]!.segtype, "thin");
+  assert.equal(report.authority.data_accounting_complete, true);
+  assert.deepEqual(
+    world.log.filter((entry) => entry.startsWith("lvcreate")),
+    ["lvcreate pgcf_anchor"],
+  );
+  // A pool that has its anchor gets no second one.
+  const anchored = identityWorld();
+  await identityTurn(anchored);
+  assert.deepEqual(
+    anchored.log.filter((entry) => entry.startsWith("lvcreate")),
+    [],
+  );
+});
+
 test("a driver tool that exits non-zero is a failed command after its repeats", async () => {
   const world = identityWorld();
   world.failing.add("lvs");

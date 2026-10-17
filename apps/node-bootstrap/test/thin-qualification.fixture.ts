@@ -836,6 +836,17 @@ export class ThinWorld {
           ? value("--thinpool")
           : value("--name");
         this.log.push(`lvcreate ${name}`);
+        if (rest.includes("--thin")) {
+          this.addLv({
+            name,
+            uuid: lvm("An"),
+            segtype: "thin",
+            pool: rest.at(-1)!.split("/")[1]!,
+            size: Number(value("--virtualsize").slice(0, -1)),
+            tags: rest.filter((_, index) => rest[index - 1] === "--addtag"),
+          });
+          return ok("");
+        }
         this.addLv({
           name,
           uuid: lvm("Np"),

@@ -260,6 +260,15 @@ export class IdentityWorld extends ThinWorld {
       tags: [`pgcf.node.${ids.node_uid}`, `pgcf.action.${this.leaseOperation}`],
     });
     this.poolUuid = pool.uuid;
+    // The pool's own never-written thin LV, as every turn after the first finds it.
+    this.addLv({
+      name: "pgcf_anchor",
+      uuid: lvm("An"),
+      segtype: "thin",
+      pool: "pgcf_thinpool",
+      size: 4 * 1024 ** 2,
+      tags: [`pgcf.node.${ids.node_uid}`],
+    });
     const classes = this.classObjects();
     this.store.set("storageclass", [classes[0]!]);
     this.store.set("volumeattributesclass", [classes[1]!]);

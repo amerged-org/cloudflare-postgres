@@ -632,6 +632,28 @@ export function thinPoolCommand(
   ];
 }
 
+/** lvm-localpv removes `pgcf_thinpool` as soon as its last thin LV is destroyed, so the pool keeps
+ * one thin LV of its own that nothing mounts or writes. */
+export const THIN_POOL_ANCHOR = "pgcf_anchor";
+export function thinAnchorCommand(facts: ThinLvmFacts, nodeUid: string) {
+  if (
+    !facts.physical.thin_pool ||
+    facts.volumes.some((lv) => lv.name === THIN_POOL_ANCHOR)
+  )
+    return null;
+  return [
+    "lvcreate",
+    "--thin",
+    "--virtualsize",
+    `${facts.extent}B`,
+    "--name",
+    THIN_POOL_ANCHOR,
+    "--addtag",
+    `pgcf.node.${nodeUid}`,
+    "pgcf/pgcf_thinpool",
+  ];
+}
+
 /** Prints the io.max of each readable cgroup file named by an argument. */
 const IO_LIMITS_SCRIPT = 'for p do if [ -r "$p" ]; then cat "$p"; fi; done';
 export function thinPodCgroupPaths(podUid: string) {
@@ -1651,6 +1673,12 @@ export async function runThinStorage(
             throw new BootstrapError("thin_storage_action_unconfirmed");
         }
       }
+      const anchor = thinAnchorCommand(facts, lease.node_uid);
+      if (anchor) {
+        await freshDriver();
+        await driverExec(anchor);
+        facts = await readLvm();
+      }
       const className = thinStorageClass(lease.profile_sha256);
       const expectedClasses = [
         thinStorageClassObject(lease.profile, lease.profile_sha256),
@@ -1853,6 +1881,9 @@ export async function runThinStorage(
         accounted.add(lvmUid(lv.lv_uuid));
         volumes.push(volume);
       }
+      for (const lv of facts.volumes)
+        if (lv.name === THIN_POOL_ANCHOR && lv.segtype === "thin")
+          accounted.add(lv.lv_uuid);
       const dataComplete =
         facts.volumes
           .filter((v) => v.segtype === "thin")
