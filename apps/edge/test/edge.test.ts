@@ -1522,29 +1522,43 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.admit_ms).toBeGreaterThanOrEqual(0);
   });
 
-  it("a caller without CF-Connecting-IP is limited under the binding key and admitted", async () => {
+  it("a caller without CF-Connecting-IP takes the binding limiter's own budget, never a public bucket", async () => {
     expect(connectionRateKey(null)).toBe("binding");
-    const limit = vi.fn(async (options: { key: string }) => ({
-      success: options.key.length > 0,
-    }));
-    const connection = await open({
-      ip: null,
-      bindings: {
-        ...testEnv,
-        CONNECTION_RATE_LIMITER: { limit } as unknown as RateLimit,
-      },
-    });
+    let allow = true;
+    const limiter = () =>
+      ({
+        limit: vi.fn(async () => ({ success: allow })),
+      }) as unknown as RateLimit & { limit: ReturnType<typeof vi.fn> };
+    const binding = limiter(),
+      connection = limiter(),
+      databaseLimit = limiter();
+    const bindings = {
+      ...testEnv,
+      BINDING_CONNECTION_RATE_LIMITER: binding,
+      CONNECTION_RATE_LIMITER: connection,
+      DATABASE_CONNECTION_RATE_LIMITER: databaseLimit,
+    };
+    const connected = await open({ ip: null, bindings });
     expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
       "accepted",
     );
-    expect(limit).toHaveBeenCalledExactlyOnceWith({
+    expect(binding.limit).toHaveBeenCalledExactlyOnceWith({
       key: JSON.stringify([database, "app", "binding"]),
     });
+    expect(connection.limit).not.toHaveBeenCalled();
+    expect(databaseLimit.limit).not.toHaveBeenCalled();
     const startup = encodeStartup({ user: "app", database });
-    connection.socket.send(startup);
+    connected.socket.send(startup);
     await expect
       .poll(async () => (await stats())[0]?.bytes)
       .toEqual([...startup]);
+    allow = false;
+    expect(await errorCode(await open({ ip: null, bindings }))).toBe("53300");
+    allow = true;
+    await open({ bindings });
+    expect(binding.limit).toHaveBeenCalledTimes(2);
+    expect(connection.limit).toHaveBeenCalledTimes(1);
+    expect(databaseLimit.limit).toHaveBeenCalledTimes(1);
   });
 
   it("a wake admission is signed v5 and opens the gateway once", async () => {

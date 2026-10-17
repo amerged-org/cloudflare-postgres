@@ -17,6 +17,8 @@ export interface DatabaseActorNamespace {
 export interface Env {
   readonly DATABASE_ACTOR: DatabaseActorNamespace;
   readonly CONNECTION_RATE_LIMITER: RateLimit;
+  /** Callers on a service binding (no CF-Connecting-IP), per database and role. */
+  readonly BINDING_CONNECTION_RATE_LIMITER: RateLimit;
   readonly DATABASE_CONNECTION_RATE_LIMITER: RateLimit;
   readonly ROUTE_MASTER_KEYS: string;
   readonly [binding: string]: unknown;

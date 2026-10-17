@@ -35,5 +35,13 @@
         "period": 60,
       },
     },
+    {
+      "name": "BINDING_CONNECTION_RATE_LIMITER",
+      "namespace_id": "4",
+      "simple": {
+        "limit": 1000,
+        "period": 60,
+      },
+    },
   ],
 }

@@ -41,18 +41,18 @@
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.md",
-      "sha256": "31b437ec67e2c3e49321a89081011824f46eb42d127d089cb15e50ab111fea8c"
+      "sha256": "5d4dfe2779a2ce187536adf85933c7f0659bda266e10350cb8a1ac8945dbfed7"
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.mmd",
-      "sha256": "964ed9eb1b351e10e317c187d1ec5e1fc2e8711610bd36e066cf898899a68c2d"
+      "sha256": "372f60b005fd98532a7705e40bb4718dd717755e43530f01d6ee7529e751beab"
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "7d401e4de28f75f6ebfe8b899140a591485d156bdaa1741860971b631b9f8699"
+      "sha256": "1dd81e4d83bd9a944d6bf71dc2240fb772880943f783b1641f3a91da50552b10"
     }
   ],
-  "fingerprint": "33724a9b89d887e1f1a0efc5d0018e22b6a77010c16b2df62686700b29e2b214",
+  "fingerprint": "882288295ae0a4be5f1965205d5edf43722765257ddb81f36a3be14f2e718cc9",
   "toolVersion": "0.1.1",
   "version": 1
 }
