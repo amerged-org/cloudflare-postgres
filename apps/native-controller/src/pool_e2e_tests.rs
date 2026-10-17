@@ -505,7 +505,7 @@ async fn a_held_client_is_answered_by_the_slot_its_wake_was_attached_to() {
         wake::slot_tls_name(&slot_ns()),
         w.slot_postgres.as_ref().unwrap().address,
     );
-    w.fresh_authority();
+    w.node_storage(true);
     // The Edge's ticket for the sleeping database: the gateway answers 101 at once and holds the
     // StartupMessage.
     let expected = w.wake_request();
@@ -616,8 +616,6 @@ fn legacy_binding(w: &World) -> String {
 async fn a_pool_miss_holds_the_client_until_the_database_s_own_cluster_is_released() {
     // A database without thin storage slept through its own Cluster: a pool miss.
     let mut w = World::awake().await;
-    w.quick();
-    w.snapshot.region["parking"] = Value::Null;
     w.admitted();
     assert!(
         w.sleep_pass().await.is_none(),
@@ -688,7 +686,7 @@ async fn a_pool_miss_holds_the_client_until_the_database_s_own_cluster_is_releas
     w.cnpg_reconciles();
     let mut ready = None;
     for _ in 0..10 {
-        w.fresh_authority();
+        w.node_storage(true);
         let observed = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
         if let Some(observed) = observed.filter(|o| o["state"] == "ready") {
             ready = Some(observed);

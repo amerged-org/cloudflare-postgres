@@ -77,7 +77,6 @@ fn each_decision_row_returns_its_reason_in_table_order() {
     let base = || Facts {
         trigger: Trigger::Gateway(&wake),
         cell: Some(&db),
-        protection: None,
         asleep: true,
         busy: false,
         identity: Some(&identity),
@@ -85,7 +84,7 @@ fn each_decision_row_returns_its_reason_in_table_order() {
         record: Some(&sleep),
         image: IMAGE,
         fingerprint: &fingerprint,
-        authority: true,
+        room: true,
         gateways_ready: true,
         slots: vec![&small, &fits],
         headroom: true,
@@ -139,11 +138,6 @@ fn each_decision_row_returns_its_reason_in_table_order() {
             Box::new(|f| f.cell = Some(&deleted)),
         ),
         (
-            "protected",
-            Outcome::Refused,
-            Box::new(|f| f.protection = Some(4)),
-        ),
-        (
             "not_sleeping",
             Outcome::Miss,
             Box::new(|f| f.cell = Some(&manual)),
@@ -188,11 +182,7 @@ fn each_decision_row_returns_its_reason_in_table_order() {
             Outcome::Miss,
             Box::new(|f| f.fingerprint = "0"),
         ),
-        (
-            "write_authority",
-            Outcome::Miss,
-            Box::new(|f| f.authority = false),
-        ),
+        ("no_room", Outcome::Miss, Box::new(|f| f.room = false)),
         (
             "gateways_not_ready",
             Outcome::Miss,
@@ -223,10 +213,6 @@ fn each_decision_row_returns_its_reason_in_table_order() {
         rows[index].2(&mut alone);
         assert_eq!(decide(&alone).err(), Some((*outcome, *reason)));
     }
-    // An older protection marker is the CNPG path's to clear: a miss, not a refusal.
-    let mut older = base();
-    older.protection = Some(3);
-    assert_eq!(decide(&older).err(), Some((Outcome::Miss, "protected")));
     // A ticket of another generation than the sleeping row's next is stale.
     let ahead = WakeRequest {
         generation: 7,
@@ -271,7 +257,6 @@ fn a_gateway_wake_cloudflare_already_claimed_is_not_stale_for_the_route_revision
     let facts = Facts {
         trigger: Trigger::Gateway(&wake),
         cell: Some(&claimed),
-        protection: None,
         asleep: true,
         busy: false,
         identity: Some(&identity),
@@ -279,7 +264,7 @@ fn a_gateway_wake_cloudflare_already_claimed_is_not_stale_for_the_route_revision
         record: Some(&sleep),
         image: IMAGE,
         fingerprint: &sleep.configuration_sha256,
-        authority: true,
+        room: true,
         gateways_ready: true,
         slots: vec![&fits],
         headroom: true,
@@ -736,7 +721,7 @@ mod world {
     }
     /// The gateway delivers the wake of the Edge's ticket and the pool decides it.
     async fn delivered_wake(w: &mut World) -> WakeRequest {
-        w.fresh_authority();
+        w.node_storage(true);
         let wake = w.wake_request();
         w.reconciler.pool.delivered(&w.gateway_pod(), &wake);
         w.reconciler
@@ -904,7 +889,7 @@ mod world {
             .pool
             .confirm_tickets(|id| (id == db["id"]).then_some(&db), Instant::now());
         assert_eq!(decided, vec![(w.id.clone(), TicketOutcome::Confirmed)]);
-        w.fresh_authority();
+        w.node_storage(true);
         let observed = w
             .reconciler
             .reconcile(&w.db, &w.snapshot)
@@ -1105,7 +1090,7 @@ mod world {
         // Cloudflare's claim reaches the controller: its pass retires the slot before anything
         // starts on the volume, and only the pass after it takes the database's own Cluster.
         w.claimed(&wake);
-        w.fresh_authority();
+        w.node_storage(true);
         let from = w.log_len();
         assert!(w.reconciler.reconcile(&w.db, &w.snapshot).await.is_err());
         let lines = w.since(from);
@@ -1325,7 +1310,7 @@ mod world {
         w.reconciler
             .pool
             .confirm_tickets(|id| (id == db["id"]).then_some(&db), Instant::now());
-        w.fresh_authority();
+        w.node_storage(true);
         let observed = w
             .reconciler
             .reconcile(&w.db, &w.snapshot)
@@ -1406,7 +1391,7 @@ mod world {
         let mut w = World::pooled().await;
         let wake = w.wake_request();
         w.claimed(&wake);
-        w.fresh_authority();
+        w.node_storage(true);
         let observed = w
             .reconciler
             .reconcile(&w.db, &w.snapshot)
@@ -1425,7 +1410,7 @@ mod world {
         w.reconciler.pool.discard(SLOT_HEX).await.unwrap();
         let wake = w.wake_request();
         w.claimed(&wake);
-        w.fresh_authority();
+        w.node_storage(true);
         let from = w.log_len();
         w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
         let lines = w.since(from);
@@ -1458,7 +1443,7 @@ mod world {
             .unwrap()
             .holders
             .insert(LV_UUID.into(), format!("slot:{}:{BOOT_ID}", uid(77)));
-        w.fresh_authority();
+        w.node_storage(true);
         let from = w.log_len();
         let observed = w
             .reconciler
@@ -1488,6 +1473,57 @@ mod world {
     }
 
     #[tokio::test]
+    async fn a_node_without_thin_pool_room_neither_attaches_nor_lifts_hibernation() {
+        let mut w = World::pooled().await;
+        // Cloudflare's reserve rule says the node's thin pool is too full to start anything.
+        w.node_storage(false);
+        let wake = w.wake_request();
+        let from = w.log_len();
+        w.reconciler.pool.delivered(&w.gateway_pod(), &wake);
+        let _ = w
+            .reconciler
+            .pool
+            .wake(&w.reconciler, Some((&w.db, &w.snapshot)), &wake, false)
+            .await;
+        assert!(!has(&w.since(from), "AGENT attach"));
+        assert!(!w.reconciler.pool.serves(&w.id));
+        eventually("the miss", || {
+            result_of(&w, "miss").is_some_and(|r| r["reason"] == "no_room")
+        })
+        .await;
+        // Cloudflare committed the wake: the miss path starts nothing on the full pool either.
+        w.claimed(&wake);
+        let from = w.log_len();
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed["state"], "provisioning", "{observed}");
+        assert_eq!(observed["message"], "waiting for thin pool room");
+        let lines = w.since(from);
+        assert!(!has(&lines, "AGENT hold"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("\"cnpg.io/hibernation\":\"off\""))
+        );
+        // Room again: the pass holds the volume and lifts hibernation, without any start hold.
+        w.reconciler.pool.discard(SLOT_HEX).await.unwrap();
+        w.node_storage(true);
+        assert!(w.db["storage_startup"].is_null());
+        let from = w.log_len();
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+        let lines = w.since(from);
+        let lifted = lines
+            .iter()
+            .position(|line| line.contains("\"cnpg.io/hibernation\":\"off\""))
+            .unwrap_or_else(|| panic!("hibernation lifted in {lines:#?}"));
+        assert!(at(&lines, "AGENT hold ok") < lifted);
+    }
+
+    #[tokio::test]
     async fn the_miss_path_waits_for_the_holder_while_the_node_agent_is_not_ready() {
         let mut w = World::pooled().await;
         w.reconciler.pool.discard(SLOT_HEX).await.unwrap();
@@ -1501,7 +1537,7 @@ mod world {
             .holders
             .insert(LV_UUID.into(), format!("slot:{}:{BOOT_ID}", uid(77)));
         agent_ready(&w, false);
-        w.fresh_authority();
+        w.node_storage(true);
         let from = w.log_len();
         let observed = w
             .reconciler
@@ -1531,11 +1567,9 @@ mod world {
     #[tokio::test]
     async fn the_cnpg_sleep_waits_for_the_holder_release_while_the_node_agent_is_not_ready() {
         let mut w = World::awake().await;
-        w.quick();
         w.reconciler.power.attach.client =
             crate::attach_protocol::Client::new(w.gateway.client.clone());
         w.thin();
-        w.snapshot.region["parking"] = Value::Null;
         w.gateway
             .agent
             .lock()
@@ -1545,17 +1579,7 @@ mod world {
         assert!(w.sleep_pass().await.is_none());
         w.hibernated_by_cnpg();
         agent_ready(&w, false);
-        let sleep = crate::power::Sleep {
-            parking: &Value::Null,
-            basis: crate::power::Basis {
-                node: &w.node,
-                release: &w.snapshot.fleet_release,
-                manifests: None,
-                runtime_class: "",
-            },
-            slot: None,
-        };
-        let observed = w.reconciler.power.suspend(&w.db, &sleep).await;
+        let observed = w.reconciler.power.suspend(&w.db, None).await;
         assert!(
             !observed
                 .as_ref()
@@ -1626,11 +1650,9 @@ mod world {
     async fn the_cnpg_sleep_writes_the_sleep_record_and_releases_the_holder_after_the_pod_is_gone()
     {
         let mut w = World::awake().await;
-        w.quick();
         w.reconciler.power.attach.client =
             crate::attach_protocol::Client::new(w.gateway.client.clone());
         w.thin();
-        w.snapshot.region["parking"] = Value::Null;
         w.gateway
             .agent
             .lock()
@@ -1685,7 +1707,6 @@ mod world {
         // A role's password rotates at the next generation.
         w.db["generation"] = 4.into();
         w.db["power"]["revision"] = 4.into();
-        w.db["storage_startup"]["generation"] = 4.into();
         w.db["roles"][1]["password"] = "z".repeat(43).into();
         w.db["roles"][1]["revision"] = 3.into();
         let observed = w
@@ -1741,9 +1762,8 @@ mod world {
         // The class changes: the slot is retired, and the same pass starts the own Cluster.
         w.db["generation"] = 5.into();
         w.db["power"]["revision"] = 5.into();
-        w.db["storage_startup"]["generation"] = 5.into();
         w.db["size"]["max_connections"] = 30.into();
-        w.fresh_authority();
+        w.node_storage(true);
         let from = w.log_len();
         w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
         let lines = w.since(from);
@@ -1795,17 +1815,6 @@ mod world {
         assert_eq!(record(&w), None);
         assert_eq!(holder(&w), None);
         assert!(!w.reconciler.pool.serves(&w.id));
-    }
-
-    #[tokio::test]
-    async fn protecting_a_served_database_retires_its_slot() {
-        let mut w = World::pooled().await;
-        confirmed(&mut w).await;
-        let observed = w.reconciler.protect_storage(&w.db).await.unwrap();
-        assert_eq!(observed.unwrap()["state"], "provisioning");
-        assert!(!w.reconciler.pool.serves(&w.id));
-        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
-        assert_eq!(holder(&w), None);
     }
 
     fn fresh_reconciler(w: &World) -> crate::reconcile::Reconciler {
@@ -2091,7 +2100,7 @@ mod world {
         let mut w = World::pooled().await;
         // PostgreSQL of the slot does not come up, and the pass is cut off meanwhile.
         w.slot_postgres.as_ref().unwrap().stop();
-        w.fresh_authority();
+        w.node_storage(true);
         let wake = w.wake_request();
         let cut = tokio::time::timeout(
             Duration::from_millis(400),

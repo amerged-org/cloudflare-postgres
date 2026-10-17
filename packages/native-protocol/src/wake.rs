@@ -44,12 +44,12 @@ pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
 pub const SLOT_NAMESPACE_PREFIX: &str = "pgcf-slot-";
 /// Every reason a wake result may name.
-pub const REASONS: [&str; 33] = [
+pub const REASONS: [&str; 32] = [
     "no_desired_row",
     "not_sleeping",
     "wake_in_progress",
     "desired_stale",
-    "write_authority",
+    "no_room",
     "thick_storage",
     "volume_identity_missing",
     "no_power_record",
@@ -76,7 +76,6 @@ pub const REASONS: [&str; 33] = [
     "sql_identity_mismatch",
     "release_failed",
     "deleted",
-    "protected",
     "not_in_region",
 ];
 const MAX_SAFE: u64 = 9_007_199_254_740_991;

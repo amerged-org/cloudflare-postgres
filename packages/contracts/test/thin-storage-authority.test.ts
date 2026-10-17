@@ -171,4 +171,31 @@ describe("the desired region's storage nodes", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("serves each storage node's thin pool room bit beside its identities", () => {
+    const region = {
+      id: "eu-test",
+      backup: {
+        bucket: "pgcf-backups",
+        endpoint_url: "https://r2.example.invalid",
+        region: "auto",
+      },
+    };
+    for (const room of [true, false])
+      expect(
+        DesiredRegion.parse({ ...region, storage_nodes: [composed({ room })] })
+          .storage_nodes![0]!.room,
+      ).toBe(room);
+    // Absent while a page is composed for a controller that predates the bit.
+    expect(
+      DesiredRegion.parse({ ...region, storage_nodes: [composed()] })
+        .storage_nodes![0],
+    ).not.toHaveProperty("room");
+    expect(
+      DesiredRegion.safeParse({
+        ...region,
+        storage_nodes: [composed({ room: "yes" })],
+      }).success,
+    ).toBe(false);
+  });
 });

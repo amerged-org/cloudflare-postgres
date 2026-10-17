@@ -15,7 +15,7 @@ use crate::{
     intake::Intake,
     kubernetes::Kubernetes,
     manifests,
-    power::{Basis, GatewayPod, GatewaySnapshot, PowerCoordinator, PowerIntent, Sleep, SlotSleep},
+    power::{GatewayPod, GatewaySnapshot, PowerCoordinator, PowerIntent, SlotSleep},
     reconcile::Reconciler,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -200,8 +200,6 @@ pub struct Facts<'a> {
     pub trigger: Trigger<'a>,
     /// The database's cached desired row.
     pub cell: Option<&'a Value>,
-    /// The generation of a storage protection marker of the database.
-    pub protection: Option<u64>,
     /// The database sleeps: its sleep completed and its own Cluster is hibernated.
     pub asleep: bool,
     /// A ticket of another operation or generation is pending for it.
@@ -215,8 +213,8 @@ pub struct Facts<'a> {
     pub image: &'a str,
     /// `sleep_fingerprint` of the desired row.
     pub fingerprint: &'a str,
-    /// The node-wide Cloudflare write authority is current.
-    pub authority: bool,
+    /// The node's thin pool has room for a start (Cloudflare's reserve rule).
+    pub room: bool,
     /// Every gateway Pod answered a wake poll since this controller started.
     pub gateways_ready: bool,
     /// The free slots of the database's node.
@@ -229,7 +227,7 @@ pub struct Choice {
     pub slot: String,
     pub volume: Volume,
 }
-/// Decides a wake by the table of the build spec (rows 1-16, first failing row wins).
+/// Decides a wake by the table of the build spec (first failing row wins).
 pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     let miss = |reason| Err((Outcome::Miss, reason));
     let Some(cell) = facts.cell else {
@@ -238,13 +236,6 @@ pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     let generation = number(cell, "generation");
     if text(cell, "desired_state") == "deleted" {
         return Err((Outcome::Refused, "deleted"));
-    }
-    if let Some(protected) = facts.protection {
-        return if protected >= generation {
-            Err((Outcome::Refused, "protected"))
-        } else {
-            miss("protected")
-        };
     }
     let power = &cell["power"];
     let sleeping = text(cell, "desired_state") == "suspended"
@@ -309,8 +300,8 @@ pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     if record.configuration_sha256 != facts.fingerprint {
         return miss("configuration_changed");
     }
-    if !facts.authority {
-        return miss("write_authority");
+    if !facts.room {
+        return miss("no_room");
     }
     if !facts.gateways_ready {
         return miss("gateways_not_ready");
@@ -1195,16 +1186,13 @@ impl Pool {
             .unwrap_or(&self.image)
             .to_string();
         let fingerprint = sleep_fingerprint(&view, &self.image).unwrap_or_default();
-        let authority = node
+        let room = node
             .as_ref()
-            .is_some_and(|node| rec.write_authority(&view, snapshot, node));
+            .is_some_and(|node| rec.room(&view, snapshot, node));
         let slots = self.free_on(text(db, "node"));
         let facts = Facts {
             trigger,
             cell: Some(db),
-            protection: storage
-                .as_ref()
-                .and_then(crate::power::protection_generation),
             asleep: cluster
                 .ok()
                 .flatten()
@@ -1217,7 +1205,7 @@ impl Pool {
             record: record.as_ref(),
             image: &image,
             fingerprint: &fingerprint,
-            authority,
+            room,
             gateways_ready: gateways
                 .as_ref()
                 .is_some_and(|gateways| self.intake.ready(&gateways.pods)),
@@ -2064,7 +2052,6 @@ impl Pool {
         &self,
         rec: &Reconciler,
         db: &Value,
-        snapshot: &DesiredSnapshot,
         serving: Serving,
     ) -> Result<Option<Value>, Error> {
         let id = text(db, "id");
@@ -2073,22 +2060,13 @@ impl Pool {
         }
         let ns = slot_namespace(&serving.slot);
         let socket = self.socket(&serving.pod.ip)?;
-        let sleep = |gone: bool| Sleep {
-            parking: &Value::Null,
-            basis: Basis {
-                node: &Value::Null,
-                release: &snapshot.fleet_release,
-                manifests: None,
-                runtime_class: "",
-            },
-            slot: Some(SlotSleep {
-                pod: socket,
-                tls_name: slot_tls_name(&ns),
-                gone,
-            }),
+        let sleep = |gone: bool| SlotSleep {
+            pod: socket,
+            tls_name: slot_tls_name(&ns),
+            gone,
         };
         if serving.retire.is_none() {
-            let observed = rec.power.suspend(db, &sleep(false)).await?;
+            let observed = rec.power.suspend(db, Some(&sleep(false))).await?;
             if observed.is_some() {
                 return Ok(observed);
             }
@@ -2100,7 +2078,7 @@ impl Pool {
         if !self.unwind(rec, id, Some(db)).await? {
             return Ok(None);
         }
-        rec.power.suspend(db, &sleep(true)).await
+        rec.power.suspend(db, Some(&sleep(true))).await
     }
 
     /// What the pool does next for its free slots, at `now`: slots to create and to delete. A
