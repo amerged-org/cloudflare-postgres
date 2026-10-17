@@ -1625,6 +1625,12 @@ impl Reconciler {
             );
         }
         let ca = ca_bytes(&ca_secret, &cluster)?;
+        // As for the database's own Pod, ready is PostgreSQL accepting on the tenant's database as
+        // a primary, asked of it now: the instance manager restarts a crashed postmaster inside
+        // the same container, so the Pod, its container and the volume's opener say nothing of it.
+        if !self.pool.accepting(db, &serving.pod, ns, &ca).await {
+            return Ok(observation(db, "provisioning", None));
+        }
         let volume: Value =
             serde_json::from_str(text(&storage["metadata"]["annotations"], VOLUME))?;
         let container = pod["spec"]["containers"]

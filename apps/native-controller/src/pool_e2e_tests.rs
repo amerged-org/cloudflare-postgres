@@ -692,3 +692,299 @@ async fn a_pool_miss_holds_the_client_until_the_database_s_own_cluster_is_releas
         gateway.refused.lock().unwrap()
     );
 }
+
+/// The end of Cloudflare's claim of `wake`: the claim's admission mutation moves the admission
+/// epoch and the route revision on.
+fn claim(w: &mut World, wake: &WakeRequest) {
+    w.db["admission"]["admission_epoch"] =
+        (w.db["admission"]["admission_epoch"].as_u64().unwrap() + 1).into();
+    w.db["admission"]["route_revision"] = (wake.route_revision + 1).into();
+}
+/// What the kubelet and CNPG write once the slot's instance runs: the Pod and its `postgres`
+/// container ready, the Cluster's primary.
+fn slot_runs(w: &World) {
+    w.server.edit("Pod", Some(&slot_ns()), "database-1", |pod| {
+        pod["status"]["conditions"] = json!([{"type":"Ready","status":"True"}]);
+        pod["status"]["containerStatuses"][0]["ready"] = true.into();
+    });
+    w.server
+        .edit("Cluster", Some(&slot_ns()), "database", |cluster| {
+            cluster["status"]["currentPrimary"] = "database-1".into();
+            cluster["status"]["readyInstances"] = 1.into();
+            cluster["status"]["conditions"] = json!([{"type":"Ready","status":"True"}]);
+        });
+}
+/// A wake through the real gateway: the held client, the controller's intake and the pool. It
+/// returns the client, connected to whatever the wake released it to, and the wake.
+async fn held_wake(w: &World, gateway: &RealGateway, cid: u64) -> (Client, WakeRequest) {
+    let expected = w.wake_request();
+    let mut client = gateway
+        .connect(&ticket(&expected, "app", &crate::test_server::uid(cid)))
+        .await
+        .expect("a v5 ticket is upgraded at once");
+    client
+        .send(Message::Binary(startup("app", &w.id).into()))
+        .await
+        .unwrap();
+    let (pod, delivered) = intake(w).await;
+    w.reconciler.pool.delivered(&pod, &delivered);
+    w.reconciler
+        .pool
+        .wake(&w.reconciler, Some((&w.db, &w.snapshot)), &delivered, false)
+        .await
+        .unwrap();
+    (client, delivered)
+}
+
+#[tokio::test]
+async fn a_pool_hit_is_reported_ready_sleeps_through_its_slot_and_wakes_by_a_pool_hit_again() {
+    let mut w = World::pooled().await;
+    let gateway = RealGateway::start(&mut w).await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    w.node_storage(true);
+    let (mut client, delivered) = held_wake(&w, &gateway, 910).await;
+    assert!(w.reconciler.pool.serves(&w.id), "a pool hit");
+    until_ready(&mut client).await;
+    // Unfenced, the slot's instance runs: the kubelet reports its Pod ready and CNPG writes the
+    // Cluster's status.
+    slot_runs(&w);
+    // Cloudflare commits the ticket; the controller's loop confirms it from the desired row the
+    // Actor's hint carries, which is read ahead of the snapshot publish that closes the claim's
+    // admission mutation: the admission is still the one before the claim.
+    w.claimed(&delivered);
+    let db = w.db.clone();
+    assert_eq!(
+        w.reconciler.pool.confirm_tickets(
+            |id| (id == db["id"]).then_some(&db),
+            std::time::Instant::now()
+        ),
+        vec![(w.id.clone(), crate::pool::TicketOutcome::Confirmed)]
+    );
+    // (1) The passes that follow report the database as an awake one: ready at the claim's
+    // generation, awake under its operation, attested at the slot's Pod under the admission the
+    // claim committed.
+    w.node_storage(true);
+    let first = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+    assert_eq!(
+        first.as_ref().map(|o| o["state"].clone()),
+        Some("ready".into()),
+        "{first:?}"
+    );
+    // The admission mutation completes: the next pull has the claim's admission.
+    claim(&mut w, &delivered);
+    let mut ready = None;
+    for _ in 0..5 {
+        w.node_storage(true);
+        if let Some(observed) = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap()
+            && observed["state"] == "ready"
+        {
+            ready = Some(observed);
+            break;
+        }
+    }
+    let ready = ready.expect("a ready observation of the slot-served database");
+    assert_eq!(ready["generation"], delivered.generation, "{ready}");
+    assert_eq!(ready["power"]["state"], "awake", "{ready}");
+    assert_eq!(ready["power"]["operation"], delivered.operation.as_str());
+    assert_eq!(ready["power"]["revision"], delivered.generation);
+    let proof = &ready["runtime_attestation"];
+    assert_eq!(proof["pod_uid"], slot_pod_uid(), "{ready}");
+    assert_eq!(proof["generation"], delivered.generation);
+    assert_eq!(proof["route_revision"], w.db["admission"]["route_revision"]);
+    assert_eq!(
+        proof["admission_epoch"],
+        w.db["admission"]["admission_epoch"]
+    );
+    // (2) Converged: the API took the ready report, which ends the claim's start hold, and the
+    // next passes report the same database ready without writing anything.
+    w.db.as_object_mut().unwrap().remove("storage_startup");
+    for _ in 0..3 {
+        w.node_storage(true);
+        let from = w.log_len();
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .expect("a converged pass reports the database");
+        assert_eq!(observed["state"], "ready", "{observed}");
+        assert_eq!(observed["power"]["state"], "awake", "{observed}");
+        let writes: Vec<_> = w
+            .since(from)
+            .into_iter()
+            .filter(|line| {
+                ["PATCH ", "POST ", "PUT ", "DELETE "]
+                    .iter()
+                    .any(|verb| line.starts_with(verb))
+            })
+            .collect();
+        assert!(writes.is_empty(), "{writes:#?}");
+    }
+    assert!(w.reconciler.pool.serves(&w.id));
+    drop(client);
+    // (3) Idle: Cloudflare asks for the sleep. The slot proves it, the sleep record is written,
+    // the slot's namespace deleted and its holder released.
+    w.db["generation"] = (delivered.generation + 1).into();
+    w.db["desired_state"] = "suspended".into();
+    w.db["power"] = json!({"operation":format!("op_{}","i".repeat(20)),"revision":delivered.generation + 1,"mode":"quiesce","reason":"idle"});
+    w.db["size"]
+        .as_object_mut()
+        .unwrap()
+        .remove("memory_request_mib");
+    w.db["admission"]["admission_epoch"] =
+        (w.db["admission"]["admission_epoch"].as_u64().unwrap() + 1).into();
+    w.db["admission"]["route_revision"] =
+        (w.db["admission"]["route_revision"].as_u64().unwrap() + 1).into();
+    let mut slept = None;
+    for _ in 0..5 {
+        w.node_storage(true);
+        if let Some(observed) = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap()
+            && observed["state"] == "hibernated"
+        {
+            slept = Some(observed);
+            break;
+        }
+    }
+    let slept = slept.expect("the slot-served database sleeps");
+    assert_eq!(slept["generation"], delivered.generation + 1, "{slept}");
+    assert!(!w.reconciler.pool.serves(&w.id));
+    assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+    let storage = w
+        .server
+        .get("ConfigMap", Some(SYSTEM), &format!("storage-{}", w.id))
+        .unwrap();
+    let record: crate::pool::SleepRecord = serde_json::from_str(
+        storage["metadata"]["annotations"][crate::pool::SLEEP_RECORD]
+            .as_str()
+            .expect("a sleep record"),
+    )
+    .unwrap();
+    assert_eq!(record.via, crate::pool::Via::Slot);
+    // (4) The refill gives the node a free slot again, and the next wake is a pool hit.
+    w.free_slot().await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    let (mut client, again) = held_wake(&w, &gateway, 911).await;
+    assert_eq!(again.generation, delivered.generation + 2);
+    assert!(
+        w.reconciler.pool.serves(&w.id),
+        "the second wake is a pool hit"
+    );
+    until_ready(&mut client).await;
+    eventually("the gateway accepted the second hit", || {
+        gateway
+            .results()
+            .iter()
+            .any(|result| result["outcome"] == "hit" && result["generation"] == again.generation)
+    })
+    .await;
+}
+
+/// The reasons the events of this test's thread give for passes that withheld `id`'s ready
+/// report.
+fn withheld(id: &str) -> Vec<String> {
+    crate::timing::take_emitted()
+        .into_iter()
+        .filter(|event| event["event"] == "ready_withheld" && event["database_id"] == id)
+        .map(|event| event["reason"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_pass_that_withholds_a_slot_served_database_s_ready_report_says_why() {
+    let mut w = World::pooled().await;
+    let gateway = RealGateway::start(&mut w).await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    w.node_storage(true);
+    let (mut client, delivered) = held_wake(&w, &gateway, 912).await;
+    until_ready(&mut client).await;
+    slot_runs(&w);
+    // Cloudflare has not committed the ticket yet: the pass reports nothing, and says so.
+    w.claimed(&delivered);
+    crate::timing::take_emitted();
+    assert_eq!(
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap(),
+        None
+    );
+    assert_eq!(withheld(&w.id), ["wake_ticket_pending"]);
+    let db = w.db.clone();
+    w.reconciler.pool.confirm_tickets(
+        |id| (id == db["id"]).then_some(&db),
+        std::time::Instant::now(),
+    );
+    // The fence the ready report is released under asks for a sleep meanwhile.
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+        |map| {
+            let mut intent: Value =
+                serde_json::from_str(map["data"]["intent.json"].as_str().unwrap()).unwrap();
+            intent["mode"] = "quiesce".into();
+            map["data"]["intent.json"] = intent.to_string().into();
+        },
+    );
+    w.node_storage(true);
+    crate::timing::take_emitted();
+    assert_eq!(
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap(),
+        None
+    );
+    assert_eq!(withheld(&w.id), ["ready_fence_quiesced"]);
+}
+
+#[tokio::test]
+async fn a_slot_served_database_whose_postgres_does_not_accept_is_not_reported_ready() {
+    let mut w = World::pooled().await;
+    let gateway = RealGateway::start(&mut w).await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    w.node_storage(true);
+    let (mut client, delivered) = held_wake(&w, &gateway, 913).await;
+    until_ready(&mut client).await;
+    slot_runs(&w);
+    w.claimed(&delivered);
+    let db = w.db.clone();
+    w.reconciler.pool.confirm_tickets(
+        |id| (id == db["id"]).then_some(&db),
+        std::time::Instant::now(),
+    );
+    claim(&mut w, &delivered);
+    let mut ready = false;
+    for _ in 0..5 {
+        w.node_storage(true);
+        if w.reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .is_some_and(|observed| observed["state"] == "ready")
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "the slot-served database is reported ready");
+    // PostgreSQL in the slot goes down inside the same container: the Pod, its container and the
+    // volume's single opener stay what they were.
+    w.slot_postgres.as_ref().unwrap().stop();
+    w.node_storage(true);
+    crate::timing::take_emitted();
+    let observed = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+    assert_eq!(withheld(&w.id), ["slot_postgres_not_accepting"]);
+    assert_ne!(
+        observed.as_ref().map(|o| o["state"].clone()),
+        Some("ready".into()),
+        "{observed:?}"
+    );
+    assert!(w.reconciler.pool.serves(&w.id));
+}
