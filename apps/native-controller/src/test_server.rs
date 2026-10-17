@@ -164,6 +164,20 @@ fn merge(value: &mut Value, patch: &Value) {
         *value = patch.clone();
     }
 }
+/// The defaults the API server writes into a CNPG Cluster from its CRD's structural schema: each
+/// managed role is `present`, inherits and has no connection limit unless it says otherwise.
+fn defaulted(value: &mut Value) {
+    if value["kind"] != "Cluster" {
+        return;
+    }
+    if let Some(roles) = value["spec"]["managed"]["roles"].as_array_mut() {
+        for role in roles.iter_mut().filter_map(Value::as_object_mut) {
+            role.entry("ensure").or_insert_with(|| "present".into());
+            role.entry("inherit").or_insert_with(|| true.into());
+            role.entry("connectionLimit").or_insert_with(|| (-1).into());
+        }
+    }
+}
 fn collection(path: &str) -> bool {
     let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
     let rest = match parts.first() {
@@ -309,6 +323,7 @@ fn handle(
             state.serial += 1;
             value["metadata"]["uid"] = uid(1000 + state.serial).into();
             value["metadata"]["resourceVersion"] = "1".into();
+            defaulted(&mut value);
             state.objects.insert(key.clone(), value.clone());
             queue_event(state, "ADDED", &value);
             state.writes.push((method.into(), key, value.clone()));
@@ -386,6 +401,7 @@ fn handle(
                 return reply(409, &json!({"reason":"Conflict"}));
             }
             merge(&mut current, &patch);
+            defaulted(&mut current);
             advance(&mut current);
             state.objects.insert(path.into(), current.clone());
             queue_event(state, "MODIFIED", &current);

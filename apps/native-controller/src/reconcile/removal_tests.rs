@@ -46,11 +46,13 @@ fn at(w: &World, needles: &[&str], after: usize) -> usize {
 fn held(w: &World, change: impl FnOnce(&mut RoleRow)) {
     change(w.sql.lock().unwrap().roles.get_mut(REPORT).unwrap());
 }
+/// The disabled role as the Cluster holds it, with the defaults of CNPG's CRD.
 fn disabled() -> Value {
-    json!({"name":REPORT,"ensure":"present","login":false})
+    json!({"name":REPORT,"ensure":"present","login":false,"inherit":true,"connectionLimit":-1})
 }
+/// The dropped role as the Cluster holds it, with the defaults of CNPG's CRD.
 fn dropped() -> Value {
-    json!({"name":REPORT,"ensure":"absent"})
+    json!({"name":REPORT,"ensure":"absent","inherit":true,"connectionLimit":-1})
 }
 fn secret(w: &World) -> Option<Value> {
     w.server

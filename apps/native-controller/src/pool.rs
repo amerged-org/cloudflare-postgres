@@ -2008,6 +2008,7 @@ impl Pool {
         let configuration = sleep_fingerprint(db, &self.image)?;
         if configuration != serving.configuration {
             if !self.roles_applied(rec, db, snapshot, &ns).await? {
+                crate::timing::ready_withheld(db, "slot_roles_pending", None);
                 return Ok(Served::Observed(Some(
                     json!({"id":db["id"],"generation":db["generation"],"state":"provisioning","archive":{"continuous":false,"ready_wal_files":null}}),
                 )));
@@ -2064,7 +2065,13 @@ impl Pool {
             .read("Cluster", Some(ns), "database")
             .await?
             .ok_or("slot Cluster missing")?;
-        if cluster["spec"]["managed"]["roles"] != json!(parts.managed_roles) {
+        // The API server writes the defaults of CNPG's CRD into each role (`inherit`,
+        // `connectionLimit`): they are applied once the Cluster's roles hold what was written.
+        if !crate::reconcile::contains(
+            &cluster["spec"]["managed"]["roles"],
+            &json!(parts.managed_roles),
+            "",
+        ) {
             self.k8s
                 .patch(
                     &cluster,
