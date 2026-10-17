@@ -23,5 +23,6 @@ mod test_postgres;
 #[cfg(test)]
 mod test_sql;
 pub mod timing;
+pub mod units;
 pub mod volume;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
