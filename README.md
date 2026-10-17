@@ -37,7 +37,9 @@ states what runs where; it does not repeat measurements.
 | Regional gateway                                 | Native Rust (`apps/native-gateway`, Deployment `pgcf-gateway`), deployed                                                                               |
 | Bootstrap relay (EU control only)                | TypeScript (`apps/regional`) is deployed; the native replacement (`apps/native-bootstrap-relay`) is built and not deployed                             |
 | Database storage                                 | New databases use Thin LVM volumes on EU1; retained thick volumes keep their backend and data                                                          |
-| Idle sleep                                       | CNPG hibernation; the [parked sleep tier](docs/architecture/parked-instances.md) is implemented and the region policy `parked_tier` is its only switch |
+| Thin storage safety                              | One writer per volume (the attach agent's holder file); no start or attach without thin pool room, automatic growth and an alert                       |
+| Host guard                                       | The `pgcf-sandbox-controller` host extension still runs on EU1 and is removed by a host release ([decision A](docs/architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)) |
+| Idle sleep                                       | CNPG hibernation; a cold database wakes into a free pool slot on its node; the parked sleep tier is being deleted                                      |
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
 through the authenticated management API. Expansion requires ten fresh aligned consecutive
@@ -109,8 +111,8 @@ flowchart LR
   Boot -->|"install Talos, join"| Region
 ```
 
-Connecting to a sleeping database (the idle sleep is CNPG hibernation, or the parked tier when the
-region policy enables it):
+Connecting to a sleeping database (the idle sleep is CNPG hibernation; a wake takes a free pool
+slot on the node when one is ready):
 
 ```mermaid
 sequenceDiagram
@@ -125,7 +127,7 @@ sequenceDiagram
   E->>A: ensureAwake()
   A->>R: wake (coalesced)
   R->>G: wake db-id
-  G->>P: start PostgreSQL (unfence the parked Pod or remove CNPG hibernation)
+  G->>P: start PostgreSQL (attach the volume to a pool slot and lift its fence, or remove CNPG hibernation)
   P-->>G: ready
   G-->>R: observed ready
   R-->>A: ready
@@ -246,12 +248,11 @@ missing measurement keeps it.
 Fixed-rule alarms need no threshold and are evaluated for every region: a stale or lost node, a
 failing or stale daily infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
-awake time (`database_base_backup_stale`; hibernated databases are excluded), a blocked Thin
-storage node (`thin_storage_blocked`) and a database held in a protective stop for five minutes
-(`database_storage_protected`). Each minute-cron step runs in its own failure boundary, and the
-`CronWatchdog` Durable Object (binding `CRON_WATCHDOG`) judges the cron's heartbeat from its own
-alarm, independently of the cron trigger, raising `control_cron_stalled` and
-`control_cron_step_failing`. Every event carries a short runbook `action`; the
+awake time (`database_base_backup_stale`; hibernated databases are excluded), and a blocked Thin
+storage node or a thin pool without room that cannot grow (`thin_storage_blocked`). Each
+minute-cron step runs in its own failure boundary, and the `CronWatchdog` Durable Object (binding
+`CRON_WATCHDOG`) judges the cron's heartbeat from its own alarm, independently of the cron trigger,
+raising `control_cron_stalled` and `control_cron_step_failing`. Every event carries a short runbook `action`; the
 [alert runbook](docs/operations/infrastructure-backups.md#alert-kinds-and-runbook-actions)
 lists each kind's rule and action.
 
@@ -311,8 +312,6 @@ configuration fails explicitly. Unit tests do not replace the live acceptance re
   status and the go-live path.
 - [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): the native
   runtime architecture, verified routing and the cold-start design.
-- [Parked sleep tier](docs/architecture/parked-instances.md): the idle sleep that keeps the
-  instance Pod and stops only PostgreSQL.
 - [Wake path v2 and control-plane scale](docs/architecture/wake-path-v2-and-scale.md): what the
   field does (Neon, Xata), where PGCF's wake time goes, the work packages that take it below one
   second, and how the API load scales with nodes.
