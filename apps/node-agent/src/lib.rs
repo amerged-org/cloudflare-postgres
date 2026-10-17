@@ -16,6 +16,7 @@ pub mod pg_control;
 pub mod postgres;
 pub mod sleep;
 pub mod sleep_record;
+pub mod storage;
 #[cfg(test)]
 mod test_api;
 #[cfg(test)]

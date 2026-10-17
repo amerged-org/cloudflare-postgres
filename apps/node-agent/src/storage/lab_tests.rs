@@ -1,0 +1,648 @@
+// SPDX-License-Identifier: Apache-2.0
+//! `Storage` against real LVM, ext4 and the kernel's mount API on loop devices. They change the
+//! machine, so they run only in a privileged Linux container with lvm2, thin-provisioning-tools,
+//! e2fsprogs and util-linux, one at a time:
+//! `cargo test -p pgcf-node-agent --lib -- --ignored --test-threads=1 storage::lab_tests`
+use super::{
+    commands::{self, FS_TAG, RESERVE_FREED_TAG},
+    lvm::{self, LogicalVolume},
+    mountinfo, *,
+};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, chown},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
+
+static LABS: AtomicU32 = AtomicU32::new(0);
+const TENANT: u32 = 1234;
+const ID: &str = "a1b2c3d4e5f6g7h8i9j0";
+const OTHER: &str = "k1l2m3n4o5p6q7r8s9t0";
+
+fn sh(program: &str, args: &[&str]) -> String {
+    let output = Command::new(program).args(args).output().expect("starts");
+    assert!(
+        output.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+fn policy() -> Policy {
+    Policy {
+        reserve_bytes: 4 << 20,
+        metadata_no_room_percent: 75,
+        sample_max_age: Duration::from_secs(10),
+    }
+}
+fn id(database: &str, generation: u64) -> VolumeId {
+    VolumeId::new(database, generation).unwrap()
+}
+
+/// A loop device of its own with its own volume group, removed again when the test ends.
+struct Lab {
+    dir: PathBuf,
+    loop_device: String,
+    storage: Storage,
+}
+
+impl Lab {
+    fn new(disk_mib: u64) -> Lab {
+        let name = format!(
+            "pgcflab{}x{}",
+            std::process::id(),
+            LABS.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = std::env::temp_dir().join(&name);
+        fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join("disk.img");
+        fs::File::create(&disk)
+            .unwrap()
+            .set_len(disk_mib << 20)
+            .unwrap();
+        let loop_device = sh("losetup", &["-f", "--show", disk.to_str().unwrap()])
+            .trim()
+            .to_string();
+        if !Path::new(&loop_device).exists() {
+            let number = loop_device.trim_start_matches("/dev/loop");
+            sh("mknod", &[&loop_device, "b", "7", number]);
+        }
+        let config = Config {
+            device: loop_device.clone().into(),
+            group: name,
+            mount_root: dir.join("db"),
+            pool_metadata_bytes: 8 << 20,
+            ..Config::default()
+        };
+        Lab {
+            dir,
+            loop_device,
+            storage: Storage::new(SystemRunner, config),
+        }
+    }
+    /// A lab with the pool made.
+    fn open(disk_mib: u64) -> Lab {
+        let lab = Lab::new(disk_mib);
+        lab.storage.open().unwrap();
+        lab
+    }
+    fn config(&self) -> &Config {
+        self.storage.config()
+    }
+    fn run(&self, command: Vec<String>) -> String {
+        let output = SystemRunner.run(&command).unwrap();
+        assert_eq!(output.code, 0, "{command:?}: {}", output.stderr);
+        output.stdout
+    }
+    fn dir_of(&self, id: &VolumeId) -> PathBuf {
+        self.config().mount_root.join(id.database())
+    }
+    fn lvs(&self) -> Vec<LogicalVolume> {
+        lvm::parse_lvs(&self.run(commands::lvs(self.config()))).unwrap()
+    }
+    fn lv(&self, id: &VolumeId) -> Option<LogicalVolume> {
+        self.lvs().into_iter().find(|lv| lv.name == id.lv_name())
+    }
+    fn group(&self) -> lvm::VolumeGroup {
+        lvm::parse_vgs(&self.run(commands::vgs()))
+            .unwrap()
+            .into_iter()
+            .find(|group| group.name == self.config().group)
+            .unwrap()
+    }
+    fn mount_table(&self) -> String {
+        fs::read_to_string("/proc/self/mountinfo").unwrap()
+    }
+    fn mounted(&self, id: &VolumeId) -> bool {
+        mountinfo::parse(&self.mount_table())
+            .unwrap()
+            .iter()
+            .any(|mount| mount.mount_point == self.dir_of(id))
+    }
+    fn create(&self, id: &VolumeId, size_mib: u64) {
+        self.storage
+            .create_volume(id, size_mib << 20, &policy())
+            .unwrap();
+        chown(self.dir_of(id), Some(TENANT), Some(TENANT)).unwrap();
+    }
+    fn volume(&self, id: &VolumeId) -> VolumeInfo {
+        self.storage
+            .inventory()
+            .unwrap()
+            .volumes
+            .into_iter()
+            .find(|volume| volume.id == *id)
+            .unwrap()
+    }
+    /// What a database's PostgreSQL does: writes as its own user, never as root.
+    fn tenant_dd(&self, id: &VolumeId, file: &str, kib: u64, source: &str) -> bool {
+        Command::new("setpriv")
+            .args([
+                &format!("--reuid={TENANT}"),
+                &format!("--regid={TENANT}"),
+                "--clear-groups",
+            ])
+            .args(["dd", &format!("if={source}")])
+            .arg(format!("of={}", self.dir_of(id).join(file).display()))
+            .args(["bs=64k", &format!("count={}", kib / 64), "conv=fsync"])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+    fn pool_used(&self) -> u64 {
+        sh("sync", &[]);
+        self.storage.poll_pool().unwrap().data_used_bytes
+    }
+}
+
+impl Drop for Lab {
+    fn drop(&mut self) {
+        if let Ok(mounts) = mountinfo::parse(&self.mount_table()) {
+            for mount in mounts
+                .iter()
+                .rev()
+                .filter(|m| m.mount_point.starts_with(&self.dir))
+            {
+                let _ = Command::new("umount").arg(&mount.mount_point).output();
+            }
+        }
+        let _ = Command::new("vgremove")
+            .args(["-ff", "-y", "--quiet", &self.config().group])
+            .output();
+        let _ = Command::new("losetup")
+            .args(["-d", &self.loop_device])
+            .output();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Ends a child that holds a mount busy, also when the test fails.
+struct Holder(Child);
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn first_boot_makes_the_group_and_a_pool_over_the_whole_partition_and_repeats_as_a_no_op() {
+    let lab = Lab::new(512);
+    lab.storage.open().unwrap();
+    let group = lab.group();
+    // No slack: the pool, its metadata and the spare use every extent.
+    assert_eq!(group.free_bytes, 0);
+    assert!(group.mda_bytes >= 64 << 20, "{}", group.mda_bytes);
+    let lvs = lab.lvs();
+    let pool = lvs.iter().find(|lv| lv.name == "pgcf_thinpool").unwrap();
+    assert!(pool.is_pool());
+    assert_eq!(pool.size_bytes, group.size_bytes - 2 * (8 << 20));
+    assert_eq!((pool.chunk_bytes, pool.metadata_bytes), (65_536, 8 << 20));
+    assert_eq!(
+        (pool.when_full.as_str(), pool.zero.as_str()),
+        ("error", "zero")
+    );
+    // The pool fails writes at once and the status reads back through dmsetup.
+    let sample = lab.storage.poll_pool().unwrap();
+    assert_eq!(sample.data_total_bytes, pool.size_bytes);
+    assert_eq!(sample.metadata_total_bytes, 8 << 20);
+    assert_eq!(sample.mode, PoolMode::ReadWrite);
+    lab.storage.open().unwrap();
+    assert_eq!(lab.lvs(), lvs);
+    // No volume yet: nothing to report, and nothing nominal.
+    let inventory = lab.storage.inventory().unwrap();
+    assert_eq!((inventory.volumes.len(), inventory.nominal_bytes), (0, 0));
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_first_boot_that_stopped_halfway_is_finished() {
+    // After pvcreate.
+    let lab = Lab::new(512);
+    lab.run(commands::pvcreate(lab.config()));
+    lab.storage.open().unwrap();
+    assert!(lab.lv(&id(ID, 1)).is_none());
+    assert_eq!(lab.lvs()[0].when_full, "error");
+
+    // After lvcreate of the pool, before `lvchange --errorwhenfull y`.
+    let lab = Lab::new(512);
+    lab.run(commands::pvcreate(lab.config()));
+    lab.run(commands::vgcreate(lab.config()));
+    let data = lab.group().free_bytes - 2 * (8 << 20);
+    lab.run(commands::pool_create(lab.config(), data));
+    assert_eq!(lab.lvs()[0].when_full, "queue");
+    lab.storage.open().unwrap();
+    assert_eq!(lab.lvs()[0].when_full, "error");
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_disk_of_another_group_is_never_adopted() {
+    let lab = Lab::new(512);
+    sh(
+        "vgcreate",
+        &["--quiet", "pgcf-someone-else", &lab.loop_device],
+    );
+    let result = lab.storage.open();
+    let other = Command::new("vgremove")
+        .args(["-f", "pgcf-someone-else"])
+        .output();
+    assert!(matches!(result, Err(Error::Unexpected(_))), "{result:?}");
+    assert!(other.unwrap().status.success());
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_volume_is_created_formatted_and_mounted_for_its_owner_alone() {
+    let lab = Lab::open(1024);
+    let id = id(ID, 1);
+    lab.create(&id, 256);
+    let lv = lab.lv(&id).unwrap();
+    assert!(lv.is_thin());
+    assert_eq!(lv.size_bytes, 256 << 20);
+    for tag in [&format!("pgcf.db.{ID}"), "pgcf.gen.1", FS_TAG] {
+        assert!(lv.has_tag(tag), "{tag}: {:?}", lv.tags);
+    }
+    assert!(lab.mounted(&id));
+    assert_eq!(
+        fs::metadata(lab.dir_of(&id)).unwrap().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&lab.config().mount_root).unwrap().mode() & 0o7777,
+        0o711
+    );
+    let table = lab.mount_table();
+    let line = table
+        .lines()
+        .find(|l| l.contains(&format!("/{ID} ")))
+        .unwrap();
+    assert!(line.contains(" rw,nosuid,nodev,noexec,"), "{line}");
+    assert!(!line.contains("discard"), "{line}");
+
+    let inventory = lab.storage.inventory().unwrap();
+    assert_eq!(inventory.nominal_bytes, 256 << 20);
+    let volume = &inventory.volumes[0];
+    assert_eq!(
+        (volume.id.clone(), volume.size_bytes),
+        (id.clone(), 256 << 20)
+    );
+    assert!(volume.formatted && !volume.reserve_released);
+    let mount = volume.mount.unwrap();
+    assert!(!mount.fs_errors);
+    assert!(mount.usage.total_bytes > 200 << 20 && mount.usage.total_bytes < 256 << 20);
+    assert!(mount.usage.inodes_total > 1000);
+    // mkfs wrote its inode tables and journal: some chunks, far fewer than the nominal size.
+    assert!(volume.pool_used_bytes > 1 << 20 && volume.pool_used_bytes < 64 << 20);
+    let report = serde_json::json!({
+        "observed_at": "2026-10-18T10:00:00.000Z",
+        "volumes": inventory.volumes.iter().map(VolumeInfo::to_contract).collect::<Vec<_>>(),
+    });
+    assert!(crate::node_link::schema_valid("NodeVolumeReport", &report));
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn creating_again_never_formats_again_and_a_stopped_create_continues() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    fs::write(lab.dir_of(&a).join("kept"), b"committed").unwrap();
+    lab.storage.create_volume(&a, 256 << 20, &policy()).unwrap();
+    lab.storage.unmount_volume(&a).unwrap();
+    assert!(!lab.mounted(&a));
+    lab.storage.create_volume(&a, 256 << 20, &policy()).unwrap();
+    assert!(lab.mounted(&a));
+    assert_eq!(fs::read(lab.dir_of(&a).join("kept")).unwrap(), b"committed");
+    // Another size is another volume, never this one.
+    assert!(matches!(
+        lab.storage.create_volume(&a, 512 << 20, &policy()),
+        Err(Error::Unexpected(_))
+    ));
+
+    // The agent stopped after lvcreate: no filesystem yet.
+    let b = id(OTHER, 1);
+    lab.run(commands::volume_create(lab.config(), &b, 256 << 20));
+    assert!(!lab.lv(&b).unwrap().has_tag(FS_TAG));
+    lab.storage.create_volume(&b, 256 << 20, &policy()).unwrap();
+    assert!(lab.lv(&b).unwrap().has_tag(FS_TAG) && lab.mounted(&b));
+
+    for bad in [0, (256 << 20) + 1, 6 << 20] {
+        assert!(matches!(
+            lab.storage
+                .create_volume(&id("c1b2c3d4e5f6g7h8i9j0", 1), bad, &policy()),
+            Err(Error::InvalidSize)
+        ));
+    }
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn creating_is_refused_without_room_and_past_the_logical_cap() {
+    let lab = Lab::open(256);
+    // The pool is about 170 MiB: the cap of 4 x pool is below 1 GiB.
+    let big = id(ID, 1);
+    let result = lab.storage.create_volume(&big, 1 << 30, &policy());
+    assert!(
+        matches!(result, Err(Error::LogicalCap { .. })),
+        "{result:?}"
+    );
+    assert!(lab.lv(&big).is_none());
+
+    let reserve = Policy {
+        reserve_bytes: 1 << 40,
+        ..policy()
+    };
+    let result = lab.storage.create_volume(&big, 64 << 20, &reserve);
+    assert!(
+        matches!(result, Err(Error::NoRoom(NoRoom::Reserve))),
+        "{result:?}"
+    );
+    assert!(lab.lv(&big).is_none());
+    lab.create(&big, 64);
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_volume_goes_only_when_unmounted_and_ordered_and_returns_its_chunks() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    assert!(lab.tenant_dd(&a, "data", 30720, "/dev/urandom"));
+    let used = lab.pool_used();
+
+    let ordered = Removal::DatabaseDeleted;
+    assert!(matches!(
+        lab.storage.remove_volume(&a, ordered),
+        Err(Error::Mounted)
+    ));
+    let kept = Removal::Superseded {
+        remove_volume: false,
+    };
+    assert!(matches!(
+        lab.storage.remove_volume(&a, kept),
+        Err(Error::NotAuthorised)
+    ));
+    assert!(lab.lv(&a).is_some());
+
+    lab.storage.unmount_volume(&a).unwrap();
+    assert!(matches!(
+        lab.storage.remove_volume(&a, kept),
+        Err(Error::NotAuthorised)
+    ));
+    assert!(lab.lv(&a).is_some());
+    lab.storage
+        .remove_volume(
+            &a,
+            Removal::Superseded {
+                remove_volume: true,
+            },
+        )
+        .unwrap();
+    assert!(lab.lv(&a).is_none());
+    assert!(!lab.dir_of(&a).exists());
+    assert!(lab.pool_used() + (25 << 20) < used);
+    // Removing what is gone is done.
+    lab.storage.remove_volume(&a, ordered).unwrap();
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_volume_that_is_not_a_database_volume_is_never_removed() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    // Named like a database volume but without its tags.
+    sh(
+        "lvcreate",
+        &[
+            "--quiet",
+            "--thin",
+            "--virtualsize",
+            "64m",
+            "--name",
+            &a.lv_name(),
+            &format!("{}/{}", lab.config().group, lab.config().pool),
+        ],
+    );
+    let result = lab.storage.remove_volume(&a, Removal::DatabaseDeleted);
+    assert!(matches!(result, Err(Error::Unexpected(_))), "{result:?}");
+    assert!(lab.lv(&a).is_some());
+    // It is not reported as a database's volume, but it counts toward the logical cap.
+    let inventory = lab.storage.inventory().unwrap();
+    assert_eq!(
+        (inventory.volumes.len(), inventory.nominal_bytes),
+        (0, 64 << 20)
+    );
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_filesystem_that_something_holds_is_not_unmounted() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    let holder = Holder(
+        Command::new("sleep")
+            .arg("60")
+            .current_dir(lab.dir_of(&a))
+            .spawn()
+            .unwrap(),
+    );
+    assert!(matches!(lab.storage.unmount_volume(&a), Err(Error::Busy)));
+    assert!(lab.mounted(&a));
+    drop(holder);
+    lab.storage.unmount_volume(&a).unwrap();
+    assert!(!lab.mounted(&a));
+    // Not mounted is done.
+    lab.storage.unmount_volume(&a).unwrap();
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_volume_grows_online_never_shrinks_and_never_passes_the_cap() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    let before = lab.volume(&a).mount.unwrap().usage.total_bytes;
+    lab.storage.grow_volume(&a, 512 << 20).unwrap();
+    let grown = lab.volume(&a);
+    assert_eq!(grown.size_bytes, 512 << 20);
+    assert!(grown.mount.unwrap().usage.total_bytes > before + (200 << 20));
+    lab.storage.grow_volume(&a, 512 << 20).unwrap();
+    assert!(matches!(
+        lab.storage.grow_volume(&a, 256 << 20),
+        Err(Error::Shrink)
+    ));
+    // A volume that sleeps unmounted is mounted again to grow.
+    lab.storage.unmount_volume(&a).unwrap();
+    lab.storage.grow_volume(&a, 768 << 20).unwrap();
+    assert!(lab.mounted(&a));
+    assert!(lab.volume(&a).mount.unwrap().usage.total_bytes > 700 << 20);
+    let result = lab.storage.grow_volume(&a, 64 << 30);
+    assert!(
+        matches!(result, Err(Error::LogicalCap { .. })),
+        "{result:?}"
+    );
+    assert_eq!(lab.volume(&a).size_bytes, 768 << 20);
+    assert!(matches!(
+        lab.storage.grow_volume(&id(OTHER, 1), 256 << 20),
+        Err(Error::Missing)
+    ));
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn the_pool_sample_follows_writes_and_the_room_rule_follows_the_policy() {
+    let lab = Lab::open(1024);
+    assert_eq!(lab.storage.room(&policy()), Err(NoRoom::Unobserved));
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    let before = lab.pool_used();
+    assert_eq!(lab.storage.room(&policy()), Ok(()));
+    assert!(lab.tenant_dd(&a, "data", 40960, "/dev/urandom"));
+    assert!(lab.pool_used() >= before + (40 << 20));
+    let reserve = Policy {
+        reserve_bytes: 1 << 40,
+        ..policy()
+    };
+    assert_eq!(lab.storage.room(&reserve), Err(NoRoom::Reserve));
+    let quick = Policy {
+        sample_max_age: Duration::from_millis(300),
+        ..policy()
+    };
+    lab.storage.poll_pool().unwrap();
+    assert_eq!(lab.storage.room(&quick), Ok(()));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(lab.storage.room(&quick), Err(NoRoom::Stale));
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn trimming_returns_deleted_data_to_the_pool() {
+    let lab = Lab::open(1024);
+    let a = id(ID, 1);
+    lab.create(&a, 256);
+    assert!(lab.tenant_dd(&a, "data", 61440, "/dev/urandom"));
+    let full = lab.pool_used();
+    fs::remove_file(lab.dir_of(&a).join("data")).unwrap();
+    sh("sync", &[]);
+    assert!(lab.pool_used() + (10 << 20) > full);
+    lab.storage.trim_volume(&a).unwrap();
+    assert!(lab.pool_used() + (50 << 20) < full);
+    lab.storage.unmount_volume(&a).unwrap();
+    assert!(matches!(
+        lab.storage.trim_volume(&a),
+        Err(Error::NotMounted)
+    ));
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_booted_node_mounts_every_formatted_volume_again() {
+    let lab = Lab::open(1024);
+    let (a, b) = (id(ID, 1), id(OTHER, 2));
+    lab.create(&a, 128);
+    lab.create(&b, 128);
+    fs::write(lab.dir_of(&a).join("kept"), b"committed").unwrap();
+    // A volume whose create stopped before mkfs is not mounted.
+    let c = id("c1b2c3d4e5f6g7h8i9j0", 1);
+    lab.run(commands::volume_create(lab.config(), &c, 128 << 20));
+    for volume in [&a, &b] {
+        lab.storage.unmount_volume(volume).unwrap();
+    }
+    // What a reboot does to the volumes: the group is inactive until lvm2 activates it.
+    sh(
+        "vgchange",
+        &["--quiet", "--activate", "n", &lab.config().group],
+    );
+    lab.storage.open().unwrap();
+    assert!(lab.storage.mount_all().unwrap().is_empty());
+    assert!(lab.mounted(&a) && lab.mounted(&b) && !lab.mounted(&c));
+    assert_eq!(fs::read(lab.dir_of(&a).join("kept")).unwrap(), b"committed");
+    // Mounting twice changes nothing.
+    assert!(lab.storage.mount_all().unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_full_pool_stops_writers_and_recovery_brings_the_volume_back_with_its_data() {
+    let lab = Lab::open(320);
+    let (a, b) = (id(ID, 1), id(OTHER, 1));
+    lab.create(&a, 256);
+    lab.create(&b, 256);
+    // `kept` is committed before the pool fills.
+    assert!(lab.tenant_dd(&a, "kept", 1024, "/dev/urandom"));
+    let kept = fs::read(lab.dir_of(&a).join("kept")).unwrap();
+    assert!(lab.tenant_dd(&b, "bulk", 122880, "/dev/urandom"));
+    // The tenant of `a` fills what is left, and the pool fails the write at once.
+    assert!(!lab.tenant_dd(&a, "more", 204800, "/dev/urandom"));
+    sh("sync", &[]);
+    assert!(!lab.tenant_dd(&a, "after", 1024, "/dev/zero"));
+
+    let sample = lab.storage.poll_pool().unwrap();
+    assert_eq!(sample.mode, PoolMode::OutOfDataSpace);
+    assert_eq!(lab.storage.room(&policy()), Err(NoRoom::Unwritable));
+    let inventory = lab.storage.inventory().unwrap();
+    let damaged: Vec<_> = inventory.damaged().iter().map(|v| v.id.clone()).collect();
+    assert_eq!(damaged, vec![a.clone()]);
+
+    // No space yet: recovery would write into a full pool.
+    lab.storage.unmount_volume(&b).unwrap();
+    let result = lab.storage.recover_volume(&a, &policy());
+    assert!(matches!(result, Err(Error::NoRoom(_))), "{result:?}");
+    assert!(lab.mounted(&a));
+
+    // A deleted database returns its chunks; then the affected volume is repaired and mounted.
+    lab.storage
+        .remove_volume(&b, Removal::DatabaseDeleted)
+        .unwrap();
+    lab.storage.recover_volume(&a, &policy()).unwrap();
+    assert!(lab.mounted(&a));
+    assert!(lab.storage.inventory().unwrap().damaged().is_empty());
+    assert_eq!(fs::read(lab.dir_of(&a).join("kept")).unwrap(), kept);
+    assert!(lab.tenant_dd(&a, "after", 1024, "/dev/zero"));
+    assert_eq!(lab.storage.room(&policy()), Ok(()));
+}
+
+#[test]
+#[ignore = "lab: needs root, lvm2, thin-provisioning-tools, e2fsprogs and loop devices"]
+fn a_full_volume_gets_its_reserve_freed_and_gives_it_back_when_use_drops() {
+    let lab = Lab::open(512);
+    let a = id(ID, 1);
+    lab.create(&a, 64);
+    let reserved = |lab: &Lab| -> u64 {
+        sh("tune2fs", &["-l", &commands::device(lab.config(), &a)])
+            .lines()
+            .find_map(|l| l.strip_prefix("Reserved block count:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let at_one_percent = reserved(&lab);
+    assert!(at_one_percent > 0);
+
+    assert!(!lab.tenant_dd(&a, "fill", 102400, "/dev/zero"));
+    let usage = lab.volume(&a).mount.unwrap().usage;
+    assert!(usage.space_full(), "{usage:?}");
+    assert_eq!(usage.reserve_action(false), ReserveAction::Release);
+    lab.storage.set_reserve(&a, ReserveAction::Release).unwrap();
+    assert!(lab.lv(&a).unwrap().has_tag(RESERVE_FREED_TAG));
+    assert!(lab.volume(&a).reserve_released);
+    assert_eq!(reserved(&lab), 0);
+    // The crash recovery and the deletes of the tenant have room to run.
+    assert!(lab.tenant_dd(&a, "room", 256, "/dev/zero"));
+
+    fs::remove_file(lab.dir_of(&a).join("fill")).unwrap();
+    let usage = lab.volume(&a).mount.unwrap().usage;
+    assert_eq!(usage.reserve_action(true), ReserveAction::Restore);
+    lab.storage.set_reserve(&a, ReserveAction::Restore).unwrap();
+    assert!(!lab.lv(&a).unwrap().has_tag(RESERVE_FREED_TAG));
+    assert_eq!(reserved(&lab), at_one_percent);
+    lab.storage.set_reserve(&a, ReserveAction::Keep).unwrap();
+}
