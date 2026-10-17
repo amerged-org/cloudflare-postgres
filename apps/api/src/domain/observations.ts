@@ -100,13 +100,6 @@ export function observationApplies(
     return false;
   if (
     observation.state === "ready" &&
-    row.storage_protected_at != null &&
-    (row.storage_protected_generation == null ||
-      row.storage_protected_generation >= row.generation)
-  )
-    return false;
-  if (
-    observation.state === "ready" &&
     row.desired_postgres_image &&
     (observation.postgres?.image !== row.desired_postgres_image ||
       !postgresImageIdMatches(
@@ -474,7 +467,6 @@ export async function observations(
       WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?
       AND ${runtime ? "EXISTS(SELECT 1 FROM nodes rn WHERE rn.id=databases.node_id AND rn.node_uid=?)" : "1=1"}
       AND runtime_attestation_json IS ? AND ${observation.state === "deleted" ? thinStorageDeletionConfirmedSql() : "1=1"}
-      AND ${observation.state === "ready" ? "(storage_protected_at IS NULL OR storage_protected_generation<generation)" : "1=1"}
       AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND (databases.desired_state='deleted' OR n.lost_at IS NULL))
       AND (?<>'ready' OR NOT EXISTS(SELECT 1 FROM database_restores x WHERE x.target_database_id=databases.id)
         OR EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.target_database_id=databases.id AND x.operation_id=? AND o.status IN('pending','running','succeeded') AND ?=databases.storage_generation)) AND (${guard?.sql ?? "1=1"})`,

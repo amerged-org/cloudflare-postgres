@@ -2,7 +2,6 @@
 import {
   newOperationId,
   DatabaseId,
-  RegionId,
   OperationId,
   RoleName,
   Timestamp,
@@ -21,7 +20,6 @@ import {
   startupReservationStatement,
 } from "./startup-admission.ts";
 
-import { storageProtectionCurrentSql } from "./storage-capacity.ts";
 import {
   withAdmissionMutation,
   type AdmissionSqlGuard,
@@ -44,13 +42,12 @@ export function powerTransitionStatements(
   const statements = [
     db
       .prepare(
-        `UPDATE databases SET desired_state=?,suspension_reason=?,power_operation=?,generation=generation+1,observed_state='provisioning',status_message=NULL,storage_protected_at=NULL,storage_protected_generation=NULL,storage_protected_operation=NULL,updated_at=?
+        `UPDATE databases SET desired_state=?,suspension_reason=?,power_operation=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
       WHERE (id=? AND project_id=? AND node_id IS ? AND generation=? AND desired_state=? AND observed_state=? AND updated_at=? AND power_operation IS ? AND suspension_reason IS ? AND observed_power=? AND observed_generation=? AND deleted_at IS NULL)
       AND (EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
-      AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND ((observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle') OR ${sleeping ? storageProtectionCurrentSql() : "0=1"})))
+      AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle'))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
       AND ${sleeping || action === "wake" ? "1=1" : databaseStartupHeadroomSql("databases")}
-      AND ${sleeping ? "1=1" : `(storage_protected_at IS NULL OR ${storageProtectionCurrentSql()})`}
       AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
@@ -155,11 +152,7 @@ export async function changePower(
         ? row.desired_state === "suspended" &&
           row.suspension_reason === "manual"
         : row.desired_state === "running";
-      const protectedStop =
-        row.storage_protected_at != null &&
-        row.storage_protected_generation === row.generation &&
-        row.storage_protected_operation != null;
-      if (same && !(protectedStop && !sleeping)) {
+      if (same) {
         const existing = await c.env.DB.prepare(
           `SELECT id FROM operations WHERE database_id=? AND project_id=? AND generation=? AND kind IN (?,?) ORDER BY created_at DESC,id DESC LIMIT 1`,
         )
@@ -217,7 +210,6 @@ export async function changePower(
       if (
         sleeping &&
         !verifiedIdle &&
-        !protectedStop &&
         (row.observed_state !== "ready" ||
           row.observed_generation !== row.generation ||
           row.observed_power !== "awake")
@@ -369,48 +361,4 @@ export async function recoverQuiescence(
       ? { operation, revision: row.generation + 1, regionId: row.region_id }
       : null;
   });
-}
-
-/** The normal capacity turn resumes current protective stops once physical and startup budgets permit. */
-export async function recoverStorageProtectedDatabases(
-  env: Env,
-  regionId: string,
-  limit = 8,
-): Promise<string[]> {
-  const db = env.DB;
-  RegionId.parse(regionId);
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8)
-    throw new Error("invalid_storage_recovery_limit");
-  const rows = await db
-    .prepare(
-      `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
-    WHERE d.region_id=? AND d.desired_state='running' AND d.deleted_at IS NULL AND d.node_id IS NOT NULL
-      AND d.storage_protected_at IS NOT NULL AND ${storageProtectionCurrentSql("d")}
-    ORDER BY d.storage_protected_at,d.id LIMIT ?`,
-    )
-    .bind(regionId, limit)
-    .all<DatabaseRow>();
-  const recovered: string[] = [];
-  for (const row of rows.results) {
-    const operation = newOperationId(),
-      now = new Date().toISOString();
-    const result = await withAdmissionMutation(
-      env,
-      [row.id],
-      async (mutation) =>
-        mutation.batch(
-          powerTransitionStatements(
-            db,
-            row,
-            "resume",
-            operation,
-            now,
-            undefined,
-            mutation.guard(row.id),
-          ),
-        ),
-    );
-    if (result[0]!.meta.changes === 1) recovered.push(row.id);
-  }
-  return recovered;
 }

@@ -15,7 +15,6 @@ import { installThinQualifiedFixture } from "./thin-qualified-fixture.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
   thinPoolRoomSql,
-  storageProtectionStatements,
   storageHoldVolumeStatements,
   storageDrainReservationStatement,
   thinStorageDeletionConfirmedSql,
@@ -27,30 +26,19 @@ import {
   observation,
   observedBody,
 } from "./fixtures.ts";
-import { recoverStorageProtectedDatabases } from "../../src/domain/lifecycle.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
-import {
-  releaseCoveredStartupReservationsStatement,
-  databaseCpuChargeSql,
-} from "../../src/domain/startup-admission.ts";
+import { releaseCoveredStartupReservationsStatement } from "../../src/domain/startup-admission.ts";
 const mib = 1024 ** 2,
   gib = 1024 ** 3,
   sha = "a".repeat(64);
 const vg = "ABCDEF-1234-1234-1234-1234-1234-ABCDEF",
   pool = "POOLXX-1234-1234-1234-1234-1234-ABCDEF";
-const thinProjects: string[] = [];
 const extraClasses: string[] = [];
 const qualifiedReleases: string[] = [];
 const recoveryArchiveKeys: string[] = [];
 afterEach(async () => {
   if (recoveryArchiveKeys.length)
     await env.ARCHIVE.delete(recoveryArchiveKeys.splice(0));
-  for (const project of thinProjects.splice(0))
-    await env.DB.prepare(
-      "UPDATE databases SET storage_protected_operation=NULL WHERE project_id=?",
-    )
-      .bind(project)
-      .run();
   await cleanupFixtures();
   for (const id of qualifiedReleases.splice(0))
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
@@ -70,7 +58,6 @@ async function thinFixture(
     now = Date.now(),
     observed = new Date(now).toISOString();
   if (beforeThin) await beforeThin(f);
-  thinProjects.push(f.project);
   const node = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
     .bind(f.node)
     .first<{ node_uid: string }>();
@@ -572,7 +559,6 @@ async function bindVolume(
 async function accepted(
   f: Awaited<ReturnType<typeof thinFixture>>,
   input: NodeThinStorageAuthority,
-  protect = false,
 ) {
   const authority = NodeThinStorageAuthority.parse(input);
   await env.DB.batch([
@@ -585,149 +571,10 @@ async function accepted(
       f.node,
     ),
     ...storageHoldVolumeStatements(env.DB, authority),
-    ...(protect ? storageProtectionStatements(env.DB, authority) : []),
   ]);
   return authority;
 }
 
-async function protectiveStop() {
-  const f = await thinFixture(),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    bound = await bindVolume(f, created),
-    now = Date.now();
-  const authority = await accepted(
-    f,
-    {
-      ...bound.authority,
-      revision: 2,
-      observed_at: new Date(now).toISOString(),
-      expires_at: new Date(now + 30000).toISOString(),
-      write_allowed: false,
-      protections: [
-        {
-          database_id: created.database.id,
-          generation: 1,
-          operation_id: created.operation.id,
-          storage_uid: bound.receipt.storage_uid,
-          namespace_uid: bound.receipt.namespace_uid,
-          cluster_uid: bound.receipt.cluster_uid,
-          node_uid: f.nodeUid,
-          profile_sha256: sha,
-          requested_at: now,
-          hibernation_on: true,
-          pods_absent: true,
-        },
-      ],
-    },
-    true,
-  );
-  return { ...f, created, ...bound, authority };
-}
-it("a proven protective stop releases CPU and recovers through one real bounded resume intent", async () => {
-  const f = await protectiveStop(),
-    id = f.created.database.id;
-  expect(
-    await env.DB.prepare(
-      "SELECT desired_state,observed_power,storage_protected_generation FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first(),
-  ).toEqual({
-    desired_state: "running",
-    observed_power: "hibernated",
-    storage_protected_generation: 1,
-  });
-  expect(
-    await env.DB.prepare(
-      `SELECT ${databaseCpuChargeSql()} charge FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
-    )
-      .bind(id)
-      .first("charge"),
-  ).toBe(0);
-  // The node has room: the stop recovers at once, whatever its authority's freshness.
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([id]);
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
-  expect(
-    await env.DB.prepare(
-      `SELECT ${databaseCpuChargeSql()} charge FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
-    )
-      .bind(id)
-      .first("charge"),
-  ).toBe(600);
-  expect(
-    await env.DB.prepare(
-      "SELECT generation,desired_state,storage_protected_at FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first(),
-  ).toEqual({
-    generation: 2,
-    desired_state: "running",
-    storage_protected_at: null,
-  });
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.resume'",
-    )
-      .bind(id)
-      .first("n"),
-  ).toBe(1);
-});
-it("manual suspension wins over a current protective stop and stale Native repeats cannot reopen it", async () => {
-  const f = await protectiveStop(),
-    id = f.created.database.id;
-  const suspended = await request(
-    `/v1/databases/${id}/suspend`,
-    f.integrator,
-    "POST",
-    undefined,
-    crypto.randomUUID(),
-  );
-  expect(suspended.status).toBe(202);
-  await env.DB.batch(storageProtectionStatements(env.DB, f.authority));
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
-  expect(
-    await env.DB.prepare(
-      "SELECT desired_state,generation,storage_protected_at FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first(),
-  ).toEqual({
-    desired_state: "suspended",
-    generation: 2,
-    storage_protected_at: null,
-  });
-});
-it("a fresh RAM sample alone cannot settle storage; a later bound Native physical read can", async () => {
-  const f = await protectiveStop();
-  const release = () =>
-    releaseCoveredStartupReservationsStatement(env.DB, {
-      nodeId: f.node,
-      nodeUid: f.nodeUid,
-    }).run();
-  expect(
-    await env.DB.prepare(
-      "SELECT ready_at FROM database_start_admissions WHERE operation_id=?",
-    )
-      .bind(f.created.operation.id)
-      .first("ready_at"),
-  ).not.toBeNull();
-  await new Promise((done) => setTimeout(done, 5100));
-  const now = Date.now();
-  await env.DB.prepare(
-    "UPDATE node_memory_samples SET observed_at=? WHERE node_id=? AND node_uid=?",
-  )
-    .bind(new Date(now).toISOString(), f.node, f.nodeUid)
-    .run();
-  expect((await release()).meta.changes).toBe(0);
-  await accepted(f, {
-    ...f.authority,
-    revision: 3,
-    observed_at: new Date(now).toISOString(),
-    expires_at: new Date(now + 30000).toISOString(),
-  });
-  expect((await release()).meta.changes).toBe(1);
-}, 15000);
 it("an ordinary deleted report waits for a fresh negative Native physical read of the frozen LV", async () => {
   const f = await thinFixture(),
     created = DatabaseWithOperation.parse(await (await f.create()).json()),
@@ -787,30 +634,6 @@ it("an ordinary deleted report waits for a fresh negative Native physical read o
   ).toBe("deleted");
 });
 
-it("a same-generation Regional Ready report cannot overwrite a Native protective stop", async () => {
-  const f = await protectiveStop(),
-    id = f.created.database.id;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, 1),
-        postgres: {
-          image: f.postgres.reference,
-          image_id: "sha256:" + f.postgres.sha256,
-        },
-      },
-    ]),
-  );
-  expect(
-    await env.DB.prepare("SELECT observed_power FROM databases WHERE id=?")
-      .bind(id)
-      .first("observed_power"),
-  ).toBe("hibernated");
-});
-
 it("desired state replicates the immutable storage profile and the real startup hold without inventing an IO token", async () => {
   const f = await thinFixture(),
     created = DatabaseWithOperation.parse(await (await f.create()).json());
@@ -826,93 +649,6 @@ it("desired state replicates the immutable storage profile and the real startup 
     pool_uuid: pool,
     node_uid: f.nodeUid,
   });
-});
-it("a retained protected generation emits no startup grant but a real newer recovery does", async () => {
-  const f = await protectiveStop(),
-    id = f.created.database.id;
-  await accepted(f, { ...f.authority, revision: 3, write_allowed: true });
-  const holds = () =>
-    env.DB.prepare(
-      "SELECT operation_id,generation,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=? ORDER BY generation",
-    )
-      .bind(id)
-      .all();
-  const retained = (await holds()).results;
-  expect(retained[0]!.ready_at).not.toBeNull();
-  const host = async () => {
-    const response = await request(
-      `/agent/v1/nodes/${f.node}/storage-guard`,
-      f.agent,
-    );
-    expect(response.status).toBe(200);
-    return (await response.json()) as {
-      databases: {
-        database_id: string;
-        startup_operation_id: string | null;
-        startup_expires_at: number | null;
-      }[];
-    };
-  };
-  // The host lease permits the database whatever its holds say, under its creation operation.
-  const permit = (await host()).databases.find((db) => db.database_id === id)!;
-  expect(permit).toMatchObject({
-    startup_operation_id: expect.stringMatching(/^op_/),
-    startup_expires_at: expect.any(Number),
-  });
-  expect((await holds()).results).toEqual(retained);
-  const resumed = DatabaseWithOperation.parse(
-    await (
-      await request(
-        `/v1/databases/${id}/resume`,
-        f.integrator,
-        "POST",
-        undefined,
-        crypto.randomUUID(),
-      )
-    ).json(),
-  );
-  expect(resumed.operation.kind).toBe("database.resume");
-  expect(resumed.database.generation).toBe(2);
-  expect(
-    (await host()).databases.find((db) => db.database_id === id)
-      ?.startup_operation_id,
-  ).toBe(permit.startup_operation_id);
-  expect((await holds()).results[0]).toEqual(retained[0]);
-});
-it("an uncertain unready hold stays reserved but cannot restart its protected generation", async () => {
-  const f = await thinFixture(),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    id = created.database.id;
-  await env.DB.prepare(
-    "UPDATE databases SET storage_protected_at=?,storage_protected_generation=generation,storage_protected_operation=? WHERE id=?",
-  )
-    .bind(new Date().toISOString(), created.operation.id, id)
-    .run();
-  const before = await env.DB.prepare(
-    "SELECT operation_id,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=?",
-  )
-    .bind(id)
-    .first();
-  expect(before!.ready_at).toBeNull();
-  const response = await request(
-    `/agent/v1/nodes/${f.node}/storage-guard`,
-    f.agent,
-  );
-  expect(response.status).toBe(200);
-  const host = (await response.json()) as {
-    databases: { database_id: string; startup_operation_id: string | null }[];
-  };
-  // The host lease permits it all the same: no running writer is stopped for storage.
-  expect(
-    host.databases.find((db) => db.database_id === id)!.startup_operation_id,
-  ).toBe(created.operation.id);
-  expect(
-    await env.DB.prepare(
-      "SELECT operation_id,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(id)
-      .first(),
-  ).toEqual(before);
 });
 it("thin quota growth preserves the physical receipt and class while shrink remains forbidden", async () => {
   const f = await thinFixture(),
@@ -1031,7 +767,7 @@ it("a ready thin startup retains its quota runway until later Native proof inclu
   expect((await release()).meta.changes).toBe(1);
 }, 15000);
 
-it("a protected 4 GiB tenant drains a real delete intent with zero additional RAM and no startup grant, and a suspend never drains", async () => {
+it("a 4 GiB tenant with a frozen volume drains a real delete intent with zero additional RAM and no startup grant, and a suspend never drains", async () => {
   const f = await thinFixture(8 * gib, 8 * gib);
   await env.DB.prepare("UPDATE size_classes SET memory_mib=4096 WHERE id=?")
     .bind(f.size)
@@ -1039,19 +775,15 @@ it("a protected 4 GiB tenant drains a real delete intent with zero additional RA
   const created = DatabaseWithOperation.parse(await (await f.create()).json()),
     bound = await bindVolume(f, created),
     at = Date.now();
-  let a = await accepted(
-    f,
-    {
-      ...bound.authority,
-      revision: 2,
-      active_lv_uuids: [bound.receipt.lv_uuid],
-      observed_at: new Date(at).toISOString(),
-      captured_at: new Date(at).toISOString(),
-      expires_at: new Date(at + 30000).toISOString(),
-      volumes: bound.authority.volumes.map((v) => ({ ...v, quiesced: true })),
-    },
-    true,
-  );
+  let a = await accepted(f, {
+    ...bound.authority,
+    revision: 2,
+    active_lv_uuids: [bound.receipt.lv_uuid],
+    observed_at: new Date(at).toISOString(),
+    captured_at: new Date(at).toISOString(),
+    expires_at: new Date(at + 30000).toISOString(),
+    volumes: bound.authority.volumes.map((v) => ({ ...v, quiesced: true })),
+  });
   await env.DB.prepare(
     "UPDATE node_memory_samples SET available_bytes=0,working_set_bytes=capacity_memory_bytes,memory_pressure=1 WHERE node_id=?",
   )
@@ -1062,6 +794,12 @@ it("a protected 4 GiB tenant drains a real delete intent with zero additional RA
   )
     .bind(created.database.id)
     .first("n");
+  // The controller's ready report of the start.
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation WHERE id=?",
+  )
+    .bind(created.database.id)
+    .run();
   const suspended = await request(
     `/v1/databases/${created.database.id}/suspend`,
     f.integrator,
@@ -1500,96 +1238,6 @@ async function deletedUnboundRestore() {
     .run();
   return { f, restored, source, receipt, complete, release };
 }
-it("a restored pre-Ready protection is accepted with its real restore operation and the normal capacity turn creates a newer resume", async () => {
-  const { f, restored } = await pendingThinRestore(),
-    id = restored.target_database.id;
-  const bound = await bindVolume(
-    f,
-    DatabaseWithOperation.parse({
-      database: restored.target_database,
-      operation: restored.operation,
-    }),
-    2,
-  );
-  const owner = await env.DB.prepare(
-    "SELECT archive_path,power_operation FROM databases WHERE id=?",
-  )
-    .bind(id)
-    .first<{ archive_path: string; power_operation: string | null }>();
-  expect(owner!.power_operation).toBeNull();
-  expect(owner!.archive_path.slice(-23)).toBe(restored.operation.id);
-  const at = Date.now(),
-    proof: NodeThinStorageAuthority["protections"][number] = {
-      database_id: id,
-      generation: 1,
-      operation_id: restored.operation.id,
-      storage_uid: bound.receipt.storage_uid,
-      namespace_uid: bound.receipt.namespace_uid,
-      cluster_uid: bound.receipt.cluster_uid,
-      node_uid: f.nodeUid,
-      profile_sha256: sha,
-      requested_at: at,
-      hibernation_on: true,
-      pods_absent: true,
-    };
-  const authority = NodeThinStorageAuthority.parse({
-    ...bound.authority,
-    revision: 2,
-    observed_at: new Date(at).toISOString(),
-    captured_at: new Date(at).toISOString(),
-    expires_at: new Date(at + 30000).toISOString(),
-    protections: [{ ...proof, operation_id: null }],
-  });
-  await accepted(f, authority, true);
-  await runNodeCapacity(env, f.region);
-  expect(
-    await env.DB.prepare(
-      "SELECT generation,storage_protected_at FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first(),
-  ).toEqual({ generation: 1, storage_protected_at: null });
-  await accepted(f, { ...authority, revision: 3, protections: [proof] }, true);
-  expect(
-    await env.DB.prepare(
-      "SELECT generation,storage_protected_operation,observed_power FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first(),
-  ).toEqual({
-    generation: 1,
-    storage_protected_operation: restored.operation.id,
-    observed_power: "hibernated",
-  });
-  await runNodeCapacity(env, f.region);
-  const recovered = await env.DB.prepare(
-    "SELECT generation,storage_protected_at,power_operation FROM databases WHERE id=?",
-  )
-    .bind(id)
-    .first<{
-      generation: number;
-      storage_protected_at: string | null;
-      power_operation: string;
-    }>();
-  expect(recovered).toMatchObject({
-    generation: 2,
-    storage_protected_at: null,
-  });
-  expect(
-    await env.DB.prepare("SELECT kind,generation FROM operations WHERE id=?")
-      .bind(recovered!.power_operation)
-      .first(),
-  ).toEqual({ kind: "database.resume", generation: 2 });
-  await runNodeCapacity(env, f.region);
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.resume'",
-    )
-      .bind(id)
-      .first("n"),
-  ).toBe(1);
-});
-
 it(
   "releases a superseded never-bound restore hold only after confirmed deletion and a later global zero-Thin read while retaining the original thick volume",
   { timeout: 15000 },

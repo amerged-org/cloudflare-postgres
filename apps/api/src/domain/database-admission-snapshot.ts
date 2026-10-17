@@ -191,8 +191,6 @@ export async function readDatabaseAdmissionSnapshot(
     row.observed_state === "ready" &&
     row.observed_power === "awake" &&
     row.observed_generation === row.generation &&
-    (row.storage_protected_at == null ||
-      (row.storage_protected_generation ?? 0) < row.generation) &&
     (row.cache_capable === 0 || runtime !== null);
   const wakeable =
     !deleted &&
@@ -201,9 +199,7 @@ export async function readDatabaseAdmissionSnapshot(
     row.lost_at === null &&
     row.desired_state === "suspended" &&
     row.suspension_reason === "idle" &&
-    row.power_operation !== null &&
-    (row.storage_protected_at == null ||
-      (row.storage_protected_generation ?? 0) < row.generation);
+    row.power_operation !== null;
   return {
     presence: DatabasePresence.parse({
       database_id: id,

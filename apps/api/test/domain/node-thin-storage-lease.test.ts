@@ -113,24 +113,21 @@ it("permits every live thin database of the node through its startup window, nev
   ).toBe(1);
 }, 60_000);
 
-it("keeps every live permit while the node's reading is stale, denies writes, is blocked or the database was protected", async () => {
+it("keeps every live permit while the node's reading is stale, denies writes or is blocked", async () => {
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
   const live = await node.add({ kind: "live" }),
     asleep = await node.add({ kind: "asleep" });
   const proof = await node.commit();
   const stale = new Date(Date.now() - 60 * 60_000).toISOString();
-  await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE node_thin_storage SET authority_json=?,authority_received_at=?,status='blocked',error_code='thin_storage_pool_full' WHERE node_id=?",
-    ).bind(
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_json=?,authority_received_at=?,status='blocked',error_code='thin_storage_pool_full' WHERE node_id=?",
+  )
+    .bind(
       JSON.stringify({ ...proof, write_allowed: false }),
       stale,
       node.f.node,
-    ),
-    env.DB.prepare(
-      "UPDATE databases SET storage_protected_at=?,storage_protected_generation=generation WHERE id=?",
-    ).bind(stale, live.id),
-  ]);
+    )
+    .run();
   const entries = await node.leaseEntries();
   for (const id of [node.held.id, live.id, asleep.id])
     expect(entries.get(id), id).toMatchObject({

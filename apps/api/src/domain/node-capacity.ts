@@ -44,7 +44,6 @@ import {
   thinPoolGrowthNeededSql,
   selectedStorageProfileSql,
 } from "./storage-capacity.ts";
-import { recoverStorageProtectedDatabases } from "./lifecycle.ts";
 import { thinStorageTurnsFor } from "./databases.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 /** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
@@ -215,17 +214,13 @@ export async function runNodeCapacity(
       adopt_instance_ids: string;
       placement_mode: "reserved" | "actual_ram";
     }>();
-  const recovered = dryRun
-    ? []
-    : await recoverStorageProtectedDatabases(env, regionId);
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
   if (!dryRun) await requestThinPoolGrowth(env, regionId);
-  if (placed.length || recovered.length) {
-    await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify([
-      ...recovered,
-      ...placed,
-    ]);
-    await thinStorageTurnsFor(env, [...recovered, ...placed]);
+  if (placed.length) {
+    await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify(
+      placed,
+    );
+    await thinStorageTurnsFor(env, placed);
   }
   const result = {
     region_id: regionId,

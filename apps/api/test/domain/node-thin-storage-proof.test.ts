@@ -4,7 +4,6 @@ import { afterEach, expect, it, vi } from "vitest";
 import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
-  NodeThinStorageAuthority,
   newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
@@ -16,10 +15,7 @@ import {
   desiredRegionStorageNodes,
   readCurrentNodeThinStorage,
 } from "../../src/domain/node-thin-storage.ts";
-import {
-  storageProtectionStatements,
-  thinStorageDeletionConfirmedSql,
-} from "../../src/domain/storage-capacity.ts";
+import { thinStorageDeletionConfirmedSql } from "../../src/domain/storage-capacity.ts";
 import {
   type Fixture,
   gib,
@@ -718,84 +714,6 @@ it("still blocks a missing pool while a non-deleted thin database references it"
   expect(await row(f)).toMatchObject({
     status: "blocked",
     error_code: "thin_storage_retained_pool_missing",
-  });
-});
-
-it("records a protective stop from an identity proof whose composed authority already expired", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { created, receipt, physical } = await boundDatabase(f),
-    read = Date.now() - 30_000;
-  const proof = NodeThinStorageAuthority.parse({
-    ...f.authority,
-    revision: 3,
-    physical,
-    observed_at: iso(read),
-    captured_at: iso(read),
-    expires_at: iso(read + 10_000),
-    inventory_observed_at: iso(read),
-    inventory_expires_at: iso(read + 300_000),
-    inventory_revision: 3,
-    write_allowed: false,
-    physical_lvs: [
-      lvs.pool,
-      lvs.data,
-      lvs.meta,
-      {
-        name: receipt.volume_handle,
-        lv_uuid: receipt.lv_uuid,
-        size_bytes: 5 * gib,
-        segtype: "thin",
-      },
-    ],
-    volumes: [
-      {
-        database_id: created.database.id,
-        generation: 1,
-        storage_generation: 1,
-        storage_uid: receipt.storage_uid,
-        namespace_uid: receipt.namespace_uid,
-        cluster_uid: receipt.cluster_uid,
-        volume_handle: receipt.volume_handle,
-        lv_uuid: receipt.lv_uuid,
-        pvc_uid: receipt.pvc_uid,
-        pv_uid: receipt.pv_uid,
-        storage_class: thinStorageClass(f.authority.profile_sha256),
-        volume_attributes_class: thinStorageClass(f.authority.profile_sha256),
-        io: [],
-      },
-    ],
-    protections: [
-      {
-        database_id: created.database.id,
-        generation: 1,
-        operation_id: created.operation.id,
-        storage_uid: receipt.storage_uid,
-        namespace_uid: receipt.namespace_uid,
-        cluster_uid: receipt.cluster_uid,
-        node_uid: f.uid,
-        profile_sha256: f.authority.profile_sha256,
-        requested_at: read,
-        hibernation_on: true,
-        pods_absent: true,
-      },
-    ],
-  });
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET authority_revision=3,authority_json=?,authority_received_at=? WHERE node_id=?",
-  )
-    .bind(JSON.stringify(proof), iso(Date.now()), f.node)
-    .run();
-  await env.DB.batch(storageProtectionStatements(env.DB, proof));
-  expect(
-    await env.DB.prepare(
-      "SELECT storage_protected_at,storage_protected_operation,observed_power FROM databases WHERE id=?",
-    )
-      .bind(created.database.id)
-      .first(),
-  ).toEqual({
-    storage_protected_at: iso(read),
-    storage_protected_operation: created.operation.id,
-    observed_power: "hibernated",
   });
 });
 

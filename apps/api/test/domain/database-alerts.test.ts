@@ -511,46 +511,6 @@ it("alarms a blocked Thin node with its error code, keeps the episode while it r
   ]);
 });
 
-it("alarms a protective stop only after five minutes and until the database resumes", async () => {
-  const f = await fixture(),
-    now = Date.now(),
-    hook = receiver(),
-    id = await database(f, "protected"),
-    protect = (ms: number) =>
-      env.DB.prepare(
-        "UPDATE databases SET storage_protected_at=?,storage_protected_generation=generation WHERE id=?",
-      )
-        .bind(ago(now, ms), id)
-        .run();
-  await protect(2 * 60_000);
-  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
-  expect(await status(f, "database_storage_protected")).toBeUndefined();
-  await protect(6 * 60_000);
-  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
-  expect(hook.events).toHaveLength(1);
-  expect(hook.events[0]!.event).toMatchObject({
-    kind: "database_storage_protected",
-    database_ids: [id],
-    action: INFRA_ALERT_ACTIONS.database_storage_protected,
-  });
-  // A fresh stop of the same database keeps the episode; a resume clears it.
-  await protect(60_000);
-  await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
-  expect(await status(f, "database_storage_protected")).toMatchObject({
-    active: true,
-  });
-  await env.DB.prepare(
-    "UPDATE databases SET storage_protected_at=NULL,storage_protected_generation=NULL WHERE id=?",
-  )
-    .bind(id)
-    .run();
-  await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
-  expect(await status(f, "database_storage_protected")).toMatchObject({
-    active: false,
-  });
-  expect(hook.events).toHaveLength(1);
-});
-
 it("still judges nodes when the database reads fail and keeps the unread kinds as they were", async () => {
   const f = await fixture(),
     now = Date.now(),

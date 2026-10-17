@@ -191,7 +191,7 @@ export async function warmReclaimCandidate(env: Env, databaseId: string) {
   const row = await env.DB.prepare(
     `SELECT d.*,s.memory_mib,CASE WHEN p.placement_mode='actual_ram' THEN p.postgres_memory_request_mib ELSE s.memory_mib END memory_request_mib
  FROM databases d JOIN projects pr ON pr.id=d.project_id AND pr.deleted_at IS NULL JOIN size_classes s ON s.id=d.size_class_id
- LEFT JOIN node_region_policies p ON p.region_id=d.region_id WHERE d.id=? AND d.deleted_at IS NULL AND d.desired_state='running' AND d.observed_state='ready' AND d.observed_power='awake' AND d.observed_generation=d.generation AND d.storage_protected_at IS NULL`,
+ LEFT JOIN node_region_policies p ON p.region_id=d.region_id WHERE d.id=? AND d.deleted_at IS NULL AND d.desired_state='running' AND d.observed_state='ready' AND d.observed_power='awake' AND d.observed_generation=d.generation`,
   )
     .bind(databaseId)
     .first<DatabaseRow & { memory_mib: number; memory_request_mib: number }>();

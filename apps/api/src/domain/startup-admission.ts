@@ -62,16 +62,7 @@ export function databaseCpuChargeSql(
   const database = identifier(databaseAlias),
     size = identifier(sizeAlias);
   const sleeping = stoppedSleeperSql(database, acceptingStopInCurrentBatch);
-  const protectedStop = `(${database}.desired_state='running' AND ${database}.deleted_at IS NULL
-    AND ${database}.observed_power='hibernated' AND ${database}.observed_generation=${database}.generation)
-    AND (${database}.storage_profile_json IS NOT NULL AND ${database}.storage_volume_json IS NOT NULL
-    AND ${database}.storage_protected_at IS NOT NULL AND ${database}.storage_protected_generation=${database}.generation)
-    AND EXISTS(SELECT 1 FROM nodes stopped_node WHERE stopped_node.id=${database}.node_id
-      AND stopped_node.node_uid=json_extract(${database}.storage_profile_json,'$.node_uid') AND stopped_node.lost_at IS NULL)
-    AND EXISTS(SELECT 1 FROM operations protected_operation WHERE protected_operation.id=${database}.storage_protected_operation
-      AND protected_operation.database_id=${database}.id AND protected_operation.project_id=${database}.project_id
-      AND protected_operation.generation<=${database}.generation)`;
-  return `(CASE WHEN (${sleeping}) OR (${protectedStop}) THEN 0
+  return `(CASE WHEN (${sleeping}) THEN 0
     ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores}+${computePoolOverheadSql(database, "cpu_millicores")} END)`;
 }
 

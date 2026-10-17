@@ -48,14 +48,12 @@ erDiagram
         TEXT project_id FK
         TEXT region_id FK
         TEXT size_class_id FK
-        TEXT storage_protected_operation FK
     }
     n_bed86ed15f2a }o--|o n_2bf2587cd333 : "project_id → id"
     n_1b1cae9180e6 }o--|| n_c9267dd990d0 : "database_id → id"
     n_c801169360a4 }o--|| n_58f669cf5603 : "size_class_id → id"
     n_c801169360a4 }o--|o n_d767846eb139 : "node_id → id"
     n_c9267dd990d0 }o--|| n_58f669cf5603 : "size_class_id → id"
-    n_c9267dd990d0 }o--|o n_1b1cae9180e6 : "storage_protected_operation → id"
     n_c801169360a4 }o--|| n_c9267dd990d0 : "database_id → id"
     n_d767846eb139 }o--|| n_62201d615e26 : "region_id → id"
     n_c9267dd990d0 }o--|| n_2bf2587cd333 : "project_id → id"
@@ -126,5 +124,6 @@ erDiagram
 - [apps/api/migrations/0057_fleet_release_thin_facts.sql:1](../../../apps/api/migrations/0057_fleet_release_thin_facts.sql#L1)
 - [apps/api/migrations/0058_drop_thin_headroom_samples.sql:1](../../../apps/api/migrations/0058_drop_thin_headroom_samples.sql#L1)
 - [apps/api/migrations/0059_drop_parked_tier.sql:1](../../../apps/api/migrations/0059_drop_parked_tier.sql#L1)
+- [apps/api/migrations/0060_drop_storage_protection.sql:1](../../../apps/api/migrations/0060_drop_storage_protection.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

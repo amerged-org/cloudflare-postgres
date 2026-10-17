@@ -37,9 +37,6 @@ export interface DatabaseRow extends DatabaseHealthSource {
   storage_generation?: number;
   storage_profile_json?: string | null;
   storage_volume_json?: string | null;
-  storage_protected_at?: string | null;
-  storage_protected_generation?: number | null;
-  storage_protected_operation?: string | null;
   warm_reclaim_policy_json?: string | null;
   runtime_attestation_json?: string | null;
   observed_generation: number;

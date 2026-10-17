@@ -573,14 +573,6 @@ it("wakeable is true only for an idle suspension with a power operation, a node 
     `UPDATE database_admission_epochs SET mutation_id='${crypto.randomUUID()}',mutation_started_at='${at}',mutation_status='pending' WHERE database_id='${f.id}'`,
     `UPDATE database_admission_epochs SET mutation_id=NULL,mutation_started_at=NULL,mutation_status=NULL WHERE database_id='${f.id}'`,
   );
-  await refusedBy(
-    `UPDATE databases SET storage_protected_at='${at}',storage_protected_generation=${sleepGeneration} ${where}`,
-    `UPDATE databases SET storage_protected_at=NULL,storage_protected_generation=NULL ${where}`,
-  );
-  // A protection marker of an earlier generation does not hold the sleeper.
-  await env.DB.exec(
-    `UPDATE databases SET storage_protected_at='${at}',storage_protected_generation=${sleepGeneration - 1} ${where}`,
-  );
   expect(await wakeable()).toBe(true);
   // A lost node is final.
   await env.DB.exec(`UPDATE nodes SET lost_at='${at}' WHERE id='${f.node}'`);

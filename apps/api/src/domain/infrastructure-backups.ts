@@ -230,7 +230,7 @@ async function thinStartInFlight(db: D1Database, now: number) {
       `SELECT 1 held FROM database_start_admissions a
       JOIN databases d ON d.id=a.database_id AND d.generation=a.generation
       WHERE a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND a.granted_at>?
-        AND d.deleted_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation)
+        AND d.deleted_at IS NULL
       LIMIT 1`,
     )
     .bind(new Date(now - THIN_START_WINDOW_MS).toISOString())

@@ -195,7 +195,6 @@ it("reports every infrastructure alert kind of a region", async () => {
       "control_cron_step_failing",
       "database_archive_failing",
       "database_base_backup_stale",
-      "database_storage_protected",
       "infrastructure_backup_failed",
       "infrastructure_backup_stale",
       "regional_node_cap_reached",

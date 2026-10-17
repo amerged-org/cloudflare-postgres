@@ -16,13 +16,12 @@ export const InfraAlertKind = z
     "database_archive_failing",
     "database_base_backup_stale",
     "thin_storage_blocked",
-    "database_storage_protected",
     "control_cron_stalled",
     "control_cron_step_failing",
   ])
   .describe(
     "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: a daily D1 or etcd backup of the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy. " +
-      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's Thin storage is blocked, or its fresh physical sample shows the thin pool without room (thin_pool_no_room: no database starts or attaches there) or below its growth point with no growth left (thin_pool_growth_exhausted: the pool is at its maximum, the volume group is too full, or metadata is under twice its reserve); thin_storage lists each node with its thin_storage_* or thin_pool_* error_code, or null while only pool headroom blocks writes. database_storage_protected: a running database has been stopped by storage write protection for at least 5 minutes (database_ids). " +
+      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's Thin storage is blocked, or its fresh physical sample shows the thin pool without room (thin_pool_no_room: no database starts or attaches there) or below its growth point with no growth left (thin_pool_growth_exhausted: the pool is at its maximum, the volume group is too full, or metadata is under twice its reserve); thin_storage lists each node with its thin_storage_* or thin_pool_* error_code, or null while only pool headroom blocks writes. " +
       "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
   );
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
@@ -51,8 +50,6 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
     "The listed awake databases have no completed base backup for 36 h of awake time. Check their scheduled backup and R2 access; read backup.status in GET /v1/operational-health?scope=databases.",
   thin_storage_blocked:
     "A listed node's thin pool is short of space or its Thin storage is blocked. thin_pool_no_room: nothing starts there until the pool grows. thin_pool_growth_exhausted: raise maximum_data_bytes, free the volume group or move databases. thin_storage_*: repeat PUT /v1/nodes/{id}/storage-profile with the current expected_revision once the lease expires (docs/operations/recovery.md).",
-  database_storage_protected:
-    "The listed databases have been stopped by storage write protection for over 5 minutes. PGCF resumes them once Thin write authority is current; if it persists check thin_storage_blocked and the node's storage.",
   control_cron_stalled:
     "The minute cron has not completed a run for over 5 minutes. Check the Worker's cron trigger and logs (cron_step_failed, cron_completed) and redeploy the Worker if its trigger is missing.",
   control_cron_step_failing:
