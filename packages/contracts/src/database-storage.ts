@@ -263,16 +263,6 @@ export function thinVolumeAttributesClassObject(
 export const THIN_INVENTORY_MAX_SECONDS = 300;
 /** The next identity proof is due this long after the last accepted one. */
 export const THIN_INVENTORY_INTERVAL_SECONDS = 60;
-/** Cloudflare's headroom sample period for a guard: guard_seconds × 200 ms (2 s at a 10 s guard). */
-export function thinStorageSamplePeriodMilliseconds(guardSeconds: number) {
-  if (
-    !Number.isSafeInteger(guardSeconds) ||
-    guardSeconds < 1 ||
-    guardSeconds > 120
-  )
-    throw new Error("invalid_thin_guard_seconds");
-  return guardSeconds * 200;
-}
 
 export const NodeThinStorageAuthority = z
   .strictObject({

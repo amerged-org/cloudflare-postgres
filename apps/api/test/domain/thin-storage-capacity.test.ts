@@ -33,7 +33,6 @@ import {
   releaseCoveredStartupReservationsStatement,
   databaseCpuChargeSql,
 } from "../../src/domain/startup-admission.ts";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 const mib = 1024 ** 2,
   gib = 1024 ** 3,
   sha = "a".repeat(64);
@@ -591,56 +590,6 @@ async function accepted(
   return authority;
 }
 
-it("requires a new identity read when the sampler observes a retained thin LV's changed logical size", async () => {
-  const f = await thinFixture(8 * gib, 8 * gib),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    bound = await bindVolume(f, created),
-    authority = await accepted(f, {
-      ...bound.authority,
-      physical_lvs: [
-        ...bound.authority.physical_lvs,
-        {
-          name: "pgcf_thinpool",
-          lv_uuid: pool,
-          size_bytes: 8 * gib,
-          segtype: "thin-pool",
-        },
-      ],
-    });
-  const body = {
-    nonce: null,
-    node_uid: f.nodeUid,
-    captured_at: new Date().toISOString(),
-    physical: authority.physical,
-    lvs: [
-      { name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 8 * gib },
-      {
-        name: bound.receipt.volume_handle,
-        segtype: "thin",
-        size_bytes: 6 * gib,
-      },
-    ],
-    lv_count: 2,
-    witnesses: {
-      cluster_uid: authority.cluster_uid,
-      boot_id: f.bootId,
-      volume_group_uuid: vg,
-      driver_pod_uid: authority.driver_pod_uid,
-      driver_image: f.profile.driver_image,
-    },
-    scrape_milliseconds: 0,
-  };
-  const url = `/agent/v1/nodes/${f.node}/storage-headroom`,
-    nonce = NodeStorageHeadroomResponse.parse(
-      await (await request(url, f.agent, "POST", body)).json(),
-    ).nonce;
-  const result = NodeStorageHeadroomResponse.parse(
-    await (await request(url, f.agent, "POST", { ...body, nonce })).json(),
-  );
-  expect(result.accepted).toBe(false);
-  expect(result.reason).toBe("thin_storage_sample_volumes_changed");
-  expect(result.authority).toBeNull();
-});
 async function protectiveStop() {
   const f = await thinFixture(),
     created = DatabaseWithOperation.parse(await (await f.create()).json()),
@@ -877,14 +826,6 @@ it("desired state replicates the immutable storage profile and the real startup 
     pool_uuid: pool,
     node_uid: f.nodeUid,
   });
-  expect(database.storage_startup).toEqual({
-    operation_id: created.operation.id,
-    generation: 1,
-    node_uid: f.nodeUid,
-    budget_bytes: 5 * gib,
-    expires_at: f.authority.expires_at,
-  });
-  expect(database.storage_authority).toBeUndefined();
 });
 it("a retained protected generation emits no startup grant but a real newer recovery does", async () => {
   const f = await protectiveStop(),
@@ -898,10 +839,6 @@ it("a retained protected generation emits no startup grant but a real newer reco
       .all();
   const retained = (await holds()).results;
   expect(retained[0]!.ready_at).not.toBeNull();
-  const desired = async () =>
-    DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    ).databases.find((db) => db.id === id)!;
   const host = async () => {
     const response = await request(
       `/agent/v1/nodes/${f.node}/storage-guard`,
@@ -916,7 +853,6 @@ it("a retained protected generation emits no startup grant but a real newer reco
       }[];
     };
   };
-  expect((await desired()).storage_startup).toBeUndefined();
   // The host lease permits the database whatever its holds say, under its creation operation.
   const permit = (await host()).databases.find((db) => db.database_id === id)!;
   expect(permit).toMatchObject({
@@ -937,9 +873,6 @@ it("a retained protected generation emits no startup grant but a real newer reco
   );
   expect(resumed.operation.kind).toBe("database.resume");
   expect(resumed.database.generation).toBe(2);
-  expect((await desired()).storage_startup?.operation_id).toBe(
-    resumed.operation.id,
-  );
   expect(
     (await host()).databases.find((db) => db.database_id === id)
       ?.startup_operation_id,
@@ -961,12 +894,6 @@ it("an uncertain unready hold stays reserved but cannot restart its protected ge
     .bind(id)
     .first();
   expect(before!.ready_at).toBeNull();
-  const page = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  expect(
-    page.databases.find((db) => db.id === id)!.storage_startup,
-  ).toBeUndefined();
   const response = await request(
     `/agent/v1/nodes/${f.node}/storage-guard`,
     f.agent,
@@ -1190,13 +1117,6 @@ it("a protected 4 GiB tenant drains a real delete intent with zero additional RA
       .bind(stop.operation.id)
       .first(),
   ).toBeNull();
-  const desired = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  expect(
-    desired.databases.find((d) => d.id === created.database.id)!
-      .storage_startup,
-  ).toBeUndefined();
   await storageDrainReservationStatement(env.DB, {
     databaseId: created.database.id,
     operationId: created.operation.id,

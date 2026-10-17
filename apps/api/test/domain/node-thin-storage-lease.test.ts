@@ -3,17 +3,11 @@
 // controlled metadata; the live latency of the endpoint is measured on Dev, not here.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 import { countStatements } from "./d1-statements.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
-import { gib, mib, nonce, post, row, sample } from "./thin-renewal-fixture.ts";
-import {
-  HOST_LEASE_TOMBSTONE_RETENTION_MS,
-  runningWriterTokens,
-} from "../../src/domain/node-thin-storage.ts";
-import type { Env } from "../../src/env.ts";
+import { HOST_LEASE_TOMBSTONE_RETENTION_MS } from "../../src/domain/node-thin-storage.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -196,50 +190,6 @@ it("costs the same D1 statements for three databases as for forty and a hundred 
   expect(large.roundTrips).toBe(small.roundTrips);
 }, 120_000);
 
-// The accepted sample's whole handler, its token issuance included.
-const SAMPLE_STATEMENT_BOUND = 15;
-it("issues the tokens of forty databases with the statements of three", async () => {
-  const counted = async (live: number, deleted: number) => {
-    const { node, proof } = await crowdedNode(live, deleted),
-      f = node.f;
-    const physical = {
-      ...proof.physical,
-      thin_pool: {
-        ...proof.physical.thin_pool!,
-        data_used_bytes_upper_bound: gib,
-        metadata_used_bytes_upper_bound: mib,
-      },
-    };
-    const first = await nonce(f);
-    const result = await countStatements(() =>
-      post(
-        f,
-        sample(f, first, {
-          physical,
-          lvs: [
-            {
-              name: "pgcf_thinpool",
-              segtype: "thin-pool",
-              size_bytes: 16 * gib,
-            },
-          ],
-          lv_count: 1,
-        }),
-      ),
-    );
-    const response = NodeStorageHeadroomResponse.parse(result.result.body);
-    expect(response.accepted).toBe(true);
-    return { ...result, tokens: response.tokens };
-  };
-  const small = await counted(3, 5),
-    large = await counted(40, 100);
-  expect(small.tokens).toHaveLength(3);
-  expect(large.tokens).toHaveLength(40);
-  expect(large.statements).toBe(small.statements);
-  expect(large.statements).toBeLessThanOrEqual(SAMPLE_STATEMENT_BOUND);
-  expect(large.roundTrips).toBe(small.roundTrips);
-}, 120_000);
-
 it("names a deleted database only while a protective scope of it may still need the entry", async () => {
   const node = await thinLeaseNode(await thinExecutionFixture(releases));
   const minute = 60_000,
@@ -361,64 +311,6 @@ it("logs what each lease served: the counts and its time, never an entry's secre
   expect(JSON.stringify(line).includes(node.f.agent)).toBe(false);
 }, 60_000);
 
-/** A sample the node's pool answers with room to write, after `crowdedNode`'s proof. */
-function roomySample(
-  f: Awaited<ReturnType<typeof crowdedNode>>["node"]["f"],
-  proof: Awaited<ReturnType<typeof crowdedNode>>["proof"],
-  at: string | null,
-  usedBytes = gib,
-) {
-  return sample(f, at, {
-    physical: {
-      ...proof.physical,
-      thin_pool: {
-        ...proof.physical.thin_pool!,
-        data_used_bytes_upper_bound: usedBytes,
-        metadata_used_bytes_upper_bound: mib,
-      },
-    },
-    lvs: [
-      { name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 16 * gib },
-    ],
-    lv_count: 1,
-  });
-}
-it("allows writes while the pool's free space covers its reserves, however much its volumes could hold", async () => {
-  const { node, proof } = await crowdedNode(40, 0),
-    f = node.f;
-  // Forty volumes and the held start hold far more than the 1 GiB of the 16 GiB pool still free;
-  // the free space covers the data and metadata reserve.
-  const answer = NodeStorageHeadroomResponse.parse(
-    (await post(f, roomySample(f, proof, await nonce(f), 15 * gib))).body,
-  );
-  expect(answer.accepted).toBe(true);
-  expect(answer.authority!.write_allowed).toBe(true);
-  expect((await row(f)).status).toBe("ready");
-}, 60_000);
-const nodeReads = (sql: string[]) =>
-  sql.filter((text) =>
-    text.startsWith("SELECT t.*,n.region_id,n.k8s_node_name"),
-  );
-
-it("reads the node once for a sample and signs its tokens from the row its own write left", async () => {
-  const { node, proof } = await crowdedNode(3, 2),
-    f = node.f;
-  const first = await nonce(f);
-  const counted = await countStatements(() =>
-    post(f, roomySample(f, proof, first)),
-  );
-  const response = NodeStorageHeadroomResponse.parse(counted.result.body);
-  expect(response.accepted).toBe(true);
-  expect(response.tokens).toHaveLength(3);
-  // The node and the qualification join under it are read before the compare-and-set and not
-  // again after it; the compare-and-set carries its own predicate.
-  expect(nodeReads(counted.sql)).toHaveLength(1);
-  // What reading the written row back signs is what the sample signed.
-  expect(response.tokens).toEqual(
-    await runningWriterTokens(env as Env, f.node, f.region, Date.now()),
-  );
-}, 60_000);
-
 function guardLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
   return servedLines(log, nodeId);
 }
@@ -439,54 +331,4 @@ it("writes one lease line in thirty per node and the first after a silence", asy
   expect(guardLines(log, node.f.node)).toHaveLength(4);
   await node.lease();
   expect(guardLines(log, node.f.node)).toHaveLength(4);
-}, 60_000);
-
-function acceptedLines(log: { mock: { calls: unknown[][] } }, nodeId: string) {
-  return log.mock.calls.flatMap(([value]) => {
-    if (typeof value !== "string") return [];
-    const event = JSON.parse(value) as Record<string, unknown>;
-    return event.event === "thin_storage_sample_accepted" &&
-      event.node_id === nodeId
-      ? [event]
-      : [];
-  });
-}
-
-it("writes one accepted-sample line in thirty per node, and every one that withholds writes or fails", async () => {
-  const log = vi.spyOn(console, "log").mockImplementation(() => {});
-  const { node, proof } = await crowdedNode(2, 0),
-    f = node.f;
-  let next = await nonce(f);
-  const accept = async (usedBytes = gib) => {
-    const answer = NodeStorageHeadroomResponse.parse(
-      (await post(f, roomySample(f, proof, next, usedBytes))).body,
-    );
-    expect(answer.accepted).toBe(true);
-    next = answer.nonce;
-    return answer;
-  };
-  vi.useFakeTimers({ toFake: ["Date"] });
-  for (let i = 0; i < 61; i++) {
-    await accept();
-    vi.setSystemTime(Date.now() + 100);
-  }
-  // The 1st, 31st and 61st accepted sample.
-  expect(acceptedLines(log, f.node)).toHaveLength(3);
-  // A sample that leaves the node without room is always written.
-  const blocked = await accept(16 * gib - mib);
-  expect(blocked.authority!.write_allowed).toBe(false);
-  expect(acceptedLines(log, f.node)).toHaveLength(4);
-  // One that fails after its compare-and-set is written, and its fields are the same.
-  await accept();
-  expect(acceptedLines(log, f.node)).toHaveLength(4);
-  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
-  vi.spyOn(prototype, "batch").mockRejectedValueOnce(
-    new Error("d1_unavailable"),
-  );
-  expect((await post(f, roomySample(f, proof, next))).status).toBe(500);
-  const lines = acceptedLines(log, f.node);
-  expect(lines).toHaveLength(5);
-  expect(Object.keys(lines.at(-1)!).sort()).toEqual(
-    Object.keys(lines[0]!).sort(),
-  );
 }, 60_000);

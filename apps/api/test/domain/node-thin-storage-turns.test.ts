@@ -12,14 +12,14 @@ import {
   request,
 } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { awakeWriter, hibernated, idleIntent } from "./parked-tier-fixture.ts";
+import { awakeWriter, hibernated, idleIntent } from "./thin-writer-fixture.ts";
 import {
   type Fixture,
   forgetTurns,
   gib,
   identityProof,
   turnRequested,
-} from "./thin-renewal-fixture.ts";
+} from "./thin-proof-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {

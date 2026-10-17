@@ -17,8 +17,6 @@ import {
   sleeping,
   untilWake,
 } from "./wake-fixture.ts";
-import { awakeWriter, claimsOf, parkedWriter } from "./parked-tier-fixture.ts";
-import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
   admissionFixtureReleases,
   admissionSnapshotFixture,
@@ -123,39 +121,6 @@ it("the hint of a claimed wake carries the page a targeted pull reads for its da
     readyBody(f, row.power_operation),
   );
   expect(await waiting).toMatchObject({ ok: true });
-}, 30_000);
-
-it("a parked thin wake's page carries its startup hold, write token and admission as the page serves them", async () => {
-  const w = await awakeWriter(await thinExecutionFixture(releases));
-  await parkedWriter(w, "fast");
-  const wake = await resume(w.id, w.f.integrator);
-  const hinted = (await wakeHintPage(env, w.f.region, w.id, {
-    operation: wake.operation.id,
-    revision: wake.database.generation,
-  }))!;
-  const page = await pulled(w.f.agent, w.id);
-  const [carried] = hinted.databases,
-    [served] = page.databases;
-  expect(carried!.storage_startup).toMatchObject({
-    operation_id: wake.operation.id,
-    generation: wake.database.generation,
-  });
-  expect(carried!.storage_authority).toMatch(/^sa1\./);
-  // The token is signed when the page is read; everything it states but its issue and expiry is equal.
-  const scope = (token: string | undefined) => ({
-    ...claimsOf(token)!,
-    iat: undefined,
-    exp: undefined,
-  });
-  expect(scope(carried!.storage_authority)).toEqual(
-    scope(served!.storage_authority),
-  );
-  const unsigned = (database: typeof carried) => ({
-    ...database,
-    storage_authority: undefined,
-  });
-  expect(unsigned(carried)).toEqual(unsigned(served));
-  expect({ ...hinted, databases: [] }).toEqual({ ...page, databases: [] });
 }, 30_000);
 
 it("a wake's page in an admission-capable region carries the admission epoch and route the page serves", async () => {

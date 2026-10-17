@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Identity proofs, headroom samples and slow reports against the real D1 thin execution fixture.
+// Identity proofs and slow reports against the real D1 thin execution fixture.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { expect } from "vitest";
 import { NodeThinStorageAuthority } from "@pgcf/contracts";
-import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 import sources from "../../../../infra/storage/sources.lock.json" with { type: "json" };
-import { request } from "./fixtures.ts";
 import type { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
   recordThinStorageReport,
@@ -59,51 +56,9 @@ export async function identityProof(f: Fixture, overrides: object = {}) {
     .run();
   return authority;
 }
-export function sample(
-  f: Fixture,
-  nonce: string | null,
-  overrides: object = {},
-) {
-  return {
-    nonce,
-    node_uid: f.uid,
-    captured_at: iso(Date.now()),
-    physical: {
-      ...f.authority.physical,
-      thin_pool: {
-        ...f.authority.physical.thin_pool!,
-        data_used_bytes_upper_bound: 64 * mib,
-        metadata_used_bytes_upper_bound: mib,
-      },
-    },
-    lvs: [{ name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 2 * gib }],
-    lv_count: 1,
-    witnesses: {
-      cluster_uid: f.authority.cluster_uid,
-      boot_id: f.qualified.bootId,
-      volume_group_uuid: f.authority.volume_group_uuid,
-      driver_pod_uid: f.authority.driver_pod_uid,
-      driver_image: f.authority.driver_image,
-    },
-    scrape_milliseconds: 140,
-    ...overrides,
-  };
-}
-export async function post(f: Fixture, body: unknown, key = f.agent) {
-  const response = await request(
-    `/agent/v1/nodes/${f.node}/storage-headroom`,
-    key,
-    "POST",
-    body,
-  );
-  return {
-    status: response.status,
-    body: (await response.json()) as Record<string, unknown>,
-  };
-}
 export async function row(f: Fixture) {
   return (await env.DB.prepare(
-    "SELECT authority_revision,authority_json,status,error_code,sample_nonce,sample_nonce_issued_at,sample_observed_at,sample_data_used_bytes FROM node_thin_storage WHERE node_id=?",
+    "SELECT authority_revision,authority_json,status,error_code FROM node_thin_storage WHERE node_id=?",
   )
     .bind(f.node)
     .first<{
@@ -111,17 +66,7 @@ export async function row(f: Fixture) {
       authority_json: string;
       status: string;
       error_code: string | null;
-      sample_nonce: string | null;
-      sample_nonce_issued_at: string | null;
-      sample_observed_at: string | null;
-      sample_data_used_bytes: number | null;
     }>())!;
-}
-/** A first nonce: the request renews nothing. */
-export async function nonce(f: Fixture) {
-  const first = await post(f, sample(f, null));
-  expect(first.status).toBe(200);
-  return NodeStorageHeadroomResponse.parse(first.body).nonce;
 }
 /** Whether this node's NodeBootstrap Durable Object was asked for an identity turn. */
 export async function turnRequested(f: Fixture) {

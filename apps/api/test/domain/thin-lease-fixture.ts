@@ -18,7 +18,7 @@ import {
   iso,
   lvs,
   mib,
-} from "./thin-renewal-fixture.ts";
+} from "./thin-proof-fixture.ts";
 
 export type LeaseDatabase =
   /** Running and ready; the node's identity proof evidences its Pod's io.max. */

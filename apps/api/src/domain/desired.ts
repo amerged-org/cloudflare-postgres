@@ -3,8 +3,6 @@ import {
   ARCHIVE_SERVER_NAME,
   DesiredDatabase,
   DesiredDatabaseStorage,
-  DesiredStorageStartup,
-  thinStorageAuthorityMatches,
   DesiredResponse,
   ParkedTierPolicy,
   type DesiredCreation,
@@ -25,21 +23,11 @@ import {
   admissionSnapshotCapable,
 } from "./fleet-releases.ts";
 import { desiredRegionArchiveSources } from "./region-archive-sources.ts";
-
-import {
-  readRegionThinStorage,
-  storageWriteAuthorityForDatabase,
-} from "./node-thin-storage.ts";
-import { desiredRegionStorageSamples } from "./node-thin-storage-samples.ts";
-import { currentStartHoldSql } from "./storage-capacity.ts";
+import { desiredRegionStorageNodes } from "./node-thin-storage.ts";
 interface DesiredRow extends DatabaseRow, DesiredSize {
   admission_revision: number;
   route_revision: number;
   k8s_node_name: string;
-  storage_startup_operation: string | null;
-  storage_startup_generation: number | null;
-  storage_startup_node_uid: string | null;
-  storage_startup_budget: number | null;
   roles_json: string;
   creation_operation_id: string | null;
   creation_generation: number | null;
@@ -121,8 +109,7 @@ async function desiredPage(
     regionRow,
     admissionCapable,
     policy,
-    thin,
-    storageSamples,
+    storageNodes,
     fleetRelease,
     recoverySources,
   ] = await Promise.all([
@@ -145,13 +132,11 @@ async function desiredPage(
         compute_pool_json: string | null;
         parked_tier_json: string | null;
       }>(),
-    readRegionThinStorage(env, regionId),
-    desiredRegionStorageSamples(env, regionId),
+    desiredRegionStorageNodes(env, regionId),
     readDesiredFleetRelease(env.DB, regionId),
     desiredRegionArchiveSources(env, regionId),
   ]);
   if (!regionRow) return undefined;
-  const storageNodes = thin.nodes;
   // The region policy is the only switch, and it is served whether enabled or not: a disabled
   // policy is how the controller learns to demote what it parked. A stored policy that no longer
   // parses is served as none, which demotes the same way.
@@ -167,7 +152,7 @@ async function desiredPage(
         }
       : undefined;
   const result = await env.DB.prepare(
-    `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
+    `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'deleted_at',r.deleted_at,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls)) FROM roles r WHERE r.database_id=d.id) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
@@ -176,7 +161,6 @@ async function desiredPage(
     src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id
-    LEFT JOIN database_start_admissions a ON ${currentStartHoldSql()}
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     LEFT JOIN database_restores x ON x.target_database_id=d.id
@@ -248,37 +232,6 @@ async function desiredPage(
     const storage = row.storage_profile_json
       ? DesiredDatabaseStorage.parse(JSON.parse(row.storage_profile_json))
       : undefined;
-    // The page's own reading of the node judges its database: the node is not read again.
-    const storageAuthority = storage
-      ? await storageWriteAuthorityForDatabase(
-          env,
-          row,
-          undefined,
-          row.node_id === null ? undefined : thin.snapshots.get(row.node_id),
-        )
-      : undefined;
-    const physical = storageNodes.find(
-      (value) => value.node_id === row.node_id,
-    );
-    const startup =
-      storage &&
-      row.desired_state === "running" &&
-      row.storage_startup_operation &&
-      physical &&
-      row.storage_startup_node_uid === storage.node_uid &&
-      row.storage_startup_budget ===
-        Math.max(storage.startup_reserve_bytes, row.storage_gib * 1024 ** 3) &&
-      row.storage_startup_generation !== null &&
-      row.storage_startup_generation <= row.generation &&
-      thinStorageAuthorityMatches(storage, physical, row.k8s_node_name)
-        ? DesiredStorageStartup.parse({
-            operation_id: row.storage_startup_operation,
-            generation: row.generation,
-            node_uid: storage.node_uid,
-            budget_bytes: row.storage_startup_budget,
-            expires_at: physical.expires_at,
-          })
-        : undefined;
     databases.push(
       DesiredDatabase.parse({
         id: row.id,
@@ -328,8 +281,6 @@ async function desiredPage(
         node: row.k8s_node_name,
         pg_major: row.pg_major,
         ...(storage ? { storage } : {}),
-        ...(storageAuthority ? { storage_authority: storageAuthority } : {}),
-        ...(startup ? { storage_startup: startup } : {}),
         ...(row.desired_postgres_release_id
           ? {
               postgres: {
@@ -391,7 +342,6 @@ async function desiredPage(
         : {}),
       ...(parking?.success ? { parking: parking.data } : {}),
       ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
-      ...(storageSamples.length ? { storage_samples: storageSamples } : {}),
       ...(recoverySources === undefined
         ? {}
         : { recovery_sources: recoverySources }),

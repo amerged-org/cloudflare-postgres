@@ -6,7 +6,7 @@ import { afterEach, expect, it } from "vitest";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { awakeWriter, idleIntent, leaseEntry } from "./parked-tier-fixture.ts";
+import { awakeWriter, idleIntent, leaseEntry } from "./thin-writer-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {

@@ -12,11 +12,8 @@ import { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 import { NodeStorageSample } from "./node-physical-storage.ts";
 import {
   DesiredDatabaseStorage,
-  DesiredStorageStartup,
   NodeThinStorageAuthority,
 } from "./database-storage.ts";
-import { STORAGE_AUTHORITY_MAX_LENGTH } from "./storage-write-authority.ts";
-import { ThinStorageSampleTarget } from "./node-thin-storage.ts";
 export {
   DesiredDatabaseStorage,
   DesiredStorageStartup,
@@ -28,7 +25,6 @@ export {
   ThinStorageProfile,
   thinStorageAuthorityMatches,
   thinStorageInventory,
-  thinStorageSamplePeriodMilliseconds,
   thinStorageVolumeReclaimed,
   thinStorageClass,
   thinStorageClassObject,
@@ -279,9 +275,6 @@ export const DesiredDatabase = z
     pg_major: z.literal(PG_MAJOR),
     postgres: DesiredPostgres.optional(),
     storage: DesiredDatabaseStorage.optional(),
-    /** CF-only signed, short-lived write gate; never part of power/configuration fingerprints. */
-    storage_authority: z.string().max(STORAGE_AUTHORITY_MAX_LENGTH).optional(),
-    storage_startup: DesiredStorageStartup.optional(),
     size: DesiredSize,
     roles: z
       .array(z.union([DesiredRole, DesiredRoleRemoval]))
@@ -433,15 +426,6 @@ export const DesiredRegion = z.strictObject({
   parking: ParkedTierPolicy.optional(),
   /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
   storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
-  /** Nodes whose controller posts headroom samples, each once; omitted while none is selected. */
-  storage_samples: z
-    .array(ThinStorageSampleTarget)
-    .max(1000)
-    .refine(
-      (rows) => new Set(rows.map((row) => row.node_id)).size === rows.length,
-      { message: "Each node is sampled once" },
-    )
-    .optional(),
   /** Authenticated target-region-only source-read custody; omission preserves legacy installations. */
   recovery_sources: RecoverySourceCredentialsMap.optional(),
   backup: z.strictObject({

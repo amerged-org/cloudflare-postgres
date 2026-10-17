@@ -4,7 +4,7 @@ import { introspectWorkflowInstance } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { identityProof, gib } from "./thin-renewal-fixture.ts";
+import { identityProof, gib } from "./thin-proof-fixture.ts";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { withAdmissionMutation } from "../../src/domain/admission-mutations.ts";
 import { prepareNodeHostConfiguration } from "../../src/domain/node-host-configuration.ts";

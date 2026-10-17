@@ -48,7 +48,6 @@ import {
   storageProtectionStatements,
   storageHoldVolumeStatements,
   knownStorageHoldVolume,
-  thinLogicalVolumeExposures,
   currentStorageStopSql,
 } from "./storage-capacity.ts";
 import {
@@ -499,7 +498,7 @@ export async function reserveThinStorageLease(
   ).toISOString();
   // The newest sample accepted before this lease bounds what its own LVM reading may show.
   const result = await env.DB.prepare(
-    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=?,lease_sample_observed_at=sample_observed_at,lease_sample_data_used_bytes=sample_data_used_bytes WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}
+    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=? WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}
       AND (?=0 OR (NOT EXISTS(SELECT 1 FROM database_start_admissions a WHERE a.node_id=node_thin_storage.node_id AND a.storage_budget_bytes>0)
         AND NOT EXISTS(SELECT 1 FROM databases d WHERE d.node_id=node_thin_storage.node_id AND d.deleted_at IS NULL AND d.desired_state<>'deleted' AND d.storage_profile_json IS NOT NULL)))`,
   )
@@ -731,26 +730,6 @@ export async function dispatchThinPoolAction(
   return { dispatched: true };
 }
 
-/** Temporary full-volume exposure across both identity reads and exact captured holds.
- * io.max's metadata/swap bypass cannot justify a rate-only physical growth bound. */
-function thinWriteAllowance(
-  writers: readonly (NodeThinStorageAuthority | null)[],
-  holds: { bytes: number; exposures?: ReadonlyMap<string, number> },
-) {
-  const exposure = new Map(holds.exposures);
-  for (const authority of writers) {
-    if (!authority) continue;
-    const retained = thinLogicalVolumeExposures(authority);
-    if (!retained) return Number.MAX_SAFE_INTEGER;
-    for (const [key, bytes] of retained)
-      exposure.set(key, Math.max(exposure.get(key) ?? 0, bytes));
-  }
-  const total =
-    [...exposure.values()].reduce((sum, value) => sum + value, 0) +
-    (holds.exposures ? 0 : holds.bytes);
-  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
-}
-
 /** The slow report is an identity proof: its read started at the lease's issue, it stays usable
  * THIN_INVENTORY_MAX_SECONDS and it carries its own revision. Cloudflare composes the authority from
  * it and the fresher of its reading and the current one, even when that authority already expired. */
@@ -795,7 +774,7 @@ async function acceptIdentityProof(
   // the executor's refused callback became a transient failure.
   const block = async (code: string): Promise<never> => {
     await env.DB.prepare(
-      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
+      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
     )
       .bind(code, nodeId, row.lease_id, row.lease_revision)
       .run();
@@ -868,7 +847,6 @@ async function acceptIdentityProof(
       issued,
     ),
     headroom = minimumHeadroom(lease.profile),
-    pool = a.physical.thin_pool,
     proofWriteAllowed = thinStorageWriteAllowed(
       lease.profile,
       a,
@@ -936,37 +914,6 @@ async function acceptIdentityProof(
     )
       return block("thin_storage_report_identity_changed");
   }
-  const stored = retainedPoolAuthority(row);
-  // The proof's own reading must not exceed the newest sample before its lease plus what Cloudflare
-  // allowed since: the sampler or a writer's limit was wrong, so the node stops being renewed.
-  if (
-    pool &&
-    row.lease_sample_observed_at !== null &&
-    row.lease_sample_data_used_bytes !== null
-  ) {
-    const allowed =
-      row.lease_sample_data_used_bytes + thinWriteAllowance([stored, a], holds);
-    // Both LVM readers round percentages to hundredths and charge another hundredth. The
-    // conservative upper bound can rise after growth without a write; compare its lower bound.
-    const proofUsedLowerBound = Math.max(
-      0,
-      pool.data_used_bytes_upper_bound -
-        Math.ceil(pool.data_total_bytes / 5000),
-    );
-    if (proofUsedLowerBound > allowed) {
-      console.error(
-        JSON.stringify({
-          event: "thin_storage_headroom_inconsistent",
-          node_id: nodeId,
-          sample_observed_at: row.lease_sample_observed_at,
-          sample_data_used_bytes: row.lease_sample_data_used_bytes,
-          proof_data_used_bytes: pool.data_used_bytes_upper_bound,
-          allowed_bytes: allowed,
-        }),
-      );
-      return block("thin_storage_headroom_inconsistent");
-    }
-  }
   const receipts: {
     database: (typeof lease.databases)[number];
     storage: NonNullable<(typeof lease.databases)[number]["storage"]>;
@@ -1007,40 +954,15 @@ async function acceptIdentityProof(
     }),
     reportedVolumes = JSON.stringify(a.volumes),
     heldOperations = JSON.stringify(holds.operations);
-  // Validate custody, inventory and receipts once. A fast renewal changes only the reading and
-  // revision; after a conflict the one row read below is enough to compose with that fresh sample.
+  // Validate custody, inventory and receipts once; after a conflict the one row read below is
+  // enough to try again.
   for (let attempt = 0; attempt < 3; attempt++) {
-    const current = retainedPoolAuthority(row),
-      freshPool = current?.physical.thin_pool,
-      fresher =
-        current &&
-        pool &&
-        freshPool &&
-        current.pool_uuid === a.pool_uuid &&
-        current.profile_revision === a.profile_revision &&
-        freshPool.metadata_total_bytes === pool.metadata_total_bytes &&
-        freshPool.data_total_bytes >= pool.data_total_bytes &&
-        Date.parse(current.observed_at) > issued
-          ? current
-          : null;
-    // The executor reads the final post-action geometry. A larger later sample cannot describe the
-    // same non-shrinking pool, even with a dispatched growth; never use its inflated free space.
-    if (fresher && freshPool!.data_total_bytes > pool!.data_total_bytes)
-      return block("thin_storage_headroom_inconsistent");
-    const reading = fresher
-        ? {
-            observed_at: Date.parse(fresher.observed_at),
-            captured_at: fresher.captured_at,
-            physical: fresher.physical,
-          }
-        : {
-            observed_at: issued,
-            captured_at: a.captured_at,
-            physical: a.physical,
-          },
-      writeAllowed =
-        proofWriteAllowed &&
-        thinStorageWriteAllowed(lease.profile, a, reading.physical, headroom),
+    const reading = {
+        observed_at: issued,
+        captured_at: a.captured_at,
+        physical: a.physical,
+      },
+      writeAllowed = proofWriteAllowed,
       composed = composeThinStorageAuthority({
         identity: a,
         inventory,
@@ -1180,8 +1102,6 @@ async function acceptIdentityProof(
           "boot_id",
           "configuration_boot_id",
           "error_code",
-          "lease_sample_observed_at",
-          "lease_sample_data_used_bytes",
         ] as const
       ).some((field) => after[field] !== validated[field])
     )

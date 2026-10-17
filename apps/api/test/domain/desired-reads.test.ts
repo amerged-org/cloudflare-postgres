@@ -5,7 +5,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
 import { DesiredResponse } from "@pgcf/contracts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
-import { awakeWriter } from "./parked-tier-fixture.ts";
+import { awakeWriter } from "./thin-writer-fixture.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 
 const releases: string[] = [];
@@ -90,7 +90,7 @@ it("the desired page reads the region's independent data together", async () => 
   expect((await response).status).toBe(200);
 }, 30_000);
 
-it("the desired page reads a thin node's authority once for its region and its databases", async () => {
+it("the desired page reads a thin node's identity proof once for its region and its databases", async () => {
   const w = await awakeWriter(await thinExecutionFixture(releases));
   let reads = 0;
   const prototype = Object.getPrototypeOf(env.DB) as D1Database;
@@ -119,7 +119,7 @@ it("the desired page reads a thin node's authority once for its region and its d
     await (await request("/agent/v1/desired", w.f.agent)).json(),
   );
   const record = page.databases.find((database) => database.id === w.id)!;
-  expect(record.storage_authority).toMatch(/^sa1\./);
+  expect(record.storage).toBeDefined();
   expect(page.region.storage_nodes).toHaveLength(1);
   expect(reads).toBe(1);
 }, 30_000);

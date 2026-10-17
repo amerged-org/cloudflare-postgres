@@ -28,7 +28,7 @@ import {
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { identityProof } from "./thin-renewal-fixture.ts";
+import { identityProof } from "./thin-proof-fixture.ts";
 import {
   installationHash,
   canonicalInstallation,
@@ -573,7 +573,7 @@ it("preserves an uncertain dispatched pool write and only clears an expired know
       .first("action_json"),
   ).toBeNull();
 });
-it("selects against stable inventory when a fast renewal wins between read and commit", async () => {
+it("selects against stable inventory when another identity write wins between read and commit", async () => {
   const f = await thinExecutionFixture(releaseIds);
   const hash = await installationHash(thinVolumeProfile(f.profile));
   Object.assign(f.authority, {
