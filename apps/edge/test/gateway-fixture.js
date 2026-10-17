@@ -23,6 +23,35 @@ export default {
       text_frames: 0,
     };
     connections.push(connection);
+    if (url.pathname === "/sql") {
+      // HTTP SQL: records the forwarded request and answers as the gateway would.
+      connection.method = request.method;
+      connection.body = await request.text();
+      if (url.searchParams.get("mode") === "reject")
+        return new Response("unavailable", { status: 503 });
+      if (url.searchParams.get("mode") === "sql-error")
+        return Response.json(
+          {
+            message: "relation does not exist",
+            code: "42P01",
+            severity: "ERROR",
+          },
+          { status: 400 },
+        );
+      const result = {
+        fields: [],
+        command: "SELECT",
+        rowCount: 0,
+        rows: [],
+        rowAsArray: true,
+      };
+      const forwarded = JSON.parse(connection.body);
+      return Response.json(
+        forwarded.transaction
+          ? { results: forwarded.queries.map(() => result) }
+          : result,
+      );
+    }
     if (url.searchParams.get("mode") === "redirect") {
       const target = new URL("/redirect-target", request.url);
       target.hostname = ["redirect", "invalid"].join(".");

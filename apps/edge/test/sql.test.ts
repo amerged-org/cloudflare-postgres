@@ -1,0 +1,384 @@
+// SPDX-License-Identifier: Apache-2.0
+import { env } from "cloudflare:workers";
+import {
+  createExecutionContext,
+  waitOnExecutionContext,
+} from "cloudflare:test";
+import { neon, neonConfig } from "@neondatabase/serverless";
+import { newDatabaseId, newOperationId } from "@pgcf/contracts";
+import {
+  deriveRegionKeyring,
+  parseRouteKeyring,
+  verifyRouteToken,
+} from "@pgcf/contracts/route-token";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import worker from "../src/index.ts";
+import { MAX_SQL_REQUEST_BYTES } from "../src/sql.ts";
+import type { DatabaseWakeAdmission, Env } from "../src/env.ts";
+
+const testEnv = env as unknown as Env & { GATEWAY: Fetcher };
+const origin = `https://${["edge", "invalid"].join(".")}`;
+const gatewayOrigin = `https://${["gateway", "invalid"].join(".")}`;
+const region = "eu-test";
+const password = "pass word:/@ü";
+let logs: ReturnType<typeof vi.spyOn>;
+let database: string;
+
+interface Forwarded {
+  token: string;
+  headers: Record<string, string>;
+  path: string;
+  method: string;
+  body: string;
+}
+
+async function forwarded(): Promise<Forwarded[]> {
+  const response = await testEnv.GATEWAY.fetch(`${gatewayOrigin}/stats`);
+  return response.json<Forwarded[]>();
+}
+
+function connectionString(user = "app", databaseId = database): string {
+  return `postgresql://${user}:${encodeURIComponent(password)}@${["db", "invalid"].join(".")}/${databaseId}`;
+}
+
+/** An Actor that answers every admission with `admission`, as the real one answers it. */
+function admitting(
+  admission: DatabaseWakeAdmission | (() => Promise<DatabaseWakeAdmission>),
+  bindings: Partial<Env> = {},
+): Env {
+  const admitWake = vi.fn(async () =>
+    typeof admission === "function" ? admission() : admission,
+  );
+  return {
+    ...testEnv,
+    ...bindings,
+    DATABASE_ACTOR: {
+      idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+      get: () => ({ admitWake, cancelWakeWaiter: async () => false }),
+    },
+  };
+}
+
+function awake(mode?: string): DatabaseWakeAdmission & { ok: true } {
+  return {
+    ok: true,
+    region: {
+      id: region,
+      gateway_url: `${gatewayOrigin}/pg${mode ? `?mode=${mode}` : ""}`,
+      gateway_binding: "GATEWAY",
+    },
+    target: { revision: 2, pod_uid: crypto.randomUUID(), route_revision: 5 },
+  };
+}
+
+const neonHeaders = (user?: string) => ({
+  "Neon-Connection-String": connectionString(user),
+  "Neon-Raw-Text-Output": "true",
+  "Neon-Array-Mode": "true",
+});
+
+async function post(
+  bindings: Env,
+  body: unknown,
+  headers: Record<string, string> = neonHeaders(),
+  method = "POST",
+): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(
+    new Request(`${origin}/sql`, {
+      method,
+      headers: { "CF-Connecting-IP": [192, 0, 2, 1].join("."), ...headers },
+      body: method === "POST" ? JSON.stringify(body) : null,
+    }),
+    bindings,
+    ctx,
+  );
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
+async function refusal(response: Response): Promise<string> {
+  expect(response.status).toBe(400);
+  const body = await response.json<{ code: string; message: string }>();
+  expect(typeof body.message).toBe("string");
+  return body.code;
+}
+
+beforeEach(async () => {
+  logs = vi.spyOn(console, "log").mockImplementation(() => {});
+  await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
+  database = newDatabaseId();
+});
+
+afterEach(async () => {
+  await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
+  logs.mockRestore();
+  vi.restoreAllMocks();
+});
+
+describe("HTTP SQL in the Neon serverless driver's wire format", () => {
+  it("the actual driver's query and transaction each reach the gateway once, admitted and signed", async () => {
+    const bindings = admitting(awake());
+    neonConfig.fetchEndpoint = () => `${origin}/sql`;
+    neonConfig.fetchFunction = async (url: string, init: RequestInit) => {
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(
+        new Request(url, init),
+        bindings,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      return response;
+    };
+    try {
+      const sql = neon(connectionString());
+      expect(await sql.query("select $1, $2", [1, null])).toEqual([]);
+      expect(
+        await sql.transaction(
+          [sql`insert into items values (${"a"})`, sql`select 1`],
+          { isolationLevel: "Serializable", readOnly: true },
+        ),
+      ).toEqual([[], []]);
+    } finally {
+      neonConfig.fetchEndpoint = undefined as never;
+      neonConfig.fetchFunction = undefined;
+    }
+    const requests = await forwarded();
+    expect(requests).toHaveLength(2);
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    for (const request of requests) {
+      expect(request.path).toBe("/sql");
+      expect(request.method).toBe("POST");
+      expect(
+        await verifyRouteToken(request.token, { region, keys: keyring.keys }),
+      ).toMatchObject({
+        ok: true,
+        claims: { v: 4, db: database, user: "app" },
+      });
+      // The password travels only in the body, never in a header or the URL.
+      expect(JSON.stringify(request.headers)).not.toContain("pass");
+      expect(request.headers["neon-connection-string"]).toBeUndefined();
+    }
+    const encoded = btoa(
+      String.fromCharCode(...new TextEncoder().encode(password)),
+    )
+      .replaceAll("+", "-")
+      .replaceAll("/", "_")
+      .replace(/=+$/, "");
+    expect(JSON.parse(requests[0]!.body)).toEqual({
+      password: encoded,
+      queries: [{ query: "select $1, $2", params: ["1", null] }],
+    });
+    expect(JSON.parse(requests[1]!.body)).toEqual({
+      password: encoded,
+      queries: [
+        { query: "insert into items values ($1)", params: ["a"] },
+        { query: "select 1", params: [] },
+      ],
+      transaction: { isolation: "Serializable", read_only: true },
+    });
+    for (const [line] of logs.mock.calls) {
+      expect(line).not.toContain("pass");
+      expect(line).not.toContain("select");
+    }
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log).toMatchObject({
+      event: "sql_admission",
+      database_id: database,
+      route: "v4",
+      outcome: "accepted",
+      gateway_status: 200,
+    });
+  });
+
+  it("the actual driver reads gateway and Edge refusals as PostgreSQL errors", async () => {
+    neonConfig.fetchEndpoint = () => `${origin}/sql`;
+    let bindings = admitting(awake("sql-error"));
+    neonConfig.fetchFunction = async (url: string, init: RequestInit) =>
+      worker.fetch(new Request(url, init), bindings, createExecutionContext());
+    try {
+      const sql = neon(connectionString());
+      await expect(sql.query("select")).rejects.toMatchObject({
+        code: "42P01",
+        message: "relation does not exist",
+      });
+      bindings = admitting({ ok: false, sqlstate: "28P01" });
+      await expect(sql.query("select")).rejects.toMatchObject({
+        code: "28P01",
+        message: "password authentication failed",
+        severity: "FATAL",
+      });
+    } finally {
+      neonConfig.fetchEndpoint = undefined as never;
+      neonConfig.fetchFunction = undefined;
+    }
+  });
+
+  it("a wake admission is forwarded once under a v5 route", async () => {
+    const wake = {
+      operation: newOperationId(),
+      generation: 3,
+      route_revision: 7,
+      role_revision_hash: "a".repeat(64),
+    };
+    const response = await post(
+      admitting({ ok: true, region: awake().region, wake }),
+      { query: "select 1", params: [] },
+    );
+    expect(response.status).toBe(200);
+    const [request] = await forwarded();
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    expect(
+      await verifyRouteToken(request!.token, { region, keys: keyring.keys }),
+    ).toMatchObject({ ok: true, claims: { v: 5, db: database, gen: 3 } });
+  });
+
+  it("an empty transaction answers at once without admission", async () => {
+    const bindings = admitting(awake());
+    const response = await post(bindings, { queries: [] });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ results: [] });
+    expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("refuses malformed requests before admission or any gateway call", async () => {
+    const admission = vi.fn(async () => awake());
+    const bindings = admitting(admission);
+    const query = { query: "select 1", params: [] };
+    const cases: [string, Response][] = [
+      ["08P01", await post(bindings, query, neonHeaders(), "GET")],
+      ["08P01", await post(bindings, query, {})],
+      [
+        "08P01",
+        await post(bindings, query, {
+          ...neonHeaders(),
+          "Neon-Connection-String": "https://db.invalid/x",
+        }),
+      ],
+      [
+        "3D000",
+        await post(bindings, query, {
+          ...neonHeaders(),
+          "Neon-Connection-String": connectionString("app", "Not-An-Id"),
+        }),
+      ],
+      ["28P01", await post(bindings, query, neonHeaders("pg_signal"))],
+      [
+        "28P01",
+        await post(bindings, query, {
+          ...neonHeaders(),
+          "Neon-Connection-String": `postgresql://app@db.invalid/${database}`,
+        }),
+      ],
+      [
+        "0A000",
+        await post(bindings, query, {
+          ...neonHeaders(),
+          "Neon-Array-Mode": "false",
+        }),
+      ],
+      [
+        "0A000",
+        await post(bindings, query, {
+          ...neonHeaders(),
+          Authorization: "Bearer token",
+        }),
+      ],
+      [
+        "08P01",
+        await post(bindings, query, {
+          ...neonHeaders(),
+          "Neon-Batch-Isolation-Level": "Chaos",
+        }),
+      ],
+      ["08P01", await post(bindings, { query: 1 })],
+      ["08P01", await post(bindings, { query: "select", params: [{}] })],
+      ["08P01", await post(bindings, { query: "select", user: "other" })],
+      [
+        "08P01",
+        await post(bindings, {
+          queries: Array.from({ length: 257 }, () => query),
+        }),
+      ],
+      [
+        "54000",
+        await post(bindings, {
+          query: "x".repeat(MAX_SQL_REQUEST_BYTES),
+          params: [],
+        }),
+      ],
+    ];
+    for (const [code, response] of cases)
+      expect(await refusal(response)).toBe(code);
+    expect(admission).not.toHaveBeenCalled();
+    expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("maps admission refusals as the WebSocket path does, without a gateway call", async () => {
+    for (const [sqlstate, code] of [
+      ["3D000", "28P01"],
+      ["28P01", "28P01"],
+      ["57P03", "57P03"],
+      ["53300", "53300"],
+      ["08006", "08006"],
+    ] as const) {
+      const response = await post(admitting({ ok: false, sqlstate }), {
+        query: "select 1",
+      });
+      expect(await refusal(response)).toBe(code);
+    }
+    const refused = { limit: async () => ({ success: false }) } as RateLimit;
+    expect(
+      await refusal(
+        await post(
+          admitting(awake(), { DATABASE_CONNECTION_RATE_LIMITER: refused }),
+          { query: "select 1" },
+        ),
+      ),
+    ).toBe("53300");
+    expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("counts HTTP requests in their own buckets of the same limiters", async () => {
+    const connection = vi.fn(async () => ({ success: true }));
+    const perDatabase = vi.fn(async () => ({ success: true }));
+    const response = await post(
+      admitting(awake(), {
+        CONNECTION_RATE_LIMITER: { limit: connection } as unknown as RateLimit,
+        DATABASE_CONNECTION_RATE_LIMITER: {
+          limit: perDatabase,
+        } as unknown as RateLimit,
+      }),
+      { query: "select 1" },
+    );
+    expect(response.status).toBe(200);
+    expect(connection).toHaveBeenCalledExactlyOnceWith({
+      key: JSON.stringify(["sql", database, "app", "ipv4:192.0.2.1"]),
+    });
+    expect(perDatabase).toHaveBeenCalledExactlyOnceWith({
+      key: JSON.stringify(["sql", database]),
+    });
+  });
+
+  it("passes gateway answers through and reports anything else as an unknown outcome", async () => {
+    const error = await post(admitting(awake("sql-error")), {
+      query: "select 1",
+    });
+    expect(error.status).toBe(400);
+    expect(await error.json()).toEqual({
+      message: "relation does not exist",
+      code: "42P01",
+      severity: "ERROR",
+    });
+    const lost = await post(admitting(awake("reject")), { query: "insert" });
+    expect(await refusal(lost)).toBe("08007");
+    // Each request reached the gateway exactly once: nothing is retried.
+    expect(await forwarded()).toHaveLength(2);
+  });
+});
