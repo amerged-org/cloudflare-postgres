@@ -10,7 +10,7 @@ Earlier clauses preserving full sleeping CPU and logical disk reservations are s
 
 The texts of 2026-10-05 and 2026-10-08 required Neon's **shared pool of prestarted, unassigned
 compute** before go-live. The owner decided on 2026-10-15 that the go-live path reaches a sub-second
-wake through the [parked sleep tier](parked-instances.md), which keeps the database's instance Pod
+wake through the parked sleep tier, which keeps the database's instance Pod
 and stops only PostgreSQL, and that the shared pool is deleted. Section 4 records why the pool is
 not built.
 
@@ -75,7 +75,7 @@ Pin the Rust toolchain, dependency lockfile, build inputs and runtime-image dige
 Neon starts unassigned compute before demand, applies configuration only when a connection needs
 it, and shortens routing and readiness work
 ([Cold starts just got hot](https://neon.com/blog/cold-starts-just-got-hot)). PGCF answers the same
-question for a database that slept recently with the [parked sleep tier](parked-instances.md): the
+question for a database that slept recently with the parked sleep tier: the
 instance Pod, volume and sidecar stay and only PostgreSQL stops, so the next connection unfences a
 Pod that already exists. A database that is demoted, or that has been hibernated, takes the ordinary
 CNPG wake. The owner decided on 2026-10-15 that this replaces a shared pool of unassigned compute

@@ -884,6 +884,31 @@ it("a wake claim whose row keeps moving is tried three times, then refused", asy
   expect(await wakeOperations(f.id)).toBe(0);
 });
 
+it("a wake claim refused while its row stays unmoved answers 57P03 at once, without waiting for a later report", async () => {
+  const f = await ready();
+  await idle(f);
+  // A late node report and a commit that D1 refuses without moving the row: the claim does not wait
+  // for the next report, it answers at once and the client retries.
+  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+    .bind(new Date(Date.now() - 300_000).toISOString(), f.node)
+    .run();
+  await env.DB.exec(
+    `CREATE TRIGGER refuse_wake_claim BEFORE UPDATE OF generation ON databases WHEN OLD.id='${f.id}' BEGIN SELECT RAISE(IGNORE); END`,
+  );
+  try {
+    const started = Date.now();
+    expect(
+      await actor(f.id).ensureAwake(f.id, "app", {
+        deadline: Date.now() + 10_000,
+      }),
+    ).toEqual({ ok: false, sqlstate: "57P03" });
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(await wakeOperations(f.id)).toBe(0);
+  } finally {
+    await env.DB.exec("DROP TRIGGER refuse_wake_claim");
+  }
+}, 15_000);
+
 it("a wake claim that lost its row after the caller's deadline is not tried again", async () => {
   const f = await ready();
   await idle(f);

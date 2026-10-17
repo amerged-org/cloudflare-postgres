@@ -1342,14 +1342,10 @@ export async function issueThinStorageTransport(
 
 /** Ask the node's NodeBootstrap for an identity turn now instead of at its cadence. The starts that
  * wait for it, if any, supersede a running turn that read their databases before they began. */
-export async function requestThinStorageTurn(
-  env: Env,
-  nodeId: string,
-  waiting: readonly { database_id: string; generation: number }[] = [],
-) {
+export async function requestThinStorageTurn(env: Env, nodeId: string) {
   await env.NODE_BOOTSTRAP.get(
     env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
-  ).thinStorageDue(nodeId, waiting);
+  ).thinStorageDue(nodeId);
 }
 /** A thin database just placed on a node, or starting there again, needs the node's next identity
  * proof: only a proof reads a new volume into its receipt or measures the Pod writing to it, and the

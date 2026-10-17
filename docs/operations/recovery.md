@@ -240,15 +240,14 @@ and archived WAL, before changing application connections. Retain the source thr
 after target writes, a rollback must reconcile them rather than point clients at stale data. Keep
 adapter changes and customer prices outside this generic service.
 
-## Thin storage admission and protective recovery
+## Thin storage admission and recovery
 
-Thin storage is enabled explicitly per node only after the selected driver, fixed pool and
-host expiry guard have passed qualification. An unqualified, stale or identity-mismatched
-selection stays closed; it never silently falls back to thick provisioning. Customer activation
-requires the immutable selected release's complete-profile qualification receipt, including
-dirty-writeback and full-pool acceptance; driver-only readiness cannot enable placement. No such
-live receipt is inferred from local tests. Existing thick volumes keep their backend and data.
-A selected thin volume keeps its immutable class,
+Thin storage is enabled explicitly per node only after the selected driver and fixed pool have
+passed qualification. An unqualified, stale or identity-mismatched selection stays closed; it never
+silently falls back to thick provisioning. Customer activation requires the immutable selected
+release's complete-profile qualification receipt, including the full-pool gates; driver-only
+readiness cannot enable placement. No such live receipt is inferred from local tests. Existing
+thick volumes keep their backend and data. A selected thin volume keeps its immutable class,
 profile hash, Node UID, volume-group UUID and pool UUID; logical quota growth is forward-only
 within the configured finite maximum.
 
@@ -257,99 +256,53 @@ PUT includes `expected_revision`, the physical `node_uid`, literal management `a
 `volume_group_uuid`, the complete finite `profile` and `allow_new_databases:false`.
 `Idempotency-Key` protects repeated requests. Selection records desired policy and supplies no
 qualification; only a Native report changes its `status`. An active Native lease blocks
-reselection, and an uncertain dispatched pool action blocks any change to it. The approved
-release must pin the exact driver, the storage verifier, the `pgcf-sandbox-controller` host
-extension and the `native-gateway` and `native-controller` images on every role. Only the
-native controller writes the gateway's write-authority ledger, protection marker and
-reclamation proof.
-The regional capacity policy accepts an optional `thin_storage` standing template: omission
-preserves it, explicit null clears it. Future purchases seal that template before ordering;
-customer placement still waits for the actual joined node's qualified physical report.
+reselection, and an uncertain dispatched pool action blocks any change to it. Only the native
+controller writes the reclamation proof. The regional capacity policy accepts an optional
+`thin_storage` standing template: omission preserves it, explicit null clears it. Future purchases
+seal that template before ordering; customer placement still waits for the actual joined node's
+qualified physical report.
 
-A retained node is selected in place. A release that pins this guard configures and requires
-the `dm_thin_pool` kernel module on every role in its host-configuration stage, before any
-receipt exists, so the release's own patch makes the module live. The region release must declare
-`thin_storage_sampling_version: 1` and its sampling controllers must have confirmed patches before
-selection or qualification is accepted (otherwise HTTP 409). The capability marker stays in
-Cloudflare; the desired fleet-release wire view omits it. Composed inventory authorities and
-sampling targets are withheld from controllers without this capability: the region's release declares
-it, the newest completed patch of every member was of a release that declares it and no later patch
-was of one that does not, so a rollout between two such releases does not withdraw it. Thin storage also requires the
-region capacity policy's `compute_pool`: activation and write authority bind the patch's runtime
-admission, which is recorded only while that policy is set. Once the node's current release patch
-has completed with its host configuration, a successful PUT starts the Native executor. Its one
-lease initializes a missing `pgcf_thinpool` from free volume-group extents only, leaves thick
-volumes untouched and never repeats an uncertain dispatched action. The response waits for that
-first Native run and reports the resulting `status` and `error_code`. A failed run leaves the
-node `blocked` with its `error_code`; after the lease expires, repeat the PUT with the current
-`expected_revision` to start one new run. While a dispatched action is uncertain, only the
-identical selection is accepted: it keeps the revision and the action, and the new run only reads
-the action back. Only the pool that action created or grew, at its target size, confirms it;
-otherwise the node is blocked again and the write is not repeated. Without that completed patch
-the PUT is refused; select after the sampling controllers converge. No API removes a
-selection, and a selected node never takes new thick placements.
+A retained node is selected in place. Once the node's current release patch has completed with its
+host configuration, a successful PUT starts the Native executor. Its one lease initializes a
+missing `pgcf_thinpool` from free volume-group extents only, leaves thick volumes untouched and
+never repeats an uncertain dispatched action. The response waits for that first Native run and
+reports the resulting `status` and `error_code`. A failed run leaves the node `blocked` with its
+`error_code`; after the lease expires, repeat the PUT with the current `expected_revision` to start
+one new run. While a dispatched action is uncertain, only the identical selection is accepted: it
+keeps the revision and the action, and the new run only reads the action back. Only the pool that
+action created or grew, at its target size, confirms it; otherwise the node is blocked again and
+the write is not repeated. No API removes a selection, and a selected node never takes new thick
+placements. The executor's identity turn reads the LVM inventory, volume receipts and pool actions
+every 60 seconds; transient readback races retry with backoff, while uncertain pool actions stay
+journaled for readback.
 
-The native controller reads exporter headroom every `guard_seconds / 5` and answers a single-use
-Cloudflare nonce at `POST /agent/v1/nodes/{id}/storage-headroom`. Cloudflare alone signs authority,
-anchored to nonce issue and bounded by the 300-second identity proof. The executor refreshes that
-proof every 60 seconds; transient readback races retry with 5–60-second backoff, while uncertain
-pool actions stay journaled for readback. A held writer can receive its first token before its IO
-limits are measured, but a later identity read without those limits ends both its token and startup
-grant. A controller rollback withdraws sampling capability; it never relabels a fast sample as an
-inventory proof.
+**Safety rules** ([decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)):
 
-While a thin database's sleep (idle or manual) is under way, the host lease keeps its instance Pod
-the running writer: until the sleep's stop operation of that generation leaves pending or running,
-the entry is `running` with a write token for that one Pod, and carries no startup grant and no
-drain. The Pod is named by the same evidence the running token trusts: the Pod the latest identity
-proof measured on the volume or, before a reading has measured it, the held writer (the start's
-storage hold plus the controller's attestation); both must agree. The controller stops PostgreSQL
-in that Pod; once it reports the sleep the entry becomes `suspended` (a parked Pod keeps its token)
-and the guard may freeze the volume the stopped Pod left. Without that evidence or a current
-write-allowed reading, or after the stop timed out, the guard freezes the volume and stops the Pod.
-Only a deletion still drains. A wake reuses a parked Pod only when the controller's last report
-claimed the fast wake and the wake is the generation right after the reported sleep; any other wake
-retires the parked Pod and the controller starts a new one.
+- One writer per volume: the attach agent creates a volume's holder file with `O_EXCL` only while
+  the device's open count is 0, for a pool slot and before the controller lifts CNPG hibernation.
+  The controller checks `system_identifier` and timeline before it releases any client.
+- Room: a start or attach needs a thin pool without error, a storage observation at most 120 s old,
+  free data at least the profile's `data_reserve_bytes` and free metadata at least
+  `metadata_reserve_bytes`. Without room Cloudflare refuses create, resume, restart, restore and the
+  wake of a miss, and the controller attaches nothing. Logical quota totals do not reserve extents.
+- Growth and alert: the capacity cron requests a bounded pool growth when free space falls below the
+  reserve plus the startup reserve; free space elsewhere in the volume group becomes placeable only
+  after Native has read back the larger geometry. `thin_storage_blocked` fires when the pool has no
+  room or cannot grow. Native fails closed with `thin_storage_pool_percent_invalid` when LVM reports
+  an empty or non-decimal pool percentage; an unknown percentage never reads as 0%.
+- A full pool fails writes at once (`--errorwhenfull y`). PostgreSQL then stops with PANIC and no
+  commit is acknowledged without durable WAL. Grow the pool (or wait for the automatic growth); the
+  next start recovers from WAL. Running writers are never stopped for storage.
 
-The first lease of a sleep window or of a fast wake can arrive while the node's authority revision
-has not moved since the previous token; the guard then refuses that whole node lease once and keeps
-its previous state until the next accepted headroom sample moves the revision. The fast-wake claim
-is the controller's last parked report: if the Pod drifts after it and the wake has to start a new
-Pod after all, the guard refuses that Pod for the wake's generation until the wake times out and the
-next wake bumps the generation.
-
-A release that carries the receipt requires current thin write authority from every member that
-takes databases and from every member that already has a selection. Until then that member stays
-Pending, its patch storage check repeats and operation-owned placement stays closed. A
-control/relay member with database placement disabled and no selection converges without a pool.
-
-Cloudflare admits starts from the **already allocated** pool's actual data and metadata
-headroom, verified live write limits and outstanding startup holds. Logical quota totals do
-not reserve thin extents. Free space elsewhere in the volume group becomes placeable only
-after a bounded pool growth has completed and Native has read back its larger geometry.
-Native fails closed with `thin_storage_pool_percent_invalid` when LVM reports an empty or
-non-decimal pool data or metadata percentage; an unknown percentage never reads as 0%.
-Profiles explicitly configure quotas, IO limits, guard/drain windows and reserves; they have
-no unbounded or guessed defaults. Thin starts require the region's actual-RAM policy.
-
-The existing startup ledger captures both the full RAM peak and the bounded storage debit.
-A thin start temporarily debits the greater of its configured startup reserve and current logical
-quota until actual Ready, later RAM and Native LV/Pod IO-limit proof cover it. This bounds uncapped
-startup writes and dirty writeback; established or sleeping databases do not permanently debit
-that quota. Mapping headroom includes these in-flight bytes and established writers' bounded
-64KiB chunk exposure. These holds reserve admission runway; they do not preallocate extents.
-The RAM peak includes PostgreSQL, the Barman limit and one assigned host allowance. Idle
-prestarted-slot memory is already present in actual Node measurements and is not subtracted again. Permission
-expiry and an operation timeout do not release uncertain capacity. Accepted readiness or a
-verified stopped runtime must be followed by later bound RAM and Native physical observations
-before their holds are released.
-
-When the host guard protects a running database, Native proves the bound Cluster is hibernated
-and its Pods are absent. Cloudflare keeps the running intent and records that exact generation
-and prior operation. A stale same-generation Regional Ready report cannot overwrite this
-stop. Once current Node, RAM, CPU and physical storage checks permit it, the normal capacity
-turn issues one real resume operation and advances the generation. Manual suspension,
-deletion and a newer intent take precedence. No application SQL is replayed.
+**Host guard until the host release of decision A.** The `pgcf-sandbox-controller` extension on
+EU1 still suspends (`dmsetup suspend`) and stops every covered Pod when it has had no accepted
+lease for 120 s: an API outage, a material revision change or a boot mismatch. Cloudflare serves
+it a permit for every live thin volume, so it does not act otherwise; do not roll out a material
+change on EU1 before the host release. Symptoms of a suspend: PostgreSQL processes in
+uninterruptible IO, a database Pod stuck in Terminating, a device with open count 1 and no Pod, a
+pool attach that never takes the database. Recovery from a privileged Pod on the node:
+`dmsetup info -c` shows the suspended database LVs; `dmsetup resume` each one; the hung processes
+then end and the stuck Pods finish deleting. The next start recovers from WAL.
 
 A thin deletion stays pending until a fresh Native read after the delete intent proves the
 retained actual LV UUID absent from both physical and active inventories. An ordinary Regional
@@ -431,8 +384,8 @@ clusters with the setup baseline, so such a change fails the run.
 | `retained_thick_preservation` | Compares the retained thick LVs, PVs/PVCs, LVMVolumes and CNPG `Ready`/`ContinuousArchiving` with the setup baseline | All identical and no thin-profile database on the node |
 
 `trim_delete_recreate` qualifies extent return on LV and PVC deletion. The thin class has no
-in-filesystem discard. A resume through the Cloudflare host guard, including refusal of a changed LV
-identity and of an expired token, is verified after activation by the six live checks.
+in-filesystem discard. The host release of decision A drops `noflush_quiescence`,
+`resume_marker` and `startup_bound` from the receipt.
 
 **Failure and cleanup**
 - A failed gate or executor error records its code and moves straight to cleanup.
@@ -482,22 +435,10 @@ decision must accept or avoid that outage. Options:
 
 ## Parked sleep tier
 
-The parked tier is implemented ([design](../architecture/parked-instances.md)); its live
-acceptance is open in the ULTRA go-live path. With the region policy `parked_tier` enabled
-(`PUT /v1/regions/{id}/capacity-policy`), an idle sleep fences the database's single CNPG
-instance instead of hibernating the Cluster: only PostgreSQL stops, while the instance Pod, its
-volume, the Barman sidecar and the primary Lease stay and the Pod's requests shrink in place. The
-sleep proof (quiesce, archived WAL segment) is unchanged, so every acknowledged commit is in R2
-before the fence. The public state stays `hibernated`; the next connection unfences the Pod and
-resizes it back instead of creating a new one.
-
-The native controller demotes a parked database to full hibernation when `ttl_seconds` passes,
-when the node holds more than `max_per_node` parked databases (the oldest first), when the policy
-is switched off (`enabled:false`) or removed (`null`), and when anything changed since parking:
-the fleet release, the node boot, the Pod or container identity, or the desired spec (a resize, a
-role change or a password reset). A manual suspend demotes it; a delete follows the ordinary
-delete flow. A wake that is not eligible for the fast path demotes first and takes the ordinary
-CNPG wake. No writer exists while a Pod is fenced.
+The parked tier is deleted by the native release of decision A. Before that release, switch it off
+for the region (`parked_tier` `enabled:false` in `PUT /v1/regions/{id}/capacity-policy`) and wait
+until no database is parked: the controller demotes each parked database to full hibernation once
+the policy is off. A wake then takes a pool slot or the ordinary CNPG start.
 
 ## Optional warm reclaim
 

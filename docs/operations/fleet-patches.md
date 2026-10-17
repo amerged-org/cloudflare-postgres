@@ -16,8 +16,7 @@ Talos/Kubernetes transport without Contabo, Rescue, disk reinstallation or SSH.
    `PUT /v1/fleet/releases/{id}`. Select the release for the region and assign it to every current
    member with the existing region/node release APIs. Change the release of a region with assigned
    members only through the one-request rollout below: after a region assignment alone, the native
-   controller cannot verify the databases of members still on the old release and protectively
-   stops thin ones. The reviewed `platform_source_commit` pins
+   controller cannot verify the databases of members still on the old release. The reviewed `platform_source_commit` pins
    the fixed public lock, Flux artifact and platform manifests; the lock never embeds its own Git
    commit. Declare cluster-scoped platform workloads explicitly. PostgreSQL, Barman and the sandbox
    controller artifact are globally qualified; actual database runtimes and host extensions are
@@ -44,29 +43,18 @@ unchanged physical identities only after every member finishes its final pass. A
 change blocks authority. This maintenance rule is separate from continued placement while a76%
 capacity expansion is prepared.
 
-Existing databases keep their data. What an awake thin database sees depends on the release:
+Existing databases keep their data. A rollout stops no awake thin database for storage reasons:
+Cloudflare serves the host lease and the room rule independently of the rollout
+([decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)).
+Placement, wake, resume and selection wait for the node's patch to complete and for a fresh storage
+observation of the new assignment. What a release restarts on the node is not decided here: the
+controller is one `Recreate` replica, and a HelmRelease value change in the platform source can
+restart CloudNativePG or OpenEBS Pods.
 
-- A release that pins the same thin facts as the one the node was patched and proven with (it moves
-  only the API, Edge, bootstrap, controller, gateway, Flux, cert-manager, Cloudflared or Cilium pins
-  and the platform source) leaves thin write authority continuous in Cloudflare: samples, tokens, the
-  host guard's lease and the identity proofs continue through the rollout. Placement, wake, resume
-  and selection wait for the node's patch to complete and for one identity proof of the new
-  assignment. What a release restarts on the node is not decided here: the controller is one
-  `Recreate` replica, and its replacement, a restarted OpenEBS driver Pod or a restarted Kubernetes
-  API server can interrupt sampling for longer than the guard, which stops the awake databases and
-  resumes them when sampling returns.
-- A release that changes a pinned fact pauses authority at the assignment: the host extension,
-  kernel, Talos installer, schematic, version or extensions, Kubernetes version or images (of
-  either role), the driver, thin profile, authority keys, configuration schema revision, sandbox
-  runtime image, `postgres` (image or version), `barman`, `cloudnative-pg`, or the host custody's
-  content. So does a rollback to a release after one that changed such a fact: the node runs the
-  other facts until the rollback's own patch completed. The guard stops awake thin databases until
-  the new patch completed and the node was proven again: plan a maintenance window for it.
-- Not pinned, and so continuous, are the `image/cloudnative-pg/cloudnative-pg` operator image, the
-  barman plugin chart and images, the OpenEBS chart and its other images, Flux, Cilium and the
-  platform source commit. A HelmRelease value change in the platform source can restart
-  CloudNativePG or OpenEBS Pods under continuous authority: a restarted driver is caught by its
-  Pod UID, a restarted CloudNativePG instance by the host guard.
+- Until the host release of decision A removes the `pgcf-sandbox-controller` extension, a release
+  that changes the cluster material makes that node's host guard refuse its lease; after 120 s it
+  suspends and stops every covered Pod ([recovery](recovery.md#thin-storage-admission-and-recovery)).
+  Do not roll out a material change on EU1 before the host release.
 - Deploy the API and the node-bootstrap executor together, outside a rollout.
 
 The `postgres` stage restarts only databases whose PostgreSQL image, version or configuration schema
@@ -186,9 +174,9 @@ controller and `openebs-lvm` on every role) adds `dm_thin_pool` to every member'
 configuration and requires it loaded, with or without a qualification receipt. A confirmed
 configuration waiting for a kernel module never triggers another identical apply.
 Final Ready and operation-owned placement reopening wait for every current-material host/pool and
-selected storage qualification. A release that carries the receipt also requires thin write
-authority from every member that takes databases; a control/relay member with database placement
-disabled and no thin selection converges without one. Thin storage additionally requires the
+selected storage qualification. A release that carries the receipt also requires a fresh thin
+storage observation from every member that takes databases; a control/relay member with database
+placement disabled and no thin selection converges without one. Thin storage additionally requires the
 region `compute_pool` policy, because only a pool-enabled patch records the runtime admission that
 thin activation binds. The previous completed operations remain immutable.
 Roles without protected host settings use a distinct current-custody runtime/database final pass
