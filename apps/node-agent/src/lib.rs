@@ -11,6 +11,7 @@ pub mod holder;
 pub mod measurements;
 #[cfg(target_os = "linux")]
 pub mod mount;
+pub mod node_link;
 pub mod pg_control;
 pub mod postgres;
 pub mod sleep;

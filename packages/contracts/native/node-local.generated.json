@@ -1,0 +1,350 @@
+{
+  "version": 1,
+  "constants": {
+    "AGENT_GATEWAY_SOCKET": "/run/pgcf/agent/gateway.sock",
+    "AGENT_CHANNEL_MAX_LINE_BYTES": 4194304,
+    "AGENT_CHANNEL_MAX_DATABASES": 10000,
+    "UNIX_SOCKET_PATH_MAX_BYTES": 100,
+    "WAKE_REDELIVER_MS": 3000,
+    "WAKE_PHASES": [
+      "admission",
+      "queue_wait",
+      "pg_control",
+      "mount",
+      "start",
+      "release"
+    ],
+    "WAKE_OUTCOMES": ["started", "refused"],
+    "WAKE_REASONS": [
+      "no_desired_row",
+      "not_sleeping",
+      "wake_in_progress",
+      "desired_stale",
+      "no_room",
+      "thick_storage",
+      "volume_identity_missing",
+      "no_power_record",
+      "no_sleep_record",
+      "image_changed",
+      "configuration_changed",
+      "no_free_slot",
+      "no_headroom",
+      "gateways_not_ready",
+      "agent_unavailable",
+      "holder_busy",
+      "volume_open",
+      "volume_suspended",
+      "volume_missing",
+      "uuid_mismatch",
+      "unclean",
+      "control_version",
+      "identity_mismatch",
+      "container_missing",
+      "mount_failed",
+      "audit_failed",
+      "bind_failed",
+      "start_timeout",
+      "sql_identity_mismatch",
+      "release_failed",
+      "deleted",
+      "not_in_region"
+    ],
+    "AGENT_ARCHIVE_SOCKET": "/run/pgcf/agent/archive.sock",
+    "ARCHIVE_SOCKET_ENVIRONMENT": "PGCF_AGENT_ARCHIVE_SOCKET",
+    "ARCHIVE_PROTOCOL": "pgcf-archive/1",
+    "ARCHIVE_MAX_LINE_BYTES": 256,
+    "ARCHIVE_AGENT_BOUND_MS": 60000,
+    "ARCHIVE_CLIENT_BOUND_MS": 70000
+  },
+  "gateway_channel": {
+    "agent": [
+      {
+        "name": "table",
+        "line": "{\"type\":\"table\",\"databases\":[{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}},{\"database\":\"ebbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"sleeping\",\"route_revision\":7}]}",
+        "valid": true
+      },
+      {
+        "name": "empty-table",
+        "line": "{\"type\":\"table\",\"databases\":[]}",
+        "valid": true
+      },
+      {
+        "name": "quiesce",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"quiesce\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": true
+      },
+      {
+        "name": "retired",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"retired\",\"route_revision\":7}}",
+        "valid": true
+      },
+      {
+        "name": "removed",
+        "line": "{\"type\":\"removed\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": true
+      },
+      {
+        "name": "refused",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\"}}",
+        "valid": true
+      },
+      {
+        "name": "started",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"steps_ms\":{\"admission\":1,\"release\":1,\"start\":61}}}",
+        "valid": true
+      },
+      {
+        "name": "started-without-steps",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\"}}",
+        "valid": true
+      },
+      {
+        "name": "begin",
+        "line": "{\"type\":\"control\",\"id\":9,\"action\":\"begin\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3}",
+        "valid": true
+      },
+      {
+        "name": "activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": true
+      },
+      {
+        "name": "table-twice",
+        "line": "{\"type\":\"table\",\"databases\":[{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}},{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"sleeping\",\"route_revision\":7}]}",
+        "valid": false
+      },
+      {
+        "name": "running-without-writer",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7}}",
+        "valid": false
+      },
+      {
+        "name": "sleeping-with-writer",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"sleeping\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "root-uid",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":0,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "pid-one",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":1,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "bare-instance",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e5b7a4c1e9a3b2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "relative-socket",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"run/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "parent-socket",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/../etc/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "long-socket",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "unknown-field",
+        "line": "{\"type\":\"removed\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"extra\":1}",
+        "valid": false
+      },
+      {
+        "name": "unknown-type",
+        "line": "{\"type\":\"stop\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": false
+      },
+      {
+        "name": "started-with-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"reason\":\"no_room\"}}",
+        "valid": false
+      },
+      {
+        "name": "refused-without-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\"}}",
+        "valid": false
+      },
+      {
+        "name": "pool-hit",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"hit\"}}",
+        "valid": false
+      },
+      {
+        "name": "pool-miss",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"miss\",\"reason\":\"no_room\"}}",
+        "valid": false
+      },
+      {
+        "name": "unknown-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"busy\"}}",
+        "valid": false
+      },
+      {
+        "name": "step-name",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"steps_ms\":{\"Start\":1}}}",
+        "valid": false
+      },
+      {
+        "name": "step-too-long",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"steps_ms\":{\"start\":600001}}}",
+        "valid": false
+      },
+      {
+        "name": "generation-zero",
+        "line": "{\"type\":\"control\",\"id\":9,\"action\":\"close\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":0}",
+        "valid": false
+      },
+      {
+        "name": "unknown-action",
+        "line": "{\"type\":\"control\",\"id\":9,\"action\":\"stop\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3}",
+        "valid": false
+      }
+    ],
+    "gateway": [
+      {
+        "name": "wake",
+        "line": "{\"type\":\"wake\",\"wake\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"route_revision\":7,\"role_revision_hash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"queued_at_ms\":1760702400000}}",
+        "valid": true
+      },
+      {
+        "name": "status",
+        "line": "{\"type\":\"status\",\"id\":9,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"idle\",\"connections\":2,\"busy_connections\":0,\"pending_dials\":0}",
+        "valid": true
+      },
+      {
+        "name": "activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"busyConnections\":0,\"connections\":1,\"lastActivityAt\":\"2026-10-17T12:00:00.000Z\"}}",
+        "valid": true
+      },
+      {
+        "name": "upper-hash",
+        "line": "{\"type\":\"wake\",\"wake\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"route_revision\":7,\"role_revision_hash\":\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\",\"queued_at_ms\":1760702400000}}",
+        "valid": false
+      },
+      {
+        "name": "generation-zero",
+        "line": "{\"type\":\"wake\",\"wake\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":0,\"route_revision\":7,\"role_revision_hash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"queued_at_ms\":1760702400000}}",
+        "valid": false
+      },
+      {
+        "name": "unknown-status",
+        "line": "{\"type\":\"status\",\"id\":9,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"asleep\",\"connections\":0,\"busy_connections\":0,\"pending_dials\":0}",
+        "valid": false
+      },
+      {
+        "name": "unknown-type",
+        "line": "{\"type\":\"release\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": false
+      }
+    ]
+  },
+  "archive": {
+    "requests": [
+      {
+        "line": "pgcf-archive/1 archive 000000010000000000000003",
+        "valid": true,
+        "request": { "type": "archive", "name": "000000010000000000000003" }
+      },
+      {
+        "line": "pgcf-archive/1 archive 00000002.history",
+        "valid": true,
+        "request": { "type": "archive", "name": "00000002.history" }
+      },
+      {
+        "line": "pgcf-archive/1 archive 000000010000000000000003.00000028.backup",
+        "valid": true,
+        "request": {
+          "type": "archive",
+          "name": "000000010000000000000003.00000028.backup"
+        }
+      },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003.partial pg_wal/RECOVERYXLOG",
+        "valid": true,
+        "request": {
+          "type": "fetch",
+          "name": "000000010000000000000003.partial",
+          "destination": "pg_wal/RECOVERYXLOG"
+        }
+      },
+      {
+        "line": "pgcf-archive/1 fetch 00000002.history pg_wal/RECOVERYHISTORY",
+        "valid": true,
+        "request": {
+          "type": "fetch",
+          "name": "00000002.history",
+          "destination": "pg_wal/RECOVERYHISTORY"
+        }
+      },
+      {
+        "line": "pgcf-archive/1 archive 000000010000000000000003 extra",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/2 archive 000000010000000000000003",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 archive  000000010000000000000003",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 archive 0000000a0000000000000003",
+        "valid": false
+      },
+      { "line": "pgcf-archive/1 archive RECOVERYXLOG", "valid": false },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003 base/1",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003 pg_wal/../postgresql.conf",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003 pg_wal/.hidden",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 delete 000000010000000000000003",
+        "valid": false
+      },
+      { "line": "", "valid": false }
+    ],
+    "replies": [
+      { "line": "ok", "valid": true, "reply": { "type": "ok" } },
+      { "line": "missing", "valid": true, "reply": { "type": "missing" } },
+      { "line": "failed", "valid": true, "reply": { "type": "failed" } },
+      {
+        "line": "failed upload_timeout",
+        "valid": true,
+        "reply": { "type": "failed", "reason": "upload_timeout" }
+      },
+      { "line": "OK", "valid": false },
+      { "line": "ok ", "valid": false },
+      { "line": "failed ", "valid": false },
+      { "line": "failed Access Denied", "valid": false },
+      { "line": "", "valid": false }
+    ],
+    "formats": [
+      { "reply": { "type": "ok" }, "line": "ok\n" },
+      {
+        "reply": { "type": "failed", "reason": "upload_timeout" },
+        "line": "failed upload_timeout\n"
+      },
+      {
+        "reply": { "type": "failed", "reason": "Access Denied\n" },
+        "line": "failed\n"
+      }
+    ]
+  }
+}

@@ -20,18 +20,6 @@
       "archive_timeout",
       "aborted"
     ],
-    "WAKE_PHASES": [
-      "wake_prepare",
-      "desired_apply",
-      "archive_metrics",
-      "ca_publication",
-      "desired_applied",
-      "role_runtime_auth",
-      "volume_identity",
-      "runtime_unchanged",
-      "fence_release",
-      "observation_post"
-    ],
     "GATEWAY_RETIRE_HOLD_MS": 65000
   }
 }

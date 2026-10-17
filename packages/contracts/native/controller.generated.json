@@ -315,7 +315,7 @@
                 },
                 "required": ["name", "state"],
                 "additionalProperties": false,
-                "description": "A deleted role the region must remove; it carries no credential."
+                "description": "A deleted role the node must remove; it carries no credential."
               }
             ]
           }
@@ -1712,7 +1712,7 @@
                       },
                       "required": ["name", "state"],
                       "additionalProperties": false,
-                      "description": "A deleted role the region must remove; it carries no credential."
+                      "description": "A deleted role the node must remove; it carries no credential."
                     }
                   ]
                 }

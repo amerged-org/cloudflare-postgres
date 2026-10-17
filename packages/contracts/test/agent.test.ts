@@ -11,8 +11,8 @@ import {
   ObservationReport,
   ObservationRequest,
   RegionalInventory,
-  ServerLinkMessage,
-  AgentLinkMessage,
+  LinkDesiredHint,
+  LinkHello,
   archiveDestinationPath,
   newDatabaseId,
   newOperationId,
@@ -1048,9 +1048,9 @@ describe("observation coverage", () => {
 });
 
 describe("link messages", () => {
-  it("parses hello, welcome and desired hints", () => {
+  it("parses hello and desired hints", () => {
     expect(
-      AgentLinkMessage.safeParse({
+      LinkHello.safeParse({
         type: "hello",
         protocol: 1,
         agent_version: "0.0.0",
@@ -1058,21 +1058,18 @@ describe("link messages", () => {
       }).success,
     ).toBe(true);
     expect(
-      AgentLinkMessage.safeParse({
+      LinkHello.safeParse({
         type: "hello",
         protocol: 2,
         agent_version: "0",
         instance_id: "a",
       }).success,
     ).toBe(false);
+    expect(LinkDesiredHint.safeParse({ type: "desired" }).success).toBe(true);
     expect(
-      ServerLinkMessage.safeParse({ type: "welcome", protocol: 1 }).success,
+      LinkDesiredHint.safeParse({ type: "desired", ids: [id] }).success,
     ).toBe(true);
-    expect(ServerLinkMessage.safeParse({ type: "desired" }).success).toBe(true);
-    expect(
-      ServerLinkMessage.safeParse({ type: "desired", ids: [id] }).success,
-    ).toBe(true);
-    expect(ServerLinkMessage.safeParse({ type: "apply" }).success).toBe(false);
+    expect(LinkDesiredHint.safeParse({ type: "apply" }).success).toBe(false);
   });
   it("a wake's hint carries the desired page of exactly the one database it names", () => {
     const page = {
@@ -1088,7 +1085,7 @@ describe("link messages", () => {
       next: null,
     };
     const hint = { type: "desired", ids: [id], desired: page };
-    expect(ServerLinkMessage.safeParse(hint).success).toBe(true);
+    expect(LinkDesiredHint.safeParse(hint).success).toBe(true);
     for (const refused of [
       { ...hint, ids: undefined },
       { ...hint, ids: [newDatabaseId()] },
@@ -1097,7 +1094,7 @@ describe("link messages", () => {
       { ...hint, desired: { ...page, next: id } },
       { ...hint, desired: { ...page, region: { ...page.region, id: "us-1" } } },
     ])
-      expect(ServerLinkMessage.safeParse(refused).success).toBe(false);
+      expect(LinkDesiredHint.safeParse(refused).success).toBe(false);
     // Both ends of the link refuse a larger message, so a page is carried only within it.
     expect(LINK_MESSAGE_MAX_BYTES).toBe(64 * 1024);
   });

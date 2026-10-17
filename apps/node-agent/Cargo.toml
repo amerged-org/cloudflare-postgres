@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 webpki-roots = "=1.0.9"
+base64 = "=0.23.1"
+ring = "=0.17.14"
 pgcf-native-protocol = { path = "../../packages/native-protocol" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

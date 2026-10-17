@@ -34,7 +34,7 @@ hmac 0.13.0 and base64 0.23.1 (all `MIT OR Apache-2.0`), zeroize 1.9.1 (`Apache-
 rustls 0.23.45 (`Apache-2.0 OR ISC OR MIT`), and tokio 1.53.2 and tokio-tungstenite 0.30.0
 (MIT). The protocol crate adds regex 1.13.1 (`MIT OR Apache-2.0`). The node agent adds
 x509-parser 0.18.1, tokio-postgres 0.7.18 and libc 0.2.190 (`MIT OR Apache-2.0`), jsonschema
-0.58.6 and tokio-postgres-rustls 0.14.0 (MIT), and webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). Tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`).
+0.58.6 and tokio-postgres-rustls 0.14.0 (MIT), ring 0.17.14 (`Apache-2.0 AND ISC`; it signs the node's requests with its Ed25519 key), base64 0.23.1 as above, and webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). Tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`).
 rustls-pki-types is used directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not
 used. The gateway's SCRAM client uses hmac and zeroize directly, with sha2.
 
