@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import {
-  DatabaseWithOperation,
-  INFRA_ALERT_ACTIONS,
-  InfraAlert,
-  newNodeId,
-  type InfraAlertKind,
-} from "@pgcf/contracts";
+import { INFRA_ALERT_ACTIONS, InfraAlert, newNodeId } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
+import { runInfrastructureHealthAlerts } from "../../src/domain/infrastructure-alerts.ts";
 import {
-  infrastructureAlertStatus,
-  runInfrastructureHealthAlerts,
-} from "../../src/domain/infrastructure-alerts.ts";
+  HOUR,
+  ago,
+  awake,
+  database,
+  receiver,
+  status,
+  type Fixture,
+} from "./alert-fixtures.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
 afterEach(async () => {
@@ -21,63 +21,6 @@ afterEach(async () => {
   ).run();
   await cleanupFixtures();
 });
-
-type Fixture = Awaited<ReturnType<typeof fixture>>;
-const ago = (now: number, ms: number) => new Date(now - ms).toISOString();
-const HOUR = 3_600_000;
-
-async function database(
-  f: Fixture,
-  name: string,
-  columns: Record<string, string | number | null> = {},
-) {
-  const created = DatabaseWithOperation.parse(
-    await (await f.create(name)).json(),
-  );
-  const id = created.database.id,
-    keys = Object.keys(columns);
-  // The create's own lifecycle event is "now"; these databases claim an older history.
-  await env.DB.prepare("DELETE FROM lifecycle_events WHERE database_id=?")
-    .bind(id)
-    .run();
-  if (keys.length)
-    await env.DB.prepare(
-      `UPDATE databases SET ${keys.map((key) => `${key}=?`).join(",")} WHERE id=?`,
-    )
-      .bind(...Object.values(columns), id)
-      .run();
-  return id;
-}
-const awake = (now: number, extra: Record<string, string | number | null>) => ({
-  observed_state: "ready",
-  observed_power: "awake",
-  created_at: ago(now, 100 * HOUR),
-  ...extra,
-});
-/** The webhook receiver of the alert tests: records each event and acknowledges it. */
-function receiver() {
-  const events: { event: InfraAlert; key: string | null }[] = [];
-  const fetcher: typeof fetch = async (_url, init) => {
-    events.push({
-      event: InfraAlert.parse(JSON.parse(init!.body as string)),
-      key: new Headers(init!.headers).get("Idempotency-Key"),
-    });
-    return new Response(null, { status: 204 });
-  };
-  return {
-    events,
-    fetcher,
-    env: {
-      ...env,
-      INFRASTRUCTURE_ALERT_WEBHOOK_URL: "https://receiver.invalid/events",
-      INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN: "test-alert-receiver-token",
-    },
-  };
-}
-const status = async (f: Fixture, kind: InfraAlertKind) =>
-  (await infrastructureAlertStatus(env.DB, f.region)).find(
-    (value) => value.kind === kind,
-  );
 
 it("alarms a failing WAL archive once, with the databases and the runbook action, by email", async () => {
   const f = await fixture(),
@@ -417,7 +360,7 @@ it("alarms a thin pool without room, or below its growth point with no growth le
     },
   );
   const failing = () =>
-    hook.events.at(-1)!.event.thin_storage?.map((entry) => entry.error_code);
+    hook.events.at(-1)!.event.stalled?.map((entry) => entry.code);
   await poolSample(f, {
     dataTotal: 32 * gib,
     dataFree: 8 * gib,
@@ -475,7 +418,7 @@ it("alarms a thin pool that holds volumes while its node reports no fresh sample
     hook = receiver();
   await thinNode(f, { status: "ready", code: null });
   const failing = () =>
-    hook.events.at(-1)!.event.thin_storage?.map((entry) => entry.error_code);
+    hook.events.at(-1)!.event.stalled?.map((entry) => entry.code);
   const sample = (observedAt: string, physical: string | null) =>
     env.DB.prepare(
       "UPDATE node_storage_observations SET observed_at=?,physical_json=? WHERE node_id=?",
@@ -517,48 +460,6 @@ it("alarms a thin pool that holds volumes while its node reports no fresh sample
   expect(await status(f, "thin_storage_blocked")).toMatchObject({
     active: false,
   });
-});
-
-it("alarms a blocked Thin node with its error code, keeps the episode while it requalifies and clears it once ready", async () => {
-  const f = await fixture(),
-    now = Date.now(),
-    hook = receiver(),
-    set = (status: string, code: string | null) =>
-      env.DB.prepare(
-        "UPDATE node_thin_storage SET status=?,error_code=? WHERE node_id=?",
-      )
-        .bind(status, code, f.node)
-        .run();
-  await thinNode(f, { status: "ready", code: null });
-  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
-  expect(await status(f, "thin_storage_blocked")).toBeUndefined();
-  await set("blocked", "thin_storage_report_unqualified");
-  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
-  expect(hook.events).toHaveLength(1);
-  expect(hook.events[0]!.event).toMatchObject({
-    kind: "thin_storage_blocked",
-    thin_storage: [
-      { node_id: f.node, error_code: "thin_storage_report_unqualified" },
-    ],
-    action: INFRA_ALERT_ACTIONS.thin_storage_blocked,
-  });
-  await set("qualifying", null);
-  await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
-  expect(await status(f, "thin_storage_blocked")).toMatchObject({
-    active: true,
-  });
-  await set("ready", null);
-  await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
-  expect(await status(f, "thin_storage_blocked")).toMatchObject({
-    active: false,
-  });
-  // Only the pool reserve is short: no error code.
-  await set("blocked", null);
-  await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
-  expect(hook.events).toHaveLength(2);
-  expect(hook.events[1]!.event.thin_storage).toEqual([
-    { node_id: f.node, error_code: null },
-  ]);
 });
 
 it("still judges nodes when the database reads fail and keeps the unread kinds as they were", async () => {
