@@ -1,45 +1,28 @@
 # Daily infrastructure backups and alerts
 
-Daily infrastructure backups protect the Cloudflare control database and each
-existing regional Kubernetes control plane. They complement CNPG/Barman database
-base backups and WAL; they do not replace them. All storage uses the installation's
-existing, region-bound R2 archive buckets. No Contabo API call, server purchase,
-cluster credential rotation, or Kubernetes mutation occurs during capture.
+Daily infrastructure backups protect the Cloudflare control database (D1). They
+complement the Barman database base backups and WAL; they do not replace them. All
+storage uses the installation's existing, region-bound R2 archive buckets. No Contabo
+API call or server purchase occurs during capture.
 
 ## Installation configuration
 
 Apply migrations `0039_infrastructure_backups.sql`,
 `0043_infrastructure_backup_attempts.sql` and
 `0052_infrastructure_backup_deferrals.sql` (the status route of the Worker reads the
-last one, so apply it first), deploy the `InfrastructureBackup`
-Workflow binding shown in `apps/api/wrangler.example.jsonc`, and deploy the matching
-NodeBootstrap image. The existing minute Cron dispatches one persisted run per UTC
-calendar day and retries a failed day: the next attempt starts at least 90 minutes
-after the failed attempt ended, at most three attempts per UTC day, and never while
-another run is pending or running. The spacing makes the three attempts of a day
-cover several hours, so one disturbance cannot use them all. An attempt that is due
-waits, without taking an attempt number, while a fleet patch is running or a thin
-database is starting ([held-back attempts](#held-back-attempts)). Fresh
-installations have backups disabled and no email addresses configured.
-
-Set the operator-configurable `containers[].max_instances` high enough for a backup
-to run alongside node patches and installations. The example uses eight because a
-fleet patch keeps its container for the inactivity window after it finishes. These
-operations share the existing NodeBootstrap application; a full limit rejects the
-next container before native capture starts. Size this limit for the maintenance
-concurrency your installation allows, and keep it in the saved deployment
-configuration so a later publication does not restore an older limit.
+last one, so apply it first) and deploy the `InfrastructureBackup` Workflow binding
+shown in `apps/api/wrangler.example.jsonc`. The existing minute Cron dispatches one
+persisted run per UTC calendar day and retries a failed day: the next attempt starts
+at least 90 minutes after the failed attempt ended, at most three attempts per UTC
+day, and never while another run is pending or running. The spacing makes the three
+attempts of a day cover several hours, so one disturbance cannot use them all. An
+attempt that is due waits, without taking an attempt number, while a thin database is
+starting ([held-back attempts](#held-back-attempts)). Fresh installations have backups
+disabled and no email addresses configured.
 
 Set the private Worker secret `INFRASTRUCTURE_BACKUP_CF_TOKEN` to an operator-owned
 Cloudflare API token with D1 export permission for the actual control database.
-The token stays in the management Worker. The container receives only the temporary
-HTTPS export URL. Set `NODE_BOOTSTRAP_CALLBACK_URL` to the management API's public
-HTTPS origin and retain the existing protected relay binding, signing keys and
-sealed regional join material. Control nodes must report fresh signed fleet facts,
-including their Kubernetes control-plane role and configured/runtime Cilium image
-pins. Missing or changed authority fails the daily run rather than choosing an
-unverified source. Backups use the existing administrator relay capability; this
-change grants no new regional Kubernetes RBAC or Talos credentials to Pods.
+The token stays in the management Worker.
 
 Apply migration `0053_cron_heartbeat_and_alert_kinds.sql` with the Worker that
 introduces it, and keep the `CRON_WATCHDOG` Durable Object binding and its migration
@@ -83,11 +66,7 @@ changing the D1 account, database or archive region, revokes an unfinished run's
 capability. Changing only the alert sender or recipient never does: the update carries
 every valid pending or running run to the new revision in the same transaction, and a
 run the cron creates while the update is in flight takes the revision in the statement
-that inserts it. The existing operator Kubernetes API still requires administrator authorization.
-The internal backup WebSocket instead accepts only an expiring capability bound to
-one current run, artifact, node UID, cluster UID and custody revision. Both paths
-recheck current Cloudflare authority and the operator checks actual Kubernetes,
-Talos, boot and Cilium carrier identities before and after capture.
+that inserts it.
 
 ## Capture and acceptance
 
@@ -98,18 +77,14 @@ Control-plane requests may wait during this export window; [what is known about 
 length](#the-d1-export-window) and what is not is recorded below, and every run stores
 its own window.
 
-One Workflow captures D1 and one etcd snapshot per existing regional cluster in a
-private NodeBootstrap container. A region whose nodes are all marked lost, or that
-has no node, is skipped: the run captures no etcd snapshot there and backup
-freshness expects none. Files are streamed and hashed; the complete run's
-private payload workspace is bounded to 1 GiB. Encryption uses a purpose-derived
-AES-256-GCM key from the existing active `CREDENTIAL_KEYS` version. No cluster key
-or credential key is generated or rotated. Plaintext files are removed immediately
+One Workflow captures the D1 export. Files are streamed and hashed; the complete
+run's private payload workspace is bounded to 1 GiB. Encryption uses a
+purpose-derived AES-256-GCM key from the existing active `CREDENTIAL_KEYS` version.
+No credential key is generated or rotated. Plaintext files are removed immediately
 after encryption; the ephemeral workspace is removed when the run closes.
 
-The Worker uploads ciphertext using bounded 8 MiB R2 multipart parts over private
-container/R2 bindings, then reads the entire committed object back through the
-container. Completion requires matching object ownership, encrypted byte count,
+The Worker uploads ciphertext using bounded 8 MiB R2 multipart parts, then reads the
+entire committed object back. Completion requires matching object ownership, encrypted byte count,
 SHA-256, authenticated run/source identity, GCM tag, plaintext byte count and
 SHA-256. The receipt is persisted in D1 only after this full readback. Unique keys
 are `infrastructure/v1/<UTC-day>/<run-UUID>/<artifact-id>.pgcfenc`.
@@ -117,7 +92,7 @@ are `infrastructure/v1/<UTC-day>/<run-UUID>/<artifact-id>.pgcfenc`.
 A lost multipart completion response is resolved by reading that exact object.
 An existing unique object is verified, never overwritten. An uncertain Workflow
 creation is resolved using its persisted run UUID. Failed capture, lost transient
-container state, expired authority, or mismatching readback produces a durable
+capture state, expired authority, or mismatching readback produces a durable
 failed run; it does not repeat an uncertain write or regenerate a different archive
 under the same object identity. A same-day retry or the next UTC day creates a fresh
 run with its own UUID and object keys.
@@ -132,35 +107,29 @@ alarms reuse the existing heartbeat freshness rule. Never-observed new nodes do 
 trigger a stale-node alarm.
 
 Before accepting customer data, enable this configuration and verify a real daily
-run contains D1 and every expected regional etcd artifact with `status: complete`.
+run contains the D1 artifact with `status: complete`.
 Record the real artifact byte counts, full readback results, duration and recovery
 proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 ## Held-back attempts
 
-The capture reaches each regional Kubernetes API through the bootstrap relay and uses the control
-database, both of which a fleet patch is using, and the D1 export makes the control database
-unavailable for the whole of its job, which a thin database start in flight must not meet. A due
-attempt therefore waits, without taking an attempt number and so without using one of the day's
-three, while one of these holds. The Cron checks every minute:
+The D1 export makes the control database unavailable for the whole of its job, which a thin
+database start in flight must not meet. A due attempt therefore waits, without taking an attempt
+number and so without using one of the day's three, while this holds. The Cron checks every
+minute:
 
 | Reason | Holds while |
 | --- | --- |
-| `deferred_by_patch` | any fleet patch operation of any region is unfinished (stage not `complete` or `host_ready`, state not `halted`, deadline not passed, node not marked lost), or changed within the last 15 minutes |
 | `deferred_by_thin_start` | a thin database start (an admission that holds thin storage and has no `ready_at`) was granted within the last 15 minutes |
 
-The 15 minutes bridge the seconds between the operations of one rollout and the minutes after its
-last one. A halted patch, a patch past its deadline and a patch of a lost node hold an attempt back
-for those 15 minutes at most, so a stuck operation cannot stop backups; a start older than 15
-minutes counts as stuck, not as in flight.
+A start older than 15 minutes counts as stuck, not as in flight, so a stuck start cannot stop
+backups.
 
 Each check that holds an attempt back is recorded in `infrastructure_backup_deferrals`: one row per
 UTC day and reason with the first and the latest check and their number. `GET
 /v1/infrastructure-backups` returns the latest row as `deferral`; it is current while `last_at` is
-at most a few minutes old. A day held back by maintenance has no run until the maintenance ends;
-when no backup completes for 36 hours the existing stale alarm fires. A run that is already running
-is not stopped by a patch that starts: it may fail and takes its attempt, and the 90 minutes then
-separate it from the next.
+at most a few minutes old. A day that is held back has no run until the hold ends; when no backup
+completes for 36 hours the existing stale alarm fires.
 
 The export request repeats the thin-start check right before it asks the provider, because the
 Cron's check is a minute or more older (the first stall of a run was seen 20 to 126 s after its
@@ -168,54 +137,18 @@ creation). It polls every 5 s for at most 5 minutes for a start in flight to bec
 goes on, so neither a start that never becomes ready nor a check that fails can stop the backup.
 
 Not detectable: a thin start or a wake that begins after the export request (the export then
-overlaps it), an awake thin database under writes (see the export window below), a node addition
-and a material rotation (a run that overlaps either may fail its authority check and is retried).
-
-## The operator path and its timeout
-
-The etcd snapshot goes through the operator path. The container opens one WebSocket to the Worker
-per TCP connection of kubectl (`/internal/v1/infrastructure-backups/{run}/{artifact}/kubernetes`).
-For each connection the Worker checks the run capability and the node authority (the node must have
-been observed within 180 s) in 36 sequential D1 round trips, 13 of them inside the relay request's
-10 s budget, and connects through the relay to the Kubernetes API server. The container reads the
-node, namespace, DaemonSet and Pods with four `kubectl get` calls, starts `kubectl port-forward` to
-the verified host-network Cilium Pod and waits 20 s for it to print its listening address; talosctl
-then reaches the Talos API behind that port and takes the etcd snapshot. Without the address the run
-fails with `infrastructure_backup_operator_portforward_timeout`
-(`apps/node-bootstrap/src/talos-operator.ts`). kubectl retries a refused read before it fails, so a
-refused or slow connection ends as this timeout and not as a relay error.
-
-Observed on 2026-10-14: all three attempts failed with this code while a fleet rollout patched the
-region (23:47 to 00:31 UTC). The attempts were ten minutes apart, and the third began 86 seconds
-after the last patch operation. The rollout did not reboot either node and changed only the native
-controller image, so the control plane kept running. Which link stalled is not known: no per-phase
-record of a failed run survives (the container's port-forward log is removed with its workspace).
-The candidates, each made worse by a running patch: the node's observation lapsing while the
-controller is replaced (older than 180 s refuses every connection), the relay's 32 concurrent
-sessions that the patch's parallel kubectl reads share, the control database answering slowly, and
-the 20 s limit itself, which is thin against the two or three relayed connections the port-forward
-needs when one connection cost 2 to 6.6 s for the thin executor on 2026-10-12. Holding attempts
-back during a patch removes the shared cause whichever link it was; a timeout without a patch is a
-new observation to diagnose, and widening that limit or repeating the port-forward once is the
-next change to consider.
-
-Replayed over the ten recorded runs, the patch rule holds exactly the four failures that overlapped
-or trailed a patch (the three of 2026-10-14 and the first of 2026-10-12) and none of the four
-completed runs. The other two failures did not meet a patch: 2026-10-11 ended with
-`infrastructure_backup_snapshot_source_unavailable` and the second of 2026-10-12 with
-`infrastructure_backup_prepare_failed`, the code a failure without a recorded cause had then.
+overlaps it), an awake thin database under writes (see the export window below) and a node
+addition (a run that overlaps it may fail its authority check and is retried).
 
 ## The D1 export window
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile. Since [decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)
-no running database needs D1 to keep writing. A wake that arrives during the window needs D1. Until
-the host release of decision A, the EU1 host guard still stops thin databases when it gets no
-storage lease for 120 s; every stall measured below was shorter.
+meanwhile. No running database needs D1 to keep writing. A wake that arrives during the window
+needs D1.
 
-Measured from the usage samples of the six runs that reached or passed the export. The regional
-agent posts one sample every 15 s per emitting database; a gap in `usage_samples.observed_at` of
+Measured on the retired Kubernetes runtime from the usage samples of the six runs that reached or
+passed the export. The regional agent posted one sample every 15 s per emitting database; a gap in `usage_samples.observed_at` of
 source `agent` inside a run (`SELECT DISTINCT observed_at FROM usage_samples WHERE source='agent'
 AND observed_at BETWEEN <created_at> AND <completed_at> ORDER BY observed_at`, spacings above 25 s)
 is the time its posts did not complete:
@@ -230,8 +163,8 @@ is the time its posts did not complete:
 | 2026-10-15 | 468 MB | 00:02:21 to 00:02:58 (37 s) | 70 s |
 
 The gap runs from the last sample that was stored to the first one stored afterwards, so the stall
-itself is up to 30 s shorter than the gap: in three runs it lasted at least 37 s, more than three
-times the guard, and in the fourth between 7 and 37 s. It does not follow the database size, and in
+itself is up to 30 s shorter than the gap: in three runs it lasted at least 37 s, and in the fourth
+between 7 and 37 s. It does not follow the database size, and in
 two runs no stall is visible at all. The gateway's samples show the same gap as one longer interval.
 
 Unknown:
@@ -242,9 +175,8 @@ Unknown:
 - Whether a request during the window waits or is rejected: the code tolerates both.
 
 The raw samples this relies on are being reduced (pruned once their hourly rollup is final, none
-from idle databases), so read the derivation while they exist. Go-live step 9 is met when a night with an
-awake thin database under writes and one wake during the export shows no stopped database and no
-failed wake.
+from idle databases), so read the derivation while they exist. Go-live gate G6 also needs a night
+with an awake database under writes and one wake during the export that shows no failed wake.
 
 ## Optional email or webhook delivery
 
@@ -259,12 +191,12 @@ Per-node threshold warnings use the same delivery. Set `node_ram_warning_thresho
 `node_cpu_warning_threshold_ppm` or `node_storage_warning_threshold_ppm` through
 `PUT /v1/regions/{id}/capacity-policy` to an integer from 1 to 1000000 parts per
 million (`850000` means 85%); `null` disables one. The cron checks every node of a
-policy region each minute, including control:
+policy region each minute:
 
 - RAM uses the node's own fresh ten-minute window.
-- CPU averages kubelet CPU usage over the same ten minutes against node CPU capacity.
-  Only reporters that send the optional CPU sample fields supply it (the native
-  controller shipped with R2); otherwise CPU stays unknown and sends nothing.
+- CPU averages reported CPU usage over the same ten minutes against node CPU capacity.
+  Only reporters that send the optional CPU sample fields supply it (the node agent,
+  Stage 3); otherwise CPU stays unknown and sends nothing.
 - Storage uses the fresh LVM sample: thin-pool data or metadata fill, otherwise
   volume-group allocation.
 
@@ -299,46 +231,39 @@ same event ID while it stays active; a cleared episode sends nothing.
 | `regional_ram_warning` | regional ten-minute RAM utilization reaches the threshold | `ram_warning_threshold_ppm`, off by default | Read `GET /v1/regions/{id}/capacity-decision`; add a node or reduce awake databases |
 | `regional_node_cap_reached` | allocated nodes reached `max_nodes` | `cap_warning_enabled` with a finite `max_nodes` | Raise `max_nodes` in the capacity policy or free a slot |
 | `regional_node_ram_warning` | a node's ten-minute RAM average reaches the threshold | `node_ram_warning_threshold_ppm` | Reduce awake databases on the listed node or add capacity |
-| `regional_node_cpu_warning` | a node's ten-minute CPU average reaches the threshold | `node_cpu_warning_threshold_ppm`; unknown without the native controller's CPU samples | Reduce awake databases on the listed node or add capacity |
+| `regional_node_cpu_warning` | a node's ten-minute CPU average reaches the threshold | `node_cpu_warning_threshold_ppm`; unknown without the node agent's CPU samples | Reduce awake databases on the listed node or add capacity |
 | `regional_node_storage_warning` | the node's thin-pool data or metadata fill, otherwise its volume-group allocation, reaches the threshold | `node_storage_warning_threshold_ppm` | Grow the pool or free space; see Thin storage admission in [recovery](recovery.md) |
-| `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed; never-observed nodes are ignored | Check the server and its regional controller; if it is gone follow the lost-node runbook |
-| `infrastructure_backup_failed` | the latest daily D1 or etcd attempt failed | fixed | Read `GET /v1/infrastructure-backups` for the artifact's `error_code`; same-day retries run by themselves |
+| `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed; never-observed nodes are ignored | Check the server and its node agent; if it is gone follow the lost-node runbook |
+| `infrastructure_backup_failed` | the latest daily D1 attempt failed | fixed | Read `GET /v1/infrastructure-backups` for the artifact's `error_code`; same-day retries run by themselves |
 | `infrastructure_backup_stale` | no complete daily backup for 36 h | fixed | Read the same route and the cron heartbeat; fix the cause before the next 00:00Z run |
-| `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability, archive credentials and the backup plugin; WAL accumulates on the volume meanwhile |
+| `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability and archive credentials; WAL accumulates on the volume meanwhile |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
-| `thin_storage_blocked` | a node's Thin storage status is `blocked`, its fresh physical sample shows the thin pool without room or unable to grow, or a pool that holds thin volumes has no fresh sample | fixed | With a `thin_storage_*` code, repeat the node's storage-profile PUT with the current `expected_revision` after the lease expires; with `thin_pool_no_room` or `thin_pool_growth_exhausted`, or none, grow the pool by hand (raise the profile's maximum or add a disk to the volume group) or free space |
+| `thin_storage_blocked` | a node's fresh physical sample shows the thin pool without room or unable to grow, or a pool that holds thin volumes has no fresh sample | fixed | With `thin_pool_no_room` or `thin_pool_growth_exhausted`, grow the pool by hand (raise the profile's maximum or add a disk to the volume group) or free space; with `thin_pool_unobserved`, fix the node's storage sample |
 | `control_cron_stalled` | no run of the minute cron completed for 300 s | fixed | Check the Worker's cron trigger and logs; see the cron heartbeat below |
 | `control_cron_step_failing` | a cron step failed in each of its last 5 completed runs | fixed | Read the Worker logs for `cron_step_failed` with the step named in `cron.failing_steps` |
 
 Rules of the database and Thin storage kinds:
 
 - **WAL archive.** Only a database that is running, awake and `ready` is judged; its
-  `health.archiving` must be `failing` (the controller reports that for a stalled queue,
-  a backlog of 32 or more segments, or CNPG's `ContinuousArchiving` false). `unknown` and
-  `ok` never fire. A database that is hibernated, suspended or deleted cannot archive
+  `health.archiving` must be `failing` (the node reports that for a stalled queue or a
+  backlog of 32 or more segments). `unknown` and
+  `ok` never fire. A database that is asleep, suspended or deleted cannot archive
   and is left out.
 - **Base backup.** The 36 h count starts at the latest of the last completed base backup,
   the database's placement (`created`) and its last wake (`woke`, written by every resume
   and wake). A `ready` event is not a wake: any generation bump, such as a role change or a
-  resize, writes one. The daily 03:00 UTC backup skips a hibernated cluster, so a database
+  resize, writes one. The daily 03:00 UTC backup skips a sleeping database, so a database
   that slept through it is not reported until it has been awake 36 h without a backup. The
   agent's backup report must be fresh (at most 180 s old) and `ok` with a completion time,
-  or `failing`; a hibernated database and an unknown report are excluded.
-- **Thin storage.** `blocked` with a `thin_storage_*` `error_code` needs an operator
-  (identity or qualification refused); `blocked` with `error_code: null` means the pool is
-  below its data or metadata reserve at the last identity proof. From the node's fresh
-  physical sample (at most 120 s old), `thin_pool_no_room` means no database starts or
-  attaches on the node; `thin_pool_growth_exhausted` means the pool is below its growth
-  point with no growth left (its maximum reached or the volume group too full) or its
-  metadata, which does not grow, is under twice its reserve. `thin_pool_unobserved` means a
-  node with a bound thin volume has no physical sample of its pool at most 120 s old (the
-  storage exporter scrape fails or the controller does not post), so neither the room rule,
-  the growth nor this alert sees the pool fill: check the controller's
-  `node_storage_sample_failed` events and the exporter. While growth is possible the
-  capacity cron requests the pool growth turn itself. Running databases are never stopped
-  for storage; a pool that does fill fails the write and PostgreSQL stops without
-  acknowledging it. A node that is selected or qualifying again keeps the episode until it
-  is `ready`.
+  or `failing`; a sleeping database and an unknown report are excluded.
+- **Thin storage.** From the node's fresh physical sample (at most 120 s old),
+  `thin_pool_no_room` means no database starts on the node; `thin_pool_growth_exhausted`
+  means the pool is below its growth point with no growth left (its maximum reached or the
+  volume group too full) or its metadata, which does not grow, is under twice its reserve.
+  `thin_pool_unobserved` means a node with a bound thin volume has no physical sample of its
+  pool at most 120 s old, so neither the room rule nor this alert sees the pool fill. Running
+  databases are never stopped for storage; a pool that does fill fails the write and
+  PostgreSQL stops without acknowledging it.
 - **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
   16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the
   episode with a new event that lists the current subjects (this also holds for
@@ -355,7 +280,7 @@ The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
 `infrastructure_backup_dispatch`, then `admission_recovery`,
 `resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `role_deletion_timeouts`,
 `idempotency_purge`, `region_hints`, `database_actors`, `usage`, `node_capacity`,
-`retained_archives`, `fleet_updates` and `fleet_rollouts`. Alerting needs only D1 and a bounded send, so it
+`retained_archives` and `fleet_updates`. Alerting needs only D1 and a bounded send, so it
 leads, and the daily backup dispatch follows ahead of the steps that call out to other
 systems: a step that fails, is slow or exhausts the invocation's D1 statement budget cannot
 starve them. A step that hangs still holds back the steps after it in that run; the stall
@@ -419,7 +344,7 @@ event ID at least 60 s later.
 ## Offline recovery custody
 
 Keep all referenced `CREDENTIAL_KEYS.keys[kid]` versions in protected offline
-custody, separate from R2 and D1. A D1 export contains encrypted cluster/role custody;
+custody, separate from R2 and D1. A D1 export contains encrypted role custody;
 it cannot recover those credentials if the matching master key versions were lost.
 Never upload a plaintext keyring alongside these objects. Disabling capture or
 changing the active key does not retire keys needed by existing archives.
@@ -431,6 +356,6 @@ master version: salt UTF-8 `pgcf-infrastructure-backup-v1`, info UTF-8 the `kid`
 AAD binds the run/artifact/source/day/region, node and cluster identities, custody
 revision, `kid`, plaintext SHA-256 and byte count. Verify the complete encrypted
 SHA-256/length from the API receipt and GCM/AAD/plaintext hash before writing or
-restoring recovered SQL/snapshots. Never restore an unverified or partial object.
-Use the existing [recovery runbook](recovery.md) for controlled D1 and etcd restoration;
+restoring recovered SQL. Never restore an unverified or partial object.
+Use the existing [recovery runbook](recovery.md) for controlled D1 restoration;
 restoration changes live state and requires explicit operator authorization.

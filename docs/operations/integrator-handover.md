@@ -10,9 +10,9 @@ and Appendix C lists what the served OpenAPI document states in words rather tha
 Behaviour without a live acceptance is marked **not yet verified**. Values that are installation
 configuration rather than code (region policy, alert thresholds) were read from the live
 installation on 2026-10-15 and are labelled as such. Measured numbers carry their source in the
-[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#done), which is also
+[ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#111-done), which is also
 where PGCF publishes new ones. The plan's
-[Go-live path](../architecture/cloudflare-convergence-and-serverless-plan.md#go-live-path) is the
+[go-live gates](../architecture/cloudflare-convergence-and-serverless-plan.md#stage-7-go-live-gates) are the
 authority on what still blocks go-live; operator procedures are in the other runbooks
 ([recovery](recovery.md), [credentials](credentials.md),
 [infrastructure backups](infrastructure-backups.md)).
@@ -21,7 +21,8 @@ authority on what still blocks go-live; operator procedures are in the other run
 
 | Topic | State on 2026-10-15 |
 | --- | --- |
-| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met** yet: the [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design) of free PostgreSQL instances that targets it is live on EU1 since 2026-10-17, and its first live hit answered the first SaaS request after 1.09 s (Go-live path: *Cold request under one second*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
+| Runtime | The Kubernetes runtime this handover describes was retired on 2026-10-17. No node executes databases until the Debian node runtime passes Stage 5 of the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md); this handover is rewritten in Stage 6. |
+| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met** yet: the pool of free PostgreSQL instances that targets it is live on EU1 since 2026-10-17, and its first live hit answered the first SaaS request after 1.09 s (Go-live path: *Cold request under one second*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
 | Redundancy | One customer node (EU1), one PostgreSQL instance per database, no replica, no second node. Losing EU1 stops every database until it is restored from R2 onto new capacity ([7](#7-failure-and-recovery)). |
 | Capacity numbers | The density test that measures how many databases may be awake has not run (Go-live path: *Density on EU1*). The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the arithmetic the admission code applies, not measured capacity. |
 | New databases | Thin storage is live on EU1 and new databases are placed on Thin volumes; open defects of Thin starts and idle sleeps are listed in the ULTRA plan (go-live path and after go-live). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced ([2.1](#21-create)). |
@@ -603,7 +604,7 @@ Measured wake times through Cloudflare (standard runtime, CNPG hibernation):
 | Earlier 20-wake series (p50 / p95 / max) | 8.4 / 9.2 / 9.7 s |
 | Already awake database, first row | 0.47–0.96 s (0.54–0.61 s in the warm rounds) |
 
-**The sub-second goal is not met yet.** The path to it is the [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design): a cold
+**The sub-second goal is not met yet.** The path to it is the pool: a cold
 database's volume is attached to an already running, free PostgreSQL instance on its node, so the
 next connection does not wait for a new Pod. Its first live hit through Cloudflare (2026-10-17)
 answered the first SaaS request after 1.09 s; p95, misses and databases idle for an hour are not
@@ -941,7 +942,7 @@ disk verdicts for every project at once.
 | Archiving failing (`health.archiving: failing`, for example an R2 problem) | connections keep working; WAL accumulates on the volume until archiving works again, and a full volume stops writes (standard PostgreSQL behaviour, not tested here) | recoverable window goes stale | escalate at once |
 | Volume full | PostgreSQL cannot write | kept | free space; for Thin, resize to a larger class ([2.5](#25-resize)) |
 | **EU1 lost** | **all databases are down.** Their local volumes are gone with the server | only what reached R2 | [7.4](#74-eu1-lost) |
-| Cloudflare unavailable | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake databases keep running and wakes fail; until the host release of [decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17), the EU1 host guard stops Thin databases when it gets no storage lease from Cloudflare for 120 s | kept | wait |
+| Cloudflare unavailable | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake databases keep running and wakes fail | kept | wait |
 
 ### 7.2 Recovery point
 
@@ -1130,14 +1131,14 @@ outcome and are not replayed.
 | Edge, hints, SQLSTATE, deadline, decoy | `apps/edge/src/*.ts` (the Rust/Wasm port in `apps/edge-rust` applies the same policy) |
 | HTTP query mode | `apps/edge/src/sql.ts`, `apps/native-gateway/src/sql.rs` |
 | Gateway limits, TLS, cancel, startup, idle close | `apps/native-gateway/src/transport.rs`, `packages/native-protocol/src/activity.rs`, `packages/contracts/src/pg-wire.ts`, `packages/contracts/native/protocol.generated.json` |
-| Sleep sequence and refusals | `apps/native-controller/src/power.rs` |
-| PostgreSQL cluster, backup schedule, retention, `pg_hba` | `apps/native-controller/src/manifests.rs`, `infra/postgres/README.md`, `infra/platform/versions.lock.json` |
+| Sleep sequence and refusals | `apps/node-agent/src/power.rs` |
+| PostgreSQL cluster, backup schedule, retention, `pg_hba` | the retired runtime on the `archive/kubernetes-runtime` branch |
 | Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, [README](../../README.md) |
-| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/native-controller/src/measurements.rs` |
+| Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/node-agent/src/measurements.rs` |
 | Alerts, health | `apps/api/src/domain/{operational-health,infrastructure-alerts,cron-health}.ts`, `apps/api/src/{cron,cron-watchdog}.ts`, `docs/operations/infrastructure-backups.md` |
-| Recovery, maintenance | `docs/operations/recovery.md`, `docs/operations/fleet-patches.md` |
+| Recovery, maintenance | `docs/operations/recovery.md` |
 | Measured numbers and open steps | the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md) |
-| Region policy, Thin profile, alert thresholds (installation values) | `GET /v1/regions/{id}/capacity-policy` and `GET /v1/nodes/{id}/storage-profile` of the live installation, not the repository |
+| Region policy, alert thresholds (installation values) | `GET /v1/regions/{id}/capacity-policy` of the live installation, not the repository |
 
 ## Appendix C. What the served OpenAPI document states in words
 
