@@ -195,7 +195,7 @@ async function inspectionStatusBody(response: Response, signal: AbortSignal) {
   }
 }
 
-/** Section 5 of thin-authority-renewal.md: failures that end only this identity turn. A relay
+/** Failures that end only this identity turn. A relay
  * transport or callback refused after its repeats, a command that still fails after its repeats and
  * an absent executor or a read-consistency race keep the node ready while the identity proof stays valid; identity,
  * qualification, ownership and uncertain pool-action failures block it as before. */
