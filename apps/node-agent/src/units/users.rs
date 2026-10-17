@@ -62,7 +62,8 @@ struct State {
     uids: BTreeMap<String, u32>,
 }
 
-/// The uids handed out on this node, persisted in one file that is replaced atomically.
+/// The uids handed out on this node, persisted in one file that is replaced atomically. The
+/// calls that change it take `&mut self`: the agent keeps one table behind a lock.
 pub struct Users {
     path: PathBuf,
     uids: BTreeMap<String, u32>,

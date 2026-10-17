@@ -304,7 +304,10 @@ async fn a_unit_that_is_still_starting_is_waited_for() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(seen, ActiveState::Activating);
-    let started = within(units.wait_started(id)).await.unwrap();
+    // A start of a unit that is starting joins the start under way: both see the same unit.
+    let (waited, joined) = tokio::join!(within(units.wait_started(id)), within(units.start(id)),);
+    let started = waited.unwrap();
+    assert_eq!(joined.unwrap(), started);
     assert_eq!(started.uid, database.uid);
     assert_eq!(
         units.state(id).await.unwrap().main_pid,
