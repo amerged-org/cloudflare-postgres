@@ -17,10 +17,21 @@ params=${1:?usage: install.sh /ABSOLUTE/PARAMS_FILE [--validate-only]}
 	exit 2
 }
 # cloud-config.yaml writes install.sh and the parameters into one directory, which is the work
-# directory.
+# directory. cloud-init created it with its default mode and the parameters in it carry the tokens,
+# so it is closed before anything is read, which also covers a refused parameter.
 work=${params%/*}
+validate_only=false
+[ "${2-}" = --validate-only ] && validate_only=true
+$validate_only || chmod 0700 "$work"
 ram=$work/ram
 target=$work/target
+
+# A refused parameters file is removed, because it holds the tokens; --validate-only leaves it.
+refuse() {
+	echo "$1" >&2
+	$validate_only || rm -f "$params"
+	exit 2
+}
 
 names=" PGCF_IMAGE_URL PGCF_IMAGE_ZST_SHA256 PGCF_IMAGE_ZST_BYTES PGCF_IMAGE_RAW_SHA256 PGCF_IMAGE_RAW_BYTES PGCF_DISK_BYTES PGCF_MEMORY_MIN_KIB PGCF_MAC PGCF_IPV4 PGCF_IPV4_PREFIX PGCF_IPV4_GATEWAY PGCF_IPV6 PGCF_IPV6_PREFIX PGCF_IPV6_GATEWAY PGCF_DNS PGCF_HOSTNAME PGCF_PROGRESS_URL PGCF_PROGRESS_TOKEN PGCF_NODE_ID PGCF_REGION PGCF_API_URL PGCF_ENROLLMENT_TOKEN "
 for name in $names; do unset "$name"; done
@@ -30,26 +41,17 @@ while IFS= read -r line || [ -n "$line" ]; do
 	name=${line%%=*}
 	case $names in
 	*" $name "*) printf -v "$name" '%s' "${line#*=}" ;;
-	*)
-		echo "unknown parameter" >&2
-		exit 2
-		;;
+	*) refuse "unknown parameter" ;;
 	esac
 done <"$params"
 
 need() {
 	local name=$1 pattern=$2
-	[[ ${!name-} =~ $pattern ]] || {
-		echo "invalid or missing parameter $name" >&2
-		exit 2
-	}
+	[[ ${!name-} =~ $pattern ]] || refuse "invalid or missing parameter $name"
 }
 token_length() {
 	local value=${!1}
-	[ "${#value}" -ge 16 ] && [ "${#value}" -le 512 ] || {
-		echo "invalid parameter $1" >&2
-		exit 2
-	}
+	[ "${#value}" -ge 16 ] && [ "${#value}" -le 512 ] || refuse "invalid parameter $1"
 }
 hex64='^[0-9a-f]{64}$'
 count='^[1-9][0-9]{0,15}$'
@@ -81,14 +83,10 @@ need PGCF_API_URL "$https"
 need PGCF_ENROLLMENT_TOKEN "$token"
 token_length PGCF_ENROLLMENT_TOKEN
 if [ -n "${PGCF_IPV6}" ] && { [ -z "${PGCF_IPV6_PREFIX}" ] || [ -z "${PGCF_IPV6_GATEWAY}" ]; }; then
-	echo "IPv6 needs an address, a prefix and a gateway" >&2
-	exit 2
+	refuse "IPv6 needs an address, a prefix and a gateway"
 fi
-[ "${2-}" = --validate-only ] && exit 0
+if $validate_only; then exit 0; fi
 
-# cloud-init created the directory with its default mode, which `mkdir -p -m` leaves alone.
-mkdir -p "$work"
-chmod 0700 "$work"
 # The progress token travels in a header file, never on a command line.
 printf 'Authorization: Bearer %s\n' "${PGCF_PROGRESS_TOKEN}" >"$work/progress.header"
 

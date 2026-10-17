@@ -134,6 +134,44 @@ test("a failed install reports it, leaves a 0700 work directory and removes both
   }
 });
 
+test("a refused parameters file is removed and its directory is made 0700, except under --validate-only", () => {
+  const root = mkdtempSync(join(tmpdir(), "pgcf-installer-"));
+  try {
+    const valid = installerParameters(longest);
+    const refusals: Record<string, string> = {
+      "an unknown name": `${valid}PGCF_EXTRA=1\n`,
+      "an invalid value": valid.replace(/^PGCF_IMAGE_URL=https:/m, "PGCF_IMAGE_URL=http:"),
+      "a short token": valid.replace(/^PGCF_ENROLLMENT_TOKEN=.*$/m, "PGCF_ENROLLMENT_TOKEN=short"),
+      "an incomplete IPv6 address": valid.replace(/^PGCF_IPV6_GATEWAY=.*$/m, "PGCF_IPV6_GATEWAY="),
+    };
+    for (const [name, text] of Object.entries(refusals)) {
+      const work = join(root, name.replaceAll(" ", "-"));
+      mkdirSync(work);
+      chmodSync(work, 0o755);
+      const params = join(work, "params");
+      writeFileSync(params, text, { mode: 0o600 });
+      const run = (...flags: string[]) =>
+        spawnSync(toolPath("bash"), [new URL("install.sh", import.meta.url).pathname, params, ...flags], {
+          encoding: "utf8",
+          env: { PATH: "/usr/bin:/bin" },
+        });
+
+      const validated = run("--validate-only");
+      assert.equal(validated.status, 2, `${name}: ${validated.stderr}`);
+      assert.deepEqual(readdirSync(work), ["params"], `${name}: --validate-only leaves the file in place`);
+      assert.equal(statSync(work).mode & 0o777, 0o755, `${name}: --validate-only leaves the mode alone`);
+
+      const installed = run();
+      assert.equal(installed.status, 2, `${name}: ${installed.stderr}`);
+      assert.doesNotMatch(installed.stderr, /e{16}|t{16}/, `${name}: no token in the error output`);
+      assert.equal(statSync(work).mode & 0o777, 0o700, `${name}: the directory is 0700`);
+      assert.deepEqual(readdirSync(work), [], `${name}: no token file is left behind`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("install.sh needs only tools the Contabo rescue system carries", () => {
   const tools = /^for tool in ([a-z0-9 ]+); do$/m.exec(script)?.[1]?.split(" ");
   assert.ok(tools, "install.sh checks its tools before it starts");

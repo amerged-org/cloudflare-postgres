@@ -224,8 +224,9 @@ reads it back, moves the backup GPT, writes the network settings, hostname, `res
 enrollment seed, reports each checkpoint (`started`, `hardware_ok`, `image_verified`,
 `disk_written`, `configured`, `rebooting`, or `failed` with the step) to the progress URL with the
 progress token from a header file, and reboots. The work directory (the one that holds `install.sh`
-and the parameters) is set to 0700, and the header file and the parameters file are removed when
-the install succeeds and when it fails.
+and the parameters) is set to 0700 before the parameters are read, and the header file and the
+parameters file are removed when the install succeeds, when it fails and when a parameter is
+refused; `--validate-only`, which the renderer test uses, changes nothing.
 
 The installer is built on what Stage 1 recorded about Contabo's rescue system (plan 11.1):
 
