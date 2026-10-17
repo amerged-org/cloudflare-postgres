@@ -200,8 +200,6 @@ pub struct Facts<'a> {
     pub trigger: Trigger<'a>,
     /// The database's cached desired row.
     pub cell: Option<&'a Value>,
-    /// The generation of a storage protection marker of the database.
-    pub protection: Option<u64>,
     /// The database sleeps: its sleep completed and its own Cluster is hibernated.
     pub asleep: bool,
     /// A ticket of another operation or generation is pending for it.
@@ -229,7 +227,7 @@ pub struct Choice {
     pub slot: String,
     pub volume: Volume,
 }
-/// Decides a wake by the table of the build spec (rows 1-16, first failing row wins).
+/// Decides a wake by the table of the build spec (first failing row wins).
 pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     let miss = |reason| Err((Outcome::Miss, reason));
     let Some(cell) = facts.cell else {
@@ -238,13 +236,6 @@ pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     let generation = number(cell, "generation");
     if text(cell, "desired_state") == "deleted" {
         return Err((Outcome::Refused, "deleted"));
-    }
-    if let Some(protected) = facts.protection {
-        return if protected >= generation {
-            Err((Outcome::Refused, "protected"))
-        } else {
-            miss("protected")
-        };
     }
     let power = &cell["power"];
     let sleeping = text(cell, "desired_state") == "suspended"
@@ -1202,9 +1193,6 @@ impl Pool {
         let facts = Facts {
             trigger,
             cell: Some(db),
-            protection: storage
-                .as_ref()
-                .and_then(crate::power::protection_generation),
             asleep: cluster
                 .ok()
                 .flatten()

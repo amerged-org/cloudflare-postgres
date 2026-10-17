@@ -1881,14 +1881,6 @@ impl PowerCoordinator {
         intent: &PowerIntent,
         sleep: &Sleep<'_>,
     ) -> Option<Value> {
-        if sleep.slot.is_none() {
-            match self.protected_manual_suspend(db, intent).await {
-                Ok(Some(result)) => return result,
-                Ok(None) => {}
-                Err(Fault::Recovery(reason)) => return Some(recovery_observation(db, reason)),
-                Err(_) => return None,
-            }
-        }
         let mut map = None;
         let mut progress = None;
         let result: Result<Option<Value>> = async {
@@ -2186,146 +2178,6 @@ impl PowerCoordinator {
             }
         }
     }
-    /// An explicit stop may confirm an already protected postmaster's absence. This
-    /// neither proves archival completion nor repeats SQL against a stopped process.
-    async fn protected_manual_suspend(
-        &self,
-        db: &Value,
-        intent: &PowerIntent,
-    ) -> Result<Option<Option<Value>>> {
-        if db["storage"].is_null()
-            || text(&db["power"], "reason") != "manual"
-            || intent.mode != "quiesce"
-        {
-            return Ok(None);
-        }
-        let id = text(db, "id");
-        let ns = namespace(db);
-        let storage_name = format!("storage-{id}");
-        let Some(storage) = self
-            .k8s
-            .read("ConfigMap", Some(SYSTEM), &storage_name)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let storage = owned(Some(storage), &storage_name, id, Some(SYSTEM), false)?;
-        let Some(raw) = storage["data"][protection_key()].as_str() else {
-            return Ok(None);
-        };
-        let marker: Value = serde_json::from_str(required(raw, 4096)?)
-            .map_err(|_| Fault::Recovery("storage_protection_marker_invalid"))?;
-        let (physical, cluster) = self.anchor(db).await?;
-        let generation = crate::contracts::integer(&marker, "generation")?;
-        if marker["v"] != 1
-            || marker["database_id"] != id
-            || generation == 0
-            || generation >= intent.revision
-            || !valid_pattern("operation", text(&marker, "operation_id"))
-            || marker["operation_id"] == intent.operation
-            || marker["storage_uid"] != physical.storage_uid
-            || uid(&storage)? != physical.storage_uid
-            || marker["namespace_uid"] != physical.namespace_uid
-            || marker["cluster_uid"] != physical.cluster_uid
-            || marker["node_uid"] != db["storage"]["node_uid"]
-            || marker["profile_sha256"] != db["storage"]["profile_sha256"]
-            || crate::contracts::integer(&marker, "requested_at")? > self.now()
-        {
-            return Err(Fault::Recovery("storage_protection_marker_changed"));
-        }
-        let mut map = self.fence(db).await?;
-        let previous = map
-            .as_ref()
-            .map(|value| progress_from(value, self.now()))
-            .transpose()?
-            .flatten();
-        if previous
-            .as_ref()
-            .is_some_and(|progress| !progress.anchor.matches(&physical))
-        {
-            return Err(Fault::Recovery("power_storage_identity_changed"));
-        }
-        if previous
-            .as_ref()
-            .is_some_and(|progress| progress.target.revision > intent.revision)
-        {
-            return Err(Fault::Stale);
-        }
-        if cluster["metadata"]["annotations"][HIBERNATION] != "on"
-            || !condition(&cluster, HIBERNATION)
-            || !self
-                .k8s
-                .list("Pod", Some(&ns), Some("cnpg.io/cluster=database"))
-                .await?
-                .iter()
-                .all(terminal_pod)
-        {
-            return Ok(Some(None));
-        }
-        if map
-            .as_ref()
-            .map(|value| intent_from(value, id))
-            .transpose()?
-            .as_ref()
-            != Some(intent)
-        {
-            // Retain any existing switch/archival uncertainty verbatim. Only the
-            // normal gateway intent advances to the current CF-owned manual stop.
-            let progress = previous.unwrap_or_else(|| {
-                Progress::new(
-                    intent.clone(),
-                    Phase::Quiescing,
-                    physical.clone(),
-                    self.now(),
-                )
-            });
-            map = Some(
-                self.write(db, map.as_ref(), Some(intent), &progress)
-                    .await?,
-            );
-        }
-        let current = map.ok_or(Fault::Recovery("gateway_fence_missing"))?;
-        self.bind_fence(db, &current).await?;
-        let snapshot = self.snapshot().await?;
-        self.controls(intent, &snapshot, "begin").await?;
-        self.controls(intent, &snapshot, "close").await?;
-        self.controls(intent, &snapshot, "status").await?;
-        let (confirmed, cluster) = self.anchor(db).await?;
-        let actual = self.fence(db).await?.ok_or(Fault::Stale)?;
-        let fresh = owned(
-            self.k8s
-                .read("ConfigMap", Some(SYSTEM), &storage_name)
-                .await?,
-            &storage_name,
-            id,
-            Some(SYSTEM),
-            false,
-        )?;
-        if !confirmed.matches(&physical)
-            || uid(&actual)? != uid(&current)?
-            || intent_from(&actual, id)? != *intent
-            || fresh["data"][protection_key()] != raw
-            || uid(&fresh)? != physical.storage_uid
-        {
-            return Err(Fault::Recovery("protected_stop_identity_changed"));
-        }
-        if cluster["metadata"]["annotations"][HIBERNATION] != "on"
-            || !condition(&cluster, HIBERNATION)
-            || !self
-                .k8s
-                .list("Pod", Some(&ns), Some("cnpg.io/cluster=database"))
-                .await?
-                .iter()
-                .all(terminal_pod)
-            || !self.snapshot().await?.same_identity(&snapshot)
-        {
-            return Ok(Some(None));
-        }
-        self.cluster_intent(intent, &cluster, "on").await?;
-        let mut value = observation(db, intent, "hibernated", None);
-        value["message"]="Physical storage protection stopped PostgreSQL; committed WAL is retained locally and archive completion is unknown".into();
-        Ok(Some(Some(value)))
-    }
     pub async fn prepare_running(
         &self,
         db: &Value,
@@ -2337,19 +2189,13 @@ impl PowerCoordinator {
         let intent = desired_power(db)?.ok_or("wake intent missing")?;
         let phase = timing::Phase::begin(db, "wake_prepare");
         let result = tokio::time::timeout(Duration::from_secs(10), async {
-            // The anchor is read while the fence and the thin receipt are, and looked at only
-            // if this wake is not the creation's own (which has no anchor yet).
-            let (map, protected, anchored) = tokio::join!(
-                self.fence(db),
-                self.storage_protection_for_running(db, &intent),
-                self.anchor(db)
-            );
+            // The anchor is read while the fence is, and looked at only if this wake is not the
+            // creation's own (which has no anchor yet).
+            let (map, anchored) = tokio::join!(self.fence(db), self.anchor(db));
             let map = map?;
-            let protected = protected?;
             if map.is_none()
                 && db["creation"]["ever_ready"] == false
                 && number(&db["creation"], "generation") <= number(db, "generation")
-                && !protected
             {
                 return Ok(PrepareRunning::Proceed);
             }
@@ -2372,10 +2218,6 @@ impl PowerCoordinator {
             {
                 return Err(Fault::Stale);
             }
-            // A same-generation/rebound marker must reject before either progress
-            // or hibernation-off changes. CAS clearing belongs only to the new CF intent.
-            self.clear_storage_protection(db, &intent, &physical.storage_uid)
-                .await?;
             // A database that retains its instance Pod resumes it when nothing it was parked
             // under has changed, and otherwise demotes it before the ordinary CNPG wake.
             if let (Some(held), Some(current)) =
@@ -3726,177 +3568,6 @@ fn report_count(value: &Value, key: &str) -> Result<u64> {
         .filter(|v| *v <= MAX_SAFE)
         .ok_or(Fault::Unavailable("gateway_ack_identity_mismatch"))
 }
-/// The generation of the storage protection marker a storage receipt holds, if it holds one.
-pub(crate) fn protection_generation(storage: &Value) -> Option<u64> {
-    let raw = storage["data"][protection_key()].as_str()?;
-    let marker: Value = serde_json::from_str(raw).ok()?;
-    marker["generation"].as_u64()
-}
-fn protection_key() -> &'static str {
-    POWER_CONTRACT["constants"]["STORAGE_PROTECTION_LEDGER_KEY"]
-        .as_str()
-        .expect("generated protection key")
-}
-fn storage_operation(db: &Value) -> Value {
-    db["power"]["operation"]
-        .as_str()
-        .or_else(|| db["recovery"]["operation_id"].as_str())
-        .or_else(|| db["creation"]["operation_id"].as_str())
-        .map(|v| Value::String(v.into()))
-        .unwrap_or(Value::Null)
-}
-#[cfg(test)]
-#[test]
-fn a_protected_restore_keeps_the_current_cloudflare_restore_operation_for_node_readback() {
-    let restore = format!("op_{}", "r".repeat(20));
-    let mut db = json!({"power":null,"creation":{"operation_id":null},"recovery":{"operation_id":restore,"status":"running"}});
-    assert_eq!(
-        storage_operation(&db),
-        db["recovery"]["operation_id"],
-        "a restore archive suffix and NodeBootstrap protection witness name this operation"
-    );
-    db["power"] = json!({"operation":format!("op_{}","w".repeat(20))});
-    assert_eq!(
-        storage_operation(&db),
-        db["power"]["operation"],
-        "a later CF resume remains the current protection owner"
-    );
-}
-impl PowerCoordinator {
-    /// Physical lease failure is not a Cloudflare suspend operation. This path
-    /// cannot force a WAL switch, claim successful hibernation or release CPU holds.
-    pub async fn protect_storage(&self, db: &Value) -> std::result::Result<Option<Value>, Error> {
-        if !database_valid(db) || db["storage"].is_null() || text(db, "desired_state") == "deleted"
-        {
-            return Err("invalid physical storage protection scope".into());
-        }
-        let result=tokio::time::timeout(Duration::from_secs(10),async{
-   let id=text(db,"id");let ns=namespace(db);let storage_name=format!("storage-{id}");let(namespace_value,cluster_value,storage_value)=tokio::try_join!(self.k8s.read("Namespace",None,&ns),self.k8s.read("Cluster",Some(&ns),"database"),self.k8s.read("ConfigMap",Some(SYSTEM),&storage_name))?;
-   // No object identity is invented before an authorized bounded startup has
-   // actually created it. The caller owns the separate CF start-admission check.
-   let(Some(namespace_value),Some(cluster_value),Some(storage_value))=(namespace_value,cluster_value,storage_value)else{return Ok(None);};
-   let namespace_value=owned(Some(namespace_value),&ns,id,None,false)?;let cluster=owned(Some(cluster_value),"database",id,Some(&ns),false)?;let storage=owned(Some(storage_value),&storage_name,id,Some(SYSTEM),false)?;
-   if [&namespace_value,&cluster,&storage].iter().any(|v|generation(v)>number(db,"generation")||v["metadata"]["annotations"]["pgcf.io/accepted-generation"].as_str().and_then(|s|s.parse::<u64>().ok()).is_some_and(|g|g>number(db,"generation"))){return Err(Fault::Stale);}
-   let state:Value=serde_json::from_str(required(text(&storage["data"],"state"),4096)?).map_err(|_|Fault::Recovery("storage_fence_invalid"))?;
-   if state["namespaceUid"]!=uid(&namespace_value)?||state["clusterUid"]!=uid(&cluster)?||state["storage"]!=db["storage"]{return Err(Fault::Recovery("storage_protection_identity_changed"));}
-   let prior=storage["data"][protection_key()].as_str().map(serde_json::from_str::<Value>).transpose().map_err(|_|Fault::Recovery("storage_protection_marker_invalid"))?;
-   let operation=storage_operation(db);
-   let marker=if let Some(prior)=prior {
-    if prior["v"]!=1||prior["database_id"]!=id||prior["generation"]!=db["generation"]||prior["operation_id"]!=operation||prior["storage_uid"]!=storage["metadata"]["uid"]||prior["namespace_uid"]!=namespace_value["metadata"]["uid"]||prior["cluster_uid"]!=cluster["metadata"]["uid"]||prior["node_uid"]!=db["storage"]["node_uid"]||prior["profile_sha256"]!=db["storage"]["profile_sha256"]||crate::contracts::integer(&prior,"requested_at")?>self.now(){return Err(Fault::Recovery("storage_protection_marker_changed"));}
-    prior
-   } else {json!({"v":1,"database_id":id,"generation":db["generation"],"operation_id":operation,"storage_uid":uid(&storage)?,"namespace_uid":uid(&namespace_value)?,"cluster_uid":uid(&cluster)?,"node_uid":db["storage"]["node_uid"],"profile_sha256":db["storage"]["profile_sha256"],"requested_at":self.now()})};
-   let serialized=serde_json::to_string(&marker).unwrap();if text(&storage["data"],protection_key())!=serialized{let written=self.k8s.patch(&storage,&json!({"data":{protection_key():serialized}})).await?;if written["data"][protection_key()]!=serialized{return Err(Fault::Unavailable("storage_protection_marker_unknown"));}}
-   let drain=crate::contracts::integer(&db["storage"],"drain_seconds")?;
-   if cluster["metadata"]["annotations"][HIBERNATION]!="on"||number(&cluster["spec"],"stopDelay")!=drain||number(&cluster["spec"],"smartShutdownTimeout")!=0{
-    let actual=self.k8s.patch(&cluster,&json!({"metadata":{"annotations":{HIBERNATION:"on"}},"spec":{"stopDelay":drain,"smartShutdownTimeout":0}})).await?;
-    if actual["metadata"]["annotations"][HIBERNATION]!="on"||number(&actual["spec"],"stopDelay")!=drain||number(&actual["spec"],"smartShutdownTimeout")!=0{return Err(Fault::Unavailable("storage_protection_result_unknown"));}
-   }
-   Ok(Some(json!({"id":db["id"],"generation":db["generation"],"state":"provisioning","message":"Storage write authority unavailable; physical protection requested","archive":{"continuous":false,"ready_wal_files":null}})))
-  }).await;
-        Ok(match result {
-            Ok(Ok(value)) => value,
-            Ok(Err(Fault::Stale)) | Err(_) => None,
-            Ok(Err(Fault::Recovery(reason))) => Some(recovery_observation(db, reason)),
-            Ok(Err(_)) => None,
-        })
-    }
-    fn running_protection_valid(
-        &self,
-        db: &Value,
-        intent: &PowerIntent,
-        storage: &Value,
-    ) -> Result<bool> {
-        if storage["data"][protection_key()].is_null() {
-            return Ok(false);
-        }
-        let raw = required(text(&storage["data"], protection_key()), 4096)?;
-        let marker: Value = serde_json::from_str(raw)
-            .map_err(|_| Fault::Recovery("storage_protection_marker_invalid"))?;
-        let state: Value = serde_json::from_str(required(text(&storage["data"], "state"), 4096)?)
-            .map_err(|_| Fault::Recovery("storage_fence_invalid"))?;
-        let operation_valid = match marker.get("operation_id") {
-            Some(Value::Null) => db.get("creation").is_none_or(Value::is_null),
-            Some(Value::String(operation)) => valid_pattern("operation", operation),
-            _ => false,
-        };
-        if marker["v"] != 1
-            || state["storage"] != db["storage"]
-            || marker["cluster_uid"] != state["clusterUid"]
-            || marker["namespace_uid"] != state["namespaceUid"]
-            || marker["database_id"] != db["id"]
-            || marker["storage_uid"] != uid(storage)?
-            || marker["node_uid"] != db["storage"]["node_uid"]
-            || marker["profile_sha256"] != db["storage"]["profile_sha256"]
-            || crate::contracts::integer(&marker, "generation")? == 0
-            || crate::contracts::integer(&marker, "generation")? >= intent.revision
-            || crate::contracts::integer(&marker, "requested_at")? > self.now()
-            || !operation_valid
-            || marker["operation_id"] == intent.operation
-        {
-            return Err(Fault::Recovery(
-                "storage_protection_recovery_authority_missing",
-            ));
-        }
-        Ok(true)
-    }
-    async fn storage_protection_for_running(
-        &self,
-        db: &Value,
-        intent: &PowerIntent,
-    ) -> Result<bool> {
-        if db["storage"].is_null() {
-            return Ok(false);
-        }
-        let id = text(db, "id");
-        let name = format!("storage-{id}");
-        let Some(storage) = self
-            .k8s
-            .read_known("ConfigMap", Some(SYSTEM), &name)
-            .await?
-        else {
-            return Ok(false);
-        };
-        let storage = owned(Some(storage), &name, id, Some(SYSTEM), false)?;
-        self.running_protection_valid(db, intent, &storage)
-    }
-    async fn clear_storage_protection(
-        &self,
-        db: &Value,
-        intent: &PowerIntent,
-        expected_uid: &str,
-    ) -> Result<()> {
-        if db["storage"].is_null() {
-            return Ok(());
-        }
-        let id = text(db, "id");
-        let name = format!("storage-{id}");
-        let storage = owned(
-            self.k8s
-                .read_known("ConfigMap", Some(SYSTEM), &name)
-                .await?,
-            &name,
-            id,
-            Some(SYSTEM),
-            false,
-        )?;
-        if uid(&storage)? != expected_uid {
-            return Err(Fault::Recovery("storage_protection_identity_changed"));
-        }
-        if !self.running_protection_valid(db, intent, &storage)? {
-            return Ok(());
-        }
-        // Anchor validation and the new CF running intent precede this exact marker CAS;
-        // hibernation remains on until clearing succeeds, so denial cannot wake a tenant.
-        let result = self
-            .k8s
-            .patch(&storage, &json!({"data":{protection_key():Value::Null}}))
-            .await?;
-        if !result["data"][protection_key()].is_null() {
-            return Err(Fault::Unavailable("storage_protection_clear_unknown"));
-        }
-        Ok(())
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4099,7 +3770,7 @@ mod tls_tests {
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -4109,9 +3780,8 @@ mod tls_tests {
     struct Server {
         k8s: Kubernetes,
         objects: Arc<Mutex<HashMap<String, Value>>>,
-        marker_writes: Arc<AtomicUsize>,
+        other_writes: Arc<AtomicUsize>,
         cluster_writes: Arc<AtomicUsize>,
-        fail: Arc<AtomicBool>,
         requests: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
         token: std::path::PathBuf,
@@ -4330,7 +4000,7 @@ mod tls_tests {
         v
     }
     impl Server {
-        async fn new(db: &Value, replace_after_unknown: bool) -> Self {
+        async fn new(db: &Value) -> Self {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let identity = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
             let ca = identity.cert.pem();
@@ -4376,46 +4046,42 @@ mod tls_tests {
                     json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(&storage_name,Some("pgcf-system"),&id(3),db),"data":{"state":json!({"namespaceUid":id(1),"clusterUid":id(2),"storage":db["storage"]}).to_string()}}),
                 ),
             ])));
-            let marker_writes = Arc::new(AtomicUsize::new(0));
+            let other_writes = Arc::new(AtomicUsize::new(0));
             let cluster_writes = Arc::new(AtomicUsize::new(0));
-            let fail = Arc::new(AtomicBool::new(true));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let (server_objects, markers, clusters) = (
                 objects.clone(),
-                marker_writes.clone(),
+                other_writes.clone(),
                 cluster_writes.clone(),
             );
             let cluster_path =
                 format!("/apis/postgresql.cnpg.io/v1/namespaces/{ns}/clusters/database");
-            let returned_fail = fail.clone();
             let server_requests = requests.clone();
             let task = tokio::spawn(async move {
                 let mut handlers = tokio::task::JoinSet::new();
                 loop {
                     let (tcp, _) = listener.accept().await.unwrap();
-                    let (acceptor, objects, markers, clusters, fail, cluster_path) = (
+                    let (acceptor, objects, markers, clusters, cluster_path) = (
                         acceptor.clone(),
                         server_objects.clone(),
                         markers.clone(),
                         clusters.clone(),
-                        fail.clone(),
                         cluster_path.clone(),
                     );
                     let requests = server_requests.clone();
                     handlers.spawn(async move{
     let mut tls=acceptor.accept(tcp).await.unwrap();let mut bytes=Vec::new();let mut byte=[0];while !bytes.ends_with(b"\r\n\r\n"){if tls.read_exact(&mut byte).await.is_err(){return;}bytes.push(byte[0]);assert!(bytes.len()<64*1024);}let header=String::from_utf8(bytes).unwrap();assert!(header.to_lowercase().contains("authorization: bearer generated-local-test-token"));let mut first=header.lines().next().unwrap().split_whitespace();let method=first.next().unwrap();let path=first.next().unwrap().split('?').next().unwrap();let length=header.lines().find_map(|line|line.split_once(':').filter(|(key,_)|key.eq_ignore_ascii_case("content-length")).map(|(_,n)|n.trim().parse::<usize>().unwrap())).unwrap_or(0);assert!(length<=2*1024*1024);let mut body=vec![0;length];tls.read_exact(&mut body).await.unwrap();
     requests.lock().unwrap().push(format!("{method} {path}"));
-    let (status,response,unknown)={let mut resources=objects.lock().unwrap();let current=resources.get(path).cloned();match (method,current){("GET",Some(v))=>(200,v,false),("POST",None)=>{let mut value:Value=serde_json::from_slice(&body).unwrap();assert_eq!(value["kind"],"ConfigMap");value["metadata"]["uid"]=id(500).into();value["metadata"]["resourceVersion"]="1".into();let target=format!("{path}/{}",text(&value["metadata"],"name"));resources.insert(target,value.clone());(201,value,false)},("PATCH",Some(mut v))=>{let patch:Value=serde_json::from_slice(&body).unwrap();if patch["metadata"]["uid"]!=v["metadata"]["uid"]||patch["metadata"]["resourceVersion"]!=v["metadata"]["resourceVersion"]{(409,json!({"message":"precondition"}),false)}else{if path==cluster_path{clusters.fetch_add(1,Ordering::SeqCst);}else{markers.fetch_add(1,Ordering::SeqCst);}merge(&mut v,&patch);v["metadata"]["resourceVersion"]=(text(&v["metadata"],"resourceVersion").parse::<u64>().unwrap()+1).to_string().into();resources.insert(path.into(),v.clone());let unknown=path!=cluster_path&&fail.swap(false,Ordering::SeqCst);if unknown&&replace_after_unknown{resources.get_mut(&cluster_path).unwrap()["metadata"]["uid"]=id(999).into();}(200,v,unknown)}},_=>(404,json!({}),false)}};
-    if unknown{return;}let body=serde_json::to_vec(&response).unwrap();tls.write_all(format!("HTTP/1.1 {status} OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();tls.write_all(&body).await.unwrap();let _=tls.shutdown().await;
+    let (status,response)={let mut resources=objects.lock().unwrap();let current=resources.get(path).cloned();match (method,current){("GET",Some(v))=>(200,v),("POST",None)=>{let mut value:Value=serde_json::from_slice(&body).unwrap();assert_eq!(value["kind"],"ConfigMap");value["metadata"]["uid"]=id(500).into();value["metadata"]["resourceVersion"]="1".into();let target=format!("{path}/{}",text(&value["metadata"],"name"));resources.insert(target,value.clone());(201,value)},("PATCH",Some(mut v))=>{let patch:Value=serde_json::from_slice(&body).unwrap();if patch["metadata"]["uid"]!=v["metadata"]["uid"]||patch["metadata"]["resourceVersion"]!=v["metadata"]["resourceVersion"]{(409,json!({"message":"precondition"}))}else{if path==cluster_path{clusters.fetch_add(1,Ordering::SeqCst);}else{markers.fetch_add(1,Ordering::SeqCst);}merge(&mut v,&patch);v["metadata"]["resourceVersion"]=(text(&v["metadata"],"resourceVersion").parse::<u64>().unwrap()+1).to_string().into();resources.insert(path.into(),v.clone());(200,v)}},_=>(404,json!({}))}};
+    let body=serde_json::to_vec(&response).unwrap();tls.write_all(format!("HTTP/1.1 {status} OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();tls.write_all(&body).await.unwrap();let _=tls.shutdown().await;
    });
                 }
             });
             Self {
                 k8s,
                 objects,
-                marker_writes,
+                other_writes,
                 cluster_writes,
-                fail: returned_fail,
                 requests,
                 task,
                 token,
@@ -4438,7 +4104,7 @@ mod tls_tests {
             *value = patch.clone();
         }
     }
-    fn protected_database() -> Value {
+    fn suspended_database() -> Value {
         let mut db = database();
         db["generation"] = 2.into();
         db["desired_state"] = "suspended".into();
@@ -4446,7 +4112,26 @@ mod tls_tests {
         assert!(database_valid(&db));
         db
     }
-    fn protected_objects(server: &Server, db: &Value) {
+    /// The record of a sleep that completed at generation 1: hibernated after its proof.
+    async fn hibernated_record(server: &Server, db: &Value, coordinator: &PowerCoordinator) {
+        let (anchor, _) = coordinator.anchor(db).await.unwrap();
+        let snapshot = coordinator.snapshot().await.unwrap();
+        let prior = PowerIntent {
+            database: text(db, "id").into(),
+            operation: text(&db["creation"], "operation_id").into(),
+            revision: 1,
+            mode: "quiesce".into(),
+        };
+        let mut p = Progress::new(prior.clone(), Phase::Hibernated, anchor, 99_000);
+        p.proof_intent = Some(prior.clone());
+        p.segment = Some("000000010000000000000001".into());
+        p.gateways = Some(snapshot.pods);
+        p.key_uid = Some(snapshot.key_uid);
+        p.key_version = Some(snapshot.key_version);
+        let name = format!("gateway-fence-{}", text(db, "id"));
+        server.objects.lock().unwrap().insert(format!("/api/v1/namespaces/pgcf-system/configmaps/{name}"),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":serde_json::to_string(&p).unwrap()}}));
+    }
+    fn hibernated_objects(server: &Server, db: &Value) {
         let ns = namespace(db);
         let storage_name = format!("storage-{}", text(db, "id"));
         let claim = "database-1";
@@ -4467,7 +4152,6 @@ mod tls_tests {
             .unwrap();
         storage["data"]["state"]=json!({"namespaceUid":id(1),"clusterUid":id(2),"storage":db["storage"],"node":db["node"],"archivePath":db["archive"]["destination_path"]}).to_string().into();
         storage["metadata"]["annotations"][VOLUME_IDENTITY]=json!({"claimUid":id(5),"volumeUid":id(6),"handle":handle,"lvUuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef"}).to_string().into();
-        storage["data"][protection_key()]=json!({"v":1,"database_id":db["id"],"generation":1,"operation_id":db["creation"]["operation_id"],"storage_uid":id(3),"namespace_uid":id(1),"cluster_uid":id(2),"node_uid":db["storage"]["node_uid"],"profile_sha256":db["storage"]["profile_sha256"],"requested_at":90_000}).to_string().into();
         resources.insert(format!("/api/v1/nodes/{}",text(db,"node")),json!({"apiVersion":"v1","kind":"Node","metadata":{"name":db["node"],"uid":id(4),"resourceVersion":"1"}}));
         // OpenEBS names the PersistentVolume and the LVMVolume after the volume ID.
         let pv = json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":handle,"uid":id(6),"resourceVersion":"1"},"spec":{"claimRef":{"name":claim,"namespace":ns,"uid":id(5)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":handle},"storageClassName":db["storage"]["storage_class"],"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":[db["node"]]}]}]}}},"status":{"phase":"Bound"}});
@@ -4482,12 +4166,9 @@ mod tls_tests {
         let keyring = json!({"active":"local","keys":{"local":URL_SAFE_NO_PAD.encode([7_u8;32])}})
             .to_string();
         resources.insert("/api/v1/namespaces/pgcf-system/secrets/pgcf-gateway".into(),json!({"kind":"Secret","metadata":{"name":"pgcf-gateway","namespace":SYSTEM,"uid":id(21),"resourceVersion":"1"},"data":{"PGCF_ROUTE_KEY":STANDARD.encode(keyring)}}));
-        server.fail.store(false, Ordering::SeqCst);
     }
     struct Controls {
         client: reqwest::Client,
-        busy: Arc<AtomicBool>,
-        swap: Arc<AtomicBool>,
         calls: Arc<AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -4497,7 +4178,7 @@ mod tls_tests {
         }
     }
     impl Controls {
-        async fn new(server: &Server, db: &Value) -> Self {
+        async fn new() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let client = reqwest::Client::builder()
@@ -4505,16 +4186,8 @@ mod tls_tests {
                 .retry(reqwest::retry::never())
                 .build()
                 .unwrap();
-            let busy = Arc::new(AtomicBool::new(false));
-            let swap = Arc::new(AtomicBool::new(false));
             let calls = Arc::new(AtomicUsize::new(0));
-            let (busy_copy, swap_copy, calls_copy, objects, ns) = (
-                busy.clone(),
-                swap.clone(),
-                calls.clone(),
-                server.objects.clone(),
-                namespace(db),
-            );
+            let calls_copy = calls.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -4557,289 +4230,23 @@ mod tls_tests {
                     )
                     .unwrap();
                     calls_copy.fetch_add(1, Ordering::SeqCst);
-                    if action == "close" && swap_copy.load(Ordering::SeqCst) {
-                        objects
-                            .lock()
-                            .unwrap()
-                            .get_mut(&format!(
-                                "/apis/postgresql.cnpg.io/v1/namespaces/{ns}/clusters/database"
-                            ))
-                            .unwrap()["metadata"]["uid"] = id(999).into();
-                    }
-                    let busy = busy_copy.load(Ordering::SeqCst);
                     // A release acknowledges the running intent; every other action reports quiescence.
                     let (mode, status) = if action == "release" {
                         ("running", "running")
                     } else {
-                        ("quiesce", if busy { "busy" } else { "closed" })
+                        ("quiesce", "closed")
                     };
-                    let body=json!({"database":claims["database"],"operation":claims["operation"],"revision":claims["revision"],"mode":mode,"pod":id(20),"status":status,"connections":u64::from(busy),"busyConnections":u64::from(busy),"pendingDials":0}).to_string();
+                    let body=json!({"database":claims["database"],"operation":claims["operation"],"revision":claims["revision"],"mode":mode,"pod":id(20),"status":status,"connections":0,"busyConnections":0,"pendingDials":0}).to_string();
                     socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                     let _ = socket.shutdown().await;
                 }
             });
             Self {
                 client,
-                busy,
-                swap,
                 calls,
                 task,
             }
         }
-    }
-    #[tokio::test]
-    async fn protected_manual_suspend_finishes_without_sql_or_archival_claim() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let controls = Controls::new(&server, &db).await;
-        let mut coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        coordinator.http = controls.client.clone();
-        let result = coordinator
-            .suspend(&db, &Sleep::cold())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            result["state"],
-            "hibernated",
-            "{result}; reads {:?}",
-            server.requests.lock().unwrap()
-        );
-        assert_eq!(result["power"]["operation"], db["power"]["operation"]);
-        assert_eq!(result["archive"]["continuous"], false);
-        assert!(result["archive"]["ready_wal_files"].is_null());
-        assert!(
-            !server
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path.contains("maintenance-credentials") || path.contains("ca-"))
-        );
-        assert_eq!(controls.calls.load(Ordering::SeqCst), 3);
-        let repeated = coordinator
-            .suspend(&db, &Sleep::cold())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(repeated["state"], "hibernated");
-        let objects = server.objects.lock().unwrap();
-        let map = objects
-            .values()
-            .find(|v| v["data"]["power.json"].is_string())
-            .unwrap();
-        let progress: Value = serde_json::from_str(text(&map["data"], "power.json")).unwrap();
-        assert_eq!(progress["phase"], "quiescing");
-        assert!(progress["segment"].is_null());
-        assert!(
-            objects
-                .values()
-                .any(|v| v["data"][protection_key()].is_string())
-        );
-    }
-    #[tokio::test]
-    async fn protected_stop_waits_for_condition_pods_sessions_and_rechecks_identity() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let controls = Controls::new(&server, &db).await;
-        let mut coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        coordinator.http = controls.client.clone();
-        let ns = namespace(&db);
-        let cluster_path = format!("/apis/postgresql.cnpg.io/v1/namespaces/{ns}/clusters/database");
-        let pods_path = format!("/api/v1/namespaces/{ns}/pods");
-        server
-            .objects
-            .lock()
-            .unwrap()
-            .get_mut(&cluster_path)
-            .unwrap()["status"]["conditions"] = json!([]);
-        assert!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
-        {
-            let mut objects = server.objects.lock().unwrap();
-            objects.get_mut(&cluster_path).unwrap()["status"]["conditions"] =
-                json!([{"type":HIBERNATION,"status":"True","reason":"Stopping"}]);
-        }
-        assert!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        {
-            let mut objects = server.objects.lock().unwrap();
-            objects.get_mut(&cluster_path).unwrap()["status"]["conditions"] =
-                json!([{"type":HIBERNATION,"status":"True","reason":"Hibernated"}]);
-            objects.get_mut(&pods_path).unwrap()["items"] =
-                json!([{"kind":"Pod","metadata":{"namespace":ns,"uid":id(88)}}]);
-        }
-        assert!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
-        server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"] = json!([]);
-        controls.busy.store(true, Ordering::SeqCst);
-        assert!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
-        controls.busy.store(false, Ordering::SeqCst);
-        controls.swap.store(true, Ordering::SeqCst);
-        let rejected = coordinator
-            .suspend(&db, &Sleep::cold())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rejected["state"], "error");
-        assert!(rejected.get("power").is_none());
-        assert_eq!(rejected["archive"]["continuous"], false);
-        assert!(
-            !server
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path.contains("maintenance-credentials"))
-        );
-    }
-    #[tokio::test]
-    async fn protected_stop_rejects_future_or_rebound_marker_without_touching_wal() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        let storage_path = format!(
-            "/api/v1/namespaces/pgcf-system/configmaps/storage-{}",
-            text(&db, "id")
-        );
-        let mut marker: Value = serde_json::from_str(text(
-            &server.objects.lock().unwrap()[&storage_path]["data"],
-            protection_key(),
-        ))
-        .unwrap();
-        marker["generation"] = 2.into();
-        server
-            .objects
-            .lock()
-            .unwrap()
-            .get_mut(&storage_path)
-            .unwrap()["data"][protection_key()] = marker.to_string().into();
-        assert_eq!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .unwrap()["state"],
-            "error"
-        );
-        marker["generation"] = 1.into();
-        marker["cluster_uid"] = id(999).into();
-        server
-            .objects
-            .lock()
-            .unwrap()
-            .get_mut(&storage_path)
-            .unwrap()["data"][protection_key()] = marker.to_string().into();
-        assert_eq!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .unwrap()["state"],
-            "error"
-        );
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-        assert!(
-            !server
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|path| path.contains("maintenance-credentials"))
-        );
-    }
-    #[tokio::test]
-    async fn protected_stop_preserves_unknown_switch_progress_and_does_not_relax_idle_sleep() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let controls = Controls::new(&server, &db).await;
-        let mut coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        coordinator.http = controls.client.clone();
-        let intent = desired_power(&db).unwrap().unwrap();
-        let (anchor, _) = coordinator.anchor(&db).await.unwrap();
-        let snapshot = coordinator.snapshot().await.unwrap();
-        let mut progress = Progress::new(intent.clone(), Phase::Switching, anchor, 99_000);
-        progress.proof_intent = Some(intent.clone());
-        progress.gateways = Some(snapshot.pods);
-        progress.key_uid = Some(snapshot.key_uid);
-        progress.key_version = Some(snapshot.key_version);
-        let raw = serde_json::to_string(&progress).unwrap();
-        let name = format!("gateway-fence-{}", text(&db, "id"));
-        server.objects.lock().unwrap().insert(format!("/api/v1/namespaces/pgcf-system/configmaps/{name}"),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&intent).unwrap(),"power.json":raw}}));
-        assert_eq!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .unwrap()["state"],
-            "hibernated"
-        );
-        assert_eq!(
-            server.objects.lock().unwrap()
-                [&format!("/api/v1/namespaces/pgcf-system/configmaps/{name}")]["data"]["power.json"],
-            raw
-        );
-        let mut idle = db.clone();
-        idle["power"]["reason"] = "idle".into();
-        assert!(
-            coordinator
-                .protected_manual_suspend(&idle, &intent)
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
     #[tokio::test]
     async fn original_creation_can_start_after_queued_release_generations() {
@@ -4851,7 +4258,7 @@ mod tls_tests {
         db["creation"]["ever_ready"] = false.into();
         db["power"] = json!({"operation":db["creation"]["operation_id"],"revision":3,"mode":"running","reason":null});
         assert!(database_valid(&db));
-        let server = Server::new(&db, false).await;
+        let server = Server::new(&db).await;
         server.objects.lock().unwrap().clear();
         let coordinator = PowerCoordinator::with_clock(
             server.k8s.clone(),
@@ -4867,301 +4274,9 @@ mod tls_tests {
                 .unwrap(),
             PrepareRunning::Proceed
         ));
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(server.other_writes.load(Ordering::SeqCst), 0);
         assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
         assert!(server.objects.lock().unwrap().is_empty());
-    }
-    #[tokio::test]
-    async fn protected_running_generation_is_rejected_before_any_wake_write() {
-        let mut db = protected_database();
-        db["generation"] = 1.into();
-        db["desired_state"] = "running".into();
-        db["power"] = json!({"operation":db["creation"]["operation_id"],"revision":1,"mode":"running","reason":null});
-        db["creation"]["ever_ready"] = true.into();
-        assert!(database_valid(&db));
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        let (anchor, _) = coordinator.anchor(&db).await.unwrap();
-        let snapshot = coordinator.snapshot().await.unwrap();
-        let prior = PowerIntent {
-            database: text(&db, "id").into(),
-            operation: text(&db["creation"], "operation_id").into(),
-            revision: 1,
-            mode: "quiesce".into(),
-        };
-        let mut p = Progress::new(prior.clone(), Phase::Switching, anchor, 99_000);
-        p.proof_intent = Some(prior.clone());
-        p.gateways = Some(snapshot.pods);
-        p.key_uid = Some(snapshot.key_uid);
-        p.key_version = Some(snapshot.key_version);
-        let raw = serde_json::to_string(&p).unwrap();
-        let name = format!("gateway-fence-{}", text(&db, "id"));
-        let path = format!("/api/v1/namespaces/pgcf-system/configmaps/{name}");
-        server.objects.lock().unwrap().insert(path.clone(),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":raw}}));
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Observation(_)
-        ));
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            server.objects.lock().unwrap()[&path]["data"]["power.json"],
-            raw
-        );
-        assert!(
-            server
-                .objects
-                .lock()
-                .unwrap()
-                .values()
-                .any(|v| v["data"][protection_key()].is_string())
-        );
-        db["generation"] = 2.into();
-        db["power"] = json!({"operation":format!("op_{}","z".repeat(20)),"revision":2,"mode":"running","reason":null});
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Proceed
-        ));
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 1);
-        assert!(
-            !server
-                .objects
-                .lock()
-                .unwrap()
-                .values()
-                .any(|v| v["data"][protection_key()].is_string())
-        );
-    }
-    #[tokio::test]
-    async fn protected_creation_shortcut_cannot_reuse_current_generation_startup() {
-        let mut db = protected_database();
-        db["generation"] = 1.into();
-        db["desired_state"] = "running".into();
-        db["power"] = json!({"operation":db["creation"]["operation_id"],"revision":1,"mode":"running","reason":null});
-        assert!(database_valid(&db));
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Observation(_)
-        ));
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-    }
-    #[tokio::test]
-    async fn malformed_or_future_protection_cannot_clear_or_overwrite_switch_state() {
-        let mut db = protected_database();
-        db["desired_state"] = "running".into();
-        db["power"] = json!({"operation":format!("op_{}","z".repeat(20)),"revision":2,"mode":"running","reason":null});
-        db["creation"]["ever_ready"] = true.into();
-        assert!(database_valid(&db));
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        let (anchor, _) = coordinator.anchor(&db).await.unwrap();
-        let snapshot = coordinator.snapshot().await.unwrap();
-        let prior = PowerIntent {
-            database: text(&db, "id").into(),
-            operation: text(&db["creation"], "operation_id").into(),
-            revision: 1,
-            mode: "quiesce".into(),
-        };
-        let mut progress = Progress::new(prior.clone(), Phase::Switching, anchor, 99_000);
-        progress.proof_intent = Some(prior.clone());
-        progress.gateways = Some(snapshot.pods);
-        progress.key_uid = Some(snapshot.key_uid);
-        progress.key_version = Some(snapshot.key_version);
-        let raw = serde_json::to_string(&progress).unwrap();
-        let name = format!("gateway-fence-{}", text(&db, "id"));
-        let path = format!("/api/v1/namespaces/pgcf-system/configmaps/{name}");
-        server.objects.lock().unwrap().insert(path.clone(),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":raw}}));
-        let storage_path = format!(
-            "/api/v1/namespaces/pgcf-system/configmaps/storage-{}",
-            text(&db, "id")
-        );
-        let mut marker: Value = serde_json::from_str(text(
-            &server.objects.lock().unwrap()[&storage_path]["data"],
-            protection_key(),
-        ))
-        .unwrap();
-        marker["requested_at"] = 100_001.into();
-        server
-            .objects
-            .lock()
-            .unwrap()
-            .get_mut(&storage_path)
-            .unwrap()["data"][protection_key()] = marker.to_string().into();
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Observation(_)
-        ));
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            server.objects.lock().unwrap()[&path]["data"]["power.json"],
-            raw
-        );
-        marker["requested_at"] = 90_000.into();
-        marker["operation_id"] = "not-an-operation".into();
-        server
-            .objects
-            .lock()
-            .unwrap()
-            .get_mut(&storage_path)
-            .unwrap()["data"][protection_key()] = marker.to_string().into();
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Observation(_)
-        ));
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            server.objects.lock().unwrap()[&path]["data"]["power.json"],
-            raw
-        );
-        marker["operation_id"] = Value::Null;
-        server
-            .objects
-            .lock()
-            .unwrap()
-            .get_mut(&storage_path)
-            .unwrap()["data"][protection_key()] = marker.to_string().into();
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Observation(_)
-        ));
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            server.objects.lock().unwrap()[&path]["data"]["power.json"],
-            raw
-        );
-        db["creation"] = Value::Null;
-        assert!(database_valid(&db));
-        assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
-            PrepareRunning::Proceed
-        ));
-    }
-    #[tokio::test]
-    async fn uncertain_marker_write_is_read_before_same_uid_protection_continues() {
-        let db = database();
-        let server = Server::new(&db, false).await;
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        assert!(coordinator.protect_storage(&db).await.unwrap().is_none());
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 1);
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-        let resumed = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_001),
-        )
-        .unwrap();
-        let observed = resumed.protect_storage(&db).await.unwrap().unwrap();
-        assert_eq!(observed["state"], "provisioning");
-        assert!(observed.get("power").is_none());
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 1);
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 1);
-        assert!(
-            server
-                .objects
-                .lock()
-                .unwrap()
-                .values()
-                .any(|v| v["kind"] == "Cluster"
-                    && v["metadata"]["annotations"][HIBERNATION] == "on"
-                    && v["spec"]["stopDelay"] == 1
-                    && v["spec"]["smartShutdownTimeout"] == 0)
-        );
-    }
-    #[tokio::test]
-    async fn replaced_cluster_is_never_stopped_after_uncertain_marker_result() {
-        let db = database();
-        let server = Server::new(&db, true).await;
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        assert!(coordinator.protect_storage(&db).await.unwrap().is_none());
-        let observed = coordinator.protect_storage(&db).await.unwrap().unwrap();
-        assert_eq!(observed["state"], "error");
-        assert!(text(&observed, "message").contains("identity_changed"));
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 1);
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
-    }
-    #[tokio::test]
-    async fn a_newer_or_rebound_protection_marker_is_not_overwritten() {
-        let db = database();
-        let server = Server::new(&db, false).await;
-        {
-            let mut objects = server.objects.lock().unwrap();
-            let storage = objects
-                .values_mut()
-                .find(|v| v["kind"] == "ConfigMap")
-                .unwrap();
-            storage["data"][protection_key()]=json!({"v":1,"database_id":db["id"],"generation":2,"operation_id":db["creation"]["operation_id"],"storage_uid":id(3),"namespace_uid":id(1),"cluster_uid":id(2),"node_uid":db["storage"]["node_uid"],"profile_sha256":db["storage"]["profile_sha256"],"requested_at":90_000}).to_string().into();
-        }
-        let coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        let observed = coordinator.protect_storage(&db).await.unwrap().unwrap();
-        assert_eq!(observed["state"], "error");
-        assert!(text(&observed, "message").contains("marker_changed"));
-        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn a_failed_before_allocation_thin_database_deletes_only_after_complete_fresh_host_proof()
@@ -5170,8 +4285,7 @@ mod tls_tests {
         db["desired_state"] = "deleted".into();
         db["generation"] = 2.into();
         assert!(database_valid(&db));
-        let server = Server::new(&db, false).await;
-        server.fail.store(false, Ordering::SeqCst);
+        let server = Server::new(&db).await;
         {
             let mut resources = server.objects.lock().unwrap();
             resources.clear();
@@ -5225,9 +4339,9 @@ mod tls_tests {
     }
     #[tokio::test]
     async fn terminal_gateway_pods_neither_block_nor_receive_power_controls() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
+        let db = suspended_database();
+        let server = Server::new(&db).await;
+        hibernated_objects(&server, &db);
         // Graceful node shutdown leaves Deployment Pods behind as terminal objects without an address.
         server
             .objects
@@ -5238,7 +4352,7 @@ mod tls_tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"kind":"Pod","metadata":{"name":"gateway-shutdown","namespace":SYSTEM,"uid":id(22),"labels":{"app.kubernetes.io/name":"pgcf-gateway"}},"spec":{"serviceAccountName":"pgcf-gateway"},"status":{"phase":"Succeeded","containerStatuses":[{"name":"gateway","restartCount":0,"state":{"terminated":{"exitCode":0}}}]}}));
-        let controls = Controls::new(&server, &db).await;
+        let controls = Controls::new().await;
         let mut coordinator = PowerCoordinator::with_clock(
             server.k8s.clone(),
             "eu-test".into(),
@@ -5247,14 +4361,15 @@ mod tls_tests {
         )
         .unwrap();
         coordinator.http = controls.client.clone();
+        hibernated_record(&server, &db, &coordinator).await;
         let result = coordinator
             .suspend(&db, &Sleep::cold())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(result["state"], "hibernated");
-        // The control endpoint accepts only the live Pod: begin, close and status reached it alone.
-        assert_eq!(controls.calls.load(Ordering::SeqCst), 3);
+        // The control endpoint accepts only the live Pod: the status reached it alone.
+        assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
         let two = PowerCoordinator::with_clock(
             server.k8s.clone(),
             "eu-test".into(),
@@ -5268,63 +4383,18 @@ mod tls_tests {
         ));
     }
     #[tokio::test]
-    async fn a_terminal_instance_pod_is_stopped_but_a_terminating_one_blocks_a_protected_stop() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
-        let controls = Controls::new(&server, &db).await;
-        let mut coordinator = PowerCoordinator::with_clock(
-            server.k8s.clone(),
-            "eu-test".into(),
-            1,
-            Arc::new(|| 100_000),
-        )
-        .unwrap();
-        coordinator.http = controls.client.clone();
-        let ns = namespace(&db);
-        let pods_path = format!("/api/v1/namespaces/{ns}/pods");
-        server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"] = json!([{"kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":id(88),"deletionTimestamp":"2026-10-11T00:00:00Z","labels":{"cnpg.io/cluster":"database"}},"status":{"phase":"Running"}}]);
-        assert!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
-        server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"][0]["status"]["phase"] =
-            "Failed".into();
-        assert_eq!(
-            coordinator
-                .suspend(&db, &Sleep::cold())
-                .await
-                .unwrap()
-                .unwrap()["state"],
-            "hibernated"
-        );
-    }
-    #[tokio::test]
     async fn a_terminal_instance_pod_does_not_hold_a_hibernated_database_awake() {
-        let db = protected_database();
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
+        let db = suspended_database();
+        let server = Server::new(&db).await;
+        hibernated_objects(&server, &db);
         let ns = namespace(&db);
-        let storage_path = format!(
-            "/api/v1/namespaces/pgcf-system/configmaps/storage-{}",
-            text(&db, "id")
-        );
-        {
-            // This database slept through the normal proof, not a physical protection stop.
-            let mut objects = server.objects.lock().unwrap();
-            objects.get_mut(&storage_path).unwrap()["data"]
-                .as_object_mut()
-                .unwrap()
-                .remove(protection_key());
-            objects
-                .get_mut(&format!("/api/v1/namespaces/{ns}/pods"))
-                .unwrap()["items"] = json!([{"kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":id(88),"labels":{"cnpg.io/cluster":"database"}},"status":{"phase":"Failed","reason":"Terminated"}}]);
-        }
-        let controls = Controls::new(&server, &db).await;
+        server
+            .objects
+            .lock()
+            .unwrap()
+            .get_mut(&format!("/api/v1/namespaces/{ns}/pods"))
+            .unwrap()["items"] = json!([{"kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":id(88),"labels":{"cnpg.io/cluster":"database"}},"status":{"phase":"Failed","reason":"Terminated"}}]);
+        let controls = Controls::new().await;
         let mut coordinator = PowerCoordinator::with_clock(
             server.k8s.clone(),
             "eu-test".into(),
@@ -5333,22 +4403,7 @@ mod tls_tests {
         )
         .unwrap();
         coordinator.http = controls.client.clone();
-        let (anchor, _) = coordinator.anchor(&db).await.unwrap();
-        let snapshot = coordinator.snapshot().await.unwrap();
-        let prior = PowerIntent {
-            database: text(&db, "id").into(),
-            operation: text(&db["creation"], "operation_id").into(),
-            revision: 1,
-            mode: "quiesce".into(),
-        };
-        let mut p = Progress::new(prior.clone(), Phase::Hibernated, anchor, 99_000);
-        p.proof_intent = Some(prior.clone());
-        p.segment = Some("000000010000000000000001".into());
-        p.gateways = Some(snapshot.pods);
-        p.key_uid = Some(snapshot.key_uid);
-        p.key_version = Some(snapshot.key_version);
-        let name = format!("gateway-fence-{}", text(&db, "id"));
-        server.objects.lock().unwrap().insert(format!("/api/v1/namespaces/pgcf-system/configmaps/{name}"),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":serde_json::to_string(&p).unwrap()}}));
+        hibernated_record(&server, &db, &coordinator).await;
         let result = coordinator
             .suspend(&db, &Sleep::cold())
             .await
@@ -5381,10 +4436,10 @@ mod tls_tests {
         .into();
         db["recovery"] = json!({"operation_id":restore,"source_database_id":source,"source_archive_path":format!("s3://native-controller-test/eu-test/{source}/g1-op_{}","s".repeat(20)),"source_storage_generation":1,"backup_id":"20261012T000000","status":"running","ever_ready":false});
         assert!(database_valid(&db));
-        let server = Server::new(&db, false).await;
-        protected_objects(&server, &db);
+        let server = Server::new(&db).await;
+        hibernated_objects(&server, &db);
         {
-            // Running PostgreSQL: no hibernation and no physical protection stop.
+            // Running PostgreSQL: no hibernation.
             let mut objects = server.objects.lock().unwrap();
             let cluster = objects
                 .get_mut(&format!(
@@ -5398,7 +4453,7 @@ mod tls_tests {
                 .remove(HIBERNATION);
             cluster["status"] = json!({});
         }
-        let controls = Controls::new(&server, &db).await;
+        let controls = Controls::new().await;
         let mut coordinator = PowerCoordinator::with_clock(
             server.k8s.clone(),
             "eu-test".into(),

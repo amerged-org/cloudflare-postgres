@@ -77,7 +77,6 @@ fn each_decision_row_returns_its_reason_in_table_order() {
     let base = || Facts {
         trigger: Trigger::Gateway(&wake),
         cell: Some(&db),
-        protection: None,
         asleep: true,
         busy: false,
         identity: Some(&identity),
@@ -137,11 +136,6 @@ fn each_decision_row_returns_its_reason_in_table_order() {
             "deleted",
             Outcome::Refused,
             Box::new(|f| f.cell = Some(&deleted)),
-        ),
-        (
-            "protected",
-            Outcome::Refused,
-            Box::new(|f| f.protection = Some(4)),
         ),
         (
             "not_sleeping",
@@ -223,10 +217,6 @@ fn each_decision_row_returns_its_reason_in_table_order() {
         rows[index].2(&mut alone);
         assert_eq!(decide(&alone).err(), Some((*outcome, *reason)));
     }
-    // An older protection marker is the CNPG path's to clear: a miss, not a refusal.
-    let mut older = base();
-    older.protection = Some(3);
-    assert_eq!(decide(&older).err(), Some((Outcome::Miss, "protected")));
     // A ticket of another generation than the sleeping row's next is stale.
     let ahead = WakeRequest {
         generation: 7,
@@ -271,7 +261,6 @@ fn a_gateway_wake_cloudflare_already_claimed_is_not_stale_for_the_route_revision
     let facts = Facts {
         trigger: Trigger::Gateway(&wake),
         cell: Some(&claimed),
-        protection: None,
         asleep: true,
         busy: false,
         identity: Some(&identity),
@@ -1795,17 +1784,6 @@ mod world {
         assert_eq!(record(&w), None);
         assert_eq!(holder(&w), None);
         assert!(!w.reconciler.pool.serves(&w.id));
-    }
-
-    #[tokio::test]
-    async fn protecting_a_served_database_retires_its_slot() {
-        let mut w = World::pooled().await;
-        confirmed(&mut w).await;
-        let observed = w.reconciler.protect_storage(&w.db).await.unwrap();
-        assert_eq!(observed.unwrap()["state"], "provisioning");
-        assert!(!w.reconciler.pool.serves(&w.id));
-        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
-        assert_eq!(holder(&w), None);
     }
 
     fn fresh_reconciler(w: &World) -> crate::reconcile::Reconciler {

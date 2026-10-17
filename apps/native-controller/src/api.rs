@@ -194,35 +194,6 @@ impl ControlApi {
         }
         Ok(reply)
     }
-    /// Posts one headroom sample of a node. Every reply carries the next nonce; only an accepted
-    /// product sample also carries the composed node authority and the node's write tokens.
-    pub async fn storage_headroom(&self, node_id: &str, sample: &Value) -> Result<Value, Error> {
-        if !node_id.strip_prefix("nod_").is_some_and(|id| {
-            id.len() == 20
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        }) || !crate::node_storage::sample_valid(sample)
-        {
-            return Err("native headroom sample invalid".into());
-        }
-        let reply = self
-            .request(
-                &format!("/agent/v1/nodes/{node_id}/storage-headroom"),
-                Some(sample),
-            )
-            .await?;
-        let accepted = reply["accepted"] == true;
-        let renewal = !reply["authority"].is_null();
-        if !schema_valid("NodeStorageHeadroomResponse", &reply)
-            || accepted != reply["reason"].is_null()
-            || (!accepted && renewal)
-            || (!renewal && reply["tokens"].as_array().is_none_or(|t| !t.is_empty()))
-        {
-            return Err("headroom acknowledgement invalid".into());
-        }
-        Ok(reply)
-    }
     pub async fn from_env() -> Result<Self, Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let region = std::env::var("PGCF_REGION_ID")?;

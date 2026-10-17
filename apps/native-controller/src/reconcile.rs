@@ -387,50 +387,15 @@ fn millis(value: &Value) -> Option<i128> {
     .ok()
     .map(|t| t.unix_timestamp_nanos() / 1_000_000)
 }
-#[derive(Debug)]
-struct ExpiredStorageSnapshot;
-impl std::fmt::Display for ExpiredStorageSnapshot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("thin host authority snapshot expired")
-    }
-}
-impl std::error::Error for ExpiredStorageSnapshot {}
-/// Internal retry classification; permission/identity failures never have this type.
-pub fn storage_snapshot_expired(error: &Error) -> bool {
-    error.downcast_ref::<ExpiredStorageSnapshot>().is_some()
-}
-/// A job owns a snapshot; the main loop independently monitors the latest authority.
-/// Expiry alone asks for fresh work. Every physical/permission mismatch still protects.
-fn storage_guard(
-    db: &Value,
-    node: &Value,
-    authority: &Value,
-    cluster_uid: &str,
-    require_write: bool,
-    current: i128,
-) -> Result<(), Error> {
+/// The node storage row stands for the database's own node, volume group and thin pool.
+fn storage_guard(db: &Value, node: &Value, row: &Value) -> Result<(), Error> {
     let storage = &db["storage"];
-    let start = millis(&authority["observed_at"]).ok_or("host observation clock invalid")?;
-    let end = millis(&authority["expires_at"]).ok_or("host observation expiry invalid")?;
-    if current < 0
-        || start > current + 5000
-        || start < current - 120000
-        || end <= start
-        || end - start > i128::from(number(storage, "guard_seconds")) * 1000
-        || (require_write && authority["write_allowed"] != true)
-        || authority["node_uid"] != node["metadata"]["uid"]
-        || text(authority, "cluster_uid") != cluster_uid
-        || authority["node_uid"] != storage["node_uid"]
-        || authority["volume_group_uuid"] != storage["volume_group_uuid"]
-        || authority["pool_uuid"] != storage["pool_uuid"]
-        || authority["profile_sha256"] != storage["profile_sha256"]
-        || integer(authority, "profile_revision")? < number(storage, "profile_revision")
-        || authority["storage_class"] != storage["storage_class"]
+    if row["node_uid"] != node["metadata"]["uid"]
+        || row["node_uid"] != storage["node_uid"]
+        || row["volume_group_uuid"] != storage["volume_group_uuid"]
+        || row["pool_uuid"] != storage["pool_uuid"]
     {
-        return Err("thin host identity or write authority changed".into());
-    }
-    if end <= current {
-        return Err(Box::new(ExpiredStorageSnapshot));
+        return Err("thin node storage identity changed".into());
     }
     Ok(())
 }
@@ -481,90 +446,6 @@ fn pending_creation(db: &Value) -> bool {
     origin["ever_ready"] == false
         && matches!(text(origin, "status"), "pending" | "running")
         && text(&db["archive"], "destination_path").ends_with(&expected)
-}
-/// The schema-valid claims of an `sa1` token, read without its signature. They only order ledger
-/// writes and choose earlier protective stops; the gateway verifies the signature itself.
-pub fn storage_claims(token: &str) -> Option<Value> {
-    let parts: Vec<_> = token.split('.').collect();
-    if parts.len() != 3 || parts[0] != "sa1" {
-        return None;
-    }
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).ok()?).ok()?;
-    pgcf_native_protocol::valid_schema("storageWriteClaims", &claims).then_some(claims)
-}
-/// A token's place in the ledger: its node authority revision, then its database generation.
-fn ledger_order(claims: &Value) -> Option<(u64, u64)> {
-    Some((
-        integer(claims, "authority_revision").ok()?,
-        integer(claims, "generation").ok()?,
-    ))
-}
-/// The newer of two tokens by ledger order; `held` wins a tie, and an unreadable token loses.
-pub fn newer_token<'a>(held: Option<&'a str>, candidate: Option<&'a str>) -> Option<&'a str> {
-    let order = |token: Option<&str>| {
-        token
-            .and_then(storage_claims)
-            .and_then(|c| ledger_order(&c))
-    };
-    if order(candidate) > order(held) {
-        candidate
-    } else {
-        held.or(candidate)
-    }
-}
-/// Whether `candidate` may replace the ledger's `current` token at wall clock `now` (ms). A token
-/// never replaces one of a higher authority revision, or within one revision of a higher
-/// generation: the gateway disconnects on a regression, and a 60 s snapshot can still carry an
-/// older token than a fast renewal wrote. A removal decided at node authority revision `decided`
-/// never withdraws an unexpired token signed for a newer authority.
-pub fn ledger_replaces(
-    current: Option<&str>,
-    candidate: Option<&str>,
-    decided: Option<u64>,
-    now: u64,
-) -> bool {
-    if current == candidate {
-        return false;
-    }
-    let Some(held) = current.and_then(storage_claims) else {
-        return true;
-    };
-    let order = ledger_order(&held);
-    match candidate {
-        Some(token) => storage_claims(token)
-            .and_then(|claims| ledger_order(&claims))
-            .is_some_and(|candidate| Some(candidate) >= order),
-        None => {
-            integer(&held, "exp").is_ok_and(|expiry| expiry <= now)
-                || decided
-                    .zip(order)
-                    .is_some_and(|(decided, (revision, _))| decided >= revision)
-        }
-    }
-}
-/// Writes `candidate` into database `db`'s gateway write-authority ledger when it replaces the
-/// current token. The patch is bound to the resourceVersion that was compared, so a concurrent
-/// writer makes it fail instead of being overwritten. Returns whether it wrote.
-pub async fn write_ledger(
-    k8s: &Kubernetes,
-    db: &Value,
-    candidate: Option<&str>,
-    decided: Option<u64>,
-) -> Result<bool, Error> {
-    let name = format!("storage-{}", text(db, "id"));
-    let Some(map) = k8s.read_known("ConfigMap", Some(SYSTEM), &name).await? else {
-        return Ok(false);
-    };
-    owned(&map, db, &name, Some(SYSTEM))?;
-    let key = constant("STORAGE_AUTHORITY_LEDGER_KEY")
-        .as_str()
-        .ok_or("storage gate key not generated")?;
-    let clock = u64::try_from(now()).map_err(|_| "ledger clock invalid")?;
-    if !ledger_replaces(map["data"][key].as_str(), candidate, decided, clock) {
-        return Ok(false);
-    }
-    k8s.patch(&map, &json!({"data":{key:candidate}})).await?;
-    Ok(true)
 }
 fn startup_valid(db: &Value) -> bool {
     let hold = &db["storage_startup"];
@@ -685,8 +566,7 @@ async fn accepting(
     }
 }
 impl Reconciler {
-    /// Native has already bound this thin volume. Pin that physical custody before Ready;
-    /// the separate Ready path still requires this Pod's measured IO limits and write token.
+    /// Native has already bound this thin volume. Pin that physical custody before Ready.
     async fn bind_native_volume(
         &self,
         db: &Value,
@@ -894,17 +774,6 @@ impl Reconciler {
             let Some(reported) = reported else {
                 return Ok(None);
             };
-            let io = reported["io"].as_array().and_then(|items| {
-                items
-                    .iter()
-                    .find(|io| io["pod_uid"] == pod["metadata"]["uid"])
-            });
-            if io.is_none_or(|io| {
-                io["write_bytes_per_second"] != storage["write_bytes_per_second"]
-                    || io["write_iops_per_second"] != storage["write_iops_per_second"]
-            }) {
-                return Ok(None);
-            }
             identity["lvUuid"] = reported["lv_uuid"].clone();
         }
         Ok(Some(identity))
@@ -1110,19 +979,6 @@ impl Reconciler {
                 .await?
                 .map(|session| (session, ca, ip)))
         })))
-    }
-    /// Writes the database's token into its ledger, never over a newer one; `decided` is the
-    /// revision of the node authority under which the token (or its absence) was decided.
-    pub async fn renew_storage_authority(
-        &self,
-        db: &Value,
-        decided: Option<u64>,
-    ) -> Result<(), Error> {
-        if db["storage"].is_null() {
-            return Ok(());
-        }
-        write_ledger(&self.k8s, db, db["storage_authority"].as_str(), decided).await?;
-        Ok(())
     }
     /// A runtime switch at the same generation relabels the namespace that runtime admission
     /// matches, then deletes only a primary on the other runtime, so that CNPG recreates it on its
@@ -1369,24 +1225,13 @@ impl Reconciler {
         // Cluster. None depends on another, and they are judged in the order they always were.
         let deletion = format!("delete-{id}");
         let (guarded, retired, ns_read, fence_read, cluster_read) = tokio::join!(
-            self.guard(db, snapshot, state_name == "running"),
+            self.guard(db, snapshot),
             self.k8s.read_known("ConfigMap", Some(SYSTEM), &deletion),
             self.k8s.read_known("Namespace", None, &ns),
             self.k8s.read_known("ConfigMap", Some(SYSTEM), &fence_name),
             self.k8s.read_known("Cluster", Some(&ns), "database"),
         );
-        let (authority, node_observed) = match guarded {
-            Ok(value) => value,
-            Err(error) if error.downcast_ref::<ExpiredStorageSnapshot>().is_some() => {
-                return Err(error);
-            }
-            Err(error) => {
-                if state_name == "running" && !db["storage"].is_null() {
-                    return self.protect_storage(db).await;
-                }
-                return Err(error);
-            }
-        };
+        let (authority, node_observed) = guarded?;
         if retired?.is_some() {
             return Err("database deletion is irreversible".into());
         }
@@ -1693,8 +1538,6 @@ impl Reconciler {
             applied.push(actual);
         }
         fence = Some(self.save_state(db, &stored, fence.as_ref(), lean).await?);
-        self.renew_storage_authority(db, integer(&authority, "revision").ok())
-            .await?;
         apply_phase.completed();
         let Some(cluster) = self
             .k8s
@@ -1960,9 +1803,6 @@ impl Reconciler {
         };
         postgres_status(pod_now).ok_or("postgres runtime proof missing")?;
         self.power.kubelet_ready(db, pod_now);
-        if !db["storage"].is_null() && db["storage_authority"].as_str().is_none() {
-            return Ok(Some(observation(db, "provisioning", None)));
-        }
         let is_ready = archive["continuous"] == true || established;
         let mut result = observation(
             db,
@@ -2373,17 +2213,6 @@ impl Reconciler {
     pub fn take_followup(&self, id: &str) -> bool {
         self.followups.lock().unwrap().remove(id)
     }
-    /// The protective stop of a database whose node write authority lapsed. A database a pool
-    /// slot serves also has its slot retired once the marker is written (rule 6.7).
-    pub async fn protect_storage(&self, db: &Value) -> Result<Option<Value>, Error> {
-        let observed = self.power.protect_storage(db).await?;
-        let id = text(db, "id");
-        if self.pool.serves(id) {
-            self.pool.unwind_later(id, "protected");
-            self.pool.unwind(self, id, None).await?;
-        }
-        Ok(observed)
-    }
     /// Whether the node-wide Cloudflare write authority of the database's node is current for a
     /// pool claim (check 4.3 #1): the snapshot's (or a newer renewal's) authority of `node`, the
     /// Node as the watch holds it.
@@ -2396,18 +2225,11 @@ impl Reconciler {
         snapshot.region["storage_nodes"]
             .as_array()
             .and_then(|nodes| nodes.iter().find(|n| n["name"] == db["node"]))
-            .is_some_and(|authority| {
-                storage_guard(db, node, authority, &self.cluster_uid, true, now()).is_ok()
-            })
+            .is_some_and(|authority| storage_guard(db, node, authority).is_ok())
     }
     /// The Node and the host authority the database stands on. The pass has asserted the identity
     /// of the cluster before it asks.
-    async fn guard(
-        &self,
-        db: &Value,
-        snapshot: &DesiredSnapshot,
-        require_write: bool,
-    ) -> Result<(Value, Value), Error> {
+    async fn guard(&self, db: &Value, snapshot: &DesiredSnapshot) -> Result<(Value, Value), Error> {
         let assigned = snapshot.fleet_release["nodes"]
             .as_array()
             .and_then(|nodes| {
@@ -2437,15 +2259,8 @@ impl Reconciler {
                     .iter()
                     .find(|node| text(node, "name") == text(db, "node"))
             })
-            .ok_or("thin host authority missing")?;
-        storage_guard(
-            db,
-            &node,
-            authority,
-            &self.cluster_uid,
-            require_write,
-            now(),
-        )?;
+            .ok_or("thin node storage missing")?;
+        storage_guard(db, &node, authority)?;
         Ok((authority.clone(), node))
     }
     /// The receipt of the database's storage, with the state it records. A receipt that records
@@ -2827,84 +2642,6 @@ mod tests {
         );
     }
     use super::*;
-    use crate::test_server::{Server, token, uid};
-    #[test]
-    fn a_ledger_token_never_yields_to_an_older_one() {
-        let (id, node) = ("db000000000000000001", uid(1));
-        let current = token(id, 2, &node, 5, 10_000);
-        let older = token(id, 2, &node, 4, 10_000);
-        let newer = token(id, 2, &node, 6, 10_000);
-        let woken = token(id, 3, &node, 5, 10_000);
-        // A snapshot pulled before a fast renewal carries an older token: it never replaces it.
-        assert!(!ledger_replaces(Some(&current), Some(&older), Some(9), 0));
-        assert!(ledger_replaces(Some(&current), Some(&newer), None, 0));
-        // Within one authority revision a newer generation replaces, never the reverse.
-        assert!(ledger_replaces(Some(&current), Some(&woken), None, 0));
-        assert!(!ledger_replaces(Some(&woken), Some(&current), None, 0));
-        assert!(!ledger_replaces(Some(&current), Some(&current), None, 0));
-        // An empty or unreadable ledger takes a token; an unreadable token replaces nothing.
-        assert!(ledger_replaces(None, Some(&older), None, 0));
-        assert!(ledger_replaces(Some("garbage"), Some(&older), None, 0));
-        assert!(!ledger_replaces(
-            Some(&current),
-            Some("sa1.e30.c2ln"),
-            None,
-            0
-        ));
-        // A removal withdraws a live token only when decided at its authority or a newer one.
-        assert!(!ledger_replaces(Some(&current), None, Some(4), 0));
-        assert!(ledger_replaces(Some(&current), None, Some(5), 0));
-        assert!(!ledger_replaces(Some(&current), None, None, 9_999));
-        assert!(ledger_replaces(Some(&current), None, None, 10_000));
-        assert_eq!(
-            newer_token(Some(&current), Some(&older)),
-            Some(current.as_str())
-        );
-        assert_eq!(
-            newer_token(Some(&older), Some(&current)),
-            Some(current.as_str())
-        );
-        assert_eq!(
-            newer_token(Some(&current), Some(&woken)),
-            Some(woken.as_str())
-        );
-        assert_eq!(newer_token(None, Some(&older)), Some(older.as_str()));
-    }
-    #[tokio::test]
-    async fn the_ledger_write_is_bound_to_the_token_it_compared() {
-        let server = Server::start().await;
-        let (id, node) = ("db000000000000000001", uid(1));
-        let soon = u64::try_from(now()).unwrap() + 60_000;
-        let (current, older, newer) = (
-            token(id, 2, &node, 5, soon),
-            token(id, 2, &node, 4, soon),
-            token(id, 2, &node, 6, soon),
-        );
-        server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{id}"),"namespace":SYSTEM,"uid":uid(7),"labels":{LABEL:id}},"data":{"state":"{}","write-authority":current}}));
-        let db = json!({ "id": id });
-        assert!(
-            !write_ledger(&server.k8s, &db, Some(&older), Some(4))
-                .await
-                .unwrap()
-        );
-        assert!(
-            write_ledger(&server.k8s, &db, Some(&newer), Some(6))
-                .await
-                .unwrap()
-        );
-        let ledger = server
-            .get("ConfigMap", Some(SYSTEM), &format!("storage-{id}"))
-            .unwrap();
-        assert_eq!(ledger["data"]["write-authority"], newer);
-        assert_eq!(ledger["data"]["state"], "{}");
-        // The one patch named the uid and resourceVersion of the ledger it compared.
-        let writes = server.state.lock().unwrap().writes.clone();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(
-            writes[0].2["metadata"],
-            json!({"uid":uid(7),"resourceVersion":"1"})
-        );
-    }
     #[test]
     fn a_cluster_held_down_starts_postgres_when_released() {
         let vectors: Value = serde_json::from_str(include_str!(
@@ -3025,36 +2762,20 @@ mod tests {
         assert!(!startup_valid(&db));
     }
     #[test]
-    fn an_expired_host_snapshot_is_stale_only_with_unchanged_scope() {
+    fn the_node_storage_row_binds_only_the_node_volume_group_and_pool() {
         let db = json!({"storage":{"node_uid":"same","volume_group_uuid":"vg","pool_uuid":"pool","profile_sha256":"profile","profile_revision":1,"storage_class":"class","guard_seconds":10}});
         let node = json!({"metadata":{"uid":"same"}});
-        let authority = json!({"observed_at":"1970-01-01T00:00:01.000Z","expires_at":"1970-01-01T00:00:02.000Z","write_allowed":true,"node_uid":"same","cluster_uid":"cluster","volume_group_uuid":"vg","pool_uuid":"pool","profile_sha256":"profile","profile_revision":1,"storage_class":"class"});
-        let error = storage_guard(&db, &node, &authority, "cluster", true, 2000).unwrap_err();
-        assert!(error.downcast_ref::<ExpiredStorageSnapshot>().is_some());
-        let mut revoked = authority.clone();
-        revoked["write_allowed"] = false.into();
-        assert!(
-            storage_guard(&db, &node, &revoked, "cluster", true, 2000)
-                .unwrap_err()
-                .downcast_ref::<ExpiredStorageSnapshot>()
-                .is_none()
-        );
+        // Write authority, its expiry and the profile are no longer the controller's to judge.
+        let row = json!({"observed_at":"1970-01-01T00:00:01.000Z","expires_at":"1970-01-01T00:00:02.000Z","write_allowed":false,"node_uid":"same","cluster_uid":"other","volume_group_uuid":"vg","pool_uuid":"pool","profile_sha256":"other","profile_revision":1,"storage_class":"other"});
+        assert!(storage_guard(&db, &node, &row).is_ok());
         let mut replaced = node.clone();
         replaced["metadata"]["uid"] = "replaced".into();
-        assert!(
-            storage_guard(&db, &replaced, &authority, "cluster", true, 2000)
-                .unwrap_err()
-                .downcast_ref::<ExpiredStorageSnapshot>()
-                .is_none()
-        );
-        let mut replaced = authority.clone();
-        replaced["profile_sha256"] = "replaced".into();
-        assert!(
-            storage_guard(&db, &node, &replaced, "cluster", true, 2000)
-                .unwrap_err()
-                .downcast_ref::<ExpiredStorageSnapshot>()
-                .is_none()
-        );
+        assert!(storage_guard(&db, &replaced, &row).is_err());
+        for key in ["node_uid", "volume_group_uuid", "pool_uuid"] {
+            let mut changed = row.clone();
+            changed[key] = "replaced".into();
+            assert!(storage_guard(&db, &node, &changed).is_err(), "{key}");
+        }
     }
     #[test]
     fn native_lvm_custody_requires_ready_and_a_live_owned_object() {

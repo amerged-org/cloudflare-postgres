@@ -813,12 +813,3 @@ pub async fn api_double(
     let api = ControlApi::double(reqwest::Url::parse(&format!("http://{address}/")).unwrap());
     (api, requests)
 }
-/// An `sa1` token of node `node_uid` with schema-valid claims; its signature is never read here.
-pub fn token(database: &str, generation: u64, node_uid: &str, revision: u64, exp: u64) -> String {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let claims = json!({"v":1,"kid":"cf","database_id":database,"generation":generation,"authority_revision":revision,"storage_uid":uid(31),"node_uid":node_uid,"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","profile_sha256":"f".repeat(64),"volume_handle":format!("pvc-{}",uid(32)),"lv_uuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","pvc_uid":uid(33),"pv_uid":uid(34),"pod_uid":uid(35),"observed_at":exp.saturating_sub(10_000),"iat":exp.saturating_sub(10_000),"exp":exp,"guard_seconds":10,"drain_seconds":10,"write_allowed":true});
-    format!(
-        "sa1.{}.c2lnbmF0dXJl",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
-    )
-}
