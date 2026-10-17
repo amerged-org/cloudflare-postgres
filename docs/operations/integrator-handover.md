@@ -528,18 +528,23 @@ pool.Client = class extends Client {
     super(config);
     this.neonConfig.useSecureWebSocket = true; // wss
     this.neonConfig.forceDisablePgSSL = true; // TLS is the WebSocket; see 3.3
-    this.neonConfig.pipelineConnect = false; // required: authentication is SCRAM, not cleartext
+    // pipelineConnect keeps its default "password" and coalesceWrites its default true; see below
     // The driver prepends wss://; return host and path only, with both hints.
     this.neonConfig.wsProxy = (host) => `${host}/v2?${new URLSearchParams({ database, user })}`;
   }
 };
 ```
 
-`pipelineConnect = false` is required: the driver's default `"password"` pipelines startup,
-authentication and first query and, per its documentation, only works with cleartext password
-authentication, while PGCF authenticates with SCRAM end to end between your client and
-PostgreSQL. A TCP DSN with only the hostname replaced is not enough, and HTTP query mode
-(`neon()`, `poolQueryViaFetch`) is not supported.
+Keep the driver's defaults `pipelineConnect: "password"` and `coalesceWrites: true`: the driver
+then sends the StartupMessage, the password and the first query in one WebSocket message. The
+gateway answers AuthenticationCleartextPassword, logs in to PostgreSQL with SCRAM-SHA-256 inside
+the cluster and sends AuthenticationOk through ReadyForQuery as one message, so a new connection
+needs one round trip after the upgrade instead of four, also after a wake: a sleeping database's
+connection is asked for its password while it waits. The gateway decides from the message that
+carries the StartupMessage, so pass the password as a string (a password function must not wait
+for anything). `pipelineConnect: false` still works and authenticates with SCRAM end to end, at
+three more round trips per connection. A TCP DSN with only the hostname replaced is not enough,
+and HTTP query mode (`neon()`, `poolQueryViaFetch`) is not supported.
 
 For `psql` and migration tools build the CLI (`pnpm --filter @pgcf/cli build`) and run
 `node packages/cli/dist/main.js connect --endpoint wss://db.example.com --database <id> --user <role>`;
@@ -564,7 +569,9 @@ SQL and allows 16 local connections.
   integrity check through the CLI).
 - The gateway pings every 30 s and drops a connection that misses a pong; ordinary WebSocket
   stacks answer automatically.
-- The StartupMessage must arrive within 10 s of the upgrade and is at most 10,000 bytes.
+- The StartupMessage must arrive within 10 s of the upgrade and is at most 10,000 bytes. A
+  password pipelined with it is a PasswordMessage of at most 4,096 bytes; an empty, oversized or
+  wrong one, an unknown role and an unknown database are all answered with the same `28P01`.
 
 ### 3.3 TLS
 
@@ -573,8 +580,12 @@ for the hostname); Cloudflare to the regional gateway with a signed, 30-second r
 token; gateway to PostgreSQL over TLS verified against the database's own CA and its exact
 service name (`pg_hba` rejects non-TLS connections). The gateway answers a PostgreSQL
 `SSLRequest` or GSS request with `N`, so a client that requires protocol-level TLS (`ssl: true`,
-`sslmode=require`) fails; the WebSocket is the encryption. SCRAM authentication runs between your
-client and PostgreSQL; PGCF's Edge and gateway only relay it.
+`sslmode=require`) fails; the WebSocket is the encryption. A password pipelined with the
+StartupMessage travels inside that WebSocket to the gateway, which proves it to PostgreSQL with
+SCRAM-SHA-256 and continues only after PostgreSQL's server signature matches; the gateway never
+logs or stores the password and zeroizes it after the login. Without a pipelined password
+(`pipelineConnect: false`, the CLI) SCRAM runs between your client and PostgreSQL, and PGCF's
+Edge and gateway only relay it.
 
 ### 3.4 Timeouts and retries for a sleeping database
 
@@ -605,7 +616,7 @@ Recommended policy (derived from those numbers, not a PGCF guarantee):
 
 | Setting | Value | Reason |
 | --- | --- | --- |
-| Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus SCRAM and startup (0.1–0.4 s); a cold Thin wake without a free pool instance takes about 22 s, a pool hit about 1.1 s |
+| Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus login and startup (0.1–0.4 s); a cold Thin wake without a free pool instance takes about 22 s, a pool hit about 1.1 s |
 | Statement timeout | separate from the connect timeout | a connect timeout does not bound a query |
 | Retry `57P03`, `08006`, `53300` | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | transient by definition |
 | Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never | configuration or credentials; fix, do not loop |
