@@ -6,6 +6,9 @@ metadata:
   labels:
     app.kubernetes.io/name: pgcf-gateway
     app.kubernetes.io/part-of: pgcf
+# Cluster-wide endpoints: a ready gateway beside every cloudflared is not guaranteed (the
+# placement is a preference and a rollout replaces gateways), so a node-local traffic policy
+# could drop connections. The shared preference keeps both on the database node.
 spec:
   type: ClusterIP
   selector:
@@ -54,13 +57,20 @@ spec:
         runAsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: pgcf-gateway
+      # Ingress runs beside PostgreSQL: prefer a customer node (an admitted PGCF node that is not
+      # the control plane), so the tunnel, the gateway and the database share one node and no
+      # WireGuard hop. Soft, so the control server alone still runs it at first install. No
+      # hostname spread: it would push a replica onto the control server.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: pgcf.io/node-id
+                    operator: Exists
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
       containers:
         - name: gateway
           image: pgcf-regional

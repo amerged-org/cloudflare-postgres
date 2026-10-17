@@ -671,3 +671,66 @@ test("mixed gateway-first readback distinguishes legacy controller and native ga
     false,
   );
 });
+test("the database ingress prefers the customer nodes that host PostgreSQL without depending on one", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-runtime-ingress-"));
+  try {
+    for (const path of [
+      "regional",
+      "regional-gateway-native",
+      "regional-native",
+    ])
+      await cp(join(root, "infra/platform", path), join(directory, path), {
+        recursive: true,
+        filter: (path) => !path.includes(".env"),
+      });
+    const values = await render(
+      directory,
+      "regional-native",
+      fleetRegionalImages(nativeInput()),
+    );
+    // A customer node is an admitted PGCF node that is not the region's control plane. The
+    // preference is soft: the control server alone still runs the ingress at first install.
+    for (const name of ["pgcf-cloudflared", "pgcf-gateway"]) {
+      const spec = pod(deployment(values, name));
+      assert.deepEqual(spec.affinity, {
+        nodeAffinity: {
+          preferredDuringSchedulingIgnoredDuringExecution: [
+            {
+              weight: 100,
+              preference: {
+                matchExpressions: [
+                  { key: "pgcf.io/node-id", operator: "Exists" },
+                  {
+                    key: "node-role.kubernetes.io/control-plane",
+                    operator: "DoesNotExist",
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      });
+      // Spreading over hostnames would push a replica onto the control server.
+      assert.equal(spec.topologySpreadConstraints, undefined);
+    }
+    // Without a guaranteed ready gateway beside every cloudflared, a node-local policy could
+    // drop connections; the Service keeps cluster-wide endpoints.
+    const service = values.find(
+      (value) =>
+        value.kind === "Service" &&
+        object(value.metadata).name === "pgcf-gateway",
+    )!;
+    assert.equal(object(service.spec).internalTrafficPolicy, undefined);
+    const tunnel = deployment(values, "pgcf-cloudflared");
+    // An absolute lookup first: the gateway's FQDN never walks the Pod's search list.
+    assert.deepEqual(pod(tunnel).dnsConfig, {
+      options: [{ name: "ndots", value: "1" }],
+    });
+    // The tunnel is not CPU-throttled; its memory stays bounded.
+    const resources = object(container(tunnel, "cloudflared").resources);
+    assert.deepEqual(resources.limits, { memory: "256Mi" });
+    assert.deepEqual(resources.requests, { cpu: "50m", memory: "64Mi" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
