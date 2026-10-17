@@ -201,6 +201,11 @@ pub fn ready_withheld_event(db: &Value, reason: &str, detail: Option<&str>) -> V
 pub(crate) fn ready_withheld(db: &Value, reason: &str, detail: Option<&str>) {
     emit(ready_withheld_event(db, reason, detail));
 }
+/// A sleep refused by the safety check: its reason and the sessions that were busy
+/// (`role/application/state/backend type`, comma-separated), when they could be read.
+pub fn sleep_refused_event(db: &Value, reason: &str, sessions: Option<&str>) -> Value {
+    json!({"event":"sleep_refused","database_id":db["id"],"generation":db["generation"],"reason":reason,"sessions":sessions,"at_ms":wall_clock_ms()})
+}
 /// A retirement of a slot that serves `database` waits at `step` (`postgres_stop`,
 /// `holder_release`), or went on without having seen PostgreSQL shut down
 /// (`postgres_stop_unseen`); `detail` is what the node agent answered last.

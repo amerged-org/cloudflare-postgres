@@ -867,6 +867,15 @@ fn answers(
             one(vec![("count", Cell::Int8(count))])
         } else if sql.contains("pg_stat_clear_snapshot") {
             one(vec![("pg_stat_clear_snapshot", Cell::Void)])
+        } else if sql.contains("AS sessions FROM pg_catalog.pg_stat_activity") {
+            one(vec![(
+                "sessions",
+                if s.busy > 0 {
+                    text("app/psql/active/client backend")
+                } else {
+                    Cell::Null(25)
+                },
+            )])
         } else if sql.contains("pg_prepared_xacts") {
             one(vec![
                 ("busy", Cell::Int4(s.busy)),
@@ -1597,6 +1606,11 @@ mod wire_tests {
                 sql("GUARD"),
                 None,
                 vec![("busy", Type::INT4), ("prepared", Type::INT4)],
+            ),
+            (
+                crate::power::BUSY_SESSIONS,
+                None,
+                vec![("sessions", Type::TEXT)],
             ),
             (
                 sql("IDENTITY"),

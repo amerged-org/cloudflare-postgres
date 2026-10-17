@@ -1407,6 +1407,8 @@ static POWER_CONTRACT: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| 
     ))
     .expect("generated power constants")
 });
+/// The sessions the sleep guard counts as busy, for the refusal's log line only.
+pub(crate) const BUSY_SESSIONS: &str = "SELECT pg_catalog.left(pg_catalog.string_agg(pg_catalog.concat_ws('/', usename, application_name, state, backend_type), ','), 512) AS sessions FROM pg_catalog.pg_stat_activity WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid() AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)";
 pub(crate) fn sql(name: &str) -> &'static str {
     POWER_CONTRACT["constants"]["SLEEP_SQL"][name]
         .as_str()
@@ -1575,6 +1577,20 @@ impl PowerCoordinator {
                 return Ok(Some("probe_unavailable"));
             }
             if let Some(reason) = self.safety(&session).await? {
+                let sessions = session
+                    .query(BUSY_SESSIONS, &[])
+                    .await
+                    .ok()
+                    .and_then(|rows| {
+                        rows.first()?
+                            .try_get::<_, Option<String>>("sessions")
+                            .ok()?
+                    });
+                crate::timing::emit(crate::timing::sleep_refused_event(
+                    db,
+                    reason,
+                    sessions.as_deref(),
+                ));
                 return Ok(Some(reason));
             }
             // The data directory the postmaster runs on, while it runs, for the sleep record a pool

@@ -1435,6 +1435,36 @@ mod world {
     }
     /// The controller's loop until it posts the hibernated observation of the world's
     /// generation, at most `turns` turns.
+    #[tokio::test]
+    async fn a_sleep_refused_for_a_busy_session_says_which_session() {
+        // Live, the first sleep after each pool wake was refused as power_busy and nothing said
+        // which of the three reasons or which session it was.
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        w.db["generation"] = 4.into();
+        w.db["desired_state"] = "suspended".into();
+        w.db["power"] = json!({"operation":format!("op_{}","e".repeat(20)),"revision":4,"mode":"quiesce","reason":"idle"});
+        w.db["size"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_request_mib");
+        w.sql.lock().unwrap().busy = 1;
+        crate::timing::take_emitted();
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .expect("a refused sleep is reported");
+        assert_eq!(observed["power"]["refusal"], "busy", "{observed}");
+        let refused: Vec<_> = crate::timing::take_emitted()
+            .into_iter()
+            .filter(|event| event["event"] == "sleep_refused")
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["reason"], "sql_busy");
+        assert_eq!(refused[0]["sessions"], "app/psql/active/client backend");
+    }
     async fn until_hibernated(w: &mut World, turns: usize) -> Value {
         for _ in 0..turns {
             if let Ok(Some(observed)) = turn(w).await
