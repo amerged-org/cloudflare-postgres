@@ -14,6 +14,10 @@
 //!   every stopped unit when it starts.
 //! - A database's Linux user and uid are `users`.
 //!
+//! - The memory ceiling of `pgcf.slice`, which holds every database, is the operator's awake-database
+//!   budget (`set_slice_memory`): the kernel's backstop under either memory rule. The image's slice
+//!   has 80 % of RAM until the agent sets it.
+//!
 //! The agent runs as root on the node; systemd answers these calls without further authorization.
 pub mod limits;
 pub mod ready;
@@ -22,13 +26,16 @@ pub mod users;
 mod dbus;
 
 use futures_util::StreamExt;
-use limits::{Limits, Property, cpu_quota};
+use limits::{Limits, Property, cpu_quota, slice_memory};
 use pgcf_native_protocol::valid_pattern;
 use std::{num::NonZeroU32, path::PathBuf};
 use zbus::{proxy::CacheProperties, zvariant::OwnedObjectPath};
 
 /// Where the database volumes are mounted: `<DB_ROOT>/<id>` holds the data directory `data`.
 pub const DB_ROOT: &str = "/var/lib/pgcf/db";
+
+/// The slice that holds every database unit (`Slice=` of `pgcf-pg@.service`).
+const SLICE: &str = "pgcf.slice";
 
 /// The prefix of a database's unit; the instance is the database ID.
 const UNIT_PREFIX: &str = "pgcf-pg@";
@@ -381,20 +388,27 @@ impl Units {
 
     async fn set_properties(
         &self,
-        database: &str,
+        unit: &str,
         runtime: bool,
         properties: &[Property],
     ) -> Result<(), Error> {
         let encoded: Vec<_> = properties.iter().map(dbus::encode).collect();
         self.manager
-            .set_unit_properties(&Self::unit_of(database)?, runtime, &encoded)
+            .set_unit_properties(unit, runtime, &encoded)
             .await?;
         Ok(())
     }
 
     /// Sets a database's size limits on its unit, running or not, and keeps them across a reboot.
     pub async fn set_limits(&self, database: &str, limits: &Limits) -> Result<(), Error> {
-        self.set_properties(database, false, &limits.properties())
+        self.set_properties(&Self::unit_of(database)?, false, &limits.properties())
+            .await
+    }
+
+    /// Sets the memory ceiling of all databases together, the awake budget, on their slice,
+    /// running or not, and keeps it across a reboot.
+    pub async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), Error> {
+        self.set_properties(SLICE, false, &[slice_memory(awake_budget_mib)])
             .await
     }
 
@@ -404,7 +418,7 @@ impl Units {
         database: &str,
         millicores: Option<NonZeroU32>,
     ) -> Result<(), Error> {
-        self.set_properties(database, true, &[cpu_quota(millicores)])
+        self.set_properties(&Self::unit_of(database)?, true, &[cpu_quota(millicores)])
             .await
     }
 }

@@ -417,3 +417,44 @@ async fn write_limits_of_a_device_are_accepted() {
     let text = String::from_utf8(properties.stdout).unwrap();
     assert!(text.contains("16000000") && text.contains("1000"), "{text}");
 }
+
+/// Removes what `set_slice_memory` left on the image's slice, so the next run starts from it.
+struct Slice;
+impl Drop for Slice {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all("/etc/systemd/system.control/pgcf.slice.d");
+        quiet("systemctl", &["daemon-reload"]);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs systemd as PID 1, root and the node image's units (lab)"]
+async fn the_awake_budget_is_the_memory_ceiling_of_the_database_slice() {
+    if !lab() {
+        return;
+    }
+    let _slice = Slice;
+    let database = Database::new(6);
+    let units = Units::connect(DB_ROOT).await.unwrap();
+    // Set before any database runs, and kept across a reboot.
+    units.set_slice_memory(2048).await.unwrap();
+    assert!(Path::new("/etc/systemd/system.control/pgcf.slice.d/50-MemoryMax.conf").is_file());
+    let started = within(units.start(&database.id)).await.unwrap();
+    let slice = cgroup_of(started.main_pid).parent().unwrap().to_path_buf();
+    assert!(slice.ends_with("pgcf.slice"), "{slice:?}");
+    let memory_max = || {
+        fs::read_to_string(slice.join("memory.max"))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    assert_eq!(memory_max(), (2048u64 << 20).to_string());
+    // A new policy reaches the running slice, with neither a reload nor a restart.
+    units.set_slice_memory(3000).await.unwrap();
+    assert_eq!(memory_max(), (3000u64 << 20).to_string());
+    assert_eq!(
+        units.state(&database.id).await.unwrap().main_pid,
+        Some(started.main_pid)
+    );
+    within(units.stop(&database.id)).await.unwrap();
+}

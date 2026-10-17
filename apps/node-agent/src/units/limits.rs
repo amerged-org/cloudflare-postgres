@@ -101,6 +101,12 @@ impl Limits {
     }
 }
 
+/// The memory ceiling of the slice that holds every database: the operator's awake-database budget
+/// (plan 4.5). The kernel enforces it as the backstop under either memory rule (plan 4.6).
+pub fn slice_memory(awake_budget_mib: u64) -> Property {
+    Property::MemoryMax(awake_budget_mib.saturating_mul(MIB))
+}
+
 /// The quota of a database's CPU size, or none (`CPUQuota=`).
 pub fn cpu_quota(millicores: Option<NonZeroU32>) -> Property {
     Property::CpuQuotaPerSecUsec(match millicores {
@@ -197,6 +203,15 @@ mod tests {
         assert_eq!(quota(100), Property::CpuQuotaPerSecUsec(100_000));
         assert_eq!(quota(6000), Property::CpuQuotaPerSecUsec(6_000_000));
         assert_eq!(quota(0), Property::CpuQuotaPerSecUsec(u64::MAX));
+    }
+
+    #[test]
+    fn the_slice_ceiling_is_the_awake_budget_in_bytes() {
+        assert_eq!(slice_memory(9913), Property::MemoryMax(9913 * MIB));
+        assert_eq!(slice_memory(256), Property::MemoryMax(256 * MIB));
+        // The contract's largest budget, 1 TiB.
+        assert_eq!(slice_memory(1_048_576), Property::MemoryMax(1 << 40));
+        assert_eq!(slice_memory(9913).name(), "MemoryMax");
     }
 
     #[test]
