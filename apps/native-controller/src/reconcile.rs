@@ -962,7 +962,7 @@ impl Reconciler {
                 "suspended" => return self.pool.sleep(self, db, serving).await,
                 _ => {
                     self.pool.unwind_later(id, "deleted");
-                    if !self.pool.unwind(self, id, None).await? {
+                    if !self.pool.unwind(self, id, Some(db)).await? {
                         return Err("pool slot retirement pending".into());
                     }
                 }

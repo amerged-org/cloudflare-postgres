@@ -1845,7 +1845,8 @@ impl Pool {
         write_sleep_record(&self.k8s, id, next.as_ref()).await
     }
     /// Retires the slot that serves `id`; `db` is the desired row the sleep record is written
-    /// under. `true` once the slot is gone and the volume released.
+    /// under. A deleted database leaves no sleep record and never waits for its PostgreSQL to be
+    /// seen shut down: its data goes with it. `true` once the slot is gone and the volume released.
     pub async fn unwind(
         &self,
         rec: &Reconciler,
@@ -1872,7 +1873,8 @@ impl Pool {
                 pod: Some(serving.pod.clone()),
                 created: Instant::now(),
             });
-        let inspect = serving.retire.is_none_or(|retire| retire.inspect);
+        let deleted = db.is_some_and(|db| text(db, "desired_state") == "deleted");
+        let inspect = !deleted && serving.retire.is_none_or(|retire| retire.inspect);
         if !self
             .retire(
                 rec,

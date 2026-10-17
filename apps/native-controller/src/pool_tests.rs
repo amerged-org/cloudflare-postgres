@@ -1391,6 +1391,136 @@ mod world {
         assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
     }
 
+    /// Cloudflare deletes the database: the desired row at the next generation. The data directory
+    /// in the slot is not seen shut down cleanly, as after a crash of the slot's PostgreSQL: a
+    /// deletion has no sleep to record and never waits for one.
+    fn deleted(w: &mut World) {
+        w.db["generation"] = (w.db["generation"].as_u64().unwrap() + 1).into();
+        w.db["desired_state"] = "deleted".into();
+        w.db.as_object_mut().unwrap().remove("power");
+        w.gateway
+            .agent
+            .lock()
+            .unwrap()
+            .devices
+            .get_mut(LV_UUID)
+            .unwrap()
+            .control
+            .state = 6;
+    }
+    /// The deletion pass of `w.db`: the slot is fenced, its namespace deleted and its holder
+    /// released, without a sleep record, and only then is the tenant's own namespace deleted.
+    async fn deletion_retires_the_slot(w: &World) {
+        let from = w.log_len();
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .expect("a deletion observation");
+        let lines = w.since(from);
+        assert!(
+            ["deleting", "deleted"].contains(&observed["state"].as_str().unwrap()),
+            "{observed}"
+        );
+        let fenced = at(
+            &lines,
+            &format!(
+                "PATCH /apis/postgresql.cnpg.io/v1/namespaces/{}/clusters/database",
+                slot_ns()
+            ),
+        );
+        let slot_deleted = at(&lines, &format!("DELETE /api/v1/namespaces/{}", slot_ns()));
+        let released = at(&lines, "AGENT release ok");
+        let tenant_deleted = at(&lines, &format!("DELETE /api/v1/namespaces/{}", w.ns));
+        assert!(fenced < slot_deleted && slot_deleted < released && released < tenant_deleted);
+        assert!(!has(
+            &lines,
+            &format!(
+                "PATCH /api/v1/namespaces/{SYSTEM}/configmaps/storage-{}",
+                w.id
+            )
+        ));
+        assert_eq!(holder(w), None);
+        assert!(!w.reconciler.pool.serves(&w.id));
+        assert!(w.reconciler.pool.unwinding().is_empty());
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_database_s_serving_slot_is_retired_and_its_deletion_proceeds() {
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        deleted(&mut w);
+        deletion_retires_the_slot(&w).await;
+        // A wake that still arrives is refused, and no slot serves the database again.
+        w.free_slot().await;
+        let wake = WakeRequest {
+            generation: w.db["generation"].as_u64().unwrap() + 1,
+            ..w.wake_request()
+        };
+        w.reconciler.pool.delivered(&w.gateway_pod(), &wake);
+        w.reconciler
+            .pool
+            .wake(&w.reconciler, Some((&w.db, &w.snapshot)), &wake, false)
+            .await
+            .unwrap();
+        eventually("the refusal", || result_of(&w, "refused").is_some()).await;
+        assert!(!w.reconciler.pool.serves(&w.id));
+        assert_eq!(holder(&w), None);
+    }
+
+    #[tokio::test]
+    async fn a_deletion_that_arrives_while_a_claim_is_in_flight_ends_with_no_slot_holding_the_volume()
+     {
+        let mut w = World::pooled().await;
+        // The gateway's wake is claimed on the sleeping row; Cloudflare deletes the database
+        // before it confirms the ticket.
+        let wake = delivered_wake(&mut w).await;
+        assert!(w.reconciler.pool.serves(&w.id), "a hit");
+        deleted(&mut w);
+        assert_eq!(number(&w.db, "generation"), wake.generation);
+        let db = w.db.clone();
+        assert_eq!(
+            w.reconciler
+                .pool
+                .confirm_tickets(|id| (id == db["id"]).then_some(&db), Instant::now()),
+            vec![(w.id.clone(), TicketOutcome::Refuted)]
+        );
+        // The controller's loop retires the refuted slot under the deleted row; the deletion
+        // pass that follows finds nothing left of it.
+        assert!(
+            w.reconciler
+                .pool
+                .unwind(&w.reconciler, &w.id, Some(&w.db))
+                .await
+                .unwrap()
+        );
+        assert_eq!(holder(&w), None);
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert_eq!(record(&w).map(|record| record.via), Some(Via::Cnpg));
+        let observed = w
+            .reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .expect("a deletion observation");
+        assert!(
+            ["deleting", "deleted"].contains(&observed["state"].as_str().unwrap()),
+            "{observed}"
+        );
+        assert!(!w.reconciler.pool.serves(&w.id));
+        // A deletion pass that runs before the loop's retirement retires the slot itself.
+        let mut w = World::pooled().await;
+        delivered_wake(&mut w).await;
+        deleted(&mut w);
+        let db = w.db.clone();
+        w.reconciler
+            .pool
+            .confirm_tickets(|id| (id == db["id"]).then_some(&db), Instant::now());
+        deletion_retires_the_slot(&w).await;
+    }
+
     #[tokio::test]
     async fn a_desired_trigger_wake_hits_inside_the_reconcile_pass_and_a_miss_continues_unchanged()
     {
