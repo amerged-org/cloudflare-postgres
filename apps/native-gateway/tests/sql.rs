@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -203,7 +203,56 @@ fn strings(body: &[u8]) -> Vec<String> {
         .map(|part| String::from_utf8(part.to_vec()).unwrap())
         .collect()
 }
-/// One PostgreSQL session of the double. Queries are a small fixed language: `select ...`
+/// The server side of SCRAM-SHA-256 for `PASSWORD`; true when the client proved it.
+async fn scram(tls: &mut server::TlsStream<TcpStream>) -> Result<bool, Failure> {
+    let mut mechanisms = 10u32.to_be_bytes().to_vec();
+    mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
+    send(tls, b'R', &mechanisms).await?;
+    let (tag, initial) = receive(tls).await?;
+    assert_eq!(tag, b'p');
+    let nul = initial.iter().position(|b| *b == 0).unwrap();
+    assert_eq!(&initial[..nul], b"SCRAM-SHA-256");
+    let first = std::str::from_utf8(&initial[nul + 5..])?.to_string();
+    let bare = first.strip_prefix("n,,").expect("no channel binding");
+    let client_nonce = bare
+        .strip_prefix("n=,r=")
+        .expect("client-first-message-bare");
+    let nonce = format!("{client_nonce}server");
+    let server_first = format!("r={nonce},s={},i=4096", STANDARD.encode(SALT));
+    let mut continuing = 11u32.to_be_bytes().to_vec();
+    continuing.extend_from_slice(server_first.as_bytes());
+    send(tls, b'R', &continuing).await?;
+    let (tag, last) = receive(tls).await?;
+    assert_eq!(tag, b'p');
+    let last = String::from_utf8(last)?;
+    let (without_proof, proof) = last.rsplit_once(",p=").unwrap();
+    assert_eq!(without_proof, format!("c=biws,r={nonce}"));
+    let salted = pbkdf2(PASSWORD.as_bytes(), SALT, 4096);
+    let stored = Sha256::digest(mac(&salted, b"Client Key")).to_vec();
+    let message = format!("{bare},{server_first},{without_proof}");
+    let signature = mac(&stored, message.as_bytes());
+    let recovered: Vec<u8> = STANDARD
+        .decode(proof)?
+        .iter()
+        .zip(&signature)
+        .map(|(a, b)| a ^ b)
+        .collect();
+    if Sha256::digest(&recovered).to_vec() != stored {
+        return Ok(false);
+    }
+    let mut done = 12u32.to_be_bytes().to_vec();
+    done.extend_from_slice(
+        format!(
+            "v={}",
+            STANDARD.encode(mac(&mac(&salted, b"Server Key"), message.as_bytes()))
+        )
+        .as_bytes(),
+    );
+    send(tls, b'R', &done).await?;
+    Ok(true)
+}
+/// One PostgreSQL session of the double. It authenticates with SCRAM-SHA-256, or with a cleartext
+/// password when `cleartext` is set. Queries are a small fixed language: `select ...`
 /// returns its parameters as one row of text columns (or `1` without parameters), `insert`
 /// inserts one row, `fail` raises 42P01 when executed, `copy` starts COPY FROM STDIN, `hang`
 /// drops the connection once executed, `big` returns 12 MiB of rows.
@@ -211,6 +260,7 @@ async fn postgres_session(
     mut tcp: TcpStream,
     acceptor: TlsAcceptor,
     journal: Journal,
+    cleartext: bool,
 ) -> Result<(), Failure> {
     let mut request = [0; 8];
     tcp.read_exact(&mut request).await?;
@@ -230,39 +280,15 @@ async fn postgres_session(
         .map(|pair| format!("{}={}", pair[0], pair[1]))
         .collect();
     journal.push(format!("startup:{}", pairs.join(" ")));
-    let mut mechanisms = 10u32.to_be_bytes().to_vec();
-    mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
-    send(&mut tls, b'R', &mechanisms).await?;
-    let (tag, initial) = receive(&mut tls).await?;
-    assert_eq!(tag, b'p');
-    let nul = initial.iter().position(|b| *b == 0).unwrap();
-    assert_eq!(&initial[..nul], b"SCRAM-SHA-256");
-    let first = std::str::from_utf8(&initial[nul + 5..])?.to_string();
-    let bare = first.strip_prefix("n,,").expect("no channel binding");
-    let client_nonce = bare
-        .strip_prefix("n=,r=")
-        .expect("client-first-message-bare");
-    let nonce = format!("{client_nonce}server");
-    let server_first = format!("r={nonce},s={},i=4096", STANDARD.encode(SALT));
-    let mut continuing = 11u32.to_be_bytes().to_vec();
-    continuing.extend_from_slice(server_first.as_bytes());
-    send(&mut tls, b'R', &continuing).await?;
-    let (tag, last) = receive(&mut tls).await?;
-    assert_eq!(tag, b'p');
-    let last = String::from_utf8(last)?;
-    let (without_proof, proof) = last.rsplit_once(",p=").unwrap();
-    assert_eq!(without_proof, format!("c=biws,r={nonce}"));
-    let salted = pbkdf2(PASSWORD.as_bytes(), SALT, 4096);
-    let stored = Sha256::digest(mac(&salted, b"Client Key")).to_vec();
-    let message = format!("{bare},{server_first},{without_proof}");
-    let signature = mac(&stored, message.as_bytes());
-    let recovered: Vec<u8> = STANDARD
-        .decode(proof)?
-        .iter()
-        .zip(&signature)
-        .map(|(a, b)| a ^ b)
-        .collect();
-    if Sha256::digest(&recovered).to_vec() != stored {
+    let accepted = if cleartext {
+        send(&mut tls, b'R', &3u32.to_be_bytes()).await?;
+        let (tag, body) = receive(&mut tls).await?;
+        assert_eq!(tag, b'p');
+        body == [PASSWORD.as_bytes(), b"\0"].concat()
+    } else {
+        scram(&mut tls).await?
+    };
+    if !accepted {
         journal.push("auth:failed".into());
         let body = error(
             "FATAL",
@@ -274,15 +300,6 @@ async fn postgres_session(
         return Ok(());
     }
     journal.push("auth:ok".into());
-    let mut done = 12u32.to_be_bytes().to_vec();
-    done.extend_from_slice(
-        format!(
-            "v={}",
-            STANDARD.encode(mac(&mac(&salted, b"Server Key"), message.as_bytes()))
-        )
-        .as_bytes(),
-    );
-    send(&mut tls, b'R', &done).await?;
     send(&mut tls, b'R', &0u32.to_be_bytes()).await?;
     send(&mut tls, b'S', b"server_version\x0017.6\0").await?;
     send(&mut tls, b'K', &[0, 0, 0, 1, 0, 0, 0, 2]).await?;
@@ -461,6 +478,8 @@ struct Fixture {
     /// PostgreSQL connections the gateway dialled.
     calls: Arc<AtomicUsize>,
     journal: Journal,
+    /// The double asks for a cleartext password instead of SCRAM.
+    cleartext: Arc<AtomicBool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -514,6 +533,8 @@ impl Fixture {
         let (stop, receiver) = watch::channel(false);
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let recorder = journal.clone();
+        let cleartext = Arc::new(AtomicBool::new(false));
+        let asks = cleartext.clone();
         let mut shutdown = receiver.clone();
         let upstream_task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
@@ -522,8 +543,8 @@ impl Fixture {
                     _ = shutdown.changed() => break,
                     accepted = upstream.accept() => {
                         let (tcp, _) = accepted.unwrap();
-                        let (acceptor, journal) = (acceptor.clone(), recorder.clone());
-                        tasks.spawn(async move { let _ = postgres_session(tcp, acceptor, journal).await; });
+                        let (acceptor, journal, cleartext) = (acceptor.clone(), recorder.clone(), asks.load(Ordering::SeqCst));
+                        tasks.spawn(async move { let _ = postgres_session(tcp, acceptor, journal, cleartext).await; });
                     }
                 }
             }
@@ -553,6 +574,7 @@ impl Fixture {
             port,
             calls,
             journal,
+            cleartext,
             stop,
             tasks: vec![upstream_task, gateway_task],
         }
@@ -962,5 +984,24 @@ async fn a_wake_ticket_is_held_without_a_dial_until_the_fence_releases_the_write
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["rows"], json!([["woken"]]));
     assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_cleartext_challenge_is_answered_and_its_session_kept_only_for_that_password() {
+    let fixture = Fixture::new().await;
+    fixture.cleartext.store(true, Ordering::SeqCst);
+    let request = body(PASSWORD, &[("select", json!([]))], None);
+    assert_eq!(fixture.sql(&route(22), &request).await.0, 200);
+    fixture.idle(1).await;
+    assert_eq!(fixture.sql(&route(23), &request).await.0, 200);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.idle(1).await;
+    let (status, answer) = fixture
+        .sql(&route(24), &body("guess", &[("select", json!([]))], None))
+        .await;
+    assert_eq!((status, &answer["code"]), (400, &json!("28P01")));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.journal.count("auth:ok"), 1);
+    assert_eq!(fixture.journal.count("auth:failed"), 1);
     fixture.stop().await;
 }

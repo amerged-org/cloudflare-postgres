@@ -1010,7 +1010,9 @@ async fn authenticate(
                         authenticated = true;
                     }
                     3 => {
-                        let mut secret = Secret(password.to_vec());
+                        // Sized once: a reallocation would leave an unwiped copy behind.
+                        let mut secret = Secret(Vec::with_capacity(password.len() + 1));
+                        secret.0.extend_from_slice(password);
                         secret.0.push(0);
                         let reply = password_message(&secret.0);
                         write_guarded(gateway, backend, &reply.0)
