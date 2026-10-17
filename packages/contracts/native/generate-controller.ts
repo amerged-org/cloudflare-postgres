@@ -16,7 +16,6 @@ import {
   fleetFluxReady,
   fleetChartObservation,
 } from "../src/releases.ts";
-import { STORAGE_AUTHORITY_LEDGER_KEY } from "../src/storage-write-authority.ts";
 import {
   gatewayControlReportSchema,
   gatewayIntentSchema,
@@ -650,7 +649,6 @@ const files = {
       OWNER_ROLE_NAME,
       MAINTENANCE_ROLE,
       MAINTENANCE_BOOTSTRAP_SQL,
-      STORAGE_AUTHORITY_LEDGER_KEY,
       THIN_INVENTORY_MAX_SECONDS,
       AGENT_PROTOCOL_VERSION,
       LINK_MESSAGE_MAX_BYTES,

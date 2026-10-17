@@ -32,8 +32,6 @@
       "fence_release",
       "observation_post"
     ],
-    "GATEWAY_RETIRE_HOLD_MS": 65000,
-    "STORAGE_PROTECTION_LEDGER_KEY": "storage-protection.json",
-    "STORAGE_AUTHORITY_LEDGER_KEY": "write-authority"
+    "GATEWAY_RETIRE_HOLD_MS": 65000
   }
 }

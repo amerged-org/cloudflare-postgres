@@ -7945,7 +7945,6 @@
       "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
       "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
     ],
-    "STORAGE_AUTHORITY_LEDGER_KEY": "write-authority",
     "THIN_INVENTORY_MAX_SECONDS": 300,
     "AGENT_PROTOCOL_VERSION": 1,
     "LINK_MESSAGE_MAX_BYTES": 65536,

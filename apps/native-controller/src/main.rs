@@ -89,14 +89,6 @@ struct Active {
     class: Class,
 }
 fn fingerprint(db: &Value, snapshot: &DesiredSnapshot) -> Result<Vec<u8>, Error> {
-    let mut db = db.clone();
-    db.as_object_mut()
-        .ok_or("desired item invalid")?
-        .remove("storage_authority");
-    // Cloudflare still sends start holds and write tokens; neither is configuration.
-    db.as_object_mut()
-        .ok_or("desired item invalid")?
-        .remove("storage_startup");
     Ok(Sha256::digest(serde_json::to_vec(&json!({"database":db,"backup":snapshot.region["backup"],"recovery_sources":snapshot.region["recovery_sources"],"fleet":snapshot.fleet_release,"compute_pool":snapshot.region["compute_pool"]}))?).to_vec())
 }
 fn apply_snapshot(
@@ -1642,25 +1634,6 @@ mod tests {
             .map(|attempt| reconcile_failure_delay(attempt).as_millis())
             .collect();
         assert_eq!(delays, [250, 2000, 4000, 8000, 16000, 32000]);
-    }
-    #[test]
-    fn write_tokens_and_start_holds_are_not_configuration() {
-        // Cloudflare still sends them until it stops; the controller reads neither, so a renewal
-        // or a new hold never makes a database due.
-        let db = json!({"id":"a","generation":1,"storage_authority":"old","storage_startup":{"operation_id":operation(1),"expires_at":"1970-01-01T00:00:10.000Z"}});
-        let mut new = db.clone();
-        new["storage_authority"] = "renewed".into();
-        new["storage_startup"] =
-            json!({"operation_id":operation(2),"expires_at":"1970-01-01T00:00:20.000Z"});
-        assert_eq!(
-            fingerprint(&db, &snapshot(vec![])).unwrap(),
-            fingerprint(&new, &snapshot(vec![])).unwrap()
-        );
-        new["storage_startup"] = Value::Null;
-        assert_eq!(
-            fingerprint(&db, &snapshot(vec![])).unwrap(),
-            fingerprint(&new, &snapshot(vec![])).unwrap()
-        );
     }
     #[test]
     fn a_completed_wake_is_due_again_when_its_proof_renews_and_not_before() {

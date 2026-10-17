@@ -1512,7 +1512,6 @@ mod world {
         // Room again: the pass holds the volume and lifts hibernation, without any start hold.
         w.reconciler.pool.discard(SLOT_HEX).await.unwrap();
         w.node_storage(true);
-        assert!(w.db["storage_startup"].is_null());
         let from = w.log_len();
         w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
         let lines = w.since(from);

@@ -361,7 +361,6 @@ mod tests {
         let mut changed = vectors[0]["db"].clone();
         changed["generation"] = 9.into();
         changed["roles"][0]["password"] = "not-hashed".into();
-        changed["storage_authority"] = "renewed".into();
         assert_eq!(
             configuration_fingerprint(&changed, text(&vectors[0]["ctx"], "postgresImage")).unwrap(),
             text(&vectors[0], "configuration_fingerprint")

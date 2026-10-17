@@ -65,7 +65,6 @@
     "fenceNamespace": "pgcf-system",
     "fenceLabel": "pgcf.io/gateway-fence",
     "fenceSelector": "pgcf.io/gateway-fence=true",
-    "storageAuthorityLedgerKey": "write-authority",
     "storageAuthorityPrefix": "sa1",
     "storageAuthorityDomain": "pgcf-storage-authority/v1\n"
   },
@@ -769,67 +768,6 @@
     "$defs": {
       "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
       "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
-    }
-  },
-  "legacyStorageBinding": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "database_id": { "$ref": "#/$defs/DatabaseId" },
-      "storage_uid": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "namespace_uid": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "cluster_uid": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "physical_generation": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "volume_identity": {
-        "type": "object",
-        "properties": {
-          "handle": { "type": "string", "pattern": "^pvc-[a-f0-9-]{36}$" },
-          "claimUid": {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-          },
-          "volumeUid": {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-          },
-          "lvUuid": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
-          }
-        },
-        "required": ["handle", "claimUid", "volumeUid"],
-        "additionalProperties": false
-      }
-    },
-    "required": [
-      "database_id",
-      "storage_uid",
-      "namespace_uid",
-      "cluster_uid",
-      "physical_generation",
-      "volume_identity"
-    ],
-    "additionalProperties": false,
-    "$defs": {
-      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
     }
   },
   "storageHostLease": {

@@ -6,14 +6,13 @@ import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 
 export const STORAGE_AUTHORITY_PREFIX = "sa1";
 export const STORAGE_AUTHORITY_DOMAIN = "pgcf-storage-authority/v1\n";
-export const STORAGE_AUTHORITY_LEDGER_KEY = "write-authority";
 export const STORAGE_PROTECTION_LEDGER_KEY = "storage-protection.json";
 export const STORAGE_AUTHORITY_MAX_LENGTH = 4096;
 export const STORAGE_AUTHORITY_MAX_SECONDS = 120;
 export const STORAGE_AUTHORITY_SKEW_MS = 5000;
 export const STORAGE_AUTHORITY_KEY_ID_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
-/** Deployment-pinned retained thick cohort; absence always requires a signed thin gate. */
+/** Retained thick volumes a fleet patch records from the cluster. */
 export const LegacyStorageBinding = z.strictObject({
   database_id: DatabaseId,
   storage_uid: z.uuid(),

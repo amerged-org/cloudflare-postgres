@@ -18,9 +18,6 @@ impl VerifiedStorageAuthority {
     pub fn claims(&self) -> &StorageWriteClaims {
         &self.0
     }
-    pub fn permits(&self, binding: &StorageBinding, now: u64) -> bool {
-        self.0.permits(binding, now)
-    }
 }
 
 fn decode(encoded: &str) -> Result<Vec<u8>, &'static str> {
@@ -171,22 +168,6 @@ fn safe_unsigned<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u6
     Ok(value as u64)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StorageBinding {
-    pub database_id: String,
-    pub generation: u64,
-    pub storage_uid: String,
-    pub node_uid: String,
-    pub volume_group_uuid: String,
-    pub pool_uuid: String,
-    pub profile_sha256: String,
-    pub volume_handle: String,
-    pub lv_uuid: String,
-    pub pvc_uid: String,
-    pub pv_uid: String,
-    pub pod_uid: String,
-}
-
 impl StorageWriteClaims {
     pub fn valid_at(&self, now: u64) -> bool {
         let skew = constant("STORAGE_AUTHORITY_SKEW_MS");
@@ -202,68 +183,6 @@ impl StorageWriteClaims {
                 .checked_mul(1000)
                 .and_then(|ttl| self.observed_at.checked_add(ttl))
                 .is_some_and(|end| self.exp <= end)
-    }
-
-    pub fn matches(&self, expected: &StorageBinding) -> bool {
-        self.database_id == expected.database_id
-            && self.generation == expected.generation
-            && self.storage_uid == expected.storage_uid
-            && self.node_uid == expected.node_uid
-            && self.volume_group_uuid == expected.volume_group_uuid
-            && self.pool_uuid == expected.pool_uuid
-            && self.profile_sha256 == expected.profile_sha256
-            && self.volume_handle == expected.volume_handle
-            && self.lv_uuid == expected.lv_uuid
-            && self.pvc_uid == expected.pvc_uid
-            && self.pv_uid == expected.pv_uid
-            && self.pod_uid == expected.pod_uid
-    }
-
-    pub fn permits(&self, expected: &StorageBinding, now: u64) -> bool {
-        self.write_allowed && self.valid_at(now) && self.matches(expected)
-    }
-}
-
-/// Healthy refreshes change only authority freshness; they never change power/configuration epochs.
-#[derive(Default)]
-pub struct StorageGate {
-    current: Option<StorageWriteClaims>,
-    highest: Option<StorageWriteClaims>,
-}
-impl StorageGate {
-    pub fn update(
-        &mut self,
-        verified: VerifiedStorageAuthority,
-        expected: &StorageBinding,
-        now: u64,
-    ) -> Result<(), &'static str> {
-        let claims = verified.0;
-        if !claims.matches(expected) || !claims.valid_at(now) {
-            self.current = None;
-            return Err("storage authority identity or freshness changed");
-        }
-        if let Some(previous) = &self.highest
-            && (claims.authority_revision < previous.authority_revision
-                || (claims.authority_revision == previous.authority_revision
-                    && claims != *previous))
-        {
-            self.current = None;
-            return Err("storage authority regressed or conflicted");
-        }
-        self.highest = Some(claims.clone());
-        self.current = Some(claims);
-        Ok(())
-    }
-    pub fn permits(&self, expected: &StorageBinding, now: u64) -> bool {
-        self.current
-            .as_ref()
-            .is_some_and(|claims| claims.permits(expected, now))
-    }
-    pub fn deadline(&self) -> Option<u64> {
-        self.current.as_ref().map(|claims| claims.exp)
-    }
-    pub fn disconnect(&mut self) {
-        self.current = None;
     }
 }
 
@@ -333,34 +252,14 @@ mod tests {
             write_allowed: true,
         }
     }
-    fn binding(c: &StorageWriteClaims) -> StorageBinding {
-        StorageBinding {
-            database_id: c.database_id.clone(),
-            generation: c.generation,
-            storage_uid: c.storage_uid.clone(),
-            node_uid: c.node_uid.clone(),
-            volume_group_uuid: c.volume_group_uuid.clone(),
-            pool_uuid: c.pool_uuid.clone(),
-            profile_sha256: c.profile_sha256.clone(),
-            volume_handle: c.volume_handle.clone(),
-            lv_uuid: c.lv_uuid.clone(),
-            pvc_uid: c.pvc_uid.clone(),
-            pv_uid: c.pv_uid.clone(),
-            pod_uid: c.pod_uid.clone(),
-        }
-    }
     #[test]
-    fn actual_signature_expiry_and_immutable_binding_are_required() {
+    fn actual_signature_and_expiry_are_required() {
         let issuer = Issuer::new();
         let c = claims();
-        let expected = binding(&c);
         let token = issuer.token(&c);
         let verified = issuer.trust.verify(&token, 1000).unwrap();
-        assert!(verified.permits(&expected, 1000));
+        assert_eq!(verified.claims(), &c);
         assert!(issuer.trust.verify(&token, 11000).is_err());
-        let mut replacement = expected.clone();
-        replacement.pool_uuid = "defghi-defg-defg-defg-defg-defg-defghi".into();
-        assert!(!verified.permits(&replacement, 1000));
         assert!(Issuer::new().trust.verify(&token, 1000).is_err());
     }
     #[test]
@@ -371,7 +270,6 @@ mod tests {
         assert!(issuer.trust.verify(&token, c.exp).is_err());
         let historical = issuer.trust.verify_for_protection(&token).unwrap();
         assert_eq!(historical.claims().lv_uuid, c.lv_uuid);
-        assert!(!historical.permits(&binding(&c), c.exp));
         assert!(Issuer::new().trust.verify_for_protection(&token).is_err());
     }
     #[test]
@@ -384,32 +282,6 @@ mod tests {
         )]))
         .unwrap();
         assert!(StorageTrust::parse(&encoded, &"0".repeat(64)).is_err());
-    }
-    #[test]
-    fn blocked_authority_cannot_be_replayed_after_a_watch_gap() {
-        let issuer = Issuer::new();
-        let old = claims();
-        let expected = binding(&old);
-        let mut blocked = old.clone();
-        blocked.authority_revision = 2;
-        blocked.write_allowed = false;
-        let mut gate = StorageGate::default();
-        gate.update(
-            issuer.trust.verify(&issuer.token(&blocked), 1000).unwrap(),
-            &expected,
-            1000,
-        )
-        .unwrap();
-        assert!(!gate.permits(&expected, 1000));
-        gate.disconnect();
-        assert!(
-            gate.update(
-                issuer.trust.verify(&issuer.token(&old), 1000).unwrap(),
-                &expected,
-                1000
-            )
-            .is_err()
-        );
     }
     #[test]
     fn signed_integral_json_numbers_match_the_authoritative_zod_semantics() {
@@ -429,12 +301,6 @@ mod tests {
             body,
             URL_SAFE_NO_PAD.encode(signature.as_ref())
         );
-        assert!(
-            issuer
-                .trust
-                .verify(&token, 1000)
-                .unwrap()
-                .permits(&binding(&c), 1000)
-        );
+        assert_eq!(issuer.trust.verify(&token, 1000).unwrap().claims(), &c);
     }
 }

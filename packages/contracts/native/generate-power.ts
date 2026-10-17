@@ -9,10 +9,6 @@ import {
 import { WAKE_PHASES } from "../../../apps/regional/src/agent/power.ts";
 import { GATEWAY_RETIRE_HOLD_MS } from "../src/gateway-control.ts";
 import {
-  STORAGE_PROTECTION_LEDGER_KEY,
-  STORAGE_AUTHORITY_LEDGER_KEY,
-} from "../src/storage-write-authority.ts";
-import {
   powerIntentVectors,
   powerProgressVectors,
   physicalReclamationVectors,
@@ -25,8 +21,6 @@ const contract = {
     SLEEP_REFUSALS,
     WAKE_PHASES,
     GATEWAY_RETIRE_HOLD_MS,
-    STORAGE_PROTECTION_LEDGER_KEY,
-    STORAGE_AUTHORITY_LEDGER_KEY,
   },
 };
 for (const [name, value] of Object.entries({

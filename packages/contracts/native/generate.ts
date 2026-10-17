@@ -12,8 +12,6 @@ import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import {
   StorageWriteClaims,
-  LegacyStorageBinding,
-  STORAGE_AUTHORITY_LEDGER_KEY,
   STORAGE_AUTHORITY_PREFIX,
   STORAGE_AUTHORITY_DOMAIN,
   STORAGE_AUTHORITY_MAX_LENGTH,
@@ -211,7 +209,6 @@ const contract = {
     fenceNamespace: GATEWAY_FENCE_NAMESPACE,
     fenceLabel: GATEWAY_FENCE_LABEL,
     fenceSelector: GATEWAY_FENCE_SELECTOR,
-    storageAuthorityLedgerKey: STORAGE_AUTHORITY_LEDGER_KEY,
     storageAuthorityPrefix: STORAGE_AUTHORITY_PREFIX,
     storageAuthorityDomain: STORAGE_AUTHORITY_DOMAIN,
   },
@@ -238,7 +235,6 @@ const contract = {
   intent: schema(gatewayIntentSchema),
   storageWriteClaims: schema(StorageWriteClaims),
   reclaimClaims: schema(ReclaimClaims),
-  legacyStorageBinding: z.toJSONSchema(LegacyStorageBinding),
   storageHostLease: z.toJSONSchema(HostStorageLease),
   nodeThinStorageLease: z.toJSONSchema(NodeThinStorageLease),
 };
