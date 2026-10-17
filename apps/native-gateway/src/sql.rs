@@ -224,8 +224,9 @@ struct Stages {
     database: Option<String>,
     outcome: &'static str,
     pooled: bool,
-    /// `warm`, or `cold` for a request that waited for its database's wake.
-    wake_path: &'static str,
+    /// `warm` for a request admitted on a running unit when it arrived, `cold` for one that
+    /// waited for its database's wake; none for one refused before either.
+    wake_path: Option<&'static str>,
     statements: usize,
     received: Instant,
     dial: Option<Duration>,
@@ -283,7 +284,7 @@ pub async fn serve(
         // Kept only when the task is cancelled before it records an end.
         outcome: "aborted",
         pooled: false,
-        wake_path: "warm",
+        wake_path: None,
         statements: 0,
         received,
         dial: None,
@@ -366,6 +367,8 @@ async fn handle(
         }
     };
     let (target, epoch) = attempt!(current(gateway, &claims, released.as_deref()).await);
+    // Admitted without a hold: the database was running when the request arrived.
+    stages.wake_path.get_or_insert("warm");
     let mut backend = match checkout(gateway, &claims, &target, epoch, &request.password).await {
         Checkout::Taken(backend) => {
             stages.pooled = true;
@@ -594,12 +597,12 @@ async fn wake(
         WakeState::Stale => return Err(not_accepting("route_stale")),
         WakeState::Waiting => {}
     }
-    stages.wake_path = "cold";
     let deadline = tokio::time::Instant::from_std(stages.received + transport::WAKE_BOUND);
     let mut held = gateway
         .wakes
         .hold(ticket, http::now(), Instant::now())
         .map_err(|_| not_accepting("wake_capacity"))?;
+    stages.wake_path = Some("cold");
     let mut stop = stop.clone();
     loop {
         // Armed before the table is read, so a change between the read and the wait wakes it.

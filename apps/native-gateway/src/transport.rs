@@ -318,9 +318,9 @@ fn replay_status(reason: &str) -> u16 {
 struct Stages {
     database: String,
     outcome: &'static str,
-    /// `warm` for a connection whose database was running when it arrived, `cold` for one held
-    /// for its database's wake (plan 5.7).
-    wake_path: &'static str,
+    /// `warm` for a connection admitted on a running unit when it arrived, `cold` for one held
+    /// for its database's wake (plan 5.7); none for one refused before either.
+    wake_path: Option<&'static str>,
     /// How a held wake connection's wait ended; none for any other connection.
     held_outcome: Option<&'static str>,
     /// From the upgrade of a held wake connection to its release.
@@ -340,7 +340,7 @@ impl Stages {
             database: database.into(),
             // Kept only when the task is cancelled before it records an end.
             outcome: "aborted",
-            wake_path: "warm",
+            wake_path: None,
             held_outcome: None,
             wake_wait: None,
             verdict: None,
@@ -499,6 +499,7 @@ pub async fn serve_socket(
             return http::reply(&mut socket, 503, serde_json::json!({ "error": refused })).await;
         }
     };
+    stages.wake_path = Some("warm");
     let Some(base) = session_memory(&gateway, &claims.db) else {
         stages.outcome = "memory_capacity";
         return memory_refused(&mut socket, &gateway, &claims.db).await;
@@ -728,7 +729,6 @@ async fn serve_held(
     ticket: WakeClaims,
     mut stages: Stages,
 ) -> Result<(), Failure> {
-    stages.wake_path = "cold";
     let database = ticket.db.clone();
     if gateway.draining.load(Ordering::Acquire) {
         stages.outcome = "fenced";
@@ -769,6 +769,7 @@ async fn serve_held(
             .await;
         }
     };
+    stages.wake_path = Some("cold");
     let wire = WireBudget::new(gateway.memory.lease(&database));
     let stream = BudgetedStream::new(socket, head.prefix, head.end, wire.clone(), base);
     let accepted = timeout(

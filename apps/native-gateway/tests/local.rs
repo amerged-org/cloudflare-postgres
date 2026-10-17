@@ -844,7 +844,18 @@ async fn every_connection_is_labelled_warm_or_cold() {
         // HTTP SQL the same way.
         assert_eq!(of("sql_stages", "warm").len(), 1, "{lines:?}");
         assert_eq!(of("sql_stages", "cold").len(), 1, "{lines:?}");
-        assert_eq!(lines.len(), 6, "{lines:?}");
+        // A connection or request refused before admission or hold is neither: the database was
+        // not running, so `warm` would be false, and nothing waited for a wake.
+        for event in ["conn_stages", "sql_stages"] {
+            let mut outcomes = lines
+                .iter()
+                .filter(|line| line["event"] == event && line["wake_path"].is_null())
+                .map(|line| line["outcome"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            outcomes.sort_unstable();
+            assert_eq!(outcomes, ["fenced", "route_stale"], "{event} {lines:?}");
+        }
+        assert_eq!(lines.len(), 10, "{lines:?}");
         return;
     }
     let mut cluster = blocking(|| database_cluster(&bin));
@@ -919,6 +930,21 @@ async fn every_connection_is_labelled_warm_or_cold() {
     });
     assert_eq!(client.refused().await, "57P03");
     drop(client);
+
+    // The database is sleeping: its admission route is refused, and a ticket of an earlier
+    // generation is stale, on a connection and as a request.
+    assert_eq!(node.upgrade(&route(7, 3, INSTANCE)).await.err(), Some(503));
+    assert_eq!(
+        node.upgrade(&ticket(8, 2, &operation('s'))).await.err(),
+        Some(503)
+    );
+    assert_eq!(node.sql(&route(9, 3, INSTANCE), "select 1").await.0, 400);
+    assert_eq!(
+        node.sql(&ticket(10, 2, &operation('t')), "select 1")
+            .await
+            .0,
+        400
+    );
     // Every line is logged before the child ends.
     timeout(Duration::from_secs(10), async {
         while node

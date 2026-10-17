@@ -74,10 +74,11 @@ that moves past the ticket answer FATAL 57P03; a draining gateway and a failed d
 Every connection that passes route verification logs one `conn_stages` JSON line to stdout when
 it ends: the database ID, a fixed `outcome` class, monotonic milliseconds `upgrade_ms`,
 `startup_ms`, `dial_ms`, `first_backend_ms` and `session_ms`, null when a stage was not reached,
-and `wake_path`: `warm` when the database was running when the connection arrived, `cold` when
-the connection was held for its wake. A held wake adds `held_outcome`, `wake_wait_ms` (upgrade to
-release), and the agent's `wake_reason` and `agent_ms` once its result arrived. Roles, addresses,
-tokens and payload bytes are never logged.
+and `wake_path`: `warm` when the route was admitted on the running unit when the connection
+arrived, `cold` when the connection was held for its wake, null when it was refused before
+either. A held wake adds `held_outcome`, `wake_wait_ms` (upgrade to release), and the agent's
+`wake_reason` and `agent_ms` once its result arrived. Roles, addresses, tokens and payload bytes
+are never logged.
 
 ## HTTP SQL
 
@@ -90,8 +91,9 @@ after use and never logged or stored. A session is kept after `DISCARD ALL` for 
 and 60 s in all, reused only for a password that derives its SCRAM StoredKey, and closed by the
 agent's actions like any idle session. Statement bytes are never resent: a session lost after the
 write answers `08007`. Each request logs one `sql_stages` line with the database ID, a fixed
-`outcome`, `pooled`, `wake_path` (`warm` or `cold`), the statement count and `dial_ms`, `auth_ms`,
-`query_ms` and `request_ms`; roles, statements, parameters and passwords are never logged.
+`outcome`, `pooled`, `wake_path` (`warm`, `cold` or null, as for a connection), the statement
+count and `dial_ms`, `auth_ms`, `query_ms` and `request_ms`; roles, statements, parameters and
+passwords are never logged.
 
 ## Tests and contracts
 

@@ -1039,8 +1039,11 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
                 ]
             );
             assert_eq!(line["database"], DATABASE);
-            assert_eq!(line["wake_path"], "warm");
         }
+        // Admitted on the running unit is warm; refused before admission is neither warm nor cold.
+        assert_eq!(lines[0]["wake_path"], "warm");
+        assert_eq!(lines[1]["wake_path"], "warm");
+        assert!(lines[2]["wake_path"].is_null(), "{}", lines[2]);
         let complete = |name: &str| lines[0][name].as_u64().unwrap();
         assert_eq!(lines[0]["outcome"], "client_closed");
         // The client waited 40 ms before its StartupMessage and 40 ms before closing.
