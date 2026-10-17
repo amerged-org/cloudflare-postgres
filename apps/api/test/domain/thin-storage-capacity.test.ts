@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import type { D1Migration } from "cloudflare:test";
+import { runInDurableObject, type D1Migration } from "cloudflare:test";
 import {
   DatabaseWithOperation,
   DatabaseRestored,
@@ -375,6 +375,50 @@ it("resumes a thin database only while its node has room", async () => {
   });
   await physicalSample(f, { dataFree: gib });
   expect((await resume()).status).toBe(202);
+});
+
+/** Whether the node's NodeBootstrap Durable Object was asked for a thin storage turn. */
+async function turnAsked(f: Awaited<ReturnType<typeof thinFixture>>) {
+  return await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`thin-storage:${f.node}`),
+    ),
+    async (_instance, state) =>
+      (await state.storage.get<string>("thinStorageNodeId")) === f.node,
+  );
+}
+async function forgetTurn(f: Awaited<ReturnType<typeof thinFixture>>) {
+  await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`thin-storage:${f.node}`),
+    ),
+    async (_instance, state) => {
+      await state.storage.deleteAlarm();
+      await state.storage.deleteAll();
+    },
+  );
+}
+
+it("asks for the pool growth turn when free space falls below the reserve and one start, while the pool can grow", async () => {
+  const f = await thinFixture();
+  // The reserve is 512 MiB and a start 32 MiB.
+  await physicalSample(f, { dataFree: 600 * mib });
+  await runNodeCapacity(env, f.region);
+  expect(await turnAsked(f)).toBe(false);
+  await physicalSample(f, { dataFree: 540 * mib });
+  await runNodeCapacity(env, f.region, true);
+  expect(await turnAsked(f)).toBe(false);
+  await runNodeCapacity(env, f.region);
+  expect(await turnAsked(f)).toBe(true);
+  await forgetTurn(f);
+  // At its maximum, or with the volume group too full for the growth step, it cannot grow.
+  await physicalSample(f, { dataFree: 540 * mib, dataTotal: 64 * gib });
+  await runNodeCapacity(env, f.region);
+  expect(await turnAsked(f)).toBe(false);
+  await physicalSample(f, { dataFree: 540 * mib }, 0, 8 * gib);
+  await runNodeCapacity(env, f.region);
+  expect(await turnAsked(f)).toBe(false);
+  await forgetTurn(f);
 });
 
 it("places logical quotas against fresh physical thin headroom instead of the old GiB reservation", async () => {

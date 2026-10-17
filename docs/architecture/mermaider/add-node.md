@@ -36,7 +36,7 @@ flowchart TD
 - [apps/api/src/domain/bootstrap-jobs.ts · bootstrapJobInput:111](../../../apps/api/src/domain/bootstrap-jobs.ts#L111)
 - [apps/api/src/domain/bootstrap-jobs.ts · finalizeNodeAdmission:1524](../../../apps/api/src/domain/bootstrap-jobs.ts#L1524)
 - [apps/api/src/domain/fleet-patches.ts · ensureBootstrapFleetPatch:1386](../../../apps/api/src/domain/fleet-patches.ts#L1386)
-- [apps/api/src/domain/node-capacity.ts · placePendingDatabases:67](../../../apps/api/src/domain/node-capacity.ts#L67)
+- [apps/api/src/domain/node-capacity.ts · placePendingDatabases:68](../../../apps/api/src/domain/node-capacity.ts#L68)
 - [apps/api/src/domain/node-inspection.ts · ensureNodeInstallationInspection:574](../../../apps/api/src/domain/node-inspection.ts#L574)
 - [apps/api/src/domain/node-proof.ts · ensureNodePreparationProof:23](../../../apps/api/src/domain/node-proof.ts#L23)
 - [apps/api/src/domain/node-proof.ts · ensureNodeVerificationProof:75](../../../apps/api/src/domain/node-proof.ts#L75)

@@ -396,6 +396,35 @@ export function thinPoolRoomSql(
     )})`;
 }
 
+/**
+ * Whether the node's thin pool should grow now: its latest fresh sample leaves less than the data
+ * reserve and one start free, and the pool is below its maximum with the volume group's reserve
+ * still free after the growth step. The capacity cron then asks for the node's pool action turn.
+ */
+export function thinPoolGrowthNeededSql(): string {
+  return allOf(
+    freshSampleSql,
+    `${sampled("volume_group_uuid")}=t.volume_group_uuid`,
+    `${sampledDataFree}<${field("data_reserve_bytes")}+${field("startup_reserve_bytes")}`,
+    `${sampled("thin_pool.data_total_bytes")}<${field("maximum_data_bytes")}`,
+    `${sampled("free_bytes")}>=${field("vg_reserve_bytes")}+MIN(${field("growth_bytes")},${field("maximum_data_bytes")}-${sampled("thin_pool.data_total_bytes")})`,
+  );
+}
+
+/**
+ * Why a node's fresh sample says its pool cannot take more, for the thin storage alert: no room
+ * now, or below the growth point with no growth left (the maximum reached or the volume group too
+ * full). Metadata does not grow past the profile's size and a full metadata device needs repair,
+ * so its alert comes at twice its reserve. NULL while the pool is fine.
+ */
+export function thinPoolExhaustionSql(): string {
+  return `CASE WHEN json_type(o.physical_json,'$.thin_pool') IS NOT 'object' OR NOT(${freshSampleSql}) THEN NULL
+    WHEN ${sampledDataFree}<${field("data_reserve_bytes")} OR ${sampledMetadataFree}<${field("metadata_reserve_bytes")} THEN 'thin_pool_no_room'
+    WHEN ${sampledMetadataFree}<2*${field("metadata_reserve_bytes")}
+      OR (${sampledDataFree}<${field("data_reserve_bytes")}+${field("startup_reserve_bytes")} AND NOT(${thinPoolGrowthNeededSql()})) THEN 'thin_pool_growth_exhausted'
+    ELSE NULL END`;
+}
+
 /** New placements retain the old thick behavior only on nodes with no selected thin policy. */
 export function nodeStoragePlacementSql(
   nodeAlias = "n",

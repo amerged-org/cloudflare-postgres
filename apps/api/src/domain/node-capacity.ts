@@ -41,6 +41,7 @@ import {
 
 import {
   nodeStoragePlacementSql,
+  thinPoolGrowthNeededSql,
   selectedStorageProfileSql,
 } from "./storage-capacity.ts";
 import { recoverStorageProtectedDatabases } from "./lifecycle.ts";
@@ -181,6 +182,21 @@ export async function placePendingDatabases(
   return placed;
 }
 
+/** Each thin node of the region whose pool should grow gets its pool action turn now. */
+async function requestThinPoolGrowth(env: Env, regionId: string) {
+  const nodes = await env.DB.prepare(
+    `SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
+    JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid
+    WHERE n.region_id=? AND n.lost_at IS NULL AND t.error_code IS NULL AND ${thinPoolGrowthNeededSql()} ORDER BY t.node_id`,
+  )
+    .bind(regionId)
+    .all<{ node_id: string }>();
+  if (!nodes.results.length) return;
+  const { requestThinStorageTurn } =
+    await import("./node-thin-storage-execution.ts");
+  for (const { node_id } of nodes.results)
+    await requestThinStorageTurn(env, node_id).catch(() => undefined);
+}
 export async function runNodeCapacity(
   env: Env,
   regionId: string,
@@ -203,6 +219,7 @@ export async function runNodeCapacity(
     ? []
     : await recoverStorageProtectedDatabases(env, regionId);
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
+  if (!dryRun) await requestThinPoolGrowth(env, regionId);
   if (placed.length || recovered.length) {
     await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify([
       ...recovered,
