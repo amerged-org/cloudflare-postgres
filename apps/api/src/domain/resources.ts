@@ -17,7 +17,7 @@ import type { DatabaseRow, SizeRow } from "./rows.ts";
 
 /** The database's own values; null takes the size class's. */
 export type ResourceOverrides = DatabaseResources;
-export type Resources = DatabaseEffectiveResources;
+type Resources = DatabaseEffectiveResources;
 
 export const NO_OVERRIDES: ResourceOverrides = {
   memory_mib: null,
@@ -105,7 +105,7 @@ export function effectiveOf(
 }
 
 /** What a region allows one database; its limits come from the region's policy and nodes. */
-export interface RegionBounds {
+interface RegionBounds {
   maximum_memory_mib: number;
   /** The cores of the region's largest node, in millicores; null while no node has reported. */
   maximum_cpu_millicores: number | null;

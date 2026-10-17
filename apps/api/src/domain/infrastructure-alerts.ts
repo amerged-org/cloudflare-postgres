@@ -728,11 +728,11 @@ function collectSubjects(rows: readonly SubjectRow[]): RegionSubjects {
 }
 
 /** A node refusing this many wakes for awake capacity within the window is an alert. */
-export const CAPACITY_REFUSAL_COUNT = 5;
-export const CAPACITY_REFUSAL_WINDOW_MS = 600_000;
+const CAPACITY_REFUSAL_COUNT = 5;
+const CAPACITY_REFUSAL_WINDOW_MS = 600_000;
 /** The share of a volume's space or inodes from which the database is warned, and warned loudly. */
-export const VOLUME_WARNING_PERCENT = 80;
-export const VOLUME_CRITICAL_PERCENT = 90;
+const VOLUME_WARNING_PERCENT = 80;
+const VOLUME_CRITICAL_PERCENT = 90;
 
 /**
  * What the node samples and volume reports say of a region (plan 4.10): thin pools without room,

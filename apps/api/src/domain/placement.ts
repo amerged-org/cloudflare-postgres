@@ -12,10 +12,10 @@ const CLOCK_SKEW_MS = 5000;
 /** Parts per million of active RAM and of CPU load a node reaches at most (the owner's 80 %). */
 export const PLACEMENT_LIMIT_PPM = 800_000;
 /** The thin pool is closed for placement from these shares of its data and metadata (plan 4.3). */
-export const POOL_DATA_CLOSED_PPM = 800_000;
-export const POOL_METADATA_CLOSED_PPM = 500_000;
+const POOL_DATA_CLOSED_PPM = 800_000;
+const POOL_METADATA_CLOSED_PPM = 500_000;
 /** The sold storage of a node stays within this many times its pool's data (plan 4.3). */
-export const LOGICAL_CAP_FACTOR = 4;
+const LOGICAL_CAP_FACTOR = 4;
 /** The averaging window of a load figure, and how far back its highest value counts. */
 export const AVERAGE_WINDOW_SECONDS = 1800;
 export const PEAK_WINDOW_MS = 7 * 86_400_000;
@@ -81,7 +81,7 @@ export function nodeOnline(node: PlacementNode, now: number): boolean {
   return at >= now - NODE_OBSERVATION_MAX_AGE_MS && at <= now + CLOCK_SKEW_MS;
 }
 /** The node's own flags allow new databases. */
-export function nodeOpen(node: PlacementNode): boolean {
+function nodeOpen(node: PlacementNode): boolean {
   return (
     node.ready === 1 &&
     node.schedulable === 1 &&
@@ -91,14 +91,14 @@ export function nodeOpen(node: PlacementNode): boolean {
   );
 }
 
-export type PoolState =
+type PoolState =
   "unavailable" | "no_room" | "data" | "metadata" | "cap" | "open";
 /**
  * Whether the node's thin pool is open for placement (plan 4.3): readable, with room, below 80 %
  * of its data and 50 % of its metadata, and with the sold storage below the logical cap. The pool
  * of an offline node is judged by its last sample.
  */
-export function poolState(
+function poolState(
   pool: Pick<
     PlacementNode,
     | "room"
@@ -196,7 +196,7 @@ export function choosePlacement(
 }
 
 /** What a resize adds to the node its database stays on; a shrink adds nothing. */
-export interface PlacementGrowth {
+interface PlacementGrowth {
   memory_mib: number;
   storage_gib: number;
   cpu_millicores: number;
