@@ -1,0 +1,611 @@
+// SPDX-License-Identifier: Apache-2.0
+//! What the node reports to Cloudflare over HTTP and keeps until Cloudflare answered it: usage rows
+//! and events. Rows are persisted before they are sent and kept unchanged until acknowledged, so
+//! that a retried post counts once (the API keeps the row it already holds). Bodies are cut by the
+//! arithmetic of `measurements.rs`. A metric the node cannot know stays `null` in its row, never a
+//! manufactured zero.
+use super::{file, request::Api};
+use crate::{
+    Error,
+    api::Refusal,
+    measurements::batches,
+    node_link::{constant, schema_valid},
+};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashSet, VecDeque},
+    io::ErrorKind,
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
+};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::{Mutex as Gate, Notify};
+
+/// Usage rows held while Cloudflare does not answer: about 5 MB, hours of a full node's rows.
+const USAGE_MAX_ROWS: usize = 20_000;
+/// Events are timing facts; beyond this many unanswered ones the oldest are dropped.
+const EVENTS_MAX: usize = 10_000;
+
+/// The rows or events one batch is cut from. `measurements::batches` puts at most one cohort in
+/// a body and needs to see no more than that.
+const BATCH_WINDOW: usize = 100;
+/// `USAGE_HOUR_MS` of the usage contract.
+const HOUR_MS: i128 = 3_600_000;
+
+fn millis(timestamp: &Value) -> Option<i128> {
+    let at = OffsetDateTime::parse(timestamp.as_str()?, &Rfc3339).ok()?;
+    Some(at.unix_timestamp_nanos() / 1_000_000)
+}
+/// A usage row (`NodeUsageRow`), with the rules a JSON Schema cannot state: its interval is
+/// positive and stays within one UTC hour, and a database is not awake longer than the interval.
+/// One invalid row would make Cloudflare refuse the whole batch it sits in.
+fn usage_row_valid(row: &Value) -> bool {
+    let (Some(start), Some(end)) = (millis(&row["interval_start"]), millis(&row["interval_end"]))
+    else {
+        return false;
+    };
+    schema_valid("NodeUsageReport", &json!({"rows": [row]}))
+        && end > start
+        && start.div_euclid(HOUR_MS) == (end - 1).div_euclid(HOUR_MS)
+        && row["awake_ms"]
+            .as_i64()
+            .is_none_or(|awake| i128::from(awake) <= end - start)
+}
+/// An event (`NodeEvent`) with the rules a JSON Schema cannot state: exactly a refusal names its
+/// reason, and exactly the refusal of awake capacity (`no_headroom`) carries the retry hint.
+fn event_valid(event: &Value) -> bool {
+    schema_valid("NodeEventReport", &json!({"events": [event]}))
+        && match event["type"].as_str() {
+            Some("admission") => {
+                (event["decision"] == "refused") == event.get("reason").is_some()
+                    && (event["reason"] == "no_headroom")
+                        == event.get("retry_after_seconds").is_some()
+            }
+            Some("wake") => (event["outcome"] == "refused") == event.get("reason").is_some(),
+            _ => true,
+        }
+}
+
+/// The usage rows not yet acknowledged, oldest first, and the file that keeps them.
+struct UsageQueue {
+    path: PathBuf,
+    rows: Vec<Value>,
+}
+fn identity(row: &Value) -> (&str, &str, &str) {
+    let text = |key: &str| row[key].as_str().unwrap_or_default();
+    (
+        text("database"),
+        text("interval_start"),
+        text("interval_end"),
+    )
+}
+impl UsageQueue {
+    /// The queue a previous run left. A file that is no valid queue is no loss worth stopping
+    /// the agent for: usage is a metric, and the file is replaced by the next write.
+    fn load(path: PathBuf) -> Self {
+        let rows = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .filter(|stored| {
+                    stored["v"] == 1 && stored.as_object().is_some_and(|o| o.len() == 2)
+                })
+                .and_then(|stored| stored["rows"].as_array().cloned())
+                .filter(|rows| rows.len() <= USAGE_MAX_ROWS && rows.iter().all(usage_row_valid)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Some(vec![]),
+            Err(_) => None,
+        };
+        Self {
+            rows: rows.unwrap_or_else(|| {
+                super::log("usage_outbox_discarded", &"usage outbox invalid".into());
+                vec![]
+            }),
+            path,
+        }
+    }
+    fn persist(&self, rows: &[Value]) -> Result<(), Error> {
+        file::create_private_directory(self.path.parent().ok_or("outbox has no directory")?)?;
+        file::write_private(
+            &self.path,
+            &serde_json::to_vec(&json!({"v":1,"rows":rows}))?,
+        )?;
+        Ok(())
+    }
+    /// Takes the rows in, or none of them: each must be a valid row, within the bound. A row of
+    /// an interval already queued is the same row again (a restart computes it twice) and is
+    /// skipped.
+    fn queue(&mut self, rows: &[Value]) -> Result<(), Error> {
+        if !rows.iter().all(usage_row_valid) {
+            return Err("native usage rows invalid".into());
+        }
+        let mut seen: HashSet<_> = self.rows.iter().map(identity).collect();
+        let fresh: Vec<&Value> = rows
+            .iter()
+            .filter(|row| seen.insert(identity(row)))
+            .collect();
+        if self.rows.len() + fresh.len() > USAGE_MAX_ROWS {
+            return Err("usage outbox full".into());
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let mut queued = self.rows.clone();
+        queued.extend(fresh.into_iter().cloned());
+        self.persist(&queued)?;
+        self.rows = queued;
+        Ok(())
+    }
+    /// The next rows to post: a bounded prefix of the queue.
+    fn batch(&self) -> Result<Option<Vec<Value>>, Error> {
+        let prefix = self.rows.iter().take(BATCH_WINDOW).cloned().collect();
+        Ok(batches("rows", prefix)?.into_iter().next())
+    }
+    /// Cloudflare answered the first `count` rows, or refused them for good.
+    fn done(&mut self, count: usize) -> Result<(), Error> {
+        let remaining = self.rows[count..].to_vec();
+        self.persist(&remaining)?;
+        self.rows = remaining;
+        Ok(())
+    }
+}
+
+/// The events not yet acknowledged. A batch is re-posted unchanged for `NODE_EVENT_RETRY_SECONDS`
+/// after its first attempt, because Cloudflare remembers the ids of a batch for that long and
+/// counts a retried event once; after that it is dropped, and a repeat could count twice.
+struct EventQueue {
+    waiting: VecDeque<Value>,
+    posted: Option<(Vec<Value>, Instant)>,
+}
+impl EventQueue {
+    /// Takes valid events in; beyond the bound the oldest waiting ones go. Returns how many.
+    fn queue(&mut self, events: &[Value]) -> Result<usize, Error> {
+        if !events.iter().all(event_valid) {
+            return Err("native events invalid".into());
+        }
+        // An event of an id queued before is the same event again.
+        let id = |event: &Value| event["id"].as_str().unwrap_or_default().to_string();
+        let mut seen: HashSet<String> = self
+            .waiting
+            .iter()
+            .chain(self.posted.iter().flat_map(|(batch, _)| batch))
+            .map(id)
+            .collect();
+        let fresh: Vec<&Value> = events
+            .iter()
+            .filter(|event| seen.insert(id(event)))
+            .collect();
+        self.waiting.extend(fresh.into_iter().cloned());
+        let excess = self.waiting.len().saturating_sub(EVENTS_MAX);
+        self.waiting.drain(..excess);
+        Ok(excess)
+    }
+    /// The batch to post: the one still being retried, or a new one from the waiting events.
+    fn batch(&mut self, now: Instant) -> Result<Option<Vec<Value>>, Error> {
+        let retry = Duration::from_secs(
+            constant("NODE_EVENT_RETRY_SECONDS")
+                .as_u64()
+                .expect("generated retry window"),
+        );
+        if let Some((batch, first)) = &self.posted {
+            if now.duration_since(*first) < retry {
+                return Ok(Some(batch.clone()));
+            }
+            self.posted = None;
+        }
+        let prefix = self.waiting.iter().take(BATCH_WINDOW).cloned().collect();
+        let Some(batch) = batches("events", prefix)?.into_iter().next() else {
+            return Ok(None);
+        };
+        self.waiting.drain(..batch.len());
+        self.posted = Some((batch.clone(), now));
+        Ok(Some(batch))
+    }
+    /// Cloudflare answered the batch, or refused it for good.
+    fn done(&mut self) {
+        self.posted = None;
+    }
+}
+
+struct State {
+    usage: UsageQueue,
+    events: EventQueue,
+}
+/// What one flush delivered.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Flushed {
+    pub usage_rows: usize,
+    pub events: usize,
+    /// Rows and events Cloudflare refused as invalid; they are dropped, so that they do not block
+    /// what is behind them.
+    pub refused: usize,
+}
+
+/// The usage rows and events of one node, on their way to Cloudflare.
+pub(super) struct Outbox {
+    api: Arc<Api>,
+    state: Mutex<State>,
+    /// One flush at a time, so that the front of a queue is what the answer is for.
+    gate: Gate<()>,
+    work: Notify,
+}
+/// A body Cloudflare refuses as it is will be refused again: drop it. Anything else, a fence, a
+/// credential, a limit, an outage, is retried.
+fn refused(error: &Error) -> bool {
+    error
+        .downcast_ref::<Refusal>()
+        .is_some_and(|refusal| matches!(refusal.status, 400 | 413 | 422))
+}
+impl Outbox {
+    pub fn new(api: Arc<Api>, usage_file: PathBuf) -> Self {
+        Self {
+            api,
+            state: Mutex::new(State {
+                usage: UsageQueue::load(usage_file),
+                events: EventQueue {
+                    waiting: VecDeque::new(),
+                    posted: None,
+                },
+            }),
+            gate: Gate::new(()),
+            work: Notify::new(),
+        }
+    }
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Persists `rows` (`NodeUsageRow`) to be sent; none of them are taken when this fails.
+    pub fn queue_usage(&self, rows: &[Value]) -> Result<(), Error> {
+        self.state().usage.queue(rows)?;
+        self.work.notify_one();
+        Ok(())
+    }
+    /// Queues `events` (`NodeEvent`) to be sent.
+    pub fn queue_events(&self, events: &[Value]) -> Result<(), Error> {
+        let dropped = self.state().events.queue(events)?;
+        if dropped > 0 {
+            super::log("events_dropped", &"event queue full".into());
+        }
+        self.work.notify_one();
+        Ok(())
+    }
+    /// Resolves when something was queued since the last time it resolved.
+    pub async fn queued(&self) {
+        self.work.notified().await;
+    }
+    /// Posts everything queued, in bounded batches, oldest first. A batch that fails stays and is
+    /// the first of the next flush. Both queues are tried; the first failure is returned.
+    pub async fn flush(&self) -> Result<Flushed, Error> {
+        let _flush = self.gate.lock().await;
+        let mut flushed = Flushed::default();
+        let usage = self.flush_usage(&mut flushed).await;
+        let events = self.flush_events(&mut flushed).await;
+        usage.and(events).map(|()| flushed)
+    }
+    async fn flush_usage(&self, flushed: &mut Flushed) -> Result<(), Error> {
+        loop {
+            // The lock is not held while the batch is posted.
+            let batch = self.state().usage.batch()?;
+            let Some(batch) = batch else {
+                return Ok(());
+            };
+            match self
+                .api
+                .post("/node/v1/usage", &json!({"rows": batch}))
+                .await
+            {
+                Ok(()) => flushed.usage_rows += batch.len(),
+                Err(error) if refused(&error) => {
+                    flushed.refused += batch.len();
+                    super::log("usage_rows_refused", &error);
+                }
+                Err(error) => return Err(error),
+            }
+            self.state().usage.done(batch.len())?;
+        }
+    }
+    async fn flush_events(&self, flushed: &mut Flushed) -> Result<(), Error> {
+        loop {
+            let batch = self.state().events.batch(Instant::now())?;
+            let Some(batch) = batch else {
+                return Ok(());
+            };
+            match self
+                .api
+                .post("/node/v1/events", &json!({"events": batch}))
+                .await
+            {
+                Ok(()) => flushed.events += batch.len(),
+                Err(error) if refused(&error) => {
+                    flushed.refused += batch.len();
+                    super::log("events_refused", &error);
+                }
+                Err(error) => return Err(error),
+            }
+            self.state().events.done();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::{
+        request::{Fenced, tests::enrolled},
+        test_server::{Cloud, Failure, database_id, tempdir, vector, vectors},
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The `index`th row: ten seconds of one database, 300 rows to a database.
+    fn row(index: usize) -> Value {
+        let at =
+            |seconds: usize| format!("2026-10-17T11:{:02}:{:02}.000Z", seconds / 60, seconds % 60);
+        let start = (index % 300) * 10;
+        json!({"database":database_id(index / 300),"interval_start":at(start),"interval_end":at(start + 10),
+            "awake_ms":10_000,"ingress_bytes":null,"egress_bytes":null,"connections":null,"connection_ms":null})
+    }
+    fn rows(range: std::ops::Range<usize>) -> Vec<Value> {
+        range.map(row).collect()
+    }
+    fn events() -> Vec<Value> {
+        vector("NodeEventReport", "events")["events"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn the_rules_decide_as_the_contract_does_for_every_usage_and_event_vector() {
+        for vector in vectors("NodeUsageReport") {
+            let (value, rows) = (
+                &vector["value"],
+                vector["value"]["rows"].as_array().unwrap(),
+            );
+            let identities: HashSet<_> = rows.iter().map(identity).collect();
+            let accepted = schema_valid("NodeUsageReport", value)
+                && rows.iter().all(usage_row_valid)
+                && identities.len() == rows.len();
+            assert_eq!(accepted, vector["valid"], "{}", vector["name"]);
+        }
+        for vector in vectors("NodeEventReport") {
+            let (value, events) = (
+                &vector["value"],
+                vector["value"]["events"].as_array().unwrap(),
+            );
+            let ids: HashSet<_> = events
+                .iter()
+                .map(|e| e["id"].as_str().unwrap_or_default())
+                .collect();
+            let accepted = schema_valid("NodeEventReport", value)
+                && events.iter().all(event_valid)
+                && ids.len() == events.len();
+            assert_eq!(accepted, vector["valid"], "{}", vector["name"]);
+        }
+    }
+
+    #[test]
+    fn usage_rows_wait_in_a_private_file_until_they_are_done() {
+        let base = tempdir();
+        let path = base.join("link/usage-outbox.json");
+        let mut queue = UsageQueue::load(path.clone());
+        queue.queue(&rows(0..5)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // The same intervals again are the same rows: a restart computes them twice.
+        queue.queue(&rows(3..8)).unwrap();
+        assert_eq!(queue.rows, rows(0..8));
+        // A restart finds them, and what was done stays done.
+        assert_eq!(UsageQueue::load(path.clone()).rows, rows(0..8));
+        queue.done(3).unwrap();
+        assert_eq!(UsageQueue::load(path.clone()).rows, rows(3..8));
+        queue.done(5).unwrap();
+        assert!(UsageQueue::load(path).rows.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rows_against_the_contract_or_beyond_the_bound_are_refused_whole() {
+        let base = tempdir();
+        let path = base.join("usage-outbox.json");
+        let mut queue = UsageQueue::load(path.clone());
+        queue.queue(&rows(0..2)).unwrap();
+        let mut late = row(5);
+        late["interval_end"] = "2026-10-17T12:00:10.000Z".into();
+        assert!(
+            queue.queue(&[row(4), late]).is_err(),
+            "an interval over the hour"
+        );
+        assert!(queue.queue(&[row(4), json!({"database":"x"})]).is_err());
+        assert!(
+            queue.queue(&rows(10..USAGE_MAX_ROWS + 10)).is_err(),
+            "beyond the bound"
+        );
+        assert_eq!(queue.rows, rows(0..2));
+        assert_eq!(UsageQueue::load(path).rows, rows(0..2));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_usage_file_is_an_empty_queue() {
+        let base = tempdir();
+        let path = base.join("usage-outbox.json");
+        for damaged in [
+            "{",
+            r#"{"v":2,"rows":[]}"#,
+            r#"{"v":1,"rows":[{"database":"x"}]}"#,
+        ] {
+            std::fs::write(&path, damaged).unwrap();
+            assert!(UsageQueue::load(path.clone()).rows.is_empty(), "{damaged}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn an_event_batch_is_retried_unchanged_for_ten_minutes_and_then_dropped() {
+        let mut queue = EventQueue {
+            waiting: VecDeque::new(),
+            posted: None,
+        };
+        let all = events();
+        queue.queue(&all[..2]).unwrap();
+        let start = Instant::now();
+        assert_eq!(queue.batch(start).unwrap(), Some(all[..2].to_vec()));
+        // Events that come later wait: a retry carries the ids of the first attempt only.
+        queue.queue(&all[2..3]).unwrap();
+        assert_eq!(
+            queue.batch(start + Duration::from_secs(599)).unwrap(),
+            Some(all[..2].to_vec())
+        );
+        // Cloudflare forgot those ids after 600 s: a repeat could count twice.
+        assert_eq!(
+            queue.batch(start + Duration::from_secs(600)).unwrap(),
+            Some(all[2..3].to_vec())
+        );
+        queue.done();
+        assert_eq!(queue.batch(start + Duration::from_secs(601)).unwrap(), None);
+        // An event that breaks the contract is refused whole.
+        assert!(
+            queue
+                .queue(&[all[0].clone(), json!({"type":"reboot"})])
+                .is_err()
+        );
+        assert_eq!(queue.batch(start).unwrap(), None);
+    }
+
+    #[test]
+    fn beyond_the_bound_the_oldest_events_are_dropped() {
+        let mut queue = EventQueue {
+            waiting: VecDeque::new(),
+            posted: None,
+        };
+        let event = |i: usize| {
+            let mut event = events()[0].clone();
+            event["id"] = format!("{i:08x}-1111-4111-8111-111111111111").into();
+            event
+        };
+        let many: Vec<Value> = (0..EVENTS_MAX + 3).map(event).collect();
+        assert_eq!(queue.queue(&many[..EVENTS_MAX]).unwrap(), 0);
+        assert_eq!(queue.queue(&many[EVENTS_MAX..]).unwrap(), 3);
+        assert_eq!(queue.waiting.len(), EVENTS_MAX);
+        assert_eq!(queue.waiting[0], many[3], "the oldest went");
+        // An event of an id that is queued already is the same event.
+        assert_eq!(queue.queue(&many[10..20]).unwrap(), 0);
+        assert_eq!(queue.waiting.len(), EVENTS_MAX);
+    }
+
+    async fn outbox(cloud: &Cloud) -> (Outbox, PathBuf) {
+        let (api, _) = enrolled(cloud).await;
+        let path = tempdir().join("usage-outbox.json");
+        (Outbox::new(Arc::new(api), path.clone()), path)
+    }
+
+    #[tokio::test]
+    async fn usage_is_posted_in_bounded_batches_oldest_first_and_forgotten_once_answered() {
+        let cloud = Cloud::start().await;
+        let (outbox, path) = outbox(&cloud).await;
+        outbox.queue_usage(&rows(0..60)).unwrap();
+        let flushed = outbox.flush().await.unwrap();
+        assert_eq!(
+            flushed,
+            Flushed {
+                usage_rows: 60,
+                events: 0,
+                refused: 0
+            }
+        );
+        let bodies = cloud.acknowledged("/node/v1/usage");
+        assert!(
+            bodies.len() >= 3
+                && bodies
+                    .iter()
+                    .all(|b| b["rows"].as_array().unwrap().len() <= 25)
+        );
+        let sent: Vec<Value> = bodies
+            .iter()
+            .flat_map(|b| b["rows"].as_array().unwrap().clone())
+            .collect();
+        assert_eq!(sent, rows(0..60));
+        assert!(UsageQueue::load(path).rows.is_empty());
+        // Nothing queued, nothing posted.
+        assert_eq!(outbox.flush().await.unwrap(), Flushed::default());
+        assert_eq!(cloud.posted("/node/v1/usage").len(), bodies.len());
+    }
+
+    #[tokio::test]
+    async fn a_post_that_fails_or_whose_answer_is_lost_is_repeated_with_the_same_rows() {
+        let cloud = Cloud::start().await;
+        let (outbox, path) = outbox(&cloud).await;
+        outbox.queue_usage(&rows(0..30)).unwrap();
+        // The API is unavailable; then it applies a batch and the answer is lost.
+        cloud.fail_next([Failure::Status(503)]);
+        assert!(outbox.flush().await.is_err());
+        assert_eq!(
+            UsageQueue::load(path.clone()).rows,
+            rows(0..30),
+            "kept for the next flush"
+        );
+        cloud.fail_next([Failure::Drop]);
+        assert!(outbox.flush().await.is_err());
+        let posted = cloud.posted("/node/v1/usage");
+        assert_eq!(posted[0], posted[1], "the retry is the same batch");
+        assert_eq!(outbox.flush().await.unwrap().usage_rows, 30);
+        assert_eq!(cloud.posted("/node/v1/usage")[2], posted[0]);
+        assert!(UsageQueue::load(path).rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_batch_cloudflare_refuses_is_dropped_so_the_queue_drains_past_it() {
+        let cloud = Cloud::start().await;
+        let (outbox, _) = outbox(&cloud).await;
+        outbox.queue_usage(&rows(0..30)).unwrap();
+        cloud.fail_next([Failure::Status(400)]);
+        let flushed = outbox.flush().await.unwrap();
+        assert_eq!((flushed.usage_rows, flushed.refused), (5, 25));
+        let sent: Vec<Value> = cloud
+            .acknowledged("/node/v1/usage")
+            .iter()
+            .flat_map(|b| b["rows"].as_array().unwrap().clone())
+            .collect();
+        assert_eq!(sent, rows(25..30));
+    }
+
+    #[tokio::test]
+    async fn a_fenced_node_keeps_what_it_could_not_report() {
+        let cloud = Cloud::start().await;
+        let (outbox, path) = outbox(&cloud).await;
+        outbox.queue_usage(&rows(0..3)).unwrap();
+        outbox.queue_events(&events()).unwrap();
+        cloud.with(|inner| inner.fenced = true);
+        assert!(outbox.flush().await.unwrap_err().is::<Fenced>());
+        assert_eq!(UsageQueue::load(path).rows, rows(0..3));
+        let state = outbox.state();
+        let posted = state
+            .events
+            .posted
+            .as_ref()
+            .map_or(0, |(batch, _)| batch.len());
+        assert_eq!(state.events.waiting.len() + posted, events().len());
+    }
+
+    #[tokio::test]
+    async fn events_are_posted_and_a_lost_answer_repeats_the_same_batch() {
+        let cloud = Cloud::start().await;
+        let (outbox, _) = outbox(&cloud).await;
+        outbox.queue_events(&events()).unwrap();
+        cloud.fail_next([Failure::Drop]);
+        // The usage queue is empty: the failure is the events'.
+        assert!(outbox.flush().await.is_err());
+        let mut later = events()[0].clone();
+        later["id"] = "99999999-1111-4111-8111-111111111111".into();
+        outbox.queue_events(&[later.clone()]).unwrap();
+        let flushed = outbox.flush().await.unwrap();
+        assert_eq!(flushed.events, events().len() + 1);
+        let posted = cloud.posted("/node/v1/events");
+        assert_eq!(posted[0], posted[1], "the repeat carries the same ids");
+        assert_eq!(posted[0]["events"], json!(events()));
+        // The event queued after the failure follows in a batch of its own.
+        assert_eq!(posted[2]["events"], json!([later]));
+        assert_eq!(posted.len(), 3);
+    }
+}
