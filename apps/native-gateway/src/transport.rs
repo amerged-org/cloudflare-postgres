@@ -1051,7 +1051,7 @@ async fn run_session(
         let mut held = None;
         if let Some(password) = password {
             let login = tokio::select! {
-                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
+                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password,None))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
                 _=stop.changed()=>Err("gateway_draining"),
                 _=actions.changed()=>Err("fenced"),
             };
@@ -1062,7 +1062,7 @@ async fn run_session(
                     let _ = send_error(websocket, "08006", "database connection failed").await;
                     return Err("login failed".into());
                 }
-                Ok(Login::Authenticated(answer)) => answer,
+                Ok(Login::Authenticated(answer, _)) => answer,
                 Ok(Login::Refused) => {
                     stages.outcome = "authentication_failed";
                     refuse(websocket).await;

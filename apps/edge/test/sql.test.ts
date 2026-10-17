@@ -320,6 +320,18 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     expect(await forwarded()).toHaveLength(0);
   });
 
+  it("answers a decoy byte for byte as the gateway refuses a password", async () => {
+    // The gateway's answer to a refused password (apps/native-gateway/tests/sql.rs): an unknown
+    // database or role and a wrong password cannot be told apart by their bytes.
+    const response = await post(admitting({ ok: false, sqlstate: "3D000" }), {
+      query: "select 1",
+    });
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(
+      '{"message":"password authentication failed","code":"28P01","severity":"FATAL"}',
+    );
+  });
+
   it("maps admission refusals as the WebSocket path does, without a gateway call", async () => {
     for (const [sqlstate, code] of [
       ["3D000", "28P01"],

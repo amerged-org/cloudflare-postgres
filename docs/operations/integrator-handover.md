@@ -573,6 +573,9 @@ SQL and allows 16 local connections.
 - The StartupMessage must arrive within 10 s of the upgrade and is at most 10,000 bytes. A
   password pipelined with it is a PasswordMessage of at most 4,096 bytes; an empty, oversized or
   wrong one, an unknown role and an unknown database are all answered with the same `28P01`.
+- The gateway logs in with a pipelined password (and over HTTP) only to a PostgreSQL that asks for
+  SCRAM-SHA-256 with at most 100,000 iterations (PostgreSQL's default `scram_iterations` is
+  4,096), or for no password; anything else answers `08006` and never receives the password.
 
 ### 3.3 TLS
 
@@ -698,12 +701,12 @@ const [, total] = await sql.transaction(
 
 | Topic | Behaviour |
 | --- | --- |
-| Password | Sent in the driver's `Neon-Connection-String` header over HTTPS to Cloudflare. The Edge forwards it once, in the request body, over the tunnel to the gateway, which authenticates to PostgreSQL with SCRAM-SHA-256 inside the cluster. It is never logged or stored and is wiped from the gateway's memory after use. |
+| Password | Sent in the driver's `Neon-Connection-String` header over HTTPS to Cloudflare. The Edge forwards it once, in the request body, over the tunnel to the gateway, which authenticates to PostgreSQL with SCRAM-SHA-256 inside the cluster, with the same login and limits as a pipelined WebSocket password ([3.2](#32-what-the-gateway-does-and-does-not-support)). It is never logged or stored and is zeroized in the gateway's memory after use. |
 | Statements | One statement per query (`a; b` is refused by PostgreSQL with `42601`). Parameters are `$1`, `$2`, ... in text; PostgreSQL infers their types. Results are text, parsed by the driver's type parsers (its `types` option), as with Neon. `arrayMode` and `fullResults` work: the driver applies them itself. |
 | Transactions | `transaction()` runs its statements between `BEGIN` and `COMMIT` in one request, with `isolationLevel`, `readOnly` and `deferrable`. An error rolls the whole transaction back. |
 | Session state | None across requests: each request starts like a new session (the gateway runs `DISCARD ALL` after it). `SET`, temporary tables, advisory locks, `LISTEN` and prepared statements end with the request; a transaction a single query leaves open is rolled back. Use WebSocket mode for interactive transactions and session state. |
 | Not supported | `COPY` (`0A000`); `authToken` / `Authorization` (`0A000`); clients other than the driver must send `Neon-Raw-Text-Output: true` and `Neon-Array-Mode: true`. |
-| Limits | Request body 4 MiB, at most 256 statements per transaction, result rows 10 MiB (`54000`; the session is closed and the outcome is unknown). |
+| Limits | Request body 4 MiB, at most 256 statements per transaction, answer 10 MiB of JSON (`54000`; the session is closed and the outcome is unknown). |
 | Sleeping database | The request waits for the wake as a connection does ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)): at most 60 s, with the same `57P03` and `08006` answers. Set your `fetch` timeout accordingly. |
 | Admission and limits | Every request is one admission. It counts in the same Edge rate limiters as a connection (a service-binding caller in its own limiter), in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the example configuration that is 120 requests per 60 s per database and Cloudflare location: the installation must size these limits for HTTP traffic. |
 | Errors | HTTP 400 with PostgreSQL's error fields (`message`, `code`, `severity`, `detail`, `hint`, `position`, ...); the driver throws them as `NeonDbError`. Admission refusals use the codes of [A.4](#a4-sqlstate-at-connect-time). |

@@ -4,10 +4,11 @@
 //! the gateway answers it on a pooled PostgreSQL session of the route's database and role, in the
 //! driver's wire format (raw text values, rows as arrays).
 //!
-//! The gateway authenticates that session with SCRAM-SHA-256 using the client's password. The
-//! password is held in memory only for the request, wiped after use, and never logged or stored;
-//! a pooled session keeps only its SCRAM verifier (salt, iterations, StoredKey) and is reused for
-//! a request only when the request's password derives the same StoredKey. A pooled session
+//! The gateway authenticates that session with the client's password through the SCRAM client
+//! of the WebSocket login ([`auth::login`]). The password is held in memory only for the request,
+//! zeroized after use, and never logged or stored; a pooled session keeps only its SCRAM verifier
+//! (salt, iterations, StoredKey) and is reused for a request only when the request's password
+//! derives the same StoredKey. A session PostgreSQL did not challenge is not pooled. A pooled session
 //! carries no session state between requests (`DISCARD ALL`), waits at most [`IDLE`] for its next
 //! request and is retired [`LIFETIME`] after it authenticated, which bounds how long a rotated
 //! password is still accepted. It counts as an idle gateway session, so a sleeping database
@@ -15,28 +16,26 @@
 //!
 //! Statement bytes that reached PostgreSQL are never sent again: a session lost before
 //! PostgreSQL's answer answers SQLSTATE 08007 (outcome unknown) and is closed.
+//!
+//! The answer is serialized as PostgreSQL's messages arrive, into one buffer whose capacity is
+//! leased from the database's memory budget: what is counted is what the gateway holds.
 use crate::{
+    auth::{self, Login, Password, Salted, Verifier},
     budget::{Lease, WireBudget},
     control::{self, HttpHead},
     sessions::Action,
     targets::TargetIdentity,
     transport::{self, Gateway, SessionLease, WakeState},
 };
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
     route::{RouteClaims, verify},
     wake::{self, Outcome, WakeClaims},
 };
-use ring::{hmac, pbkdf2, rand::SecureRandom};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    num::NonZeroU32,
     sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -47,11 +46,12 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::client::TlsStream;
+use zeroize::Zeroizing;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 pub const PATH: &str = "/sql";
 /// The largest request body; the Edge refuses a larger one first.
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-/// The largest answer, counted as PostgreSQL's row bytes.
+/// The largest answer, counted as its JSON bytes.
 pub const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 /// The most statements of one batch.
 pub const MAX_STATEMENTS: usize = 256;
@@ -63,31 +63,41 @@ pub const LIFETIME: Duration = Duration::from_secs(60);
 const POOLED_PER_ROLE: usize = 4;
 /// The time a request has to send its body.
 const BODY_BOUND: Duration = Duration::from_secs(10);
-/// The most SCRAM iterations the gateway computes for PostgreSQL's verifier.
-const MAX_ITERATIONS: u32 = 1_000_000;
-
-/// Bytes wiped when dropped: the password and every buffer that held it.
-struct Secret(Vec<u8>);
-impl Drop for Secret {
-    fn drop(&mut self) {
-        wipe(&mut self.0);
-    }
-}
-fn wipe(bytes: &mut [u8]) {
-    bytes.fill(0);
-    std::hint::black_box(bytes);
-}
 
 /// A refusal in the driver's error format, answered with HTTP 400, and its log outcome.
+#[derive(Debug)]
 struct Refused {
     outcome: &'static str,
-    body: Value,
+    body: Vec<u8>,
+}
+/// The gateway's own error, with its fields in the order the Edge writes them, so a refusal of
+/// both has the same bytes.
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    message: &'a str,
+    code: &'a str,
+    severity: &'a str,
+}
+fn error_body(message: &str, code: &str, severity: &str) -> Vec<u8> {
+    serde_json::to_vec(&ErrorBody {
+        message,
+        code,
+        severity,
+    })
+    .expect("strings serialize")
 }
 fn refused(outcome: &'static str, code: &str, message: &str) -> Refused {
     Refused {
         outcome,
-        body: json!({"message":message,"code":code,"severity":"ERROR"}),
+        body: error_body(message, code, "ERROR"),
     }
+}
+fn too_large() -> Refused {
+    refused(
+        "response_too_large",
+        "54000",
+        "result is too large for HTTP SQL; the connection was closed and the request's outcome is unknown",
+    )
 }
 fn invalid(message: &str) -> Refused {
     refused("invalid_request", "08P01", message)
@@ -138,13 +148,13 @@ enum Isolation {
     Serializable,
 }
 struct Request {
-    password: Secret,
+    password: Password,
     statements: Vec<Statement>,
     transaction: Option<Transaction>,
 }
 fn parse(body: &[u8]) -> Result<Request, Refused> {
     let parsed: Body = serde_json::from_slice(body).map_err(|_| invalid("invalid request"))?;
-    let password = Secret(
+    let password = Zeroizing::new(
         URL_SAFE_NO_PAD
             .decode(parsed.password)
             .map_err(|_| invalid("invalid request"))?,
@@ -168,9 +178,7 @@ fn parse(body: &[u8]) -> Result<Request, Refused> {
         ));
     }
     // PostgreSQL never accepts an empty password, and one with a NUL cannot be sent.
-    if password.0.is_empty() || password.0.contains(&0) {
-        return Err(authentication_failed());
-    }
+    let password = Password::new(password).ok_or_else(authentication_failed)?;
     Ok(Request {
         password,
         statements: parsed.queries,
@@ -180,7 +188,7 @@ fn parse(body: &[u8]) -> Result<Request, Refused> {
 fn authentication_failed() -> Refused {
     Refused {
         outcome: "authentication_failed",
-        body: json!({"message":"password authentication failed","code":"28P01","severity":"FATAL"}),
+        body: error_body("password authentication failed", "28P01", "FATAL"),
     }
 }
 fn begin(transaction: &Transaction) -> String {
@@ -234,138 +242,6 @@ impl Drop for Stages {
     }
 }
 
-/// SCRAM-SHA-256 (RFC 5802, RFC 7677) without channel binding: TLS to PostgreSQL is verified
-/// against the database's own authority before the first byte.
-mod scram {
-    use super::*;
-    /// What a session authenticated with: enough to recognise its password, not to recover it.
-    #[derive(Clone, PartialEq, Eq)]
-    pub(super) struct Verifier {
-        pub salt: Vec<u8>,
-        pub iterations: u32,
-        pub stored_key: [u8; 32],
-    }
-    pub(super) fn salted(password: &[u8], salt: &[u8], iterations: u32) -> Secret {
-        let mut out = Secret(vec![0; 32]);
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            NonZeroU32::new(iterations).expect("positive iterations"),
-            salt,
-            password,
-            &mut out.0,
-        );
-        out
-    }
-    pub(super) fn mac(key: &[u8], data: &[u8]) -> [u8; 32] {
-        let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data);
-        tag.as_ref().try_into().expect("SHA-256 tag")
-    }
-    impl Verifier {
-        pub fn of(password: &[u8], salt: Vec<u8>, iterations: u32) -> Self {
-            let salted = salted(password, &salt, iterations);
-            let mut client_key = mac(&salted.0, b"Client Key");
-            let stored_key = Sha256::digest(client_key).into();
-            wipe(&mut client_key);
-            Self {
-                salt,
-                iterations,
-                stored_key,
-            }
-        }
-        /// A verifier of its own for a session PostgreSQL did not challenge with SCRAM.
-        pub fn local(password: &[u8]) -> Result<Self, Refused> {
-            let mut salt = vec![0; 16];
-            ring::rand::SystemRandom::new()
-                .fill(&mut salt)
-                .map_err(|_| connection_failed("random_unavailable"))?;
-            Ok(Self::of(password, salt, 4096))
-        }
-        /// Whether `stored_key` was derived from the same password, compared in constant time.
-        pub fn same(&self, stored_key: &[u8; 32]) -> bool {
-            self.stored_key
-                .iter()
-                .zip(stored_key)
-                .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-                == 0
-        }
-    }
-    /// The client's first message and its bare part, for a fresh random nonce.
-    pub(super) fn client_first(user: &str) -> Result<(String, String), Refused> {
-        let mut nonce = [0; 18];
-        ring::rand::SystemRandom::new()
-            .fill(&mut nonce)
-            .map_err(|_| connection_failed("random_unavailable"))?;
-        Ok(first_with_nonce(user, &STANDARD.encode(nonce)))
-    }
-    pub(super) fn first_with_nonce(user: &str, nonce: &str) -> (String, String) {
-        let bare = format!("n={user},r={nonce}");
-        (format!("n,,{bare}"), bare)
-    }
-    /// The client's final message, the server signature PostgreSQL must prove, and the verifier.
-    pub(super) fn client_final(
-        password: &[u8],
-        first_bare: &str,
-        server_first: &str,
-    ) -> Result<(String, [u8; 32], Verifier), Refused> {
-        let protocol = || connection_failed("authentication_protocol");
-        let client_nonce = first_bare
-            .split(',')
-            .find_map(|part| part.strip_prefix("r="))
-            .ok_or_else(protocol)?;
-        let mut nonce = None;
-        let mut salt = None;
-        let mut iterations = None;
-        for part in server_first.split(',') {
-            match part.split_at_checked(2) {
-                Some(("r=", value)) => nonce = Some(value),
-                Some(("s=", value)) => salt = STANDARD.decode(value).ok(),
-                Some(("i=", value)) => iterations = value.parse::<u32>().ok(),
-                _ => return Err(protocol()),
-            }
-        }
-        let (Some(nonce), Some(salt), Some(iterations)) = (nonce, salt, iterations) else {
-            return Err(protocol());
-        };
-        if !nonce.starts_with(client_nonce)
-            || nonce.len() == client_nonce.len()
-            || salt.is_empty()
-            || iterations == 0
-            || iterations > MAX_ITERATIONS
-        {
-            return Err(protocol());
-        }
-        let without_proof = format!("c=biws,r={nonce}");
-        let message = format!("{first_bare},{server_first},{without_proof}");
-        let salted = salted(password, &salt, iterations);
-        let mut client_key = mac(&salted.0, b"Client Key");
-        let stored_key: [u8; 32] = Sha256::digest(client_key).into();
-        let signature = mac(&stored_key, message.as_bytes());
-        let mut proof = [0u8; 32];
-        for (index, byte) in proof.iter_mut().enumerate() {
-            *byte = client_key[index] ^ signature[index];
-        }
-        wipe(&mut client_key);
-        let server = mac(&mac(&salted.0, b"Server Key"), message.as_bytes());
-        Ok((
-            format!("{without_proof},p={}", STANDARD.encode(proof)),
-            server,
-            Verifier {
-                salt,
-                iterations,
-                stored_key,
-            },
-        ))
-    }
-    /// Whether PostgreSQL's final message proves the server signature.
-    pub(super) fn server_proved(server_final: &str, expected: &[u8; 32]) -> bool {
-        server_final
-            .strip_prefix("v=")
-            .and_then(|value| STANDARD.decode(value).ok())
-            .is_some_and(|value| value == expected)
-    }
-}
-use scram::Verifier;
-
 /// One authenticated PostgreSQL session of a database and role, reserved as a gateway session.
 struct Backend {
     lease: SessionLease,
@@ -375,7 +251,8 @@ struct Backend {
     user: String,
     /// The fence epoch the session was admitted at.
     epoch: (u64, u64),
-    verifier: Verifier,
+    /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
+    verifier: Option<Verifier>,
     authenticated: Instant,
     /// The memory the session holds while it exists.
     _memory: Lease,
@@ -414,17 +291,17 @@ pub async fn serve(
         query: None,
     };
     let (answer, backend) = handle(&mut socket, head, &gateway, &stop, permit, &mut stages).await;
-    let (status, body) = match answer {
-        Ok(body) => {
+    // The answer's memory stays leased until it was sent.
+    let (status, bytes, _memory) = match answer {
+        Ok(answer) => {
             stages.outcome = "ok";
-            (200, body)
+            (200, answer.bytes, Some(answer.memory))
         }
         Err(refusal) => {
             stages.outcome = refusal.outcome;
-            (400, refusal.body)
+            (400, refusal.body, None)
         }
     };
-    let bytes = serde_json::to_vec(&body)?;
     if let Some((backend, _)) = &backend {
         gateway
             .measurements
@@ -453,7 +330,7 @@ async fn respond(socket: &mut TcpStream, status: u16, body: &[u8]) -> Result<(),
     .await??;
     Ok(())
 }
-type Answer = (Result<Value, Refused>, Option<(Backend, u8)>);
+type Handled = (Result<Answer, Refused>, Option<(Backend, u8)>);
 async fn handle(
     socket: &mut TcpStream,
     head: HttpHead,
@@ -461,7 +338,7 @@ async fn handle(
     stop: &watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
     stages: &mut Stages,
-) -> Answer {
+) -> Handled {
     macro_rules! attempt {
         ($value:expr) => {
             match $value {
@@ -477,8 +354,8 @@ async fn handle(
     stages.database = Some(route.database().to_string());
     let body = attempt!(read_body(socket, head).await);
     drop(permit);
-    let request = attempt!(parse(&body.0));
-    let request_bytes = body.0.len();
+    let request = attempt!(parse(&body));
+    let request_bytes = body.len();
     drop(body);
     stages.statements = request.statements.len();
     let (claims, released) = match route {
@@ -489,18 +366,19 @@ async fn handle(
         }
     };
     let (target, epoch) = attempt!(current(gateway, &claims, released.as_deref()).await);
-    let mut backend = match checkout(gateway, &claims, &target, epoch, &request.password.0).await {
-        Some(backend) => {
+    let mut backend = match checkout(gateway, &claims, &target, epoch, &request.password).await {
+        Checkout::Taken(backend) => {
             stages.pooled = true;
-            backend
+            *backend
         }
-        None => attempt!(
+        Checkout::Missed(known) => attempt!(
             open(
                 gateway,
                 &claims,
                 &target,
                 epoch,
-                &request.password.0,
+                &request.password,
+                known,
                 stages
             )
             .await
@@ -527,14 +405,8 @@ async fn handle(
     let executed = execute(gateway, &mut backend, &statements, transaction.as_ref()).await;
     stages.query = Some(started.elapsed());
     match executed {
-        Ok((Ok(mut results), status)) if results.len() == statements.len() => {
-            // A single statement answers its result; a transaction the list of them.
-            let answer = if transaction.is_some() {
-                json!({ "results": results })
-            } else {
-                results.swap_remove(0)
-            };
-            (Ok(answer), Some((backend, status)))
+        Ok((Ok(answer), status)) if answer.results == statements.len() => {
+            (Ok(answer.finish()), Some((backend, status)))
         }
         Ok((Ok(_), _)) => {
             terminate(backend).await;
@@ -595,15 +467,15 @@ fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Route, Refused> 
         .map_err(|_| denied())?;
     Ok(route)
 }
-/// The request body, by Content-Length or chunked. Every buffer that held it is wiped.
-async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Secret, Refused> {
+/// The request body, by Content-Length or chunked. Every buffer that held it is zeroized.
+async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<Vec<u8>>, Refused> {
     let HttpHead {
         headers,
         prefix,
         end,
         ..
     } = head;
-    let prefix = Secret(prefix);
+    let prefix = Zeroizing::new(prefix);
     let one = |name: &str| {
         let mut values = headers.iter().filter(|(key, _)| key == name);
         let value = values.next().map(|(_, value)| value.as_str());
@@ -617,41 +489,41 @@ async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Secret, Ref
         {
             return Err(invalid("invalid request"));
         }
-        let mut raw = Secret(Vec::with_capacity(MAX_REQUEST_BYTES + 64 * 1024));
-        raw.0.extend_from_slice(&prefix.0[end..]);
-        let mut body = Secret(Vec::with_capacity(MAX_REQUEST_BYTES));
+        let mut raw = Zeroizing::new(Vec::with_capacity(MAX_REQUEST_BYTES + 64 * 1024));
+        raw.extend_from_slice(&prefix[end..]);
+        let mut body = Zeroizing::new(Vec::with_capacity(MAX_REQUEST_BYTES));
         let mut offset = 0;
         let deadline = tokio::time::Instant::now() + BODY_BOUND;
         loop {
             // Parses what has arrived; reads more only when a chunk is incomplete.
-            match httparse::parse_chunk_size(&raw.0[offset..]) {
+            match httparse::parse_chunk_size(&raw[offset..]) {
                 Ok(httparse::Status::Complete((consumed, 0))) => {
                     // The last chunk; trailers are not accepted.
-                    while raw.0.len() < offset + consumed + 2 {
+                    while raw.len() < offset + consumed + 2 {
                         read_more(socket, &mut raw, deadline).await?;
                     }
-                    if &raw.0[offset + consumed..offset + consumed + 2] != b"\r\n" {
+                    if &raw[offset + consumed..offset + consumed + 2] != b"\r\n" {
                         return Err(invalid("invalid request"));
                     }
                     return Ok(body);
                 }
                 Ok(httparse::Status::Complete((consumed, size))) => {
                     let size = usize::try_from(size).map_err(|_| too_large())?;
-                    if size > MAX_REQUEST_BYTES - body.0.len() {
+                    if size > MAX_REQUEST_BYTES - body.len() {
                         return Err(too_large());
                     }
                     let start = offset + consumed;
-                    while raw.0.len() < start + size + 2 {
+                    while raw.len() < start + size + 2 {
                         read_more(socket, &mut raw, deadline).await?;
                     }
-                    if &raw.0[start + size..start + size + 2] != b"\r\n" {
+                    if &raw[start + size..start + size + 2] != b"\r\n" {
                         return Err(invalid("invalid request"));
                     }
-                    body.0.extend_from_slice(&raw.0[start..start + size]);
+                    body.extend_from_slice(&raw[start..start + size]);
                     offset = start + size + 2;
                 }
                 Ok(httparse::Status::Partial) => {
-                    if raw.0.len() - offset > 1024 {
+                    if raw.len() - offset > 1024 {
                         return Err(invalid("invalid request"));
                     }
                     read_more(socket, &mut raw, deadline).await?;
@@ -667,35 +539,35 @@ async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Secret, Ref
     if length > MAX_REQUEST_BYTES {
         return Err(too_large());
     }
-    if prefix.0.len() - end > length {
+    if prefix.len() - end > length {
         return Err(invalid("invalid request"));
     }
     // Sized once: a reallocation would leave an unwiped copy behind.
-    let mut body = Secret(Vec::with_capacity(length));
-    body.0.extend_from_slice(&prefix.0[end..]);
-    let filled = body.0.len();
-    body.0.resize(length, 0);
-    match timeout(BODY_BOUND, socket.read_exact(&mut body.0[filled..])).await {
+    let mut body = Zeroizing::new(Vec::with_capacity(length));
+    body.extend_from_slice(&prefix[end..]);
+    let filled = body.len();
+    body.resize(length, 0);
+    match timeout(BODY_BOUND, socket.read_exact(&mut body[filled..])).await {
         Ok(Ok(_)) => Ok(body),
         _ => Err(invalid("incomplete request")),
     }
 }
 async fn read_more(
     socket: &mut TcpStream,
-    raw: &mut Secret,
+    raw: &mut Zeroizing<Vec<u8>>,
     deadline: tokio::time::Instant,
 ) -> Result<(), Refused> {
-    if raw.0.len() >= raw.0.capacity() {
+    if raw.len() >= raw.capacity() {
         return Err(refused(
             "request_too_large",
             "54000",
             "request is too large",
         ));
     }
-    let mut chunk = Secret(vec![0; (raw.0.capacity() - raw.0.len()).min(64 * 1024)]);
-    match tokio::time::timeout_at(deadline, socket.read(&mut chunk.0)).await {
+    let mut chunk = Zeroizing::new(vec![0; (raw.capacity() - raw.len()).min(64 * 1024)]);
+    match tokio::time::timeout_at(deadline, socket.read(&mut chunk)).await {
         Ok(Ok(length)) if length > 0 => {
-            raw.0.extend_from_slice(&chunk.0[..length]);
+            raw.extend_from_slice(&chunk[..length]);
             Ok(())
         }
         _ => Err(invalid("incomplete request")),
@@ -807,33 +679,51 @@ async fn current(
     Ok((target, epoch))
 }
 
+/// What the pool had for a request.
+enum Checkout {
+    Taken(Box<Backend>),
+    /// No session matched; the SaltedPassword derived for the newest one, which a new session's
+    /// login uses when PostgreSQL asks for the same salt and iterations.
+    Missed(Option<Salted>),
+}
 /// An idle session of the route's database and role on the same writer and fence epoch whose
-/// verifier the password matches. Only the newest session's verifier is derived: the sessions of
-/// one role share it unless its password was rotated.
+/// verifier the password matches. Only the newest session's verifier is derived, once: the
+/// sessions of one role share it unless its password was rotated.
 async fn checkout(
     gateway: &Gateway,
     claims: &RouteClaims,
     target: &TargetIdentity,
     epoch: (u64, u64),
-    password: &[u8],
-) -> Option<Backend> {
+    password: &Password,
+) -> Checkout {
     let key = (claims.db.clone(), claims.user.clone());
     let newest = {
         let mut parked = gateway.sql.parked.lock().unwrap();
-        let sessions = parked.get_mut(&key)?;
+        let Some(sessions) = parked.get_mut(&key) else {
+            return Checkout::Missed(None);
+        };
         sessions.retain(|session| !session.take.is_closed());
-        sessions.last()?.verifier.clone()
+        match sessions.last() {
+            Some(session) => session.verifier.clone(),
+            None => return Checkout::Missed(None),
+        }
     };
-    let derived = Verifier::of(password, newest.salt.clone(), newest.iterations);
+    let Ok(salted) = Salted::derive(password, newest.salt, newest.iterations).await else {
+        return Checkout::Missed(None);
+    };
+    let derived = salted.verifier();
     loop {
         let parked = {
             let mut parked = gateway.sql.parked.lock().unwrap();
-            let sessions = parked.get_mut(&key)?;
-            let index = sessions.iter().rposition(|session| {
-                session.verifier.salt == derived.salt
-                    && session.verifier.iterations == derived.iterations
-                    && session.verifier.same(&derived.stored_key)
-            })?;
+            let Some(sessions) = parked.get_mut(&key) else {
+                break;
+            };
+            let Some(index) = sessions
+                .iter()
+                .rposition(|session| session.verifier.same(&derived))
+            else {
+                break;
+            };
             sessions.remove(index)
         };
         let (reply, taken) = oneshot::channel();
@@ -852,10 +742,11 @@ async fn checkout(
                 .await
                 .permits(&claims.db, &backend.lease.target)
         {
-            return Some(backend);
+            return Checkout::Taken(Box::new(backend));
         }
         terminate(backend).await;
     }
+    Checkout::Missed(Some(salted))
 }
 /// Dials the admitted writer and authenticates a new session with the request's password.
 async fn open(
@@ -863,7 +754,8 @@ async fn open(
     claims: &RouteClaims,
     target: &TargetIdentity,
     epoch: (u64, u64),
-    password: &[u8],
+    password: &Password,
+    known: Option<Salted>,
     stages: &mut Stages,
 ) -> Result<Backend, Refused> {
     let database = &claims.db;
@@ -927,18 +819,14 @@ async fn open(
         database: database.clone(),
         user: claims.user.clone(),
         epoch,
-        verifier: Verifier {
-            salt: Vec::new(),
-            iterations: 0,
-            stored_key: [0; 32],
-        },
+        verifier: None,
         authenticated: Instant::now(),
         _memory: memory,
     };
     let authenticating = Instant::now();
     let authenticated = timeout(
         transport::STARTUP_BOUND,
-        authenticate(gateway, &mut backend, password),
+        authenticate(gateway, &mut backend, password, known),
     )
     .await
     .unwrap_or_else(|_| Err(connection_failed("startup_timeout")));
@@ -965,17 +853,14 @@ fn message(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
     out.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     out.extend_from_slice(body);
 }
-/// A frontend message whose body holds the password; the buffer is wiped when dropped.
-fn password_message(body: &[u8]) -> Secret {
-    let mut out = Secret(Vec::with_capacity(body.len() + 5));
-    message(&mut out.0, b'p', body);
-    out
-}
+/// Writes the StartupMessage and logs in with the request's password; the answer is the verifier
+/// PostgreSQL proved, if it asked for a password.
 async fn authenticate(
     gateway: &Gateway,
     backend: &mut Backend,
-    password: &[u8],
-) -> Result<Verifier, Refused> {
+    password: &Password,
+    known: Option<Salted>,
+) -> Result<Option<Verifier>, Refused> {
     let failed = || connection_failed("postgres_error");
     let protocol = || connection_failed("authentication_protocol");
     let mut startup = 196_608u32.to_be_bytes().to_vec();
@@ -995,105 +880,36 @@ async fn authenticate(
     write_guarded(gateway, backend, &bytes)
         .await
         .map_err(|_| failed())?;
-    let mut first: Option<String> = None;
-    let mut expected: Option<[u8; 32]> = None;
-    let mut verifier: Option<Verifier> = None;
-    let mut authenticated = false;
-    loop {
-        let (tag, body) = read_message(&mut backend.postgres)
-            .await
-            .map_err(|_| failed())?;
+    let login = auth::login(&mut backend.postgres, password, known)
+        .await
+        .map_err(|_| failed())?;
+    let startup_error = |body: &[u8]| Refused {
+        outcome: "postgres_startup_error",
+        body: serde_json::to_vec(&error_fields(body)).expect("fields serialize"),
+    };
+    let (messages, verifier) = match login {
+        Login::Refused => return Err(authentication_failed()),
+        Login::Failed(message) => return Err(startup_error(message.get(5..).unwrap_or_default())),
+        Login::Authenticated(messages, verifier) => (messages, verifier),
+    };
+    // AuthenticationOk through ReadyForQuery, and nothing behind it.
+    let mut rest = messages.as_slice();
+    while let Some((&tag, tail)) = rest.split_first() {
+        let length = tail
+            .get(..4)
+            .map(|length| u32::from_be_bytes(length.try_into().unwrap()) as usize)
+            .filter(|length| *length >= 4 && *length <= tail.len())
+            .ok_or_else(protocol)?;
+        let body = &tail[4..length];
+        rest = &tail[length..];
         match tag {
-            b'R' if body.len() >= 4 => {
-                let data = &body[4..];
-                match u32::from_be_bytes(body[..4].try_into().unwrap()) {
-                    0 => {
-                        if expected.is_some() {
-                            return Err(protocol());
-                        }
-                        authenticated = true;
-                    }
-                    3 => {
-                        // Sized once: a reallocation would leave an unwiped copy behind.
-                        let mut secret = Secret(Vec::with_capacity(password.len() + 1));
-                        secret.0.extend_from_slice(password);
-                        secret.0.push(0);
-                        let reply = password_message(&secret.0);
-                        write_guarded(gateway, backend, &reply.0)
-                            .await
-                            .map_err(|_| failed())?;
-                        verifier = Some(Verifier::local(password)?);
-                    }
-                    10 => {
-                        if !data
-                            .split(|b| *b == 0)
-                            .any(|mechanism| mechanism == b"SCRAM-SHA-256")
-                        {
-                            return Err(protocol());
-                        }
-                        let (client_first, bare) = scram::client_first("")?;
-                        let mut initial = b"SCRAM-SHA-256\0".to_vec();
-                        initial.extend_from_slice(&(client_first.len() as u32).to_be_bytes());
-                        initial.extend_from_slice(client_first.as_bytes());
-                        let mut reply = Vec::new();
-                        message(&mut reply, b'p', &initial);
-                        write_guarded(gateway, backend, &reply)
-                            .await
-                            .map_err(|_| failed())?;
-                        first = Some(bare);
-                    }
-                    11 => {
-                        let bare = first.take().ok_or_else(protocol)?;
-                        let server_first = std::str::from_utf8(data).map_err(|_| protocol())?;
-                        let (last, server, derived) =
-                            scram::client_final(password, &bare, server_first)?;
-                        let reply = password_message(last.as_bytes());
-                        write_guarded(gateway, backend, &reply.0)
-                            .await
-                            .map_err(|_| failed())?;
-                        expected = Some(server);
-                        verifier = Some(derived);
-                    }
-                    12 => {
-                        let server_final = std::str::from_utf8(data).map_err(|_| protocol())?;
-                        if !expected
-                            .take()
-                            .is_some_and(|expected| scram::server_proved(server_final, &expected))
-                        {
-                            return Err(protocol());
-                        }
-                    }
-                    _ => {
-                        return Err(refused(
-                            "authentication_method",
-                            "08006",
-                            "unsupported authentication method",
-                        ));
-                    }
-                }
-            }
-            b'E' => {
-                let error = error_fields(&body);
-                return Err(if error["code"] == "28P01" {
-                    authentication_failed()
-                } else {
-                    Refused {
-                        outcome: "postgres_startup_error",
-                        body: error,
-                    }
-                });
-            }
-            b'S' | b'K' | b'N' => {}
-            b'Z' if authenticated => {
-                // A server that asked for no password is recognised by a verifier of its own.
-                return match verifier {
-                    Some(verifier) => Ok(verifier),
-                    None => Verifier::local(password),
-                };
-            }
+            b'E' => return Err(startup_error(body)),
+            b'Z' if rest.is_empty() => return Ok(verifier),
+            b'R' | b'S' | b'K' | b'N' => {}
             _ => return Err(protocol()),
         }
     }
+    Err(protocol())
 }
 /// Writes to PostgreSQL only while the fence still admits the session's database at the epoch it
 /// was admitted at and the watches still show its writer, holding both for the bounded write.
@@ -1196,22 +1012,120 @@ fn row_description(body: &[u8]) -> Option<Vec<Value>> {
     }
     Some(fields)
 }
-fn data_row(body: &[u8]) -> Option<Value> {
-    let count = i16::from_be_bytes(body.get(..2)?.try_into().ok()?);
-    let mut rest = &body[2..];
-    let mut values = Vec::new();
-    for _ in 0..count {
-        let length = i32::from_be_bytes(rest.get(..4)?.try_into().ok()?);
-        rest = &rest[4..];
-        if length < 0 {
-            values.push(Value::Null);
-        } else {
-            let value = rest.get(..length as usize)?;
-            values.push(String::from_utf8_lossy(value).into());
-            rest = &rest[length as usize..];
+/// The length of a string serialized as JSON, as serde_json escapes it.
+fn json_string_length(value: &str) -> usize {
+    2 + value
+        .bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' | 0x08 | 0x09 | 0x0a | 0x0c | 0x0d => 2,
+            0..=0x1f => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+/// The answer in the driver's format, serialized as PostgreSQL's messages arrive: one result
+/// object per described statement, in `{"results":[...]}` for a transaction. The whole capacity
+/// of its buffer is leased from the database's memory budget.
+struct Answer {
+    bytes: Vec<u8>,
+    memory: Lease,
+    transaction: bool,
+    /// The results completed.
+    results: usize,
+    /// The rows of the result being written, if one is.
+    rows: Option<usize>,
+}
+impl Answer {
+    fn new(memory: Lease, transaction: bool) -> Result<Self, Refused> {
+        let mut answer = Self {
+            bytes: Vec::new(),
+            memory,
+            transaction,
+            results: 0,
+            rows: None,
+        };
+        if transaction {
+            answer.push(b"{\"results\":[")?;
         }
+        Ok(answer)
     }
-    Some(Value::Array(values))
+    /// Room for `additional` more bytes and the transaction's closing ones, within
+    /// [`MAX_RESPONSE_BYTES`] and the budget.
+    fn reserve(&mut self, additional: usize) -> Result<(), Refused> {
+        let needed = self.bytes.len() + additional + 2;
+        if needed > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        let capacity = self.bytes.capacity();
+        if needed > capacity {
+            let grown = needed.max(capacity * 2).min(MAX_RESPONSE_BYTES);
+            if !self.memory.grow(grown - capacity) {
+                return Err(too_large());
+            }
+            self.bytes.reserve_exact(grown - self.bytes.len());
+        }
+        Ok(())
+    }
+    fn push(&mut self, bytes: &[u8]) -> Result<(), Refused> {
+        self.reserve(bytes.len())?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+    /// A RowDescription or NoData: the result of the next statement begins.
+    fn begin(&mut self, fields: &[Value]) -> Result<(), Refused> {
+        if self.results > 0 {
+            self.push(b",")?;
+        }
+        self.push(b"{\"fields\":")?;
+        self.push(&serde_json::to_vec(fields).expect("fields serialize"))?;
+        self.push(b",\"rowAsArray\":true,\"rows\":[")?;
+        self.rows = Some(0);
+        Ok(())
+    }
+    /// A DataRow, as an array of raw text values.
+    fn row(&mut self, body: &[u8]) -> Result<(), Refused> {
+        let protocol = || unknown("postgres_protocol");
+        let rows = self.rows.as_mut().ok_or_else(protocol)?;
+        let first = *rows == 0;
+        *rows += 1;
+        if !first {
+            self.push(b",")?;
+        }
+        let count = i16::from_be_bytes(body.get(..2).ok_or_else(protocol)?.try_into().unwrap());
+        let mut rest = &body[2..];
+        self.push(b"[")?;
+        for index in 0..count {
+            if index > 0 {
+                self.push(b",")?;
+            }
+            let length =
+                i32::from_be_bytes(rest.get(..4).ok_or_else(protocol)?.try_into().unwrap());
+            rest = &rest[4..];
+            if length < 0 {
+                self.push(b"null")?;
+            } else {
+                let value = rest.get(..length as usize).ok_or_else(protocol)?;
+                rest = &rest[length as usize..];
+                let text = String::from_utf8_lossy(value);
+                self.reserve(json_string_length(&text))?;
+                serde_json::to_writer(&mut self.bytes, &*text).expect("strings serialize");
+            }
+        }
+        self.push(b"]")
+    }
+    /// A CommandComplete (or EmptyQueryResponse) of a described statement.
+    fn end(&mut self, command: Value, count: Value) -> Result<(), Refused> {
+        self.rows = None;
+        self.results += 1;
+        self.push(format!("],\"command\":{command},\"rowCount\":{count}}}").as_bytes())
+    }
+    fn finish(mut self) -> Self {
+        if self.transaction {
+            // Reserved by every write.
+            self.bytes.extend_from_slice(b"]}");
+        }
+        self
+    }
 }
 /// The command and row count of a CommandComplete tag, as node-postgres reads them.
 fn command(tag: &str) -> (Value, Value) {
@@ -1255,7 +1169,7 @@ async fn execute(
     backend: &mut Backend,
     statements: &[Statement],
     transaction: Option<&Transaction>,
-) -> Result<(Result<Vec<Value>, Value>, u8), Refused> {
+) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
     let mut pipeline = Vec::new();
     if let Some(transaction) = transaction {
         statement(&mut pipeline, &begin(transaction), &[], false);
@@ -1272,12 +1186,15 @@ async fn execute(
         Err(Guard::Fenced) => return Err(not_accepting("fenced")),
         Err(Guard::Lost) => return Err(unknown("postgres_error")),
     }
-    let mut memory = gateway.memory.lease(&backend.database);
+    let answer = Answer::new(
+        gateway.memory.lease(&backend.database),
+        transaction.is_some(),
+    )?;
     let Backend {
         postgres, actions, ..
     } = backend;
     tokio::select! {
-        result = results(postgres, &mut memory) => result,
+        result = results(postgres, answer) => result,
         _ = retired(actions) => Err(unknown("database_retired")),
     }
 }
@@ -1293,61 +1210,54 @@ async fn retired(actions: &mut watch::Receiver<Action>) {
 }
 async fn results(
     postgres: &mut TlsStream<TcpStream>,
-    memory: &mut Lease,
-) -> Result<(Result<Vec<Value>, Value>, u8), Refused> {
-    let mut results = Vec::new();
+    mut answer: Answer,
+) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
     let mut error = None;
-    let mut current: Option<(Vec<Value>, Vec<Value>)> = None;
-    let mut size = 0usize;
     let protocol = || unknown("postgres_protocol");
     loop {
         let (tag, body) = read_message(postgres)
             .await
             .map_err(|_| unknown("postgres_error"))?;
-        match tag {
-            b'1' | b'2' | b'3' | b'N' | b'S' | b'A' => {}
-            b'T' => current = Some((row_description(&body).ok_or_else(protocol)?, Vec::new())),
-            b'n' => current = Some((Vec::new(), Vec::new())),
-            b'D' => {
-                size += body.len();
-                if size > MAX_RESPONSE_BYTES || !memory.grow(body.len()) {
-                    return Err(refused(
-                        "response_too_large",
-                        "54000",
-                        "result is too large for HTTP SQL; the connection was closed and the request's outcome is unknown",
-                    ));
-                }
-                let row = data_row(&body).ok_or_else(protocol)?;
-                current.as_mut().ok_or_else(protocol)?.1.push(row);
-            }
-            b'C' | b'I' => {
-                // BEGIN and COMMIT are not described, so they leave no result.
-                if let Some((fields, rows)) = current.take() {
-                    let (command, count) = if tag == b'C' {
-                        command(cstring(&body).ok_or_else(protocol)?.0)
-                    } else {
-                        (Value::Null, Value::Null)
-                    };
-                    results.push(json!({"fields":fields,"command":command,"rowCount":count,"rows":rows,"rowAsArray":true}));
-                }
-            }
+        // Each message is leased while it is held.
+        let held = body.len();
+        if !answer.memory.grow(held) {
+            return Err(too_large());
+        }
+        let step = match tag {
+            b'1' | b'2' | b'3' | b'N' | b'S' | b'A' => Ok(()),
+            b'T' => row_description(&body)
+                .ok_or_else(protocol)
+                .and_then(|fields| answer.begin(&fields)),
+            b'n' => answer.begin(&[]),
+            b'D' => answer.row(&body),
+            // BEGIN and COMMIT are not described, so they leave no result.
+            b'C' | b'I' if answer.rows.is_none() => Ok(()),
+            b'C' => cstring(&body).ok_or_else(protocol).and_then(|(tag, _)| {
+                let (command, count) = command(tag);
+                answer.end(command, count)
+            }),
+            b'I' => answer.end(Value::Null, Value::Null),
             b'E' => {
                 error.get_or_insert_with(|| error_fields(&body));
-                current = None;
+                answer.rows = None;
+                Ok(())
             }
             b'Z' => {
                 let status = *body.first().ok_or_else(protocol)?;
-                return Ok((error.map_or(Ok(results), Err), status));
+                answer.memory.shrink(held);
+                let error =
+                    error.map(|error| serde_json::to_vec(&error).expect("fields serialize"));
+                return Ok((error.map_or(Ok(answer), Err), status));
             }
-            b'G' | b'H' | b'W' => {
-                return Err(refused(
-                    "copy_unsupported",
-                    "0A000",
-                    "COPY is not supported over HTTP",
-                ));
-            }
-            _ => return Err(protocol()),
-        }
+            b'G' | b'H' | b'W' => Err(refused(
+                "copy_unsupported",
+                "0A000",
+                "COPY is not supported over HTTP",
+            )),
+            _ => Err(protocol()),
+        };
+        answer.memory.shrink(held);
+        step?;
     }
 }
 /// After the answer: a session goes back to the pool only as it was opened, with no transaction
@@ -1408,10 +1318,13 @@ fn park(gateway: Arc<Gateway>, mut backend: Backend, mut stop: watch::Receiver<b
             tokio::spawn(terminate(backend));
             return;
         }
-        sessions.push(Parked {
-            verifier: backend.verifier.clone(),
-            take,
-        });
+        // A session PostgreSQL did not challenge has nothing to match a request against.
+        let Some(verifier) = backend.verifier.clone() else {
+            drop(parked);
+            tokio::spawn(terminate(backend));
+            return;
+        };
+        sessions.push(Parked { verifier, take });
     }
     gateway
         .sessions
@@ -1469,39 +1382,71 @@ async fn terminate(mut backend: Backend) {
 mod tests {
     use super::*;
     #[test]
-    fn scram_matches_the_rfc_7677_example() {
-        let (first, bare) = scram::first_with_nonce("user", "rOprNGfwEbeRWgbNEkqO");
-        assert_eq!(first, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
-        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-        let (last, server, verifier) =
-            scram::client_final(b"pencil", &bare, server_first).unwrap_or_else(|_| panic!());
+    fn a_json_string_is_as_long_as_its_length_says() {
+        let mut text: String = (0u8..0x80).map(char::from).collect();
+        text.push_str("ünïcode \u{2028} \u{1F600}");
         assert_eq!(
-            last,
-            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+            json_string_length(&text),
+            serde_json::to_string(&text).unwrap().len()
         );
-        assert!(scram::server_proved(
-            "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
-            &server
-        ));
-        assert!(!scram::server_proved("v=AAAA", &server));
-        let again = Verifier::of(b"pencil", verifier.salt.clone(), 4096);
-        assert!(verifier.same(&again.stored_key));
-        let other = Verifier::of(b"pencil2", verifier.salt.clone(), 4096);
-        assert!(!verifier.same(&other.stored_key));
+    }
+    fn row(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut body = (values.len() as i16).to_be_bytes().to_vec();
+        for value in values {
+            match value {
+                Some(value) => {
+                    body.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                    body.extend_from_slice(value);
+                }
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        body
     }
     #[test]
-    fn scram_refuses_a_server_nonce_that_does_not_extend_the_client_nonce() {
-        let (_, bare) = scram::first_with_nonce("", "abc");
-        for server_first in [
-            "r=xyz,s=c2FsdA==,i=4096",
-            "r=abc,s=c2FsdA==,i=4096",
-            "r=abcd,s=,i=4096",
-            "r=abcd,s=c2FsdA==,i=0",
-            "r=abcd,s=c2FsdA==,i=2000000",
-            "r=abcd,s=c2FsdA==",
-        ] {
-            assert!(scram::client_final(b"pw", &bare, server_first).is_err());
-        }
+    fn the_answer_leases_what_it_holds_and_refuses_beyond_its_bound() {
+        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024);
+        let mut answer = Answer::new(budget.lease("db"), true).unwrap();
+        answer.begin(&[json!({"name":"x"})]).unwrap();
+        answer.row(&row(&[None, Some(b"a\"b\n")])).unwrap();
+        answer.row(&row(&[Some(b"")])).unwrap();
+        answer.end(json!("SELECT"), json!(2)).unwrap();
+        answer.begin(&[]).unwrap();
+        answer.end(json!("INSERT"), json!(1)).unwrap();
+        let answer = answer.finish();
+        assert_eq!(answer.results, 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&answer.bytes).unwrap(),
+            json!({"results":[
+                {"fields":[{"name":"x"}],"rowAsArray":true,"rows":[[null,"a\"b\n"],[""]],"command":"SELECT","rowCount":2},
+                {"fields":[],"rowAsArray":true,"rows":[],"command":"INSERT","rowCount":1},
+            ]})
+        );
+        assert!(budget.database_used("db") >= answer.bytes.capacity());
+        drop(answer);
+        assert_eq!(budget.database_used("db"), 0);
+        // NULLs are 6 bytes on the wire and 5 as JSON: 2,000,000 of them stay within 10 MiB of
+        // PostgreSQL's bytes, and are refused as an answer over 10 MiB.
+        let mut answer = Answer::new(budget.lease("db"), false).unwrap();
+        answer.begin(&[]).unwrap();
+        let null = row(&[None]);
+        let refused = (0..2_000_000).find_map(|_| answer.row(&null).err());
+        assert_eq!(
+            refused.map(|refusal| refusal.outcome),
+            Some("response_too_large")
+        );
+        assert!(answer.bytes.len() <= MAX_RESPONSE_BYTES);
+        assert_eq!(budget.database_used("db"), answer.bytes.capacity());
+        // The budget refuses before the bound does.
+        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024);
+        let mut answer = Answer::new(small.lease("db"), false).unwrap();
+        answer.begin(&[]).unwrap();
+        let refused = (0..1_000_000).find_map(|_| answer.row(&null).err());
+        assert_eq!(
+            refused.map(|refusal| refusal.outcome),
+            Some("response_too_large")
+        );
+        assert!(answer.bytes.capacity() <= 1024 * 1024);
     }
     #[test]
     fn command_tags_read_as_node_postgres_reads_them() {

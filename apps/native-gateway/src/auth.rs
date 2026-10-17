@@ -2,13 +2,21 @@
 //! The password a client pipelines behind its StartupMessage, proven to PostgreSQL inside the
 //! cluster. The gateway answers AuthenticationCleartextPassword, takes the password over the
 //! encrypted WebSocket and runs SCRAM-SHA-256 to PostgreSQL itself, so a new connection costs the
-//! client one round trip instead of three. The password is held only for that exchange: it is
-//! never logged or persisted, and it is zeroized when dropped.
+//! client one round trip instead of three. HTTP SQL logs in with the same client. The password is
+//! held only for that exchange: it is never logged or persisted, and it is zeroized when dropped.
+//!
+//! The gateway's one SCRAM client accepts a PostgreSQL that proves the password's verifier, or one
+//! that asks for no password; any other request (a cleartext or MD5 password) never receives it.
+//! Its PBKDF2 runs off the async workers, a bounded number at once, for at most
+//! [`MAXIMUM_ITERATIONS`].
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_protocol::{constant, startup::error_response};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Semaphore,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -17,8 +25,11 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 pub const CLEARTEXT_REQUEST: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
 /// The longest message PostgreSQL may send while the gateway logs in for the client.
 const MAXIMUM_MESSAGE: usize = 64 * 1024;
-/// The most PBKDF2 iterations a PostgreSQL verifier may ask for (its default is 4096).
-const MAXIMUM_ITERATIONS: u32 = 1_000_000;
+/// The most PBKDF2 iterations a PostgreSQL verifier may ask for: 25 times PostgreSQL's default
+/// (4096), so no role's verifier makes a login cost the gateway more than milliseconds of CPU.
+pub const MAXIMUM_ITERATIONS: u32 = 100_000;
+/// The PBKDF2 derivations that run at once, on blocking threads.
+static DERIVATIONS: Semaphore = Semaphore::const_new(2);
 
 /// What a client pipelined behind its StartupMessage, in the message of the StartupMessage.
 #[derive(Debug)]
@@ -80,6 +91,12 @@ pub fn refusal() -> Vec<u8> {
 
 /// A client's password, zeroized when dropped.
 pub struct Password(Zeroizing<Vec<u8>>);
+impl Password {
+    /// A password PostgreSQL could accept: none is empty, and none holds a NUL.
+    pub fn new(bytes: Zeroizing<Vec<u8>>) -> Option<Self> {
+        (!bytes.is_empty() && !bytes.contains(&0)).then_some(Self(bytes))
+    }
+}
 impl std::fmt::Debug for Password {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Password(..)")
@@ -114,36 +131,108 @@ pub fn take_password(rest: &mut Vec<u8>) -> Pipelined {
     }
 }
 
+/// SCRAM's SaltedPassword of a password for one salt and iteration count, zeroized when dropped.
+pub struct Salted {
+    salt: Vec<u8>,
+    iterations: u32,
+    key: Zeroizing<[u8; 32]>,
+}
+impl Salted {
+    /// Derives it on a blocking thread, at most [`DERIVATIONS`] at once.
+    pub async fn derive(
+        password: &Password,
+        salt: Vec<u8>,
+        iterations: u32,
+    ) -> Result<Self, Failure> {
+        if salt.is_empty() || !(1..=MAXIMUM_ITERATIONS).contains(&iterations) {
+            return Err("invalid SCRAM salt or iteration count".into());
+        }
+        // The permit moves with the work, so a cancelled login still bounds what runs.
+        let permit = DERIVATIONS.acquire().await?;
+        let password = password.0.clone();
+        let (salt, key) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let key = salted_password(&password, &salt, iterations);
+            (salt, key)
+        })
+        .await?;
+        Ok(Self {
+            salt,
+            iterations,
+            key,
+        })
+    }
+    /// What PostgreSQL stores for the password: enough to recognise it, not to recover it.
+    pub fn verifier(&self) -> Verifier {
+        let client_key = Zeroizing::new(hmac(&*self.key, b"Client Key"));
+        Verifier {
+            salt: self.salt.clone(),
+            iterations: self.iterations,
+            stored_key: Sha256::digest(client_key.as_slice()).into(),
+        }
+    }
+}
+/// A password's SCRAM verifier: its salt, iteration count and StoredKey.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Verifier {
+    pub salt: Vec<u8>,
+    pub iterations: u32,
+    stored_key: [u8; 32],
+}
+impl Verifier {
+    /// Whether both were derived from the same password, compared in constant time.
+    pub fn same(&self, other: &Verifier) -> bool {
+        self.salt == other.salt
+            && self.iterations == other.iterations
+            && self
+                .stored_key
+                .iter()
+                .zip(other.stored_key)
+                .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                == 0
+    }
+}
+
 /// How PostgreSQL answered the gateway's login.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Login {
     /// AuthenticationOk and what PostgreSQL sent behind it through ReadyForQuery (or an
-    /// ErrorResponse), for the client as it is.
-    Authenticated(Vec<u8>),
+    /// ErrorResponse), for the client as it is, with the verifier PostgreSQL proved (none when it
+    /// asked for no password).
+    Authenticated(Vec<u8>, Option<Verifier>),
     /// PostgreSQL did not accept the password (28P01).
     Refused,
     /// Another ErrorResponse of PostgreSQL, for the client as it is.
     Failed(Vec<u8>),
 }
 
+impl std::fmt::Debug for Verifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Verifier(..)")
+    }
+}
+
 /// Logs in to PostgreSQL, whose StartupMessage was written, with the client's password. Only a
-/// PostgreSQL that proves it holds the password's verifier is trusted with the session.
+/// PostgreSQL that proves it holds the password's verifier is trusted with the session. `known`,
+/// derived for the same password, is used when PostgreSQL asks for its salt and iterations.
 pub async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     postgres: &mut S,
     password: &Password,
+    known: Option<Salted>,
 ) -> Result<Login, Failure> {
     let mut random = [0u8; 18];
     rustls::crypto::ring::default_provider()
         .secure_random
         .fill(&mut random)
         .map_err(|_| "random source unavailable")?;
-    login_with(postgres, password, &STANDARD.encode(random)).await
+    login_with(postgres, password, &STANDARD.encode(random), known).await
 }
 
 async fn login_with<S: AsyncRead + AsyncWrite + Unpin>(
     postgres: &mut S,
     password: &Password,
     nonce: &str,
+    mut known: Option<Salted>,
 ) -> Result<Login, Failure> {
     let mut backend = Backend::default();
     let mut scram: Option<Scram> = None;
@@ -164,8 +253,10 @@ async fn login_with<S: AsyncRead + AsyncWrite + Unpin>(
         match (code, &mut scram) {
             // Without SASL only when PostgreSQL asks for no password at all.
             (0, None) | (0, Some(Scram { verified: true, .. })) if data.is_empty() => {
+                let verifier = scram.and_then(|scram| scram.verifier);
                 return Ok(Login::Authenticated(
                     backend.through_ready(postgres, frame(tag, &body)).await?,
+                    verifier,
                 ));
             }
             (10, None) => {
@@ -181,7 +272,12 @@ async fn login_with<S: AsyncRead + AsyncWrite + Unpin>(
                 scram = Some(started);
             }
             (11, Some(started)) if started.server_signature.is_none() => {
-                let response = started.continue_with(&password.0, data)?;
+                let (salt, iterations) = started.server_first(data)?;
+                let salted = match known.take() {
+                    Some(known) if known.salt == salt && known.iterations == iterations => known,
+                    _ => Salted::derive(password, salt, iterations).await?,
+                };
+                let response = started.client_final(&salted, data);
                 postgres.write_all(&response).await?;
                 postgres.flush().await?;
             }
@@ -196,6 +292,7 @@ struct Scram {
     client_first_bare: String,
     nonce: String,
     server_signature: Option<[u8; 32]>,
+    verifier: Option<Verifier>,
     verified: bool,
 }
 impl Scram {
@@ -208,6 +305,7 @@ impl Scram {
             client_first_bare: format!("n={user},r={nonce}"),
             nonce: nonce.into(),
             server_signature: None,
+            verifier: None,
             verified: false,
         }
     }
@@ -218,8 +316,8 @@ impl Scram {
         body.extend_from_slice(first.as_bytes());
         frame(b'p', &body)
     }
-    /// The client-final message for the server-first message, as a SASLResponse.
-    fn continue_with(&mut self, password: &[u8], server_first: &[u8]) -> Result<Vec<u8>, Failure> {
+    /// The salt and iteration count of a server-first message that extends the client's nonce.
+    fn server_first(&self, server_first: &[u8]) -> Result<(Vec<u8>, u32), Failure> {
         let server_first =
             std::str::from_utf8(server_first).map_err(|_| "invalid SCRAM server-first message")?;
         let mut parts = server_first.split(',');
@@ -248,8 +346,13 @@ impl Scram {
         {
             return Err("invalid SCRAM server nonce".into());
         }
-        let salted = salted_password(password, &salt, iterations);
-        let client_key = Zeroizing::new(hmac(&*salted, b"Client Key"));
+        Ok((salt, iterations))
+    }
+    /// The client-final message for a checked server-first message, as a SASLResponse.
+    fn client_final(&mut self, salted: &Salted, server_first: &[u8]) -> Vec<u8> {
+        let server_first = String::from_utf8_lossy(server_first);
+        let combined = &server_first[2..server_first.find(',').expect("checked server-first")];
+        let client_key = Zeroizing::new(hmac(&*salted.key, b"Client Key"));
         let stored_key = Sha256::digest(client_key.as_slice());
         let without_proof = format!("c=biws,r={combined}");
         let message = format!("{},{server_first},{without_proof}", self.client_first_bare);
@@ -258,9 +361,10 @@ impl Scram {
         for (index, byte) in proof.iter_mut().enumerate() {
             *byte = client_key[index] ^ signature[index];
         }
-        self.server_signature = Some(hmac(&hmac(&*salted, b"Server Key"), message.as_bytes()));
+        self.server_signature = Some(hmac(&hmac(&*salted.key, b"Server Key"), message.as_bytes()));
+        self.verifier = Some(salted.verifier());
         let client_final = format!("{without_proof},p={}", STANDARD.encode(*proof));
-        Ok(frame(b'p', client_final.as_bytes()))
+        frame(b'p', client_final.as_bytes())
     }
     /// Checks the server-final message against the verifier the password derives.
     fn verify(&mut self, server_final: &[u8]) -> Result<(), Failure> {
@@ -381,18 +485,26 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    #[test]
-    fn the_scram_exchange_matches_the_rfc_7677_test_vector() {
+    const SERVER_FIRST: &[u8] =
+        b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    fn password(value: &[u8]) -> Password {
+        Password::new(Zeroizing::new(value.to_vec())).unwrap()
+    }
+    async fn continue_with(scram: &mut Scram, value: &[u8], server_first: &[u8]) -> Vec<u8> {
+        let (salt, iterations) = scram.server_first(server_first).unwrap();
+        let salted = Salted::derive(&password(value), salt, iterations)
+            .await
+            .unwrap();
+        scram.client_final(&salted, server_first)
+    }
+
+    #[tokio::test]
+    async fn the_scram_exchange_matches_the_rfc_7677_test_vector() {
         let mut scram = Scram::for_user("user", "rOprNGfwEbeRWgbNEkqO");
         let initial = scram.initial_response();
         assert_eq!(&initial[5..19], b"SCRAM-SHA-256\0");
         assert_eq!(&initial[23..], b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
-        let response = scram
-            .continue_with(
-                b"pencil",
-                b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
-            )
-            .unwrap();
+        let response = continue_with(&mut scram, b"pencil", SERVER_FIRST).await;
         assert_eq!(
             &response[5..],
             b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
@@ -403,12 +515,7 @@ mod tests {
                 .is_ok()
         );
         let mut forged = Scram::for_user("user", "rOprNGfwEbeRWgbNEkqO");
-        forged
-            .continue_with(
-                b"pencil",
-                b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
-            )
-            .unwrap();
+        continue_with(&mut forged, b"pencil", SERVER_FIRST).await;
         assert!(
             forged
                 .verify(b"v=7rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
@@ -424,17 +531,71 @@ mod tests {
             "r=otherserver,s=c2FsdA==,i=4096",
             "r=clientserver,s=,i=4096",
             "r=clientserver,s=c2FsdA==,i=0",
-            "r=clientserver,s=c2FsdA==,i=1000001",
+            "r=clientserver,s=c2FsdA==,i=100001",
             "r=clientserver,s=c2FsdA==,i=4096,m=extension",
             "r=client server,s=c2FsdA==,i=4096",
         ] {
             assert!(
                 Scram::new("client")
-                    .continue_with(b"secret", server_first.as_bytes())
+                    .server_first(server_first.as_bytes())
                     .is_err(),
                 "{server_first}"
             );
         }
+    }
+
+    #[test]
+    fn pbkdf2_runs_off_the_async_workers() {
+        // One worker thread: a derivation on it would stop the ticker until it ends.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = ticks.clone();
+            let ticker = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            let started = std::time::Instant::now();
+            Salted::derive(&password(b"pencil"), b"salt".to_vec(), MAXIMUM_ITERATIONS)
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+            ticker.abort();
+            let ticks = ticks.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                elapsed.as_millis() < 10 || ticks as u128 >= elapsed.as_millis() / 4,
+                "{ticks} ticks in {elapsed:?}"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_known_salted_password_for_the_same_salt_and_iterations_is_not_derived_again() {
+        let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        // Derived from the RFC's password: the proof shows it was used for this one.
+        let known = Salted::derive(&password(b"pencil"), salt.clone(), 4096)
+            .await
+            .unwrap();
+        let mut scram = Scram::for_user("user", "rOprNGfwEbeRWgbNEkqO");
+        let (salt_asked, iterations) = scram.server_first(SERVER_FIRST).unwrap();
+        assert_eq!((salt_asked, iterations), (salt, 4096));
+        assert!(known.verifier().same(&known.verifier()));
+        let response = scram.client_final(&known, SERVER_FIRST);
+        assert!(response.ends_with(b"p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="));
+        let other = Salted::derive(&password(b"pencil2"), known.salt.clone(), 4096)
+            .await
+            .unwrap();
+        assert!(!known.verifier().same(&other.verifier()));
+        assert!(
+            Salted::derive(&password(b"pencil"), Vec::new(), 4096)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -516,8 +677,13 @@ mod tests {
             }
             written
         });
-        let password = Password(Zeroizing::new(b"pencil".to_vec()));
-        let login = login_with(&mut gateway, &password, "rOprNGfwEbeRWgbNEkqO").await;
+        let login = login_with(
+            &mut gateway,
+            &password(b"pencil"),
+            "rOprNGfwEbeRWgbNEkqO",
+            None,
+        )
+        .await;
         drop(gateway);
         (login, server.await.unwrap())
     }
@@ -539,8 +705,37 @@ mod tests {
         assert!(login.is_err());
         // A PostgreSQL that asks for no password logs in as it is.
         let (login, written) = exchange(vec![ready.clone()]).await;
-        assert_eq!(login.unwrap(), Login::Authenticated(ready.clone()));
+        assert_eq!(login.unwrap(), Login::Authenticated(ready.clone(), None));
         assert!(written.is_empty());
+        // A cleartext (or MD5) request never receives the password.
+        let (login, written) = exchange(vec![frame(b'R', &[0, 0, 0, 3])]).await;
+        assert!(login.is_err());
+        assert!(written.is_empty());
+        let (login, written) = exchange(vec![frame(b'R', &[0, 0, 0, 5, 1, 2, 3, 4])]).await;
+        assert!(login.is_err());
+        assert!(written.is_empty());
+        // The whole exchange: the verifier PostgreSQL proved comes back with the session.
+        let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        let server_first = std::str::from_utf8(SERVER_FIRST).unwrap();
+        let combined = &server_first[2..server_first.find(',').unwrap()];
+        let message = format!("n=,r=rOprNGfwEbeRWgbNEkqO,{server_first},c=biws,r={combined}");
+        let server_key = hmac(&*salted_password(b"pencil", &salt, 4096), b"Server Key");
+        let signature = STANDARD.encode(hmac(&server_key, message.as_bytes()));
+        let server_final = [&[0, 0, 0, 12], format!("v={signature}").as_bytes()].concat();
+        let (login, _) = exchange(vec![
+            frame(b'R', b"\0\0\0\x0aSCRAM-SHA-256\0\0"),
+            frame(b'R', &[&[0, 0, 0, 11], SERVER_FIRST].concat()),
+            [frame(b'R', &server_final), ready.clone()].concat(),
+        ])
+        .await;
+        let Login::Authenticated(answer, Some(verifier)) = login.unwrap() else {
+            panic!("not authenticated with a verifier");
+        };
+        assert_eq!(answer, ready);
+        let expected = Salted::derive(&password(b"pencil"), salt, 4096)
+            .await
+            .unwrap();
+        assert!(verifier.same(&expected.verifier()));
         // Its refusal of the password is the decoys' class; any other error goes through.
         let refused = frame(
             b'E',

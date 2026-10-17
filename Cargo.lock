@@ -1437,7 +1437,6 @@ dependencies = [
  "pgcf-native-protocol",
  "rcgen",
  "reqwest",
- "ring",
  "rustls",
  "rustls-pki-types",
  "serde",

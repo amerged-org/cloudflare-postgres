@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -251,16 +251,25 @@ async fn scram(tls: &mut server::TlsStream<TcpStream>) -> Result<bool, Failure> 
     send(tls, b'R', &done).await?;
     Ok(true)
 }
-/// One PostgreSQL session of the double. It authenticates with SCRAM-SHA-256, or with a cleartext
-/// password when `cleartext` is set. Queries are a small fixed language: `select ...`
-/// returns its parameters as one row of text columns (or `1` without parameters), `insert`
-/// inserts one row, `fail` raises 42P01 when executed, `copy` starts COPY FROM STDIN, `hang`
-/// drops the connection once executed, `big` returns 12 MiB of rows.
+/// How the double authenticates a session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Authentication {
+    Scram,
+    /// AuthenticationCleartextPassword; what the gateway answers is journaled.
+    Cleartext,
+    /// No password: AuthenticationOk at once.
+    Trust,
+}
+/// One PostgreSQL session of the double. It authenticates as `authentication` says. Queries are
+/// a small fixed language: `select ...` returns its parameters as one row of text columns (or
+/// `1` without parameters), `insert` inserts one row, `fail` raises 42P01 when executed, `copy`
+/// starts COPY FROM STDIN, `hang` drops the connection once executed, `big` returns 12 MiB of
+/// rows, `nulls` returns 1,700,000 rows of one NULL (6 bytes each on the wire).
 async fn postgres_session(
     mut tcp: TcpStream,
     acceptor: TlsAcceptor,
     journal: Journal,
-    cleartext: bool,
+    authentication: Authentication,
 ) -> Result<(), Failure> {
     let mut request = [0; 8];
     tcp.read_exact(&mut request).await?;
@@ -280,13 +289,15 @@ async fn postgres_session(
         .map(|pair| format!("{}={}", pair[0], pair[1]))
         .collect();
     journal.push(format!("startup:{}", pairs.join(" ")));
-    let accepted = if cleartext {
-        send(&mut tls, b'R', &3u32.to_be_bytes()).await?;
-        let (tag, body) = receive(&mut tls).await?;
-        assert_eq!(tag, b'p');
-        body == [PASSWORD.as_bytes(), b"\0"].concat()
-    } else {
-        scram(&mut tls).await?
+    let accepted = match authentication {
+        Authentication::Scram => scram(&mut tls).await?,
+        Authentication::Cleartext => {
+            send(&mut tls, b'R', &3u32.to_be_bytes()).await?;
+            let answer = receive(&mut tls).await.map(|(tag, _)| tag as char);
+            journal.push(format!("cleartext:{}", answer.unwrap_or('-')));
+            return Ok(());
+        }
+        Authentication::Trust => true,
     };
     if !accepted {
         journal.push("auth:failed".into());
@@ -390,7 +401,7 @@ async fn postgres_session(
                         .map(|(n, o, s)| (n.as_str(), *o, *s))
                         .collect();
                     send(&mut tls, b'T', &row_description(&columns)).await?;
-                } else if query == "big" {
+                } else if query == "big" || query == "nulls" {
                     send(&mut tls, b'T', &row_description(&[("x", 25, -1)])).await?;
                 } else {
                     send(&mut tls, b'n', &[]).await?;
@@ -443,6 +454,16 @@ async fn postgres_session(
                         }
                         send(&mut tls, b'C', &complete("SELECT 12")).await?;
                     }
+                    "nulls" => {
+                        let mut rows = Vec::new();
+                        for _ in 0..1_700_000 {
+                            rows.push(b'D');
+                            rows.extend_from_slice(&10u32.to_be_bytes());
+                            rows.extend_from_slice(&data_row(&[None]));
+                        }
+                        tls.write_all(&rows).await?;
+                        send(&mut tls, b'C', &complete("SELECT 1700000")).await?;
+                    }
                     _ => panic!("unexpected query"),
                 }
             }
@@ -478,8 +499,8 @@ struct Fixture {
     /// PostgreSQL connections the gateway dialled.
     calls: Arc<AtomicUsize>,
     journal: Journal,
-    /// The double asks for a cleartext password instead of SCRAM.
-    cleartext: Arc<AtomicBool>,
+    /// How the double authenticates the sessions it accepts next.
+    authentication: Arc<Mutex<Authentication>>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -533,8 +554,8 @@ impl Fixture {
         let (stop, receiver) = watch::channel(false);
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let recorder = journal.clone();
-        let cleartext = Arc::new(AtomicBool::new(false));
-        let asks = cleartext.clone();
+        let authentication = Arc::new(Mutex::new(Authentication::Scram));
+        let asks = authentication.clone();
         let mut shutdown = receiver.clone();
         let upstream_task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
@@ -543,8 +564,8 @@ impl Fixture {
                     _ = shutdown.changed() => break,
                     accepted = upstream.accept() => {
                         let (tcp, _) = accepted.unwrap();
-                        let (acceptor, journal, cleartext) = (acceptor.clone(), recorder.clone(), asks.load(Ordering::SeqCst));
-                        tasks.spawn(async move { let _ = postgres_session(tcp, acceptor, journal, cleartext).await; });
+                        let (acceptor, journal, authentication) = (acceptor.clone(), recorder.clone(), *asks.lock().unwrap());
+                        tasks.spawn(async move { let _ = postgres_session(tcp, acceptor, journal, authentication).await; });
                     }
                 }
             }
@@ -574,7 +595,7 @@ impl Fixture {
             port,
             calls,
             journal,
-            cleartext,
+            authentication,
             stop,
             tasks: vec![upstream_task, gateway_task],
         }
@@ -606,15 +627,23 @@ impl Fixture {
 }
 /// One `POST /sql` as the Edge sends it: the route header and a sized JSON body.
 async fn post(port: u16, route: &str, body: &[u8]) -> (u16, Value) {
+    let (status, body) = post_bytes(port, route, body).await;
+    (status, serde_json::from_slice(&body).unwrap())
+}
+async fn post_bytes(port: u16, route: &str, body: &[u8]) -> (u16, Vec<u8>) {
     let mut request = format!(
         "POST /sql HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-PGCF-Route: {route}\r\n\r\n",
         body.len()
     )
     .into_bytes();
     request.extend_from_slice(body);
-    exchange(port, &request).await
+    exchange_bytes(port, &request).await
 }
 async fn exchange(port: u16, request: &[u8]) -> (u16, Value) {
+    let (status, body) = exchange_bytes(port, request).await;
+    (status, serde_json::from_slice(&body).unwrap())
+}
+async fn exchange_bytes(port: u16, request: &[u8]) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     stream.write_all(request).await.unwrap();
     let mut bytes = Vec::new();
@@ -626,7 +655,7 @@ async fn exchange(port: u16, request: &[u8]) -> (u16, Value) {
     let header = std::str::from_utf8(&bytes[..split]).unwrap();
     assert!(header.contains("Content-Type: application/json"));
     let status = header.split_whitespace().nth(1).unwrap().parse().unwrap();
-    (status, serde_json::from_slice(&bytes[split..]).unwrap())
+    (status, bytes[split..].to_vec())
 }
 fn body(password: &str, queries: &[(&str, Value)], transaction: Option<Value>) -> Value {
     json!({
@@ -719,16 +748,20 @@ async fn a_batch_runs_in_one_transaction_with_the_requested_characteristics() {
 #[tokio::test]
 async fn a_wrong_password_is_refused_as_28p01_and_no_session_is_kept() {
     let fixture = Fixture::new().await;
-    let (status, answer) = fixture
-        .sql(&route(4), &body("wrong", &[("select", json!([]))], None))
-        .await;
-    assert_eq!(status, 400);
-    assert_eq!(
-        answer,
-        json!({"message":"password authentication failed","code":"28P01","severity":"FATAL"})
-    );
+    // Byte for byte the Edge decoy's answer (apps/edge/test/sql.test.ts): a refused password and
+    // an unknown database or role cannot be told apart.
+    let decoy =
+        br#"{"message":"password authentication failed","code":"28P01","severity":"FATAL"}"#;
+    let request = body("wrong", &[("select", json!([]))], None).to_string();
+    let (status, answer) = post_bytes(fixture.port, &route(4), request.as_bytes()).await;
+    assert_eq!((status, answer.as_slice()), (400, decoy.as_slice()));
     assert_eq!(fixture.journal.count("auth:failed"), 1);
     fixture.idle(0).await;
+    // A password the gateway refuses before PostgreSQL answers the same bytes.
+    let request = json!({"password":URL_SAFE_NO_PAD.encode("a\0b"),"queries":[{"query":"select","params":[]}]}).to_string();
+    let (status, answer) = post_bytes(fixture.port, &route(25), request.as_bytes()).await;
+    assert_eq!((status, answer.as_slice()), (400, decoy.as_slice()));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     fixture.stop().await;
 }
 #[tokio::test]
@@ -838,6 +871,13 @@ async fn copy_and_an_oversized_result_close_the_session() {
     fixture.idle(0).await;
     let (status, answer) = fixture
         .sql(&route(14), &body(PASSWORD, &[("big", json!([]))], None))
+        .await;
+    assert_eq!((status, &answer["code"]), (400, &json!("54000")));
+    fixture.idle(0).await;
+    // Under 10 MiB of PostgreSQL's row bytes, but over 10 MiB as the answer: what is counted is
+    // what the gateway holds, not what PostgreSQL sent.
+    let (status, answer) = fixture
+        .sql(&route(26), &body(PASSWORD, &[("nulls", json!([]))], None))
         .await;
     assert_eq!((status, &answer["code"]), (400, &json!("54000")));
     fixture.idle(0).await;
@@ -987,21 +1027,27 @@ async fn a_wake_ticket_is_held_without_a_dial_until_the_fence_releases_the_write
     fixture.stop().await;
 }
 #[tokio::test]
-async fn a_cleartext_challenge_is_answered_and_its_session_kept_only_for_that_password() {
+async fn a_cleartext_challenge_gets_no_password_and_a_trusting_session_is_not_pooled() {
     let fixture = Fixture::new().await;
-    fixture.cleartext.store(true, Ordering::SeqCst);
+    // As the WebSocket login: PostgreSQL proves the password's verifier with SCRAM or asks for
+    // none; a cleartext challenge never receives the password.
+    *fixture.authentication.lock().unwrap() = Authentication::Cleartext;
     let request = body(PASSWORD, &[("select", json!([]))], None);
-    assert_eq!(fixture.sql(&route(22), &request).await.0, 200);
-    fixture.idle(1).await;
+    let (status, answer) = fixture.sql(&route(22), &request).await;
+    assert_eq!((status, &answer["code"]), (400, &json!("08006")));
+    timeout(Duration::from_secs(5), async {
+        while fixture.journal.count("cleartext:X") != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.idle(0).await;
+    // A session that asked for no password has no verifier to match a later request against.
+    *fixture.authentication.lock().unwrap() = Authentication::Trust;
     assert_eq!(fixture.sql(&route(23), &request).await.0, 200);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-    fixture.idle(1).await;
-    let (status, answer) = fixture
-        .sql(&route(24), &body("guess", &[("select", json!([]))], None))
-        .await;
-    assert_eq!((status, &answer["code"]), (400, &json!("28P01")));
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(fixture.journal.count("auth:ok"), 1);
-    assert_eq!(fixture.journal.count("auth:failed"), 1);
+    fixture.idle(0).await;
+    assert_eq!(fixture.sql(&route(24), &request).await.0, 200);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
     fixture.stop().await;
 }
