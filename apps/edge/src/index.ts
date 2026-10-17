@@ -304,7 +304,10 @@ export default {
       console.log(
         JSON.stringify({
           event: "conn_admission",
+          // The gateway receives the same cid in the route token.
           cid,
+          // The Cloudflare location that admitted the connection; none on a service binding.
+          colo: request.cf?.colo ?? null,
           database_id: hints?.database ?? null,
           user: hints?.user ?? null,
           region_id: region,

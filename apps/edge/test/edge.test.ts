@@ -82,6 +82,7 @@ async function open(
     user?: string;
     query?: string;
     signal?: AbortSignal;
+    cf?: { colo: string };
   } = {},
 ) {
   const ctx = createExecutionContext();
@@ -92,7 +93,7 @@ async function open(
   const response = await worker.fetch(
     new Request(
       `${origin}/v2?${options.query ?? new URLSearchParams({ database: options.database ?? database, user: options.user ?? "app" })}`,
-      { headers, signal: options.signal },
+      { headers, signal: options.signal, cf: options.cf },
     ),
     options.bindings ?? testEnv,
     ctx,
@@ -1520,6 +1521,25 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.outcome).toBe("accepted");
     expect(log.limiters_ms).toBeGreaterThanOrEqual(0);
     expect(log.admit_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("logs the admitting colo and the connection id signed into the route", async () => {
+    await open({ cf: { colo: "FRA" } });
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log).toMatchObject({ event: "conn_admission", colo: "FRA" });
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    expect(
+      await verifyRouteToken((await stats())[0]!.token, {
+        region,
+        keys: keyring.keys,
+      }),
+    ).toMatchObject({ ok: true, claims: { cid: log.cid } });
+    await open();
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).colo).toBeNull();
   });
 
   it("gets the DatabaseActor with the configured location hint, and none without one", async () => {
