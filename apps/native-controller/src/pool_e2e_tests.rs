@@ -970,3 +970,51 @@ async fn a_pass_that_withholds_a_slot_served_database_s_ready_report_says_why() 
     );
     assert_eq!(withheld(&w.id), ["ready_fence_quiesced"]);
 }
+
+#[tokio::test]
+async fn a_slot_served_database_whose_postgres_does_not_accept_is_not_reported_ready() {
+    let mut w = World::pooled().await;
+    let gateway = RealGateway::start(&mut w, "[]").await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    w.fresh_authority();
+    let (mut client, delivered) = held_wake(&w, &gateway, 913).await;
+    until_ready(&mut client).await;
+    slot_runs(&w);
+    w.claimed(&delivered);
+    let db = w.db.clone();
+    w.reconciler.pool.confirm_tickets(
+        |id| (id == db["id"]).then_some(&db),
+        std::time::Instant::now(),
+    );
+    claim(&mut w, &delivered);
+    let mut ready = false;
+    for _ in 0..5 {
+        w.fresh_authority();
+        if w.reconciler
+            .reconcile(&w.db, &w.snapshot)
+            .await
+            .unwrap()
+            .is_some_and(|observed| observed["state"] == "ready")
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "the slot-served database is reported ready");
+    // PostgreSQL in the slot goes down inside the same container: the Pod, its container and the
+    // volume's single opener stay what they were.
+    w.slot_postgres.as_ref().unwrap().stop();
+    w.fresh_authority();
+    crate::timing::take_emitted();
+    let observed = w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap();
+    assert_eq!(withheld(&w.id), ["slot_postgres_not_accepting"]);
+    assert_ne!(
+        observed.as_ref().map(|o| o["state"].clone()),
+        Some("ready".into()),
+        "{observed:?}"
+    );
+    assert!(w.reconciler.pool.serves(&w.id));
+}

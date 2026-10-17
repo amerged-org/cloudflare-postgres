@@ -376,6 +376,8 @@ pub fn headroom_need(db: &Value) -> u64 {
 }
 /// The memory a free slot's `postgres` container requests.
 const SLOT_REQUEST_MEMORY_MIB: u64 = 128;
+/// How long a pass over a slot-served database waits for PostgreSQL in the slot to answer.
+const ACCEPTING_WAIT: Duration = Duration::from_secs(2);
 fn mebibytes(value: &Value) -> Option<f64> {
     crate::reconcile::quantity(value).map(|bytes| bytes / 1_048_576.0)
 }
@@ -1596,6 +1598,47 @@ impl Pool {
         self.k8s.patch(&cluster, &claim_patch(view, claim)).await?;
         Ok((ca, ca_secret))
     }
+    /// Whether PostgreSQL in the slot that serves `view` accepts there on the tenant's database
+    /// as a primary now, asked once within `ACCEPTING_WAIT`.
+    pub(crate) async fn accepting(&self, view: &Value, pod: &SlotPod, ns: &str, ca: &[u8]) -> bool {
+        let Ok(socket) = self.socket(&pod.ip) else {
+            return false;
+        };
+        let name = slot_tls_name(ns);
+        let attempt = self.accepting_at(view, pod, socket, &name, ca);
+        matches!(
+            tokio::time::timeout(ACCEPTING_WAIT, attempt).await,
+            Ok(Ok(Some(_)))
+        )
+    }
+    /// One session with the slot's PostgreSQL under the tenant's maintenance role: the session
+    /// when it accepts on the tenant's database as a primary at the slot Pod's address.
+    async fn accepting_at(
+        &self,
+        view: &Value,
+        pod: &SlotPod,
+        socket: SocketAddr,
+        name: &str,
+        ca: &[u8],
+    ) -> Result<Option<crate::postgres::Session>, Error> {
+        let session = crate::postgres::connect_slot(
+            view,
+            socket,
+            name,
+            ca,
+            text(&view["maintenance"], "role"),
+            text(&view["maintenance"], "password"),
+        )
+        .await?;
+        let rows = session.query(crate::postgres::ACCEPTING_QUERY, &[]).await?;
+        let [row] = rows.as_slice() else {
+            return Ok(None);
+        };
+        let accepting = row.try_get::<_, String>("database")? == text(view, "id")
+            && !row.try_get::<_, bool>("recovery")?
+            && row.try_get::<_, String>("server_address")? == pod.ip;
+        Ok(accepting.then_some(session))
+    }
     /// Polls the claimed slot until PostgreSQL accepts there on the tenant's database as a
     /// primary: the session that proved it, or `None` within the start budget.
     async fn started(
@@ -1609,25 +1652,7 @@ impl Pool {
         let deadline = Instant::now() + self.start_budget;
         let name = slot_tls_name(ns);
         loop {
-            let attempt = async {
-                let session = crate::postgres::connect_slot(
-                    view,
-                    socket,
-                    &name,
-                    ca,
-                    text(&view["maintenance"], "role"),
-                    text(&view["maintenance"], "password"),
-                )
-                .await?;
-                let rows = session.query(crate::postgres::ACCEPTING_QUERY, &[]).await?;
-                let [row] = rows.as_slice() else {
-                    return Ok::<_, Error>(None);
-                };
-                let accepting = row.try_get::<_, String>("database")? == text(view, "id")
-                    && !row.try_get::<_, bool>("recovery")?
-                    && row.try_get::<_, String>("server_address")? == pod.ip;
-                Ok(accepting.then_some(session))
-            };
+            let attempt = self.accepting_at(view, pod, socket, &name, ca);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Ok(Ok(Some(session))) = tokio::time::timeout(remaining, attempt).await {
                 return Some(session);
@@ -1992,6 +2017,10 @@ impl Pool {
             }
         }
         let observation = rec.slot_observation(db, &ns, &serving).await?;
+        if observation["state"] != "ready" {
+            crate::timing::ready_withheld(db, "slot_postgres_not_accepting", None);
+            return Ok(Served::Observed(Some(observation)));
+        }
         // The gateway routes to a slot by its attestation alone: without one the pass ends
         // without an observation, and the next one forms it.
         if !db["admission"].is_null() && observation["runtime_attestation"]["v"] != 2 {
