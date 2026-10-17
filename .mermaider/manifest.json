@@ -3,18 +3,9 @@
     "architecture_3806f8bb5e61",
     "architecture_f9bf00edc351",
     "ci_b803fcb7f17e",
-    "data:schema:apps/api/migrations",
-    "pgcf-add-node"
+    "data:schema:apps/api/migrations"
   ],
   "files": [
-    {
-      "path": "docs/architecture/mermaider/add-node.md",
-      "sha256": "ad80638e58d75faf249c83a933cad9473d66497c04c8653e160c21fe5fd340ce"
-    },
-    {
-      "path": "docs/architecture/mermaider/add-node.mmd",
-      "sha256": "33ce0d5cb44747a521a0835384da168b4412b15ed8e0e2278dddeb43df703750"
-    },
     {
       "path": "docs/architecture/mermaider/api-resources.md",
       "sha256": "ebbcd6f59aaac9a9baab53d29e8ea7d2259934fe2ebc21f9c89513811c02c2d5"
@@ -25,11 +16,11 @@
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
-      "sha256": "bf48e65dcd7ac1036c21b659f8a75786c8ccd0c2e6ba815c589ea167eb73dc7f"
+      "sha256": "c3b52e49fcbd017900fcdf45b94100e68f1ae923f96647e36c35b3f3ebb00628"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.mmd",
-      "sha256": "01957995b5dd5c88ec10b5d02e64a3cd193bfb58f89e0c69e629e5d62a3d9c6c"
+      "sha256": "337cd48095a0c2f9cf79da83e5654b80fe0c8d4ce090c672d7649a526ce411fa"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
@@ -49,10 +40,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "3b9d928b930e3adbce56a9d41be2b55c552f1f2eca39c0f31e9344aa5af92ffa"
+      "sha256": "ac9087331be302de62c35dc9d5618b128aaf8d3081143224543776eaf124b6f6"
     }
   ],
-  "fingerprint": "9b57fc0912352b4e3462de6f1a2ddc9db8699c1f2e48aa529ff946fc5fc9b490",
+  "fingerprint": "a60f4a48a18d25cdd4f303127971e7be1b0442a4b6f4c19ec035b7f8b4b1ae02",
   "toolVersion": "0.1.1",
   "version": 1
 }

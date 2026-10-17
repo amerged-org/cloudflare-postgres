@@ -21,8 +21,6 @@ import {
   externalProbeFailure,
 } from "../src/external-probe.ts";
 import type { ProbeIo } from "../src/external-probe.ts";
-import { Run } from "../src/run.ts";
-import { fingerprint } from "../src/core.ts";
 
 const host4 = (...octets: number[]) => octets.join(".");
 const host6 = (value: number) => `${value.toString(16)}::1`;
@@ -654,69 +652,5 @@ test("actual consumer rejects a signature digest for reserialized JSON instead o
   await assert.rejects(fixture.consume(), {
     message: "external_probe_attestation_mismatch",
   });
-  assert.equal(fixture.verifications(), 1);
-});
-
-function resumedScan(
-  targets: string[],
-  proof: () => Promise<Set<string>>,
-): Run {
-  const names = targets.map((_, index) => `pgcf-node-${index}`);
-  return Object.assign(Object.create(Run.prototype) as Run, {
-    c: { values: { PGCF_E2E_REGIONAL_NAMESPACE: "pgcf-system" } },
-    state: {
-      completed: ["E5"],
-      scans: targets.map((host, index) =>
-        fingerprint(`${names[index]}:${host}`),
-      ),
-      operator_scans: [],
-      scan_ranges: {},
-    },
-    assertCluster: async () => undefined,
-    kube: {
-      read: async (resource: string) =>
-        resource === "nodes"
-          ? {
-              items: targets.map((host, index) => ({
-                metadata: { name: names[index] },
-                status: { addresses: [{ type: "ExternalIP", address: host }] },
-              })),
-            }
-          : { items: [] },
-    },
-    nativeProof: proof,
-    save: async () => undefined,
-    emit: async () => undefined,
-  });
-}
-
-test("resumed Run.scan cannot complete E6 when a target lacks native coverage", async (t) => {
-  const targets = [host4(11, 1, 2, 3), host4(13, 1, 2, 3)];
-  const fixture = await consumerFixture(t, targets);
-  fixture.report.results[1]!.after.state = "inconclusive";
-  await fixture.replaceReport();
-  const run = resumedScan(targets, fixture.consume);
-  await assert.rejects(run.scan(), {
-    message: "supplemental_external_tcp_probe_required",
-  });
-  assert.deepEqual(run.state.completed, ["E5"]);
-});
-
-test("resumed Run.scan cannot complete E6 while IPv6 remains inconclusive", async (t) => {
-  const targets = [host4(11, 1, 2, 3), host6(0x2001)];
-  const fixture = await consumerFixture(t, targets);
-  const run = resumedScan(targets, fixture.consume);
-  await assert.rejects(run.scan(), {
-    message: "supplemental_external_tcp_probe_required",
-  });
-  assert.deepEqual(run.state.completed, ["E5"]);
-});
-
-test("resumed Run.scan completes E6 only after the actual consumer covers every current target", async (t) => {
-  const targets = [host4(11, 1, 2, 3), host4(13, 1, 2, 3)];
-  const fixture = await consumerFixture(t, targets);
-  const run = resumedScan(targets, fixture.consume);
-  assert.equal(await run.scan(), true);
-  assert.deepEqual(run.state.completed, ["E5", "E6"]);
   assert.equal(fixture.verifications(), 1);
 });

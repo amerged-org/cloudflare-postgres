@@ -1,9 +1,0 @@
-{
-  "extends": "../../../tsconfig.base.json",
-  "include": [
-    "images.ts",
-    "images.test.ts",
-    "publish-artifacts.ts",
-    "publish-artifacts.test.ts"
-  ]
-}

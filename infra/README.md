@@ -1,34 +1,10 @@
-# Regional infrastructure
+# Infrastructure
 
-Recipes for the Contabo side of a region. They contain no provider credentials, node addresses,
-generated machine configurations, kubeconfigs, database passwords or backup keys. Keep those in
-ignored local state or a private deployment repository.
+[platform/versions.lock.json](platform/versions.lock.json) pins the Rust compiler and its test
+builder image, the Rust Edge Worker build tools and the CI toolchain (Node, Docker, the runner
+distribution and the Rust targets). CI and `scripts/ci/toolchain.mjs` read it.
 
-| Directory | Contents |
-| --- | --- |
-| [talos/](talos/README.md) | Talos patches and the Contabo rescue install path for a node |
-| [platform/](platform/README.md) | Pinned Flux baseline: Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin |
-
-Ownership:
-
-- **Flux** owns platform releases.
-- **The regional controller** (`pgcf-agent`, see [PLAN.md](../PLAN.md)) owns per-database
-  namespaces and CNPG resources.
-- **CNPG** owns PostgreSQL instances.
-- **Talos** owns host and Kubernetes upgrades.
-
-Each region has one control server, configured from the
-[per-region parameters](talos/README.md#control-server-configuration-per-region) and excluded
-from customer database placement, plus identical customer workers installed from the Golden
-image through AddNode. The current deployment is EU only: the existing EU control/relay VPS and
-the already-admitted customer EU1 (formerly EU2), a Contabo Cloud VPS with 6 vCPU and 12 GB RAM.
-The US region is cancelled; US and Oceania return later through the same configuration.
-Preserve EU1's installation, Node identity, data and custody; EU1 is not reinstalled. Earlier
-EU1 loss, deletion and decommissioning kits are withheld. System and platform resources remain
-reserved; node loss is recovered from R2.
-
-The programmed bootstrap owns worker join and new-region platform installation. These recipes
-also document the manual installation and recovery path; only the EU control/relay server, which
-predates the programmed installer, still depends on it. Software checks do not establish
-fresh-node acceptance; see [the operator installation runbook](../docs/operations/operator-installation.md)
-and [PLAN.md](../PLAN.md) for the outstanding live installation and recovery checks.
+The Kubernetes runtime that lived here (Talos, Flux, CloudNativePG, OpenEBS and the relay) was
+retired on 2026-10-17 and is kept on the `archive/kubernetes-runtime` branch. The Debian node
+image arrives in `infra/node-image` in Stage 3 of the
+[ULTRA plan](../docs/architecture/cloudflare-convergence-and-serverless-plan.md).

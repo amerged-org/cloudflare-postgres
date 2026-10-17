@@ -4,8 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { createConnection, isIP } from "node:net";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { command } from "./clients.ts";
-import { HarnessError, record, string } from "./core.ts";
+import { HarnessError, command, record, string } from "./core.ts";
 
 type TcpState = "connected" | "refused" | "timed_out" | "inconclusive";
 interface Sample {
