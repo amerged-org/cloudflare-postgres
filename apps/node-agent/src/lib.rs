@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The node agent's reusable parts, moved from the native controller without their Kubernetes
 //! surroundings. The agent binary is built in Stage 3.
+pub mod admission;
 pub mod api;
 pub mod contracts;
 pub mod diagnostics;

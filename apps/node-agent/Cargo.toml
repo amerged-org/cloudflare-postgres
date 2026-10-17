@@ -31,5 +31,6 @@ time = { version = "=0.3.55", features = ["formatting", "parsing"] }
 libc = "=0.2.190"
 
 [dev-dependencies]
+tokio = { version = "=1.53.2", features = ["test-util"] }
 tokio-rustls = {version="=0.26.6",default-features=false,features=["ring","tls12"]}
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
