@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Zod and existing protocol implementations are authoritative. Check generated files in CI.
 import { edgeContract, edgeVectors } from "./generate-edge.ts";
-import { GatewayAdmissionTarget } from "../src/database-admission.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import { format } from "prettier";
@@ -50,35 +49,7 @@ import {
   encodeStartup,
   encodeSslRequest,
 } from "../src/pg-wire.ts";
-import {
-  gatewayPodUidSchema,
-  gatewayControlClaimsSchema,
-  gatewayIntentSchema,
-  GATEWAY_CONTROL_MAX_LENGTH,
-  GATEWAY_CONTROL_MAX_LIFETIME_SECONDS,
-  GATEWAY_CONTROL_TOKEN_PREFIX,
-  GATEWAY_CONTROL_SIGNING_PURPOSE,
-  GATEWAY_CONTROL_KEY_PURPOSE,
-  GATEWAY_CONTROL_PATH_PREFIX,
-  GATEWAY_CONTROL_HEADER,
-  GATEWAY_RETIRE_HOLD_MS,
-  GATEWAY_FENCE_NAMESPACE,
-  GATEWAY_FENCE_LABEL,
-  GATEWAY_FENCE_SELECTOR,
-  signGatewayControl,
-  verifyGatewayControl,
-} from "../src/gateway-control.ts";
-import {
-  gatewayActivityClaimsSchema,
-  GATEWAY_ACTIVITY_MAX_LENGTH,
-  GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS,
-  GATEWAY_ACTIVITY_SIGNING_PURPOSE,
-  GATEWAY_ACTIVITY_TOKEN_PREFIX,
-  GATEWAY_ACTIVITY_KEY_PURPOSE,
-  GATEWAY_ACTIVITY_PATH,
-  GATEWAY_ACTIVITY_HEADER,
-  verifyGatewayActivity,
-} from "../src/gateway-activity.ts";
+import { gatewayPodUidSchema } from "../src/gateway-control.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
 import {
   DEFAULT_MEMORY_LIMIT_BYTES,
@@ -152,11 +123,6 @@ const contract = {
     CANCEL_MIN_LENGTH,
     CANCEL_MAX_LENGTH,
     ROUTE_TOKEN_SIGNATURE_BYTES,
-    GATEWAY_CONTROL_MAX_LENGTH,
-    GATEWAY_CONTROL_MAX_LIFETIME_SECONDS,
-    GATEWAY_ACTIVITY_MAX_LENGTH,
-    GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS,
-    GATEWAY_RETIRE_HOLD_MS,
     DEFAULT_MEMORY_LIMIT_BYTES,
     DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
     MAX_PAYLOAD_BYTES,
@@ -176,19 +142,6 @@ const contract = {
     wakeRouteSignatureDomain: ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
     legacyRouteTokenPrefix: ROUTE_TOKEN_LEGACY_PREFIX,
     legacyRouteSignatureDomain: ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
-    controlSigningPurpose: GATEWAY_CONTROL_SIGNING_PURPOSE,
-    controlTokenPrefix: GATEWAY_CONTROL_TOKEN_PREFIX,
-    controlKeyPurpose: GATEWAY_CONTROL_KEY_PURPOSE,
-    activitySigningPurpose: GATEWAY_ACTIVITY_SIGNING_PURPOSE,
-    activityTokenPrefix: GATEWAY_ACTIVITY_TOKEN_PREFIX,
-    activityKeyPurpose: GATEWAY_ACTIVITY_KEY_PURPOSE,
-    controlPathPrefix: GATEWAY_CONTROL_PATH_PREFIX,
-    controlHeader: GATEWAY_CONTROL_HEADER,
-    activityPath: GATEWAY_ACTIVITY_PATH,
-    activityHeader: GATEWAY_ACTIVITY_HEADER,
-    fenceNamespace: GATEWAY_FENCE_NAMESPACE,
-    fenceLabel: GATEWAY_FENCE_LABEL,
-    fenceSelector: GATEWAY_FENCE_SELECTOR,
   },
   patterns: {
     database: DATABASE_ID_PATTERN.source,
@@ -204,11 +157,7 @@ const contract = {
   routeClaims,
   admissionRouteClaims: schema(cnpgAdmissionRouteTokenClaimsSchema),
   wakeRouteClaims: schema(wakeRouteTokenClaimsSchema),
-  gatewayAdmissionTarget: schema(GatewayAdmissionTarget),
   legacyRouteClaims: schema(legacyRouteTokenClaimsSchema),
-  controlClaims: schema(gatewayControlClaimsSchema),
-  activityClaims: schema(gatewayActivityClaimsSchema),
-  intent: schema(gatewayIntentSchema),
 };
 const key = new Uint8Array(32).fill(7),
   database = "a".repeat(20),
@@ -618,117 +567,6 @@ const startups = startupInputs.map((input) => {
   }
   return { ...input, chunks: input.chunks.map(bytesToBase64url), events };
 });
-const pod = "01234567-89ab-4def-8123-0123456789ab",
-  operation = `op_${"b".repeat(20)}`;
-const keyring = { active: "test", keys: new Map([["test", key]]) };
-const controls = [];
-for (const action of [
-  "begin",
-  "status",
-  "close",
-  "release",
-  "retire",
-] as const) {
-  const value = await signGatewayControl({
-    keyring,
-    region,
-    pod,
-    database,
-    operation,
-    revision: 7,
-    action,
-    now: 1000000,
-  });
-  for (const change of [
-    { name: "valid" },
-    { name: "wrong-pod", pod: "01234567-89ab-4def-8123-0123456789ac" },
-    { name: "wrong-region", region: "us-test" },
-    { name: "expired", now: 1030001 },
-    { name: "exact-expiry", now: 1030000 },
-  ]) {
-    const expectedInput = {
-      keys: keyring.keys,
-      region: change.region ?? region,
-      pod: change.pod ?? pod,
-      action,
-      now: change.now ?? 1000000,
-    };
-    controls.push({
-      name: `${action}-${change.name}`,
-      token: value,
-      ...expectedInput,
-      keys: undefined,
-      expected: await verifyGatewayControl(value, expectedInput),
-    });
-  }
-}
-const activityClaims = {
-  v: 1,
-  region,
-  database,
-  revision: 7,
-  pod,
-  nonce: "01234567-89ab-4def-8123-0123456789ac",
-  kid: "test",
-  iat: 1000,
-  exp: 1030,
-};
-async function purposeToken(
-  prefix: string,
-  keyPurpose: string,
-  signingPurpose: string,
-  value: unknown,
-) {
-  const payload = bytesToBase64url(
-    new TextEncoder().encode(JSON.stringify(value)),
-  );
-  const derived = await crypto.subtle.sign(
-    "HMAC",
-    cryptoKey,
-    new TextEncoder().encode(keyPurpose),
-  );
-  const imported = await crypto.subtle.importKey(
-    "raw",
-    derived,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign(
-    "HMAC",
-    imported,
-    new TextEncoder().encode(signingPurpose + payload),
-  );
-  return `${prefix}.${payload}.${bytesToBase64url(new Uint8Array(signature))}`;
-}
-const activityToken = await purposeToken(
-  GATEWAY_ACTIVITY_TOKEN_PREFIX,
-  GATEWAY_ACTIVITY_KEY_PURPOSE,
-  GATEWAY_ACTIVITY_SIGNING_PURPOSE,
-  activityClaims,
-);
-const activities = [];
-for (const change of [
-  { name: "valid" },
-  { name: "wrong-pod", pod: "01234567-89ab-4def-8123-0123456789ad" },
-  { name: "wrong-region", region: "us-test" },
-  { name: "expired", now: 1030000 },
-  { name: "before-issued", now: 999999 },
-]) {
-  const input = {
-    keys: keyring.keys,
-    region: change.region ?? region,
-    pod: change.pod ?? pod,
-    now: change.now ?? 1000000,
-  };
-  activities.push({
-    name: change.name,
-    token: activityToken,
-    ...input,
-    keys: undefined,
-    expected: await verifyGatewayActivity(activityToken, input),
-  });
-}
 for (const [name, value] of [
   ["protocol.generated.json", contract],
   [
@@ -741,8 +579,6 @@ for (const [name, value] of [
       wakeSigned,
       roleRevisionHashes,
       startups,
-      controls,
-      activities,
       postgresActivity: activityVectors(),
       gatewayMeasurements: telemetryVectors(),
     },

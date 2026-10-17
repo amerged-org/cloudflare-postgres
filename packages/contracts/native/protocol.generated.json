@@ -23,11 +23,6 @@
     "CANCEL_MIN_LENGTH": 16,
     "CANCEL_MAX_LENGTH": 268,
     "ROUTE_TOKEN_SIGNATURE_BYTES": 32,
-    "GATEWAY_CONTROL_MAX_LENGTH": 1024,
-    "GATEWAY_CONTROL_MAX_LIFETIME_SECONDS": 30,
-    "GATEWAY_ACTIVITY_MAX_LENGTH": 1024,
-    "GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS": 30,
-    "GATEWAY_RETIRE_HOLD_MS": 65000,
     "DEFAULT_MEMORY_LIMIT_BYTES": 201326592,
     "DEFAULT_DATABASE_MEMORY_LIMIT_BYTES": 100663296,
     "MAX_PAYLOAD_BYTES": 33554432,
@@ -48,20 +43,7 @@
     "wakeRouteTokenPrefix": "v5",
     "wakeRouteSignatureDomain": "pgcf-route/v5\n",
     "legacyRouteTokenPrefix": "v2",
-    "legacyRouteSignatureDomain": "pgcf-route/v2\n",
-    "controlSigningPurpose": "pgcf-gateway-control/v1\n",
-    "controlTokenPrefix": "gc1",
-    "controlKeyPurpose": "pgcf-gateway-control-key/v1\n",
-    "activitySigningPurpose": "pgcf-gateway-activity/v1\n",
-    "activityTokenPrefix": "ga1",
-    "activityKeyPurpose": "pgcf-gateway-activity-key/v1\n",
-    "controlPathPrefix": "/_pgcf/gateway/",
-    "controlHeader": "X-PGCF-Control",
-    "activityPath": "/_pgcf/gateway/activity",
-    "activityHeader": "X-PGCF-Activity",
-    "fenceNamespace": "pgcf-system",
-    "fenceLabel": "pgcf.io/gateway-fence",
-    "fenceSelector": "pgcf.io/gateway-fence=true"
+    "legacyRouteSignatureDomain": "pgcf-route/v2\n"
   },
   "patterns": {
     "database": "^[a-z][a-z0-9]{19}$",
@@ -315,64 +297,6 @@
       "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
     }
   },
-  "gatewayAdmissionTarget": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "v": { "type": "number", "const": 1 },
-      "generation": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "route_revision": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "admission_epoch": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "pod_uid": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "container_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-      "ca_secret_uid": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "ca_secret_resource_version": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 128
-      },
-      "ca_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-      "tls_server_name": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 253,
-        "pattern": "^[a-z0-9.-]+$"
-      }
-    },
-    "required": [
-      "v",
-      "generation",
-      "route_revision",
-      "admission_epoch",
-      "pod_uid",
-      "container_id",
-      "ca_secret_uid",
-      "ca_secret_resource_version",
-      "ca_sha256",
-      "tls_server_name"
-    ],
-    "additionalProperties": false
-  },
   "legacyRouteClaims": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -396,132 +320,6 @@
     "additionalProperties": false,
     "$defs": {
       "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
-    }
-  },
-  "controlClaims": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "v": { "type": "number", "const": 1 },
-      "region": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-      },
-      "database": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "operation": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
-      "revision": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "pod": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "action": {
-        "type": "string",
-        "enum": ["begin", "status", "close", "release", "retire"]
-      },
-      "kid": {
-        "type": "string",
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
-      },
-      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
-    },
-    "required": [
-      "v",
-      "region",
-      "database",
-      "operation",
-      "revision",
-      "pod",
-      "action",
-      "kid",
-      "iat",
-      "exp"
-    ],
-    "additionalProperties": false,
-    "$defs": {
-      "RegionId": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-      },
-      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
-    }
-  },
-  "activityClaims": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "v": { "type": "number", "const": 1 },
-      "region": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-      },
-      "database": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "revision": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "pod": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "nonce": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "kid": {
-        "type": "string",
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
-      },
-      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
-    },
-    "required": [
-      "v",
-      "region",
-      "database",
-      "revision",
-      "pod",
-      "nonce",
-      "kid",
-      "iat",
-      "exp"
-    ],
-    "additionalProperties": false,
-    "$defs": {
-      "RegionId": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-      },
-      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
-    }
-  },
-  "intent": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "database": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "operation": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
-      "revision": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "mode": { "type": "string", "enum": ["quiesce", "running", "retired"] }
-    },
-    "required": ["database", "operation", "revision", "mode"],
-    "additionalProperties": false,
-    "$defs": {
-      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
     }
   }
 }

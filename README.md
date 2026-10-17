@@ -32,7 +32,7 @@ states what runs where; it does not repeat measurements.
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | API Worker, DatabaseActor, RegionLink, Workflows | TypeScript on Cloudflare, deployed; they remain TypeScript                                                               |
 | Edge Worker                                      | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built by CI and not deployed            |
-| Regional gateway                                 | Rust (`apps/native-gateway`); its Kubernetes routing stays until local mode replaces it in Stage 3; not deployed         |
+| Gateway                                          | Rust (`apps/native-gateway`): beside the node agent, on its table and the databases' Unix sockets; not deployed          |
 | Node runtime                                     | Not running: the Kubernetes runtime was retired on 2026-10-17; the node agent and the node image are built in Stage 3    |
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed

@@ -119,7 +119,7 @@ pub enum ToGateway {
     Database { database: Database },
     /// A database without any entry any more.
     Removed { database: String },
-    /// The result of a wake the gateway queued: a label, or the refusal of its connections.
+    /// The result of a wake the gateway queued: started, or the refusal of its connections.
     WakeResult { result: WakeResult },
     /// A request the gateway answers with `FromGateway::Status`.
     Control {

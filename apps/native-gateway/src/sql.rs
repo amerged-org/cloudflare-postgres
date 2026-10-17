@@ -22,13 +22,14 @@
 use crate::{
     auth::{self, Login, Password, Salted, Verifier},
     budget::{Lease, WireBudget},
-    control::{self, HttpHead},
+    http::{self, HttpHead},
+    local,
     sessions::Action,
-    transport::{self, Blocked, Epoch, Gateway, SessionLease, WakeState, Writer},
-    upstream::Upstream,
+    transport::{self, Blocked, Epoch, Gateway, SessionLease, WakeState},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
+    agent::Writer,
     route::{RouteClaims, verify},
     wake::{self, Outcome, WakeClaims},
 };
@@ -41,7 +42,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpStream, UnixStream},
     sync::{OwnedSemaphorePermit, oneshot, watch},
     time::timeout,
 };
@@ -223,7 +224,7 @@ struct Stages {
     database: Option<String>,
     outcome: &'static str,
     pooled: bool,
-    /// `warm`, or `pool_hit`/`pool_miss` for a request that waited for its database's wake.
+    /// `warm`, or `cold` for a request that waited for its database's wake.
     wake_path: &'static str,
     statements: usize,
     received: Instant,
@@ -245,10 +246,10 @@ impl Drop for Stages {
 struct Backend {
     lease: SessionLease,
     actions: watch::Receiver<Action>,
-    postgres: Upstream,
+    postgres: UnixStream,
     database: String,
     user: String,
-    /// The fence epoch the session was admitted at.
+    /// The table epoch the session was admitted at.
     epoch: Epoch,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
@@ -360,8 +361,8 @@ async fn handle(
     let (claims, released) = match route {
         Route::Admitted(claims) => (claims, None),
         Route::Wake(ticket) => {
-            let (claims, pod) = attempt!(wake(gateway, &ticket, stop, stages).await);
-            (claims, Some(pod))
+            let (claims, unit) = attempt!(wake(gateway, &ticket, stop, stages).await);
+            (claims, Some(unit))
         }
     };
     let (target, epoch) = attempt!(current(gateway, &claims, released.as_deref()).await);
@@ -449,12 +450,11 @@ fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Route, Refused> 
     let (route, claims) = if token
         .is_some_and(|token| token.starts_with(&format!("{}.", wake::ROUTE_PREFIX)))
     {
-        let ticket =
-            wake::verify_wake(token, keys, region, control::now()).map_err(|_| denied())?;
+        let ticket = wake::verify_wake(token, keys, region, http::now()).map_err(|_| denied())?;
         let claims = ticket.admitted(None);
         (Route::Wake(ticket), claims)
     } else {
-        let claims = verify(token, keys, region, control::now() as f64).map_err(|_| denied())?;
+        let claims = verify(token, keys, region, http::now() as f64).map_err(|_| denied())?;
         (Route::Admitted(claims.clone()), claims)
     };
     gateway
@@ -462,7 +462,7 @@ fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Route, Refused> 
         .lock()
         .unwrap()
         .replay
-        .use_token(&claims, control::now())
+        .use_token(&claims, http::now())
         .map_err(|_| denied())?;
     Ok(route)
 }
@@ -573,18 +573,15 @@ async fn read_more(
     }
 }
 
-/// Waits, as a held WebSocket connection does, until the fence releases the ticket's wake; the
-/// answer is the route the request is admitted under and the released writer.
+/// Waits, as a held WebSocket connection does, until the agent's table releases the ticket's
+/// wake; the answer is the route the request is admitted under and the released unit.
 async fn wake(
     gateway: &Arc<Gateway>,
     ticket: &WakeClaims,
     stop: &watch::Receiver<bool>,
     stages: &mut Stages,
 ) -> Result<(RouteClaims, String), Refused> {
-    let released = |writer: String, slot: bool, route_revision: u64, stages: &mut Stages| {
-        if slot {
-            stages.wake_path = "pool_hit";
-        }
+    let released = |writer: String, route_revision: u64| {
         let claims = transport::admitted_wake(ticket, &writer, route_revision);
         (claims, writer)
     };
@@ -593,26 +590,23 @@ async fn wake(
         WakeState::Released {
             writer,
             route_revision,
-            ..
-        } => return Ok(released(writer, false, route_revision, stages)),
+        } => return Ok(released(writer, route_revision)),
         WakeState::Stale => return Err(not_accepting("route_stale")),
         WakeState::Waiting => {}
     }
-    stages.wake_path = "pool_miss";
+    stages.wake_path = "cold";
     let deadline = tokio::time::Instant::from_std(stages.received + transport::WAKE_BOUND);
     let mut held = gateway
         .wakes
-        .hold(ticket, control::now(), Instant::now())
+        .hold(ticket, http::now(), Instant::now())
         .map_err(|_| not_accepting("wake_capacity"))?;
     let mut stop = stop.clone();
     loop {
-        // Armed before the fence is read, so a change between the read and the wait wakes it.
-        let [fences_changed, targets_changed] = gateway.signals().await;
-        let fences = fences_changed.notified();
-        let targets = targets_changed.notified();
-        tokio::pin!(fences, targets);
-        fences.as_mut().enable();
-        targets.as_mut().enable();
+        // Armed before the table is read, so a change between the read and the wait wakes it.
+        let table = gateway.changed().await;
+        let changed = table.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
             return Err(refused("gateway_draining", "08006", "gateway restarting"));
         }
@@ -625,18 +619,16 @@ async fn wake(
         match transport::wake_state(gateway, ticket).await {
             WakeState::Released {
                 writer,
-                slot,
                 route_revision,
             } => {
                 let _ = held.release();
-                return Ok(released(writer, slot, route_revision, stages));
+                return Ok(released(writer, route_revision));
             }
             WakeState::Stale => return Err(not_accepting("route_stale")),
             WakeState::Waiting => {}
         }
         tokio::select! {
-            _ = fences.as_mut() => {},
-            _ = targets.as_mut() => {},
+            _ = changed.as_mut() => {},
             _ = held.answered() => {},
             _ = tokio::time::sleep_until(deadline) => {
                 return Err(refused("wake_timeout", "57P03", "database did not wake in time"));
@@ -647,17 +639,14 @@ async fn wake(
         }
     }
 }
-/// The writer the route was admitted on, if the fence and the watches (or the agent's table)
-/// still show it, and the fence epoch it is admitted at.
+/// The unit the route was admitted on, if the agent's table still shows it, and the table epoch
+/// it is admitted at.
 async fn current(
     gateway: &Gateway,
     claims: &RouteClaims,
     released: Option<&str>,
 ) -> Result<(Writer, Epoch), Refused> {
-    gateway
-        .admit(claims, released)
-        .await
-        .map_err(|refusal| not_accepting(refusal.outcome))
+    gateway.admit(claims, released).await.map_err(not_accepting)
 }
 
 /// What the pool had for a request.
@@ -667,7 +656,7 @@ enum Checkout {
     /// login uses when PostgreSQL asks for the same salt and iterations.
     Missed(Option<Salted>),
 }
-/// An idle session of the route's database and role on the same writer and fence epoch whose
+/// An idle session of the route's database and role on the same writer and table epoch whose
 /// verifier the password matches. Only the newest session's verifier is derived, once: the
 /// sessions of one role share it unless its password was rotated.
 async fn checkout(
@@ -715,7 +704,7 @@ async fn checkout(
             continue;
         };
         if backend.epoch == epoch
-            && backend.lease.target.id() == target.id()
+            && backend.lease.target == *target
             && backend.authenticated.elapsed() < LIFETIME
             && gateway.permits(&claims.db, &backend.lease.target).await
         {
@@ -743,23 +732,17 @@ async fn open(
         .reserve(claims, wire, target, false)
         .map_err(|_| capacity())?;
     // The route was checked against this writer; a replacement is never dialled.
-    let plan = gateway
-        .plan(claims, Some(epoch), target)
+    gateway
+        .dialable(database, Some(epoch), target)
         .await
-        .map_err(|outcome| {
-            not_accepting(if outcome == "target_changed" {
-                outcome
-            } else {
-                "fenced"
-            })
-        })?;
+        .map_err(not_accepting)?;
     gateway
         .sessions
         .lock()
         .unwrap()
         .update(&lease.id, false, true, true);
     let dialing = Instant::now();
-    let dialed = timeout(transport::STARTUP_BOUND, gateway.dial_plan(&plan)).await;
+    let dialed = timeout(transport::STARTUP_BOUND, local::dial(target)).await;
     stages.dial = Some(dialing.elapsed());
     let postgres = match dialed {
         Ok(Ok(postgres)) => postgres,
@@ -870,8 +853,8 @@ async fn authenticate(
     }
     Err(protocol())
 }
-/// Writes to PostgreSQL only while the fence still admits the session's database at the epoch it
-/// was admitted at and the watches still show its writer, holding both for the bounded write.
+/// Writes to PostgreSQL only while the agent's table still admits the session's database at the
+/// epoch it was admitted at on its writer, holding the table for the bounded write.
 async fn write_guarded(
     gateway: &Gateway,
     backend: &mut Backend,
@@ -898,7 +881,7 @@ enum Guard {
     /// The write failed: its bytes may have reached PostgreSQL.
     Lost,
 }
-async fn read_message(postgres: &mut Upstream) -> std::io::Result<(u8, Vec<u8>)> {
+async fn read_message(postgres: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut header = [0; 5];
     postgres.read_exact(&mut header).await?;
     let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
@@ -1163,7 +1146,7 @@ async fn retired(actions: &mut watch::Receiver<Action>) {
     }
 }
 async fn results(
-    postgres: &mut Upstream,
+    postgres: &mut UnixStream,
     mut answer: Answer,
 ) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
     let mut error = None;
@@ -1259,7 +1242,8 @@ async fn recycle(
     }
 }
 /// Puts an idle session in the pool. It waits in its own task for a request, its idle bound, the
-/// end of its lifetime, a fence action, the gateway's drain, or PostgreSQL ending it.
+/// end of its lifetime, an action of the agent's table, the gateway's drain, or PostgreSQL ending
+/// it.
 fn park(gateway: Arc<Gateway>, mut backend: Backend, mut stop: watch::Receiver<bool>) {
     let key = (backend.database.clone(), backend.user.clone());
     let (take, mut request) = oneshot::channel::<oneshot::Sender<Backend>>();
@@ -1322,11 +1306,12 @@ fn park(gateway: Arc<Gateway>, mut backend: Backend, mut stop: watch::Receiver<b
         }
     });
 }
-/// Ends a session with Terminate, close_notify and FIN; dropping it releases its reservation.
+/// Ends a session with Terminate and the end of its stream; dropping it releases its
+/// reservation.
 async fn terminate(mut backend: Backend) {
     let _ = timeout(
         Duration::from_millis(500),
-        transport::write_upstream(&mut backend.postgres, &[b'X', 0, 0, 0, 4]),
+        backend.postgres.write_all(&[b'X', 0, 0, 0, 4]),
     )
     .await;
     transport::close_upstream(&mut backend.postgres).await;

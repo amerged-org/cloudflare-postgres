@@ -102,42 +102,6 @@ fn arbitrary_startup_chunks_remain_bounded_and_never_panic() {
     }
 }
 #[test]
-fn authoritative_control_and_activity_tokens_have_identical_scope_and_expiry() {
-    let vectors = vectors();
-    let key = vectors["key"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u8)
-        .collect();
-    let keys = HashMap::from([("test".into(), key)]);
-    for kind in ["controls", "activities"] {
-        for case in vectors[kind].as_array().unwrap() {
-            let token = case["token"].as_str().unwrap();
-            let region = case["region"].as_str().unwrap();
-            let pod = case["pod"].as_str().unwrap();
-            let now = case["now"].as_u64().unwrap();
-            let got = if kind == "controls" {
-                pgcf_native_protocol::scoped_tokens::control(
-                    token,
-                    &keys,
-                    region,
-                    pod,
-                    case["action"].as_str().unwrap(),
-                    now,
-                )
-            } else {
-                pgcf_native_protocol::scoped_tokens::activity(token, &keys, region, pod, now)
-            };
-            let actual = match got {
-                Some(claims) => json!({"ok":true,"claims":claims}),
-                None => json!({"ok":false}),
-            };
-            assert_eq!(actual, case["expected"], "{kind} {}", case["name"]);
-        }
-    }
-}
-#[test]
 fn authoritative_typescript_wake_route_vectors() {
     let vectors = vectors();
     let key: Vec<u8> = vectors["key"]

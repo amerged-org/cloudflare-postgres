@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Local mode (plan 5.7): the gateway on a node beside the node agent. Its writers are the
-//! agent's table, which the agent sends over the local channel (`pgcf_native_protocol::agent`):
+//! The gateway on a node beside the node agent (plan 5.7). Its writers are the agent's table,
+//! which the agent sends over the local channel (`pgcf_native_protocol::agent`):
 //! each database's PostgreSQL unit with its Unix socket, uid, main PID and invocation ID, the
 //! generation and route revision the gateway admits routes of, and what the database's
 //! PostgreSQL does (running, quiescing, sleeping or retired). A connection is dialled on the
@@ -158,6 +158,15 @@ pub enum DialFailure {
     /// The process behind the socket is not the unit's: another uid or another PID.
     Peer,
 }
+impl DialFailure {
+    /// The `conn_stages` outcome of the failure.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::Connect(_) => "postgres_connect_error",
+            Self::Peer => "peer_mismatch",
+        }
+    }
+}
 impl std::fmt::Display for DialFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -187,7 +196,7 @@ pub async fn dial(writer: &Writer) -> Result<UnixStream, DialFailure> {
 /// changes, delivers the queued wakes and answers the agent's requests, and connects again after
 /// a loss.
 pub async fn synchronize(gateway: Arc<Gateway>, socket: PathBuf, mut stop: watch::Receiver<bool>) {
-    let table = gateway.local_table().expect("local mode").clone();
+    let table = gateway.table.clone();
     loop {
         if *stop.borrow() {
             break;
@@ -339,7 +348,7 @@ async fn apply(
 }
 
 /// The agent's quiesce, close or status request for the sessions of one database at its
-/// generation, as the controller's control requests are answered in Kubernetes mode.
+/// generation.
 async fn control(
     gateway: &Gateway,
     table: &RwLock<LocalTable>,

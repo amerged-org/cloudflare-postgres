@@ -1,29 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
-//! HTTP SQL over real loopback TCP and TLS against a PostgreSQL double that speaks the
-//! frontend/backend protocol with real SCRAM-SHA-256 arithmetic; this is protocol conformance,
-//! not Dev SQL acceptance.
+//! HTTP SQL over real loopback TCP against a PostgreSQL double on a Unix socket, which the test
+//! process serves as the database's unit. The double speaks the frontend/backend protocol with
+//! real SCRAM-SHA-256 arithmetic; this is protocol conformance, not SQL acceptance.
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use futures_util::future::BoxFuture;
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_gateway::{
-    control,
-    kubernetes::{Fence, Intent},
+    http,
     sessions::Action,
-    transport::{self, Config, DatabaseTarget, Gateway, PostgresDial},
+    transport::{self, Config, Gateway},
 };
-use pgcf_native_protocol::{route::Keyring, wake, wire};
-use rcgen::generate_simple_self_signed;
-use rustls::{
-    ServerConfig,
-    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+use pgcf_native_protocol::{
+    agent::{Database, Mode, Writer},
+    route::Keyring,
+    wake, wire,
 };
+use pgcf_test_postgres::Directory;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    os::unix::fs::MetadataExt,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -32,19 +31,19 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UnixListener, UnixStream},
     sync::{Semaphore, watch},
     task::JoinHandle,
     time::timeout,
 };
-use tokio_rustls::{TlsAcceptor, client::TlsStream, server};
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 const DATABASE: &str = "aaaaaaaaaaaaaaaaaaaa";
 const REGION: &str = "eu-test";
-const POD: &str = "01234567-89ab-4def-8123-0123456789ab";
+/// The unit's invocation ID, which the routes name.
+const INSTANCE: &str = "01234567-89ab-4def-8123-0123456789ab";
+const ROUTE_REVISION: u64 = 19;
 const PASSWORD: &str = "correct horse battery";
 const SALT: &[u8] = b"pgcf-test-salt";
-const CA_MATERIAL: &str = "public test certificate material";
 fn cid(id: usize) -> String {
     format!("01234567-89ab-4def-8123-{id:012x}")
 }
@@ -58,13 +57,13 @@ fn token(prefix: &str, purpose: &str, claims: Value) -> String {
     let signature = mac(&[7; 32], format!("{purpose}{payload}").as_bytes());
     format!("{prefix}.{payload}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
-/// The v3 route Cloudflare admits for the fixture's running revision and published writer.
+/// The admission route Cloudflare signs for the fixture's running generation and unit.
 fn route(id: usize) -> String {
-    let now = control::now() / 1000;
+    let now = http::now() / 1000;
     token(
-        wire("routeTokenPrefix"),
-        wire("routeSignatureDomain"),
-        json!({"v":3,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"pod":cid(200)}),
+        wire("admissionRouteTokenPrefix"),
+        wire("admissionRouteSignatureDomain"),
+        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"pod":INSTANCE,"route_revision":ROUTE_REVISION}),
     )
 }
 fn wake_operation() -> String {
@@ -72,39 +71,26 @@ fn wake_operation() -> String {
 }
 /// The wake ticket the Edge signs for a database whose Actor snapshot sits at `generation - 1`.
 fn wake_token(id: usize, generation: u64) -> String {
-    let now = control::now() / 1000;
+    let now = http::now() / 1000;
     token(
         wake::ROUTE_PREFIX,
         wake::ROUTE_DOMAIN,
-        json!({"v":5,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"op":wake_operation(),"gen":generation,"route_revision":19,"rh":"c0".repeat(32)}),
+        json!({"v":5,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"op":wake_operation(),"gen":generation,"route_revision":ROUTE_REVISION,"rh":"c0".repeat(32)}),
     )
 }
-fn fence(mode: &str, revision: u64) -> Fence {
-    Fence {
-        admission_target: None,
-        uid: cid(100),
-        intent: Intent {
-            database: DATABASE.into(),
-            operation: format!("op_{}", "b".repeat(20)),
-            revision,
-            mode: mode.into(),
-        },
-        retired_at: None,
-        deleting: false,
+/// The agent's entry for the database: `mode` at `generation`, on `unit` while PostgreSQL runs.
+fn entry(mode: Mode, generation: u64, operation: &str, unit: &Writer) -> Database {
+    Database {
+        database: DATABASE.into(),
+        generation,
+        operation: operation.into(),
+        mode,
+        route_revision: ROUTE_REVISION,
+        writer: matches!(mode, Mode::Running | Mode::Quiesce).then(|| unit.clone()),
     }
 }
-fn writer(pod: &str) -> Value {
-    json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"database-rw-a","namespace":format!("pgcf-db-{DATABASE}"),"uid":cid(201),"labels":{"kubernetes.io/service-name":"database-rw"}},"addressType":"IPv4","ports":[{"port":5432,"protocol":"TCP"}],"endpoints":[{"addresses":["10.0.0.7"],"conditions":{"ready":true},"targetRef":{"kind":"Pod","namespace":format!("pgcf-db-{DATABASE}"),"uid":pod},"nodeName":"customer-us1"}]})
-}
-fn storage_maps() -> Vec<Value> {
-    let labels = json!({"pgcf.io/database-id":DATABASE});
-    let state = json!({"node":"customer-us1","namespaceUid":cid(207),"clusterUid":cid(208)});
-    let identity =
-        json!({"handle":format!("pvc-{}",cid(205)),"claimUid":cid(205),"volumeUid":cid(206)});
-    vec![
-        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{DATABASE}"),"namespace":"pgcf-system","uid":cid(202),"labels":labels,"annotations":{"pgcf.io/volume-identity":identity.to_string()}},"data":{"state":state.to_string()}}),
-        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("gateway-fence-{DATABASE}"),"namespace":"pgcf-system","uid":cid(100),"labels":labels},"data":{"power.json":json!({"anchor":{"storageUid":cid(202),"storageState":state.to_string(),"volumeIdentity":identity.to_string(),"physicalGeneration":1}}).to_string()}}),
-    ]
+fn operation() -> String {
+    format!("op_{}", "b".repeat(20))
 }
 
 /// What the PostgreSQL double saw, in order: startups, authentication results, every extended
@@ -135,17 +121,17 @@ fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
     }
     result
 }
-async fn send(tls: &mut server::TlsStream<TcpStream>, tag: u8, body: &[u8]) -> std::io::Result<()> {
+async fn send(stream: &mut UnixStream, tag: u8, body: &[u8]) -> std::io::Result<()> {
     let mut bytes = vec![tag];
     bytes.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     bytes.extend_from_slice(body);
-    tls.write_all(&bytes).await
+    stream.write_all(&bytes).await
 }
-async fn receive(tls: &mut server::TlsStream<TcpStream>) -> std::io::Result<(u8, Vec<u8>)> {
-    let tag = tls.read_u8().await?;
-    let length = tls.read_u32().await? as usize;
+async fn receive(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let tag = stream.read_u8().await?;
+    let length = stream.read_u32().await? as usize;
     let mut body = vec![0; length - 4];
-    tls.read_exact(&mut body).await?;
+    stream.read_exact(&mut body).await?;
     Ok((tag, body))
 }
 fn error(severity: &str, code: &str, message: &str, extra: &[(u8, &str)]) -> Vec<u8> {
@@ -204,11 +190,11 @@ fn strings(body: &[u8]) -> Vec<String> {
         .collect()
 }
 /// The server side of SCRAM-SHA-256 for `PASSWORD`; true when the client proved it.
-async fn scram(tls: &mut server::TlsStream<TcpStream>) -> Result<bool, Failure> {
+async fn scram(stream: &mut UnixStream) -> Result<bool, Failure> {
     let mut mechanisms = 10u32.to_be_bytes().to_vec();
     mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
-    send(tls, b'R', &mechanisms).await?;
-    let (tag, initial) = receive(tls).await?;
+    send(stream, b'R', &mechanisms).await?;
+    let (tag, initial) = receive(stream).await?;
     assert_eq!(tag, b'p');
     let nul = initial.iter().position(|b| *b == 0).unwrap();
     assert_eq!(&initial[..nul], b"SCRAM-SHA-256");
@@ -221,8 +207,8 @@ async fn scram(tls: &mut server::TlsStream<TcpStream>) -> Result<bool, Failure> 
     let server_first = format!("r={nonce},s={},i=4096", STANDARD.encode(SALT));
     let mut continuing = 11u32.to_be_bytes().to_vec();
     continuing.extend_from_slice(server_first.as_bytes());
-    send(tls, b'R', &continuing).await?;
-    let (tag, last) = receive(tls).await?;
+    send(stream, b'R', &continuing).await?;
+    let (tag, last) = receive(stream).await?;
     assert_eq!(tag, b'p');
     let last = String::from_utf8(last)?;
     let (without_proof, proof) = last.rsplit_once(",p=").unwrap();
@@ -248,7 +234,7 @@ async fn scram(tls: &mut server::TlsStream<TcpStream>) -> Result<bool, Failure> 
         )
         .as_bytes(),
     );
-    send(tls, b'R', &done).await?;
+    send(stream, b'R', &done).await?;
     Ok(true)
 }
 /// How the double authenticates a session.
@@ -266,21 +252,13 @@ enum Authentication {
 /// starts COPY FROM STDIN, `hang` drops the connection once executed, `big` returns 12 MiB of
 /// rows, `nulls` returns 1,700,000 rows of one NULL (6 bytes each on the wire).
 async fn postgres_session(
-    mut tcp: TcpStream,
-    acceptor: TlsAcceptor,
+    mut stream: UnixStream,
     journal: Journal,
     authentication: Authentication,
 ) -> Result<(), Failure> {
-    let mut request = [0; 8];
-    tcp.read_exact(&mut request).await?;
-    assert_eq!(request, [0, 0, 0, 8, 4, 210, 22, 47]);
-    tcp.write_all(b"S").await?;
-    // As PostgreSQL does: its many small messages are not delayed.
-    tcp.set_nodelay(true)?;
-    let mut tls = acceptor.accept(tcp).await?;
-    let length = tls.read_u32().await? as usize;
+    let length = stream.read_u32().await? as usize;
     let mut startup = vec![0; length - 4];
-    tls.read_exact(&mut startup).await?;
+    stream.read_exact(&mut startup).await?;
     assert_eq!(&startup[..4], &196608u32.to_be_bytes());
     let parameters = strings(&startup[4..]);
     let pairs: Vec<String> = parameters
@@ -290,10 +268,10 @@ async fn postgres_session(
         .collect();
     journal.push(format!("startup:{}", pairs.join(" ")));
     let accepted = match authentication {
-        Authentication::Scram => scram(&mut tls).await?,
+        Authentication::Scram => scram(&mut stream).await?,
         Authentication::Cleartext => {
-            send(&mut tls, b'R', &3u32.to_be_bytes()).await?;
-            let answer = receive(&mut tls).await.map(|(tag, _)| tag as char);
+            send(&mut stream, b'R', &3u32.to_be_bytes()).await?;
+            let answer = receive(&mut stream).await.map(|(tag, _)| tag as char);
             journal.push(format!("cleartext:{}", answer.unwrap_or('-')));
             return Ok(());
         }
@@ -307,19 +285,19 @@ async fn postgres_session(
             "password authentication failed for user \"app\"",
             &[],
         );
-        send(&mut tls, b'E', &body).await?;
+        send(&mut stream, b'E', &body).await?;
         return Ok(());
     }
     journal.push("auth:ok".into());
-    send(&mut tls, b'R', &0u32.to_be_bytes()).await?;
-    send(&mut tls, b'S', b"server_version\x0017.6\0").await?;
-    send(&mut tls, b'K', &[0, 0, 0, 1, 0, 0, 0, 2]).await?;
-    send(&mut tls, b'Z', b"I").await?;
+    send(&mut stream, b'R', &0u32.to_be_bytes()).await?;
+    send(&mut stream, b'S', b"server_version\x0017.6\0").await?;
+    send(&mut stream, b'K', &[0, 0, 0, 1, 0, 0, 0, 2]).await?;
+    send(&mut stream, b'Z', b"I").await?;
     let (mut block, mut failed, mut skipping) = (false, false, false);
     let mut query = String::new();
     let mut params: Vec<Option<String>> = Vec::new();
     loop {
-        let Ok((tag, body)) = receive(&mut tls).await else {
+        let Ok((tag, body)) = receive(&mut stream).await else {
             journal.push("closed".into());
             return Ok(());
         };
@@ -337,7 +315,7 @@ async fn postgres_session(
                     b'I'
                 }
             };
-            send(&mut tls, b'Z', &[status]).await?;
+            send(&mut stream, b'Z', &[status]).await?;
             continue;
         }
         if tag == b'Q' {
@@ -346,12 +324,14 @@ async fn postgres_session(
             match text.as_str() {
                 "ROLLBACK" => {
                     (block, failed) = (false, false);
-                    send(&mut tls, b'C', &complete("ROLLBACK")).await?;
+                    send(&mut stream, b'C', &complete("ROLLBACK")).await?;
                 }
-                "DISCARD ALL" if !block => send(&mut tls, b'C', &complete("DISCARD ALL")).await?,
+                "DISCARD ALL" if !block => {
+                    send(&mut stream, b'C', &complete("DISCARD ALL")).await?
+                }
                 _ => panic!("unexpected simple query"),
             }
-            send(&mut tls, b'Z', if block { b"T" } else { b"I" }).await?;
+            send(&mut stream, b'Z', if block { b"T" } else { b"I" }).await?;
             continue;
         }
         if skipping {
@@ -363,7 +343,7 @@ async fn postgres_session(
                 assert_eq!(parts[0], "", "unnamed statement");
                 query = parts[1].clone();
                 journal.push(format!("parse:{query}"));
-                send(&mut tls, b'1', &[]).await?;
+                send(&mut stream, b'1', &[]).await?;
             }
             b'B' => {
                 assert_eq!(&body[..2], &[0, 0], "unnamed portal and statement");
@@ -384,7 +364,7 @@ async fn postgres_session(
                 }
                 assert_eq!(&body[offset..], &[0, 0], "all results in text");
                 journal.push(format!("bind:{}", json!(params)));
-                send(&mut tls, b'2', &[]).await?;
+                send(&mut stream, b'2', &[]).await?;
             }
             b'D' => {
                 assert_eq!(body, b"P\0");
@@ -400,11 +380,11 @@ async fn postgres_session(
                         .iter()
                         .map(|(n, o, s)| (n.as_str(), *o, *s))
                         .collect();
-                    send(&mut tls, b'T', &row_description(&columns)).await?;
+                    send(&mut stream, b'T', &row_description(&columns)).await?;
                 } else if query == "big" || query == "nulls" {
-                    send(&mut tls, b'T', &row_description(&[("x", 25, -1)])).await?;
+                    send(&mut stream, b'T', &row_description(&[("x", 25, -1)])).await?;
                 } else {
-                    send(&mut tls, b'n', &[]).await?;
+                    send(&mut stream, b'n', &[]).await?;
                 }
             }
             b'E' => {
@@ -412,11 +392,11 @@ async fn postgres_session(
                 match query.as_str() {
                     q if q.starts_with("BEGIN") => {
                         block = true;
-                        send(&mut tls, b'C', &complete("BEGIN")).await?;
+                        send(&mut stream, b'C', &complete("BEGIN")).await?;
                     }
                     "COMMIT" => {
                         block = false;
-                        send(&mut tls, b'C', &complete("COMMIT")).await?;
+                        send(&mut stream, b'C', &complete("COMMIT")).await?;
                     }
                     q if q.starts_with("select") => {
                         let values: Vec<Option<&[u8]>> = if params.is_empty() {
@@ -427,10 +407,10 @@ async fn postgres_session(
                                 .map(|v| v.as_ref().map(|v| v.as_bytes()))
                                 .collect()
                         };
-                        send(&mut tls, b'D', &data_row(&values)).await?;
-                        send(&mut tls, b'C', &complete("SELECT 1")).await?;
+                        send(&mut stream, b'D', &data_row(&values)).await?;
+                        send(&mut stream, b'C', &complete("SELECT 1")).await?;
                     }
-                    "insert" => send(&mut tls, b'C', &complete("INSERT 0 1")).await?,
+                    "insert" => send(&mut stream, b'C', &complete("INSERT 0 1")).await?,
                     "fail" => {
                         let body = error(
                             "ERROR",
@@ -442,17 +422,17 @@ async fn postgres_session(
                                 (b'R', "parserOpenTable"),
                             ],
                         );
-                        send(&mut tls, b'E', &body).await?;
+                        send(&mut stream, b'E', &body).await?;
                         (failed, skipping) = (true, true);
                     }
-                    "copy" => send(&mut tls, b'G', &[0, 0, 0]).await?,
+                    "copy" => send(&mut stream, b'G', &[0, 0, 0]).await?,
                     "hang" => return Ok(()),
                     "big" => {
                         let value = vec![b'x'; 1024 * 1024];
                         for _ in 0..12 {
-                            send(&mut tls, b'D', &data_row(&[Some(&value)])).await?;
+                            send(&mut stream, b'D', &data_row(&[Some(&value)])).await?;
                         }
-                        send(&mut tls, b'C', &complete("SELECT 12")).await?;
+                        send(&mut stream, b'C', &complete("SELECT 12")).await?;
                     }
                     "nulls" => {
                         let mut rows = Vec::new();
@@ -461,8 +441,8 @@ async fn postgres_session(
                             rows.extend_from_slice(&10u32.to_be_bytes());
                             rows.extend_from_slice(&data_row(&[None]));
                         }
-                        tls.write_all(&rows).await?;
-                        send(&mut tls, b'C', &complete("SELECT 1700000")).await?;
+                        stream.write_all(&rows).await?;
+                        send(&mut stream, b'C', &complete("SELECT 1700000")).await?;
                     }
                     _ => panic!("unexpected query"),
                 }
@@ -472,30 +452,11 @@ async fn postgres_session(
     }
 }
 
-struct TestDial {
-    address: std::net::SocketAddr,
-    ca: Vec<u8>,
-    calls: Arc<AtomicUsize>,
-}
-impl PostgresDial for TestDial {
-    fn dial<'a>(
-        &'a self,
-        target: &'a DatabaseTarget,
-    ) -> BoxFuture<'a, Result<TlsStream<TcpStream>, Failure>> {
-        Box::pin(async move {
-            assert_eq!(target.database, DATABASE);
-            assert_eq!(target.host, format!("database-rw.pgcf-db-{DATABASE}.svc"));
-            assert_eq!(target.pod_uid, cid(200));
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let stream = TcpStream::connect(self.address).await?;
-            stream.set_nodelay(true)?;
-            transport::negotiate_tls(stream, &target.host, &self.ca).await
-        })
-    }
-}
 struct Fixture {
     gateway: Arc<Gateway>,
     port: u16,
+    /// The unit the double serves: its socket, this process's uid and PID.
+    unit: Writer,
     /// PostgreSQL connections the gateway dialled.
     calls: Arc<AtomicUsize>,
     journal: Journal,
@@ -503,57 +464,42 @@ struct Fixture {
     authentication: Arc<Mutex<Authentication>>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    _directory: Directory,
 }
 impl Fixture {
     async fn new() -> Self {
-        Self::with_fences(HashMap::from([(DATABASE.into(), fence("running", 1))])).await
+        Self::with(Mode::Running).await
     }
-    async fn with_fences(fences: HashMap<String, Fence>) -> Self {
-        let identity =
-            generate_simple_self_signed(vec![format!("database-rw.pgcf-db-{DATABASE}.svc")])
-                .unwrap();
-        let ca = identity.cert.pem().into_bytes();
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![identity.cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    identity.signing_key.serialize_der(),
-                )),
-            )
-            .unwrap();
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
+    /// The database `mode` at generation 1; a sleeping one has no unit.
+    async fn with(mode: Mode) -> Self {
+        let directory = Directory::new("sql");
+        let socket = directory.path().join(".s.PGSQL.5432");
+        let upstream = UnixListener::bind(&socket).unwrap();
+        let unit = Writer {
+            socket: socket.display().to_string(),
+            uid: std::fs::metadata(directory.path()).unwrap().uid(),
+            pid: std::process::id(),
+            instance: INSTANCE.into(),
+        };
         let calls = Arc::new(AtomicUsize::new(0));
-        let gateway = Gateway::new(
-            Arc::new(Config {
-                region: REGION.into(),
-                keyring: Keyring {
-                    active: "test".into(),
-                    keys: HashMap::from([("test".into(), vec![7; 32])]),
-                },
-                maximum_memory: 192 * 1024 * 1024,
-                database_memory: 96 * 1024 * 1024,
-            }),
-            POD.into(),
-            Arc::new(TestDial {
-                address,
-                ca,
-                calls: calls.clone(),
-            }),
-        );
-        gateway.fences.write().await.replace(fences).unwrap();
-        {
-            let mut targets = gateway.targets.write().await;
-            targets
-                .replace("endpointslices", &[writer(&cid(200))])
-                .unwrap();
-            targets.replace("configmaps", &storage_maps()).unwrap();
-        }
+        let gateway = Gateway::new(Arc::new(Config {
+            region: REGION.into(),
+            keyring: Keyring {
+                active: "test".into(),
+                keys: HashMap::from([("test".into(), vec![7; 32])]),
+            },
+            maximum_memory: 192 * 1024 * 1024,
+            database_memory: 96 * 1024 * 1024,
+        }));
+        gateway
+            .table
+            .write()
+            .await
+            .replace(vec![entry(mode, 1, &operation(), &unit)]);
         let journal = Journal::default();
         let (stop, receiver) = watch::channel(false);
-        let acceptor = TlsAcceptor::from(Arc::new(config));
         let recorder = journal.clone();
+        let counted = calls.clone();
         let authentication = Arc::new(Mutex::new(Authentication::Scram));
         let asks = authentication.clone();
         let mut shutdown = receiver.clone();
@@ -563,9 +509,10 @@ impl Fixture {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     accepted = upstream.accept() => {
-                        let (tcp, _) = accepted.unwrap();
-                        let (acceptor, journal, authentication) = (acceptor.clone(), recorder.clone(), *asks.lock().unwrap());
-                        tasks.spawn(async move { let _ = postgres_session(tcp, acceptor, journal, authentication).await; });
+                        let (stream, _) = accepted.unwrap();
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        let (journal, authentication) = (recorder.clone(), *asks.lock().unwrap());
+                        tasks.spawn(async move { let _ = postgres_session(stream, journal, authentication).await; });
                     }
                 }
             }
@@ -593,11 +540,13 @@ impl Fixture {
         Self {
             gateway,
             port,
+            unit,
             calls,
             journal,
             authentication,
             stop,
             tasks: vec![upstream_task, gateway_task],
+            _directory: directory,
         }
     }
     async fn sql(&self, route: &str, body: &Value) -> (u16, Value) {
@@ -785,7 +734,7 @@ async fn a_pooled_session_is_reused_only_for_its_password_and_closes_when_the_da
     assert_eq!(fixture.sql(&route(8), &request).await.0, 200);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
     fixture.idle(1).await;
-    // The controller closes idle sessions when it puts the database to sleep.
+    // The agent closes idle sessions when it puts the database to sleep.
     fixture
         .gateway
         .sessions
@@ -942,8 +891,7 @@ async fn a_chunked_body_is_read_in_full() {
 }
 #[tokio::test]
 async fn a_quiesced_database_refuses_before_any_dial() {
-    let fixture =
-        Fixture::with_fences(HashMap::from([(DATABASE.into(), fence("quiesce", 1))])).await;
+    let fixture = Fixture::with(Mode::Quiesce).await;
     let (status, answer) = fixture
         .sql(&route(20), &body(PASSWORD, &[("select", json!([]))], None))
         .await;
@@ -952,59 +900,19 @@ async fn a_quiesced_database_refuses_before_any_dial() {
     fixture.stop().await;
 }
 
-fn ca_map() -> Value {
-    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("ca-{DATABASE}"),"namespace":"pgcf-system","uid":cid(209),"labels":{"pgcf.io/database-id":DATABASE},"annotations":{"pgcf.io/source-ca-secret-uid":cid(210),"pgcf.io/source-ca-secret-resource-version":"81"}},"data":{"ca.crt":CA_MATERIAL}})
-}
-fn running_pod() -> Value {
-    json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{DATABASE}"),"uid":cid(200),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}})
-}
-/// What the controller publishes when it releases a wake to the database's own Pod: the fence
-/// running at the claimed generation with its admission target, and the writer as the watches
-/// show it before the kubelet reports it Ready.
+/// What the agent publishes when it released a wake: the unit running at the claimed generation
+/// and operation.
 async fn release(fixture: &Fixture, generation: u64) {
-    let ca = Sha256::digest(CA_MATERIAL.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let target = json!({"v":1,"generation":generation,"route_revision":19,"admission_epoch":11,"pod_uid":cid(200),"container_id":"a".repeat(64),"ca_secret_uid":cid(210),"ca_secret_resource_version":"81","ca_sha256":ca,"tls_server_name":format!("database-rw.pgcf-db-{DATABASE}.svc")});
-    let intent = json!({"database":DATABASE,"operation":wake_operation(),"revision":generation,"mode":"running"});
-    let mut slice = writer(&cid(200));
-    slice["endpoints"][0]["conditions"] =
-        json!({"ready":false,"serving":false,"terminating":false});
-    let mut maps = storage_maps();
-    maps[1]["data"]["intent.json"] = intent.to_string().into();
-    maps[1]["data"]["admission_target"] = target.to_string().into();
-    maps.push(ca_map());
-    {
-        let mut targets = fixture.gateway.targets.write().await;
-        targets.replace("endpointslices", &[slice]).unwrap();
-        targets.replace("pods", &[running_pod()]).unwrap();
-        targets.replace("configmaps", &maps).unwrap();
-    }
-    fixture
-        .gateway
-        .fences
-        .write()
-        .await
-        .replace(HashMap::from([(
-            DATABASE.into(),
-            Fence {
-                admission_target: Some(serde_json::from_value(target).unwrap()),
-                intent: Intent {
-                    database: DATABASE.into(),
-                    operation: wake_operation(),
-                    revision: generation,
-                    mode: "running".into(),
-                },
-                ..fence("running", generation)
-            },
-        )]))
-        .unwrap();
+    fixture.gateway.table.write().await.update(entry(
+        Mode::Running,
+        generation,
+        &wake_operation(),
+        &fixture.unit,
+    ));
 }
 #[tokio::test]
-async fn a_wake_ticket_is_held_without_a_dial_until_the_fence_releases_the_writer() {
-    let fixture =
-        Fixture::with_fences(HashMap::from([(DATABASE.into(), fence("quiesce", 1))])).await;
+async fn a_wake_ticket_is_held_without_a_dial_until_the_table_releases_the_unit() {
+    let fixture = Fixture::with(Mode::Sleeping).await;
     let port = fixture.port;
     let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
     let answer = tokio::spawn(async move {

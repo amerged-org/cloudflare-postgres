@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Pool wake protocol (pool design 2026-10-16). Route token v5 is the Edge's wake ticket for a
-//! sleeping database (authoritative TypeScript contract: packages/contracts/src/route-token.ts;
-//! tests/conformance.rs pins these constants and this behaviour to it). `gw1` is the scoped token
-//! of the controller's wake long-poll on the gateway control port. The wire types are what the
-//! gateway queues and the controller answers with.
+//! Wake protocol. Route token v5 is the Edge's wake ticket for a sleeping database (authoritative
+//! TypeScript contract: packages/contracts/src/route-token.ts; tests/conformance.rs pins these
+//! constants and this behaviour to it). The wire types are what the gateway queues for the node
+//! agent and what the agent answers with, over its channel (`agent`).
 use crate::{
     constant,
     route::{Connection, Keyring, RouteClaims, decode, derive_region_key},
@@ -18,30 +17,19 @@ use std::collections::{BTreeMap, HashMap};
 pub const ROUTE_VERSION: u8 = 5;
 pub const ROUTE_PREFIX: &str = "v5";
 pub const ROUTE_DOMAIN: &str = "pgcf-route/v5\n";
-pub const POLL_PREFIX: &str = "gw1";
-pub const POLL_KEY_PURPOSE: &str = "pgcf-gateway-wake-key/v1\n";
-pub const POLL_SIGNING_PURPOSE: &str = "pgcf-gateway-wake/v1\n";
-pub const POLL_HEADER: &str = "x-pgcf-wake";
-pub const POLL_ACTION: &str = "wakes";
-pub const RESULT_ACTION: &str = "wake-result";
-pub const POLL_PATH: &str = "/_pgcf/gateway/wakes";
-pub const RESULT_PATH: &str = "/_pgcf/gateway/wake-result";
-pub const POLL_MAX_LENGTH: usize = 1024;
-pub const POLL_MAX_LIFETIME_SECONDS: u64 = 30;
-pub const RESULT_MAX_BYTES: usize = 4096;
+/// The most wakes one delivery to the agent carries.
 pub const MAX_WAKES_PER_POLL: usize = 64;
 /// How long a held wake connection waits for its release, counted from its upgrade. Nested under
 /// the Edge's ADMISSION_DEADLINE_MS (60 s).
 pub const WAKE_BOUND_MS: u64 = 25_000;
-/// How long the gateway holds an empty long-poll before it answers it.
+/// How long one wait of the gateway for deliverable wakes lasts before it begins again.
 pub const POLL_HOLD_MS: u64 = 20_000;
 /// A delivered wake without a result is delivered again after this long.
 pub const REDELIVER_MS: u64 = 3_000;
-/// How long a released pool hit serves before D1 must confirm its generation.
+/// How long a delivered ticket whose connections all left is kept for its late result.
 pub const TICKET_LEASE_MS: u64 = 10_000;
 pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
-pub const SLOT_NAMESPACE_PREFIX: &str = "pgcf-slot-";
 /// Every reason a wake result may name.
 pub const REASONS: [&str; 32] = [
     "no_desired_row",
@@ -257,9 +245,9 @@ pub fn verify_wake(
 }
 impl WakeClaims {
     /// The v4-shaped claims a released wake is routed under: the same connection, the claimed
-    /// generation as `rev`, the admitted Pod and the route revision. `pod` is `None` only for the
-    /// replay check before release.
-    pub fn admitted(&self, pod: Option<&str>) -> RouteClaims {
+    /// generation as `rev`, the released unit's invocation ID and the route revision. `unit` is
+    /// `None` only for the replay check before release.
+    pub fn admitted(&self, unit: Option<&str>) -> RouteClaims {
         RouteClaims {
             v: 4,
             db: self.db.clone(),
@@ -270,7 +258,7 @@ impl WakeClaims {
             iat: self.iat,
             exp: self.exp,
             rev: Some(self.generation),
-            pod: pod.map(str::to_string),
+            pod: unit.map(str::to_string),
             route_revision: Some(self.route_revision),
         }
     }
@@ -285,78 +273,7 @@ pub fn role_revision_hash<'a>(roles: impl IntoIterator<Item = (&'a str, u64)>) -
     hex(&Sha256::digest(lines.concat().as_bytes()))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PollClaims {
-    pub v: u8,
-    pub region: String,
-    /// The gateway Pod UID the token is for.
-    pub pod: String,
-    pub action: String,
-    pub kid: String,
-    pub iat: u64,
-    pub exp: u64,
-}
-fn poll_claims_valid(claims: &PollClaims) -> bool {
-    claims.v == 1
-        && valid_pattern("region", &claims.region)
-        && valid_pattern("uuid", &claims.pod)
-        && (claims.action == POLL_ACTION || claims.action == RESULT_ACTION)
-        && kid(&claims.kid)
-        && claims.iat <= MAX_SAFE
-        && claims.exp <= MAX_SAFE
-}
-fn poll_mac(key: &[u8]) -> Option<Hmac<Sha256>> {
-    let mut inner = Hmac::<Sha256>::new_from_slice(key).ok()?;
-    inner.update(POLL_KEY_PURPOSE.as_bytes());
-    let derived = inner.finalize().into_bytes();
-    let mut mac = Hmac::<Sha256>::new_from_slice(&derived).ok()?;
-    mac.update(POLL_SIGNING_PURPOSE.as_bytes());
-    Some(mac)
-}
-/// Verifies a `gw1` token for this gateway Pod, region and action.
-pub fn verify_poll(
-    token: Option<&str>,
-    keys: &HashMap<String, Vec<u8>>,
-    region: &str,
-    pod: &str,
-    action: &str,
-    now_ms: u64,
-) -> Option<PollClaims> {
-    let token = token?;
-    if token.len() > POLL_MAX_LENGTH {
-        return None;
-    }
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 || parts[0] != POLL_PREFIX {
-        return None;
-    }
-    let payload = decode(parts[1])?;
-    let signature = decode(parts[2]).filter(|v| v.len() == 32)?;
-    let claims: PollClaims = serde_json::from_slice(&payload).ok()?;
-    if !poll_claims_valid(&claims) {
-        return None;
-    }
-    let key = keys
-        .get(&claims.kid)
-        .filter(|k| k.len() >= constant("ROUTE_KEY_MIN_BYTES") as usize)?;
-    let mut mac = poll_mac(key)?;
-    mac.update(parts[1].as_bytes());
-    mac.verify_slice(&signature).ok()?;
-    if claims.exp <= claims.iat
-        || claims.exp - claims.iat > POLL_MAX_LIFETIME_SECONDS
-        || now_ms < claims.iat * 1000
-        || now_ms > claims.exp * 1000
-        || claims.region != region
-        || claims.pod != pod
-        || claims.action != action
-    {
-        return None;
-    }
-    Some(claims)
-}
-
-/// One queued wake, as the gateway hands it to the controller's long-poll.
+/// One queued wake, as the gateway hands it to the node agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WakeRequest {
@@ -388,28 +305,15 @@ impl WakeRequest {
             && self.queued_at_ms <= MAX_SAFE
     }
 }
-/// The answer to `POST /_pgcf/gateway/wakes`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WakePoll {
-    pub pod: String,
-    pub wakes: Vec<WakeRequest>,
-}
-impl WakePoll {
-    pub fn valid(&self) -> bool {
-        valid_pattern("uuid", &self.pod)
-            && self.wakes.len() <= MAX_WAKES_PER_POLL
-            && self.wakes.iter().all(WakeRequest::valid)
-    }
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    Hit,
-    Miss,
+    /// The agent started the database's unit; its table entry releases the held connections.
+    Started,
+    /// The agent did not start it: the held connections answer 57P03.
     Refused,
 }
-/// The body of `POST /_pgcf/gateway/wake-result`.
+/// The agent's answer to a wake, with the times of its steps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WakeResult {
@@ -428,10 +332,8 @@ impl WakeResult {
             && valid_pattern("operation", &self.operation)
             && positive(self.generation)
             && match (&self.outcome, &self.reason) {
-                (Outcome::Hit, None) => true,
-                (Outcome::Miss | Outcome::Refused, Some(reason)) => {
-                    REASONS.contains(&reason.as_str())
-                }
+                (Outcome::Started, None) => true,
+                (Outcome::Refused, Some(reason)) => REASONS.contains(&reason.as_str()),
                 _ => false,
             }
             && self.steps_ms.len() <= 16
@@ -442,19 +344,4 @@ impl WakeResult {
                     && *value <= 600_000
             })
     }
-}
-/// Whether `value` is a slot namespace: `pgcf-slot-` and 8 lowercase hex digits.
-pub fn is_slot_namespace(value: &str) -> bool {
-    value
-        .strip_prefix(SLOT_NAMESPACE_PREFIX)
-        .is_some_and(|rest| lower_hex(rest, 8))
-}
-/// The TLS name CNPG gives the read-write service of a slot's Cluster `database`.
-pub fn slot_tls_name(namespace: &str) -> String {
-    format!("database-rw.{namespace}.svc")
-}
-/// The slot namespace a slot TLS name names; `None` for any other name.
-pub fn slot_namespace_of_tls_name(name: &str) -> Option<&str> {
-    let namespace = name.strip_prefix("database-rw.")?.strip_suffix(".svc")?;
-    is_slot_namespace(namespace).then_some(namespace)
 }

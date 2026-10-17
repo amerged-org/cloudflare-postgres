@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The wake queue: connections of a sleeping database that arrived with a wake ticket (route v5)
-//! are held here, one ticket per database, until the fence releases them. The controller takes the
-//! tickets with its long-poll and answers each with a result; the release itself is the fence.
+//! are held here, one ticket per database, until the node agent's table releases them. The agent
+//! takes the tickets over its channel and answers each with a result; the release itself is the
+//! table entry that shows the woken unit.
 use pgcf_native_protocol::wake::{
     MAX_HELD_PER_DATABASE, MAX_HELD_TOTAL, MAX_WAKES_PER_POLL, REDELIVER_MS, TICKET_LEASE_MS,
     WakeClaims, WakeRequest, WakeResult,
@@ -13,7 +14,7 @@ use std::{
 };
 use tokio::sync::{Notify, watch};
 
-/// The result the controller sent for a ticket, once it sent one.
+/// The result the agent sent for a ticket, once it sent one.
 type Answer = Option<WakeResult>;
 struct Ticket {
     request: WakeRequest,
@@ -152,7 +153,7 @@ impl WakeQueue {
             .min()
             .map(|at| at + Duration::from_millis(REDELIVER_MS))
     }
-    /// The controller's long-poll: the deliverable tickets as soon as there are any, or none
+    /// The agent channel's wait: the deliverable tickets as soon as there are any, or none
     /// after `hold`.
     pub async fn poll(&self, hold: Duration) -> Vec<WakeRequest> {
         let deadline = Instant::now() + hold;
@@ -172,7 +173,7 @@ impl WakeQueue {
             }
         }
     }
-    /// Records the controller's result for the ticket it names. False when no such ticket is held.
+    /// Records the agent's result for the ticket it names. False when no such ticket is held.
     pub fn result(&self, result: &WakeResult) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let Some(ticket) = inner.tickets.get_mut(&result.database).filter(|ticket| {
@@ -245,7 +246,7 @@ pub struct Held {
     replaced: bool,
 }
 impl Held {
-    /// The controller's result for the ticket, once it arrived.
+    /// The agent's result for the ticket, once it arrived.
     pub fn verdict(&self) -> Option<WakeResult> {
         self.answer
             .as_ref()
@@ -316,7 +317,7 @@ mod tests {
             operation: operation.into(),
             generation,
             outcome,
-            reason: (outcome != Outcome::Hit).then(|| "no_free_slot".into()),
+            reason: (outcome == Outcome::Refused).then(|| "no_headroom".into()),
             steps_ms: Default::default(),
         }
     }
@@ -342,8 +343,8 @@ mod tests {
         );
         assert_eq!(queue.take(start + redeliver), vec![ticket]);
         // A result reaches the held connections and ends redelivery.
-        assert!(queue.result(&result(2, &a, Outcome::Miss)));
-        assert_eq!(first.verdict().unwrap().outcome, Outcome::Miss);
+        assert!(queue.result(&result(2, &a, Outcome::Started)));
+        assert_eq!(first.verdict().unwrap().outcome, Outcome::Started);
         assert!(queue.take(start + 10 * redeliver).is_empty());
         // A higher generation replaces the ticket and is deliverable at once; the replaced
         // ticket is no longer known.
@@ -354,7 +355,7 @@ mod tests {
             (4, b.as_str())
         );
         assert_eq!(queue.take(start), vec![ticket.clone()]);
-        assert!(!queue.result(&result(2, &a, Outcome::Miss)));
+        assert!(!queue.result(&result(2, &a, Outcome::Started)));
         assert!(third.verdict().is_none());
         // A lower generation is held but never replaces the ticket.
         let fourth = queue.hold(&claims(DATABASE, 4, 2, &a), 400, start).unwrap();
@@ -398,9 +399,9 @@ mod tests {
         drop((second, third, fourth, more));
         assert_eq!(queue.held(DATABASE), 0);
         assert!(queue.take(start + redeliver).is_empty());
-        assert!(queue.result(&result(4, &b, Outcome::Hit)));
+        assert!(queue.result(&result(4, &b, Outcome::Started)));
         assert!(queue.ticket(DATABASE).is_none());
-        assert_eq!(verdict.get().unwrap().outcome, Outcome::Miss);
+        assert_eq!(verdict.get().unwrap().outcome, Outcome::Started);
         // A ticket never delivered goes with its last waiter.
         let held = queue.hold(&claims(DATABASE, 5, 6, &a), 700, start).unwrap();
         drop(held);

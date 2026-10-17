@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The password a client pipelines behind its StartupMessage, proven to PostgreSQL inside the
-//! cluster. The gateway answers AuthenticationCleartextPassword, takes the password over the
+//! The password a client pipelines behind its StartupMessage, proven to PostgreSQL on the node.
+//! The gateway answers AuthenticationCleartextPassword, takes the password over the
 //! encrypted WebSocket and runs SCRAM-SHA-256 to PostgreSQL itself, so a new connection costs the
 //! client one round trip instead of three. HTTP SQL logs in with the same client. The password is
 //! held only for that exchange: it is never logged or persisted, and it is zeroized when dropped.
@@ -12,6 +12,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_protocol::{constant, startup::error_response};
+use ring::rand::SecureRandom;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -221,8 +222,7 @@ pub async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     known: Option<Salted>,
 ) -> Result<Login, Failure> {
     let mut random = [0u8; 18];
-    rustls::crypto::ring::default_provider()
-        .secure_random
+    ring::rand::SystemRandom::new()
         .fill(&mut random)
         .map_err(|_| "random source unavailable")?;
     login_with(postgres, password, &STANDARD.encode(random), known).await

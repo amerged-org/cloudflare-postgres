@@ -6,7 +6,6 @@ pub mod agent;
 #[path = "constants.generated.rs"]
 pub mod generated;
 pub mod route;
-pub mod scoped_tokens;
 pub mod startup;
 pub mod wake;
 
@@ -47,15 +46,7 @@ static PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
 });
 static CLAIM_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
     let mut result = HashMap::new();
-    for name in [
-        "routeClaims",
-        "admissionRouteClaims",
-        "gatewayAdmissionTarget",
-        "legacyRouteClaims",
-        "controlClaims",
-        "activityClaims",
-        "intent",
-    ] {
+    for name in ["routeClaims", "admissionRouteClaims", "legacyRouteClaims"] {
         for (field, value) in CONTRACT[name]["properties"].as_object().unwrap() {
             if let Some(pattern) = value["pattern"].as_str() {
                 result.insert(

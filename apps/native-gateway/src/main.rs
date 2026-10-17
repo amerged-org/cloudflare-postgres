@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use pgcf_native_gateway::{
-    kubernetes::{self, Kubernetes},
-    local, targets,
-    transport::{self, ClusterPostgresDial, Config, Gateway},
+    local,
+    transport::{self, Config, Gateway},
 };
 use pgcf_native_protocol::{agent, constant, route::Keyring, valid_pattern};
 use std::{
@@ -13,7 +12,7 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, watch},
-    task::{JoinHandle, JoinSet},
+    task::JoinSet,
 };
 fn positive(
     name: &str,
@@ -54,55 +53,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         database_memory,
     });
     let (stop, receiver) = watch::channel(false);
-    let (gateway, listener, synchronizers) = match std::env::var("PGCF_GATEWAY_MODE")
-        .as_deref()
-        .unwrap_or("kubernetes")
-    {
-        // On a node: the agent's table over its local channel, PostgreSQL on Unix sockets, and
-        // only cloudflared, on loopback, as a client.
-        "local" => {
-            let socket = std::env::var_os("PGCF_AGENT_SOCKET")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| agent::GATEWAY_SOCKET.into());
-            let gateway = Gateway::local(config);
-            let synchronizers: Vec<JoinHandle<()>> = vec![tokio::spawn(local::synchronize(
-                gateway.clone(),
-                socket,
-                receiver.clone(),
-            ))];
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-            (gateway, listener, synchronizers)
-        }
-        "kubernetes" => {
-            let pod = std::env::var("PGCF_GATEWAY_POD_UID")?;
-            if !valid_pattern("uuid", &pod) {
-                return Err("invalid gateway identity".into());
-            }
-            let api = Arc::new(Kubernetes::in_cluster().await?);
-            let gateway =
-                Gateway::new(config, pod, Arc::new(ClusterPostgresDial::new(api.clone())));
-            let mut synchronizers: Vec<JoinHandle<()>> = ["endpointslices", "pods", "configmaps"]
-                .into_iter()
-                .map(|kind| {
-                    tokio::spawn(targets::synchronize(
-                        api.clone(),
-                        gateway.targets.clone(),
-                        kind,
-                        receiver.clone(),
-                    ))
-                })
-                .collect();
-            synchronizers.push(tokio::spawn(kubernetes::synchronize(
-                api,
-                gateway.fences.clone(),
-                gateway.sessions.clone(),
-                receiver.clone(),
-            )));
-            let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-            (gateway, listener, synchronizers)
-        }
-        _ => return Err("invalid gateway mode".into()),
-    };
+    // On a node: the agent's table over its local channel, PostgreSQL on Unix sockets, and only
+    // cloudflared, on loopback, as a client.
+    let socket = std::env::var_os("PGCF_AGENT_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| agent::GATEWAY_SOCKET.into());
+    let gateway = Gateway::new(config);
+    let synchronizer = tokio::spawn(local::synchronize(
+        gateway.clone(),
+        socket,
+        receiver.clone(),
+    ));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let pending = Arc::new(Semaphore::new(128));
     let mut sessions = JoinSet::new();
     let shutdown = shutdown_signal();
@@ -126,9 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })
     .await;
     sessions.abort_all();
-    for synchronizer in synchronizers {
-        let _ = synchronizer.await;
-    }
+    let _ = synchronizer.await;
     Ok(())
 }
 async fn shutdown_signal() {

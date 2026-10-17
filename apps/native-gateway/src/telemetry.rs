@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Bounded, authentication-scoped counters. Reads cannot allocate or invent history.
 use pgcf_native_protocol::{constant, valid_pattern};
+use ring::rand::SecureRandom;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -19,8 +20,7 @@ fn real_now() -> u64 {
 }
 fn uuid() -> String {
     let mut bytes = [0u8; 16];
-    rustls::crypto::ring::default_provider()
-        .secure_random
+    ring::rand::SystemRandom::new()
         .fill(&mut bytes)
         .expect("secure runtime identity");
     bytes[6] = (bytes[6] & 15) | 64;

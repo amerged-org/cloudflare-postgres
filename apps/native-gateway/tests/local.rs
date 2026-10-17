@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Local mode against a real PostgreSQL 18. The test plays the node agent on its channel: it
+//! The gateway against a real PostgreSQL 18. The test plays the node agent on its channel: it
 //! sends the table, starts and stops the database's PostgreSQL as the agent starts and stops its
 //! unit, and answers the gateway's wakes. Clients connect through the gateway's WebSocket and
 //! HTTP SQL ports as the Edge does.
@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_gateway::{
-    control, local,
+    http, local,
     transport::{self, Config, Gateway},
 };
 use pgcf_native_protocol::{
@@ -55,20 +55,26 @@ fn token(prefix: &str, domain: &str, claims: Value) -> String {
 /// The admission route Cloudflare signs for a running database: its generation, the unit and the
 /// route revision.
 fn route(id: usize, generation: u64, instance: &str) -> String {
-    let now = control::now() / 1000;
+    route_at(id, generation, instance, ROUTE_REVISION)
+}
+fn route_at(id: usize, generation: u64, instance: &str, route_revision: u64) -> String {
+    let now = http::now() / 1000;
     token(
         wire("admissionRouteTokenPrefix"),
         wire("admissionRouteSignatureDomain"),
-        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"pod":instance,"route_revision":ROUTE_REVISION}),
+        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"pod":instance,"route_revision":route_revision}),
     )
 }
 /// The wake ticket Cloudflare signs for a sleeping database.
 fn ticket(id: usize, generation: u64, operation: &str) -> String {
-    let now = control::now() / 1000;
+    ticket_at(id, generation, operation, ROUTE_REVISION)
+}
+fn ticket_at(id: usize, generation: u64, operation: &str, route_revision: u64) -> String {
+    let now = http::now() / 1000;
     token(
         "v5",
         "pgcf-route/v5\n",
-        json!({"v":5,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"op":operation,"gen":generation,"route_revision":ROUTE_REVISION,"rh":"c".repeat(64)}),
+        json!({"v":5,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"op":operation,"gen":generation,"route_revision":route_revision,"rh":"c".repeat(64)}),
     )
 }
 
@@ -111,7 +117,7 @@ enum Command {
     Send(ToGateway),
     Disconnect,
 }
-/// A gateway in local mode on loopback, and the test's end of its agent channel.
+/// A gateway on loopback, and the test's end of its agent channel.
 struct Node {
     gateway: Arc<Gateway>,
     port: u16,
@@ -155,7 +161,7 @@ impl Node {
                 }
             }
         });
-        let gateway = Gateway::local(Arc::new(Config {
+        let gateway = Gateway::new(Arc::new(Config {
             region: REGION.into(),
             keyring: Keyring {
                 active: "test".into(),
@@ -227,7 +233,7 @@ impl Node {
             .await;
     }
     async fn until(&self, done: impl Fn(&local::LocalTable) -> bool) {
-        let table = self.gateway.local_table().unwrap();
+        let table = &self.gateway.table;
         timeout(Duration::from_secs(10), async {
             while !done(&*table.read().await) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -282,12 +288,15 @@ impl Node {
     }
     /// One `POST /sql` as the Edge sends it.
     async fn sql(&self, route: &str, query: &str) -> (u16, Value) {
+        Self::sql_on(self.port, route, query).await
+    }
+    async fn sql_on(port: u16, route: &str, query: &str) -> (u16, Value) {
         let body = json!({"password":URL_SAFE_NO_PAD.encode(PASSWORD),"queries":[{"query":query,"params":[]}]}).to_string();
         let request = format!(
             "POST /sql HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-PGCF-Route: {route}\r\n\r\n{body}",
             body.len()
         );
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut bytes = Vec::new();
         timeout(Duration::from_secs(30), stream.read_to_end(&mut bytes))
@@ -411,6 +420,13 @@ impl Client {
             }
         }
     }
+    /// Nothing reaches the client within `bound`.
+    async fn silent(&mut self, bound: Duration) {
+        assert!(self.buffer.is_empty(), "{:?}", self.buffer);
+        if let Ok(message) = timeout(bound, self.socket.next()).await {
+            panic!("the client received {message:?}");
+        }
+    }
     /// The close frame the gateway ended the connection with.
     async fn closed(&mut self) -> Option<(u16, String)> {
         loop {
@@ -448,6 +464,14 @@ async fn a_route_reaches_the_running_unit_only_through_its_own_socket() {
     let other = "1f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c";
     assert_eq!(node.upgrade(&route(2, 1, other)).await.err(), Some(503));
     assert_eq!(node.upgrade(&route(3, 2, INSTANCE)).await.err(), Some(503));
+    for revision in [ROUTE_REVISION - 1, ROUTE_REVISION + 1] {
+        assert_eq!(
+            node.upgrade(&route_at(10 + revision as usize, 1, INSTANCE, revision))
+                .await
+                .err(),
+            Some(503)
+        );
+    }
     // The token is used once.
     assert_eq!(node.upgrade(&route(1, 1, INSTANCE)).await.err(), Some(403));
 
@@ -538,7 +562,7 @@ async fn a_held_wake_reaches_the_unit_the_agent_started_for_it() {
             database: DATABASE.into(),
             operation: wake.clone(),
             generation: 2,
-            outcome: Outcome::Hit,
+            outcome: Outcome::Started,
             reason: None,
             steps_ms: Default::default(),
         },
@@ -553,11 +577,25 @@ async fn a_held_wake_reaches_the_unit_the_agent_started_for_it() {
     let (status, answer) = node.sql(&ticket(4, 2, &wake), "select 'also awake'").await;
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["rows"], json!([["also awake"]]));
-    // A ticket of an older generation is stale.
+    // A ticket of an older generation is stale, and so is one of the wake's generation and
+    // operation whose route revision the agent's entry has not reached.
     assert_eq!(
         node.upgrade(&ticket(5, 1, &operation('s'))).await.err(),
         Some(503)
     );
+    assert_eq!(
+        node.upgrade(&ticket_at(6, 2, &wake, ROUTE_REVISION + 1))
+            .await
+            .err(),
+        Some(503)
+    );
+    // Cloudflare's claim of the wake moved the route revision past an earlier ticket's: it is
+    // routed under the entry's revision.
+    let mut earlier = node
+        .upgrade(&ticket_at(7, 2, &wake, ROUTE_REVISION - 1))
+        .await
+        .unwrap();
+    earlier.login().await;
     node.finish().await;
 }
 
@@ -623,6 +661,16 @@ async fn a_sleep_quiesces_holds_and_closes_the_sessions_the_agent_asks_for() {
     ));
     assert_eq!(node.upgrade(&route(3, 1, INSTANCE)).await.err(), Some(503));
     idle.send(query("select 'held'")).await;
+    // Not a byte of it reaches PostgreSQL while the database quiesces: the guard and the
+    // checkpoint of the sleep proof rely on it. No answer comes, and PostgreSQL never ran it.
+    idle.silent(Duration::from_millis(300)).await;
+    assert_eq!(
+        blocking(|| cluster.psql(
+            "postgres",
+            "select count(*) from pg_stat_activity where query = 'select ''held'''"
+        )),
+        "0"
+    );
     assert!(matches!(
         node.control(2, ControlAction::Close, generation).await,
         FromGateway::Status {
@@ -722,5 +770,172 @@ async fn sessions_outlive_the_agent_channel_and_new_routes_wait_for_its_table() 
         database: DATABASE.into(),
     });
     assert!(client.closed().await.is_some());
+    node.finish().await;
+}
+
+/// The `conn_stages` and `sql_stages` lines a child test process logged.
+fn logged_stages(test: &str) -> Vec<Value> {
+    // The gateway logs to stdout, so a child test process runs the connections.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("PGCF_STAGES_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(&line[line.find('{')?..]).ok())
+        .filter(|line: &Value| line["event"] == "conn_stages" || line["event"] == "sql_stages")
+        .collect()
+}
+fn started(generation: u64, operation: &str) -> ToGateway {
+    ToGateway::WakeResult {
+        result: WakeResult {
+            database: DATABASE.into(),
+            operation: operation.into(),
+            generation,
+            outcome: Outcome::Started,
+            reason: None,
+            steps_ms: [("start".to_string(), 80)].into(),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_connection_is_labelled_warm_or_cold() {
+    let Some(bin) = binaries() else { return };
+    if std::env::var_os("PGCF_STAGES_CHILD").is_none() {
+        let lines = logged_stages("every_connection_is_labelled_warm_or_cold");
+        let of = |event: &str, path: &str| {
+            lines
+                .iter()
+                .filter(|line| line["event"] == event && line["wake_path"] == path)
+                .collect::<Vec<_>>()
+        };
+        // A connection to a running database is warm, also one whose wake ticket arrives after
+        // the wake.
+        let warm = of("conn_stages", "warm");
+        assert_eq!(warm.len(), 2, "{lines:?}");
+        for line in &warm {
+            assert!(line.get("held_outcome").is_none(), "{line}");
+            assert!(line.get("wake_wait_ms").is_none(), "{line}");
+        }
+        // A connection that waited for its database's wake is cold, released or refused.
+        let cold = of("conn_stages", "cold");
+        assert_eq!(cold.len(), 2, "{lines:?}");
+        let released = cold
+            .iter()
+            .find(|line| line["held_outcome"] == "released")
+            .unwrap();
+        assert!(released["wake_wait_ms"].is_u64(), "{released}");
+        assert_eq!(released["agent_ms"], json!({"start":80}));
+        assert!(released.get("wake_reason").is_none(), "{released}");
+        let refused = cold
+            .iter()
+            .find(|line| line["held_outcome"] == "refused")
+            .unwrap();
+        assert_eq!(refused["wake_reason"], "no_headroom");
+        assert!(refused["dial_ms"].is_null());
+        // HTTP SQL the same way.
+        assert_eq!(of("sql_stages", "warm").len(), 1, "{lines:?}");
+        assert_eq!(of("sql_stages", "cold").len(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        return;
+    }
+    let mut cluster = blocking(|| database_cluster(&bin));
+    let mut node = Node::start().await;
+    node.table(vec![entry(
+        1,
+        &operation('a'),
+        Mode::Running,
+        Some(unit(&cluster)),
+    )])
+    .await;
+    let mut client = node.upgrade(&route(1, 1, INSTANCE)).await.unwrap();
+    client.login().await;
+    drop(client);
+    assert_eq!(node.sql(&route(2, 1, INSTANCE), "select 1").await.0, 200);
+
+    // A held wake the agent starts the unit for.
+    blocking(|| cluster.stop());
+    node.update(entry(1, &operation('a'), Mode::Sleeping, None))
+        .await;
+    let woken = operation('w');
+    let mut held = node.upgrade(&ticket(3, 2, &woken)).await.unwrap();
+    let mut bytes = startup();
+    bytes.extend_from_slice(&frame(b'p', format!("{PASSWORD}\0").as_bytes()));
+    held.send(bytes).await;
+    node.receive(|message| matches!(message, FromGateway::Wake { .. }))
+        .await;
+    blocking(|| cluster.start(&[]));
+    node.send(ToGateway::Database {
+        database: entry(2, &woken, Mode::Running, Some(unit(&cluster))),
+    });
+    node.send(started(2, &woken));
+    assert_eq!(held.message().await, Some((b'R', vec![0, 0, 0, 3])));
+    held.until_ready().await;
+    // A ticket of that wake after it.
+    let mut later = node.upgrade(&ticket(4, 2, &woken)).await.unwrap();
+    later.login().await;
+    drop((held, later));
+
+    // A held HTTP SQL request.
+    blocking(|| cluster.stop());
+    node.update(entry(2, &woken, Mode::Sleeping, None)).await;
+    let again = operation('v');
+    let (gateway, request) = (node.port, ticket(5, 3, &again));
+    let answer = tokio::spawn(async move { Node::sql_on(gateway, &request, "select 1").await });
+    node.receive(|message| matches!(message, FromGateway::Wake { .. }))
+        .await;
+    blocking(|| cluster.start(&[]));
+    node.send(ToGateway::Database {
+        database: entry(3, &again, Mode::Running, Some(unit(&cluster))),
+    });
+    node.send(started(3, &again));
+    assert_eq!(answer.await.unwrap().0, 200);
+
+    // A held wake the agent refuses.
+    blocking(|| cluster.stop());
+    node.update(entry(3, &again, Mode::Sleeping, None)).await;
+    let refused = operation('r');
+    let mut client = node.upgrade(&ticket(6, 4, &refused)).await.unwrap();
+    client.send(startup()).await;
+    node.receive(|message| matches!(message, FromGateway::Wake { .. }))
+        .await;
+    node.send(ToGateway::WakeResult {
+        result: WakeResult {
+            database: DATABASE.into(),
+            operation: refused,
+            generation: 4,
+            outcome: Outcome::Refused,
+            reason: Some("no_headroom".into()),
+            steps_ms: Default::default(),
+        },
+    });
+    assert_eq!(client.refused().await, "57P03");
+    drop(client);
+    // Every line is logged before the child ends.
+    timeout(Duration::from_secs(10), async {
+        while node
+            .gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .counts(DATABASE)
+            .connections
+            > 0
+            || node.gateway.wakes.held(DATABASE) > 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
     node.finish().await;
 }
