@@ -213,8 +213,8 @@ pub struct Facts<'a> {
     pub image: &'a str,
     /// `sleep_fingerprint` of the desired row.
     pub fingerprint: &'a str,
-    /// The node-wide Cloudflare write authority is current.
-    pub authority: bool,
+    /// The node's thin pool has room for a start (Cloudflare's reserve rule).
+    pub room: bool,
     /// Every gateway Pod answered a wake poll since this controller started.
     pub gateways_ready: bool,
     /// The free slots of the database's node.
@@ -300,8 +300,8 @@ pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     if record.configuration_sha256 != facts.fingerprint {
         return miss("configuration_changed");
     }
-    if !facts.authority {
-        return miss("write_authority");
+    if !facts.room {
+        return miss("no_room");
     }
     if !facts.gateways_ready {
         return miss("gateways_not_ready");
@@ -1186,9 +1186,9 @@ impl Pool {
             .unwrap_or(&self.image)
             .to_string();
         let fingerprint = sleep_fingerprint(&view, &self.image).unwrap_or_default();
-        let authority = node
+        let room = node
             .as_ref()
-            .is_some_and(|node| rec.write_authority(&view, snapshot, node));
+            .is_some_and(|node| rec.room(&view, snapshot, node));
         let slots = self.free_on(text(db, "node"));
         let facts = Facts {
             trigger,
@@ -1205,7 +1205,7 @@ impl Pool {
             record: record.as_ref(),
             image: &image,
             fingerprint: &fingerprint,
-            authority,
+            room,
             gateways_ready: gateways
                 .as_ref()
                 .is_some_and(|gateways| self.intake.ready(&gateways.pods)),

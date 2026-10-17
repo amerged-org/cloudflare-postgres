@@ -3,7 +3,7 @@ use crate::{
     Error,
     api::DesiredSnapshot,
     contracts::{
-        applied_role_revisions, constant, database_valid, generation, integer, namespace, number,
+        applied_role_revisions, constant, database_valid, generation, namespace, number,
         optional_number, present_roles, text,
     },
     health::{self, ArchiveSample, Health},
@@ -149,7 +149,7 @@ fn hibernated(cluster: &Value) -> bool {
             })
 }
 /// Whether applying `db` to its Cluster starts PostgreSQL on the volume, which a thin volume
-/// admits only under a current Cloudflare startup hold: resuming a hibernated Cluster or lifting
+/// admits only while its node's thin pool has room: resuming a hibernated Cluster or lifting
 /// the fence of a parked one, a Cluster without a primary, and a change of image, resources or
 /// parameters that rolls the primary.
 fn starts_postgres(cluster: Option<&Value>, db: &Value, default_image: &str) -> bool {
@@ -379,14 +379,6 @@ pub(crate) fn contains(actual: &Value, desired: &Value, path: &str) -> bool {
         _ => actual == desired,
     }
 }
-fn millis(value: &Value) -> Option<i128> {
-    time::OffsetDateTime::parse(
-        value.as_str()?,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()
-    .map(|t| t.unix_timestamp_nanos() / 1_000_000)
-}
 /// The node storage row stands for the database's own node, volume group and thin pool.
 fn storage_guard(db: &Value, node: &Value, row: &Value) -> Result<(), Error> {
     let storage = &db["storage"];
@@ -446,15 +438,6 @@ fn pending_creation(db: &Value) -> bool {
     origin["ever_ready"] == false
         && matches!(text(origin, "status"), "pending" | "running")
         && text(&db["archive"], "destination_path").ends_with(&expected)
-}
-fn startup_valid(db: &Value) -> bool {
-    let hold = &db["storage_startup"];
-    !hold.is_null()
-        && hold["generation"] == db["generation"]
-        && hold["node_uid"] == db["storage"]["node_uid"]
-        && integer(hold, "budget_bytes")
-            .is_ok_and(|n| n >= number(&db["storage"], "startup_reserve_bytes"))
-        && millis(&hold["expires_at"]).is_some_and(|expiry| expiry > now())
 }
 fn native_lvm_owned(db: &Value, receipt: &Value, lvm: &Value) -> bool {
     lvm["metadata"]["name"] == receipt["volume_handle"]
@@ -1333,13 +1316,13 @@ impl Reconciler {
                 .await;
         }
         if !db["storage"].is_null()
+            && authority["room"] != true
             && starts_postgres(prior_cluster.as_ref(), db, &self.postgres_image)
-            && !startup_valid(db)
         {
             return Ok(Some(observation(
                 db,
                 "provisioning",
-                Some("waiting for current Cloudflare startup admission"),
+                Some("waiting for thin pool room"),
             )));
         }
         let intent = desired_power(db)?;
@@ -2213,19 +2196,13 @@ impl Reconciler {
     pub fn take_followup(&self, id: &str) -> bool {
         self.followups.lock().unwrap().remove(id)
     }
-    /// Whether the node-wide Cloudflare write authority of the database's node is current for a
-    /// pool claim (check 4.3 #1): the snapshot's (or a newer renewal's) authority of `node`, the
-    /// Node as the watch holds it.
-    pub(crate) fn write_authority(
-        &self,
-        db: &Value,
-        snapshot: &DesiredSnapshot,
-        node: &Value,
-    ) -> bool {
+    /// Whether the database's node has thin pool room for a start (Cloudflare's reserve rule):
+    /// its storage row in the snapshot stands for `node`, as the watch holds it, and says so.
+    pub(crate) fn room(&self, db: &Value, snapshot: &DesiredSnapshot, node: &Value) -> bool {
         snapshot.region["storage_nodes"]
             .as_array()
             .and_then(|nodes| nodes.iter().find(|n| n["name"] == db["node"]))
-            .is_some_and(|authority| storage_guard(db, node, authority).is_ok())
+            .is_some_and(|row| storage_guard(db, node, row).is_ok() && row["room"] == true)
     }
     /// The Node and the host authority the database stands on. The pass has asserted the identity
     /// of the cluster before it asks.
@@ -2744,22 +2721,6 @@ mod tests {
         assert!(credential_acknowledged(&db, &cluster, &secret));
         secret["metadata"]["annotations"][ACCEPTED] = "3".into();
         assert!(!credential_acknowledged(&db, &cluster, &secret));
-    }
-    #[test]
-    fn thin_startup_requires_current_owned_generation_node_budget_and_expiry() {
-        let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(1))
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        let mut db = json!({"generation":7,"storage":{"node_uid":"same-node","startup_reserve_bytes":4096},"storage_startup":{"generation":7,"node_uid":"same-node","budget_bytes":4096,"expires_at":expires}});
-        assert!(startup_valid(&db));
-        db["storage_startup"]["generation"] = 6.into();
-        assert!(!startup_valid(&db));
-        db["storage_startup"]["generation"] = 7.into();
-        db["storage_startup"]["budget_bytes"] = 4095.into();
-        assert!(!startup_valid(&db));
-        db["storage_startup"]["budget_bytes"] = 4096.into();
-        db["storage_startup"]["node_uid"] = "another-node".into();
-        assert!(!startup_valid(&db));
     }
     #[test]
     fn the_node_storage_row_binds_only_the_node_volume_group_and_pool() {

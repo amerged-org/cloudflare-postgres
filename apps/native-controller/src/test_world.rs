@@ -1516,8 +1516,8 @@ impl World {
         w.free_slot().await;
         w
     }
-    /// The database's storage is a thin LV on the world's node, under a current node write
-    /// authority, and the node agent knows its device (open by the database's own Pod).
+    /// The database's storage is a thin LV on the world's node, whose thin pool has room, and the
+    /// node agent knows its device (open by the database's own Pod).
     pub fn thin(&mut self) {
         let class = "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa";
         self.db["storage"] = json!({"backend":"lvm-thin-v1","storage_class":class,"volume_attributes_class":class,"profile_revision":1,"profile_sha256":"a".repeat(64),"node_uid":node_uid(),"volume_group_uuid":VG_UUID,"pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","startup_reserve_bytes":1048576,"write_bytes_per_second":1048576,"write_iops_per_second":10,"guard_seconds":10,"drain_seconds":1});
@@ -1543,7 +1543,7 @@ impl World {
                 claim["spec"]["storageClassName"] = class.into();
             },
         );
-        self.fresh_authority();
+        self.node_storage(true);
         self.server.edit("Node", None, NODE, |node| {
             node["status"]["allocatable"] = json!({"memory":"8Gi","cpu":"4"});
         });
@@ -1569,11 +1569,11 @@ impl World {
         );
         self.server.put(json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"pgcf-attach-x","namespace":"pgcf-attach","uid":uid(50),"labels":{"app.kubernetes.io/name":"pgcf-attach"}},"spec":{"nodeName":NODE},"status":{"phase":"Running","podIP":AGENT_IP,"conditions":[{"type":"Ready","status":"True"}]}}));
     }
-    /// The node's Cloudflare write authority, observed now.
-    pub fn fresh_authority(&mut self) {
+    /// The node's storage row as Cloudflare serves it now: whether its thin pool has room.
+    pub fn node_storage(&mut self, room: bool) {
         let now = now_ms();
         let storage = &self.db["storage"];
-        self.snapshot.region["storage_nodes"] = json!([{"name":NODE,"node_uid":node_uid(),"cluster_uid":kube_system(),"volume_group_uuid":storage["volume_group_uuid"],"pool_uuid":storage["pool_uuid"],"profile_sha256":storage["profile_sha256"],"profile_revision":1,"storage_class":storage["storage_class"],"write_allowed":true,"observed_at":iso_ms(now),"expires_at":iso_ms(now + 9_000)}]);
+        self.snapshot.region["storage_nodes"] = json!([{"name":NODE,"node_uid":node_uid(),"cluster_uid":kube_system(),"volume_group_uuid":storage["volume_group_uuid"],"pool_uuid":storage["pool_uuid"],"profile_sha256":storage["profile_sha256"],"profile_revision":1,"storage_class":storage["storage_class"],"write_allowed":true,"observed_at":iso_ms(now),"expires_at":iso_ms(now + 9_000),"room":room}]);
     }
     /// CNPG hibernated the database's Cluster: its Pod is gone and the volume closed.
     pub fn hibernated_by_cnpg(&mut self) {
@@ -1701,13 +1701,12 @@ impl World {
         }
     }
     /// Cloudflare committed the wake of `wake`: the desired row runs at its generation, under
-    /// its operation, with the startup hold of a thin start.
+    /// its operation.
     pub fn claimed(&mut self, wake: &pgcf_native_protocol::wake::WakeRequest) {
         self.db["generation"] = wake.generation.into();
         self.db["desired_state"] = "running".into();
         self.db["power"] = json!({"operation":wake.operation,"revision":wake.generation,"mode":"running","reason":null});
         self.db["size"]["memory_request_mib"] = 128.into();
-        self.db["storage_startup"] = json!({"operation_id":wake.operation,"generation":wake.generation,"node_uid":node_uid(),"budget_bytes":1048576,"expires_at":iso_ms(now_ms() + 60_000)});
     }
     /// The lines of the log since `from`.
     pub fn since(&self, from: usize) -> Vec<String> {

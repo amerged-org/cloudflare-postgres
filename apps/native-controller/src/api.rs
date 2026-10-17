@@ -32,7 +32,7 @@ pub struct DesiredSnapshot {
 }
 /// Region configuration and fleet identity stay fixed throughout a pull. Node readings may
 /// advance between pages: keep the greatest revision of each same node, never merge away an
-/// omitted authority (which can revoke writing) or hide a changed configuration.
+/// omitted node or hide a changed configuration, and keep a "no room" any page of it read.
 fn merge_page_authority(snapshot: &mut DesiredSnapshot, page: &Value) -> Result<(), Error> {
     let mut held = snapshot.region.clone();
     let mut candidate = page["region"].clone();
@@ -79,11 +79,21 @@ fn merge_page_authority(snapshot: &mut DesiredSnapshot, page: &Value) -> Result<
             crate::contracts::integer(current, "revision")?,
             crate::contracts::integer(&row, "revision")?,
         );
-        if old == new && *current != row {
+        // Room is judged when a page is read; one "no room" of the pull stands.
+        let without_room = |row: &Value| {
+            let mut row = row.clone();
+            if let Some(fields) = row.as_object_mut() {
+                fields.remove("room");
+            }
+            row
+        };
+        if old == new && without_room(current) != without_room(&row) {
             return Err("desired node authority revision changed across reads".into());
         }
         if new > old {
             *current = row;
+        } else if old == new && current["room"] != row["room"] {
+            current["room"] = false.into();
         }
     }
     if snapshot.region.get("storage_nodes").is_some()
@@ -501,6 +511,33 @@ mod tests {
             .unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
         assert_eq!(snapshot.region["storage_nodes"][0]["revision"], 8);
+    }
+    #[tokio::test]
+    async fn a_room_reading_that_changes_between_pages_keeps_the_pull_and_the_cautious_reading() {
+        // Cloudflare judges room when it reads a page, so two pages of one pull may disagree at
+        // the same node revision: the pull stands, and no page's "no room" is lost.
+        for (first, second) in [(true, false), (false, true)] {
+            let (api, _) = api_double(move |path, _| {
+                let mut page = desired_page(
+                    7,
+                    if path.contains("after=") {
+                        Value::Null
+                    } else {
+                        "a0000000000000000001".into()
+                    },
+                );
+                page["region"]["storage_nodes"][0]["room"] = if path.contains("after=") {
+                    second
+                } else {
+                    first
+                }
+                .into();
+                (200, page)
+            })
+            .await;
+            let snapshot = api.desired(None).await.unwrap();
+            assert_eq!(snapshot.region["storage_nodes"][0]["room"], false);
+        }
     }
     #[tokio::test]
     async fn mutable_authority_never_hides_a_region_configuration_or_membership_change() {
