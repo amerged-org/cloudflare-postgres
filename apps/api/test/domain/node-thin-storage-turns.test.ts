@@ -33,12 +33,8 @@ const stub = (f: Fixture) =>
   env.NODE_BOOTSTRAP.get(
     env.NODE_BOOTSTRAP.idFromName(`thin-storage:${f.node}`),
   );
-type WaitingStart = { database_id: string; generation: number };
 /** One identity turn whose container records the given outcome; returns what the DO scheduled. A
- * "running" turn is still running at the first look and has ended at the next: cancelled if the DO
- * asked for that meanwhile (succeeded when its report was accepted first, `too_late`), otherwise
- * succeeded; a `lost` cancel answer never arrives. A demand during the turn arrives at every look,
- * with the waiting starts it names; `dueAfterTurn` arrives right after the turn. */
+ * demand during the turn arrives at every look. */
 async function turn(
   f: Fixture,
   outcome:
@@ -49,15 +45,11 @@ async function turn(
         direct?: boolean;
         payload?: Record<string, unknown>;
       }
-    | { state: "idle" }
-    | { state: "running"; cancel?: "lost" | "too_late" },
-  dueDuringTurn: boolean | WaitingStart[] = false,
-  dueAfterTurn?: WaitingStart[],
+    | { state: "idle" },
+  dueDuringTurn = false,
 ) {
   const input = (await prepareThinStorageLease(f.local, f.node))!;
   let running: NodeBootstrap;
-  let looks = 0;
-  const cancels: unknown[] = [];
   const container = {
     running: true,
     start: vi.fn(),
@@ -66,12 +58,6 @@ async function turn(
       fetch: async (request: Request) => {
         const path = new URL(request.url).pathname;
         if (path === "/") return new Response(null, { status: 401 });
-        if (request.method === "POST" && path === "/v1/turn/cancel") {
-          cancels.push(await request.json());
-          if (outcome.state === "running" && outcome.cancel === "lost")
-            throw new Error("connection_lost");
-          return Response.json({}, { status: 200 });
-        }
         if (
           request.method === "POST" &&
           outcome.state === "failed" &&
@@ -83,28 +69,16 @@ async function turn(
           );
         if (request.method === "POST")
           return Response.json({}, { status: 202 });
-        if (dueDuringTurn)
-          await running.thinStorageDue(
-            f.node,
-            ...(dueDuringTurn === true ? [] : [dueDuringTurn]),
-          );
-        const record =
-          outcome.state !== "running"
-            ? outcome
-            : looks++ === 0
-              ? outcome
-              : cancels.length && outcome.cancel !== "too_late"
-                ? { state: "failed", error_code: "thin_storage_turn_cancelled" }
-                : { state: "succeeded" };
+        if (dueDuringTurn) await running.thinStorageDue(f.node);
         return Response.json(
-          record.state === "idle"
-            ? record
+          outcome.state === "idle"
+            ? outcome
             : {
                 kind: "thin_storage",
                 operation_id: input.lease.operation_id,
                 revision: input.lease.revision,
                 error_code: null,
-                ...record,
+                ...outcome,
               },
         );
       },
@@ -126,7 +100,6 @@ async function turn(
         () => null,
         (value: unknown) => value,
       );
-      if (dueAfterTurn) await running.thinStorageDue(f.node, dueAfterTurn);
       return {
         error: error instanceof Error ? error.message : null,
         alarm: await state.storage.getAlarm(),
@@ -162,7 +135,6 @@ async function turn(
     },
     warnings,
     logs,
-    cancels,
   };
 }
 
@@ -554,166 +526,12 @@ it("keeps transient backoff when another headroom sample requests a turn", async
   expect(alarm).toBe(failed.alarm);
 });
 
-/** A thin database placed on the fixture's node: every later turn input lists it. Its `woken` start
- * is a wake claimed after a turn read it, a generation that turn's report can never carry. */
-async function placed(f: Fixture) {
-  await identityProof(f, {
-    physical: {
-      ...f.authority.physical,
-      free_bytes: 80 * gib,
-      thin_pool: {
-        ...f.authority.physical.thin_pool!,
-        data_total_bytes: 16 * gib,
-      },
-    },
-  });
-  const created = DatabaseWithOperation.parse(
-    await (await f.create()).json(),
-  ).database;
-  await forgetTurns(f);
-  return {
-    read: { database_id: created.id, generation: created.generation },
-    woken: { database_id: created.id, generation: created.generation + 1 },
-  };
-}
-const growth = (f: Fixture) =>
-  env.DB.prepare("UPDATE node_thin_storage SET action_json=? WHERE node_id=?")
-    .bind(
-      JSON.stringify({
-        kind: "grow",
-        state: "pending",
-        nonce: `op_${"y".repeat(20)}`,
-        target_data_bytes: 3 * gib,
-        target_metadata_bytes: f.profile.metadata_bytes,
-        expected_pool_uuid: f.authority.pool_uuid,
-        driver_pod_uid: null,
-        boot_id: null,
-        dispatched_at: null,
-        deadline_at: null,
-      }),
-      f.node,
-    )
-    .run();
-const superseded = (logs: unknown[][]) =>
-  logs
-    .flat()
-    .filter(
-      (value) =>
-        typeof value === "string" &&
-        value.includes('"thin_storage_turn_superseded"'),
-    )
-    .map((value) => JSON.parse(String(value)) as unknown);
-
 it("starts the next turn for demand received during a successful identity turn as soon as 10 s have passed since that turn started", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { woken } = await placed(f);
-  // The demand arrives with the turn's end: there is nothing left to supersede.
-  const done = await turn(f, { state: "succeeded" }, [woken]);
+  const done = await turn(f, { state: "succeeded" }, true);
   expect(done.error).toBeNull();
-  expect(done.cancels).toEqual([]);
   expect(done.alarm).toBeGreaterThanOrEqual(done.started + 10_000);
   expect(done.alarm).toBeLessThanOrEqual(Date.now() + 10_000);
-});
-
-it("a waiting start whose database moved since a running read-only turn read it supersedes that turn at once; one it serves or never read does not", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { read, woken } = await placed(f);
-  // The wake was claimed after the turn read its input: that turn's report can never be accepted.
-  // Another sample's demand right after the turn ended does not push the next turn out by the spacing.
-  const ended = await turn(f, { state: "running" }, [woken], [woken]);
-  expect(ended.cancels).toEqual([ended.fence]);
-  expect(ended.error).toBeNull();
-  // Not a failure: no backoff, no warning, the lease ends and the next turn starts now.
-  expect(ended.failures).toBe(0);
-  expect(ended.warnings).toEqual([]);
-  expect(ended.node).toEqual({
-    status: "ready",
-    error_code: null,
-    lease_id: null,
-  });
-  expect(ended.alarm).not.toBeNull();
-  expect(ended.alarm!).toBeLessThanOrEqual(Date.now());
-  expect(superseded(ended.logs)).toEqual([
-    {
-      event: "thin_storage_turn_superseded",
-      node_id: f.node,
-      turn_ms: expect.any(Number),
-    },
-  ]);
-  // The next turn read the generation the start waits for, and a database the turn never read (one
-  // placed after its input) may still be in an acceptable proof: neither ends it.
-  const served = await turn(f, { state: "running" }, [
-    read,
-    { database_id: "dbelsewhere000000000", generation: 1 },
-  ]);
-  expect(served.cancels).toEqual([]);
-  expect(served.error).toBeNull();
-  expect(served.alarm).toBeGreaterThanOrEqual(served.started + 10_000);
-});
-
-it("a lost cancel answer still ends the turn as superseded once the container's record shows it", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { woken } = await placed(f);
-  const ended = await turn(f, { state: "running", cancel: "lost" }, [woken]);
-  expect(ended.cancels).toEqual([ended.fence]);
-  expect(ended.error).toBeNull();
-  expect(ended.failures).toBe(0);
-  expect(ended.node).toMatchObject({ status: "ready", lease_id: null });
-  expect(superseded(ended.logs)).toHaveLength(1);
-});
-
-it("a turn whose report was accepted before the cancel could end it is a successful turn", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { woken } = await placed(f);
-  const done = await turn(f, { state: "running", cancel: "too_late" }, [woken]);
-  expect(done.cancels).toEqual([done.fence]);
-  expect(done.error).toBeNull();
-  expect(done.failures).toBe(0);
-  expect(superseded(done.logs)).toEqual([]);
-  expect(done.alarm).toBeGreaterThanOrEqual(done.started + 10_000);
-});
-
-it("never supersedes a turn that carries a pool action", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const { woken } = await placed(f);
-  await growth(f);
-  const done = await turn(f, { state: "running" }, [woken]);
-  expect(done.cancels).toEqual([]);
-  expect(done.error).toBeNull();
-  expect(done.failures).toBe(0);
-  expect(done.alarm).toBeGreaterThanOrEqual(done.started + 10_000);
-});
-
-it("a pool action turn recorded as cancelled is an uncertain outcome that blocks the node, never a superseded turn", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  await growth(f);
-  const failed = await turn(f, {
-    state: "failed",
-    error_code: "thin_storage_turn_cancelled",
-  });
-  expect(failed.error).toBe("thin_storage_turn_cancelled");
-  expect(failed.node).toEqual({
-    status: "blocked",
-    error_code: "thin_storage_turn_cancelled",
-    lease_id: failed.fence.operation_id,
-  });
-  expect(superseded(failed.logs)).toEqual([]);
-});
-
-it("records the demand even when its list of waiting starts is unreadable", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const result = await runInDurableObject(stub(f), async (_instance, state) => {
-    await state.storage.put("thinStorageStartedAt", Date.now() - 20_000);
-    await new NodeBootstrap(state, f.local).thinStorageDue(f.node, [
-      { database_id: "not a database", generation: 0 },
-    ]);
-    return {
-      due: await state.storage.get<boolean>("thinStorageDue"),
-      alarm: await state.storage.getAlarm(),
-    };
-  });
-  expect(result.due).toBe(true);
-  expect(result.alarm === null || result.alarm <= Date.now()).toBe(true);
 });
 
 it("a requested turn starts no sooner than 10 s after the previous turn started, a quiet node at once", async () => {
@@ -737,34 +555,6 @@ it("a requested turn starts no sooner than 10 s after the previous turn started,
   });
   expect(quiet.alarm === null || quiet.alarm <= Date.now()).toBe(true);
   expect(quiet.alarm === null || quiet.alarm >= quiet.before - 1000).toBe(true);
-});
-
-it("retries the first failed turn at the spacing when a start was waiting for it, then backs off", async () => {
-  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
-  const fail = () =>
-    turn(
-      f,
-      { state: "failed", error_code: "thin_storage_authority_refused" },
-      true,
-    );
-  // A hold appeared while the turn ran: its proof cannot serve that start, so the next turn follows
-  // as soon as the spacing allows instead of after the 5 s backoff.
-  const first = await fail();
-  expect(first.error).toBeNull();
-  expect(first.failures).toBe(1);
-  expect(first.alarm).toBeGreaterThanOrEqual(first.started + 10_000);
-  expect(first.alarm).toBeLessThanOrEqual(Date.now() + 10_000);
-  const requested = await runInDurableObject(stub(f), (_instance, state) =>
-    state.storage.get<boolean>("thinStorageDue"),
-  );
-  expect(requested).toBe(true);
-  // A turn that keeps failing is not hammered: the backoff doubles as before.
-  const second = await fail();
-  expect(second.failures).toBe(2);
-  expect(second.alarm).toBeGreaterThanOrEqual(second.started + 10_000);
-  const third = await fail();
-  expect(third.failures).toBe(3);
-  expect(third.alarm).toBeGreaterThanOrEqual(third.started + 20_000);
 });
 
 it("asks for an identity turn at once when a thin database is ready without a receipt", async () => {

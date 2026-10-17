@@ -547,10 +547,7 @@ it("asks for an identity turn at every sample while a start waits for a proof, a
   );
   expect(accepted.accepted).toBe(true);
   expect(await turnRequested(f)).toBe(true);
-  // The request names the waiting start, so a running turn that cannot serve it ends.
-  expect(due).toHaveBeenCalledWith(f.node, [
-    { database_id: created.id, generation: created.generation },
-  ]);
+  expect(due).toHaveBeenCalledWith(f.node);
   // A start older than two minutes is a stuck one, not a wait for the next proof.
   const identity = (await readCurrentNodeThinStorage(f.local, f.node))!
     .authority;

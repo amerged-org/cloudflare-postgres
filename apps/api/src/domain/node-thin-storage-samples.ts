@@ -487,8 +487,7 @@ async function productSample(
   let tokens: NodeStorageHeadroomResponse["tokens"];
   let failed = false;
   // A start whose hold waits cannot finish before the next identity proof. Ask while the tokens are
-  // computed; the Durable Object spaces the turns and runs one at a time, and ends a running read-only
-  // turn whose input predates one of these starts, since its report could never be accepted.
+  // computed; the Durable Object spaces the turns and runs one at a time.
   let asked: Promise<void> | undefined;
   if (holds.waiting.length > 0) {
     if (hotLogDue("thin_storage_turn_requested", nodeId))
@@ -500,9 +499,7 @@ async function productSample(
           holds: holds.waiting.length,
         }),
       );
-    asked = requestThinStorageTurn(env, nodeId, holds.waiting).catch(
-      () => undefined,
-    );
+    asked = requestThinStorageTurn(env, nodeId).catch(() => undefined);
   }
   try {
     // The node as the compare-and-set left it: the row read above with exactly the columns the
