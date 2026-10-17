@@ -421,6 +421,26 @@ it("asks for the pool growth turn when free space falls below the reserve and on
   await forgetTurn(f);
 });
 
+it("serves each storage node's room in the desired page", async () => {
+  const f = await thinFixture();
+  const node = async () =>
+    DesiredResponse.parse(
+      await (await request("/agent/v1/desired", f.agent)).json(),
+    ).region.storage_nodes?.find((entry) => entry.node_id === f.node);
+  await physicalSample(f, { dataFree: gib });
+  expect(await node()).toMatchObject({ room: true });
+  await physicalSample(f, { dataFree: 256 * mib });
+  expect(await node()).toMatchObject({ room: false });
+  // A node closed to new databases still has room for the databases it holds.
+  await physicalSample(f, { dataFree: gib });
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET allow_new_databases=0 WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(await node()).toMatchObject({ room: true });
+});
+
 it("places logical quotas against fresh physical thin headroom instead of the old GiB reservation", async () => {
   const f = await thinFixture();
   const first = DatabaseWithOperation.parse(

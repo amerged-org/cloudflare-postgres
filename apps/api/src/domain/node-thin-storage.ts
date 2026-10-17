@@ -22,6 +22,7 @@ import {
   currentStorageStopSql,
   storageDrainReservationStatement,
   thinPoolRoomSql,
+  thinPoolNodeRoomSql,
   knownStorageHoldVolume,
 } from "./storage-capacity.ts";
 
@@ -298,10 +299,11 @@ export async function readRegionThinStorage(
   const [samplingCapable, rows] = await Promise.all([
     thinStorageSamplingProtocolCapable(env.DB, regionId),
     env.DB.prepare(
-      "SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE n.region_id=? ORDER BY n.id",
+      `SELECT t.node_id,EXISTS(SELECT 1 FROM node_storage_observations o WHERE o.node_id=t.node_id AND o.node_uid=t.node_uid AND ${thinPoolNodeRoomSql()}) room
+      FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE n.region_id=? ORDER BY n.id`,
     )
       .bind(regionId)
-      .all<{ node_id: string }>(),
+      .all<{ node_id: string; room: number }>(),
   ]);
   const readings = await Promise.all(
     rows.results.map((row) =>
@@ -314,7 +316,8 @@ export async function readRegionThinStorage(
     const current = readings[index] ?? null;
     snapshots.set(row.node_id, current);
     const proof = current?.authority ?? current?.reclamation;
-    if (proof && samplingCapable) nodes.push(proof);
+    if (proof && samplingCapable)
+      nodes.push({ ...proof, room: row.room === 1 });
   });
   return { nodes, snapshots };
 }

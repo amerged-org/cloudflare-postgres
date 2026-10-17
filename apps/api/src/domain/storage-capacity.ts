@@ -384,16 +384,23 @@ export function thinPoolRoomSql(
     WHERE ${allOf(
       `t.node_id=${node}.id`,
       `t.node_uid=${node}.node_uid`,
-      "t.error_code IS NULL",
-      "json_extract(t.authority_json,'$.pool_uuid') IS NOT NULL",
-      `${sampled("volume_group_uuid")}=t.volume_group_uuid`,
-      freshSampleSql,
-      `${sampledDataFree}>=${field("data_reserve_bytes")}`,
-      `${sampledMetadataFree}>=${field("metadata_reserve_bytes")}`,
+      thinPoolNodeRoomSql(),
       `typeof(${size}.storage_gib)='integer'`,
       `${size}.storage_gib BETWEEN 1 AND ${field("maximum_quota_gib")}`,
       owner,
     )})`;
+}
+/** The node part of the room rule over its thin storage `t` and its latest sample `o`: what the
+ * desired page serves as storage_nodes[].room for the databases the node holds. */
+export function thinPoolNodeRoomSql(): string {
+  return allOf(
+    "t.error_code IS NULL",
+    "json_extract(t.authority_json,'$.pool_uuid') IS NOT NULL",
+    `${sampled("volume_group_uuid")}=t.volume_group_uuid`,
+    freshSampleSql,
+    `${sampledDataFree}>=${field("data_reserve_bytes")}`,
+    `${sampledMetadataFree}>=${field("metadata_reserve_bytes")}`,
+  );
 }
 
 /**
