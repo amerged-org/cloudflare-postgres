@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A complete in-process world around one database on a thick volume for the parked sleep tier's
-//! tests: its Kubernetes objects in the API double, a gateway control and exporter endpoint, and
-//! a PostgreSQL socket. The controller's real code runs against it; nothing here is product code.
+//! A complete in-process world around one database for the power, pool and reconcile tests: its
+//! Kubernetes objects in the API double, a gateway control and exporter endpoint, and a
+//! PostgreSQL socket. The controller's real code runs against it; nothing here is product code.
 use crate::{
     api::DesiredSnapshot,
     contracts::{namespace, present_roles, text},
@@ -998,10 +998,6 @@ pub struct World {
 fn owned_by_cluster() -> Value {
     json!([{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":cluster_uid(),"controller":true}])
 }
-/// The default parked sleep tier policy of a region.
-pub fn parking() -> Value {
-    json!({"enabled":true,"ttl_seconds":600,"max_per_node":8,"postgres_cpu_millicores":10,"postgres_memory_mib":96,"sidecar_cpu_millicores":5,"sidecar_memory_mib":64})
-}
 impl World {
     /// An idle database about to sleep: PostgreSQL runs and answers, its Pod is ready, and the
     /// desired record asks for an idle sleep at generation 2.
@@ -1019,7 +1015,7 @@ impl World {
         running["generation"] = 1.into();
         let ns = namespace(&db);
         let snapshot = DesiredSnapshot {
-            region: json!({"id":"eu-test","backup":{"bucket":"native-controller-test","endpoint_url":"https://backup.example.invalid","region":"auto"},"scheduling":{"placement_mode":"actual_ram","maximum_database_memory_mib":256,"postgres_memory_request_mib":128},"parking":parking()}),
+            region: json!({"id":"eu-test","backup":{"bucket":"native-controller-test","endpoint_url":"https://backup.example.invalid","region":"auto"},"scheduling":{"placement_mode":"actual_ram","maximum_database_memory_mib":256,"postgres_memory_request_mib":128}}),
             fleet_release: json!({"region_id":"eu-test","region_revision":1,"release":{"id":"r1","spec_sha256":"b".repeat(64),"approved_at":"2026-10-15T00:00:00.000Z","spec":{}},"nodes":[{"node_id":"nod_aaaaaaaaaaaaaaaaaaaa","node_uid":node_uid(),"k8s_node_name":NODE,"role":"customer","revision":3}]}),
             databases: vec![],
         };
@@ -1099,24 +1095,6 @@ impl World {
         world.start_postgres().await;
         world.suspend_idle();
         world
-    }
-    /// The controller reads every object it needs, as it does when the watch cannot vouch for any
-    /// of them: for the tests that pin how those reads are made.
-    pub fn cold(&self) {
-        self.server.k8s.recall_nothing();
-    }
-    /// How many requests the Kubernetes double has received so far: where `made` starts from.
-    pub fn mark(&self) -> usize {
-        self.server.state.lock().unwrap().requests.len()
-    }
-    /// Every request the Kubernetes double received since `from`, as (method, path, query).
-    pub fn made(&self, from: usize) -> Vec<(String, String, String)> {
-        let state = self.server.state.lock().unwrap();
-        state.requests[from..]
-            .iter()
-            .zip(&state.queries[from..])
-            .map(|((method, path), query)| (method.clone(), path.clone(), query.clone()))
-            .collect()
     }
     /// The instance Pod as CNPG leaves it: ready with PostgreSQL running, or fenced and not ready.
     pub fn pod(&self, ready: bool) {
@@ -1321,143 +1299,9 @@ impl World {
         }
         self.db["generation"] = (self.db["generation"].as_u64().unwrap() + 1).into();
     }
-    /// One pass of the sleep step, the retained Pod judged against what a reconcile would apply.
+    /// One pass of the sleep step of the database's own Cluster.
     pub async fn sleep_pass(&self) -> Option<Value> {
-        let cluster = self.server.get("Cluster", Some(&self.ns), "database");
-        let retained = self
-            .reconciler
-            .retained_manifests(&self.db, &self.snapshot, cluster.as_ref(), false)
-            .await;
-        self.sleep_with(retained.manifests.as_deref(), retained.runtime_class)
-            .await
-    }
-    /// One pass of the sleep step against the given manifests (`None`: they cannot be built).
-    pub async fn sleep_with(
-        &self,
-        manifests: Option<&[Value]>,
-        runtime_class: &str,
-    ) -> Option<Value> {
-        self.reconciler
-            .power
-            .suspend(
-                &self.db,
-                &crate::power::Sleep {
-                    parking: &self.snapshot.region["parking"],
-                    basis: crate::power::Basis {
-                        node: &self.node,
-                        release: &self.snapshot.fleet_release,
-                        manifests,
-                        runtime_class,
-                    },
-                    slot: None,
-                },
-            )
-            .await
-            .unwrap()
-    }
-    /// What the kubelet does to the instance Pod and CNPG to its Cluster once PostgreSQL runs: the
-    /// Pod and its `postgres` container report Ready, and the Cluster status is written again.
-    /// Each is a new version of the object, as every write is.
-    pub fn kubelet_ready_now(&self) -> Arc<dyn Fn() + Send + Sync> {
-        let state = self.server.state.clone();
-        let pod = crate::test_server::path("Pod", Some(&self.ns), "database-1");
-        let cluster = crate::test_server::path("Cluster", Some(&self.ns), "database");
-        let log = self.log.clone();
-        Arc::new(move || {
-            let mut state = state.lock().unwrap();
-            let bump = |value: &mut Value| {
-                let version: u64 = value["metadata"]["resourceVersion"]
-                    .as_str()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1);
-                value["metadata"]["resourceVersion"] = (version + 1).to_string().into();
-            };
-            if let Some(pod) = state.objects.get_mut(&pod) {
-                pod["status"]["conditions"] = json!([{"type":"Ready","status":"True"}]);
-                pod["status"]["containerStatuses"][0]["ready"] = true.into();
-                bump(pod);
-            }
-            if let Some(cluster) = state.objects.get_mut(&cluster) {
-                bump(cluster);
-            }
-            state.sync();
-            log.lock().unwrap().push("KUBELET ready".into());
-        })
-    }
-    /// The watch events of every write the cluster committed since the last call, delivered to
-    /// the controller's watch as the API server sends them, and the databases they hint for
-    /// reconciliation. Afterwards the watch's picture of the objects is the current one again, as
-    /// a watch without lag has it.
-    pub fn watch_delivers(&self) -> Vec<String> {
-        let events = std::mem::take(&mut self.server.state.lock().unwrap().events);
-        let hints = events
-            .iter()
-            .filter(|(kind, _)| crate::kubernetes::RUNTIME_WATCH_KINDS.contains(&kind.as_str()))
-            .filter_map(|(kind, event)| {
-                self.reconciler
-                    .k8s
-                    .watch_event(kind, event)
-                    .unwrap()
-                    .1
-                    .map(|candidate| candidate.trigger.database)
-            })
-            .collect();
-        self.server.state.lock().unwrap().sync();
-        hints
-    }
-    /// Changes the instance Pod the way `change` says, as a new version of it.
-    pub fn change_pod(
-        &self,
-        change: impl Fn(&mut Value) + Send + Sync + 'static,
-    ) -> Arc<dyn Fn() + Send + Sync> {
-        let state = self.server.state.clone();
-        let pod = crate::test_server::path("Pod", Some(&self.ns), "database-1");
-        Arc::new(move || {
-            let mut state = state.lock().unwrap();
-            if let Some(pod) = state.objects.get_mut(&pod) {
-                change(pod);
-                let version: u64 = pod["metadata"]["resourceVersion"]
-                    .as_str()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1);
-                pod["metadata"]["resourceVersion"] = (version + 1).to_string().into();
-            }
-            state.sync();
-        })
-    }
-    /// A rolling update replaced the gateway Pod: same name, new identity.
-    pub fn replace_gateway(&self) {
-        let next = uid(21_000 + self.log.lock().unwrap().len() as u64);
-        *self.gateway.pod.lock().unwrap() = next.clone();
-        self.server.edit("Pod", Some(SYSTEM), "gateway-0", |pod| {
-            pod["metadata"]["uid"] = next.clone().into();
-        });
-    }
-    /// Short confirmation windows keep negative cases fast.
-    pub fn quick(&mut self) {
-        self.reconciler.power.stop_budget = std::time::Duration::from_millis(300);
-        self.reconciler.accept_budget = std::time::Duration::from_millis(600);
-    }
-    /// PostgreSQL stops the way CNPG's fence stops it: the socket refuses, the exporter says
-    /// fenced, and the Pod is not ready.
-    pub fn stopped(&self) {
-        self.stop_postgres();
-        self.gateway.fenced(true);
-        self.pod(false);
-    }
-    /// A database that went through a complete idle sleep into the parked tier.
-    pub async fn parked() -> Self {
-        let mut w = Self::awake().await;
-        w.quick();
-        assert!(w.sleep_pass().await.is_none(), "the first pass fences");
-        w.stopped();
-        let observed = w.sleep_pass().await.expect("a parked observation");
-        assert_eq!(
-            observed["power"]["parked"]["pod_uid"],
-            pod_uid(),
-            "{observed}"
-        );
-        w
+        self.reconciler.power.suspend(&self.db, None).await.unwrap()
     }
 }
 
@@ -1497,13 +1341,11 @@ impl World {
     /// and one free pool slot: what a pool wake starts from. The sleep is at generation 2.
     pub async fn pooled() -> Self {
         let mut w = Self::awake().await;
-        w.quick();
         w.reconciler.pool.start_budget = std::time::Duration::from_secs(2);
         w.reconciler.power.attach.client =
             crate::attach_protocol::Client::new(w.gateway.client.clone());
         w.reconciler.pool.intake.http = w.gateway.client.clone();
         w.thin();
-        w.snapshot.region["parking"] = Value::Null;
         w.admitted();
         // The sleep of its own Cluster: proved, hibernated by CNPG, recorded.
         assert!(

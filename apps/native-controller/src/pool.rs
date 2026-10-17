@@ -15,7 +15,7 @@ use crate::{
     intake::Intake,
     kubernetes::Kubernetes,
     manifests,
-    power::{Basis, GatewayPod, GatewaySnapshot, PowerCoordinator, PowerIntent, Sleep, SlotSleep},
+    power::{GatewayPod, GatewaySnapshot, PowerCoordinator, PowerIntent, SlotSleep},
     reconcile::Reconciler,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -2052,7 +2052,6 @@ impl Pool {
         &self,
         rec: &Reconciler,
         db: &Value,
-        snapshot: &DesiredSnapshot,
         serving: Serving,
     ) -> Result<Option<Value>, Error> {
         let id = text(db, "id");
@@ -2061,22 +2060,13 @@ impl Pool {
         }
         let ns = slot_namespace(&serving.slot);
         let socket = self.socket(&serving.pod.ip)?;
-        let sleep = |gone: bool| Sleep {
-            parking: &Value::Null,
-            basis: Basis {
-                node: &Value::Null,
-                release: &snapshot.fleet_release,
-                manifests: None,
-                runtime_class: "",
-            },
-            slot: Some(SlotSleep {
-                pod: socket,
-                tls_name: slot_tls_name(&ns),
-                gone,
-            }),
+        let sleep = |gone: bool| SlotSleep {
+            pod: socket,
+            tls_name: slot_tls_name(&ns),
+            gone,
         };
         if serving.retire.is_none() {
-            let observed = rec.power.suspend(db, &sleep(false)).await?;
+            let observed = rec.power.suspend(db, Some(&sleep(false))).await?;
             if observed.is_some() {
                 return Ok(observed);
             }
@@ -2088,7 +2078,7 @@ impl Pool {
         if !self.unwind(rec, id, Some(db)).await? {
             return Ok(None);
         }
-        rec.power.suspend(db, &sleep(true)).await
+        rec.power.suspend(db, Some(&sleep(true))).await
     }
 
     /// What the pool does next for its free slots, at `now`: slots to create and to delete. A

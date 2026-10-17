@@ -616,8 +616,6 @@ fn legacy_binding(w: &World) -> String {
 async fn a_pool_miss_holds_the_client_until_the_database_s_own_cluster_is_released() {
     // A database without thin storage slept through its own Cluster: a pool miss.
     let mut w = World::awake().await;
-    w.quick();
-    w.snapshot.region["parking"] = Value::Null;
     w.admitted();
     assert!(
         w.sleep_pass().await.is_none(),

@@ -333,7 +333,7 @@ fn reconcile_failure_delay(attempt: u32) -> Duration {
     }
 }
 /// The delay after a failed reconcile of `error`. A runtime proof that changed while its target was
-/// published is a race with the kubelet's status of the Pod the wake resumed and is met by another
+/// published is a race with the kubelet's status of the woken Pod and is met by another
 /// pass at once, up to four times; a proof that keeps changing is a fault and backs off.
 fn reconcile_retry(error: &Error, attempt: u32) -> Duration {
     if attempt <= 4 && error_code(error).starts_with("runtime_proof_changed_") {
@@ -412,13 +412,6 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u
         } else {
             Duration::from_secs(1)
         };
-}
-/// How soon after a wake that was published on the barrier alone the pass that makes the checks
-/// it left to that pass is made.
-const FOLLOWUP: Duration = Duration::from_secs(1);
-/// Makes the pass over `cell` that follows a wake published on the barrier due.
-fn followed_up(cell: &mut Cell, now: Instant) {
-    cell.due = cell.due.min(now + FOLLOWUP);
 }
 /// Selects due work for the free slots; `busy` maps each running job to its class.
 /// Wakes come first, then routine reconciliation. Routine work never
@@ -950,12 +943,7 @@ async fn run() -> Result<(), Error> {
                                 continue;
                             }
                             match result {
-                                Ok(observed) => {
-                                    settle(cell, started, observed.as_ref(), marker);
-                                    if controller.take_followup(&id) {
-                                        followed_up(cell, Instant::now());
-                                    }
-                                }
+                                Ok(observed) => settle(cell, started, observed.as_ref(), marker),
                                 Err(error) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
@@ -1567,21 +1555,6 @@ mod tests {
         assert_eq!(line.as_object().unwrap().len(), 3, "{line}");
     }
     #[test]
-    fn a_wake_published_on_the_barrier_is_followed_by_a_full_pass_a_moment_later() {
-        // The wake did not prove the roles, the archive or stamp the manifests: the pass that
-        // does is due a second after the wake, not a minute.
-        let now = Instant::now();
-        let mut woken = cell(json!({"id":"db","generation":3}), now, true);
-        settle(&mut woken, now, Some(&json!({"state":"ready"})), 0);
-        assert_eq!(woken.due, now + Duration::from_secs(60));
-        followed_up(&mut woken, now);
-        assert_eq!(woken.due, now + Duration::from_secs(1));
-        // A pass that is due sooner than that stays so.
-        woken.due = now;
-        followed_up(&mut woken, now);
-        assert_eq!(woken.due, now);
-    }
-    #[test]
     fn a_wake_that_waits_for_a_proof_polls_each_second_for_a_minute_and_then_backs_off() {
         // The cold wake of a thin database waited 30 s for the node's next identity proof although
         // the proof was accepted 18 s into the wait: the passes CNPG's Pod changes had caused
@@ -1647,9 +1620,9 @@ mod tests {
     }
     #[test]
     fn a_proof_that_changed_while_its_target_was_published_is_retried_at_once() {
-        // The kubelet's status of a resumed Pod arrives between forming the runtime proof and
-        // publishing its target: live that failed a parked wake twice in a row and the second
-        // failure waited the 2 s step (4.5 s and 4.8 s against 2.2 s).
+        // The kubelet's status of a woken Pod arrives between forming the runtime proof and
+        // publishing its target: live that failed a wake twice in a row and the second failure
+        // waited the 2 s step (4.5 s and 4.8 s against 2.2 s).
         let raced: Error = "runtime proof changed during target publication".into();
         let other: Error = "something else failed".into();
         let at_once: Vec<_> = (1..=4)

@@ -22,52 +22,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 type LoseReply = Box<dyn Fn(&str, &Value) -> bool + Send>;
-type Matching = Box<dyn Fn(&str, &str) -> bool + Send>;
 type RefuseWrite = Box<dyn Fn(&str, &Value) -> Option<u16> + Send>;
-type RefuseRead = Box<dyn Fn(&str) -> Option<u16> + Send>;
 type DuringText = Box<dyn FnOnce(&mut BTreeMap<String, Value>) + Send>;
-/// How long a read waits in a `Gate` for the others of its group before it gives up.
-const GATE_WAIT: Duration = Duration::from_millis(300);
-/// Holds the requests (method, path) it matches until `want` of them wait together, and then lets
-/// that group go: a test sees whether a group of requests was issued at once. Requests issued one
-/// after another never fill a group, and each of them gives up after `GATE_WAIT`; the gate counts
-/// the groups it let go and the requests that gave up.
-pub struct Gate {
-    matching: Matching,
-    want: usize,
-    /// Matching requests that pass before the gate holds the first.
-    skip: usize,
-    /// The gate stops matching once it let one group go.
-    once: bool,
-    waiting: usize,
-    generation: u64,
-    pub rounds: usize,
-    pub gave_up: usize,
-}
-impl Gate {
-    pub fn new(want: usize, matching: impl Fn(&str, &str) -> bool + Send + 'static) -> Self {
-        Self {
-            matching: Box::new(matching),
-            want,
-            skip: 0,
-            once: false,
-            waiting: 0,
-            generation: 0,
-            rounds: 0,
-            gave_up: 0,
-        }
-    }
-    /// Lets the first `requests` matching requests pass before it holds any.
-    pub fn after(mut self, requests: usize) -> Self {
-        self.skip = requests;
-        self
-    }
-    /// Holds one group only: what matches after it is let go goes through.
-    pub fn once(mut self) -> Self {
-        self.once = true;
-        self
-    }
-}
 #[derive(Default)]
 pub struct State {
     pub objects: BTreeMap<String, Value>,
@@ -87,19 +43,9 @@ pub struct State {
     pub patch_types: Vec<(String, String)>,
     /// A write for which this returns a status is refused with it and never committed.
     pub refuse: Option<RefuseWrite>,
-    /// A read for which this returns a status fails with it.
-    pub refuse_read: Option<RefuseRead>,
-    /// The kubelet leaves an accepted Pod resize pending with this reason (`Deferred` or
-    /// `Infeasible`) instead of actuating it.
-    pub resize_pending: Option<String>,
-    /// The kubelet accepted a Pod resize and is still actuating it: the containers keep reporting
-    /// the requests they had, under a `PodResizeInProgress` condition.
-    pub resize_in_progress: bool,
     /// Every committed write as one line, appended to a log other doubles also write to, so a
     /// test can assert the order of effects across the cluster, the gateway and PostgreSQL.
     pub log: Option<Arc<Mutex<Vec<String>>>>,
-    /// Holds requests until a group of them is issued together.
-    pub gate: Option<Gate>,
     /// The first committed PATCH or DELETE matching (path, body) closes the connection without a
     /// reply.
     pub lose: Option<LoseReply>,
@@ -113,13 +59,6 @@ pub struct State {
     pub write_reply_delay: Option<Duration>,
     /// The open metadata watches: the collection each is of and the events it has yet to send.
     pub streams: Vec<(String, VecDeque<Value>)>,
-    /// Every request is answered this long after it arrived, so that requests issued together are
-    /// answered together and requests that wait for an answer are counted as rounds.
-    pub latency: Option<Duration>,
-    /// The number of sequential rounds the requests made so far needed: a request arrives one
-    /// round after the deepest request that had been answered before it arrived. Requests that
-    /// were in flight together are one round.
-    pub rounds: u64,
     serial: u64,
 }
 impl State {
@@ -253,9 +192,6 @@ fn handle(
     }
     match method {
         "GET" => {
-            if let Some(status) = state.refuse_read.as_ref().and_then(|refuse| refuse(path)) {
-                return reply(status, &json!({"reason":"Refused"}));
-            }
             if let Some(text) = state.texts.get(path).cloned() {
                 if let Some(during) = state.during_text.take() {
                     during(&mut state.objects);
@@ -325,33 +261,13 @@ fn handle(
                 return reply(409, &json!({"reason":"Conflict"}));
             }
             strategic_merge(&mut current, &patch);
-            let mut conditions: Vec<Value> = current["status"]["conditions"]
+            let conditions: Vec<Value> = current["status"]["conditions"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|c| c["type"] != "PodResizePending" && c["type"] != "PodResizeInProgress")
                 .collect();
-            if state.resize_in_progress {
-                // The spec changed and the kubelet is on it: the statuses report what is still
-                // actuated.
-                conditions.push(json!({"type":"PodResizeInProgress","status":"True"}));
-                current["status"]["conditions"] = conditions.into();
-                advance(&mut current);
-                state.objects.insert(target.into(), current.clone());
-                queue_event(state, "MODIFIED", &current);
-                return committed(state, method, path, patch, &current);
-            }
-            if let Some(reason) = state.resize_pending.clone() {
-                // The kubelet cannot allocate the new requests: the spec changed, the statuses
-                // report what is still actuated, and the Pod says why.
-                conditions.push(json!({"type":"PodResizePending","status":"True","reason":reason}));
-                current["status"]["conditions"] = conditions.into();
-                advance(&mut current);
-                state.objects.insert(target.into(), current.clone());
-                queue_event(state, "MODIFIED", &current);
-                return committed(state, method, path, patch, &current);
-            }
             current["status"]["conditions"] = conditions.into();
             // The kubelet actuates an accepted resize at once: what the containers' statuses
             // report follows the new requests.
@@ -575,54 +491,6 @@ impl Server {
                         let _ = tls.shutdown().await;
                         return;
                     }
-                    // The round this request is in: one more than the deepest request answered
-                    // before it arrived.
-                    let (round, latency) = {
-                        let state = state.lock().unwrap();
-                        (state.rounds + 1, state.latency)
-                    };
-                    // A request the gate matches waits for the others of its group.
-                    let mut held = None;
-                    {
-                        let mut state = state.lock().unwrap();
-                        if let Some(gate) = state.gate.as_mut()
-                            && !(gate.once && gate.rounds > 0)
-                            && (gate.matching)(&method, &path)
-                            && (gate.skip == 0 || {
-                                gate.skip -= 1;
-                                false
-                            })
-                        {
-                            gate.waiting += 1;
-                            if gate.waiting >= gate.want {
-                                gate.rounds += 1;
-                                gate.waiting = 0;
-                                gate.generation += 1;
-                            } else {
-                                held = Some(gate.generation);
-                            }
-                        }
-                    }
-                    if let Some(generation) = held {
-                        let deadline = Instant::now() + GATE_WAIT;
-                        loop {
-                            {
-                                let mut state = state.lock().unwrap();
-                                let Some(gate) = state.gate.as_mut() else {
-                                    break;
-                                };
-                                if gate.generation != generation {
-                                    break;
-                                }
-                                if Instant::now() >= deadline {
-                                    gate.waiting = gate.waiting.saturating_sub(1);
-                                    gate.gave_up += 1;
-                                    break;
-                                }
-                            }
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                    }
                     let (response, delay) = {
                         let mut state = state.lock().unwrap();
                         state.requests.push((method.clone(), path.clone()));
@@ -642,15 +510,8 @@ impl Server {
                     let Some((status, body)) = response else {
                         return;
                     };
-                    if let Some(latency) = latency {
-                        tokio::time::sleep(latency).await;
-                    }
                     if let Some(delay) = delay {
                         tokio::time::sleep(delay).await;
-                    }
-                    {
-                        let mut state = state.lock().unwrap();
-                        state.rounds = state.rounds.max(round);
                     }
                     tls.write_all(
                         format!(
@@ -720,20 +581,6 @@ impl Server {
         state.objects.insert(at, object.clone());
         queue_event(&mut state, "MODIFIED", &object);
         state.sync();
-    }
-    /// A write by someone else whose event the controller's watch has not delivered yet: the
-    /// object is at its next version, and the watch still holds the one before.
-    pub fn external_write_unseen(
-        &self,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        edit: impl FnOnce(&mut Value),
-    ) {
-        let mut state = self.state.lock().unwrap();
-        let object = state.objects.get_mut(&path(kind, namespace, name)).unwrap();
-        edit(object);
-        advance(object);
     }
     pub fn get(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<Value> {
         self.state

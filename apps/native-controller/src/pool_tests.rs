@@ -1567,11 +1567,9 @@ mod world {
     #[tokio::test]
     async fn the_cnpg_sleep_waits_for_the_holder_release_while_the_node_agent_is_not_ready() {
         let mut w = World::awake().await;
-        w.quick();
         w.reconciler.power.attach.client =
             crate::attach_protocol::Client::new(w.gateway.client.clone());
         w.thin();
-        w.snapshot.region["parking"] = Value::Null;
         w.gateway
             .agent
             .lock()
@@ -1581,17 +1579,7 @@ mod world {
         assert!(w.sleep_pass().await.is_none());
         w.hibernated_by_cnpg();
         agent_ready(&w, false);
-        let sleep = crate::power::Sleep {
-            parking: &Value::Null,
-            basis: crate::power::Basis {
-                node: &w.node,
-                release: &w.snapshot.fleet_release,
-                manifests: None,
-                runtime_class: "",
-            },
-            slot: None,
-        };
-        let observed = w.reconciler.power.suspend(&w.db, &sleep).await;
+        let observed = w.reconciler.power.suspend(&w.db, None).await;
         assert!(
             !observed
                 .as_ref()
@@ -1662,11 +1650,9 @@ mod world {
     async fn the_cnpg_sleep_writes_the_sleep_record_and_releases_the_holder_after_the_pod_is_gone()
     {
         let mut w = World::awake().await;
-        w.quick();
         w.reconciler.power.attach.client =
             crate::attach_protocol::Client::new(w.gateway.client.clone());
         w.thin();
-        w.snapshot.region["parking"] = Value::Null;
         w.gateway
             .agent
             .lock()

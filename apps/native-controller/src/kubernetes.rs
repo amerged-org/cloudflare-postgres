@@ -90,9 +90,9 @@ pub const RUNTIME_WATCH_KINDS: [&str; 8] = [
     "Secret",
     "ConfigMap",
 ];
-/// The kinds the wake of a parked database proves unchanged without reading them: the manifests
-/// it applies that the runtime watches above do not cover, and the volume of the claim. Their
-/// watches only keep track of versions; no change of them hints a database, as none did before.
+/// The kinds of the manifests a pass applies that the runtime watches above do not cover, and the
+/// volume of the claim: reads of them are answered from what the watch holds. Their watches only
+/// keep track of versions; no change of them hints a database.
 pub const PLAN_WATCH_KINDS: [&str; 7] = [
     "ResourceQuota",
     "LimitRange",
@@ -367,13 +367,6 @@ impl WatchContinuity {
             .iter()
             .all(|kind| self.watching(kind))
             .then(|| (self.controller_epoch.clone(), self.epoch))
-    }
-    /// The kinds the runtime proof needs a current watch of that have none.
-    fn unwatched(&self) -> Vec<&'static str> {
-        RUNTIME_WATCH_KINDS
-            .into_iter()
-            .filter(|kind| !self.watching(kind))
-            .collect()
     }
     /// Remembers that this controller wrote `object`, as the write answered, over the version
     /// `before`. A write that changed nothing answers the version it was made over and leaves no
@@ -665,10 +658,6 @@ impl Kubernetes {
     pub fn runtime_continuity(&self) -> Option<(String, u64)> {
         self.continuity.lock().unwrap().snapshot()
     }
-    /// The kinds without a current watch, which keep a parked wake from being published on the barrier.
-    pub fn runtime_unwatched(&self) -> Vec<&'static str> {
-        self.continuity.lock().unwrap().unwatched()
-    }
     /// What one event of a metadata watch of `kind` makes of the watch: the revision it stands at
     /// and the database it hints. An event for a version this controller wrote itself hints no
     /// database.
@@ -693,12 +682,6 @@ impl Kubernetes {
     #[cfg(test)]
     pub(crate) fn watch_ends(&self, kind: &str) {
         self.continuity.lock().unwrap().gap(kind);
-    }
-    /// From now on no read is answered from memory: every read is made, as when the watch cannot
-    /// vouch for any object.
-    #[cfg(test)]
-    pub(crate) fn recall_nothing(&self) {
-        self.continuity.lock().unwrap().recalling = false;
     }
     /// How long a change is held back before it hints, for a test that makes the answer of a write
     /// trail its event by a time of its own.

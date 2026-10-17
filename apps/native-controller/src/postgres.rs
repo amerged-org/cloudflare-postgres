@@ -192,32 +192,29 @@ fn probe_identity_current(
                 actual_address.parse::<std::net::IpAddr>().ok() == Some(expected)
             })
 }
-/// Where a role's login dials: the tenant's Service, or the instance Pod itself.
-enum Route {
-    /// The tenant's Service by name, or the given socket in its place.
-    Service(Option<SocketAddr>),
-    Pod(SocketAddr),
-}
-/// Every role logs in through the tenant's Service (`socket` is `None`), one after the other.
+/// Every role logs in through the tenant's Service (`socket` is `None`, or the socket in its
+/// place), one after the other, and the catalogs hold each as the record states it.
 pub async fn roles(
     db: &Value,
     ca: &[u8],
     primary_address: &str,
     socket: Option<SocketAddr>,
 ) -> Result<bool, Error> {
-    roles_at(db, ca, primary_address, Route::Service(socket), None).await
-}
-/// Every role logs in to the instance Pod itself, concurrently: the kubelet's readiness, and so
-/// the Service's endpoint, is not awaited. `maintenance` is a session of the maintenance role the
-/// caller holds on that Pod, in which the attributes are read instead of in one of their own.
-pub async fn roles_pod(
-    db: &Value,
-    ca: &[u8],
-    primary_address: &str,
-    socket: SocketAddr,
-    maintenance: Option<&Session>,
-) -> Result<bool, Error> {
-    roles_at(db, ca, primary_address, Route::Pod(socket), maintenance).await
+    if text(db, "desired_state") != "running" {
+        return Ok(false);
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        db["roles"].as_array().ok_or("roles unavailable")?;
+        // A role awaiting removal has no credential to log in with.
+        let roles: Vec<&Value> = present_roles(db).collect();
+        for role in &roles {
+            if !role_current(db, ca, primary_address, socket, role).await? {
+                return Ok::<bool, Error>(false);
+            }
+        }
+        attributes_current(db, ca, socket, &roles).await
+    })
+    .await?
 }
 /// A session of the maintenance role; `socket` as for `connect_via`.
 pub async fn maintenance(
@@ -310,32 +307,28 @@ fn too_many_connections(error: &Error) -> bool {
         .and_then(|error| error.code())
         .is_some_and(|code| *code == tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS)
 }
-/// A session of `role` on the route the logins of the database take.
+/// A session of `role` through the tenant's Service, or `socket` in its place.
 async fn open_on(
     db: &Value,
     ca: &[u8],
-    route: &Route,
+    socket: Option<SocketAddr>,
     role: &str,
     password: &str,
 ) -> Result<Session, Error> {
-    let database = text(db, "id");
-    match route {
-        Route::Service(socket) => connect_via(db, ca, role, password, database, *socket).await,
-        Route::Pod(socket) => connect_via(db, ca, role, password, database, Some(*socket)).await,
-    }
+    connect_via(db, ca, role, password, text(db, "id"), socket).await
 }
 /// A role's login, its server settings and its privileges against the desired state.
 async fn role_current(
     db: &Value,
     ca: &[u8],
     primary_address: &str,
-    route: &Route,
+    socket: Option<SocketAddr>,
     role: &Value,
 ) -> Result<bool, Error> {
     if expiring(role, SystemTime::now()) {
         return Ok(true);
     }
-    let session = match open_on(db, ca, route, text(role, "name"), text(role, "password")).await {
+    let session = match open_on(db, ca, socket, text(role, "name"), text(role, "password")).await {
         Ok(session) => session,
         // The credential was accepted: PostgreSQL refuses a role at its limit afterwards.
         Err(error) if role.get("connection_limit").is_some() && too_many_connections(&error) => {
@@ -451,9 +444,8 @@ async fn catalog_holds(session: &Session, role: &Value) -> Result<bool, Error> {
 async fn attributes_current(
     db: &Value,
     ca: &[u8],
-    route: &Route,
+    socket: Option<SocketAddr>,
     roles: &[&Value],
-    held: Option<&Session>,
 ) -> Result<bool, Error> {
     // The owner is the application's bootstrap role, not a role CNPG manages.
     let managed: Vec<&&Value> = roles.iter().filter(|role| role["owner"] != true).collect();
@@ -463,62 +455,20 @@ async fn attributes_current(
     if db["maintenance"].is_null() {
         return Ok(false);
     }
-    let opened;
-    let session = match held {
-        Some(session) => session,
-        None => {
-            opened = open_on(
-                db,
-                ca,
-                route,
-                text(&db["maintenance"], "role"),
-                text(&db["maintenance"], "password"),
-            )
-            .await?;
-            &opened
-        }
-    };
+    let session = open_on(
+        db,
+        ca,
+        socket,
+        text(&db["maintenance"], "role"),
+        text(&db["maintenance"], "password"),
+    )
+    .await?;
     for role in managed {
-        if !catalog_holds(session, role).await? {
+        if !catalog_holds(&session, role).await? {
             return Ok(false);
         }
     }
     Ok(true)
-}
-async fn roles_at(
-    db: &Value,
-    ca: &[u8],
-    primary_address: &str,
-    route: Route,
-    maintenance: Option<&Session>,
-) -> Result<bool, Error> {
-    if text(db, "desired_state") != "running" {
-        return Ok(false);
-    }
-    tokio::time::timeout(Duration::from_secs(20), async {
-        db["roles"].as_array().ok_or("roles unavailable")?;
-        // A role awaiting removal has no credential to log in with.
-        let roles: Vec<&Value> = present_roles(db).collect();
-        if matches!(route, Route::Pod(_)) {
-            let all = futures_util::future::try_join_all(
-                roles
-                    .iter()
-                    .map(|role| role_current(db, ca, primary_address, &route, role)),
-            )
-            .await?;
-            if !all.into_iter().all(|ok| ok) {
-                return Ok::<bool, Error>(false);
-            }
-        } else {
-            for role in &roles {
-                if !role_current(db, ca, primary_address, &route, role).await? {
-                    return Ok(false);
-                }
-            }
-        }
-        attributes_current(db, ca, &route, &roles, maintenance).await
-    })
-    .await?
 }
 /// A role's own view of the server: user, version, settings, database and the address it was
 /// reached at (`host()`: the cast of an `inet` to `text` keeps the netmask, which no Pod address
@@ -543,8 +493,8 @@ pub(crate) const SESSIONS_QUERY: &str = "SELECT count(*) FROM pg_catalog.pg_stat
 /// functions answer any role.
 pub const SERVER_IDENTITY_QUERY: &str = "SELECT (SELECT system_identifier FROM pg_catalog.pg_control_system())::pg_catalog.text AS system_identifier,
  (SELECT timeline_id FROM pg_catalog.pg_control_checkpoint())::pg_catalog.int4 AS timeline";
-/// The readiness of a resumed Pod by SQL: its database and TLS, whether it is a primary, which
-/// Pod answers, how long ago its postmaster started on the server's own clock, and the data
+/// The readiness of a started PostgreSQL by SQL: its database and TLS, whether it is a primary,
+/// which Pod answers, how long ago its postmaster started on the server's own clock, and the data
 /// directory it runs on (see `SERVER_IDENTITY_QUERY`).
 pub const ACCEPTING_QUERY: &str = "SELECT pg_catalog.current_database() AS database,
  pg_catalog.pg_is_in_recovery() AS recovery,
@@ -732,16 +682,6 @@ mod tests {
             .await
             .unwrap();
         assert!(all, "every role of the Pod logs in");
-        let concurrently = roles_pod(
-            &w.db,
-            w.authority.pem.as_bytes(),
-            POD_IP,
-            socket.unwrap(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(concurrently);
         // Another Pod answering is not this one.
         assert!(
             !roles(&w.db, w.authority.pem.as_bytes(), "10.0.0.99", socket)
@@ -1009,57 +949,6 @@ mod tests {
             .iter()
             .any(|line| line.contains(needle))
     }
-    /// The attributes of the roles are read in the maintenance session the caller already holds:
-    /// the roles log in on their own credentials and nothing logs in once more for the catalogs.
-    #[tokio::test]
-    async fn the_attributes_are_read_in_the_session_the_caller_holds() {
-        let w =
-            world_with_role(serde_json::json!({"connection_limit":5,"member_of":["reader_query"]}))
-                .await;
-        let socket = w.reconciler.power.postgres.unwrap();
-        let logins = |w: &crate::test_world::World, user: &str| {
-            w.log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|line| *line == &format!("LOGIN {user}"))
-                .count()
-        };
-        let held = maintenance(&w.db, w.authority.pem.as_bytes(), Some(socket))
-            .await
-            .unwrap();
-        assert_eq!(logins(&w, "pgcf_maintenance"), 1);
-        assert!(
-            roles_pod(
-                &w.db,
-                w.authority.pem.as_bytes(),
-                crate::test_world::POD_IP,
-                socket,
-                Some(&held)
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            logins(&w, "pgcf_maintenance"),
-            1,
-            "the catalogs are read in the session held"
-        );
-        assert!(log_has(&w, "role attributes report_job"));
-        // Without one, the roles open their own.
-        assert!(
-            roles_pod(
-                &w.db,
-                w.authority.pem.as_bytes(),
-                crate::test_world::POD_IP,
-                socket,
-                None
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(logins(&w, "pgcf_maintenance"), 2);
-    }
     /// A role that bypasses row security is verified by its own view of its privileges: it must
     /// bypass exactly where the record says, and a plain role must not.
     #[tokio::test]
@@ -1247,7 +1136,7 @@ mod tests {
         );
         assert!(!log_has(&w, "role memberships"));
     }
-    /// A role awaiting removal has no credential: no login is attempted for it, on either route.
+    /// A role awaiting removal has no credential: no login is attempted for it.
     #[tokio::test]
     async fn a_role_awaiting_removal_is_not_logged_in() {
         let mut w = crate::test_world::World::awake().await;
@@ -1257,18 +1146,6 @@ mod tests {
             .unwrap()
             .push(serde_json::json!({"name":"gone_job","state":"absent"}));
         assert!(verified(&w).await.unwrap());
-        let socket = w.reconciler.power.postgres.unwrap();
-        assert!(
-            roles_pod(
-                &w.db,
-                w.authority.pem.as_bytes(),
-                crate::test_world::POD_IP,
-                socket,
-                None
-            )
-            .await
-            .unwrap()
-        );
         assert!(!log_has(&w, "SQL gone_job"));
     }
     #[tokio::test]

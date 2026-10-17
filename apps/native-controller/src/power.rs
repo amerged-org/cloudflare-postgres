@@ -19,7 +19,7 @@ use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const SYSTEM: &str = "pgcf-system";
@@ -35,19 +35,11 @@ const FENCE: &str = "cnpg.io/fencedInstances";
 const FENCE_BINDING: &str = "pgcf.io/gateway-fence-uid";
 const VOLUME_IDENTITY: &str = "pgcf.io/volume-identity";
 const MAX_WAIT: u64 = 600_000;
-/// How far ahead of this controller's clock a time it recorded may be: a clock step after the
-/// write, not a forged record.
-const CLOCK_SKEW: u64 = 5_000;
-/// How long one sleep pass waits for the fenced PostgreSQL to be seen stopped.
-const STOP_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 /// How long a release is asked again of a gateway that has not yet seen the intent it follows.
 const RELEASE_RETRY_WINDOW: Duration = Duration::from_millis(150);
 /// The pause between two asks of one release.
 const RELEASE_RETRY_SPACING: Duration = Duration::from_millis(5);
-mod parked;
-use parked::{Resumed, Retained};
-pub(crate) use parked::{fenced, runs_wake};
 #[derive(Debug)]
 enum Fault {
     Stale,
@@ -166,10 +158,6 @@ enum Phase {
     Wake,
     Awake,
     Refused,
-    /// The fence is written and the stop of PostgreSQL is being confirmed (parked sleep tier).
-    Parking,
-    /// PostgreSQL is stopped by CNPG's fence; the instance Pod stays (parked sleep tier).
-    Parked,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -197,11 +185,8 @@ struct Progress {
     key_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     segment: Option<String>,
-    /// The retained instance Pod of a parked database, from `Parking` until its demotion ends.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    park: Option<Park>,
     /// The data directory the proof of the sleep found PostgreSQL running on; `None` if it could
-    /// not be read, which only keeps the Pod from being parked.
+    /// not be read, which only keeps the volume from a pool slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system: Option<SystemIdentity>,
     #[serde(flatten)]
@@ -245,59 +230,9 @@ impl Progress {
             key_uid: None,
             key_version: None,
             segment: None,
-            park: None,
             system: None,
             extra: Map::new(),
         }
-    }
-}
-/// One container's resource requests as Kubernetes quantity strings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ContainerRequests {
-    pub(crate) cpu: String,
-    pub(crate) memory: String,
-}
-/// The requests of the two containers the parked tier resizes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Requests {
-    pub(crate) postgres: ContainerRequests,
-    pub(crate) sidecar: ContainerRequests,
-}
-/// The instance Pod a parked database keeps: the identity a wake or a demotion must find again.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Park {
-    pod_name: String,
-    pod_uid: String,
-    /// Container IDs of `postgres` and the `plugin-barman-cloud` sidecar.
-    postgres_container_id: String,
-    sidecar_container_id: String,
-    node_boot_id: String,
-    release_id: String,
-    spec_sha256: String,
-    assignment_revision: u64,
-    requests_before: Requests,
-    requests_parked: Requests,
-    parked_at: u64,
-    /// The data directory PostgreSQL ran on when the sleep was proved: the postmaster a wake starts
-    /// must answer with the same. A record without them is never resumed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    system_identifier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeline: Option<i32>,
-    /// PostgreSQL was seen stopped and fenced: nothing can have been written since, whatever
-    /// gateway Pods came and went. Set when the Pod is parked, not while it is being parked.
-    stopped: bool,
-}
-impl Park {
-    /// The data directory the Pod was parked with, if the record has one.
-    fn system(&self) -> Option<SystemIdentity> {
-        Some(SystemIdentity {
-            identifier: self.system_identifier.clone()?,
-            timeline: self.timeline?,
-        })
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -337,24 +272,6 @@ struct RetirementReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     marker_version: Option<String>,
 }
-/// What a retained Pod is judged against, for a sleep as for a wake: the node and the fleet
-/// release it must still be under, and the manifests the desired state would apply to it.
-pub struct Basis<'a> {
-    pub node: &'a Value,
-    pub release: &'a Value,
-    /// The manifests desired state would apply; `None` when they cannot be built.
-    pub manifests: Option<&'a [Value]>,
-    pub runtime_class: &'a str,
-}
-/// What the sleep step needs from the regional snapshot and the database's Node.
-pub struct Sleep<'a> {
-    /// `region.parking`; null while the region has no parked sleep tier.
-    pub parking: &'a Value,
-    pub basis: Basis<'a>,
-    /// The pool slot that serves the database, which the sleep is proved on instead of the
-    /// database's own Pod.
-    pub slot: Option<SlotSleep>,
-}
 /// The pool slot a slot-served database sleeps from.
 pub struct SlotSleep {
     /// Where the proof's session dials: the slot Pod's address and port.
@@ -364,55 +281,10 @@ pub struct SlotSleep {
     /// The slot was retired: fenced, recorded, deleted and its volume released.
     pub gone: bool,
 }
-#[cfg(test)]
-static NOTHING: Value = Value::Null;
-#[cfg(test)]
-impl Basis<'static> {
-    /// Nothing is known of the retained Pod's surroundings: it is never judged fit to resume.
-    fn cold() -> Self {
-        Self {
-            node: &NOTHING,
-            release: &NOTHING,
-            manifests: None,
-            runtime_class: "",
-        }
-    }
-}
-#[cfg(test)]
-impl Sleep<'static> {
-    /// A region without the parked sleep tier: every idle sleep is a real hibernation.
-    fn cold() -> Self {
-        Self {
-            parking: &NOTHING,
-            basis: Basis::cold(),
-            slot: None,
-        }
-    }
-}
-/// The identity of the retained Pod that a fast wake resumed; the verification chain must find it.
-pub struct ParkedWake {
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub postgres_container_id: String,
-    pub sidecar_container_id: String,
-    /// The `postgres` container's restarts when the fence was lifted; `None` if the Pod could not
-    /// be read then, which no later read can equal.
-    pub postgres_restarts: Option<u64>,
-    /// The Pod's address as the inspection read it before the fence was lifted.
-    pub pod_ip: Option<String>,
-    /// The data directory the Pod was parked with: the postmaster that answers must run on it.
-    pub(crate) system: SystemIdentity,
-    /// The requests the Pod is resized back to; the wake is verified only once they are actuated.
-    pub(crate) requests_before: Requests,
-    /// Taken before the unfence was sent: a postmaster older than this did not start for it.
-    pub started: std::time::Instant,
-}
 pub enum PrepareRunning {
     Proceed,
     Pending,
     Observation(Value),
-    /// The fence was lifted on the retained Pod: PostgreSQL starts on it.
-    Parked(Box<ParkedWake>),
 }
 pub struct PowerCoordinator {
     k8s: Kubernetes,
@@ -422,12 +294,7 @@ pub struct PowerCoordinator {
     /// Where PostgreSQL clients dial instead of the Pod's address and port 5432. Only a test
     /// double sets it.
     pub(crate) postgres: Option<std::net::SocketAddr>,
-    /// How long a sleep waits for PostgreSQL to be seen stopped after it fenced the instance.
-    pub(crate) stop_budget: Duration,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// The kubelet's Ready bit of a database's resumed Pod, which its wake did not wait for, by
-    /// database id: the measurement that ends when a later pass finds the bit set.
-    kubelet: Mutex<HashMap<String, parked::KubeletWait>>,
     /// The node agents that hold the single-writer rule of thin volumes (pool design 2026-10-16).
     pub(crate) attach: crate::pool::Attach,
     /// The image a database runs under unless it names one.
@@ -649,52 +516,10 @@ fn progress_from(map: &Value, now: u64) -> Result<Option<Progress>> {
     }
     if matches!(
         p.phase,
-        Phase::Archive
-            | Phase::Proved
-            | Phase::Hibernating
-            | Phase::Hibernated
-            | Phase::Parking
-            | Phase::Parked
+        Phase::Archive | Phase::Proved | Phase::Hibernating | Phase::Hibernated
     ) && (p.segment.is_none() || p.proof_intent.is_none())
     {
         return Err(Fault::Recovery("power_segment_missing"));
-    }
-    match &p.park {
-        None if matches!(p.phase, Phase::Parking | Phase::Parked) => {
-            return Err(Fault::Recovery("power_park_missing"));
-        }
-        Some(_)
-            if !matches!(
-                p.phase,
-                Phase::Parking | Phase::Parked | Phase::Hibernating | Phase::Wake
-            ) =>
-        {
-            return Err(Fault::Recovery("power_park_invalid"));
-        }
-        Some(park) => {
-            for text in [
-                &park.pod_name,
-                &park.postgres_container_id,
-                &park.sidecar_container_id,
-                &park.node_boot_id,
-                &park.release_id,
-                &park.spec_sha256,
-            ] {
-                required(text, 4096)?;
-            }
-            if !valid_pattern("uuid", &park.pod_uid)
-                || park.system_identifier.is_some() != park.timeline.is_some()
-                || park.system().is_some_and(|system| {
-                    !SystemIdentity::valid(&system.identifier, system.timeline)
-                })
-                || park.parked_at > now.saturating_add(CLOCK_SKEW)
-                || park.parked_at > MAX_SAFE
-                || park.assignment_revision > MAX_SAFE
-            {
-                return Err(Fault::Recovery("power_park_invalid"));
-            }
-        }
-        None => {}
     }
     if let Some(gateways) = &p.gateways {
         validate_pods(gateways)?;
@@ -703,13 +528,7 @@ fn progress_from(map: &Value, now: u64) -> Result<Option<Progress>> {
     }
     if matches!(
         p.phase,
-        Phase::Switching
-            | Phase::Archive
-            | Phase::Proved
-            | Phase::Hibernating
-            | Phase::Hibernated
-            | Phase::Parking
-            | Phase::Parked
+        Phase::Switching | Phase::Archive | Phase::Proved | Phase::Hibernating | Phase::Hibernated
     ) && p.gateways.is_none()
     {
         return Err(Fault::Recovery("power_continuity_missing"));
@@ -736,24 +555,6 @@ fn observation(db: &Value, intent: &PowerIntent, state: &str, refusal: Option<Re
         let text = serde_json::to_value(refusal).unwrap();
         value["power"]["refusal"] = text.clone();
         value["message"] = format!("sleep refused: {}", text.as_str().unwrap()).into();
-    }
-    value
-}
-/// A hibernated observation whose instance Pod is still alive with PostgreSQL stopped. `fast`
-/// claims that the Pod's wake is the fast one: every predicate of it was just established.
-fn parked_observation(
-    db: &Value,
-    intent: &PowerIntent,
-    pod_uid: &str,
-    cpu_millicores: u64,
-    memory_mib: u64,
-    fast: bool,
-) -> Value {
-    let mut value = observation(db, intent, "hibernated", None);
-    value["power"]["parked"] =
-        json!({"pod_uid":pod_uid,"cpu_millicores":cpu_millicores,"memory_mib":memory_mib});
-    if fast {
-        value["power"]["parked"]["wake"] = "fast".into();
     }
     value
 }
@@ -787,9 +588,7 @@ impl PowerCoordinator {
             replicas,
             http,
             postgres: None,
-            stop_budget: STOP_BUDGET,
             clock,
-            kubelet: Mutex::default(),
             attach: crate::pool::Attach::new(k8s.clone())?,
             postgres_image: String::new(),
         })
@@ -1532,8 +1331,8 @@ impl PowerCoordinator {
         cluster: &Value,
         hibernation: &str,
     ) -> Result<()> {
-        // A wake always lifts the instance fence a retained Pod may still carry, together with
-        // hibernation, so CNPG can never create a fenced replacement Pod.
+        // A wake lifts any instance fence together with hibernation, so CNPG never creates a
+        // fenced Pod.
         self.cluster_power(intent, cluster, hibernation, hibernation == "off")
             .await
     }
@@ -1626,8 +1425,6 @@ fn phase_name(phase: Phase) -> &'static str {
         Phase::Wake => "wake",
         Phase::Awake => "awake",
         Phase::Refused => "refused",
-        Phase::Parking => "parking",
-        Phase::Parked => "parked",
     }
 }
 /// Whether `map`, a gateway fence running at `intent`, is a pool slot's release that Cloudflare
@@ -1663,6 +1460,12 @@ pub(crate) fn fence_intent(map: &Value, id: &str) -> Option<PowerIntent> {
 pub(crate) fn woke_under(map: &Value, intent: &PowerIntent, now: u64) -> bool {
     progress_from(map, now)
         .is_ok_and(|p| p.is_some_and(|p| p.phase == Phase::Awake && p.target == *intent))
+}
+/// Whether CNPG's instance fence stops PostgreSQL of the Cluster (a free pool slot's is).
+pub(crate) fn fenced(cluster: &Value) -> bool {
+    cluster["metadata"]["annotations"][FENCE]
+        .as_str()
+        .is_some_and(|v| !v.is_empty() && v != "[]")
 }
 fn condition(cluster: &Value, name: &str) -> bool {
     cluster["status"]["conditions"]
@@ -1776,9 +1579,10 @@ impl PowerCoordinator {
             if let Some(reason) = self.safety(&session).await? {
                 return Ok(Some(reason));
             }
-            // The data directory the postmaster runs on, while it runs, for the wake of a parked
-            // Pod to compare. A statement that does not answer only keeps the Pod from being
-            // parked; a second proof pass that finds another data directory is not a sleep.
+            // The data directory the postmaster runs on, while it runs, for the sleep record a pool
+            // wake compares the volume with. A statement that does not answer only keeps the
+            // volume from a slot; a second proof pass that finds another data directory is not a
+            // sleep.
             let system = session
                 .query(postgres::SERVER_IDENTITY_QUERY, &[])
                 .await
@@ -1859,10 +1663,11 @@ impl PowerCoordinator {
             })),
         }
     }
+    /// The sleep of a database: of its own Cluster, or of the pool `slot` that serves it.
     pub async fn suspend(
         &self,
         db: &Value,
-        sleep: &Sleep<'_>,
+        slot: Option<&SlotSleep>,
     ) -> std::result::Result<Option<Value>, Error> {
         if !database_valid(db) || text(db, "desired_state") != "suspended" {
             return Err("invalid suspension desired state".into());
@@ -1870,7 +1675,7 @@ impl PowerCoordinator {
         let intent = desired_power(db)?.ok_or("suspension intent missing")?;
         Ok(tokio::time::timeout(
             Duration::from_secs(10),
-            self.suspend_step(db, &intent, sleep),
+            self.suspend_step(db, &intent, slot),
         )
         .await
         .unwrap_or_default())
@@ -1879,7 +1684,7 @@ impl PowerCoordinator {
         &self,
         db: &Value,
         intent: &PowerIntent,
-        sleep: &Sleep<'_>,
+        slot: Option<&SlotSleep>,
     ) -> Option<Value> {
         let mut map = None;
         let mut progress = None;
@@ -1903,35 +1708,8 @@ impl PowerCoordinator {
             {
                 return Err(Fault::Stale);
             }
-            // A database that holds its instance Pod (parked, being parked or demoted) is
-            // handled apart: it is never proved again, and never refused for an unknown write.
-            if let (Some(held), Some(current)) =
-                (progress.as_ref().filter(|p| p.park.is_some()), map.as_ref())
-            {
-                match self
-                    .retained_sleep(
-                        db,
-                        intent,
-                        sleep,
-                        current.clone(),
-                        held.clone(),
-                        cluster.clone(),
-                    )
-                    .await
-                {
-                    Ok(Retained::Observed(value)) => return Ok(value),
-                    Ok(Retained::Ordinary) => {
-                        if let Some(p) = progress.as_mut() {
-                            p.park = None;
-                        }
-                    }
-                    Err(Fault::Recovery(reason)) => return Err(Fault::Recovery(reason)),
-                    Err(Fault::Stale) => return Err(Fault::Stale),
-                    Err(_) => return Ok(None),
-                }
-            }
             if progress.as_ref().is_none_or(|p| p.target != *intent) {
-                let already_off = sleep.slot.is_none()
+                let already_off = slot.is_none()
                     && progress
                         .as_ref()
                         .is_some_and(|p| matches!(p.phase, Phase::Hibernating | Phase::Hibernated))
@@ -1983,7 +1761,7 @@ impl PowerCoordinator {
             }
             // A slot-served database is hibernated once its slot is retired; its own Cluster has
             // been hibernated all along.
-            if let Some(slot) = &sleep.slot
+            if let Some(slot) = slot
                 && matches!(p.phase, Phase::Hibernating | Phase::Hibernated)
             {
                 if !slot.gone {
@@ -2074,13 +1852,7 @@ impl PowerCoordinator {
                 map = Some(current.clone());
             }
             if let Some(reason) = self
-                .sleep_proof(
-                    db,
-                    intent,
-                    (&mut current, p),
-                    &snapshot,
-                    sleep.slot.as_ref(),
-                )
+                .sleep_proof(db, intent, (&mut current, p), &snapshot, slot)
                 .await?
             {
                 map = Some(current.clone());
@@ -2111,26 +1883,12 @@ impl PowerCoordinator {
             if !latest.matches(&p.anchor) {
                 return Err(Fault::Recovery("power_storage_identity_changed"));
             }
-            // Step S5: a proved idle sleep keeps the Pod when the region's tier admits it. Any
-            // read that fails here only means the ordinary hibernation.
-            if sleep.slot.is_none()
-                && let Some(system) = p.system.clone()
-                && let Ok(Some(park)) = self.park_plan(db, intent, &cluster, sleep, &system).await
-            {
-                // Step S6: the record is persisted before the Cluster is written (S7).
-                p.phase = Phase::Parking;
-                p.park = Some(park);
-                current = self.write(db, Some(&current), None, p).await?;
-                map = Some(current);
-                self.cluster_fence(intent, &cluster).await?;
-                return Ok(None);
-            }
             p.phase = Phase::Hibernating;
             current = self.write(db, Some(&current), None, p).await?;
             map = Some(current);
             // A slot-served database's own Cluster is hibernated already: its slot is retired by
             // the pool, and the next pass completes the sleep.
-            if sleep.slot.is_none() {
+            if slot.is_none() {
                 self.cluster_intent(intent, &cluster, "on").await?;
             }
             Ok(None)
@@ -2141,12 +1899,10 @@ impl PowerCoordinator {
             Err(Fault::Stale) => None,
             Err(Fault::Recovery(message)) => Some(recovery_observation(db, message)),
             Err(error) => {
-                if progress.as_ref().is_some_and(|p| {
-                    matches!(
-                        p.phase,
-                        Phase::Hibernating | Phase::Hibernated | Phase::Parking | Phase::Parked
-                    )
-                }) {
+                if progress
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.phase, Phase::Hibernating | Phase::Hibernated))
+                {
                     return None;
                 }
                 if matches!(
@@ -2178,11 +1934,7 @@ impl PowerCoordinator {
             }
         }
     }
-    pub async fn prepare_running(
-        &self,
-        db: &Value,
-        basis: &Basis<'_>,
-    ) -> std::result::Result<PrepareRunning, Error> {
+    pub async fn prepare_running(&self, db: &Value) -> std::result::Result<PrepareRunning, Error> {
         if !database_valid(db) || text(db, "desired_state") != "running" {
             return Err("invalid running desired state".into());
         }
@@ -2199,9 +1951,8 @@ impl PowerCoordinator {
             {
                 return Ok(PrepareRunning::Proceed);
             }
-            let (physical, mut cluster) = anchored?;
-            let mut map = map;
-            let mut previous = map
+            let (physical, cluster) = anchored?;
+            let previous = map
                 .as_ref()
                 .map(|m| progress_from(m, self.now()))
                 .transpose()?
@@ -2218,36 +1969,6 @@ impl PowerCoordinator {
             {
                 return Err(Fault::Stale);
             }
-            // A database that retains its instance Pod resumes it when nothing it was parked
-            // under has changed, and otherwise demotes it before the ordinary CNPG wake.
-            if let (Some(held), Some(current)) =
-                (previous.as_ref().filter(|p| p.park.is_some()), map.as_ref())
-            {
-                match self
-                    .resume_retained(
-                        db,
-                        &intent,
-                        current.clone(),
-                        held.clone(),
-                        cluster.clone(),
-                        basis,
-                    )
-                    .await
-                {
-                    Ok((Resumed::Fast(resumed), ..)) => {
-                        return Ok(PrepareRunning::Parked(resumed));
-                    }
-                    Ok((Resumed::Waiting, ..)) => return Ok(PrepareRunning::Pending),
-                    Ok((Resumed::Ordinary, next_map, next_progress, next_cluster)) => {
-                        map = Some(next_map);
-                        previous = Some(next_progress);
-                        cluster = next_cluster;
-                    }
-                    // An unknown write or a conflict is read again by the next pass.
-                    Err(Fault::Unavailable(_)) => return Ok(PrepareRunning::Pending),
-                    Err(error) => return Err(error),
-                }
-            }
             // The miss path takes the volume's holder before its own Pod is created on it: never
             // while a pool slot holds it (pool design 2026-10-16).
             if cluster["metadata"]["annotations"][HIBERNATION] == "on" {
@@ -2259,9 +1980,6 @@ impl PowerCoordinator {
             {
                 progress.started_at = prior.started_at;
             }
-            // A wake that continues on a retained Pod keeps its record until the wake ends, so
-            // every pass of it can still give the Pod its requests back.
-            progress.park = previous.as_ref().and_then(|prior| prior.park.clone());
             // A wake that completed under this very intent is not begun again: the pass that
             // looks at an awake database once more would turn its record back into `Wake`, write
             // `Awake` at its end once more, and have the cluster's watch make it due again.
@@ -2285,7 +2003,7 @@ impl PowerCoordinator {
             }
         };
         match &outcome {
-            PrepareRunning::Proceed | PrepareRunning::Parked(_) => phase.completed(),
+            PrepareRunning::Proceed => phase.completed(),
             PrepareRunning::Pending => phase.pending(),
             PrepareRunning::Observation(_) => phase.failed(),
         }
@@ -4268,10 +3986,7 @@ mod tls_tests {
         )
         .unwrap();
         assert!(matches!(
-            coordinator
-                .prepare_running(&db, &Basis::cold())
-                .await
-                .unwrap(),
+            coordinator.prepare_running(&db).await.unwrap(),
             PrepareRunning::Proceed
         ));
         assert_eq!(server.other_writes.load(Ordering::SeqCst), 0);
@@ -4362,11 +4077,7 @@ mod tls_tests {
         .unwrap();
         coordinator.http = controls.client.clone();
         hibernated_record(&server, &db, &coordinator).await;
-        let result = coordinator
-            .suspend(&db, &Sleep::cold())
-            .await
-            .unwrap()
-            .unwrap();
+        let result = coordinator.suspend(&db, None).await.unwrap().unwrap();
         assert_eq!(result["state"], "hibernated");
         // The control endpoint accepts only the live Pod: the status reached it alone.
         assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
@@ -4404,11 +4115,7 @@ mod tls_tests {
         .unwrap();
         coordinator.http = controls.client.clone();
         hibernated_record(&server, &db, &coordinator).await;
-        let result = coordinator
-            .suspend(&db, &Sleep::cold())
-            .await
-            .unwrap()
-            .unwrap();
+        let result = coordinator.suspend(&db, None).await.unwrap().unwrap();
         assert_eq!(result["state"], "hibernated", "{result}");
         assert_eq!(result["power"]["revision"], 2);
         assert!(
@@ -4483,5 +4190,3 @@ mod tls_tests {
         assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
     }
 }
-#[cfg(test)]
-mod parked_tests;
