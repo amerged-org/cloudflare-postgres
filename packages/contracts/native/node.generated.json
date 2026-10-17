@@ -110,6 +110,11 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
       "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
         "tunnel_token": {
           "type": "string",
           "pattern": "^[A-Za-z0-9+/=_-]{32,4096}$"
@@ -138,7 +143,7 @@
           "additionalProperties": false
         }
       },
-      "required": ["tunnel_token", "route_keyring"],
+      "required": ["revision", "tunnel_token", "route_keyring"],
       "additionalProperties": false
     },
     "ArchiveCredential": {
@@ -466,14 +471,58 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 8
+                },
+                "memory_mib": {
+                  "type": "object",
+                  "properties": {
+                    "wal_upload": {
+                      "type": "integer",
+                      "minimum": 32,
+                      "maximum": 4096
+                    },
+                    "wal_fetch": {
+                      "type": "integer",
+                      "minimum": 32,
+                      "maximum": 4096
+                    },
+                    "base_backup": {
+                      "type": "integer",
+                      "minimum": 32,
+                      "maximum": 4096
+                    }
+                  },
+                  "required": ["wal_upload", "wal_fetch", "base_backup"],
+                  "additionalProperties": false
                 }
               },
-              "required": ["wal_uploads", "base_backups"],
+              "required": ["wal_uploads", "base_backups", "memory_mib"],
+              "additionalProperties": false
+            },
+            "io": {
+              "type": "object",
+              "properties": {
+                "write_bytes_per_second": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "write_iops": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000000
+                }
+              },
+              "required": ["write_bytes_per_second", "write_iops"],
               "additionalProperties": false
             }
           },
-          "required": ["admission", "early_sleep", "storage", "backup"],
+          "required": ["admission", "early_sleep", "storage", "backup", "io"],
           "additionalProperties": false
+        },
+        "credentials_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
         },
         "orders": {
           "maxItems": 1000,
@@ -780,7 +829,6 @@
                             "type": "string",
                             "pattern": "^[0-9]{8}T[0-9]{6}$"
                           },
-                          "target_time": { "$ref": "#/$defs/Timestamp" },
                           "credential": {
                             "type": "object",
                             "properties": {
@@ -792,13 +840,45 @@
                             },
                             "required": ["id", "expires_at"],
                             "additionalProperties": false
+                          },
+                          "end": {
+                            "type": "object",
+                            "properties": {
+                              "system_identifier": {
+                                "type": "string",
+                                "pattern": "^[1-9][0-9]{0,19}$"
+                              },
+                              "timeline": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4294967295
+                              },
+                              "checkpoint_lsn": {
+                                "type": "string",
+                                "pattern": "^[0-9A-F]{1,8}\\/[0-9A-F]{1,8}$"
+                              },
+                              "last_archived_segment": {
+                                "type": "string",
+                                "pattern": "^[0-9A-F]{24}$"
+                              },
+                              "proven_at": { "$ref": "#/$defs/Timestamp" }
+                            },
+                            "required": [
+                              "system_identifier",
+                              "timeline",
+                              "checkpoint_lsn",
+                              "last_archived_segment",
+                              "proven_at"
+                            ],
+                            "additionalProperties": false
                           }
                         },
                         "required": [
                           "database_id",
                           "path",
                           "backup_id",
-                          "credential"
+                          "credential",
+                          "end"
                         ],
                         "additionalProperties": false
                       }
@@ -830,7 +910,15 @@
           "anyOf": [{ "$ref": "#/$defs/DatabaseId" }, { "type": "null" }]
         }
       },
-      "required": ["node", "release", "policy", "orders", "databases", "next"],
+      "required": [
+        "node",
+        "release",
+        "policy",
+        "credentials_revision",
+        "orders",
+        "databases",
+        "next"
+      ],
       "additionalProperties": false,
       "$defs": {
         "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
@@ -1190,6 +1278,12 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991
+        },
+        "credentials_revision": {
+          "anyOf": [
+            { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
         }
       },
       "required": [
@@ -1203,7 +1297,8 @@
         "awake",
         "awake_memory_mib",
         "starting",
-        "queued"
+        "queued",
+        "credentials_revision"
       ],
       "additionalProperties": false,
       "$defs": {
@@ -1318,6 +1413,11 @@
                 "type": "object",
                 "properties": {
                   "type": { "type": "string", "const": "admission" },
+                  "id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
                   "at": { "$ref": "#/$defs/Timestamp" },
                   "database": { "$ref": "#/$defs/DatabaseId" },
                   "generation": {
@@ -1369,6 +1469,7 @@
                 },
                 "required": [
                   "type",
+                  "id",
                   "at",
                   "database",
                   "generation",
@@ -1384,6 +1485,11 @@
                 "type": "object",
                 "properties": {
                   "type": { "type": "string", "const": "early_sleep" },
+                  "id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
                   "at": { "$ref": "#/$defs/Timestamp" },
                   "database": { "$ref": "#/$defs/DatabaseId" },
                   "generation": {
@@ -1395,6 +1501,7 @@
                 },
                 "required": [
                   "type",
+                  "id",
                   "at",
                   "database",
                   "generation",
@@ -1406,6 +1513,11 @@
                 "type": "object",
                 "properties": {
                   "type": { "type": "string", "const": "wake" },
+                  "id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
                   "at": { "$ref": "#/$defs/Timestamp" },
                   "database": { "$ref": "#/$defs/DatabaseId" },
                   "generation": {
@@ -1421,38 +1533,28 @@
                   "reason": {
                     "type": "string",
                     "enum": [
-                      "no_desired_row",
-                      "not_sleeping",
-                      "wake_in_progress",
-                      "desired_stale",
                       "no_room",
-                      "thick_storage",
-                      "volume_identity_missing",
-                      "no_power_record",
-                      "no_sleep_record",
-                      "image_changed",
-                      "configuration_changed",
-                      "no_free_slot",
                       "no_headroom",
-                      "gateways_not_ready",
-                      "agent_unavailable",
-                      "holder_busy",
-                      "volume_open",
-                      "volume_suspended",
+                      "deleted",
+                      "suspended",
+                      "moving",
+                      "maintenance",
+                      "fenced",
+                      "superseded",
+                      "unproven",
+                      "storage_full",
+                      "desired_stale",
+                      "wake_in_progress",
+                      "identity_mismatch",
+                      "control_version",
                       "volume_missing",
                       "uuid_mismatch",
-                      "unclean",
-                      "control_version",
-                      "identity_mismatch",
-                      "container_missing",
+                      "volume_suspended",
+                      "volume_open",
+                      "holder_busy",
                       "mount_failed",
-                      "audit_failed",
-                      "bind_failed",
                       "start_timeout",
-                      "sql_identity_mismatch",
-                      "release_failed",
-                      "deleted",
-                      "not_in_region"
+                      "release_failed"
                     ]
                   },
                   "phases_ms": {
@@ -1494,6 +1596,7 @@
                 },
                 "required": [
                   "type",
+                  "id",
                   "at",
                   "database",
                   "generation",
@@ -1518,6 +1621,103 @@
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
       }
+    },
+    "NodeUsageReport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "rows": {
+          "minItems": 1,
+          "maxItems": 500,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "database": { "$ref": "#/$defs/DatabaseId" },
+              "interval_start": { "$ref": "#/$defs/Timestamp" },
+              "interval_end": { "$ref": "#/$defs/Timestamp" },
+              "awake_ms": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "ingress_bytes": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "egress_bytes": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "connections": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "connection_ms": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              }
+            },
+            "required": [
+              "database",
+              "interval_start",
+              "interval_end",
+              "awake_ms",
+              "ingress_bytes",
+              "egress_bytes",
+              "connections",
+              "connection_ms"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["rows"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "NodeFencedResponse": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": { "error": { "type": "string", "const": "node_fenced" } },
+      "required": ["error"],
+      "additionalProperties": false
     },
     "AgentLinkMessage": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1693,6 +1893,16 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
+                },
+                "credentials_revision": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    { "type": "null" }
+                  ]
                 }
               },
               "required": [
@@ -1706,7 +1916,8 @@
                 "awake",
                 "awake_memory_mib",
                 "starting",
-                "queued"
+                "queued",
+                "credentials_revision"
               ],
               "additionalProperties": false
             }
@@ -1787,7 +1998,8 @@
       "archiveCredentials": "/node/v1/archive-credentials/",
       "observations": "/node/v1/observations",
       "volumes": "/node/v1/volumes",
-      "events": "/node/v1/events"
+      "events": "/node/v1/events",
+      "usage": "/node/v1/usage"
     },
     "INSTALLER_PROGRESS_PATH": "/node/v1/installer/progress",
     "NODE_ENROLLMENT_SEED_PATH": "/var/lib/pgcf/enrollment/seed.json",
@@ -1795,6 +2007,9 @@
     "NODE_SAMPLE_INTERVAL_MS": 15000,
     "NODE_VOLUME_REPORT_INTERVAL_MS": 60000,
     "NODE_STALE_MS": 180000,
+    "NODE_EVENT_RETRY_SECONDS": 600,
+    "NODE_FENCED_PATHS": ["/node/v1/desired", "/node/v1/observations"],
+    "NODE_FENCED_ERROR": "node_fenced",
     "NODE_LINK_MESSAGE_MAX_BYTES": 65536,
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
     "NODE_REQUEST_TOKEN_PREFIX": "pgcf_nr1",
@@ -1816,11 +2031,6 @@
       "resize",
       "check"
     ],
-    "ADMISSION_REFUSALS": ["no_room", "no_headroom"],
-    "ADMISSION_REFUSAL_DETAILS": {
-      "no_room": "storage",
-      "no_headroom": "node at awake capacity"
-    },
     "NODE_DATABASE_STATES": [
       "building",
       "ready",

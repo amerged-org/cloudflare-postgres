@@ -17,6 +17,7 @@
  * in the agent's upload log; only then does PostgreSQL mark it done.
  */
 import { z } from "zod";
+import { Timestamp } from "./api.ts";
 import { DatabaseId, OperationId } from "./ids.ts";
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
@@ -53,45 +54,61 @@ export type WakePhase = (typeof WAKE_PHASES)[number];
 export const WAKE_OUTCOMES = ["started", "refused"] as const;
 export type WakeOutcome = (typeof WAKE_OUTCOMES)[number];
 /**
- * Every reason a wake result may name; the node runtime uses `no_room` (storage), `no_headroom`
- * (awake capacity), `deleted`, `mount_failed`, `start_timeout`, `release_failed` and
- * `identity_mismatch`. The others are the Kubernetes mode's until the gateway drops it.
+ * Every reason a wake result, a failed wake order and a wake event may name. `no_room` (the room
+ * rule, 57P03 "storage") and `no_headroom` (the wait for awake capacity expired) are the
+ * admission refusals of plan 4.6. The holds and states that refuse a wake follow: `deleted`;
+ * `suspended` (a manual suspend never wakes on connect); `moving` (the hold of a move source);
+ * `maintenance`; `fenced`; `superseded` (a retired storage generation); `unproven` (recovery
+ * pending or running, plan 7.10); `storage_full` (the volume cannot start). Then the checks of
+ * the wake itself: `desired_stale` (the ticket names another generation than the agent's),
+ * `wake_in_progress`, `identity_mismatch` and `control_version` (`pg_control` against the
+ * proven-sleep record), the single-writer holder rule and the mount (`volume_missing`,
+ * `uuid_mismatch`, `volume_suspended`, `volume_open`, `holder_busy`, `mount_failed`, plan 7.11),
+ * `start_timeout` and `release_failed`.
  */
 export const WAKE_REASONS = [
-  "no_desired_row",
-  "not_sleeping",
-  "wake_in_progress",
-  "desired_stale",
   "no_room",
-  "thick_storage",
-  "volume_identity_missing",
-  "no_power_record",
-  "no_sleep_record",
-  "image_changed",
-  "configuration_changed",
-  "no_free_slot",
   "no_headroom",
-  "gateways_not_ready",
-  "agent_unavailable",
-  "holder_busy",
-  "volume_open",
-  "volume_suspended",
+  "deleted",
+  "suspended",
+  "moving",
+  "maintenance",
+  "fenced",
+  "superseded",
+  "unproven",
+  "storage_full",
+  "desired_stale",
+  "wake_in_progress",
+  "identity_mismatch",
+  "control_version",
   "volume_missing",
   "uuid_mismatch",
-  "unclean",
-  "control_version",
-  "identity_mismatch",
-  "container_missing",
+  "volume_suspended",
+  "volume_open",
+  "holder_busy",
   "mount_failed",
-  "audit_failed",
-  "bind_failed",
   "start_timeout",
-  "sql_identity_mismatch",
   "release_failed",
-  "deleted",
-  "not_in_region",
 ] as const;
 export type WakeReason = (typeof WAKE_REASONS)[number];
+
+/** The refusals of the admission loop (plan 4.6). */
+export const ADMISSION_REFUSALS = ["no_room", "no_headroom"] as const;
+/**
+ * The DETAIL of the 57P03 that answers each admission refusal. The gateway sends it with every
+ * refused held connection; the other reasons of `WAKE_REASONS` have no detail.
+ */
+export const ADMISSION_REFUSAL_DETAILS = {
+  no_room: "storage",
+  no_headroom: "node at awake capacity",
+} as const satisfies Record<(typeof ADMISSION_REFUSALS)[number], string>;
+/**
+ * Only the wait for awake capacity has a retry hint (policy `retry_after_seconds`): the gateway
+ * sends it as the HINT `retry after <n> s`. `no_room` and every other reason carry none, because
+ * waiting does not make room.
+ */
+export const refusalRetryHint = (reason: WakeReason): boolean =>
+  reason === "no_headroom";
 
 const utf8 = new TextEncoder();
 export const UnixSocketPath = z
@@ -173,6 +190,8 @@ export const WakeResult = z
     generation: Positive,
     outcome: z.enum(WAKE_OUTCOMES),
     reason: z.enum(WAKE_REASONS).optional(),
+    /** The HINT of the 57P03, exactly with `no_headroom` (`refusalRetryHint`). */
+    retry_after_seconds: z.number().int().min(1).max(300).optional(),
     /** Measured steps; the agent names the phases of `WAKE_PHASES`. */
     steps_ms: z
       .record(
@@ -188,6 +207,15 @@ export const WakeResult = z
     (result) =>
       (result.outcome === "refused") === (result.reason !== undefined),
     { path: ["reason"], message: "Exactly a refusal names its reason" },
+  )
+  .refine(
+    (result) =>
+      (result.retry_after_seconds !== undefined) ===
+      (result.reason !== undefined && refusalRetryHint(result.reason)),
+    {
+      path: ["retry_after_seconds"],
+      message: "Exactly the refusal of awake capacity carries a retry hint",
+    },
   );
 export type WakeResult = z.infer<typeof WakeResult>;
 
@@ -237,6 +265,111 @@ export const SessionStatus = z.enum([
 ]);
 export type SessionStatus = z.infer<typeof SessionStatus>;
 
+/** `complete`, `partial` and `current_process_absence` have counters; `unavailable` has none. */
+export const GATEWAY_ACTIVITY_HISTORIES = [
+  "complete",
+  "partial",
+  "current_process_absence",
+  "unavailable",
+] as const;
+/**
+ * The counters and session counts of one database, as the gateway reports them (apps/native-gateway
+ * telemetry): cumulative since `countersSince` within one counter run, which `processEpoch` and
+ * `epoch` name. A counter the gateway cannot know is null, never zero.
+ */
+export const GATEWAY_ACTIVITY_FIELDS = {
+  processEpoch: z.uuid(),
+  epoch: z.uuid(),
+  startedAt: Timestamp,
+  counterStartedAt: Timestamp,
+  observedAt: Timestamp,
+  history: z.enum(GATEWAY_ACTIVITY_HISTORIES),
+  countersSince: Timestamp.nullable(),
+  ingressBytes: Count.nullable(),
+  egressBytes: Count.nullable(),
+  totalConnections: Count.nullable(),
+  connectionMilliseconds: Count.nullable(),
+  connections: Count,
+  authenticatedConnections: Count,
+  busyConnections: Count,
+  pendingDials: Count,
+  lastActivityAt: Timestamp.nullable(),
+};
+const ActivityFields = z.strictObject(GATEWAY_ACTIVITY_FIELDS);
+/** The rules of an activity report that no JSON Schema states. */
+export function refineGatewayActivity(
+  report: z.infer<typeof ActivityFields>,
+  context: z.RefinementCtx,
+): void {
+  const start = Date.parse(report.startedAt),
+    counter = Date.parse(report.counterStartedAt),
+    observed = Date.parse(report.observedAt);
+  const since =
+    report.countersSince === null ? null : Date.parse(report.countersSince);
+  const activity =
+    report.lastActivityAt === null ? null : Date.parse(report.lastActivityAt);
+  const metrics = [
+    report.ingressBytes,
+    report.egressBytes,
+    report.totalConnections,
+    report.connectionMilliseconds,
+  ];
+  if (
+    counter < start ||
+    observed < counter ||
+    (since !== null && (since < counter || since > observed)) ||
+    (activity !== null && (activity < counter || activity > observed))
+  )
+    context.addIssue({
+      code: "custom",
+      message: "Activity timestamps do not describe the current counter window",
+    });
+  if (
+    report.authenticatedConnections > report.connections ||
+    report.busyConnections > report.authenticatedConnections ||
+    report.pendingDials > report.connections
+  )
+    context.addIssue({
+      code: "custom",
+      message: "Activity session counts exceed actual connections",
+    });
+  if (
+    report.history === "unavailable"
+      ? since !== null || metrics.some((value) => value !== null)
+      : since === null || metrics.some((value) => value === null)
+  )
+    context.addIssue({
+      code: "custom",
+      message: "Unknown history must remain distinct from measured counters",
+    });
+  if (
+    (report.history === "complete" ||
+      report.history === "current_process_absence") &&
+    report.countersSince !== report.counterStartedAt
+  )
+    context.addIssue({
+      code: "custom",
+      message: "Complete history must begin at actual counter initialization",
+    });
+  if (
+    report.history === "current_process_absence" &&
+    (activity !== null ||
+      metrics.some((value) => value !== 0) ||
+      report.authenticatedConnections !== 0 ||
+      report.busyConnections !== 0)
+  )
+    context.addIssue({
+      code: "custom",
+      message: "Current process absence cannot conceal activity",
+    });
+}
+export const GatewayLocalActivityReport = ActivityFields.superRefine(
+  refineGatewayActivity,
+);
+export type GatewayLocalActivityReport = z.infer<
+  typeof GatewayLocalActivityReport
+>;
+
 /** From the gateway to the agent. */
 export const GatewayMessage = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("wake"), wake: WakeRequest }),
@@ -249,12 +382,15 @@ export const GatewayMessage = z.discriminatedUnion("type", [
     busy_connections: Count,
     pending_dials: Count,
   }),
-  /** The gateway's measurements of the database, as its activity report shows them. */
+  /**
+   * The gateway's measurements of the database. The agent decides idle sleep from `lastActivityAt`
+   * and the session counts, and turns the counters into the usage rows of its usage report.
+   */
   z.strictObject({
     type: z.literal("activity"),
     id: Count,
     database: DatabaseId,
-    report: z.record(z.string(), z.json()),
+    report: GatewayLocalActivityReport,
   }),
 ]);
 export type GatewayMessage = z.infer<typeof GatewayMessage>;
@@ -292,6 +428,14 @@ export const validWalDestination = (destination: string): boolean =>
 export type ArchiveRequest =
   | { type: "archive"; name: string }
   | { type: "fetch"; name: string; destination: string };
+/**
+ * `missing` tells PostgreSQL where the archived WAL ends, so recovery stops there and promotes:
+ * the agent answers it only when R2 reports the object absent (barman-cloud-wal-restore "not
+ * found"). Every other outcome is `failed` and aborts the recovery: an R2 or barman error, an
+ * expired credential, a timeout. A transient error must never end a recovery early. For a move
+ * target (`DatabaseOrigin`) an absent segment up to `origin.source.end.last_archived_segment` is
+ * `failed` as well, because the archive must hold every segment through it.
+ */
 export type ArchiveReply =
   { type: "ok" } | { type: "missing" } | { type: "failed"; reason?: string };
 

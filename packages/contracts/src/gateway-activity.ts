@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { Timestamp } from "./api.ts";
 import { DatabaseId, RegionId } from "./ids.ts";
 import { gatewayPodUidSchema } from "./gateway-control.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
+import {
+  GATEWAY_ACTIVITY_FIELDS,
+  refineGatewayActivity,
+} from "./node-local.ts";
 import type { RouteKeyring } from "./route-token.ts";
 
 export const GATEWAY_ACTIVITY_PATH = "/_pgcf/gateway/activity";
@@ -24,98 +27,19 @@ export const gatewayActivityClaimsSchema = z.strictObject({
   exp: Count,
 });
 export type GatewayActivityClaims = z.infer<typeof gatewayActivityClaimsSchema>;
+/**
+ * The per-pod report of the Kubernetes era. The node's local channel carries the same counters
+ * as `GatewayLocalActivityReport`, without region, database, revision and pod.
+ */
 export const gatewayActivityReportSchema = z
   .strictObject({
     region: RegionId,
     database: DatabaseId,
     revision: Count.positive(),
     pod: gatewayPodUidSchema,
-    processEpoch: z.uuid(),
-    epoch: z.uuid(),
-    startedAt: Timestamp,
-    counterStartedAt: Timestamp,
-    observedAt: Timestamp,
-    history: z.enum([
-      "complete",
-      "partial",
-      "current_process_absence",
-      "unavailable",
-    ]),
-    countersSince: Timestamp.nullable(),
-    ingressBytes: Count.nullable(),
-    egressBytes: Count.nullable(),
-    totalConnections: Count.nullable(),
-    connectionMilliseconds: Count.nullable(),
-    connections: Count,
-    authenticatedConnections: Count,
-    busyConnections: Count,
-    pendingDials: Count,
-    lastActivityAt: Timestamp.nullable(),
+    ...GATEWAY_ACTIVITY_FIELDS,
   })
-  .superRefine((report, context) => {
-    const start = Date.parse(report.startedAt),
-      counter = Date.parse(report.counterStartedAt),
-      observed = Date.parse(report.observedAt);
-    const since =
-      report.countersSince === null ? null : Date.parse(report.countersSince);
-    const activity =
-      report.lastActivityAt === null ? null : Date.parse(report.lastActivityAt);
-    const metrics = [
-      report.ingressBytes,
-      report.egressBytes,
-      report.totalConnections,
-      report.connectionMilliseconds,
-    ];
-    if (
-      counter < start ||
-      observed < counter ||
-      (since !== null && (since < counter || since > observed)) ||
-      (activity !== null && (activity < counter || activity > observed))
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "Activity timestamps do not describe the current counter window",
-      });
-    if (
-      report.authenticatedConnections > report.connections ||
-      report.busyConnections > report.authenticatedConnections ||
-      report.pendingDials > report.connections
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Activity session counts exceed actual connections",
-      });
-    if (
-      report.history === "unavailable"
-        ? since !== null || metrics.some((value) => value !== null)
-        : since === null || metrics.some((value) => value === null)
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Unknown history must remain distinct from measured counters",
-      });
-    if (
-      (report.history === "complete" ||
-        report.history === "current_process_absence") &&
-      report.countersSince !== report.counterStartedAt
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Complete history must begin at actual counter initialization",
-      });
-    if (
-      report.history === "current_process_absence" &&
-      (activity !== null ||
-        metrics.some((value) => value !== 0) ||
-        report.authenticatedConnections !== 0 ||
-        report.busyConnections !== 0)
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Current process absence cannot conceal activity",
-      });
-  });
+  .superRefine(refineGatewayActivity);
 export type GatewayActivityReport = z.infer<typeof gatewayActivityReportSchema>;
 const encoder = new TextEncoder(),
   decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });

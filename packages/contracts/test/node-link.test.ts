@@ -2,26 +2,32 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
-  ADMISSION_REFUSALS,
-  ADMISSION_REFUSAL_DETAILS,
   ArchiveCredential,
+  NODE_API_PATHS,
   NODE_AWAKE_LIMIT,
   NODE_DESIRED_PAGE_LIMIT_MAX,
+  NODE_FENCED_PATHS,
   NODE_LINK_MESSAGE_MAX_BYTES,
   NODE_REQUEST_MAX_LIFETIME_SECONDS,
+  NODE_USAGE_BATCH_MAX,
+  NodeCredentials,
+  NodeDatabaseObservation,
   NodeDesiredPage,
   NodeDesiredQuery,
   NodeEnrollmentRequest,
   NodeEnrollmentSeed,
   NodeEventReport,
+  NodeFencedResponse,
   NodeObservationReport,
   NodeSample,
+  NodeUsageReport,
   NodeVolumeReport,
   AgentLinkMessage,
   ServerLinkMessage,
   type NodeKey,
   nodePublicKey,
   nodeRequestClaims,
+  observationVerdict,
   signNodeRequest,
   verifyNodeRequest,
 } from "../src/node-link.ts";
@@ -44,6 +50,13 @@ const node = {
 const credential = {
   id: `crd_${"k".repeat(20)}`,
   expires_at: "2026-10-24T12:00:00.000Z",
+};
+const proof = {
+  system_identifier: "7428512345678901234",
+  timeline: 1,
+  checkpoint_lsn: "0/3000028",
+  last_archived_segment: "000000010000000000000002",
+  proven_at: now,
 };
 const owner = {
   name: "app",
@@ -108,8 +121,14 @@ const page = {
       metadata_no_room_percent: 75,
       sample_max_age_seconds: 10,
     },
-    backup: { wal_uploads: 2, base_backups: 1 },
+    backup: {
+      wal_uploads: 2,
+      base_backups: 1,
+      memory_mib: { wal_upload: 128, wal_fetch: 192, base_backup: 256 },
+    },
+    io: { write_bytes_per_second: 16_000_000, write_iops: 1000 },
   },
+  credentials_revision: 3,
   orders: [],
   databases: [database],
   next: null,
@@ -251,6 +270,13 @@ describe("the per-node desired page", () => {
         credential,
       },
     };
+    const moveSource = {
+      database_id: id,
+      path: `s3://pgcf-eu/eu-dev/${id}/g1-op_${"d".repeat(20)}`,
+      backup_id: "20261017T110000",
+      end: proof,
+      credential,
+    };
     for (const [entry, valid] of [
       [{ ...database, origin: { kind: "create" } }, true],
       [{ ...database, origin: { kind: "restore", source } }, true],
@@ -261,34 +287,14 @@ describe("the per-node desired page", () => {
         },
         false,
       ],
-      [
-        {
-          ...moved,
-          origin: {
-            kind: "move",
-            source: {
-              database_id: id,
-              path: `s3://pgcf-eu/eu-dev/${id}/g1-op_${"d".repeat(20)}`,
-              backup_id: "20261017T110000",
-              credential,
-            },
-          },
-        },
-        true,
-      ],
+      [{ ...moved, origin: { kind: "move", source: moveSource } }, true],
       [{ ...moved, origin: { kind: "move", source } }, false],
       [
         {
           ...moved,
           origin: {
             kind: "move",
-            source: {
-              database_id: id,
-              path: `s3://pgcf-eu/eu-dev/${id}/g1-op_${"d".repeat(20)}`,
-              backup_id: "20261017T110000",
-              target_time: "2026-10-17T11:30:00.000Z",
-              credential,
-            },
+            source: { ...moveSource, target_time: "2026-10-17T11:30:00.000Z" },
           },
         },
         false,
@@ -297,6 +303,57 @@ describe("the per-node desired page", () => {
       expect(
         NodeDesiredPage.safeParse({ ...page, databases: [entry] }).success,
       ).toBe(valid);
+  });
+
+  it("proves a move's end with the source's proven-sleep record, and a restore has none", () => {
+    // The target can check that replay reached every committed transaction only against the
+    // record that proved the source's sleep (plan 7.9, 9.5).
+    const moveSource = {
+      database_id: id,
+      path: `s3://pgcf-eu/eu-dev/${id}/g1-op_${"d".repeat(20)}`,
+      backup_id: "20261017T110000",
+      credential,
+    };
+    const moved = (source: object) => ({
+      ...page,
+      databases: [
+        {
+          ...database,
+          storage_generation: 2,
+          archive: {
+            path: `s3://pgcf-eu/eu-dev/${id}/g2-${operation}`,
+            credential,
+          },
+          origin: { kind: "move", source },
+        },
+      ],
+    });
+    expect(
+      NodeDesiredPage.safeParse(moved({ ...moveSource, end: proof })).success,
+    ).toBe(true);
+    for (const end of [
+      undefined,
+      { ...proof, timeline: 0 },
+      { ...proof, last_archived_segment: "00000001" },
+      { ...proof, proven_at: undefined },
+      { system_identifier: proof.system_identifier },
+    ])
+      expect(
+        NodeDesiredPage.safeParse(moved({ ...moveSource, end })).success,
+      ).toBe(false);
+    const restored = {
+      database_id: `s${"b".repeat(19)}`,
+      path: `s3://pgcf-eu/eu-dev/s${"b".repeat(19)}/g3-op_${"d".repeat(20)}`,
+      backup_id: "20261017T110000",
+      credential,
+    };
+    for (const source of [restored, { ...restored, end: proof }])
+      expect(
+        NodeDesiredPage.safeParse({
+          ...page,
+          databases: [{ ...database, origin: { kind: "restore", source } }],
+        }).success,
+      ).toBe(source === restored);
   });
 
   it("requires exactly one owner role while the database exists", () => {
@@ -337,7 +394,6 @@ describe("the per-node desired page", () => {
         databases: [],
         orders: [
           superseded,
-          { type: "fence", operation: `op_${"f".repeat(20)}` },
           { type: "maintenance", operation: `op_${"m".repeat(20)}` },
         ],
       }).success,
@@ -460,13 +516,6 @@ describe("the desired page query", () => {
 });
 
 describe("what a node reports", () => {
-  const proof = {
-    system_identifier: "7428512345678901234",
-    timeline: 1,
-    checkpoint_lsn: "0/3000028",
-    last_archived_segment: "000000010000000000000002",
-    proven_at: now,
-  };
   const observation = {
     id,
     generation: 4,
@@ -560,9 +609,14 @@ describe("what a node reports", () => {
       awake_memory_mib: 256,
       starting: 0,
       queued: 0,
+      credentials_revision: 3,
     };
     expect(NodeSample.safeParse(sample).success).toBe(true);
     expect(NodeSample.safeParse({ ...sample, pool: null }).success).toBe(true);
+    // Null until the node applied its first credentials; never zero.
+    expect(
+      NodeSample.safeParse({ ...sample, credentials_revision: null }).success,
+    ).toBe(true);
     // Unknown is null and never zero; nothing waiting has no age.
     expect(
       NodeSample.safeParse({
@@ -586,6 +640,8 @@ describe("what a node reports", () => {
       { archive: { ready_files: 0, oldest_ready_seconds: 5 } },
       { archive: { ready_files: null, oldest_ready_seconds: 5 } },
       { awake_memory_mib: undefined },
+      { credentials_revision: undefined },
+      { credentials_revision: 0 },
     ])
       expect(NodeSample.safeParse({ ...sample, ...broken }).success).toBe(
         false,
@@ -625,6 +681,7 @@ describe("what a node reports", () => {
       awake_memory_mib: Number.MAX_SAFE_INTEGER,
       starting: 0,
       queued: Number.MAX_SAFE_INTEGER,
+      credentials_revision: Number.MAX_SAFE_INTEGER,
     };
     const message = { type: "sample", sample };
     expect(AgentLinkMessage.safeParse(message).success).toBe(true);
@@ -662,9 +719,12 @@ describe("what a node reports", () => {
     ).toBe(false);
   });
 
-  it("names every admission refusal with its detail and retry hint, and every phase of a wake", () => {
+  it("names every admission refusal with its reason, the retry hint of awake capacity only, and every phase of a wake", () => {
+    const eventId = (letter: string) =>
+      `${letter.repeat(8)}-1111-4111-8111-111111111111`;
     const admission = {
       type: "admission",
+      id: eventId("a"),
       at: now,
       database: id,
       generation: 5,
@@ -678,6 +738,7 @@ describe("what a node reports", () => {
     };
     const wake = {
       type: "wake",
+      id: eventId("b"),
       at: now,
       database: id,
       generation: 5,
@@ -686,16 +747,25 @@ describe("what a node reports", () => {
       phases_ms: { admission: 1, start: 61, release: 1 },
     };
     expect(
-      ADMISSION_REFUSALS.map((reason) => ADMISSION_REFUSAL_DETAILS[reason]),
-    ).toEqual(["storage", "node at awake capacity"]);
-    expect(
       NodeEventReport.safeParse({
         events: [
           admission,
           wake,
-          { ...wake, outcome: "refused", reason: "no_room" },
+          {
+            ...wake,
+            id: eventId("c"),
+            outcome: "refused",
+            reason: "no_room",
+          },
+          {
+            ...admission,
+            id: eventId("d"),
+            reason: "no_room",
+            retry_after_seconds: undefined,
+          },
           {
             type: "early_sleep",
+            id: eventId("e"),
             at: now,
             database: `e${"b".repeat(19)}`,
             generation: 2,
@@ -703,6 +773,7 @@ describe("what a node reports", () => {
           },
           {
             ...admission,
+            id: eventId("f"),
             start: "recovery",
             operation: null,
             decision: "admitted",
@@ -717,6 +788,7 @@ describe("what a node reports", () => {
       { ...admission, reason: undefined },
       { ...admission, retry_after_seconds: undefined },
       { ...admission, retry_after_seconds: 0 },
+      { ...admission, reason: "no_room" },
       { ...admission, decision: "admitted", retry_after_seconds: undefined },
       { ...admission, decision: "admitted", reason: undefined },
       { ...wake, outcome: "refused" },
@@ -727,6 +799,37 @@ describe("what a node reports", () => {
       expect(NodeEventReport.safeParse({ events: [event] }).success).toBe(
         false,
       );
+  });
+
+  it("gives every event an id so a retried post is counted once", () => {
+    const events = [
+      {
+        type: "early_sleep",
+        id: "a1111111-1111-4111-8111-111111111111",
+        at: now,
+        database: `e${"b".repeat(19)}`,
+        generation: 2,
+        for_database: id,
+      },
+      {
+        type: "wake",
+        id: "b1111111-1111-4111-8111-111111111111",
+        at: now,
+        database: id,
+        generation: 5,
+        operation,
+        outcome: "started",
+        phases_ms: { start: 61 },
+      },
+    ];
+    expect(NodeEventReport.safeParse({ events }).success).toBe(true);
+    for (const broken of [
+      events.map(({ id: _, ...event }) => event),
+      events.map((event) => ({ ...event, id: "not-a-uuid" })),
+      [events[0], { ...events[1], id: events[0]!.id }],
+      [events[0], events[0]],
+    ])
+      expect(NodeEventReport.safeParse({ events: broken }).success).toBe(false);
   });
 
   it("scopes an archive credential to one prefix and lifetime", () => {
@@ -747,5 +850,253 @@ describe("what a node reports", () => {
         path: `s3://pgcf-eu/eu-dev/${id}`,
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("usage", () => {
+  const row = {
+    database: id,
+    interval_start: "2026-10-17T11:00:00.000Z",
+    interval_end: "2026-10-17T11:15:00.000Z",
+    awake_ms: 900_000,
+    ingress_bytes: 100,
+    egress_bytes: 200,
+    connections: 3,
+    connection_ms: 5_000,
+  };
+  const unknown = {
+    ...row,
+    awake_ms: null,
+    ingress_bytes: null,
+    egress_bytes: null,
+    connections: null,
+    connection_ms: null,
+  };
+  const report = (...rows: object[]) => NodeUsageReport.safeParse({ rows });
+
+  it("has its own signed path", () => {
+    expect(NODE_API_PATHS.usage).toBe("/node/v1/usage");
+  });
+
+  it("reports one database's deltas per interval, and an unknown metric as null", () => {
+    expect(report(row).success).toBe(true);
+    expect(report(unknown).success).toBe(true);
+    // Adjacent intervals tile the hours; the same interval of another database is another row.
+    expect(
+      report(
+        row,
+        {
+          ...row,
+          interval_start: row.interval_end,
+          interval_end: "2026-10-17T12:00:00.000Z",
+        },
+        { ...row, database: `e${"b".repeat(19)}` },
+      ).success,
+    ).toBe(true);
+    for (const broken of [
+      { awake_ms: undefined },
+      { ingress_bytes: -1 },
+      { egress_bytes: 1.5 },
+      { connections: Number.MAX_SAFE_INTEGER + 1 },
+      { interval_end: row.interval_start },
+      { interval_end: "2026-10-17T10:59:59.999Z" },
+      // An interval never crosses a UTC hour: the API rolls up by hour.
+      { interval_end: "2026-10-17T12:00:00.001Z" },
+      { awake_ms: 900_001 },
+      // Unknown is null; the API names the gap from the null.
+      { gaps: ["ingress_bytes"] },
+      { process_epoch: "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c" },
+    ])
+      expect(report({ ...row, ...broken }).success).toBe(false);
+  });
+
+  it("names each interval of a database once and carries at most one batch", () => {
+    expect(report().success).toBe(false);
+    expect(report(row, row).success).toBe(false);
+    expect(report(row, { ...unknown }).success).toBe(false);
+    const rows = Array.from({ length: NODE_USAGE_BATCH_MAX }, (_, index) => ({
+      ...row,
+      database: `d${String(index).padStart(19, "0")}`,
+    }));
+    expect(report(...rows).success).toBe(true);
+    expect(report(...rows, { ...row, database: id }).success).toBe(false);
+  });
+});
+
+describe("a fenced node", () => {
+  const fence = { type: "fence", operation: `op_${"f".repeat(20)}` };
+  const superseded = {
+    type: "superseded",
+    operation: `op_${"s".repeat(20)}`,
+    database: `x${"b".repeat(19)}`,
+    storage_generation: 2,
+    remove_volume: true,
+  };
+  const fenced = {
+    ...page,
+    release: null,
+    orders: [fence, superseded],
+    databases: [],
+    next: null,
+  };
+
+  it("is told by a page that has no database, no release and only fence and superseded orders", () => {
+    expect(NodeDesiredPage.safeParse(fenced).success).toBe(true);
+    for (const broken of [
+      { databases: [database] },
+      { release: page.release },
+      { next: id },
+      {
+        orders: [
+          fence,
+          { type: "maintenance", operation: `op_${"m".repeat(20)}` },
+        ],
+      },
+      {
+        orders: [
+          fence,
+          {
+            type: "move",
+            operation: `op_${"v".repeat(20)}`,
+            database: id,
+            storage_generation: 1,
+          },
+        ],
+      },
+      {
+        orders: [
+          fence,
+          {
+            type: "wake",
+            operation: `op_${"w".repeat(20)}`,
+            database: id,
+            generation: 5,
+          },
+        ],
+      },
+    ])
+      expect(NodeDesiredPage.safeParse({ ...fenced, ...broken }).success).toBe(
+        false,
+      );
+    // Without a fence order the same page is an ordinary page.
+    expect(
+      NodeDesiredPage.safeParse({ ...fenced, orders: [superseded] }).success,
+    ).toBe(true);
+  });
+
+  it("keeps its key for the desired page and its observations only, and answers the rest node_fenced", () => {
+    expect(NODE_FENCED_PATHS).toEqual([
+      NODE_API_PATHS.desired,
+      NODE_API_PATHS.observations,
+    ]);
+    expect(NodeFencedResponse.safeParse({ error: "node_fenced" }).success).toBe(
+      true,
+    );
+    for (const body of [
+      { error: "forbidden" },
+      { error: "node_fenced", detail: "x" },
+      {},
+    ])
+      expect(NodeFencedResponse.safeParse(body).success).toBe(false);
+  });
+});
+
+describe("the order of generations", () => {
+  const desired = { generation: 4, operation: `op_${"a".repeat(20)}` };
+  const released = { generation: 5, operation: `op_${"w".repeat(20)}` };
+
+  it("accepts an observation of the desired generation and operation", () => {
+    expect(observationVerdict(desired, null, desired)).toBe("accept");
+    // A refused suspend answers the suspend's own generation; it is final for it.
+    const suspend = { generation: 6, operation: `op_${"u".repeat(20)}` };
+    expect(
+      NodeDatabaseObservation.safeParse({
+        id,
+        ...suspend,
+        storage_generation: 1,
+        state: "ready",
+        proven_sleep: null,
+        refusal: "power_busy",
+        backup: null,
+        archive: { last_segment: null, ready_files: 0, failing_since: null },
+      }).success,
+    ).toBe(true);
+    expect(observationVerdict(suspend, null, suspend)).toBe("accept");
+  });
+
+  it("ignores an older generation and refuses the same generation of another operation", () => {
+    expect(
+      observationVerdict(desired, null, { ...desired, generation: 3 }),
+    ).toBe("stale");
+    // A concurrent suspend or resize won the D1 claim: the page wins and the agent applies it.
+    expect(
+      observationVerdict(desired, null, {
+        ...desired,
+        operation: `op_${"b".repeat(20)}`,
+      }),
+    ).toBe("conflict");
+  });
+
+  it("takes a generation above the page's only as the wake claim the node released", () => {
+    expect(observationVerdict(desired, released, released)).toBe("accept");
+    for (const [claim, observed] of [
+      [null, released],
+      [released, { ...released, operation: `op_${"b".repeat(20)}` }],
+      [
+        { ...released, generation: 6 },
+        { ...released, generation: 6 },
+      ],
+      [released, { ...released, generation: 6 }],
+    ] as const)
+      expect(observationVerdict(desired, claim, observed)).toBe("conflict");
+  });
+});
+
+describe("credentials and the node's policy", () => {
+  const credentials = {
+    revision: 3,
+    tunnel_token: "eyJ".padEnd(120, "A"),
+    route_keyring: {
+      active: "k1",
+      keys: { k1: "A".repeat(43) },
+    },
+  };
+
+  it("numbers the credentials the page expects and the credentials a read returns", () => {
+    expect(NodeCredentials.safeParse(credentials).success).toBe(true);
+    for (const revision of [undefined, 0, -1])
+      expect(
+        NodeCredentials.safeParse({ ...credentials, revision }).success,
+      ).toBe(false);
+    for (const credentials_revision of [undefined, 0])
+      expect(
+        NodeDesiredPage.safeParse({ ...page, credentials_revision }).success,
+      ).toBe(false);
+  });
+
+  it("carries the memory of each backup job and the write limits of a 256 MiB database", () => {
+    const withPolicy = (change: object) => ({
+      ...page,
+      policy: { ...page.policy, ...change },
+    });
+    for (const broken of [
+      { backup: { wal_uploads: 2, base_backups: 1 } },
+      {
+        backup: {
+          ...page.policy.backup,
+          memory_mib: { wal_upload: 128, wal_fetch: 192 },
+        },
+      },
+      {
+        backup: {
+          ...page.policy.backup,
+          memory_mib: { ...page.policy.backup.memory_mib, wal_upload: 0 },
+        },
+      },
+      { io: undefined },
+      { io: { ...page.policy.io, write_iops: 0 } },
+      { io: { ...page.policy.io, write_bytes_per_second: 0 } },
+    ])
+      expect(NodeDesiredPage.safeParse(withPolicy(broken)).success).toBe(false);
   });
 });

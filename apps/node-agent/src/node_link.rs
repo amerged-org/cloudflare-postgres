@@ -97,8 +97,20 @@ fn page_rules(page: &Value) -> bool {
             return false;
         }
     }
+    let orders = page["orders"].as_array().into_iter().flatten();
+    // A fenced node's page holds no database and no release, and only fence and superseded orders.
+    if orders.clone().any(|order| order["type"] == "fence")
+        && (!served.is_empty()
+            || !page["release"].is_null()
+            || !page["next"].is_null()
+            || orders
+                .clone()
+                .any(|order| !matches!(order["type"].as_str(), Some("fence" | "superseded"))))
+    {
+        return false;
+    }
     let mut operations = HashSet::new();
-    for order in page["orders"].as_array().into_iter().flatten() {
+    for order in orders {
         if !operations.insert(order["operation"].as_str()) {
             return false;
         }
@@ -115,7 +127,8 @@ fn page_rules(page: &Value) -> bool {
     true
 }
 
-/// A restore reads another database; a move reads this database's earlier generation to its end.
+/// A restore reads another database; a move reads this database's earlier generation to its end
+/// (the schema gives a move its `end` record and no target time).
 fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
     let kind = origin["kind"].as_str();
     if matches!(kind, None | Some("create")) {
@@ -131,9 +144,7 @@ fn origin_valid(origin: &Value, id: &str, storage: u64) -> bool {
     from.database == source_id
         && match kind {
             Some("restore") => source_id != id,
-            Some("move") => {
-                source_id == id && from.generation < storage && source.get("target_time").is_none()
-            }
+            Some("move") => source_id == id && from.generation < storage,
             _ => false,
         }
 }
@@ -199,6 +210,28 @@ fn roles_valid(db: &Value) -> bool {
                     })
                 })
         })
+}
+
+/// What the agent does with one database's entry of a desired page, given the generation and
+/// operation it runs (`NodeDesiredDatabase.generation` in the contract). The generation never
+/// falls: the wake claim the agent released may be above what the page names, because D1 commits
+/// the claim after the answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PageEntry {
+    /// Below what runs: ignored. The orders of its page still apply.
+    Stale,
+    /// The generation and operation that run: nothing to do.
+    Current,
+    /// Above what runs, or the same generation of another operation: the page wins. The agent
+    /// applies it and republishes the gateway's table entry.
+    Apply,
+}
+pub fn page_entry(running: &(u64, String), entry: (u64, &str)) -> PageEntry {
+    match entry.0.cmp(&running.0) {
+        std::cmp::Ordering::Less => PageEntry::Stale,
+        std::cmp::Ordering::Equal if entry.1 == running.1 => PageEntry::Current,
+        _ => PageEntry::Apply,
+    }
 }
 
 /// The claims of a signed node request, in the contract's field order.
@@ -307,6 +340,20 @@ mod tests {
             assert_eq!(sign_request(&key, &claims), vector["token"]);
         }
     }
+    #[test]
+    fn a_page_entry_never_lowers_what_the_agent_runs() {
+        let op = |letter: char| format!("op_{}", letter.to_string().repeat(20));
+        let running = (4, op('a'));
+        // An older entry is stale and ignored; the orders of its page still apply.
+        assert_eq!(page_entry(&running, (3, &op('z'))), PageEntry::Stale);
+        // The same generation and operation is what runs.
+        assert_eq!(page_entry(&running, (4, &op('a'))), PageEntry::Current);
+        // The same generation of another operation: a concurrent suspend or resize won the D1
+        // claim of the wake the agent released, so the page wins and is applied again.
+        assert_eq!(page_entry(&running, (4, &op('b'))), PageEntry::Apply);
+        assert_eq!(page_entry(&running, (5, &op('a'))), PageEntry::Apply);
+    }
+
     #[test]
     fn archive_paths_split_into_their_parts() {
         let path = format!(

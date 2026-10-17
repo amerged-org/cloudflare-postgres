@@ -32,7 +32,14 @@ import {
 } from "./ids.ts";
 import { MAINTENANCE_ROLE } from "./maintenance.ts";
 import { FleetReleaseId } from "./releases.ts";
-import { WAKE_OUTCOMES, WAKE_PHASES, WAKE_REASONS } from "./node-local.ts";
+import { USAGE_HOUR_MS } from "./usage.ts";
+import {
+  ADMISSION_REFUSALS,
+  WAKE_OUTCOMES,
+  WAKE_PHASES,
+  WAKE_REASONS,
+  refusalRetryHint,
+} from "./node-local.ts";
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const Count = z.number().int().nonnegative().max(MAX_SAFE);
@@ -53,7 +60,26 @@ export const NODE_API_PATHS = {
   observations: "/node/v1/observations",
   volumes: "/node/v1/volumes",
   events: "/node/v1/events",
+  usage: "/node/v1/usage",
 } as const;
+/**
+ * A node declared lost (plan 9.4) is fenced: its Tunnel token is revoked, and its key still signs
+ * exactly these paths (compared without the query). Everything else, the link included, is
+ * answered 403 `NodeFencedResponse`. The desired page of a fenced node carries its `fence` and
+ * `superseded` orders and nothing else, and its observations are read for the results of those
+ * orders only. A node that comes back therefore learns that it is fenced and which generations
+ * are superseded, and can report that it obeyed; it learns no credential.
+ */
+export const NODE_FENCED_PATHS = [
+  NODE_API_PATHS.desired,
+  NODE_API_PATHS.observations,
+] as const;
+export const NODE_FENCED_ERROR = "node_fenced";
+/** The body of that 403; the agent treats it as a fence and pulls its desired page. */
+export const NodeFencedResponse = z.strictObject({
+  error: z.literal(NODE_FENCED_ERROR),
+});
+export type NodeFencedResponse = z.infer<typeof NodeFencedResponse>;
 /** The installer's checkpoints go here with its one-time progress token (plan 9.2). */
 export const INSTALLER_PROGRESS_PATH = "/node/v1/installer/progress";
 export const NODE_SAMPLE_INTERVAL_MS = 15_000;
@@ -66,6 +92,12 @@ export const NODE_ORDER_LIMIT = 1000;
 export const NODE_AWAKE_LIMIT = 2000;
 export const NODE_VOLUME_LIMIT = 10_000;
 export const NODE_EVENT_BATCH_MAX = 500;
+export const NODE_USAGE_BATCH_MAX = 500;
+/**
+ * The agent re-posts an unanswered event batch unchanged for this long and then drops it; the API
+ * remembers the ids of a batch for this long and the request lifetime beyond it.
+ */
+export const NODE_EVENT_RETRY_SECONDS = 600;
 
 // ---------- Identity and enrollment ----------
 
@@ -81,7 +113,12 @@ export const NodeIdentity = z.strictObject({
 export type NodeIdentity = z.infer<typeof NodeIdentity>;
 
 export const ENROLLMENT_TOKEN_PATTERN = /^pgcf_et_[A-Za-z0-9_-]{43}$/;
-/** A token lives this long, is bound to one image version and is burnt by its enrollment. */
+/**
+ * A token lives this long, is bound to one image version and is burnt by its enrollment. A repeat
+ * of the same enrollment (same token, same public key) within the lifetime returns the same
+ * identity, because the response of the first may have been lost; only another key, or an expired
+ * token, is refused and raises an alert.
+ */
 export const ENROLLMENT_TOKEN_LIFETIME_SECONDS = 1800;
 export const EnrollmentToken = z.string().regex(ENROLLMENT_TOKEN_PATTERN);
 export const IMAGE_VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
@@ -110,7 +147,8 @@ export const NodePublicKey = z
 
 /**
  * POST /node/v1/enroll. The Worker accepts it only from the instance's own public IPv4, after the
- * installer's checkpoints for this token arrived, and for the image version the token names.
+ * installer's checkpoints for this token arrived, and for the image version the token names. A
+ * repeat with the same token and public key answers the same `NodeEnrollmentResponse`.
  */
 export const NodeEnrollmentRequest = z.strictObject({
   node_id: NodeId,
@@ -338,8 +376,13 @@ export async function verifyNodeRequest(
 
 // ---------- Credentials ----------
 
-/** GET /node/v1/credentials: what the gateway and the Tunnel need, after enrollment. */
+/**
+ * GET /node/v1/credentials: what the gateway and the Tunnel need, after enrollment. The agent
+ * reads it when the page's `credentials_revision` is above the revision it applied.
+ */
 export const NodeCredentials = z.strictObject({
+  /** The revision these credentials hold; it only rises, with every change of either secret. */
+  revision: Positive,
   tunnel_token: z.string().regex(/^[A-Za-z0-9+/=_-]{32,4096}$/),
   /** The node's route keyring for the gateway (`PGCF_ROUTE_KEY`). */
   route_keyring: RegionRouteKeyring,
@@ -621,12 +664,42 @@ export const NodePolicy = z.strictObject({
   backup: z.strictObject({
     wal_uploads: z.number().int().min(1).max(16),
     base_backups: z.number().int().min(1).max(8),
+    /** `MemoryMax` of one barman job by kind; a base backup counts for a restore too (plan 7.5). */
+    memory_mib: z.strictObject({
+      wal_upload: z.number().int().min(32).max(4096),
+      wal_fetch: z.number().int().min(32).max(4096),
+      base_backup: z.number().int().min(32).max(4096),
+    }),
+  }),
+  /**
+   * The write limits of a database unit (plan 4.3): those of a 256 MiB database. A database of m
+   * MiB gets m / 256 times as much. They bound how fast one tenant can fill the pool.
+   */
+  io: z.strictObject({
+    write_bytes_per_second: Positive,
+    write_iops: z.number().int().min(1).max(10_000_000),
   }),
 });
 export type NodePolicy = z.infer<typeof NodePolicy>;
 
+export const WAL_SEGMENT_PATTERN = /^[0-9A-F]{24}$/;
+const WalSegment = z.string().regex(WAL_SEGMENT_PATTERN);
+
+/** The fsynced record of a proven sleep (plan 7.9); a database is cold and safe only with it. */
+export const ProvenSleepRecord = z.strictObject({
+  system_identifier: z
+    .string()
+    .regex(/^[1-9][0-9]{0,19}$/)
+    .refine((value) => BigInt(value) <= 0xffff_ffff_ffff_ffffn),
+  timeline: z.number().int().min(1).max(0xffff_ffff),
+  checkpoint_lsn: z.string().regex(/^[0-9A-F]{1,8}\/[0-9A-F]{1,8}$/),
+  last_archived_segment: WalSegment,
+  proven_at: Timestamp,
+});
+export type ProvenSleepRecord = z.infer<typeof ProvenSleepRecord>;
+
 const BACKUP_ID = /^[0-9]{8}T[0-9]{6}$/;
-/** The archive a storage generation is built from: a backup and, for a PITR, a target time. */
+/** The archive a restore reads: a backup of another database and, for a PITR, a target time. */
 export const RestoreSource = z.strictObject({
   database_id: DatabaseId,
   path: ArchivePath,
@@ -636,22 +709,47 @@ export const RestoreSource = z.strictObject({
 });
 export type RestoreSource = z.infer<typeof RestoreSource>;
 /**
+ * The archive a move reads: this database's previous storage generation, to the end of its WAL,
+ * never to a point in time. `end` is the record that proved the source's sleep; it is the only
+ * statement of where the committed WAL ends, so the target can check its replay against it.
+ */
+export const MoveSource = RestoreSource.omit({ target_time: true }).extend({
+  end: ProvenSleepRecord,
+});
+export type MoveSource = z.infer<typeof MoveSource>;
+/**
  * How the node builds the storage generation: `create` (initdb, only onto an empty archive path),
  * `restore` (into a new database) or `move` (this database's previous storage generation, to the
  * end of its WAL). Absent once the generation was ready: a missing volume is then an error and
  * never a fresh build.
+ *
+ * A move target restores `source.backup_id` and replays the WAL of `end.timeline` until every
+ * segment through `end.last_archived_segment` was fetched and replayed. Recovery may end only
+ * after that, where the archive holds nothing more: the agent answers a fetch `missing` for none
+ * of those segments and fails the recovery instead (see `ArchiveReply`). The shutdown checkpoint
+ * lies in the next segment, which is never archived and holds no client commit (plan 7.9 step 8),
+ * so `end.checkpoint_lsn` is not a replay target. The target reports `ready` only after it
+ * promoted a database with `end.system_identifier` on a timeline above `end.timeline`; otherwise
+ * it reports the error `no_recovery_point` and the source's storage generation stays unretired.
  */
 export const DatabaseOrigin = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("create") }),
   z.strictObject({ kind: z.literal("restore"), source: RestoreSource }),
-  z.strictObject({ kind: z.literal("move"), source: RestoreSource }),
+  z.strictObject({ kind: z.literal("move"), source: MoveSource }),
 ]);
 export type DatabaseOrigin = z.infer<typeof DatabaseOrigin>;
 
 export const NodeDesiredDatabase = z
   .strictObject({
     id: DatabaseId,
-    /** D1's generation of the database; every change and every wake claim advances it. */
+    /**
+     * D1's generation of the database; every change and every wake claim advances it. A wake claim
+     * is committed after the wake was answered, so the node may run and report generation N + 1
+     * while the page still says N (`observationVerdict`). The agent never lowers the generation of
+     * a database it knows: an entry below it is stale and ignored (orders still apply), an entry
+     * at it with another operation wins and is applied again, and its table entry for the gateway
+     * republished.
+     */
     generation: Positive,
     /** The operation of that generation. */
     operation: OperationId,
@@ -702,8 +800,7 @@ export const NodeDesiredDatabase = z
         (db.origin.kind === "restore"
           ? source.database_id === db.id
           : source.database_id !== db.id ||
-            from.generation >= db.storage_generation ||
-            source.target_time !== undefined)
+            from.generation >= db.storage_generation)
       )
         ctx.addIssue({
           code: "custom",
@@ -726,6 +823,12 @@ export type NodeDesiredDatabase = z.infer<typeof NodeDesiredDatabase>;
  * the volume only with `remove_volume`. `fence`: the node was declared lost; start and archive
  * nothing. `maintenance`: hold new wakes, prove the sleep of every database, install the
  * release's packages, reboot if needed, check.
+ *
+ * `fence` and `superseded` outlive their result. The agent writes them to disk (fsync) before it
+ * acts on them, never lifts one because it left the page or because its result was reported, and
+ * checks them before any recovery start at boot. A fence ends only with a reinstall, which is a
+ * new install with a new key; a superseded generation never ends. The wakes that a hold or a
+ * state refuses are named in `WAKE_REASONS`: `moving`, `maintenance`, `fenced`, `superseded`.
  */
 export const NodeOrder = z.discriminatedUnion("type", [
   z.strictObject({
@@ -754,7 +857,8 @@ export type NodeOrder = z.infer<typeof NodeOrder>;
 
 /**
  * One page of the node's desired state. A database the pages do not name is never stopped or
- * deleted for that; only an order or a desired state does that.
+ * deleted for that; only an order or a desired state does that. The page of a fenced node (it
+ * has a `fence` order) holds no database, no release and only `fence` and `superseded` orders.
  */
 export const NodeDesiredPage = z
   .strictObject({
@@ -762,6 +866,13 @@ export const NodeDesiredPage = z
     /** Null until a release is assigned: the node keeps what runs. */
     release: NodeRelease.nullable(),
     policy: NodePolicy,
+    /**
+     * The revision of the node's credentials (Tunnel token and route keyring). The agent reads
+     * `NodeCredentials` when this is above the revision it applied, and reports the applied
+     * revision in every sample; the API makes a new route key active only after every node of
+     * the region reports a revision that holds it.
+     */
+    credentials_revision: Positive,
     /** Every open order, on every page. */
     orders: z.array(NodeOrder).max(NODE_ORDER_LIMIT),
     databases: z.array(NodeDesiredDatabase).max(NODE_DESIRED_PAGE_LIMIT_MAX),
@@ -784,6 +895,21 @@ export const NodeDesiredPage = z
           message: "The archive is in the node's region",
         });
     });
+    if (
+      page.orders.some((order) => order.type === "fence") &&
+      (page.databases.length > 0 ||
+        page.release !== null ||
+        page.next !== null ||
+        page.orders.some(
+          (order) => order.type !== "fence" && order.type !== "superseded",
+        ))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["orders"],
+        message:
+          "A fenced node's page holds no database and no release, and only fence and superseded orders",
+      });
     const operations = new Set<string>();
     page.orders.forEach((order, index) => {
       if (operations.has(order.operation))
@@ -807,22 +933,6 @@ export const NodeDesiredPage = z
 export type NodeDesiredPage = z.infer<typeof NodeDesiredPage>;
 
 // ---------- Observations (POST /node/v1/observations) ----------
-
-export const WAL_SEGMENT_PATTERN = /^[0-9A-F]{24}$/;
-const WalSegment = z.string().regex(WAL_SEGMENT_PATTERN);
-
-/** The fsynced record of a proven sleep (plan 7.9); a database is cold and safe only with it. */
-export const ProvenSleepRecord = z.strictObject({
-  system_identifier: z
-    .string()
-    .regex(/^[1-9][0-9]{0,19}$/)
-    .refine((value) => BigInt(value) <= 0xffff_ffff_ffff_ffffn),
-  timeline: z.number().int().min(1).max(0xffff_ffff),
-  checkpoint_lsn: z.string().regex(/^[0-9A-F]{1,8}\/[0-9A-F]{1,8}$/),
-  last_archived_segment: WalSegment,
-  proven_at: Timestamp,
-});
-export type ProvenSleepRecord = z.infer<typeof ProvenSleepRecord>;
 
 /**
  * `building`: a create, restore or move runs; `ready`: PostgreSQL runs and the storage generation
@@ -851,14 +961,21 @@ export const NODE_DATABASE_ERRORS = [
 export const NodeDatabaseObservation = z
   .strictObject({
     id: DatabaseId,
-    /** The desired generation and operation this observation answers. */
+    /**
+     * The desired generation and operation this observation answers, or the wake claim the node
+     * released that the page does not name yet (`observationVerdict`).
+     */
     generation: Positive,
     operation: OperationId,
     storage_generation: Positive,
     state: z.enum(NODE_DATABASE_STATES),
     error: z.enum(NODE_DATABASE_ERRORS).optional(),
     proven_sleep: ProvenSleepRecord.nullable(),
-    /** A sleep this generation asked for was refused; the database stays awake and wakeable. */
+    /**
+     * A sleep this generation asked for was refused; the database stays awake and wakeable. The
+     * refusal is final for that generation: the node does not retry the proof, and the database
+     * suspends only when a new generation asks again.
+     */
     refusal: z.enum(["power_busy", "power_archive"]).optional(),
     /** The newest DONE base backup of this storage generation. */
     backup: z
@@ -916,6 +1033,39 @@ export const NodeDatabaseObservation = z
       });
   });
 export type NodeDatabaseObservation = z.infer<typeof NodeDatabaseObservation>;
+
+/** A generation of one database and the operation that made it. */
+export interface GenerationRef {
+  generation: number;
+  operation: string;
+}
+export type ObservationVerdict = "accept" | "stale" | "conflict";
+/**
+ * Whether the API takes an observation of a database. `desired` is D1's current generation,
+ * `claim` the wake ticket the DatabaseActor issued whose claim D1 has not committed yet (null
+ * when none): the node releases a wake before D1 commits its claim, so it may report generation
+ * N + 1 while D1 still says N. The observation is accepted when it names the desired generation
+ * and operation, or exactly that claim. An older generation is `stale` and ignored. Anything else
+ * is a `conflict` and is recorded and never applied: the page wins, so the agent applies the
+ * desired entry (a concurrent suspend or resize that won the D1 claim) and republishes its table
+ * entry for the gateway.
+ */
+export function observationVerdict(
+  desired: GenerationRef,
+  claim: GenerationRef | null,
+  observed: GenerationRef,
+): ObservationVerdict {
+  const same = (a: GenerationRef, b: GenerationRef) =>
+    a.generation === b.generation && a.operation === b.operation;
+  if (observed.generation < desired.generation) return "stale";
+  if (observed.generation === desired.generation)
+    return same(desired, observed) ? "accept" : "conflict";
+  return claim !== null &&
+    claim.generation === desired.generation + 1 &&
+    same(claim, observed)
+    ? "accept"
+    : "conflict";
+}
 
 /**
  * How an order ended. A failed wake order names a `WAKE_REASONS` entry; every other failure names
@@ -1009,6 +1159,8 @@ export const NodeSample = z
     starting: Count,
     /** Wakes waiting for room. */
     queued: Count,
+    /** The `NodeCredentials` revision the node applied; null before its first read. */
+    credentials_revision: Positive.nullable(),
   })
   .superRefine((sample, ctx) => {
     const issue = (message: string) =>
@@ -1078,6 +1230,67 @@ export const NodeVolumeReport = z
   );
 export type NodeVolumeReport = z.infer<typeof NodeVolumeReport>;
 
+// ---------- Usage (POST /node/v1/usage) ----------
+
+/**
+ * What the node meters of one database in one interval: the milliseconds its unit was active, and
+ * the deltas of the gateway's counters (`GatewayLocalActivityReport`) over the interval. A metric
+ * the node cannot know, such as a counter lost to a gateway restart, is null and never zero; the
+ * API names the gap from the null. An interval is positive and stays within one UTC hour, so the
+ * API rolls rows up by hour. The agent keeps its rows unchanged until the API answered them.
+ */
+export const NodeUsageRow = z
+  .strictObject({
+    database: DatabaseId,
+    interval_start: Timestamp,
+    interval_end: Timestamp,
+    awake_ms: Count.nullable(),
+    ingress_bytes: Count.nullable(),
+    egress_bytes: Count.nullable(),
+    connections: Count.nullable(),
+    connection_ms: Count.nullable(),
+  })
+  .superRefine((row, ctx) => {
+    const start = Date.parse(row.interval_start),
+      end = Date.parse(row.interval_end);
+    if (
+      end <= start ||
+      Math.floor(start / USAGE_HOUR_MS) !==
+        Math.floor((end - 1) / USAGE_HOUR_MS)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["interval_end"],
+        message: "An interval is positive and stays within one UTC hour",
+      });
+    if (row.awake_ms !== null && row.awake_ms > end - start)
+      ctx.addIssue({
+        code: "custom",
+        path: ["awake_ms"],
+        message: "A database cannot be awake longer than the interval",
+      });
+  });
+export type NodeUsageRow = z.infer<typeof NodeUsageRow>;
+/**
+ * POST /node/v1/usage. A row is identified by its database, `interval_start` and `interval_end`:
+ * the API keeps the row it already holds and ignores a repeat, so a retried post counts once. Rows
+ * of one database never overlap, because only one node serves a database at a time.
+ */
+export const NodeUsageReport = z
+  .strictObject({
+    rows: z.array(NodeUsageRow).min(1).max(NODE_USAGE_BATCH_MAX),
+  })
+  .refine(
+    (report) =>
+      new Set(
+        report.rows.map(
+          (row) => `${row.database}/${row.interval_start}/${row.interval_end}`,
+        ),
+      ).size === report.rows.length,
+    { path: ["rows"], message: "A report names each interval once" },
+  );
+export type NodeUsageReport = z.infer<typeof NodeUsageReport>;
+
 // ---------- Events (POST /node/v1/events) ----------
 
 /** Every PostgreSQL start the agent admits (plan 4.6). */
@@ -1090,14 +1303,11 @@ export const ADMISSION_STARTS = [
   "resize",
   "check",
 ] as const;
-/** `no_room`: the room rule failed; `no_headroom`: the wait for awake capacity expired. */
-export const ADMISSION_REFUSALS = ["no_room", "no_headroom"] as const;
-/** The detail of the 57P03 that answers each refusal (plan 4.6). */
-export const ADMISSION_REFUSAL_DETAILS = {
-  no_room: "storage",
-  no_headroom: "node at awake capacity",
-} as const satisfies Record<(typeof ADMISSION_REFUSALS)[number], string>;
-
+/**
+ * Every event has an id. The agent keeps an event's id across retries of its post; the API
+ * deduplicates by (node uid, id), so an event whose post was retried is counted once.
+ */
+const EventId = z.uuid();
 const Duration = z.number().int().min(0).max(600_000);
 const Phases = z.strictObject(
   Object.fromEntries(WAKE_PHASES.map((phase) => [phase, Duration.optional()])),
@@ -1107,6 +1317,7 @@ export const NodeEvent = z.discriminatedUnion("type", [
   z
     .strictObject({
       type: z.literal("admission"),
+      id: EventId,
       at: Timestamp,
       database: DatabaseId,
       generation: Positive,
@@ -1114,25 +1325,36 @@ export const NodeEvent = z.discriminatedUnion("type", [
       operation: OperationId.nullable(),
       start: z.enum(ADMISSION_STARTS),
       decision: z.enum(["admitted", "refused"]),
-      /** Exactly a refusal names its reason and the retry hint its client got. */
+      /**
+       * Exactly a refusal names its reason, and exactly the refusal of awake capacity the retry
+       * hint its client got (`refusalRetryHint`).
+       */
       reason: z.enum(ADMISSION_REFUSALS).optional(),
       retry_after_seconds: z.number().int().min(1).max(300).optional(),
       waited_ms: Duration,
       memory_mib: Count,
     })
     .superRefine((event, ctx) => {
-      const refused = event.decision === "refused";
-      for (const field of ["reason", "retry_after_seconds"] as const)
-        if (refused !== (event[field] !== undefined))
-          ctx.addIssue({
-            code: "custom",
-            path: [field],
-            message: "Exactly a refusal names its reason and its retry hint",
-          });
+      if ((event.decision === "refused") !== (event.reason !== undefined))
+        ctx.addIssue({
+          code: "custom",
+          path: ["reason"],
+          message: "Exactly a refusal names its reason",
+        });
+      if (
+        (event.reason !== undefined && refusalRetryHint(event.reason)) !==
+        (event.retry_after_seconds !== undefined)
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["retry_after_seconds"],
+          message: "Exactly the refusal of awake capacity carries a retry hint",
+        });
     }),
   /** An idle-but-awake database put to sleep early for a waiting wake (D2). */
   z.strictObject({
     type: z.literal("early_sleep"),
+    id: EventId,
     at: Timestamp,
     database: DatabaseId,
     generation: Positive,
@@ -1141,6 +1363,7 @@ export const NodeEvent = z.discriminatedUnion("type", [
   z
     .strictObject({
       type: z.literal("wake"),
+      id: EventId,
       at: Timestamp,
       database: DatabaseId,
       generation: Positive,
@@ -1155,9 +1378,16 @@ export const NodeEvent = z.discriminatedUnion("type", [
     ),
 ]);
 export type NodeEvent = z.infer<typeof NodeEvent>;
-export const NodeEventReport = z.strictObject({
-  events: z.array(NodeEvent).min(1).max(NODE_EVENT_BATCH_MAX),
-});
+export const NodeEventReport = z
+  .strictObject({
+    events: z.array(NodeEvent).min(1).max(NODE_EVENT_BATCH_MAX),
+  })
+  .refine(
+    (report) =>
+      new Set(report.events.map((event) => event.id)).size ===
+      report.events.length,
+    { path: ["events"], message: "A report names each event once" },
+  );
 export type NodeEventReport = z.infer<typeof NodeEventReport>;
 
 // ---------- Link messages (GET /node/v1/link WebSocket) ----------
@@ -1178,7 +1408,10 @@ export const ServerLinkMessage = z.discriminatedUnion("type", [
     type: z.literal("welcome"),
     protocol: z.literal(NODE_PROTOCOL_VERSION),
   }),
-  /** Pull the desired page now; with `ids`, only those databases changed. */
+  /**
+   * Pull the desired page now; with `ids`, only those databases changed. It is also how the
+   * NodeActor tells a node that was declared lost: the page then holds the fence.
+   */
   z.strictObject({
     type: z.literal("desired"),
     ids: z.array(DatabaseId).min(1).max(NODE_DESIRED_PAGE_LIMIT_MAX).optional(),

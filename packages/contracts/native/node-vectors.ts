@@ -26,6 +26,13 @@ const credential = {
   id: `crd_${"k".repeat(20)}`,
   expires_at: "2026-10-24T12:00:00.000Z",
 };
+const proof = {
+  system_identifier: "7428512345678901234",
+  timeline: 1,
+  checkpoint_lsn: "0/3000028",
+  last_archived_segment: "000000010000000000000002",
+  proven_at: now,
+};
 const owner = {
   name: "app",
   owner: true,
@@ -85,6 +92,7 @@ const moved = {
       database_id: source,
       path: path(source, 3, op("d")),
       backup_id: "20261017T110000",
+      end: proof,
       credential,
     },
   },
@@ -130,8 +138,14 @@ const page = {
       metadata_no_room_percent: 75,
       sample_max_age_seconds: 10,
     },
-    backup: { wal_uploads: 2, base_backups: 1 },
+    backup: {
+      wal_uploads: 2,
+      base_backups: 1,
+      memory_mib: { wal_upload: 128, wal_fetch: 192, base_backup: 256 },
+    },
+    io: { write_bytes_per_second: 16_000_000, write_iops: 1000 },
   },
+  credentials_revision: 3,
   orders: [
     { type: "move", operation: op("v"), database: id, storage_generation: 1 },
     {
@@ -147,7 +161,6 @@ const page = {
       database: other,
       generation: 6,
     },
-    { type: "fence", operation: op("f") },
     { type: "maintenance", operation: op("t") },
   ],
   databases: [
@@ -171,18 +184,25 @@ const page = {
   ],
   next: `g${"b".repeat(19)}`,
 };
+const superseded = {
+  type: "superseded",
+  operation: op("s"),
+  database: `x${"b".repeat(19)}`,
+  storage_generation: 2,
+  remove_volume: true,
+};
+const fenced = {
+  ...page,
+  release: null,
+  orders: [{ type: "fence", operation: op("f") }, superseded],
+  databases: [],
+  next: null,
+};
 const withDatabase = (change: object) => ({
   ...page,
   orders: [],
   databases: [{ ...database, ...change }],
 });
-const proof = {
-  system_identifier: "7428512345678901234",
-  timeline: 1,
-  checkpoint_lsn: "0/3000028",
-  last_archived_segment: "000000010000000000000002",
-  proven_at: now,
-};
 const observation = {
   id,
   generation: 4,
@@ -221,6 +241,7 @@ const sample = {
   awake_memory_mib: 256,
   starting: 0,
   queued: 1,
+  credentials_revision: 3,
 };
 const volume = {
   database: id,
@@ -235,8 +256,11 @@ const volume = {
     inodes_used: 1200,
   },
 };
+const eventId = (letter: string) =>
+  `${letter.repeat(8)}-1111-4111-8111-111111111111`;
 const admission = {
   type: "admission",
+  id: eventId("a"),
   at: now,
   database: id,
   generation: 5,
@@ -250,12 +274,23 @@ const admission = {
 };
 const wake = {
   type: "wake",
+  id: eventId("b"),
   at: now,
   database: id,
   generation: 5,
   operation,
   outcome: "started",
   phases_ms: { admission: 1, pg_control: 2, start: 61, release: 1 },
+};
+const usageRow = {
+  database: id,
+  interval_start: "2026-10-17T11:00:00.000Z",
+  interval_end: "2026-10-17T11:15:00.000Z",
+  awake_ms: 900_000,
+  ingress_bytes: 100,
+  egress_bytes: 200,
+  connections: 3,
+  connection_ms: 5000,
 };
 const archiveCredential = {
   id: credential.id,
@@ -282,6 +317,8 @@ export const nodeSchemas = {
   NodeSample: link.NodeSample,
   NodeVolumeReport: link.NodeVolumeReport,
   NodeEventReport: link.NodeEventReport,
+  NodeUsageReport: link.NodeUsageReport,
+  NodeFencedResponse: link.NodeFencedResponse,
   AgentLinkMessage: link.AgentLinkMessage,
   ServerLinkMessage: link.ServerLinkMessage,
   InstallerProgress: link.InstallerProgress,
@@ -392,6 +429,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     [
       "credentials",
       {
+        revision: 3,
         tunnel_token: "eyJ".padEnd(120, "A"),
         route_keyring: {
           active: "k1",
@@ -401,8 +439,20 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
+      "no-revision",
+      {
+        tunnel_token: "eyJ".padEnd(120, "A"),
+        route_keyring: {
+          active: "k1",
+          keys: { k1: bytesToBase64url(new Uint8Array(32).fill(9)) },
+        },
+      },
+      false,
+    ],
+    [
       "short-tunnel-token",
       {
+        revision: 3,
         tunnel_token: "eyJ",
         route_keyring: {
           active: "k1",
@@ -432,6 +482,44 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
   ],
   NodeDesiredPage: [
     ["full-page", page, true],
+    ["fenced-page", fenced, true],
+    ["fence-with-databases", { ...fenced, databases: [database] }, false, true],
+    ["fence-with-release", { ...fenced, release: page.release }, false, true],
+    ["fence-with-next", { ...fenced, next: id }, false, true],
+    [
+      "fence-with-maintenance",
+      { ...fenced, orders: [...fenced.orders, page.orders[3]] },
+      false,
+      true,
+    ],
+    [
+      "fence-with-wake",
+      { ...fenced, orders: [...fenced.orders, page.orders[2]] },
+      false,
+      true,
+    ],
+    ["credentials-revision-zero", { ...page, credentials_revision: 0 }, false],
+    [
+      "no-credentials-revision",
+      { ...page, credentials_revision: undefined },
+      false,
+    ],
+    [
+      "no-write-limits",
+      { ...page, policy: { ...page.policy, io: undefined } },
+      false,
+    ],
+    [
+      "no-backup-job-memory",
+      {
+        ...page,
+        policy: {
+          ...page.policy,
+          backup: { wal_uploads: 2, base_backups: 1 },
+        },
+      },
+      false,
+    ],
     [
       "no-release-last-page",
       { ...page, release: null, orders: [], databases: [], next: null },
@@ -527,7 +615,14 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         databases: [
           {
             ...moved,
-            origin: { kind: "move", source: restored.origin.source },
+            origin: {
+              kind: "move",
+              source: {
+                ...moved.origin.source,
+                database_id: other,
+                path: path(other, 3, op("d")),
+              },
+            },
           },
         ],
       },
@@ -571,7 +666,53 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         ],
       },
       false,
-      true,
+    ],
+    [
+      "move-without-end",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          {
+            ...moved,
+            origin: {
+              kind: "move",
+              source: { ...moved.origin.source, end: undefined },
+            },
+          },
+        ],
+      },
+      false,
+    ],
+    [
+      "move-with-incomplete-end",
+      {
+        ...page,
+        orders: [],
+        databases: [
+          {
+            ...moved,
+            origin: {
+              kind: "move",
+              source: {
+                ...moved.origin.source,
+                end: { ...proof, last_archived_segment: undefined },
+              },
+            },
+          },
+        ],
+      },
+      false,
+    ],
+    [
+      "restore-with-end",
+      withDatabase({
+        origin: {
+          kind: "restore",
+          source: { ...restored.origin.source, end: proof },
+        },
+      }),
+      false,
     ],
     ["no-owner", withDatabase({ roles: [reader] }), false, true],
     [
@@ -810,6 +951,21 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["starting-above-awake", { ...sample, starting: 2 }, false, true],
+    [
+      "credentials-not-read-yet",
+      { ...sample, credentials_revision: null },
+      true,
+    ],
+    [
+      "credentials-revision-zero",
+      { ...sample, credentials_revision: 0 },
+      false,
+    ],
+    [
+      "no-credentials-revision",
+      { ...sample, credentials_revision: undefined },
+      false,
+    ],
     ["no-volume-counts", { ...sample, volumes: undefined }, false],
   ],
   NodeVolumeReport: [
@@ -846,6 +1002,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           wake,
           {
             type: "early_sleep",
+            id: eventId("c"),
             at: now,
             database: other,
             generation: 2,
@@ -853,6 +1010,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           },
           {
             ...admission,
+            id: eventId("d"),
             start: "recovery",
             operation: null,
             decision: "admitted",
@@ -862,15 +1020,36 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           },
           {
             ...wake,
+            id: eventId("e"),
             outcome: "refused",
             reason: "no_room",
             phases_ms: { admission: 1 },
+          },
+          {
+            ...admission,
+            id: eventId("f"),
+            reason: "no_room",
+            retry_after_seconds: undefined,
           },
         ],
       },
       true,
     ],
     ["empty", { events: [] }, false],
+    ["event-without-id", { events: [{ ...wake, id: undefined }] }, false],
+    ["event-id-not-a-uuid", { events: [{ ...wake, id: "wake-1" }] }, false],
+    [
+      "event-ids-twice",
+      { events: [wake, { ...admission, id: wake.id }] },
+      false,
+      true,
+    ],
+    [
+      "no-room-with-retry-hint",
+      { events: [{ ...admission, reason: "no_room" }] },
+      false,
+      true,
+    ],
     ["unknown-phase", { events: [{ ...wake, phases_ms: { boot: 1 } }] }, false],
     [
       "refused-without-reason",
@@ -917,6 +1096,66 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["pool-hit", { events: [{ ...wake, outcome: "hit" }] }, false],
+  ],
+  NodeUsageReport: [
+    ["usage", { rows: [usageRow] }, true],
+    [
+      "unknown-metrics",
+      {
+        rows: [
+          {
+            ...usageRow,
+            awake_ms: null,
+            ingress_bytes: null,
+            egress_bytes: null,
+            connections: null,
+            connection_ms: null,
+          },
+        ],
+      },
+      true,
+    ],
+    [
+      "adjacent-intervals",
+      {
+        rows: [
+          usageRow,
+          {
+            ...usageRow,
+            interval_start: usageRow.interval_end,
+            interval_end: "2026-10-17T12:00:00.000Z",
+          },
+        ],
+      },
+      true,
+    ],
+    ["empty", { rows: [] }, false],
+    ["negative-bytes", { rows: [{ ...usageRow, ingress_bytes: -1 }] }, false],
+    ["named-gap", { rows: [{ ...usageRow, gaps: ["ingress_bytes"] }] }, false],
+    [
+      "interval-across-an-hour",
+      { rows: [{ ...usageRow, interval_end: "2026-10-17T12:00:00.001Z" }] },
+      false,
+      true,
+    ],
+    [
+      "empty-interval",
+      { rows: [{ ...usageRow, interval_end: usageRow.interval_start }] },
+      false,
+      true,
+    ],
+    [
+      "awake-above-interval",
+      { rows: [{ ...usageRow, awake_ms: 900_001 }] },
+      false,
+      true,
+    ],
+    ["interval-twice", { rows: [usageRow, usageRow] }, false, true],
+  ],
+  NodeFencedResponse: [
+    ["fenced", { error: "node_fenced" }, true],
+    ["other-error", { error: "forbidden" }, false],
+    ["detail", { error: "node_fenced", detail: "lost" }, false],
   ],
   AgentLinkMessage: [
     [
@@ -1061,7 +1300,28 @@ export function gatewayChannelVectors() {
       "refused",
       {
         type: "wake_result",
-        result: { ...result, outcome: "refused", reason: "no_headroom" },
+        result: {
+          ...result,
+          outcome: "refused",
+          reason: "no_headroom",
+          retry_after_seconds: 5,
+        },
+      },
+      true,
+    ],
+    [
+      "refused-no-room",
+      {
+        type: "wake_result",
+        result: { ...result, outcome: "refused", reason: "no_room" },
+      },
+      true,
+    ],
+    [
+      "refused-move-hold",
+      {
+        type: "wake_result",
+        result: { ...result, outcome: "refused", reason: "moving" },
       },
       true,
     ],
@@ -1173,6 +1433,56 @@ export function gatewayChannelVectors() {
       false,
     ],
     [
+      "no-headroom-without-retry-hint",
+      {
+        type: "wake_result",
+        result: { ...result, outcome: "refused", reason: "no_headroom" },
+      },
+      false,
+    ],
+    [
+      "no-room-with-retry-hint",
+      {
+        type: "wake_result",
+        result: {
+          ...result,
+          outcome: "refused",
+          reason: "no_room",
+          retry_after_seconds: 5,
+        },
+      },
+      false,
+    ],
+    [
+      "started-with-retry-hint",
+      {
+        type: "wake_result",
+        result: { ...result, outcome: "started", retry_after_seconds: 5 },
+      },
+      false,
+    ],
+    [
+      "retry-hint-above-300",
+      {
+        type: "wake_result",
+        result: {
+          ...result,
+          outcome: "refused",
+          reason: "no_headroom",
+          retry_after_seconds: 301,
+        },
+      },
+      false,
+    ],
+    [
+      "kubernetes-reason",
+      {
+        type: "wake_result",
+        result: { ...result, outcome: "refused", reason: "thick_storage" },
+      },
+      false,
+    ],
+    [
       "pool-hit",
       { type: "wake_result", result: { ...result, outcome: "hit" } },
       false,
@@ -1220,6 +1530,53 @@ export function gatewayChannelVectors() {
       false,
     ],
   ];
+  const at = "2026-10-17T12:00:00.000Z",
+    since = "2026-10-17T11:00:00.000Z";
+  const report = {
+    processEpoch: "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
+    epoch: "1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
+    startedAt: since,
+    counterStartedAt: since,
+    observedAt: at,
+    history: "complete",
+    countersSince: since,
+    ingressBytes: 10,
+    egressBytes: 20,
+    totalConnections: 3,
+    connectionMilliseconds: 4000,
+    connections: 2,
+    authenticatedConnections: 1,
+    busyConnections: 1,
+    pendingDials: 1,
+    lastActivityAt: "2026-10-17T11:59:00.000Z",
+  };
+  const unavailable = {
+    ...report,
+    history: "unavailable",
+    countersSince: null,
+    ingressBytes: null,
+    egressBytes: null,
+    totalConnections: null,
+    connectionMilliseconds: null,
+    lastActivityAt: null,
+  };
+  const absent = {
+    ...report,
+    history: "current_process_absence",
+    ingressBytes: 0,
+    egressBytes: 0,
+    totalConnections: 0,
+    connectionMilliseconds: 0,
+    authenticatedConnections: 0,
+    busyConnections: 0,
+    lastActivityAt: null,
+  };
+  const activity = (value: unknown, requestId = 10) => ({
+    type: "activity",
+    id: requestId,
+    database: id,
+    report: value,
+  });
   const gateway: [string, unknown, boolean][] = [
     ["wake", { type: "wake", wake: request }, true],
     [
@@ -1235,15 +1592,57 @@ export function gatewayChannelVectors() {
       },
       true,
     ],
+    ["activity", activity(report), true],
+    ["activity-unavailable", activity(unavailable), true],
+    ["activity-process-absence", activity(absent), true],
     [
-      "activity",
-      {
-        type: "activity",
-        id: 10,
-        database: id,
-        report: { busyConnections: 0, connections: 1, lastActivityAt: now },
-      },
+      "activity-partial-history",
+      activity({
+        ...report,
+        history: "partial",
+        countersSince: "2026-10-17T11:30:00.000Z",
+      }),
       true,
+    ],
+    [
+      "activity-invented-keys",
+      activity({ busyConnections: 0, connections: 1, lastActivityAt: now }),
+      false,
+    ],
+    ["activity-with-region", activity({ ...report, region: region }), false],
+    [
+      "activity-with-pod",
+      activity({ ...report, pod: "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c" }),
+      false,
+    ],
+    [
+      "activity-without-last-activity",
+      activity({ ...report, lastActivityAt: undefined }),
+      false,
+    ],
+    ["activity-report-null", activity(null), false],
+    ["activity-report-array", activity([1]), false],
+    ["activity-report-text", activity("report"), false],
+    ["activity-id-above-2-53", activity(report, 9_007_199_254_740_992), false],
+    [
+      "activity-busy-above-authenticated",
+      activity({ ...report, busyConnections: 2 }),
+      false,
+    ],
+    [
+      "activity-unavailable-with-counters",
+      activity({ ...unavailable, ingressBytes: 0 }),
+      false,
+    ],
+    [
+      "activity-before-counters",
+      activity({ ...report, lastActivityAt: "2026-10-17T10:59:00.000Z" }),
+      false,
+    ],
+    [
+      "activity-absence-with-activity",
+      activity({ ...absent, lastActivityAt: at }),
+      false,
     ],
     [
       "upper-hash",
@@ -1265,6 +1664,19 @@ export function gatewayChannelVectors() {
         id: 9,
         database: id,
         status: "asleep",
+        connections: 0,
+        busy_connections: 0,
+        pending_dials: 0,
+      },
+      false,
+    ],
+    [
+      "status-id-above-2-53",
+      {
+        type: "status",
+        id: 9_007_199_254_740_992,
+        database: id,
+        status: "idle",
         connections: 0,
         busy_connections: 0,
         pending_dials: 0,

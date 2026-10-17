@@ -16,39 +16,34 @@
     ],
     "WAKE_OUTCOMES": ["started", "refused"],
     "WAKE_REASONS": [
-      "no_desired_row",
-      "not_sleeping",
-      "wake_in_progress",
-      "desired_stale",
       "no_room",
-      "thick_storage",
-      "volume_identity_missing",
-      "no_power_record",
-      "no_sleep_record",
-      "image_changed",
-      "configuration_changed",
-      "no_free_slot",
       "no_headroom",
-      "gateways_not_ready",
-      "agent_unavailable",
-      "holder_busy",
-      "volume_open",
-      "volume_suspended",
+      "deleted",
+      "suspended",
+      "moving",
+      "maintenance",
+      "fenced",
+      "superseded",
+      "unproven",
+      "storage_full",
+      "desired_stale",
+      "wake_in_progress",
+      "identity_mismatch",
+      "control_version",
       "volume_missing",
       "uuid_mismatch",
-      "unclean",
-      "control_version",
-      "identity_mismatch",
-      "container_missing",
+      "volume_suspended",
+      "volume_open",
+      "holder_busy",
       "mount_failed",
-      "audit_failed",
-      "bind_failed",
       "start_timeout",
-      "sql_identity_mismatch",
-      "release_failed",
-      "deleted",
-      "not_in_region"
+      "release_failed"
     ],
+    "ADMISSION_REFUSALS": ["no_room", "no_headroom"],
+    "ADMISSION_REFUSAL_DETAILS": {
+      "no_room": "storage",
+      "no_headroom": "node at awake capacity"
+    },
     "AGENT_ARCHIVE_SOCKET": "/run/pgcf/agent/archive.sock",
     "ARCHIVE_SOCKET_ENVIRONMENT": "PGCF_AGENT_ARCHIVE_SOCKET",
     "ARCHIVE_PROTOCOL": "pgcf-archive/1",
@@ -85,7 +80,17 @@
       },
       {
         "name": "refused",
-        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\"}}",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\",\"retry_after_seconds\":5}}",
+        "valid": true
+      },
+      {
+        "name": "refused-no-room",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_room\"}}",
+        "valid": true
+      },
+      {
+        "name": "refused-move-hold",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"moving\"}}",
         "valid": true
       },
       {
@@ -174,6 +179,31 @@
         "valid": false
       },
       {
+        "name": "no-headroom-without-retry-hint",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\"}}",
+        "valid": false
+      },
+      {
+        "name": "no-room-with-retry-hint",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_room\",\"retry_after_seconds\":5}}",
+        "valid": false
+      },
+      {
+        "name": "started-with-retry-hint",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"retry_after_seconds\":5}}",
+        "valid": false
+      },
+      {
+        "name": "retry-hint-above-300",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\",\"retry_after_seconds\":301}}",
+        "valid": false
+      },
+      {
+        "name": "kubernetes-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"thick_storage\"}}",
+        "valid": false
+      },
+      {
         "name": "pool-hit",
         "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"hit\"}}",
         "valid": false
@@ -222,8 +252,83 @@
       },
       {
         "name": "activity",
-        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"busyConnections\":0,\"connections\":1,\"lastActivityAt\":\"2026-10-17T12:00:00.000Z\"}}",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
         "valid": true
+      },
+      {
+        "name": "activity-unavailable",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"unavailable\",\"countersSince\":null,\"ingressBytes\":null,\"egressBytes\":null,\"totalConnections\":null,\"connectionMilliseconds\":null,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":null}}",
+        "valid": true
+      },
+      {
+        "name": "activity-process-absence",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"current_process_absence\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":0,\"egressBytes\":0,\"totalConnections\":0,\"connectionMilliseconds\":0,\"connections\":2,\"authenticatedConnections\":0,\"busyConnections\":0,\"pendingDials\":1,\"lastActivityAt\":null}}",
+        "valid": true
+      },
+      {
+        "name": "activity-partial-history",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"partial\",\"countersSince\":\"2026-10-17T11:30:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": true
+      },
+      {
+        "name": "activity-invented-keys",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"busyConnections\":0,\"connections\":1,\"lastActivityAt\":\"2026-10-17T12:00:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-with-region",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\",\"region\":\"eu-dev\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-with-pod",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\",\"pod\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-without-last-activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1}}",
+        "valid": false
+      },
+      {
+        "name": "activity-report-null",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":null}",
+        "valid": false
+      },
+      {
+        "name": "activity-report-array",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":[1]}",
+        "valid": false
+      },
+      {
+        "name": "activity-report-text",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":\"report\"}",
+        "valid": false
+      },
+      {
+        "name": "activity-id-above-2-53",
+        "line": "{\"type\":\"activity\",\"id\":9007199254740992,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-busy-above-authenticated",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":2,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-unavailable-with-counters",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"unavailable\",\"countersSince\":null,\"ingressBytes\":0,\"egressBytes\":null,\"totalConnections\":null,\"connectionMilliseconds\":null,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":null}}",
+        "valid": false
+      },
+      {
+        "name": "activity-before-counters",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T10:59:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-absence-with-activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"current_process_absence\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":0,\"egressBytes\":0,\"totalConnections\":0,\"connectionMilliseconds\":0,\"connections\":2,\"authenticatedConnections\":0,\"busyConnections\":0,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T12:00:00.000Z\"}}",
+        "valid": false
       },
       {
         "name": "upper-hash",
@@ -238,6 +343,11 @@
       {
         "name": "unknown-status",
         "line": "{\"type\":\"status\",\"id\":9,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"asleep\",\"connections\":0,\"busy_connections\":0,\"pending_dials\":0}",
+        "valid": false
+      },
+      {
+        "name": "status-id-above-2-53",
+        "line": "{\"type\":\"status\",\"id\":9007199254740992,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"idle\",\"connections\":0,\"busy_connections\":0,\"pending_dials\":0}",
         "valid": false
       },
       {
