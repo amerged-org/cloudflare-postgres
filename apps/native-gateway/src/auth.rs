@@ -665,8 +665,10 @@ mod tests {
             for answer in answers {
                 postgres.write_all(&answer).await.unwrap();
                 let mut chunk = [0u8; 4096];
+                // The gateway either answers or closes; its answer to the server-first message
+                // waits for PBKDF2, which a debug build on a busy runner takes well over 100 ms.
                 match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_secs(10),
                     postgres.read(&mut chunk),
                 )
                 .await
