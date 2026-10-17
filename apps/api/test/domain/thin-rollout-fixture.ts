@@ -254,16 +254,6 @@ export async function assignRelease(
   return assigned;
 }
 
-/** The controller pulled the assignment and reported it: the node's observation names its revision. */
-export async function observeAssignment(f: Fixture) {
-  const at = new Date().toISOString();
-  await env.DB.prepare(
-    "UPDATE fleet_node_release_observations SET assignment_revision=(SELECT revision FROM fleet_node_releases WHERE node_id=?1),observed_at=?2,received_at=?2 WHERE node_id=?1",
-  )
-    .bind(f.node, at)
-    .run();
-}
-
 /** Another physical member of the node's region, patched to `release` as a whole. */
 export async function addMember(
   f: Fixture,

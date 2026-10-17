@@ -21,7 +21,7 @@ import { parkedRecordFresh, readParkedRecord } from "./parked-tier.ts";
 import {
   currentStorageStopSql,
   storageDrainReservationStatement,
-  nodeThinStorageHeadroomSql,
+  thinPoolRoomSql,
   knownStorageHoldVolume,
 } from "./storage-capacity.ts";
 
@@ -1100,7 +1100,7 @@ export async function hostStorageLease(
         now: new Date(now).toISOString(),
       }).run();
       const hold = await c.env.DB.prepare(
-        `SELECT h.storage_budget_bytes,h.storage_volume_json FROM database_start_admissions h JOIN databases d ON d.id=h.database_id JOIN nodes n ON n.id=d.node_id JOIN size_classes s ON s.id=d.size_class_id JOIN operations stop ON stop.id=h.operation_id WHERE h.operation_id=? AND h.budget_bytes=0 AND h.generation=d.generation AND h.node_id=n.id AND h.node_uid=n.node_uid AND ${currentStorageStopSql()} AND ${nodeThinStorageHeadroomSql("n", "s", "d")}`,
+        `SELECT h.storage_budget_bytes,h.storage_volume_json FROM database_start_admissions h JOIN databases d ON d.id=h.database_id JOIN nodes n ON n.id=d.node_id JOIN size_classes s ON s.id=d.size_class_id JOIN operations stop ON stop.id=h.operation_id WHERE h.operation_id=? AND h.budget_bytes=0 AND h.generation=d.generation AND h.node_id=n.id AND h.node_uid=n.node_uid AND ${currentStorageStopSql()} AND ${thinPoolRoomSql("n", "s", "d")}`,
       )
         .bind(stop.operation_id)
         .first<{

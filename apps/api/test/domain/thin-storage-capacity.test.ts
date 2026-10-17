@@ -14,7 +14,7 @@ import { afterEach, expect, it } from "vitest";
 import { installThinQualifiedFixture } from "./thin-qualified-fixture.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
-  nodeThinStorageHeadroomSql,
+  thinPoolRoomSql,
   storageProtectionStatements,
   storageHoldVolumeStatements,
   storageDrainReservationStatement,
@@ -33,10 +33,6 @@ import {
   releaseCoveredStartupReservationsStatement,
   databaseCpuChargeSql,
 } from "../../src/domain/startup-admission.ts";
-import {
-  minimumHeadroom,
-  storageHolds,
-} from "../../src/domain/node-thin-storage-execution.ts";
 import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 const mib = 1024 ** 2,
   gib = 1024 ** 3,
@@ -180,6 +176,18 @@ async function thinFixture(
     authority.cluster_uid,
   );
   qualifiedReleases.push(qualified.releaseId);
+  // The controller's minute sample of the same pool.
+  await env.DB.prepare(
+    "INSERT INTO node_storage_observations(node_id,node_uid,observed_at,received_at,physical_json) VALUES(?,?,?,?,?)",
+  )
+    .bind(
+      f.node,
+      node!.node_uid,
+      observed,
+      observed,
+      JSON.stringify(authority.physical),
+    )
+    .run();
   return {
     ...f,
     profile,
@@ -195,7 +203,7 @@ const nodeFor = (id: string) =>
     .first("node_id");
 async function fits(f: Awaited<ReturnType<typeof thinFixture>>) {
   return await env.DB.prepare(
-    `SELECT ${nodeThinStorageHeadroomSql()} fits FROM nodes n JOIN size_classes s ON s.id=? WHERE n.id=?`,
+    `SELECT ${thinPoolRoomSql()} fits FROM nodes n JOIN size_classes s ON s.id=? WHERE n.id=?`,
   )
     .bind(f.size, f.node)
     .first("fits");
@@ -210,6 +218,165 @@ async function publish(
     .bind(JSON.stringify(authority), f.node)
     .run();
 }
+/** The node's latest physical sample, as the controller reports it every minute. */
+async function physicalSample(
+  f: Awaited<ReturnType<typeof thinFixture>>,
+  pool: { dataFree: number; metadataFree?: number; dataTotal?: number },
+  ageMs = 0,
+  vgFree = 67 * gib,
+) {
+  const dataTotal = pool.dataTotal ?? 32 * gib;
+  const at = new Date(Date.now() - ageMs).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO node_storage_observations(node_id,node_uid,observed_at,received_at,physical_json) VALUES(?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET observed_at=excluded.observed_at,received_at=excluded.received_at,physical_json=excluded.physical_json",
+  )
+    .bind(
+      f.node,
+      f.nodeUid,
+      at,
+      at,
+      JSON.stringify({
+        volume_group_uuid: vg,
+        total_bytes: 100 * gib,
+        free_bytes: vgFree,
+        thick_allocated_bytes: 0,
+        thin_pool: {
+          name: "pgcf_thinpool",
+          data_total_bytes: dataTotal,
+          data_used_bytes_upper_bound: dataTotal - pool.dataFree,
+          metadata_total_bytes: gib,
+          metadata_used_bytes_upper_bound: gib - (pool.metadataFree ?? gib),
+        },
+      }),
+    )
+    .run();
+}
+async function room(
+  f: Awaited<ReturnType<typeof thinFixture>>,
+  database?: string,
+) {
+  return database
+    ? await env.DB.prepare(
+        `SELECT ${thinPoolRoomSql("n", "s", "d")} room FROM databases d JOIN nodes n ON n.id=d.node_id JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
+      )
+        .bind(database)
+        .first("room")
+    : await env.DB.prepare(
+        `SELECT ${thinPoolRoomSql("n", "s")} room FROM nodes n JOIN size_classes s ON s.id=? WHERE n.id=?`,
+      )
+        .bind(f.size, f.node)
+        .first("room");
+}
+
+it("has room while the node's fresh physical sample leaves the profile's data and metadata reserve free", async () => {
+  const f = await thinFixture();
+  // The reserves are 512 MiB of data and 64 MiB of metadata.
+  await physicalSample(f, { dataFree: 512 * mib, metadataFree: 64 * mib });
+  expect(await room(f)).toBe(1);
+  await physicalSample(f, { dataFree: 512 * mib - 1 });
+  expect(await room(f)).toBe(0);
+  await physicalSample(f, { dataFree: gib, metadataFree: 64 * mib - 1 });
+  expect(await room(f)).toBe(0);
+  // A sample older than two minutes, or none, says nothing.
+  await physicalSample(f, { dataFree: gib }, 121_000);
+  expect(await room(f)).toBe(0);
+  await env.DB.prepare("DELETE FROM node_storage_observations WHERE node_id=?")
+    .bind(f.node)
+    .run();
+  expect(await room(f)).toBe(0);
+  await physicalSample(f, { dataFree: gib }, 100_000);
+  expect(await room(f)).toBe(1);
+  // Neither the node's write authority nor its freshness enters the rule; an error does.
+  await publish(f, {
+    ...f.authority,
+    write_allowed: false,
+    observed_at: new Date(Date.now() - 3_600_000).toISOString(),
+    expires_at: new Date(Date.now() - 3_570_000).toISOString(),
+  });
+  expect(await room(f)).toBe(1);
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET error_code='thin_storage_report_unqualified' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(await room(f)).toBe(0);
+});
+
+it("judges a database by its own pool, and a new volume by the node's openness to new databases", async () => {
+  const f = await thinFixture();
+  await physicalSample(f, { dataFree: gib });
+  const created = DatabaseWithOperation.parse(
+    await (await f.create("pooled")).json(),
+  );
+  expect(await nodeFor(created.database.id)).toBe(f.node);
+  expect(await room(f, created.database.id)).toBe(1);
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET allow_new_databases=0 WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(await room(f)).toBe(0);
+  expect(await room(f, created.database.id)).toBe(1);
+  // A recreated pool is another pool: the database's volume is not in it.
+  await publish(f, {
+    ...f.authority,
+    pool_uuid: "POOLYY-1234-1234-1234-1234-1234-ABCDEF",
+  });
+  expect(await room(f, created.database.id)).toBe(0);
+});
+
+it("places new databases by room alone, beyond the logical size of the volumes already placed", async () => {
+  // 1 GiB of the pool is free; each database has a 5 GiB quota.
+  const f = await thinFixture(gib);
+  await physicalSample(f, { dataFree: gib });
+  for (const name of ["first", "second", "third"]) {
+    const created = DatabaseWithOperation.parse(
+      await (await f.create(name)).json(),
+    );
+    expect(await nodeFor(created.database.id)).toBe(f.node);
+  }
+  await physicalSample(f, { dataFree: 256 * mib });
+  const refused = DatabaseWithOperation.parse(
+    await (await f.create("fourth")).json(),
+  );
+  expect(await nodeFor(refused.database.id)).toBeNull();
+});
+
+it("resumes a thin database only while its node has room", async () => {
+  const f = await thinFixture();
+  await physicalSample(f, { dataFree: gib });
+  const created = DatabaseWithOperation.parse(
+    await (await f.create("sleeper")).json(),
+  );
+  const id = created.database.id;
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='suspended',suspension_reason='manual',observed_state='provisioning',observed_power='hibernated',observed_generation=generation,power_operation=NULL WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  await env.DB.prepare(
+    "DELETE FROM database_start_admissions WHERE database_id=?",
+  )
+    .bind(id)
+    .run();
+  const resume = () =>
+    request(
+      `/v1/databases/${id}/resume`,
+      f.integrator,
+      "POST",
+      undefined,
+      crypto.randomUUID(),
+    );
+  await physicalSample(f, { dataFree: 256 * mib });
+  const refused = await resume();
+  expect(refused.status).toBe(409);
+  expect(await refused.json()).toMatchObject({
+    error: { details: { reason: "node_capacity" } },
+  });
+  await physicalSample(f, { dataFree: gib });
+  expect((await resume()).status).toBe(202);
+});
+
 it("places logical quotas against fresh physical thin headroom instead of the old GiB reservation", async () => {
   const f = await thinFixture();
   const first = DatabaseWithOperation.parse(
@@ -248,41 +415,7 @@ it("places logical quotas against fresh physical thin headroom instead of the ol
     { storage_budget_bytes: 5 * gib },
   ]);
 });
-it("does not count latent VG free when the allocated pool cannot cover startup and bounded writes", async () => {
-  const f = await thinFixture(520 * mib);
-  expect(await fits(f)).toBe(0);
-  expect(
-    await nodeFor(
-      DatabaseWithOperation.parse(await (await f.create()).json()).database.id,
-    ),
-  ).toBeNull();
-});
-it("serializes concurrent starts against physical storage holds and retains an uncertain failed start", async () => {
-  const f = await thinFixture(512 * mib + 5 * gib + 1);
-  const values = await Promise.all([f.create("one"), f.create("two")]);
-  const bodies = await Promise.all(
-    values.map(async (response) =>
-      DatabaseWithOperation.parse(await response.json()),
-    ),
-  );
-  const assigned = await Promise.all(bodies.map((v) => nodeFor(v.database.id)));
-  expect(assigned.filter((v) => v === f.node)).toHaveLength(1);
-  const active = bodies[assigned.indexOf(f.node)]!;
-  await env.DB.prepare(
-    "UPDATE operations SET status='failed',completed_at=?,error_code='operation_timeout' WHERE id=?",
-  )
-    .bind(new Date().toISOString(), active.operation.id)
-    .run();
-  expect(await fits(f)).toBe(0);
-  expect(
-    await env.DB.prepare(
-      "SELECT storage_budget_bytes FROM database_start_admissions WHERE operation_id=?",
-    )
-      .bind(active.operation.id)
-      .first("storage_budget_bytes"),
-  ).toBe(5 * gib);
-});
-it("selected unqualified, unknown, stale or changed physical authority never falls back to thick admission", async () => {
+it("a thin node that is not ready for new databases or has no fresh sample never falls back to thick admission", async () => {
   const f = await thinFixture();
   await env.DB.prepare("UPDATE nodes SET storage_gib_total=100 WHERE id=?")
     .bind(f.node)
@@ -302,36 +435,27 @@ it("selected unqualified, unknown, stale or changed physical authority never fal
   )
     .bind(f.node)
     .run();
-  await publish(f, { ...f.authority, data_accounting_complete: false });
+  expect(await fits(f)).toBe(1);
+  await physicalSample(f, { dataFree: gib }, 121_000);
   expect(await fits(f)).toBe(0);
-  await publish(f, { ...f.authority, node_uid: crypto.randomUUID() });
-  expect(await fits(f)).toBe(0);
-  await publish(f, {
-    ...f.authority,
-    expires_at: new Date(Date.now() - 1).toISOString(),
-  });
-  expect(await fits(f)).toBe(0);
+  expect(
+    await nodeFor(
+      DatabaseWithOperation.parse(await (await f.create("later")).json())
+        .database.id,
+    ),
+  ).toBeNull();
 });
-it("physical metadata headroom and explicit logical quota maximum constrain a new volume", async () => {
+it("the metadata reserve and the explicit logical quota maximum constrain a new volume", async () => {
   const f = await thinFixture();
-  await publish(f, {
-    ...f.authority,
-    physical: {
-      ...f.authority.physical,
-      thin_pool: {
-        ...f.authority.physical.thin_pool!,
-        metadata_used_bytes_upper_bound: gib - 64 * mib,
-      },
-    },
-  });
+  await physicalSample(f, { dataFree: 8 * gib, metadataFree: 64 * mib - 1 });
   expect(await fits(f)).toBe(0);
-  await publish(f, f.authority);
+  await physicalSample(f, { dataFree: 8 * gib, metadataFree: 64 * mib });
+  expect(await fits(f)).toBe(1);
   await env.DB.prepare("UPDATE size_classes SET storage_gib=17 WHERE id=?")
     .bind(f.size)
     .run();
   expect(await fits(f)).toBe(0);
 });
-
 async function bindVolume(
   f: Awaited<ReturnType<typeof thinFixture>>,
   created: ReturnType<typeof DatabaseWithOperation.parse>,
@@ -402,64 +526,6 @@ async function accepted(
   ]);
   return authority;
 }
-
-it("charges each potentially writable thin LV at its full measured size and shares only an exact full hold", async () => {
-  const f = await thinFixture(8 * gib, 8 * gib),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    bound = await bindVolume(f, created),
-    active = await accepted(f, {
-      ...bound.authority,
-      active_lv_uuids: [bound.receipt.lv_uuid],
-      volumes: [{ ...bound.volume, quiesced: false }],
-    });
-  const held = await storageHolds(env, f.node, f.nodeUid, active);
-  expect(held.bytes).toBe(5 * gib);
-  expect(minimumHeadroom(f.profile, active, held).data).toBe(
-    f.profile.data_reserve_bytes + 5 * gib,
-  );
-  // Controlled metadata represents a completed start; no mount or runtime acceptance is claimed.
-  await env.DB.prepare(
-    "DELETE FROM database_start_admissions WHERE database_id=?",
-  )
-    .bind(created.database.id)
-    .run();
-  const unheld = await storageHolds(env, f.node, f.nodeUid, active);
-  expect
-    .soft(minimumHeadroom(f.profile, active, unheld).data)
-    .toBe(f.profile.data_reserve_bytes + 5 * gib);
-  // Eight physical GiB cannot cover this existing five-GiB writer plus a new five-GiB start.
-  expect.soft(await fits(f)).toBe(0);
-  const stopped = { ...active, volumes: [{ ...bound.volume, quiesced: true }] };
-  await publish(f, stopped);
-  expect(minimumHeadroom(f.profile, stopped, unheld).data).toBe(
-    f.profile.data_reserve_bytes + 5 * gib,
-  );
-  expect(await fits(f)).toBe(0);
-});
-
-it("cannot exempt an ambiguous LV identity or renew a suspended-volume exemption from an expired identity read", async () => {
-  const f = await thinFixture(8 * gib, 8 * gib),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    bound = await bindVolume(f, created);
-  await env.DB.prepare(
-    "DELETE FROM database_start_admissions WHERE database_id=?",
-  )
-    .bind(created.database.id)
-    .run();
-  const missing = { ...bound.authority, physical_lvs: [] };
-  await publish(f, missing);
-  expect(await fits(f)).toBe(0);
-  const now = Date.now(),
-    stale = {
-      ...bound.authority,
-      volumes: [{ ...bound.volume, quiesced: true }],
-      inventory_revision: bound.authority.revision,
-      inventory_observed_at: new Date(now - 300000).toISOString(),
-      inventory_expires_at: new Date(now - 1).toISOString(),
-    };
-  await publish(f, stale);
-  expect(await fits(f)).toBe(0);
-});
 
 it("requires a new identity read when the sampler observes a retained thin LV's changed logical size", async () => {
   const f = await thinFixture(8 * gib, 8 * gib),
@@ -565,15 +631,7 @@ it("a proven protective stop releases CPU and recovers through one real bounded 
       .bind(id)
       .first("charge"),
   ).toBe(0);
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
-  const now = Date.now();
-  await accepted(f, {
-    ...f.authority,
-    revision: 3,
-    observed_at: new Date(now).toISOString(),
-    expires_at: new Date(now + 30000).toISOString(),
-    write_allowed: true,
-  });
+  // The node has room: the stop recovers at once, whatever its authority's freshness.
   expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([id]);
   expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
   expect(
@@ -981,249 +1039,6 @@ it("a ready thin startup retains its quota runway until later Native proof inclu
   });
   expect((await release()).meta.changes).toBe(1);
 }, 15000);
-
-it("recovers one quiesced physical LV in an8GiB pool while keeping both real5GiB startup holds", async () => {
-  const f = await thinFixture(8 * gib, 8 * gib),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    bound = await bindVolume(f, created),
-    now = Date.now();
-  const authority = await accepted(
-    f,
-    {
-      ...bound.authority,
-      revision: 2,
-      active_lv_uuids: [bound.receipt.lv_uuid],
-      observed_at: new Date(now).toISOString(),
-      captured_at: new Date(now).toISOString(),
-      expires_at: new Date(now + 30000).toISOString(),
-      volumes: bound.authority.volumes.map((v) => ({
-        ...v,
-        quiesced: true,
-        io: [],
-      })),
-    },
-    true,
-  );
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(created.database.id)
-      .first("n"),
-  ).toBe(1);
-  expect(
-    await env.DB.prepare(
-      "SELECT storage_volume_json FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(created.database.id)
-      .first("storage_volume_json"),
-  ).not.toBeNull();
-  expect(
-    await env.DB.prepare(
-      `SELECT ${nodeThinStorageHeadroomSql("n", "s", "d")} valid FROM databases d JOIN nodes n ON n.id=d.node_id JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
-    )
-      .bind(created.database.id)
-      .first("valid"),
-  ).toBe(1);
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([
-    created.database.id,
-  ]);
-  const holds = (
-    await env.DB.prepare(
-      "SELECT storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=? ORDER BY generation",
-    )
-      .bind(created.database.id)
-      .all()
-  ).results;
-  expect(holds).toEqual([
-    { storage_budget_bytes: 5 * gib, ready_at: null },
-    { storage_budget_bytes: 5 * gib, ready_at: null },
-  ]);
-  expect(
-    await env.DB.prepare(
-      "SELECT generation,observed_power FROM databases WHERE id=?",
-    )
-      .bind(created.database.id)
-      .first(),
-  ).toEqual({ generation: 2, observed_power: "awake" });
-  expect(authority.physical.thin_pool!.data_total_bytes).toBe(8 * gib);
-  const againAt = Date.now();
-  const again = await accepted(
-    f,
-    {
-      ...authority,
-      revision: 3,
-      observed_at: new Date(againAt).toISOString(),
-      captured_at: new Date(againAt).toISOString(),
-      expires_at: new Date(
-        againAt + f.profile.guard_seconds * 1000,
-      ).toISOString(),
-      volumes: authority.volumes.map((v) => ({ ...v, generation: 2 })),
-    },
-    true,
-  );
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([
-    created.database.id,
-  ]);
-  const current = await env.DB.prepare(
-    "SELECT generation,power_operation FROM databases WHERE id=?",
-  )
-    .bind(created.database.id)
-    .first<{ generation: number; power_operation: string }>();
-  expect(current!.generation).toBe(3);
-  const podUid = crypto.randomUUID();
-  const ready = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(created.database.id, 3),
-        power: {
-          state: "awake",
-          operation: current!.power_operation,
-          revision: 3,
-        },
-        postgres: {
-          image: f.postgres.reference,
-          image_id: "sha256:" + f.postgres.sha256,
-        },
-        runtime_attestation: {
-          v: 1,
-          database_id: created.database.id,
-          generation: 3,
-          storage_generation: 1,
-          node_uid: f.nodeUid,
-          boot_id: f.bootId,
-          cluster_uid: f.authority.cluster_uid,
-          namespace_uid: bound.receipt.namespace_uid,
-          cnpg_cluster_uid: bound.receipt.cluster_uid,
-          storage_uid: bound.receipt.storage_uid,
-          pvc_uid: bound.receipt.pvc_uid,
-          pv_uid: bound.receipt.pv_uid,
-          pod_uid: podUid,
-          container_id: "c".repeat(64),
-          postgres_image_sha256: f.postgres.sha256,
-          memory_request_bytes: 128 * mib,
-          memory_limit_bytes: 256 * mib,
-          observed_at: Date.now(),
-          configuration_fingerprint: "f".repeat(64),
-        },
-      },
-    ]),
-  );
-  expect(ready.status).toBe(200);
-  const before = await env.DB.prepare(
-    "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=? AND ready_at IS NULL",
-  )
-    .bind(created.database.id)
-    .first("n");
-  expect(before).toBe(1); // The intermediate resume hold needs physical supersession proof.
-  const at = Date.now() + 1;
-  const running = await accepted(f, {
-    ...again,
-    revision: 4,
-    observed_at: new Date(at).toISOString(),
-    captured_at: new Date(at).toISOString(),
-    expires_at: new Date(at + 30000).toISOString(),
-    volumes: again.volumes.map((v) => ({
-      ...v,
-      generation: 3,
-      quiesced: false,
-      io: [
-        {
-          pod_uid: podUid,
-          write_bytes_per_second: f.profile.write_bytes_per_second,
-          write_iops_per_second: f.profile.write_iops_per_second,
-        },
-      ],
-    })),
-  });
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=? AND ready_at IS NULL",
-    )
-      .bind(created.database.id)
-      .first("n"),
-  ).toBe(0);
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(created.database.id)
-      .first("n"),
-  ).toBe(3);
-  const release = () =>
-    releaseCoveredStartupReservationsStatement(env.DB, {
-      nodeId: f.node,
-      nodeUid: f.nodeUid,
-    }).run();
-  expect((await release()).meta.changes).toBe(0);
-  await new Promise((resolve) => setTimeout(resolve, 5100));
-  const later = Date.now();
-  await env.DB.prepare(
-    "UPDATE node_memory_samples SET observed_at=? WHERE node_id=? AND node_uid=?",
-  )
-    .bind(new Date(later).toISOString(), f.node, f.nodeUid)
-    .run();
-  await accepted(f, {
-    ...running,
-    revision: 5,
-    observed_at: new Date(later).toISOString(),
-    captured_at: new Date(later).toISOString(),
-    expires_at: new Date(later + 30000).toISOString(),
-  });
-  expect((await release()).meta.changes).toBe(3);
-}, 15000);
-
-it("unknown or different-LV old holds cannot share a new startup or overwrite their captured identity", async () => {
-  const f = await thinFixture(8 * gib, 8 * gib),
-    created = DatabaseWithOperation.parse(await (await f.create()).json()),
-    bound = await bindVolume(f, created),
-    at = Date.now();
-  const a = NodeThinStorageAuthority.parse({
-    ...bound.authority,
-    revision: 2,
-    active_lv_uuids: [bound.receipt.lv_uuid],
-    observed_at: new Date(at).toISOString(),
-    captured_at: new Date(at).toISOString(),
-    expires_at: new Date(at + 30000).toISOString(),
-    volumes: bound.authority.volumes.map((v) => ({ ...v, quiesced: true })),
-  });
-  // Legacy/unknown binding remains unknown despite a current database receipt.
-  await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE node_thin_storage SET authority_revision=2,authority_json=?,authority_received_at=? WHERE node_id=?",
-    ).bind(JSON.stringify(a), a.observed_at, f.node),
-    ...storageProtectionStatements(env.DB, a),
-  ]);
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
-  const different = JSON.stringify({
-    ...bound.receipt,
-    lv_uuid: "OTHERX-1234-1234-1234-1234-1234-ABCDEF",
-  });
-  await env.DB.prepare(
-    "UPDATE database_start_admissions SET storage_volume_json=? WHERE operation_id=?",
-  )
-    .bind(different, created.operation.id)
-    .run();
-  await accepted(f, a, true);
-  expect(await recoverStorageProtectedDatabases(env, f.region)).toEqual([]);
-  await expect(
-    env.DB.prepare(
-      "UPDATE database_start_admissions SET storage_volume_json=? WHERE operation_id=?",
-    )
-      .bind(JSON.stringify(bound.receipt), created.operation.id)
-      .run(),
-  ).rejects.toThrow("database_start_storage_binding_immutable");
-  expect(
-    await env.DB.prepare(
-      "SELECT COUNT(*) n FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(created.database.id)
-      .first("n"),
-  ).toBe(1);
-});
 
 it("a protected 4 GiB tenant drains a real delete intent with zero additional RAM and no startup grant, and a suspend never drains", async () => {
   const f = await thinFixture(8 * gib, 8 * gib);

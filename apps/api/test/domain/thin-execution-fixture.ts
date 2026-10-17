@@ -128,6 +128,10 @@ export async function thinExecutionFixture(
       at,
       at,
     ),
+    // The controller's minute sample of the same pool.
+    env.DB.prepare(
+      "INSERT INTO node_storage_observations(node_id,node_uid,observed_at,received_at,physical_json) VALUES(?,?,?,?,?)",
+    ).bind(f.node, uid, at, at, JSON.stringify(authority.physical)),
   ]);
   const qualified = await installThinQualifiedFixture(
     env.DB,

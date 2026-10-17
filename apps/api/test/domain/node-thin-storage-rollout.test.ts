@@ -8,10 +8,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
 import { DesiredResponse } from "@pgcf/contracts";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
-import {
-  HostStorageLease,
-  NodeStorageHeadroomResponse,
-} from "@pgcf/contracts/node-thin-storage";
+import { HostStorageLease } from "@pgcf/contracts/node-thin-storage";
 import { cleanupFixtures, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
@@ -29,7 +26,6 @@ import {
   insertRelease,
   installer,
   kubernetes,
-  observeAssignment,
   postgres,
   reordered,
   runtime,
@@ -37,9 +33,7 @@ import {
   startPatch,
 } from "./thin-rollout-fixture.ts";
 import {
-  gib,
   identityProof,
-  nonce,
   post,
   report,
   row,
@@ -51,7 +45,6 @@ import {
   qualifiedThinStorageSql,
   readCurrentNodeThinStorage,
 } from "../../src/domain/node-thin-storage.ts";
-import { nodeThinStorageHeadroomSql } from "../../src/domain/storage-capacity.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -384,41 +377,6 @@ it("does not extend authority to a replacement node that reuses the node name", 
   ).toBeNull();
 });
 
-it("keeps new placement and wake behind the assignment until its patch completed and one proof read it", async () => {
-  const f = await thinExecutionFixture(releases),
-    fits = () =>
-      env.DB.prepare(
-        `SELECT ${nodeThinStorageHeadroomSql()} fits FROM nodes n JOIN size_classes s ON s.id=? WHERE n.id=?`,
-      )
-        .bind(f.size, f.node)
-        .first<number>("fits");
-  // A pool that admits the start of one more database.
-  const physical = {
-    ...f.authority.physical,
-    free_bytes: 80 * gib,
-    thin_pool: {
-      ...f.authority.physical.thin_pool!,
-      data_total_bytes: 16 * gib,
-    },
-  };
-  await identityProof(f, { physical });
-  expect(await fits()).toBe(1);
-  const assigned = await assignRelease(f, releases);
-  // Authority continues; what starts a Pod does not.
-  expect(
-    NodeStorageHeadroomResponse.parse(
-      (await post(f, sample(f, await nonce(f), { physical }))).body,
-    ),
-  ).toMatchObject({ accepted: true });
-  expect(await fits()).toBe(0);
-  await startPatch(f, assigned, { stage: "complete", state: "confirmed" });
-  await observeAssignment(f);
-  expect(await fits()).toBe(0);
-  expect(await prepareThinStorageLease(f.local, f.node)).not.toBeNull();
-  expect(await report(f, { physical })).toMatchObject({ accepted: true });
-  expect(await fits()).toBe(1);
-});
-
 // The wire gate: the strict desired schema is served to a controller that parses it.
 
 it("exposes the sampling wire only when the latest completed patch of every member declares the protocol", async () => {
@@ -577,12 +535,6 @@ it("keeps every statement that embeds the thin predicates at most 90 levels deep
       seen.set(sql, sql);
     return prepare.call(this, sql);
   };
-  const fits = (f: { size: string; node: string }) =>
-    env.DB.prepare(
-      `SELECT ${nodeThinStorageHeadroomSql()} fits FROM nodes n JOIN size_classes s ON s.id=? WHERE n.id=?`,
-    )
-      .bind(f.size, f.node)
-      .first();
   try {
     const w = await awake();
     await renewal(w);
@@ -593,7 +545,6 @@ it("keeps every statement that embeds the thin predicates at most 90 levels deep
     await leaseEntry(w.f, w.id);
     await desired(w);
     await proven(w);
-    await fits(w.f);
   } finally {
     database.prepare = prepare;
   }

@@ -551,19 +551,17 @@ async function firstVolumeIdentity() {
   return { f, created, receipt, physical, proof };
 }
 
-it("binds a first volume under non-write authority before a fresh sample deduplicates its startup reserve", async () => {
+it("binds a first volume's receipt from its identity proof, the pool's reserve the only requirement", async () => {
   const { f, created, receipt, physical, proof } = await firstVolumeIdentity();
   const input = await prepareThinStorageLease(f.local, f.node, false);
   expect(input!.lease.required_data_free_bytes).toBe(
-    f.profile.data_reserve_bytes + 5 * gib,
+    f.profile.data_reserve_bytes,
   );
-  // The executor used the issued hold-only requirement. The first identity must not turn the
-  // new full LV and its still-unbound hold into permission before their exact receipts land.
   expect(await report(f, { ...proof, write_allowed: true })).toMatchObject({
     accepted: true,
-    write_allowed: false,
+    write_allowed: true,
   });
-  expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
   const installed = await env.DB.prepare(
     "SELECT d.storage_volume_json current_receipt,h.storage_volume_json held_receipt FROM databases d JOIN database_start_admissions h ON h.database_id=d.id WHERE d.id=?",
   )
@@ -608,7 +606,6 @@ it("does not authorize a first volume when its actual receipt installation is ig
   try {
     expect(await report(f, { ...proof, write_allowed: true })).toMatchObject({
       accepted: true,
-      write_allowed: false,
     });
     const installed = await env.DB.prepare(
       "SELECT d.storage_volume_json current_receipt,h.storage_volume_json held_receipt FROM databases d JOIN database_start_admissions h ON h.database_id=d.id WHERE d.id=?",
@@ -639,10 +636,9 @@ it("does not authorize a first volume when its actual receipt installation is ig
         )
       ).body,
     );
+    // The pool has room, but without its receipt the volume has no writer to sign.
     expect(sampled.accepted).toBe(true);
-    expect(sampled.authority?.write_allowed).toBe(false);
     expect(sampled.tokens).toEqual([]);
-    expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
   } finally {
     await env.DB.exec("DROP TRIGGER ignore_first_volume_receipt");
   }
@@ -675,7 +671,7 @@ it("reinitializes only a positively complete empty thin inventory after the pool
   );
 });
 
-it("retains full advisory LV exposure after write expiry without turning retained identity into write permission", async () => {
+it("keeps the reserve requirement after write expiry; only a new identity proof allows writes again", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
     bound = await boundDatabase(f),
     physical = {
@@ -704,7 +700,7 @@ it("retains full advisory LV exposure after write expiry without turning retaine
   ).toBeNull();
   const input = await prepareThinStorageLease(f.local, f.node, false);
   expect(input?.lease.required_data_free_bytes).toBe(
-    f.profile.data_reserve_bytes + 5 * gib,
+    f.profile.data_reserve_bytes,
   );
   expect(input?.lease.action).toBeNull();
   expect(
@@ -713,7 +709,7 @@ it("retains full advisory LV exposure after write expiry without turning retaine
       physical,
       write_allowed: false,
     }),
-  ).toMatchObject({ accepted: true, write_allowed: false });
+  ).toMatchObject({ accepted: true, write_allowed: true });
 });
 
 it("refuses a stale database generation during an identity turn without blocking the node", async () => {
@@ -902,7 +898,7 @@ it("deduplicates two startup holds for the same proved volume during a 95 s iden
   proof.physical.thin_pool.data_total_bytes = 8 * gib;
   await identityProof(f, proof);
   const input = await prepareThinStorageLease(f.local, f.node, false);
-  expect(input!.lease.required_data_free_bytes).toBe(5 * gib + 256 * mib);
+  expect(input!.lease.required_data_free_bytes).toBe(256 * mib);
   await leaseIssuedAgo(f, 30_000);
   expect(await report(f, proof)).toMatchObject({
     accepted: true,

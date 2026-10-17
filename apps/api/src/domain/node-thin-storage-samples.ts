@@ -416,7 +416,7 @@ async function productSample(
             captured_at: identity.captured_at,
             physical: identity.physical,
           };
-  const headroom = minimumHeadroom(profile, identity, holds),
+  const headroom = minimumHeadroom(profile),
     writeAllowed = thinStorageWriteAllowed(
       profile,
       identity,

@@ -12,7 +12,6 @@ import {
   type NodeThinStorageAuthority,
 } from "@pgcf/contracts";
 // The current Native receipt owns physical capacity. Logical quotas never reserve thin extents.
-const maximum = Number.MAX_SAFE_INTEGER;
 const identifier = (value: string) => {
   if (!/^[a-z][a-z0-9_]*$/.test(value))
     throw new Error("invalid_storage_sql_alias");
@@ -190,22 +189,12 @@ export function thinLogicalVolumeExposures(
   }
   return result;
 }
-function volumeKeySql(database: string) {
-  return `'lv:'||json_extract(${database}.storage_volume_json,'$.node_uid')||':'||json_extract(${database}.storage_volume_json,'$.volume_group_uuid')||':'||json_extract(${database}.storage_volume_json,'$.pool_uuid')||':'||json_extract(${database}.storage_volume_json,'$.lv_uuid')||':'||json_extract(${database}.storage_volume_json,'$.storage_uid')||':'||json_extract(${database}.storage_volume_json,'$.storage_generation')`;
-}
 function holdReceiptMatchesCurrentSql(hold: string, database: string) {
   const same = receiptFields.map(
     (key) =>
       `json_extract(${hold}.storage_volume_json,'$.${key}')=json_extract(${database}.storage_volume_json,'$.${key}')`,
   );
   return `(${hold}.storage_volume_json IS NOT NULL AND ${database}.storage_volume_json IS NOT NULL AND json_extract(${hold}.storage_volume_json,'$.storage_generation')=${database}.storage_generation AND (${same.slice(0, 4).join(" AND ")}) AND (${same.slice(4, 8).join(" AND ")}) AND (${same.slice(8).join(" AND ")}))`;
-}
-function knownHoldBindingSql(
-  hold: string,
-  database: string,
-  authority: string,
-) {
-  return `(${holdReceiptMatchesCurrentSql(hold, database)} AND ${boundStorageVolumeSql(database, authority, "any")} AND (json_extract(${database}.storage_profile_json,'$.node_uid')=${authority}.node_uid AND json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=${authority}.volume_group_uuid AND json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(${authority}.authority_json,'$.pool_uuid') AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=${authority}.profile_sha256))`;
 }
 /**
  * The predicate joining `admission` to `database` for the start the database is in the middle of:
@@ -250,7 +239,7 @@ export function storageDrainReservationStatement(
  FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id JOIN operations stop ON stop.id=? JOIN node_thin_storage t ON t.node_id=n.id
  WHERE (d.id=? AND d.generation=? AND n.id=? AND n.node_uid=t.node_uid AND n.lost_at IS NULL)
  AND ${currentStorageStopSql()}
- AND ${nodeThinStorageHeadroomSql("n", "s", "d")}
+ AND ${thinPoolRoomSql("n", "s", "d")}
  AND EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.volumes') v WHERE json_extract(v.value,'$.database_id')=d.id AND json_extract(v.value,'$.generation')=d.generation AND json_extract(v.value,'$.storage_generation')=d.storage_generation AND json_extract(v.value,'$.quiesced')=1 AND json_extract(v.value,'$.lv_uuid')=json_extract(d.storage_volume_json,'$.lv_uuid'))
  AND COALESCE((SELECT MAX(m.observed_at) FROM node_memory_samples m WHERE m.node_id=n.id AND m.node_uid=n.node_uid),(SELECT MAX(old.grant_sample_observed_at) FROM database_start_admissions old WHERE old.node_id=n.id AND old.node_uid=n.node_uid)) IS NOT NULL
  ON CONFLICT(operation_id) DO NOTHING`,
@@ -356,115 +345,55 @@ export function storageResizeAllowedSql(
         AND ${size}.storage_gib<=${field("maximum_quota_gib")})))`;
 }
 
-/** Current Native authority plus current in-flight starts, atomically shared by placement and wake.
- * A selected but unqualified node never falls back to the legacy thick quota calculation.
- * Temporary conservative accounting reserves each retained thin LV's full logical size:
- * io.max exempts metadata/swap, and suspension flags do not prove global drained quiescence.
- * The metadata bound includes mapping growth and per-new-volume metadata. Latent VG space is
- * unavailable until the Native grow action has actually published the larger allocated pool. */
-export function nodeThinStorageHeadroomSql(
+/** Physical fields of the node's latest sample `o` (node_storage_observations). */
+const sampled = (path: string) => `json_extract(o.physical_json,'$.${path}')`;
+const sampledDataFree = `(${sampled("thin_pool.data_total_bytes")}-${sampled("thin_pool.data_used_bytes_upper_bound")})`,
+  sampledMetadataFree = `(${sampled("thin_pool.metadata_total_bytes")}-${sampled("thin_pool.metadata_used_bytes_upper_bound")})`;
+/** The node's latest physical sample, read at most two minutes ago. */
+const freshSampleSql = `julianday(o.observed_at)>=julianday('now','-120 seconds') AND julianday(o.observed_at)<=julianday('now','+5 seconds')`;
+
+/**
+ * The thin pool reserve rule, Cloudflare's one storage decision at every start and attach: the
+ * node's thin storage has no error and its latest physical sample, at most 120 s old, leaves the
+ * profile's data and metadata reserve free in the pool. `databaseAlias` judges that database's own
+ * pool; without it the rule is for a new volume: the node takes new databases and has a volume to
+ * spare. No logical size is accounted: thin volumes overprovision the pool, which grows before it
+ * runs out (`thinPoolGrowthNeededSql`), and dm-thin fails a write into a full pool, so PostgreSQL
+ * acknowledges no commit it could not write. Running writers are never stopped by this rule.
+ */
+export function thinPoolRoomSql(
   nodeAlias = "n",
   sizeAlias = "s",
   databaseAlias?: string,
-  reading: StartReading = "current",
 ): string {
   const node = identifier(nodeAlias),
     size = identifier(sizeAlias),
     database = databaseAlias === undefined ? null : identifier(databaseAlias);
-  const newVolume =
+  const owner =
     database === null
-      ? "1"
-      : `CASE WHEN ${database}.storage_volume_json IS NULL THEN 1 ELSE 0 END`;
-  const identity =
-    database === null
-      ? "t.allow_new_databases=1"
-      : `(${database}.storage_profile_json IS NOT NULL
-    AND json_extract(${database}.storage_profile_json,'$.backend')='lvm-thin-v1'
-    AND json_extract(${database}.storage_profile_json,'$.node_uid')=t.node_uid
-    AND json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=t.volume_group_uuid
-    AND json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(t.authority_json,'$.pool_uuid')
-    AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=t.profile_sha256)
-    AND ( json_extract(${database}.storage_profile_json,'$.profile_revision')<=t.profile_revision
-    AND json_extract(${database}.storage_profile_json,'$.storage_class')='pgcf-lvm-thin-v1-'||substr(t.profile_sha256,1,16)
-    AND ${boundStorageVolumeSql(database, "t", reading)})`;
-  return `EXISTS(
-    WITH physical AS (
-      SELECT t.*,
-        MAX(${field("startup_reserve_bytes")},${size}.storage_gib*1073741824) startup_bytes,
-        ${field("data_reserve_bytes")} data_reserve,${field("metadata_reserve_bytes")} metadata_reserve,
-        ${field("maximum_volumes")} maximum_volumes,
-        json_extract(t.authority_json,'$.physical.thin_pool.data_total_bytes')-json_extract(t.authority_json,'$.physical.thin_pool.data_used_bytes_upper_bound') data_free,
-        json_extract(t.authority_json,'$.physical.thin_pool.metadata_total_bytes')-json_extract(t.authority_json,'$.physical.thin_pool.metadata_used_bytes_upper_bound') metadata_free
-      FROM node_thin_storage t WHERE (t.node_id=${node}.id AND t.node_uid=${node}.node_uid
-        AND t.status='ready' AND t.authority_revision>0 AND t.authority_json IS NOT NULL
-        AND EXISTS(SELECT 1 FROM node_region_policies policy WHERE policy.region_id=${node}.region_id AND policy.placement_mode='actual_ram'))
-        AND (json_extract(t.authority_json,'$.revision')=t.authority_revision
-        AND json_extract(t.authority_json,'$.node_id')=t.node_id
-        AND json_extract(t.authority_json,'$.node_uid')=t.node_uid
-        AND json_extract(t.authority_json,'$.name')=${node}.k8s_node_name
-        AND json_extract(t.authority_json,'$.cluster_uid')=t.cluster_uid
-        AND json_extract(t.authority_json,'$.volume_group_uuid')=t.volume_group_uuid
-        AND json_extract(t.authority_json,'$.physical.volume_group_uuid')=t.volume_group_uuid
-        AND json_extract(t.authority_json,'$.profile_revision')=t.profile_revision
-        AND json_extract(t.authority_json,'$.profile_sha256')=t.profile_sha256
-        AND json_extract(t.authority_json,'$.storage_class')='pgcf-lvm-thin-v1-'||substr(t.profile_sha256,1,16)
-        AND json_extract(t.authority_json,'$.pool_uuid') IS NOT NULL
-        AND json_extract(t.authority_json,'$.write_allowed')=1
-        AND json_extract(t.authority_json,'$.data_accounting_complete')=1
-        AND json_extract(t.authority_json,'$.driver_image')=t.qualified_driver_image
-        AND t.qualified_driver_image=${field("driver_image")})
-        AND (julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday('now','-120 seconds')
-        AND julianday(json_extract(t.authority_json,'$.observed_at'))<=julianday('now','+5 seconds')
-        AND julianday(json_extract(t.authority_json,'$.expires_at'))>julianday('now')
-        AND julianday(json_extract(t.authority_json,'$.expires_at'))<=julianday(json_extract(t.authority_json,'$.observed_at'),'+'||${field("guard_seconds")}||' seconds')
-        AND julianday(t.authority_received_at)>=julianday('now','-120 seconds')
-        AND julianday(t.authority_received_at)<=julianday('now','+5 seconds'))
-        AND (julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
-        AND julianday(${inventoryExpiresSql()})>julianday('now'))
-        AND (json_extract(t.authority_json,'$.physical.free_bytes')>=${field("vg_reserve_bytes")}
-        AND json_extract(t.authority_json,'$.physical.thin_pool.data_total_bytes') BETWEEN 1 AND ${field("maximum_data_bytes")}
-        AND json_extract(t.authority_json,'$.physical.thin_pool.data_used_bytes_upper_bound') BETWEEN 0 AND json_extract(t.authority_json,'$.physical.thin_pool.data_total_bytes')
-        AND json_extract(t.authority_json,'$.physical.thin_pool.metadata_used_bytes_upper_bound') BETWEEN 0 AND json_extract(t.authority_json,'$.physical.thin_pool.metadata_total_bytes')
-        AND typeof(${size}.storage_gib)='integer' AND ${size}.storage_gib BETWEEN 1 AND ${field("maximum_quota_gib")} )
-        AND (${identity}) AND ${qualifiedThinStorageSql()}
-    ), retained AS (
-      SELECT json_extract(lv.value,'$.size_bytes') storage_budget_bytes,
-        'lv:'||p.node_uid||':'||p.volume_group_uuid||':'||json_extract(p.authority_json,'$.pool_uuid')||':'||json_extract(lv.value,'$.lv_uuid')||':'||json_extract(v.value,'$.storage_uid')||':'||json_extract(v.value,'$.storage_generation') volume_key
-      FROM physical p,json_each(p.authority_json,'$.physical_lvs') lv,json_each(p.authority_json,'$.volumes') v
-      WHERE json_extract(lv.value,'$.segtype')='thin' AND json_extract(v.value,'$.lv_uuid')=json_extract(lv.value,'$.lv_uuid')
-        AND json_extract(v.value,'$.volume_handle')=json_extract(lv.value,'$.name')
-    ), held_rows AS (
-      SELECT a.storage_budget_bytes,CASE WHEN ${knownHoldBindingSql("a", "held_db", "p")} THEN ${volumeKeySql("held_db")} ELSE 'op:'||a.operation_id END volume_key
-      FROM physical p JOIN database_start_admissions a ON a.node_id=p.node_id AND a.node_uid=p.node_uid JOIN databases held_db ON held_db.id=a.database_id
-      WHERE a.storage_budget_bytes>0
-      UNION ALL SELECT storage_budget_bytes,volume_key FROM retained
-    ), held_volumes AS (
-      SELECT volume_key,MAX(storage_budget_bytes) bytes,SUM(CASE WHEN substr(volume_key,1,3)='op:' THEN 1 ELSE 0 END) new_volumes FROM held_rows GROUP BY volume_key
-    ), held AS (
-      SELECT COALESCE(SUM(bytes),0) bytes,COALESCE(SUM(new_volumes),0) new_volumes,
-        COALESCE(MAX(CASE WHEN volume_key=${database === null ? "''" : volumeKeySql(database)} THEN bytes ELSE 0 END),0) target_bytes FROM held_volumes
-    ), growth AS (
-      SELECT p.*,h.bytes held_bytes,h.new_volumes,MAX(p.startup_bytes-h.target_bytes,0) startup_extra,
-        (SELECT COUNT(*) FROM json_each(p.authority_json,'$.physical_lvs') lv WHERE json_extract(lv.value,'$.segtype')='thin') volume_count
-      FROM physical p,held h
-    ) SELECT 1 FROM growth g
-      WHERE NOT EXISTS(SELECT 1 FROM json_each(g.authority_json,'$.physical_lvs') lv
-        WHERE json_extract(lv.value,'$.segtype') NOT IN('thin','thin-pool','linear')
-        OR (json_extract(lv.value,'$.segtype')='thin' AND (
-          typeof(json_extract(lv.value,'$.size_bytes'))<>'integer' OR json_extract(lv.value,'$.size_bytes') NOT BETWEEN 1 AND ${maximum}
-          OR (SELECT COUNT(*) FROM json_each(g.authority_json,'$.physical_lvs') other WHERE json_extract(other.value,'$.lv_uuid')=json_extract(lv.value,'$.lv_uuid') OR json_extract(other.value,'$.name')=json_extract(lv.value,'$.name'))<>1
-          OR (SELECT COUNT(*) FROM json_each(g.authority_json,'$.volumes') v WHERE json_extract(v.value,'$.lv_uuid')=json_extract(lv.value,'$.lv_uuid') AND json_extract(v.value,'$.volume_handle')=json_extract(lv.value,'$.name')
-            AND json_extract(v.value,'$.storage_class')=json_extract(g.authority_json,'$.storage_class') AND json_extract(v.value,'$.volume_attributes_class')=json_extract(g.authority_json,'$.storage_class'))<>1)))
-        AND NOT EXISTS(SELECT 1 FROM json_each(g.authority_json,'$.volumes') v WHERE json_extract(v.value,'$.storage_class')<>'pgcf-lvm'
-          AND ((SELECT COUNT(*) FROM json_each(g.authority_json,'$.volumes') other WHERE json_extract(other.value,'$.lv_uuid')=json_extract(v.value,'$.lv_uuid'))<>1
-          OR NOT EXISTS(SELECT 1 FROM json_each(g.authority_json,'$.physical_lvs') lv WHERE json_extract(lv.value,'$.segtype')='thin' AND json_extract(lv.value,'$.lv_uuid')=json_extract(v.value,'$.lv_uuid') AND json_extract(lv.value,'$.name')=json_extract(v.value,'$.volume_handle'))))
-        AND g.data_free>=g.data_reserve+g.held_bytes+g.startup_extra
-        AND g.data_reserve+g.held_bytes+g.startup_extra BETWEEN 1 AND ${maximum}
-        AND g.metadata_free>=g.metadata_reserve
-          +4*(((g.held_bytes+g.startup_extra+65535)/65536+125)/126)*4096
-          +(g.new_volumes+(${newVolume}))*16384
-        AND g.volume_count+g.new_volumes+(${newVolume})<=g.maximum_volumes
-  )`;
+      ? `t.allow_new_databases=1 AND t.status='ready'
+        AND (SELECT COUNT(*) FROM databases v WHERE v.node_id=t.node_id AND v.storage_profile_json IS NOT NULL
+          AND NOT(v.desired_state='deleted' AND v.observed_state='deleted'))<${field("maximum_volumes")}`
+      : allOf(
+          `json_extract(${database}.storage_profile_json,'$.backend')='lvm-thin-v1'`,
+          `json_extract(${database}.storage_profile_json,'$.node_uid')=t.node_uid`,
+          `json_extract(${database}.storage_profile_json,'$.volume_group_uuid')=t.volume_group_uuid`,
+          `json_extract(${database}.storage_profile_json,'$.pool_uuid')=json_extract(t.authority_json,'$.pool_uuid')`,
+        );
+  return `EXISTS(SELECT 1 FROM node_thin_storage t JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid
+    WHERE ${allOf(
+      `t.node_id=${node}.id`,
+      `t.node_uid=${node}.node_uid`,
+      "t.error_code IS NULL",
+      "json_extract(t.authority_json,'$.pool_uuid') IS NOT NULL",
+      `${sampled("volume_group_uuid")}=t.volume_group_uuid`,
+      freshSampleSql,
+      `${sampledDataFree}>=${field("data_reserve_bytes")}`,
+      `${sampledMetadataFree}>=${field("metadata_reserve_bytes")}`,
+      `typeof(${size}.storage_gib)='integer'`,
+      `${size}.storage_gib BETWEEN 1 AND ${field("maximum_quota_gib")}`,
+      owner,
+    )})`;
 }
 
 /** New placements retain the old thick behavior only on nodes with no selected thin policy. */
@@ -483,18 +412,20 @@ export function nodeStoragePlacementSql(
       ? "0=1"
       : `${database}.storage_profile_json IS NULL AND ${size}.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=${database}.size_class_id)`;
   return `((NOT EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=${node}.id) AND (${thick}))
-    OR (EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=${node}.id) AND ((${retained}) OR ${nodeThinStorageHeadroomSql(node, size, database ?? undefined)})))`;
+    OR (EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=${node}.id) AND ((${retained}) OR ${thinPoolRoomSql(node, size, database ?? undefined)})))`;
 }
 
-/** Wake allocates no new extents for a retained thick filesystem. */
+/** Wake allocates no new extents for a retained thick filesystem; a thin start needs room.
+ * `reading` is only accepted while the wake guard still passes it. */
 export function databaseStorageStartupSql(
   databaseAlias = "databases",
   nodeAlias = "n",
   sizeAlias = "s",
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- deleted with the wake guard
   reading: StartReading = "current",
 ): string {
   const database = identifier(databaseAlias);
-  return `(${database}.storage_profile_json IS NULL OR ${nodeThinStorageHeadroomSql(nodeAlias, sizeAlias, database, reading)})`;
+  return `(${database}.storage_profile_json IS NULL OR ${thinPoolRoomSql(nodeAlias, sizeAlias, database)})`;
 }
 
 /** Metadata only; Native independently proves the retained thick volume before granting an exemption. */

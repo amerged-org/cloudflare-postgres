@@ -88,23 +88,36 @@ it("retained thin nodes reject successor release verifier omission without repla
       .first("lease_revision"),
   ).toBe(0);
 });
-it("grows an existing measured pool for a queued first logical-quota startup without ordering a node", async () => {
+it("grows an existing measured pool whose free space falls below its reserve and one start, without ordering a node", async () => {
   const f = await thinExecutionFixture(releases),
-    created = DatabaseWithOperation.parse(await (await f.create()).json());
-  expect(
-    await env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
-      .bind(created.database.id)
-      .first("node_id"),
-  ).toBeNull();
+    pool = f.authority.physical.thin_pool!,
+    free = f.profile.data_reserve_bytes + f.profile.startup_reserve_bytes - 1;
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_json=? WHERE node_id=?",
+  )
+    .bind(
+      JSON.stringify({
+        ...f.authority,
+        physical: {
+          ...f.authority.physical,
+          thin_pool: {
+            ...pool,
+            data_used_bytes_upper_bound: pool.data_total_bytes - free,
+          },
+        },
+      }),
+      f.node,
+    )
+    .run();
   const lease = await reserveThinStorageLease(f.local, f.node);
   expect(JSON.parse(lease!.action_json!)).toMatchObject({
     kind: "grow",
     state: "pending",
     expected_pool_uuid: f.authority.pool_uuid,
   });
-  expect(
-    JSON.parse(lease!.action_json!).target_data_bytes,
-  ).toBeGreaterThanOrEqual(5 * 1024 ** 3 + f.profile.data_reserve_bytes);
+  expect(JSON.parse(lease!.action_json!).target_data_bytes).toBeGreaterThan(
+    pool.data_total_bytes,
+  );
   expect(
     await env.DB.prepare(
       "SELECT COUNT(*) n FROM node_additions WHERE region_id=?",

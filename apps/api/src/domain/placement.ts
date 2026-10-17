@@ -7,7 +7,7 @@ import {
   type SizeResources,
 } from "@pgcf/contracts";
 import { MEMORY_SAMPLE_MAX_AGE_MS } from "./memory-capacity.ts";
-import { nodeThinStorageHeadroomSql } from "./storage-capacity.ts";
+import { thinPoolRoomSql } from "./storage-capacity.ts";
 import {
   startupPhysicalFitSql,
   databaseCpuChargeSql,
@@ -266,7 +266,7 @@ export async function placementNodes(
       ${computePoolOverheadSql("n", "cpu_millicores")} compute_pool_cpu_millicores,
       ${computePoolOverheadSql("n", "memory_mib")} compute_pool_memory_mib,
       EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=n.id) thin_storage_selected,
-      ${nodeThinStorageHeadroomSql("n", "storage_probe", existingDatabaseId === undefined ? undefined : "storage_existing")} thin_storage_available,
+      ${thinPoolRoomSql("n", "storage_probe", existingDatabaseId === undefined ? undefined : "storage_existing")} thin_storage_available,
       (SELECT json_extract(t.profile_json,'$.maximum_quota_gib') FROM node_thin_storage t WHERE t.node_id=n.id) thin_storage_maximum_quota_gib,
       ${existingDatabaseId === undefined ? "0" : "storage_existing.id IS NOT NULL AND storage_existing.storage_profile_json IS NULL"} thin_storage_retained_thick,
       COALESCE(SUM(s.memory_mib + ?+${computePoolOverheadSql("d", "memory_mib")}),0) reserved_memory_mib, COALESCE(SUM(${databaseCpuChargeSql()}+${databaseParkedCpuSql()}),0) reserved_cpu_millicores,

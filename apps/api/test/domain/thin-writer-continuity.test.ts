@@ -268,8 +268,6 @@ it("claims a parked wake on the proof of the start and carries the parked writer
   const w = await awakeWriter(await thinExecutionFixture(releases));
   // The sleep bumped the generation; the last proof still names the one the Pod was started for.
   const parked = await parkedWriter(w, "fast", { read: false });
-  // Only the Actor's wake claim reads the proof that way: a resume asks for the sleep's own.
-  expect(await transition(w, "resume")).toMatchObject({ committed: false });
   const claim = await transition(w, "wake");
   expect(claim.committed).toBe(true);
   const generation = parked.generation + 1;

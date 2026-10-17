@@ -273,42 +273,14 @@ export async function storageHolds(
     exposures,
   };
 }
-export function minimumHeadroom(
-  profile: NodeThinStorageLease["profile"],
-  authority: NodeThinStorageAuthority | null,
-  holds: {
-    bytes: number;
-    newVolumes: number;
-    ids: ReadonlySet<string>;
-    exposures?: ReadonlyMap<string, number>;
-  },
-) {
-  const retained = authority
-    ? thinLogicalVolumeExposures(authority)
-    : new Map();
-  const unknown = {
-    data: Number.MAX_SAFE_INTEGER,
-    metadata: Number.MAX_SAFE_INTEGER,
+/** The free data and metadata a thin pool keeps: the profile's reserves, the same rule as
+ * `thinPoolRoomSql`. Volumes are not accounted at their logical size: they overprovision the pool,
+ * which grows before it runs out. */
+export function minimumHeadroom(profile: NodeThinStorageLease["profile"]) {
+  return {
+    data: profile.data_reserve_bytes,
+    metadata: profile.metadata_reserve_bytes,
   };
-  if (!retained) return unknown;
-  for (const [key, bytes] of holds.exposures ?? [])
-    retained.set(key, Math.max(retained.get(key) ?? 0, bytes));
-  const bytes =
-      [...retained.values()].reduce((sum, value) => sum + value, 0) +
-      (holds.exposures ? 0 : holds.bytes),
-    chunks = Math.ceil(bytes / 65536);
-  if (!Number.isSafeInteger(bytes)) return unknown;
-  const required = {
-    data: profile.data_reserve_bytes + bytes,
-    metadata:
-      profile.metadata_reserve_bytes +
-      4 * Math.ceil(chunks / 126) * 4096 +
-      holds.newVolumes * 16384,
-  };
-  return Number.isSafeInteger(required.data) &&
-    Number.isSafeInteger(required.metadata)
-    ? required
-    : unknown;
 }
 /** Cloudflare's write decision for one reading under one identity proof; the rule the slow report
  * has always been held to: complete data accounting, the profile's geometry and free data and
@@ -431,7 +403,7 @@ export async function reserveThinStorageLease(
     advisory,
     current.authority ? Date.now() : Date.parse(advisory?.observed_at ?? now),
   );
-  const required = minimumHeadroom(profile, advisory, holds);
+  const required = minimumHeadroom(profile);
   // A queued first start cannot obtain its bounded hold until the measured pool fits it.
   // Grow the existing finite pool for one eligible request; this is not a physical quota debit
   // for established databases and never creates a VPS order below the regional RAM trigger.
@@ -575,20 +547,17 @@ export async function thinStorageStatus(env: Env, nodeId: string) {
 export async function thinStorageInput(
   env: Env,
   nodeId: string,
-  required?: { data: number; metadata: number },
 ): Promise<NodeThinStorageInput> {
   return buildThinStorageInput(
     env,
     nodeId,
     await readThinStorageLeaseRow(env, nodeId),
-    required,
   );
 }
 async function buildThinStorageInput(
   env: Env,
   nodeId: string,
   row: Awaited<ReturnType<typeof readThinStorageLeaseRow>>,
-  required?: { data: number; metadata: number },
 ): Promise<NodeThinStorageInput> {
   const current = await readCurrentNodeThinStorage(
     env,
@@ -648,25 +617,7 @@ async function buildThinStorageInput(
         storage_budget_bytes: number | null;
       }
     >();
-  const advisory =
-    current.authority ??
-    current.reclamation ??
-    retainedPoolAuthority(current.row);
-  const requiredHeadroom =
-    required ??
-    minimumHeadroom(
-      current.profile,
-      advisory,
-      await storageHolds(
-        env,
-        nodeId,
-        row.node_uid,
-        advisory,
-        current.authority
-          ? Date.now()
-          : Date.parse(advisory?.observed_at ?? row.updated_at),
-      ),
-    );
+  const requiredHeadroom = minimumHeadroom(current.profile);
   const callback = new URL(
     `/internal/v1/node-thin-storage/${nodeId}`,
     env.NODE_BOOTSTRAP_CALLBACK_URL,
@@ -916,7 +867,7 @@ async function acceptIdentityProof(
       proofAuthority,
       issued,
     ),
-    headroom = minimumHeadroom(lease.profile, a, holds),
+    headroom = minimumHeadroom(lease.profile),
     pool = a.physical.thin_pool,
     proofWriteAllowed = thinStorageWriteAllowed(
       lease.profile,

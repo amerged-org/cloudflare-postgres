@@ -8,7 +8,7 @@ import { countStatements } from "./d1-statements.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { thinLeaseNode } from "./thin-lease-fixture.ts";
-import { gib, mib, nonce, post, sample } from "./thin-renewal-fixture.ts";
+import { gib, mib, nonce, post, row, sample } from "./thin-renewal-fixture.ts";
 import {
   HOST_LEASE_TOMBSTONE_RETENTION_MS,
   runningWriterTokens,
@@ -383,6 +383,18 @@ function roomySample(
     lv_count: 1,
   });
 }
+it("allows writes while the pool's free space covers its reserves, however much its volumes could hold", async () => {
+  const { node, proof } = await crowdedNode(40, 0),
+    f = node.f;
+  // Forty volumes and the held start hold far more than the 1 GiB of the 16 GiB pool still free;
+  // the free space covers the data and metadata reserve.
+  const answer = NodeStorageHeadroomResponse.parse(
+    (await post(f, roomySample(f, proof, await nonce(f), 15 * gib))).body,
+  );
+  expect(answer.accepted).toBe(true);
+  expect(answer.authority!.write_allowed).toBe(true);
+  expect((await row(f)).status).toBe("ready");
+}, 60_000);
 const nodeReads = (sql: string[]) =>
   sql.filter((text) =>
     text.startsWith("SELECT t.*,n.region_id,n.k8s_node_name"),
