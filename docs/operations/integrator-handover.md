@@ -1131,7 +1131,7 @@ outcome and are not replayed.
 | Edge, hints, SQLSTATE, deadline, decoy | `apps/edge/src/*.ts` (the Rust/Wasm port in `apps/edge-rust` applies the same policy) |
 | HTTP query mode | `apps/edge/src/sql.ts`, `apps/native-gateway/src/sql.rs` |
 | Gateway limits, TLS, cancel, startup, idle close | `apps/native-gateway/src/transport.rs`, `packages/native-protocol/src/activity.rs`, `packages/contracts/src/pg-wire.ts`, `packages/contracts/native/protocol.generated.json` |
-| Sleep sequence and refusals | `apps/node-agent/src/power.rs` |
+| Sleep sequence and refusals | `apps/node-agent/src/sleep.rs`, `packages/contracts/src/sleep.ts` |
 | PostgreSQL cluster, backup schedule, retention, `pg_hba` | the retired runtime on the `archive/kubernetes-runtime` branch |
 | Client configuration | `scripts/e2e/probe/worker.ts`, `@neondatabase/serverless` `CONFIG.md`, [README](../../README.md) |
 | Metering | `apps/api/src/domain/{usage,usage-rollup,usage-cron,costs}.ts`; the traffic attribution across an hour boundary is `differences` in `apps/node-agent/src/measurements.rs` |

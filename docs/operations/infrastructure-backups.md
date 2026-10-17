@@ -7,18 +7,15 @@ API call or server purchase occurs during capture.
 
 ## Installation configuration
 
-Apply migrations `0039_infrastructure_backups.sql`,
-`0043_infrastructure_backup_attempts.sql` and
-`0052_infrastructure_backup_deferrals.sql` (the status route of the Worker reads the
-last one, so apply it first) and deploy the `InfrastructureBackup` Workflow binding
+Apply every API migration in order (the backup tables come from
+`0039_infrastructure_backups.sql` and `0043_infrastructure_backup_attempts.sql`) and deploy
+the `InfrastructureBackup` Workflow binding and the `nodejs_compat` compatibility flag
 shown in `apps/api/wrangler.example.jsonc`. The existing minute Cron dispatches one
 persisted run per UTC calendar day and retries a failed day: the next attempt starts
 at least 90 minutes after the failed attempt ended, at most three attempts per UTC
 day, and never while another run is pending or running. The spacing makes the three
-attempts of a day cover several hours, so one disturbance cannot use them all. An
-attempt that is due waits, without taking an attempt number, while a thin database is
-starting ([held-back attempts](#held-back-attempts)). Fresh installations have backups
-disabled and no email addresses configured.
+attempts of a day cover several hours, so one disturbance cannot use them all. Fresh
+installations have backups disabled and no email addresses configured.
 
 Set the private Worker secret `INFRASTRUCTURE_BACKUP_CF_TOKEN` to an operator-owned
 Cloudflare API token with D1 export permission for the actual control database.
@@ -77,14 +74,15 @@ Control-plane requests may wait during this export window; [what is known about 
 length](#the-d1-export-window) and what is not is recorded below, and every run stores
 its own window.
 
-One Workflow captures the D1 export. Files are streamed and hashed; the complete
-run's private payload workspace is bounded to 1 GiB. Encryption uses a
-purpose-derived AES-256-GCM key from the existing active `CREDENTIAL_KEYS` version.
-No credential key is generated or rotated. Plaintext files are removed immediately
-after encryption; the ephemeral workspace is removed when the run closes.
+The `InfrastructureBackup` Workflow of the API Worker captures the D1 export itself; no
+container or node takes part. Encryption uses a purpose-derived AES-256-GCM key from the
+existing active `CREDENTIAL_KEYS` version. No credential key is generated or rotated. The
+plaintext is never stored and never held whole: the Worker reads the signed export once to
+count and hash it, then reads it a second time and streams it through the cipher. A second
+read that differs from the first fails the run before the upload completes.
 
 The Worker uploads ciphertext using bounded 8 MiB R2 multipart parts, then reads the
-entire committed object back. Completion requires matching object ownership, encrypted byte count,
+entire committed object back (the GCM tag first, by a suffix read of the same object version). Completion requires matching object ownership, encrypted byte count,
 SHA-256, authenticated run/source identity, GCM tag, plaintext byte count and
 SHA-256. The receipt is persisted in D1 only after this full readback. Unique keys
 are `infrastructure/v1/<UTC-day>/<run-UUID>/<artifact-id>.pgcfenc`.
@@ -110,35 +108,6 @@ Before accepting customer data, enable this configuration and verify a real dail
 run contains the D1 artifact with `status: complete`.
 Record the real artifact byte counts, full readback results, duration and recovery
 proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
-
-## Held-back attempts
-
-The D1 export makes the control database unavailable for the whole of its job, which a thin
-database start in flight must not meet. A due attempt therefore waits, without taking an attempt
-number and so without using one of the day's three, while this holds. The Cron checks every
-minute:
-
-| Reason | Holds while |
-| --- | --- |
-| `deferred_by_thin_start` | a thin database start (an admission that holds thin storage and has no `ready_at`) was granted within the last 15 minutes |
-
-A start older than 15 minutes counts as stuck, not as in flight, so a stuck start cannot stop
-backups.
-
-Each check that holds an attempt back is recorded in `infrastructure_backup_deferrals`: one row per
-UTC day and reason with the first and the latest check and their number. `GET
-/v1/infrastructure-backups` returns the latest row as `deferral`; it is current while `last_at` is
-at most a few minutes old. A day that is held back has no run until the hold ends; when no backup
-completes for 36 hours the existing stale alarm fires.
-
-The export request repeats the thin-start check right before it asks the provider, because the
-Cron's check is a minute or more older (the first stall of a run was seen 20 to 126 s after its
-creation). It polls every 5 s for at most 5 minutes for a start in flight to become ready and then
-goes on, so neither a start that never becomes ready nor a check that fails can stop the backup.
-
-Not detectable: a thin start or a wake that begins after the export request (the export then
-overlaps it), an awake thin database under writes (see the export window below) and a node
-addition (a run that overlaps it may fail its authority check and is retried).
 
 ## The D1 export window
 
