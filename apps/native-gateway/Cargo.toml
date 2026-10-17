@@ -21,7 +21,6 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 
-ring = "=0.17.14"
 sha2 = "=0.11.0"
 base64 = "=0.23.1"
 

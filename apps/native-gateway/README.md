@@ -55,12 +55,12 @@ Upstream notices and actual input-lock/schema bytes remain under `/licenses`.
 
 Writer routing uses the authenticated Kubernetes EndpointSlice cache: one Ready
 writer Pod UID, node and private IP, with PostgreSQL TLS verified against the
-`database-rw.pgcf-db-<id>.svc` name. Endpoint discovery and storage-ledger watches
-run outside connection handling. A Pod/volume/node/profile change or expired
-physical write lease closes existing sessions and rejects new starts. Every
-frontend write rechecks the cached identities and lease; uncertain SQL is never
-replayed. Quiet sessions also check expiry. Healthy signed renewal preserves the
-connection and ordinary power-fence history.
+`database-rw.pgcf-db-<id>.svc` name, on the node of the database's volume. Endpoint, Pod and
+ConfigMap watches run outside connection handling. A writer Pod, address, node, container or CA
+change closes existing sessions and rejects new starts. Every frontend write rechecks the cached
+identity; uncertain SQL is never replayed. One writer per volume is the controller's and the
+node attach agent's rule (the holder file and CNPG hibernation), not the gateway's: the gateway
+needs no storage token, and a thin database routes exactly as a thick one.
 
 The kubelet reports a resumed Pod Ready up to a probe period after PostgreSQL accepts
 connections. While no endpoint is Ready, the one Pod that the controller attested in the
@@ -70,8 +70,8 @@ attested one, it is not terminating, it is the only candidate, and it has one pr
 the watched Pod is on that node and address with its `postgres` container running under the
 attested container ID; the watched CA is the attested one. A Ready endpoint always takes
 precedence, and the route ends with the Pod watch.
-Only a v4 route, which names the admitted runtime, may use such a writer; route token,
-storage binding and signed authority are checked exactly as for a Ready writer.
+Only a v4 route, which names the admitted runtime, may use such a writer; the route token is
+checked exactly as for a Ready writer.
 
 That attestation is for the wake. It is spent once this gateway has seen the attested Pod's
 endpoint and `postgres` container reported Ready: for that Pod, container and revision only the
@@ -101,22 +101,7 @@ refusal, 25 s without release, or a fence that moves past the ticket answer FATA
 draining gateway and a failed dial answer 08006.
 
 The admission target may name the Service of a pool slot, `database-rw.pgcf-slot-<8 hex>.svc`. The
-writer is then that slot's Pod in its own namespace, under the same attestation rules and without
-a storage binding: the controller holds the database's volume for the slot. A slot no fence names
+writer is then that slot's Pod in its own namespace, under the same attestation rules: the
+controller holds the database's volume for the slot. A slot no fence names
 belongs to no database. A gateway release older than the pool fails its discovery on slot Pods, so
 rolling the gateway back requires deleting every `pgcf-slot-*` namespace first.
-
-The gateway accepts thin write authority only from the public-key map pinned by
-`PGCF_STORAGE_AUTHORITY_KEYS` and its canonical SHA-256 in
-`PGCF_STORAGE_AUTHORITY_KEYS_SHA256`; the private signer remains in Cloudflare.
-The existing storage ConfigMap carries the token under the shared
-`STORAGE_AUTHORITY_LEDGER_KEY`. It does not establish its own trust anchor.
-
-Retained thick databases require immutable Deployment configuration in
-`PGCF_GATEWAY_LEGACY_BINDINGS_JSON`: an array of the shared
-`LegacyStorageBinding` contract, derived by the high-trust CF/Native patch path
-from the retained assignment and actual storage identities. It binds database
-ID, storage/namespace/Cluster UIDs, physical generation and exact volume
-identity. The default empty array permits no legacy bypass. Changing the
-regional storage ledger cannot add a legacy assignment. No customer IDs or
-volume identities are compiled into the public executable.

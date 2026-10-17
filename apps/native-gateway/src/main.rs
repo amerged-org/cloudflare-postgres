@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use pgcf_native_gateway::{
     kubernetes::{self, Kubernetes},
-    storage::StorageTrust,
     targets,
     transport::{self, ClusterPostgresDial, Config, Gateway},
 };
@@ -53,35 +52,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
     let api = Arc::new(Kubernetes::in_cluster().await?);
     let gateway = Gateway::new(config, pod, Arc::new(ClusterPostgresDial(api.clone())));
-    let trust = match (
-        std::env::var("PGCF_STORAGE_AUTHORITY_KEYS"),
-        std::env::var("PGCF_STORAGE_AUTHORITY_KEYS_SHA256"),
-    ) {
-        (Ok(keys), Ok(pin)) => Some(StorageTrust::parse(&keys, &pin)?),
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
-        _ => return Err("incomplete storage trust configuration".into()),
-    };
-    let legacy = std::env::var("PGCF_GATEWAY_LEGACY_BINDINGS_JSON").unwrap_or_else(|_| "[]".into());
-    *gateway.targets.write().await = targets::Targets::with_legacy(&legacy)?;
     let (stop, receiver) = watch::channel(false);
     let endpoints = tokio::spawn(targets::synchronize(
         api.clone(),
         gateway.targets.clone(),
-        trust.clone(),
         "endpointslices",
         receiver.clone(),
     ));
     let pods = tokio::spawn(targets::synchronize(
         api.clone(),
         gateway.targets.clone(),
-        trust.clone(),
         "pods",
         receiver.clone(),
     ));
     let storage = tokio::spawn(targets::synchronize(
         api.clone(),
         gateway.targets.clone(),
-        trust,
         "configmaps",
         receiver.clone(),
     ));

@@ -141,9 +141,6 @@ fn writer(pod: &str) -> Value {
 fn legacy_identity() -> Value {
     json!({"handle":format!("pvc-{}",cid(205)),"claimUid":cid(205),"volumeUid":cid(206)})
 }
-fn legacy_bindings() -> String {
-    json!([{"database_id":DATABASE,"storage_uid":cid(202),"namespace_uid":cid(207),"cluster_uid":cid(208),"physical_generation":1,"volume_identity":legacy_identity()}]).to_string()
-}
 fn storage_maps() -> Vec<Value> {
     let labels = json!({"pgcf.io/database-id":DATABASE});
     let state = json!({"node":"customer-us1","namespaceUid":cid(207),"clusterUid":cid(208)});
@@ -268,14 +265,10 @@ impl Fixture {
         gateway.fences.write().await.replace(fences).unwrap();
         {
             let mut targets = gateway.targets.write().await;
-            *targets =
-                pgcf_native_gateway::targets::Targets::with_legacy(&legacy_bindings()).unwrap();
             targets
-                .replace("endpointslices", &[writer(&cid(200))], None)
+                .replace("endpointslices", &[writer(&cid(200))])
                 .unwrap();
-            targets
-                .replace("configmaps", &storage_maps(), None)
-                .unwrap();
+            targets.replace("configmaps", &storage_maps()).unwrap();
         }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -814,7 +807,7 @@ async fn writer_restart_closes_authenticated_tls_session_without_forwarding_new_
         .targets
         .write()
         .await
-        .replace("endpointslices", &[writer(&cid(299))], None)
+        .replace("endpointslices", &[writer(&cid(299))])
         .unwrap();
     client.send(Message::Binary(query().into())).await.unwrap();
     let next = timeout(Duration::from_secs(1), client.next())
@@ -833,227 +826,6 @@ async fn writer_restart_closes_authenticated_tls_session_without_forwarding_new_
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
 
-struct StorageIssuer {
-    pair: ring::signature::Ed25519KeyPair,
-    trust: pgcf_native_gateway::storage::StorageTrust,
-}
-impl StorageIssuer {
-    fn new() -> Self {
-        use ring::signature::KeyPair;
-        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-            .unwrap();
-        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
-        let public = serde_json::to_string(&std::collections::BTreeMap::from([(
-            "cf",
-            URL_SAFE_NO_PAD.encode(pair.public_key().as_ref()),
-        )]))
-        .unwrap();
-        use sha2::Digest;
-        let pin = Sha256::digest(public.as_bytes())
-            .iter()
-            .map(|v| format!("{v:02x}"))
-            .collect::<String>();
-        let trust = pgcf_native_gateway::storage::StorageTrust::parse(&public, &pin).unwrap();
-        Self { pair, trust }
-    }
-    fn maps(&self, observed: u64, expires: u64, revision: u64) -> Vec<Value> {
-        let profile = json!({"backend":"lvm-thin-v1","storage_class":format!("pgcf-lvm-thin-v1-{}","a".repeat(16)),"profile_sha256":"a".repeat(64),"node_uid":cid(204),"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg"});
-        let identity = json!({"handle":format!("pvc-{}",cid(205)),"lvUuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","claimUid":cid(205),"volumeUid":cid(206)});
-        let state = json!({"node":"customer-us1","storage":profile});
-        let claims = json!({"v":1,"kid":"cf","database_id":DATABASE,"generation":1,"authority_revision":revision,"storage_uid":cid(202),"node_uid":profile["node_uid"],"volume_group_uuid":profile["volume_group_uuid"],"pool_uuid":profile["pool_uuid"],"profile_sha256":profile["profile_sha256"],"volume_handle":identity["handle"],"lv_uuid":identity["lvUuid"],"pvc_uid":cid(205),"pv_uid":cid(206),"pod_uid":cid(200),"observed_at":observed,"iat":observed,"exp":expires,"guard_seconds":120,"drain_seconds":1,"write_allowed":true});
-        let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signed = self
-            .pair
-            .sign(format!("{}{body}", wire("storageAuthorityDomain")).as_bytes());
-        let token = format!(
-            "{}.{body}.{}",
-            wire("storageAuthorityPrefix"),
-            URL_SAFE_NO_PAD.encode(signed.as_ref())
-        );
-        let mut maps = storage_maps();
-        maps[0]["data"]["state"] = state.to_string().into();
-        maps[0]["metadata"]["annotations"] = json!({"pgcf.io/gateway-fence-uid":cid(100),"pgcf.io/volume-identity":identity.to_string()});
-        maps[0]["data"][wire("storageAuthorityLedgerKey")] = token.into();
-        maps[1]["data"] = json!({"intent.json":json!({"database":DATABASE,"operation":operation(),"revision":1,"mode":"running"}).to_string(),"power.json":json!({"anchor":{"storageUid":cid(202),"storageState":state.to_string(),"volumeIdentity":identity.to_string(),"storage":profile}}).to_string()});
-        maps
-    }
-}
-#[tokio::test]
-async fn signed_storage_expiry_closes_quiet_tls_and_blocks_racing_frontend_write() {
-    let mut fixture = Fixture::new().await;
-    let issuer = StorageIssuer::new();
-    let now = control::now();
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace(
-            "configmaps",
-            &issuer.maps(now, now + 60000, 1),
-            Some(&issuer.trust),
-        )
-        .unwrap();
-    let mut quiet = fixture.authenticate(810).await;
-    let mut racing = fixture.authenticate(811).await;
-    let expiry = control::now();
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace(
-            "configmaps",
-            &issuer.maps(expiry, expiry + 250, 2),
-            Some(&issuer.trust),
-        )
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(260)).await;
-    assert_eq!(
-        fixture
-            .gateway
-            .targets
-            .read()
-            .await
-            .target(DATABASE, control::now())
-            .unwrap_err()
-            .to_string(),
-        "storage_authority_expired"
-    );
-    let _ = racing.send(Message::Binary(query().into())).await;
-    for client in [&mut quiet, &mut racing] {
-        let next = timeout(Duration::from_secs(1), client.next())
-            .await
-            .unwrap();
-        assert!(
-            matches!(next, Some(Ok(Message::Close(_))) | Some(Err(_)) | None),
-            "expired signed authority retained a session: {next:?}"
-        );
-    }
-    assert!(
-        timeout(Duration::from_millis(150), fixture.upstream.recv())
-            .await
-            .is_err(),
-        "frontend crossed signed expiry"
-    );
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
-}
-#[tokio::test]
-async fn same_generation_writer_restart_cannot_reuse_old_signed_io_authority() {
-    let mut fixture = Fixture::new().await;
-    let issuer = StorageIssuer::new();
-    let now = control::now();
-    let maps = issuer.maps(now, now + 60000, 1);
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace("configmaps", &maps, Some(&issuer.trust))
-        .unwrap();
-    let mut client = fixture.authenticate(820).await;
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace("endpointslices", &[writer(&cid(299))], Some(&issuer.trust))
-        .unwrap();
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace("configmaps", &maps, Some(&issuer.trust))
-        .unwrap();
-    let _ = client.send(Message::Binary(query().into())).await;
-    assert!(
-        fixture
-            .gateway
-            .targets
-            .read()
-            .await
-            .target(DATABASE, control::now())
-            .is_err()
-    );
-    assert_eq!(
-        fixture
-            .gateway
-            .targets
-            .read()
-            .await
-            .target(DATABASE, control::now())
-            .unwrap_err()
-            .to_string(),
-        "storage_authority_scope_or_freshness_changed"
-    );
-    let mut request = format!("ws://127.0.0.1:{}/pg", fixture.port)
-        .into_client_request()
-        .unwrap();
-    request
-        .headers_mut()
-        .insert("x-pgcf-route", route_token(821).parse().unwrap());
-    let error = connect_async(request).await.unwrap_err();
-    assert!(
-        matches!(error,tokio_tungstenite::tungstenite::Error::Http(response) if response.status()==503)
-    );
-    let next = timeout(Duration::from_secs(1), client.next())
-        .await
-        .unwrap();
-    assert!(
-        matches!(next, Some(Ok(Message::Close(_))) | Some(Err(_)) | None),
-        "watch disconnect returned {next:?}"
-    );
-    assert!(
-        timeout(Duration::from_millis(150), fixture.upstream.recv())
-            .await
-            .is_err()
-    );
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-}
-#[tokio::test]
-async fn healthy_signed_renewal_preserves_tls_session_and_power_epoch() {
-    let mut fixture = Fixture::new().await;
-    let issuer = StorageIssuer::new();
-    let now = control::now();
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace(
-            "configmaps",
-            &issuer.maps(now, now + 60000, 1),
-            Some(&issuer.trust),
-        )
-        .unwrap();
-    let epoch = fixture.gateway.fences.read().await.bound_epoch(DATABASE);
-    let mut client = fixture.authenticate(830).await;
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace(
-            "configmaps",
-            &issuer.maps(now + 1, now + 60001, 2),
-            Some(&issuer.trust),
-        )
-        .unwrap();
-    client.send(Message::Binary(query().into())).await.unwrap();
-    assert_eq!(
-        timeout(Duration::from_secs(1), fixture.upstream.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        query()
-    );
-    assert_eq!(
-        fixture.gateway.fences.read().await.bound_epoch(DATABASE),
-        epoch
-    );
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-}
 #[tokio::test]
 async fn broken_power_watch_never_forwards_new_authenticated_frontend_bytes() {
     let mut fixture = Fixture::new().await;
@@ -1074,30 +846,56 @@ async fn broken_power_watch_never_forwards_new_authenticated_frontend_bytes() {
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
+/// A thin database's maps as the controller publishes them: its thin storage profile and LV
+/// identity, and no storage ledger entry.
+fn thin_maps() -> Vec<Value> {
+    let profile = json!({"backend":"lvm-thin-v1","storage_class":format!("pgcf-lvm-thin-v1-{}","a".repeat(16)),"profile_sha256":"a".repeat(64),"node_uid":cid(204),"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg"});
+    let identity = json!({"handle":format!("pvc-{}",cid(205)),"lvUuid":"cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh","claimUid":cid(205),"volumeUid":cid(206)});
+    let state = json!({"node":"customer-us1","storage":profile});
+    let mut maps = storage_maps();
+    maps[0]["data"]["state"] = state.to_string().into();
+    maps[0]["metadata"]["annotations"] = json!({"pgcf.io/gateway-fence-uid":cid(100),"pgcf.io/volume-identity":identity.to_string()});
+    maps[1]["data"] = json!({"intent.json":json!({"database":DATABASE,"operation":operation(),"revision":1,"mode":"running"}).to_string(),"power.json":json!({"anchor":{"storageUid":cid(202),"storageState":state.to_string(),"volumeIdentity":identity.to_string(),"storage":profile}}).to_string()});
+    maps
+}
 #[tokio::test]
-async fn missing_immutable_legacy_cohort_cannot_be_replaced_by_regional_ledgers() {
-    let fixture = Fixture::new().await;
+async fn a_thin_database_is_routed_and_written_without_a_storage_ledger_token() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("configmaps", &thin_maps())
+        .unwrap();
+    let mut client = fixture.authenticate(850).await;
+    client.send(Message::Binary(query().into())).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        query()
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_database_without_thin_storage_is_routed_without_a_configured_cohort() {
+    let mut fixture = Fixture::new().await;
     {
         let mut targets = fixture.gateway.targets.write().await;
         *targets = pgcf_native_gateway::targets::Targets::default();
         targets
-            .replace("endpointslices", &[writer(&cid(200))], None)
+            .replace("endpointslices", &[writer(&cid(200))])
             .unwrap();
-        targets
-            .replace("configmaps", &storage_maps(), None)
-            .unwrap();
+        targets.replace("configmaps", &storage_maps()).unwrap();
     }
-    let mut request = format!("ws://127.0.0.1:{}/pg", fixture.port)
-        .into_client_request()
-        .unwrap();
-    request
-        .headers_mut()
-        .insert("x-pgcf-route", route_token(850).parse().unwrap());
-    let error = connect_async(request).await.unwrap_err();
-    assert!(
-        matches!(error, tokio_tungstenite::tungstenite::Error::Http(response) if response.status()==503)
-    );
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    let client = fixture.authenticate(851).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    drop(client);
+    fixture.stop().await;
 }
 #[tokio::test]
 async fn a_route_dials_only_its_admitted_revision_and_verified_pod() {
@@ -1132,7 +930,7 @@ async fn a_writer_replaced_after_admission_is_never_dialled() {
         .targets
         .write()
         .await
-        .replace("endpointslices", &[writer(&cid(299))], None)
+        .replace("endpointslices", &[writer(&cid(299))])
         .unwrap();
     client
         .send(Message::Binary(startup("app").into()))
@@ -1153,30 +951,6 @@ async fn a_writer_replaced_after_admission_is_never_dialled() {
             .await
             .is_err()
     );
-    fixture.stop().await;
-}
-#[tokio::test]
-async fn a_route_must_match_the_storage_binding_of_its_revision() {
-    let fixture = Fixture::new().await;
-    let issuer = StorageIssuer::new();
-    let now = control::now();
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace(
-            "configmaps",
-            &issuer.maps(now, now + 60000, 1),
-            Some(&issuer.trust),
-        )
-        .unwrap();
-    // The fence advanced while the sealed storage binding still names revision 1.
-    fixture.intent("running", 2, true).await;
-    for route in [routed(930, 2, &cid(200)), routed(931, 1, &cid(200))] {
-        assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
-    }
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     fixture.stop().await;
 }
 #[tokio::test]
@@ -1326,7 +1100,7 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         }
         assert!(lines[1]["dial_ms"].is_null() && lines[1]["first_backend_ms"].is_null());
         assert_eq!(lines[2]["outcome"], "target_unavailable");
-        assert_eq!(lines[2]["target_reason"], "storage_authority_invalid");
+        assert_eq!(lines[2]["target_reason"], "writer_identity_unavailable");
         for unreached in ["upgrade_ms", "startup_ms", "dial_ms", "first_backend_ms"] {
             assert!(lines[2][unreached].is_null());
         }
@@ -1337,7 +1111,6 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         assert!(lines[2]["route"].is_null());
         assert_eq!(lines[3]["route"], "attested");
         assert_eq!(lines[3]["outcome"], "client_closed");
-        assert!(!stdout.contains("private_bearer_payload_canary"));
         return;
     }
     let mut fixture = Fixture::new().await;
@@ -1360,16 +1133,13 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         .into_data();
     assert!(String::from_utf8_lossy(&error).contains("28000"));
     fixture.ended().await;
-    let issuer = StorageIssuer::new();
-    let now = control::now();
-    let mut maps = issuer.maps(now, now + 60000, 1);
-    maps[0]["data"][wire("storageAuthorityLedgerKey")] = "private_bearer_payload_canary".into();
+    // No writer: the connection is refused before its upgrade.
     fixture
         .gateway
         .targets
         .write()
         .await
-        .replace("configmaps", &maps, Some(&issuer.trust))
+        .replace("endpointslices", &[])
         .unwrap();
     assert_eq!(fixture.upgrade(&route_token(962)).await.err(), Some(503));
     // The cluster right after a fast wake: the writer is the attested Pod before its Ready.
@@ -1470,11 +1240,9 @@ async fn unready_wake(fixture: &Fixture, attested: bool) {
     }
     maps.push(ca_map());
     let mut targets = fixture.gateway.targets.write().await;
-    targets.replace("endpointslices", &[writer], None).unwrap();
-    targets
-        .replace("pods", &[running_pod(false)], None)
-        .unwrap();
-    targets.replace("configmaps", &maps, None).unwrap();
+    targets.replace("endpointslices", &[writer]).unwrap();
+    targets.replace("pods", &[running_pod(false)]).unwrap();
+    targets.replace("configmaps", &maps).unwrap();
 }
 #[tokio::test]
 async fn a_v4_route_reaches_the_attested_pod_before_its_ready_condition() {
@@ -1498,9 +1266,9 @@ async fn a_v4_route_reaches_the_attested_pod_before_its_ready_condition() {
     {
         let mut targets = fixture.gateway.targets.write().await;
         targets
-            .replace("endpointslices", &[writer(&cid(200))], None)
+            .replace("endpointslices", &[writer(&cid(200))])
             .unwrap();
-        targets.replace("pods", &[running_pod(true)], None).unwrap();
+        targets.replace("pods", &[running_pod(true)]).unwrap();
     }
     client.send(Message::Binary(query().into())).await.unwrap();
     assert_eq!(
@@ -1540,38 +1308,18 @@ async fn an_unready_pod_the_writer_cache_holds_no_attestation_for_is_not_dialled
     fixture.stop().await;
 }
 #[tokio::test]
-async fn an_attested_unready_pod_is_routed_only_under_its_signed_thin_authority() {
+async fn an_attested_unready_pod_of_a_thin_database_is_routed() {
     let mut fixture = Fixture::with_fences(attested_fence()).await;
     unready_wake(&fixture, true).await;
-    let issuer = StorageIssuer::new();
-    let now = control::now();
-    let mut thin = issuer.maps(now, now + 60000, 1);
+    let mut thin = thin_maps();
     thin[1]["data"]["admission_target"] = attested_target().to_string().into();
     thin.push(ca_map());
-    // Without a valid signed authority for this Pod the attestation alone routes nothing.
-    let mut unsigned = thin.clone();
-    unsigned[0]["data"][wire("storageAuthorityLedgerKey")] = "not_a_signed_authority".into();
     fixture
         .gateway
         .targets
         .write()
         .await
-        .replace("configmaps", &unsigned, Some(&issuer.trust))
-        .unwrap();
-    assert_eq!(
-        fixture
-            .upgrade(&admitted(982, 1, &cid(200), 19))
-            .await
-            .err(),
-        Some(503)
-    );
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    fixture
-        .gateway
-        .targets
-        .write()
-        .await
-        .replace("configmaps", &thin, Some(&issuer.trust))
+        .replace("configmaps", &thin)
         .unwrap();
     let mut client = fixture
         .upgrade(&admitted(983, 1, &cid(200), 19))
@@ -1598,7 +1346,7 @@ async fn fence_quiesces(fixture: &Fixture, revision: u64) {
         .targets
         .write()
         .await
-        .replace("configmaps", &maps, None)
+        .replace("configmaps", &maps)
         .unwrap();
     fixture
         .gateway
@@ -1690,7 +1438,7 @@ async fn an_established_session_on_an_unready_writer_closes_when_the_fence_leave
         .targets
         .write()
         .await
-        .replace("pods", &[restarted], None)
+        .replace("pods", &[restarted])
         .unwrap();
     ends_without_forwarding(&mut fixture, &mut client).await;
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
@@ -1710,7 +1458,7 @@ async fn a_writer_replaced_between_admission_and_dial_is_not_dialled_on_the_unre
         .targets
         .write()
         .await
-        .replace("endpointslices", &[writer(&cid(299))], None)
+        .replace("endpointslices", &[writer(&cid(299))])
         .unwrap();
     client
         .send(Message::Binary(startup("app").into()))
@@ -1766,7 +1514,7 @@ async fn readyz_requires_the_pod_watch() {
         .targets
         .write()
         .await
-        .replace("pods", &[], None)
+        .replace("pods", &[])
         .unwrap();
     assert_eq!(get(&fixture, "/readyz").await, (200, "ok\n".into()));
     // The watch is lost: the replica leaves the Service again, and stays alive.
@@ -1856,9 +1604,9 @@ async fn release_at(fixture: &Fixture, generation: u64, slot: bool, route_revisi
     maps.push(ca_map());
     {
         let mut targets = fixture.gateway.targets.write().await;
-        targets.replace("endpointslices", &[slice], None).unwrap();
-        targets.replace("pods", &[pod], None).unwrap();
-        targets.replace("configmaps", &maps, None).unwrap();
+        targets.replace("endpointslices", &[slice]).unwrap();
+        targets.replace("pods", &[pod]).unwrap();
+        targets.replace("configmaps", &maps).unwrap();
     }
     fixture
         .gateway

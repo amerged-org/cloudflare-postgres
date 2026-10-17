@@ -48,6 +48,8 @@ pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
 pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
 /// How long a held wake connection waits for its release, counted from its upgrade.
 pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
+/// The time one write of frontend bytes to PostgreSQL may take.
+const WRITE_BOUND: Duration = Duration::from_secs(10);
 pub struct Config {
     pub region: String,
     pub keyring: Keyring,
@@ -443,12 +445,7 @@ pub async fn serve_socket(
     }
     let revision_current = route_revision_current(&state, &claims);
     drop(state);
-    let target = match gateway
-        .targets
-        .read()
-        .await
-        .target(&claims.db, control::now())
-    {
+    let target = match gateway.targets.read().await.target(&claims.db) {
         Ok(target) => target,
         Err(reason) => {
             stages.outcome = "target_unavailable";
@@ -607,11 +604,7 @@ async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
     }) else {
         return WakeState::Waiting;
     };
-    let writer = gateway
-        .targets
-        .read()
-        .await
-        .target(&ticket.db, control::now());
+    let writer = gateway.targets.read().await.target(&ticket.db);
     match writer {
         Ok(writer) if writer.pod_uid == target.pod_uid => WakeState::Released {
             pod: target.pod_uid.clone(),
@@ -864,12 +857,7 @@ async fn serve_held(
     let epoch = state.bound_epoch(&database);
     let revision_current = state.admits(&database) && route_revision_current(&state, &claims);
     drop(state);
-    let target = match gateway
-        .targets
-        .read()
-        .await
-        .target(&database, control::now())
-    {
+    let target = match gateway.targets.read().await.target(&database) {
         Ok(target) => target,
         Err(reason) => {
             stages.outcome = "target_unavailable";
@@ -972,24 +960,16 @@ async fn run_session(
         activity.observe_frontend(&rest);
         update(gateway, id, &activity, true, false);
         let state = gateway.fences.read().await;
-        if state.bound_epoch(&claims.db) != epoch
-            || !state.admits(&claims.db)
-            || !target_revision_matches(&state, &claims.db, target)
-        {
+        if state.bound_epoch(&claims.db) != epoch || !state.admits(&claims.db) {
             stages.outcome = "fenced";
             return Err("startup fenced before first upstream write".into());
         }
         let physical = gateway.targets.read().await;
-        if !physical.permits(&claims.db, target, control::now()) {
+        if !physical.permits(&claims.db, target) {
             stages.outcome = "target_changed";
-            return Err("storage or target changed before first upstream write".into());
+            return Err("writer changed before first upstream write".into());
         }
-        let budget = physical.write_budget(&claims.db, control::now());
-        if budget.is_zero() {
-            stages.outcome = "write_authority_expired";
-            return Err("physical write authority expired before startup enqueue".into());
-        }
-        let written = timeout(budget, write_upstream(&mut postgres, &initial)).await;
+        let written = timeout(WRITE_BOUND, write_upstream(&mut postgres, &initial)).await;
         if !matches!(written, Ok(Ok(()))) {
             stages.outcome = "postgres_error";
         }
@@ -1071,7 +1051,7 @@ async fn write_upstream(postgres: &mut TlsStream<TcpStream>, bytes: &[u8]) -> st
 }
 /// Ends a failed PostgreSQL session with close_notify and FIN within 500 ms, so PostgreSQL
 /// sees a clean end of stream instead of an unexpected EOF. A stream with queued TLS records is
-/// only dropped: its close_notify would first deliver bytes whose write authority may have ended.
+/// only dropped: its close_notify would first deliver bytes to a writer that may have changed.
 async fn close_upstream(postgres: &mut TlsStream<TcpStream>) {
     if !postgres.get_ref().1.wants_write() {
         let _ = timeout(Duration::from_millis(500), postgres.shutdown()).await;
@@ -1194,10 +1174,7 @@ async fn dial_started(
     let bound = &session.target;
     let database = &claims.db;
     let state = gateway.fences.read().await;
-    if state.bound_epoch(database) != epoch
-        || !state.admits(database)
-        || !target_revision_matches(&state, database, bound)
-    {
+    if state.bound_epoch(database) != epoch || !state.admits(database) {
         stages.outcome = "fenced";
         return Err("fence changed during startup".into());
     }
@@ -1214,12 +1191,7 @@ async fn dial_started(
     };
     drop(state);
     // The route was checked against this writer; a replacement is never dialled.
-    if !gateway
-        .targets
-        .read()
-        .await
-        .permits(database, bound, control::now())
-    {
+    if !gateway.targets.read().await.permits(database, bound) {
         stages.outcome = "target_changed";
         return Err("writer changed before dial".into());
     }
@@ -1243,10 +1215,7 @@ async fn dial_started(
     stages.dial = Some(took);
     let mut postgres = dialed.inspect_err(|_| stages.outcome = "postgres_connect_error")?;
     let state = gateway.fences.read().await;
-    if state.bound_epoch(database) != epoch
-        || !state.admits(database)
-        || !target_revision_matches(&state, database, bound)
-    {
+    if state.bound_epoch(database) != epoch || !state.admits(database) {
         drop(state);
         stages.outcome = "fenced";
         close_upstream(&mut postgres).await;
@@ -1333,12 +1302,7 @@ async fn early_dial(
         None
     };
     // The route was checked against this writer; a replacement is never dialled.
-    if !gateway
-        .targets
-        .read()
-        .await
-        .permits(&claims.db, bound, control::now())
-    {
+    if !gateway.targets.read().await.permits(&claims.db, bound) {
         return None;
     }
     let target = database_target(&claims.db, bound, admitted);
@@ -1388,19 +1352,9 @@ async fn relay(
     let database = id.split_once('/').expect("bound session identity").0;
     update(gateway, id, activity, false, false);
     loop {
-        if !gateway
-            .targets
-            .read()
-            .await
-            .permits(database, target, control::now())
-        {
+        if !gateway.targets.read().await.permits(database, target) {
             stages.outcome = "target_changed";
-            close(
-                websocket,
-                CloseCode::Restart,
-                "physical write authority or writer changed",
-            )
-            .await;
+            close(websocket, CloseCode::Restart, "writer changed").await;
             break;
         }
         let requested = *actions.borrow_and_update();
@@ -1519,28 +1473,14 @@ fn admitted_runtime_current(
             })
 }
 
-/// A v3 route names the verified primary Pod; the cached writer and any storage binding must
-/// be that Pod at that revision. The dial still uses the writer's address and service TLS name.
+/// A v3 route names the verified primary Pod; the cached writer must be that Pod. The dial still
+/// uses the writer's address and service TLS name.
 fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {
     match (claims.rev, claims.pod.as_deref()) {
-        (Some(revision), Some(pod)) => {
-            target.pod_uid == pod
-                && target
-                    .storage
-                    .as_ref()
-                    .is_none_or(|binding| binding.pod_uid == pod && binding.generation == revision)
-        }
+        (Some(_), Some(pod)) => target.pod_uid == pod,
         (None, None) => true,
         _ => false,
     }
-}
-fn target_revision_matches(state: &FenceState, database: &str, target: &TargetIdentity) -> bool {
-    target.storage.as_ref().is_none_or(|binding| {
-        state
-            .records
-            .get(database)
-            .is_some_and(|fence| fence.intent.revision == binding.generation)
-    })
 }
 async fn current_mode(gateway: &Gateway, database: &str, requested: Action) -> Action {
     let state = gateway.fences.read().await;
@@ -1571,9 +1511,9 @@ async fn forward_if_running(
     // Match startup/health ordering while retaining both guards through the bounded write.
     let state = gateway.fences.read().await;
     let physical = gateway.targets.read().await;
-    if !physical.permits(database, target, control::now()) {
+    if !physical.permits(database, target) {
         stages.outcome = "target_changed";
-        return Err("physical write authority or writer changed".into());
+        return Err("writer changed".into());
     }
     if !state.synchronized() {
         stages.outcome = "fenced";
@@ -1586,26 +1526,9 @@ async fn forward_if_running(
     {
         return Ok(false);
     }
-    if physical
-        .storage_generation(database)
-        .is_some_and(|generation| {
-            state
-                .records
-                .get(database)
-                .is_none_or(|fence| fence.intent.revision != generation)
-        })
-    {
-        stages.outcome = "target_changed";
-        return Err("storage generation changed".into());
-    }
     // The bounded enqueue and fence publication share this read/write boundary.
     // Bytes already being written stay busy; new bytes cannot cross a published fence.
-    let budget = physical.write_budget(database, control::now());
-    if budget.is_zero() {
-        stages.outcome = "write_authority_expired";
-        return Err("physical write authority expired before frontend enqueue".into());
-    }
-    let written = timeout(budget, write_upstream(postgres, bytes)).await;
+    let written = timeout(WRITE_BOUND, write_upstream(postgres, bytes)).await;
     if !matches!(written, Ok(Ok(()))) {
         stages.outcome = "postgres_error";
     }
@@ -1707,7 +1630,6 @@ mod admission_revision_tests {
             address: "10.0.0.7".parse().unwrap(),
             pod_uid: pod.into(),
             node: "customer-us1".into(),
-            storage: None,
             container_id: None,
             ca: None,
             unready: false,
