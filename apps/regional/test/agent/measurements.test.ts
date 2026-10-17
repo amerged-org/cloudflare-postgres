@@ -7,10 +7,10 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { AgentApi } from "../../src/agent/api-client.ts";
 import {
   measurementBatches,
-  measurementDifferences,
   volumeUsedBytes,
 } from "../../src/agent/measurements.ts";
 import { newDatabaseId } from "@pgcf/contracts";
+import { measurementDifferences } from "@pgcf/contracts/measurements";
 import { test } from "node:test";
 import { RegionalMeasurements } from "../../src/agent/measurements.ts";
 import { Reconciler } from "../../src/agent/reconcile.ts";

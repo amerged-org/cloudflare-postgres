@@ -44,7 +44,6 @@ import {
   appliedGeneration,
   acceptedGeneration,
   ACCEPTED_GENERATION_ANNOTATION,
-  ARCHIVE_FAILURE_MS,
   ARCHIVE_OBSERVATION_ANNOTATION,
   ARCHIVE_UNKNOWN_ANNOTATION,
   archiveMetrics,
@@ -52,8 +51,11 @@ import {
   DATABASE_LABEL,
   GENERATION_ANNOTATION,
   quantity,
-  WAL_BACKLOG_LIMIT,
 } from "./observe.ts";
+import {
+  ARCHIVE_FAILURE_MS,
+  WAL_BACKLOG_LIMIT,
+} from "@pgcf/contracts/archive-health";
 import type { ArchiveProgress } from "./observe.ts";
 import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource, Log } from "./types.ts";

@@ -9,8 +9,6 @@ import type { Kubernetes, Resource } from "./types.ts";
 export const DATABASE_LABEL = "pgcf.io/database-id";
 export const GENERATION_ANNOTATION = "pgcf.io/generation";
 export const ACCEPTED_GENERATION_ANNOTATION = "pgcf.io/accepted-generation";
-export const ARCHIVE_FAILURE_MS = 10 * 60_000;
-export const WAL_BACKLOG_LIMIT = 32;
 export const ARCHIVE_OBSERVATION_ANNOTATION = "pgcf.io/archive-observation";
 export const ARCHIVE_UNKNOWN_ANNOTATION = "pgcf.io/archive-unknown-since";
 

@@ -10,8 +10,12 @@ import type { Duplex } from "node:stream";
 import type { TLSSocket } from "node:tls";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { isDatabaseId, isOperationId } from "@pgcf/contracts";
-import { PostgresActivity, WebSocketInputActivity } from "./activity.ts";
-import { GatewayMeasurements, type MeasurementSession } from "./telemetry.ts";
+import { PostgresActivity } from "../../../../packages/contracts/native/postgres-activity.ts";
+import { WebSocketInputActivity } from "./activity.ts";
+import {
+  GatewayMeasurements,
+  type MeasurementSession,
+} from "../../../../packages/contracts/native/gateway-measurements.ts";
 import {
   ReplayCache,
   ROUTE_TOKEN_HEADER,
@@ -28,20 +32,17 @@ import { databaseTarget, type PostgresDial } from "./postgres.ts";
 import {
   BudgetedWebSocketSocket,
   GatewayMemoryBudget,
-  DEFAULT_MEMORY_LIMIT_BYTES,
-  DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
   type MemoryLease,
 } from "./frame-budget.ts";
-
-export const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
-export const MAX_FRAME_BYTES = 64 * 1024;
-export const MAX_STARTUP_BUFFER_BYTES = 64 * 1024;
-export const DEFAULT_DATABASE_CONNECTION_LIMIT = 200;
-export const DEFAULT_TOTAL_CONNECTION_LIMIT = 2_000;
-export {
+import {
   DEFAULT_MEMORY_LIMIT_BYTES,
   DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
-} from "./frame-budget.ts";
+  MAX_PAYLOAD_BYTES,
+  MAX_FRAME_BYTES,
+  MAX_STARTUP_BUFFER_BYTES,
+  DEFAULT_DATABASE_CONNECTION_LIMIT,
+  DEFAULT_TOTAL_CONNECTION_LIMIT,
+} from "@pgcf/contracts/gateway-limits";
 
 export interface GatewayOptions {
   readonly region: string;

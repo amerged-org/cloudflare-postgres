@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import {
-  PostgresActivity,
-  WebSocketInputActivity,
-} from "../../src/gateway/activity.ts";
+import { PostgresActivity } from "../../../../packages/contracts/native/postgres-activity.ts";
+import { WebSocketInputActivity } from "../../src/gateway/activity.ts";
 
 function frame(type: string, body = Buffer.alloc(0)): Buffer {
   const out = Buffer.alloc(5 + body.length);

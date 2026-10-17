@@ -97,7 +97,7 @@ test("fifty small connections share real TLS relays without reserving maximum me
 
 test("a complete 32 MiB message and a longer stream retain exact bytes and release ingress reservations", async (t) => {
   const { createHash, randomBytes } = await import("node:crypto");
-  const { MAX_PAYLOAD_BYTES } = await import("../../src/gateway/server.ts");
+  const { MAX_PAYLOAD_BYTES } = await import("@pgcf/contracts/gateway-limits");
   const postgres = await postgresServer();
   const { gateway, port } = await gatewayFor(postgres.port);
   t.after(async () => {
@@ -150,7 +150,7 @@ test("an isolated real gateway bounds RSS under a multi-tenant fragmented attack
   const { WebSocket } = await import("ws");
   const { derived, region } = await import("./helpers.ts");
   const { DEFAULT_MEMORY_LIMIT_BYTES } =
-    await import("../../src/gateway/server.ts");
+    await import("@pgcf/contracts/gateway-limits");
   const postgres = await postgresServer();
   const worker = fork(new URL("./memory-probe.ts", import.meta.url), [], {
     stdio: ["ignore", "ignore", "pipe", "ipc"],

@@ -19,8 +19,8 @@ import {
   gatewayFenceName,
   signGatewayControl,
 } from "@pgcf/contracts/gateway-control";
-import { GatewayMeasurements } from "../../src/gateway/telemetry.ts";
-import { PostgresActivity } from "../../src/gateway/activity.ts";
+import { GatewayMeasurements } from "../../../../packages/contracts/native/gateway-measurements.ts";
+import { PostgresActivity } from "../../../../packages/contracts/native/postgres-activity.ts";
 import { createGatewayControl } from "../../src/gateway/control.ts";
 import { GatewayFenceStore } from "../../src/gateway/fences.ts";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";

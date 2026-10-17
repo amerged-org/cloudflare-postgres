@@ -6,7 +6,7 @@ import { readGatewayConfiguration } from "../../src/gateway/config.ts";
 import {
   DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
   DEFAULT_MEMORY_LIMIT_BYTES,
-} from "../../src/gateway/frame-budget.ts";
+} from "@pgcf/contracts/gateway-limits";
 import { derived, region } from "./helpers.ts";
 
 test("gateway memory limits have bounded defaults and explicit validated installation overrides", () => {

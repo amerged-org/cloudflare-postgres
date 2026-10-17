@@ -9,6 +9,7 @@
     "test": "node --test test/worker.node-test.ts"
   },
   "devDependencies": {
+    "pg": "8.23.1",
     "wrangler": "^4.142.0"
   }
 }

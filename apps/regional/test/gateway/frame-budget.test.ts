@@ -6,9 +6,11 @@ import { Duplex } from "node:stream";
 import { setImmediate as turn } from "node:timers/promises";
 import { newDatabaseId } from "@pgcf/contracts";
 import {
-  BudgetedWebSocketSocket,
   DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
   DEFAULT_MEMORY_LIMIT_BYTES,
+} from "@pgcf/contracts/gateway-limits";
+import {
+  BudgetedWebSocketSocket,
   GatewayMemoryBudget,
 } from "../../src/gateway/frame-budget.ts";
 

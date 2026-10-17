@@ -98,15 +98,13 @@ import { bytesToBase64url } from "../src/encoding.ts";
 import {
   DEFAULT_MEMORY_LIMIT_BYTES,
   DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
-} from "../../../apps/regional/src/gateway/frame-budget.ts";
-import {
   MAX_PAYLOAD_BYTES,
   MAX_FRAME_BYTES,
   MAX_STARTUP_BUFFER_BYTES,
   DEFAULT_DATABASE_CONNECTION_LIMIT,
   DEFAULT_TOTAL_CONNECTION_LIMIT,
-} from "../../../apps/regional/src/gateway/server.ts";
-import { MAX_ACTIVITY_RECORDS } from "../../../apps/regional/src/gateway/telemetry.ts";
+  MAX_ACTIVITY_RECORDS,
+} from "../src/gateway-limits.ts";
 import { activityVectors, telemetryVectors } from "./generate-activity.ts";
 
 function schema(source: z.ZodType) {

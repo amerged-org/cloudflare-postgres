@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { Buffer } from "node:buffer";
-import { PostgresActivity } from "../../../regional/src/gateway/activity.ts";
+import { PostgresActivity } from "../../../../packages/contracts/native/postgres-activity.ts";
 import { runInDurableObject } from "cloudflare:test";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import {

@@ -946,12 +946,7 @@ test(
             }
           });
           c.socket.addEventListener("close", () => stream.push(null));
-          const load = createRequire(import.meta.url),
-            { Client } = load(
-              load.resolve("pg", {
-                paths: [resolve(import.meta.dirname, "../../regional")],
-              }),
-            );
+          const { Client } = createRequire(import.meta.url)("pg");
           const client = new Client({
             user: "app",
             database,

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Behavioral fixtures are evaluated by the deployed TypeScript implementations.
-import { PostgresActivity } from "../../../apps/regional/src/gateway/activity.ts";
+// Behavioral fixtures are evaluated by the TypeScript reference implementations.
+import { PostgresActivity } from "./postgres-activity.ts";
 import {
   GatewayMeasurements,
   type MeasurementSession,
-} from "../../../apps/regional/src/gateway/telemetry.ts";
+} from "./gateway-measurements.ts";
 
 function frame(tag: string, body = Buffer.alloc(0)): Buffer {
   const bytes = Buffer.alloc(5 + body.length);

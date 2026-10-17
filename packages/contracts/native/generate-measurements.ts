@@ -4,14 +4,16 @@ import { format } from "prettier";
 import {
   MEASUREMENT_CHECKPOINT_KEY,
   MEASUREMENT_CURSOR_ANNOTATION,
+  measurementCheckpoint,
+} from "../../../apps/regional/src/agent/measurements.ts";
+import {
   MEASUREMENT_CHECKPOINT_BYTES,
   MEASUREMENT_MAX_OUTBOX,
   MEASUREMENT_COHORT,
   MEASUREMENT_BODY_BYTES,
   MEASUREMENT_INTERVAL_MS,
-  measurementCheckpoint,
   measurementDifferences,
-} from "../../../apps/regional/src/agent/measurements.ts";
+} from "../src/measurements.ts";
 import {
   GATEWAY_ACTIVITY_FRESH_MS,
   GATEWAY_ACTIVITY_FUTURE_MS,

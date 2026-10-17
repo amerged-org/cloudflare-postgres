@@ -9,10 +9,12 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import type { Client, ClientConfig } from "pg";
 import {
-  archiveProbeOptions,
-  probeArchive,
   ARCHIVE_QUERY,
   ARCHIVE_IDENTITY_QUERY,
+} from "@pgcf/contracts/archive-health";
+import {
+  archiveProbeOptions,
+  probeArchive,
 } from "../../src/agent/archive-probe.ts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {

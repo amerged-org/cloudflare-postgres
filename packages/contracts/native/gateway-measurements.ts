@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { randomUUID } from "node:crypto";
-import { DatabaseId } from "@pgcf/contracts";
+import { DatabaseId } from "../src/ids.ts";
+import { MAX_ACTIVITY_RECORDS } from "../src/gateway-limits.ts";
 
 const processEpoch = randomUUID(),
   startedAt = new Date(performance.timeOrigin).toISOString();
-export const MAX_ACTIVITY_RECORDS = 2000;
 interface RecordState {
   ingressBytes: number;
   egressBytes: number;

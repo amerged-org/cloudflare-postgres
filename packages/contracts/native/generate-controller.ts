@@ -48,13 +48,11 @@ import lock from "../../../infra/platform/versions.lock.json" with { type: "json
 import { openEbsDriverImage } from "../../../infra/platform/openebs-image.ts";
 import { physicalStorageMetrics } from "../../../apps/regional/src/agent/node-storage.ts";
 import {
+  ARCHIVE_FAILURE_MS,
   ARCHIVE_IDENTITY_QUERY,
   ARCHIVE_QUERY,
-} from "../../../apps/regional/src/agent/archive-probe.ts";
-import {
-  ARCHIVE_FAILURE_MS,
   WAL_BACKLOG_LIMIT,
-} from "../../../apps/regional/src/agent/observe.ts";
+} from "../src/archive-health.ts";
 import {
   buildDatabaseManifests,
   type BuildContext,

@@ -16,7 +16,7 @@ import {
 import {
   MAX_FRAME_BYTES,
   MAX_PAYLOAD_BYTES,
-} from "../../src/gateway/server.ts";
+} from "@pgcf/contracts/gateway-limits";
 import {
   database,
   gatewayFor,

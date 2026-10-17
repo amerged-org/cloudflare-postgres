@@ -21,12 +21,16 @@ import {
   type GatewayControlAction,
 } from "@pgcf/contracts/gateway-control";
 import {
+  SLEEP_REFUSALS,
+  WAKE_PHASES,
+  type SleepRefusal,
+  type WakePhase,
+} from "@pgcf/contracts/sleep";
+import {
   probeSleepSafety,
   resumeSleepSafety,
   type SleepProbeOptions,
   type SleepSafetyResult,
-  type SleepRefusal,
-  SLEEP_REFUSALS,
 } from "./sleep.ts";
 import { appliedGeneration, condition, DATABASE_LABEL } from "./observe.ts";
 import {
@@ -39,19 +43,6 @@ import {
   type Resource,
 } from "./types.ts";
 
-export const WAKE_PHASES = [
-  "wake_prepare",
-  "desired_apply",
-  "archive_metrics",
-  "ca_publication",
-  "desired_applied",
-  "role_runtime_auth",
-  "volume_identity",
-  "runtime_unchanged",
-  "fence_release",
-  "observation_post",
-] as const;
-export type WakePhase = (typeof WAKE_PHASES)[number];
 export type WakePhaseOutcome = "completed" | "pending" | "failed";
 export function beginWakePhase(
   log: Log | undefined,

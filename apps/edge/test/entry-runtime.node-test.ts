@@ -137,13 +137,8 @@ test("the actual pg default SCRAM client receives wrong-password failure from an
         /* Already closed. */
       }
     });
-    const load = createRequire(import.meta.url);
-    // Reuse the repository's declared regional pg dependency; this is a test client, not Edge code.
-    const { Client } = load(
-      load.resolve("pg", {
-        paths: [resolve(import.meta.dirname, "../../regional")],
-      }),
-    ) as {
+    // pg is a test client, not Edge code.
+    const { Client } = createRequire(import.meta.url)("pg") as {
       Client: new (options: object) => {
         connect(): Promise<void>;
         end(): Promise<void>;

@@ -2,11 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { format } from "prettier";
 import { ID_ALPHABET } from "../src/ids.ts";
-import {
-  SLEEP_SQL,
-  SLEEP_REFUSALS,
-} from "../../../apps/regional/src/agent/sleep.ts";
-import { WAKE_PHASES } from "../../../apps/regional/src/agent/power.ts";
+import { SLEEP_SQL, SLEEP_REFUSALS, WAKE_PHASES } from "../src/sleep.ts";
 import { GATEWAY_RETIRE_HOLD_MS } from "../src/gateway-control.ts";
 import {
   powerIntentVectors,

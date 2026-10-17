@@ -20,7 +20,7 @@ import {
 } from "./helpers.ts";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";
 import { createPostgresDial } from "../../src/gateway/postgres.ts";
-import { MAX_STARTUP_BUFFER_BYTES } from "../../src/gateway/server.ts";
+import { MAX_STARTUP_BUFFER_BYTES } from "@pgcf/contracts/gateway-limits";
 
 test("an authenticated WebSocket reserves capacity without dialing before startup", async (t) => {
   const postgres = await postgresServer();

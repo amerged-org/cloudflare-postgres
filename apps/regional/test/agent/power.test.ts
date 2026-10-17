@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { newOperationId, newRolePassword, presentRoles } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import { gatewayFenceName } from "@pgcf/contracts/gateway-control";
+import type { WakePhase } from "@pgcf/contracts/sleep";
 import type { AuthenticationProbe } from "../../src/agent/readiness.ts";
 import type { SleepProbeOptions } from "../../src/agent/sleep.ts";
 import { record } from "../../src/agent/types.ts";
@@ -13,7 +14,6 @@ import {
   PowerCoordinator,
   beginWakePhase,
   measureWakePhase,
-  type WakePhase,
 } from "../../src/agent/power.ts";
 import { Reconciler } from "../../src/agent/reconcile.ts";
 import {

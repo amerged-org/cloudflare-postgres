@@ -12,7 +12,7 @@ import {
   createPostgresDial,
   databaseTarget,
 } from "../../src/gateway/postgres.ts";
-import { MAX_PAYLOAD_BYTES } from "../../src/gateway/server.ts";
+import { MAX_PAYLOAD_BYTES } from "@pgcf/contracts/gateway-limits";
 import {
   client,
   database,

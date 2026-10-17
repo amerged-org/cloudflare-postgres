@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Duplex } from "node:stream";
-
-export const DEFAULT_MEMORY_LIMIT_BYTES = 192 * 1024 * 1024;
-export const DEFAULT_DATABASE_MEMORY_LIMIT_BYTES = 96 * 1024 * 1024;
+import { DEFAULT_MEMORY_LIMIT_BYTES } from "@pgcf/contracts/gateway-limits";
 
 const BUFFER_OVERHEAD_BYTES = 256;
 const MODERATE_MESSAGE_BYTES = 1024 * 1024;

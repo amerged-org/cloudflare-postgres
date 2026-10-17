@@ -8,7 +8,7 @@ import {
 import {
   DEFAULT_MEMORY_LIMIT_BYTES,
   DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
-} from "./frame-budget.ts";
+} from "@pgcf/contracts/gateway-limits";
 
 export interface GatewayConfiguration {
   readonly region: string;
