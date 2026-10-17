@@ -183,7 +183,7 @@ We build the agent ourselves from proven parts (section 6.1).
 - D10: security reboots;
 - D11: who may set per-database resources;
 - D12: the Rust/Wasm Edge target;
-- D13: sandbox depth against the node-path target.
+- D13: decided 2026-10-18 (keep the full sandbox; see 11.3).
 
 ---
 
@@ -1685,6 +1685,7 @@ From the canary on, the EU1 stack is production.
 | 2026-10-15 | Go-live approved; no backwards compatibility; PGCF generic; restore and PITR create a new database; PostgreSQL 18; 7-day retention for the first integrator's classes; Cloudflare account stays shared; alert sender later; EU1 loss and maintenance windows later |
 | 2026-10-16 | Binding product goal: cold under 1 s; only warm and cold |
 | 2026-10-17 | Decision A (remove the guard, simplify bloat). One release per batch; no "R1/R2" names. Per-database idle time 60–900 s. **Option C**, with no control server. Placement until 80 % of the 30-minute-average peak of active RAM or CPU; no count limit; storage, RAM and CPU per database through the admin API; thin-slice overbooking central. One image for every node, so patches and upgrades are identical everywhere; US1 (`pgcf-us1`) follows once EU1 works |
+| 2026-10-18 | D13 settled: the full systemd sandbox stays (own mount and network namespaces, `ProtectKernel*`); a few milliseconds above the node-path target of 150 ms are accepted without rework, and the target is measured in Stage 5, not a gate. Go: execute the plan, then the owner looks at everything again |
 
 ### 11.4 Design decisions taken in this plan
 
@@ -1726,7 +1727,6 @@ Each has a plan default. Work proceeds on the default unless the owner says othe
 | D10 | Standing pre-approval for kernel security reboots | Yes: within 7 days of a Debian kernel advisory, in an announced window, one node at a time |
 | D11 | Who may set per-database resources | Admin keys only (the owner's "admin API"); integrator keys choose a class |
 | D12 | The Rust/Wasm Edge (`apps/edge-rust`): AGENTS.md approves it as the Edge target; it was never deployed, and the old plan's language verdict found no wake gain (OP L488-495) | Keep the approved target; `apps/edge-rust` is not deleted in Stage 2 unless the owner decides otherwise |
-| D13 | Sandbox depth against the node-path target (p95 ≤ 150 ms, volume kept mounted). Without `ExecStartPre=` the target was met in the Stage 1 rerun and missed by 34 ms in the first session (11.1). What could be traded for start time, with the saving in the first session's interleaved set (start to READY, p50 / p95): (a) nothing, the full sandbox; (b) drop `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectKernelLogs` and `ProtectControlGroups`: 14 / 3 ms in the unit (118.2 / 181.2 ms against 132.4 / 184.0), about 41 ms at p50 in an exec-only unit; (c) drop (b) and also every mount, network, hostname and clock option (`PrivateNetwork`, `IPAddressDeny`, `ProtectSystem`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, the private `/dev/shm`, `ProtectProc`, `ProcSubset`, `ProtectHostname`, `ProtectClock`): 47 / 30 ms in total (85.3 / 153.6 ms left). (b) and (c) remove sandbox properties listed in Appendix C | (a), the full sandbox. The saving is small against the range of the Cloudflare connect, 182–670 ms in release 24; Stage 5 measures the whole request on the Contabo VPS, and the question returns to the owner only if the node path alone decides a miss |
 
 ---
 
