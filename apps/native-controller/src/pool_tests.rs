@@ -1577,6 +1577,61 @@ mod world {
         }
     }
 
+    /// The sleep deleted the slot namespace, and the controller restarts while it terminates: the
+    /// slot's Cluster is gone already, its Pod still ends PostgreSQL and holds the tenant volume
+    /// open. The sleep goes on there: hibernated only once the holder is released.
+    #[tokio::test]
+    async fn a_controller_restarted_while_the_slot_pod_terminates_without_its_cluster_releases_the_holder()
+     {
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        idle(&mut w);
+        w.gateway.agent.lock().unwrap().postmaster_lingers = u32::MAX;
+        // The holder release times out once: the namespace delete was sent.
+        w.gateway.agent.lock().unwrap().release_timeouts = 1;
+        let _ = turn(&mut w).await;
+        assert!(holder(&w).is_some());
+        w.server.put(json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":slot_ns(),"uid":uid(61),"deletionTimestamp":"2026-10-17T11:12:00Z","labels":{"pgcf.io/slot":SLOT_HEX,"pgcf.io/slot-node":NODE}}}));
+        w.server
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .remove(&crate::test_server::path(
+                "Cluster",
+                Some(&slot_ns()),
+                "database",
+            ));
+        w.server.edit("Pod", Some(&slot_ns()), "database-1", |pod| {
+            pod["metadata"]["deletionTimestamp"] = "2026-10-17T11:12:00Z".into();
+        });
+        restart(&mut w).await;
+        // While the Pod terminates the volume stays held, and the database stays the pool's.
+        let observed = turn(&mut w).await.unwrap();
+        assert!(
+            observed.is_none_or(|observed| observed["state"] != "hibernated"),
+            "hibernated while the slot holds the volume"
+        );
+        assert!(w.reconciler.pool.serves(&w.id));
+        assert!(holder(&w).is_some());
+        // Its termination ends.
+        for kind in [("Namespace", None), ("Pod", Some(slot_ns()))] {
+            let name = if kind.0 == "Pod" {
+                "database-1".to_string()
+            } else {
+                slot_ns()
+            };
+            w.server
+                .state
+                .lock()
+                .unwrap()
+                .objects
+                .remove(&crate::test_server::path(kind.0, kind.1.as_deref(), &name));
+        }
+        until_hibernated(&mut w, 20).await;
+        slept_and_hits_again(&mut w).await;
+    }
+
     #[tokio::test]
     async fn a_retirement_that_never_sees_postgres_shut_down_goes_on_after_the_stop_budget() {
         let mut w = World::pooled().await;

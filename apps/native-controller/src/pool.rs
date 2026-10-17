@@ -2511,21 +2511,69 @@ impl Pool {
                 self.k8s.read("Pod", Some(name), "database-1"),
                 self.k8s.read("Secret", Some(name), "database-ca"),
             )?;
+            // A slot that holds a database's volume without a claim: an attach the claim never
+            // followed (the slot still fenced), or a slot whose sleep or retirement deleted its
+            // namespace while its Pod still terminates (its Cluster gone already). It is retired,
+            // and that database is the pool's until its holder is released.
+            let unclaimed = |slot: Slot| -> Option<(String, Slot, Serving)> {
+                let pod = pod.as_ref()?;
+                let (id, volume) =
+                    slot_holder(text(&pod["metadata"], "uid")).and_then(|lv| volume_of_lv(lv))?;
+                let serving = Serving {
+                    slot: hex.into(),
+                    node: node.into(),
+                    generation: 0,
+                    operation: String::new(),
+                    ticket: None,
+                    pod: slot_pod(pod).unwrap_or_else(|| SlotPod {
+                        uid: text(&pod["metadata"], "uid").into(),
+                        ip: text(&pod["status"], "podIP").into(),
+                        postgres: String::new(),
+                        sidecar: String::new(),
+                    }),
+                    volume,
+                    structure: String::new(),
+                    configuration: String::new(),
+                    retire: Some(Retire {
+                        reason: "unclaimed",
+                        inspect: false,
+                    }),
+                };
+                Some((
+                    id,
+                    Slot {
+                        state: SlotState::Discarding,
+                        ..slot
+                    },
+                    serving,
+                ))
+            };
+            let mut retired = |(id, slot, serving): (String, Slot, Serving)| {
+                let mut state = self.state.lock().unwrap();
+                state.slots.insert(hex.into(), slot);
+                if !state.serving.contains_key(&id) {
+                    state.serving.insert(id.clone(), serving);
+                    retiring.push(id);
+                }
+            };
             let Some(cluster) = cluster else {
                 // A slot whose Cluster is gone serves nothing: it is deleted.
-                self.state.lock().unwrap().slots.insert(
-                    hex.into(),
-                    Slot {
-                        hex: hex.into(),
-                        node: node.into(),
-                        state: SlotState::Creating { since: now },
-                        image: String::new(),
-                        cpu_millicores: 0,
-                        memory_mib: 0,
-                        pod: None,
-                        created: now,
-                    },
-                );
+                let slot = Slot {
+                    hex: hex.into(),
+                    node: node.into(),
+                    state: SlotState::Creating { since: now },
+                    image: String::new(),
+                    cpu_millicores: 0,
+                    memory_mib: 0,
+                    pod: None,
+                    created: now,
+                };
+                match unclaimed(slot.clone()) {
+                    Some(held) => retired(held),
+                    None => {
+                        self.state.lock().unwrap().slots.insert(hex.into(), slot);
+                    }
+                }
                 continue;
             };
             let limits = &cluster["spec"]["resources"]["limits"];
@@ -2548,40 +2596,8 @@ impl Pool {
                 .as_str()
                 .and_then(|raw| serde_json::from_str::<Claim>(raw).ok());
             let Some(claim) = claim else {
-                // An attach the claim never followed: the slot holds a database's volume, still
-                // fenced. It is retired, and that database is the pool's until then.
-                let loaded = pod
-                    .as_ref()
-                    .and_then(|pod| slot_holder(text(&pod["metadata"], "uid")))
-                    .and_then(|lv_uuid| volume_of_lv(lv_uuid));
-                if let (Some(pod), Some((id, volume))) = (&pod, loaded) {
-                    slot.state = SlotState::Discarding;
-                    let serving = Serving {
-                        slot: hex.into(),
-                        node: node.into(),
-                        generation: 0,
-                        operation: String::new(),
-                        ticket: None,
-                        pod: current.clone().unwrap_or_else(|| SlotPod {
-                            uid: text(&pod["metadata"], "uid").into(),
-                            ip: text(&pod["status"], "podIP").into(),
-                            postgres: String::new(),
-                            sidecar: String::new(),
-                        }),
-                        volume,
-                        structure: String::new(),
-                        configuration: String::new(),
-                        retire: Some(Retire {
-                            reason: "unclaimed",
-                            inspect: false,
-                        }),
-                    };
-                    let mut state = self.state.lock().unwrap();
-                    state.slots.insert(hex.into(), slot);
-                    if !state.serving.contains_key(&id) {
-                        state.serving.insert(id.clone(), serving);
-                        retiring.push(id);
-                    }
+                if let Some(held) = unclaimed(slot.clone()) {
+                    retired(held);
                     continue;
                 }
                 if let Some(pod) = &pod
