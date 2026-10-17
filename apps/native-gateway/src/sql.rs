@@ -906,11 +906,9 @@ async fn open(
     let dialing = Instant::now();
     let dialed = timeout(
         transport::STARTUP_BOUND,
-        gateway
-            .dial
-            .dial(&transport::database_target(
-                database, target, admitted, watched,
-            )),
+        gateway.dial.dial(&transport::database_target(
+            database, target, admitted, watched,
+        )),
     )
     .await;
     stages.dial = Some(dialing.elapsed());
