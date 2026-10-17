@@ -39,7 +39,7 @@ states what runs where; it does not repeat measurements.
 | Database storage                                 | New databases use Thin LVM volumes on EU1; retained thick volumes keep their backend and data                                                          |
 | Thin storage safety                              | One writer per volume (the attach agent's holder file); no start or attach without thin pool room, automatic growth and an alert                       |
 | Host guard                                       | The `pgcf-sandbox-controller` host extension still runs on EU1 and is removed by a host release ([decision A](docs/architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)) |
-| Idle sleep                                       | CNPG hibernation; a cold database wakes into a free pool slot on its node; the parked sleep tier is being deleted                                      |
+| Idle sleep                                       | CNPG hibernation; a cold database wakes into a free pool slot on its node                                                                                |
 
 The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
 through the authenticated management API. Expansion requires ten fresh aligned consecutive

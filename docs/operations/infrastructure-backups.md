@@ -53,7 +53,7 @@ cron from that class's alarm. A Worker without the binding keeps running and log
 minute and `cron.watchdog_checked_at` must follow. The watchdog is armed by the first cron
 run after the deploy, so a cron that never runs again after it is not reported. Rolling the
 Worker back below this release first needs
-`DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','database_storage_protected','control_cron_stalled','control_cron_step_failing')`,
+`DELETE FROM infrastructure_alerts WHERE kind IN ('database_archive_failing','database_base_backup_stale','thin_storage_blocked','control_cron_stalled','control_cron_step_failing')`,
 because the earlier release's health route does not parse those kinds.
 
 Use the administrator API, replacing every placeholder with this installation's
@@ -209,10 +209,10 @@ completed runs. The other two failures did not meet a patch: 2026-10-11 ended wi
 
 While the provider's export job runs, the control database stops answering requests. Cloudflare
 documents the unavailability and states no duration. The exporter sends no D1 request of its own
-meanwhile. Thin write authority renews against D1 and ends at the Thin profile's 10 s guard, so an
-awake thin database under writes takes the protective stop when the window is longer: committed
-data stays, uncommitted work is dropped and PGCF resumes the database. A wake that arrives during
-the window needs D1 too. Thick and standard-runtime databases are unaffected.
+meanwhile. Since [decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17)
+no running database needs D1 to keep writing. A wake that arrives during the window needs D1. Until
+the host release of decision A, the EU1 host guard still stops thin databases when it gets no
+storage lease for 120 s; every stall measured below was shorter.
 
 Measured from the usage samples of the six runs that reached or passed the export. The regional
 agent posts one sample every 15 s per emitting database; a gap in `usage_samples.observed_at` of
@@ -238,18 +238,13 @@ Unknown:
 
 - Why two runs show no stall, and what the 20 to 126 s before the window are (initialization,
   image manifest reads and the provider's job start are the code's steps there; none is timed).
-- The effect on an awake thin database under writes, or on a wake, during the window: no such
-  database was awake in any nightly window. With stalls of this length in four of six runs, a
-  protective stop of every awake thin database on those nights is the expected result, not a
-  measured one.
+- The effect on a wake during the window: no wake arrived in any nightly window.
 - Whether a request during the window waits or is rejected: the code tolerates both.
 
 The raw samples this relies on are being reduced (pruned once their hourly rollup is final, none
 from idle databases), so read the derivation while they exist. Go-live step 9 is met when a night with an
-awake thin database under writes and one wake during the export shows no protective stop and no
-failed wake. The measured stalls say this needs a method or schedule change first: for example
-exporting only while no thin database is awake, or protecting the control database by another
-means than a locking export. That choice belongs to the owner.
+awake thin database under writes and one wake during the export shows no stopped database and no
+failed wake.
 
 ## Optional email or webhook delivery
 
@@ -311,8 +306,7 @@ same event ID while it stays active; a cleared episode sends nothing.
 | `infrastructure_backup_stale` | no complete daily backup for 36 h | fixed | Read the same route and the cron heartbeat; fix the cause before the next 00:00Z run |
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability, archive credentials and the backup plugin; WAL accumulates on the volume meanwhile |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
-| `thin_storage_blocked` | a node's Thin storage status is `blocked` | fixed | With a `thin_storage_*` code, repeat the node's storage-profile PUT with the current `expected_revision` after the lease expires; without one, free pool headroom |
-| `database_storage_protected` | a running database has been stopped by storage write protection for at least 5 minutes | fixed | PGCF resumes it once Thin write authority is current; look at `thin_storage_blocked` and the node's storage if it persists |
+| `thin_storage_blocked` | a node's Thin storage status is `blocked`, or its fresh physical sample shows the thin pool without room or unable to grow | fixed | With a `thin_storage_*` code, repeat the node's storage-profile PUT with the current `expected_revision` after the lease expires; with `thin_pool_no_room` or `thin_pool_growth_exhausted`, or none, grow the pool by hand (raise the profile's maximum or add a disk to the volume group) or free space |
 | `control_cron_stalled` | no run of the minute cron completed for 300 s | fixed | Check the Worker's cron trigger and logs; see the cron heartbeat below |
 | `control_cron_step_failing` | a cron step failed in each of its last 5 completed runs | fixed | Read the Worker logs for `cron_step_failed` with the step named in `cron.failing_steps` |
 
@@ -331,11 +325,16 @@ Rules of the database and Thin storage kinds:
   agent's backup report must be fresh (at most 180 s old) and `ok` with a completion time,
   or `failing`; a hibernated database and an unknown report are excluded.
 - **Thin storage.** `blocked` with a `thin_storage_*` `error_code` needs an operator
-  (identity or qualification refused); `blocked` with `error_code: null` means write
-  authority is withheld for pool headroom and returns by itself when headroom does. A
-  node that is selected or qualifying again keeps the episode until it is `ready`.
-- **Protective stop.** `storage_protected_at` is set for the current generation and at
-  least 5 minutes old. The episode ends when the named databases are no longer protected.
+  (identity or qualification refused); `blocked` with `error_code: null` means the pool is
+  below its data or metadata reserve at the last identity proof. From the node's fresh
+  physical sample (at most 120 s old), `thin_pool_no_room` means no database starts or
+  attaches on the node; `thin_pool_growth_exhausted` means the pool is below its growth
+  point with no growth left (its maximum reached or the volume group too full) or its
+  metadata, which does not grow, is under twice its reserve. While growth is possible the
+  capacity cron requests the pool growth turn itself. Running databases are never stopped
+  for storage; a pool that does fill fails the write and PostgreSQL stops without
+  acknowledging it. A node that is selected or qualifying again keeps the episode until it
+  is `ready`.
 - **Subjects.** An episode lists at most 64 databases (longest-standing first) or nodes,
   16 for Thin storage (by ID). A subject that fails and is not listed yet replaces the
   episode with a new event that lists the current subjects (this also holds for

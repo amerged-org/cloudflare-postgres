@@ -3086,9 +3086,9 @@ fn physical_authority<'a>(db: &Value, nodes: &'a Value, after: u64, now: u64) ->
     let (Some(observed), Some(expires)) = (parse("observed_at"), parse("expires_at")) else {
         return None;
     };
-    // LVs, volumes and receipts are the identity proof's read. A fast renewal moves only
-    // observed_at, so a read after the deletion is judged by the proof's own times, which an
-    // authority recorded before composition shares with its reading.
+    // LVs, volumes and receipts are the identity proof's read, so a read after the deletion is
+    // judged by the proof's own times, which an authority recorded before composition shares with
+    // its reading.
     let (read, valid) = match (
         value.get("inventory_observed_at"),
         value.get("inventory_expires_at"),

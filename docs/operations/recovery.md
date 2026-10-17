@@ -422,12 +422,12 @@ in-filesystem discard. The host release of decision A drops `noflush_quiescence`
 A new run needs a customer node without a thin selection. R2b selected EU1, so EU has no such node:
 the selection cannot be removed, the control node is excluded and AddNode selects thin storage on
 every new node. A later release that changes the Talos kernel, `openebs-lvm` or
-`pgcf-sandbox-controller` then cannot obtain a receipt, and its patch leaves EU1 waiting in the
-storage stage without thin write authority. Do not roll out such a release before the owner decides
+`pgcf-sandbox-controller` then cannot obtain a receipt, and its patch leaves EU1 waiting for the
+storage qualification with placement closed. Do not roll out such a release before the owner decides
 how to requalify. A run also needs the node's release to equal the
 region release, so a requalification first rolls out a receipt-less candidate release. Selected
-nodes have no thin write authority until the successor with the new receipt is rolled out; the
-decision must accept or avoid that outage. Options:
+nodes keep placement closed until the successor with the new receipt is rolled out; the decision
+must accept or avoid that. Options:
 - Qualify on the control node, which has placement disabled and no selection. This puts scratch
   writes on the relay host and needs free extents in its VG.
 - Allow a run on a selected node that holds no thin volumes, using a distinct scratch pool name.
@@ -435,8 +435,8 @@ decision must accept or avoid that outage. Options:
 
 ## Parked sleep tier
 
-The parked tier is deleted by the native release of decision A. Before that release, switch it off
-for the region (`parked_tier` `enabled:false` in `PUT /v1/regions/{id}/capacity-policy`) and wait
+The parked tier is deleted by the release of decision A (API and controller). Before that release,
+switch it off on the live system for the region (`parked_tier` `enabled:false` in `PUT /v1/regions/{id}/capacity-policy`) and wait
 until no database is parked: the controller demotes each parked database to full hibernation once
 the policy is off. A wake then takes a pool slot or the ordinary CNPG start.
 

@@ -502,7 +502,7 @@ it("alarms a blocked Thin node with its error code, keeps the episode while it r
   expect(await status(f, "thin_storage_blocked")).toMatchObject({
     active: false,
   });
-  // Only headroom blocks writes: no error code.
+  // Only the pool reserve is short: no error code.
   await set("blocked", null);
   await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
   expect(hook.events).toHaveLength(2);

@@ -478,7 +478,7 @@ mod tests {
         json!({"region":{"id":"eu-test","backup":{"bucket":"pgcf-backups","endpoint_url":"https://r2.example.test","region":"auto"},"storage_nodes":[authority]},"databases":[],"next":next})
     }
     #[tokio::test]
-    async fn a_renewal_between_desired_pages_keeps_the_newest_node_authority() {
+    async fn a_newer_node_authority_between_desired_pages_is_kept() {
         let (api, requests) = api_double(|path, _| {
             if path.contains("after=") {
                 (200, desired_page(8, Value::Null))
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(snapshot.region["storage_nodes"][0]["revision"], 8);
     }
     #[tokio::test]
-    async fn a_renewal_between_hinted_reads_never_regresses_the_node_authority() {
+    async fn a_newer_node_authority_between_hinted_reads_never_regresses() {
         let (api, requests) = api_double(|path, _| {
             let revision = if path.contains("after=a0000000000000000001") {
                 8

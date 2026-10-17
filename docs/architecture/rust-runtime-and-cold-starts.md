@@ -38,7 +38,8 @@ hibernates. The Edge Worker is the TypeScript `apps/edge`, and the bootstrap rel
 the TypeScript relay of `apps/regional`; their Rust replacements are built and not deployed. CNPG
 hibernation removes PostgreSQL Pods and retains the database's local LVM-backed PVC. Waking that
 database therefore recreates PostgreSQL runtime state; it does not start a new regional process.
-The parked tier keeps the Pod of an idle sleep instead.
+The [pool](cloudflare-convergence-and-serverless-plan.md#pool-design) instead attaches the
+volume to an already running, free PostgreSQL instance on the node.
 
 The ULTRA plan's Done table holds the measured wake and awake numbers. The cold series measured
 `Client.connect()` and validated the marker query afterwards, outside that timer, while an
@@ -115,16 +116,14 @@ present it as a hit of a pool.
 | `active` | PostgreSQL, its bound Pod and Barman run | Normal authenticated work |
 | Always warm | The same running runtime remains available during idle periods | Normal warm connection; no reclaim or automatic hard sleep |
 | `warm_idle` | The same PostgreSQL process and Pod run; selected cold memory pages may be reclaimed | Admission revokes further reclaim; the kernel brings back the pages actually needed |
-| Parked (public state `hibernated`, region policy `parked_tier`) | The database's instance Pod, volume, sidecar and Lease stay; CNPG's fence stops PostgreSQL and the Pod's requests are shrunk | Unfence and resize back; a database that is not eligible is demoted to `hibernated` and takes the ordinary wake |
-| `waking` | The parked Pod is being unfenced, or CNPG creates a new instance Pod | Wait for the matching verified database-ready observation |
+| `waking` | The volume is attached to a free pool instance, or CNPG creates a new instance Pod | Wait for the matching verified database-ready observation |
 | `hibernated` | No per-database compute runs; persistent volume/data remains | Ordinary CNPG wake: a new instance Pod starts on the retained volume |
 | Explicitly `suspended` | Integrator/owner admission block with real CNPG hibernation | Refuse connections until an explicit authorized resume |
 
 `warm_idle` is not a stopped database, a frozen process or zero resident memory. Kernel page-in on access is not restoration of a process snapshot. Host filesystem cache may survive real hibernation, but no cache-retention guarantee is made.
 
 `sleep_after_seconds: null` is always warm. A finite idle threshold puts the database to sleep as CNPG
-hibernation or, when the region policy `parked_tier` is enabled and the database is eligible, as a
-parked instance. Warm reclaim is a separate per-database policy (`PUT /v1/databases/{id}/warm-reclaim`)
+hibernation. Warm reclaim is a separate per-database policy (`PUT /v1/databases/{id}/warm-reclaim`)
 for an approved compatible resource class and a qualified node; a database with a qualified warm
 policy never takes the idle-sleep path. An optional later threshold may move a warm-idle database
 into real hibernation through the existing safe shutdown path.
@@ -234,7 +233,7 @@ Successful proxy-side authentication cannot bypass PostgreSQL's authentication o
 **Status.** The API policy is implemented; the node reclaimer binary was deleted (2026-10-15) and so
 was the host extension's publisher (source; the deployed extension keeps publishing until the next
 host release). No node is qualified and no database carries a policy. This mode is additional to
-the parked tier. It may optimize an already assigned idle runtime.
+the pool. It may optimize an already assigned idle runtime.
 
 Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/machinery/config/types/block/zswap_config.go).
 
@@ -303,8 +302,8 @@ The dependent runtime pieces below are delivered through R1/R2 of the [ULTRA pla
 4. **Rust/Wasm Edge and Actor snapshots:** the Actor's mutation barrier and versioned route snapshots
    are implemented in the API; the Rust/Wasm Edge preserves real VPC HTTP/unopened-WebSocket
    forwarding, is built and is not deployed.
-5. **Sub-second wake acceptance:** the go-live acceptance is the parked tier's wake through the normal
-   Cloudflare path (go-live path: sub-second wake).
+5. **Sub-second wake acceptance:** the go-live acceptance is a pool hit through the normal
+   Cloudflare path (go-live path: cold request under one second).
 6. **Optional later warm reclaim:** evaluate separately; it is not a customer-readiness gate.
 7. **Later independent work:** proxy SCRAM, process/VM snapshot research and optional native CLI stream handling.
 

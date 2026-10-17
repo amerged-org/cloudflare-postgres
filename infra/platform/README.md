@@ -14,7 +14,7 @@ The regional composition is [`regional-native`](regional-native): the native Rus
 [`regional-gateway-native`](regional-gateway-native), which swaps in the native gateway image.
 `regional-native` only adds read access to the RuntimeClass and admission policy that the
 controller waits for before it selects a region's compute pool, list/watch of the objects its
-runtime attestations follow, and the right to resize a parked instance Pod's requests in place.
+runtime attestations follow, and the right to resize a claimed pool slot Pod's requests in place.
 The existing fleet patch sets the exact selected image digests, cluster UID, PostgreSQL image and
 retained storage bindings. Future-node postjoin activation uses that same release path before
 admission; the original Factory bootstrap input remains unchanged. The controller has no HTTP
@@ -336,6 +336,6 @@ the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the 
   (read), and Nodes and Pods (read). The native overlay adds list and watch of Secrets,
   ConfigMaps, PersistentVolumes and Nodes (metadata-only watches for its runtime attestations),
   get of the RuntimeClass and admission policy it waits for, and `patch` of `pods/resize` for
-  the parked tier. It has no `pods/exec`, no RBAC or workload-controller rights. In `pgcf-system`
+  claimed pool slots. It has no `pods/exec`, no RBAC or workload-controller rights. In `pgcf-system`
   it manages ConfigMaps and reads the Secret `pgcf-backup-s3`; the gateway reads ConfigMaps
   there. Database namespaces are dynamic, so the Secret rules cannot be narrowed by name.

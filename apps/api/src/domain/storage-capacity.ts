@@ -16,8 +16,8 @@ const identifier = (value: string) => {
 };
 const field = (name: string) => `json_extract(t.profile_json,'$.${name}')`;
 /** When the identity proof behind an authority started its read, and until when it may be used.
- * Facts that need a read after an event use these; a fast renewal only moves observed_at. An
- * authority recorded before composition carries neither and was itself one complete read. */
+ * Facts that need a read after an event use these. An authority recorded before composition
+ * carries neither and was itself one complete read. */
 function inventoryObservedSql(authorityAlias = "t") {
   const authority = identifier(authorityAlias);
   return `COALESCE(json_extract(${authority}.authority_json,'$.inventory_observed_at'),json_extract(${authority}.authority_json,'$.observed_at'))`;

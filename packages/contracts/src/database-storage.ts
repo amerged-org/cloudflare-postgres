@@ -288,8 +288,8 @@ export const NodeThinStorageAuthority = z
     captured_at: z.iso.datetime(),
     expires_at: z.iso.datetime(),
     /** The identity proof behind a composed authority: its slow read's start (Cloudflare clock),
-     * its expiry and its own revision. Facts that need a read after an event use this time; a
-     * fast renewal only moves observed_at. Absent from an executor report and from an authority
+     * its expiry and its own revision. Facts that need a read after an event use this time.
+     * Absent from an executor report and from an authority
      * recorded before composition, whose observed_at and expires_at are those of its read. */
     inventory_observed_at: z.iso.datetime().optional(),
     inventory_expires_at: z.iso.datetime().optional(),
@@ -427,7 +427,7 @@ export function thinStorageAuthorityMatches(
 }
 
 /** A completed deletion may remove the last pool; never infer LV absence from an ordinary agent report.
- * Absence needs an identity read that started after the deletion; a fast renewal is no such read. */
+ * Absence needs an identity read that started after the deletion. */
 export function thinStorageVolumeReclaimed(
   storage: DesiredDatabaseStorage,
   authority: NodeThinStorageAuthority | null | undefined,

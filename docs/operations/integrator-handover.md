@@ -21,7 +21,7 @@ authority on what still blocks go-live; operator procedures are in the other run
 
 | Topic | State on 2026-10-15 |
 | --- | --- |
-| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met**: the parked sleep tier that targets it is implemented and its wake has not been measured (Go-live path: *Sub-second wake*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
+| First SQL after a wake from sleep | **8.1–9.4 s** through Cloudflare (Gate 0 rounds of 2026-10-12, standard runtime). The sub-second goal is **not met** yet: the [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design) of free PostgreSQL instances that targets it is live on EU1 since 2026-10-17, and its first live hit answered the first SaaS request after 1.09 s (Go-live path: *Cold request under one second*). See [3.4](#34-timeouts-and-retries-for-a-sleeping-database). |
 | Redundancy | One customer node (EU1), one PostgreSQL instance per database, no replica, no second node. Losing EU1 stops every database until it is restored from R2 onto new capacity ([7](#7-failure-and-recovery)). |
 | Capacity numbers | The density test that measures how many databases may be awake has not run (Go-live path: *Density on EU1*). The numbers in [4](#4-capacity-and-limits-you-must-enforce) are the arithmetic the admission code applies, not measured capacity. |
 | New databases | Thin storage is live on EU1 and new databases are placed on Thin volumes; open defects of Thin starts and idle sleeps are listed in the ULTRA plan (go-live path and after go-live). When no node qualifies, `POST /v1/databases` and restores are still accepted and the database waits unplaced ([2.1](#21-create)). |
@@ -412,8 +412,8 @@ awaiting its removal is not. A project can be deleted only after all its databas
 deleting. Retained archives are removed by a cron after expiry.
 
 A `409 conflict` from `DELETE` deletes nothing. Reason `mutation_in_progress` means another change
-to the same database holds it at that moment: a wake, an idle sleep or its compensation, a
-protective storage stop or its recovery, or a regional maintenance step. Retry with backoff and
+to the same database holds it at that moment: a wake, an idle sleep or its compensation, or a
+regional maintenance step. Retry with backoff and
 jitter (for example 1 s, 2 s, 4 s, up to about two minutes) under the same `Idempotency-Key`;
 `Retry-After` gives the first delay. Reason `generation_changed` means another request changed the
 database first (for example deleted it); the retry returns that deletion's operation.
@@ -587,12 +587,12 @@ Measured wake times through Cloudflare (standard runtime, CNPG hibernation):
 | Earlier 20-wake series (p50 / p95 / max) | 8.4 / 9.2 / 9.7 s |
 | Already awake database, first row | 0.47–0.96 s (0.54–0.61 s in the warm rounds) |
 
-**The sub-second goal is not met.** The path to it is the parked sleep tier: after an idle sleep
-the database's instance Pod stays and only PostgreSQL stops, so the next connection unfences the
-Pod instead of creating a new one (replaced by the [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design)). It is
-implemented and not measured (Go-live path: *Sub-second wake*); the design budgets 1.3 to 2.2 s
-for the first implementation and about 1.1 to 1.2 s with direct SQL readiness, so below 1 s needs
-further removals. A demoted (fully hibernated) database takes the 8.1–9.4 s wake. PGCF publishes the result only in the ULTRA plan's Done table, as the
+**The sub-second goal is not met yet.** The path to it is the [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design): a cold
+database's volume is attached to an already running, free PostgreSQL instance on its node, so the
+next connection does not wait for a new Pod. Its first live hit through Cloudflare (2026-10-17)
+answered the first SaaS request after 1.09 s; p95, misses and databases idle for an hour are not
+measured yet (Go-live path: *Cold request under one second*). A wake that finds no free instance
+takes the hibernated wake above. PGCF publishes the result only in the ULTRA plan's Done table, as the
 first row measured stage by stage from one start, with every run labelled hit or miss (demoted,
 hibernated); update this section from that row when *Sub-second wake* closes.
 
@@ -605,7 +605,7 @@ Recommended policy (derived from those numbers, not a PGCF guarantee):
 
 | Setting | Value | Reason |
 | --- | --- | --- |
-| Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus SCRAM and startup (0.1–0.4 s); a cold Thin wake takes 22 s, about 40 s when an identity turn is in flight, a parked wake 1.4–3 s |
+| Connect timeout | at least 65 s; 70 s used above | 60 s Edge deadline plus SCRAM and startup (0.1–0.4 s); a cold Thin wake without a free pool instance takes about 22 s, a pool hit about 1.1 s |
 | Statement timeout | separate from the connect timeout | a connect timeout does not bound a query |
 | Retry `57P03`, `08006`, `53300` | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | transient by definition |
 | Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never | configuration or credentials; fix, do not loop |
@@ -622,7 +622,6 @@ Actor's own deadline answers `57P03` and can win that race. To tell the causes a
 | `suspended`, `suspension_reason: manual` | manual suspension | `POST /resume` |
 | `running`, `pending` or `provisioning` | creation, restore, resize or resume in progress | poll the operation |
 | `running`, `node_id: null`, `Waiting for verified regional capacity` | no node fits yet | wait; set a deadline |
-| `running`, `provisioning`, `Storage write protection` | the host storage guard stopped the database protectively; PGCF resumes it when its checks pass | wait; escalate if it lasts |
 | `error` | the regional controller reports a failure | escalate |
 | `hibernated` (idle) and `57P03` at once | the wake could not start: no fresh memory sample, `MemoryPressure`, no CPU, RAM or storage headroom (the usual causes), a lost node, or an admission change in flight; no wake operation starts | back off and retry; shed load |
 
@@ -681,8 +680,7 @@ A database that is not confirmed hibernated is charged
 
 against `allocatable CPU - platform requests P - the charges of all awake databases`. A start is
 admitted only if its own charge still fits. A confirmed hibernated database
-carries no charge; a parked database (region policy `parked_tier`) holds the parked requests of
-its Pod instead.
+carries no charge.
 
 Starts also need a memory sample of the node that is at most 90 s old and shows no
 `MemoryPressure`, with available RAM of `memory_mib + 512 MiB` (sidecar limit) plus the prestarted
@@ -763,7 +761,7 @@ pgcf -G "$PGCF_API/v1/usage" \
 | --- | --- |
 | `provisioned_seconds`, `awake_seconds` | seconds between creation and deletion, and seconds between a ready or wake event and the next hibernation or suspension |
 | `memory_mib_seconds`, `cpu_millicore_seconds` | the class's memory and CPU **limits** times awake seconds; not measured consumption |
-| `reserved_cpu_millicore_seconds` | request plus sidecar (plus prestarted slot overhead) times awake seconds; zero while confirmed hibernated, and the parked Pod's requests while the database is parked (region policy `parked_tier`) |
+| `reserved_cpu_millicore_seconds` | request plus sidecar (plus prestarted slot overhead) times awake seconds; zero while confirmed hibernated |
 | `reserved_memory_mib_seconds` | class memory plus the 128 MiB sidecar request times **provisioned** seconds: sleeping time is included, because the hibernation snapshot does not reduce it |
 | `reserved_storage_byte_seconds` | quota times provisioned seconds; **null for Thin volumes** (their snapshot carries no physical allocation), with the gap named |
 | `storage_used_bytes_max`, `storage_allocated_bytes` | maximum of the agent's filesystem samples in the period (bytes used; PVC capacity) |
@@ -823,8 +821,7 @@ measurement is fresh and below the threshold.
 | `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 or etcd backup fails, or none completed for 36 h | fixed |
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed (from the release with migration `0052`) |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count | fixed (same release) |
-| `thin_storage_blocked` | a node's Thin storage is `blocked`, with its `thin_storage_*` `error_code` or none | fixed (same release) |
-| `database_storage_protected` | a running database has been stopped by storage write protection for 5 minutes | fixed (same release) |
+| `thin_storage_blocked` | a node's Thin storage is `blocked`, with its `thin_storage_*` `error_code` or none, or its thin pool has no room or cannot grow (`thin_pool_*`) | fixed (same release) |
 | `control_cron_stalled`, `control_cron_step_failing` | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs | fixed (same release) |
 
 Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
@@ -836,8 +833,8 @@ one episode per region and kind lists up to 64 databases. Each minute-cron step 
 failure boundary, so one failing step is logged and counted and alerting still runs; the cron's
 own heartbeat is judged by a Durable Object alarm that does not depend on the cron
 ([operator runbook](infrastructure-backups.md#minute-cron-heartbeat-and-watchdog)). Before that
-release there is no alert for one database's archive or base backup, a Thin `blocked` state or a
-protective stop, and an earlier failure in the minute cron silently skips alerting.
+release there is no alert for one database's archive or base backup or a Thin `blocked` state,
+and an earlier failure in the minute cron silently skips alerting.
 
 The control plane itself is protected by a daily encrypted D1 export and one etcd snapshot per
 region in R2, read back in full ([infrastructure backups](infrastructure-backups.md)); restoring
@@ -856,16 +853,15 @@ disk verdicts for every project at once.
 
 | Situation | Effect on your database | Data | You do |
 | --- | --- | --- | --- |
-| Idle sleep | PostgreSQL stops after quiesce and the Pod is removed, or kept parked when the region policy `parked_tier` is enabled; the next connection wakes it | WAL archived first, volume kept | reconnect |
+| Idle sleep | PostgreSQL stops after quiesce and the Pod is removed; the next connection wakes it, into a free pool instance on its node when one is free | WAL archived first, volume kept | reconnect |
 | Manual suspend | refused with `57P03` until resume | as above | `POST /resume` |
 | Planned maintenance: fleet patch or rollout | new placement is closed during it, so creates wait; the single customer node reboots and its databases "may experience visible maintenance downtime"; the control node is patched after the customer node. A release that changes kernel, Thin driver or host extension is announced as an outage of all Thin databases. From the canary on, reboots of EU1 or control need the owner's go and an announced window (the plan: a reboot of EU1 or control stops every awake database and there is no region-wide maintenance lock). The announcement channel is not defined in the repository | kept | plan around the window; ask the operator for it |
-| Node reboot (crash, or a patch) | every database Pod on the node stops; PostgreSQL crash-recovers from the local volume when the node and the regional controller are back; Thin databases additionally wait until write authority is re-established on the new boot (fresh boot confirmation and an identity proof); hibernated databases are not touched. No duration is measured for databases | kept (local volume) | retry with backoff; check `observed_state` |
-| Thin write authority lapses (protective stop) | the gateway closes sessions (close code 1012 `physical write authority or writer changed`), the Pod stops and the database shows `status_message: Storage write protection` with connections `57P03`; PGCF resumes it when authority is current again, and you will see a `database.resume` you did not start. Causes: the regional controller restarts or is rolled out, its sampling fails, a driver Pod is replaced, or Cloudflare (API or D1) cannot be reached for longer than the Thin profile's 10 s guard. Thick and standard-runtime databases are unaffected. This is the design of the thin authority renewal proposal; its acceptance on the go-live release is open | committed data kept; uncommitted work dropped and never replayed | reconnect; wait; escalate if it lasts |
-| Control node reboot or outage | EU1's Thin write authority is sampled through the Kubernetes API server on the control node, so awake Thin databases take the protective stop above until sampling returns. The plan requires this to be demonstrated and its measured impact stated; **not yet verified live** | as above | wait |
+| Node reboot (crash, or a patch) | every database Pod on the node stops; PostgreSQL crash-recovers from the local volume when the node and the regional controller are back; Thin databases additionally wait until the node reports a fresh storage sample with pool room on the new boot; hibernated databases are not touched. No duration is measured for databases | kept (local volume) | retry with backoff; check `observed_state` |
+| Control node reboot or outage | running databases keep running; Thin starts and wakes wait until EU1's storage sample, read through the Kubernetes API server on the control node, is fresh again. **Not yet verified live** | kept | wait |
 | Archiving failing (`health.archiving: failing`, for example an R2 problem) | connections keep working; WAL accumulates on the volume until archiving works again, and a full volume stops writes (standard PostgreSQL behaviour, not tested here) | recoverable window goes stale | escalate at once |
 | Volume full | PostgreSQL cannot write | kept | free space; for Thin, resize to a larger class ([2.5](#25-resize)) |
 | **EU1 lost** | **all databases are down.** Their local volumes are gone with the server | only what reached R2 | [7.4](#74-eu1-lost) |
-| Cloudflare unavailable | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake Thin databases stop protectively within one guard (see *Thin write authority lapses*) | kept | wait |
+| Cloudflare unavailable | no path to any database: all traffic enters through Cloudflare. While the Edge still routes but the API or D1 is unavailable, awake databases keep running and wakes fail; until the host release of [decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17), the EU1 host guard stops Thin databases when it gets no storage lease from Cloudflare for 120 s | kept | wait |
 
 ### 7.2 Recovery point
 
@@ -928,7 +924,7 @@ the operator supplies it at handover.** Send:
 
 ## 8. Not available yet
 
-- Sub-second first SQL after sleep (the parked sleep tier is implemented and not measured).
+- Sub-second first SQL after sleep, measured at p95 (the pool is live on EU1; its first hit took 1.09 s).
 - A second customer node, redundancy and a measured recovery time; node drain and moving
   databases with their IDs kept (a restore always creates a new ID).
 - Alert delivery to a recipient; alert history, acknowledgement and test send.
@@ -953,7 +949,7 @@ confirmation. The state column says what is measured and what is derived or open
 | --- | --- | --- |
 | RPO per class | [7.2](#72-recovery-point) | derived: `archive_timeout_seconds` plus upload time; one measured sample (66.7 s with a 60 s timeout); no per-class measurement |
 | PITR window per class | [2.7](#27-backups-restorable-window-and-restore), [7.2](#72-recovery-point) | derived from `backup_retention_days`; the window of each database is readable through `GET /v1/databases/{id}/backups`; no measured full-window restore |
-| Parked hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | **not measured**: the parked tier is implemented; the hibernated wake is 8.1–9.4 s |
+| Pool hit and miss latency | [3.4](#34-timeouts-and-retries-for-a-sleeping-database) | one live hit measured (1.09 s to the first answer, 2026-10-17); p95 and misses not measured; the hibernated wake is 8.1–9.4 s |
 | `57P03` meanings and retry rule | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [A.4](#a4-sqlstate-at-connect-time) | stated from the code and its tests; the recommended retry policy is not a PGCF guarantee |
 | Connection limits | [3.6](#36-connection-limits) | stated; the deployed per-role and per-network values are not recorded in the repository |
 | Role deletion: unroutable at once, removal confirmed by PostgreSQL, hibernated database applies it at its next wake | [2.3](#23-roles-connection-uri-and-passwords) | stated from the code and its tests; **not yet run against the live cluster** (live acceptance pending) |
@@ -987,7 +983,7 @@ different resource first.
 
 | `details.reason` | Kind | Cause | `Retry-After` |
 | --- | --- | --- | --- |
-| `mutation_in_progress` | retryable | another change to the same database holds it for the moment (a wake, an idle sleep or its compensation, a protective stop, a maintenance step) | 1 s |
+| `mutation_in_progress` | retryable | another change to the same database holds it for the moment (a wake, an idle sleep or its compensation, a maintenance step) | 1 s |
 | `generation_changed` | retryable | the database, or what a create or restore was based on, changed between the read and the write ("Database changed; retry the request") | 1 s |
 | `not_ready` | retryable | the database has not applied its latest generation or is not running yet ("Database configuration is not ready") | 5 s |
 | `node_capacity` | retryable | the node lacks memory, CPU or storage for a resize, or for a resume ([2.4](#24-suspend-and-resume)) | 30 s |
@@ -1037,8 +1033,8 @@ there is.
 ### A.5 Closing an established connection
 
 WebSocket close code 1000 `database sleeping` (idle hibernation); 1012 with `authentication
-interrupted`, `physical write authority or writer changed`, `database retired` or `gateway
-restarting` (a restart or a protective stop); 1013 `relay buffer or connection failed`; 1003
+interrupted`, `writer changed`, `database retired` or `gateway
+restarting` (a restart); 1013 `relay buffer or connection failed`; 1003
 `binary frames required`. All are disconnects: reconnect; statements in flight have an unknown
 outcome and are not replayed.
 

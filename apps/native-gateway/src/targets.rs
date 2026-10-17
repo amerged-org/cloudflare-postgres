@@ -982,7 +982,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect()
     }
-    /// A database without thin storage whose parked Pod `wake_id(3)` was resumed: the fence runs at
+    /// A database without thin storage whose Pod `wake_id(3)` was resumed in place: the fence runs at
     /// revision 7 and carries the controller's target for that Pod's `postgres` container, and
     /// the kubelet has reported neither the endpoint nor the container Ready.
     struct Wake {

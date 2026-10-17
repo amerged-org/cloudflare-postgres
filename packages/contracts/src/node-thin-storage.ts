@@ -81,8 +81,7 @@ export const NodeThinStorageLease = z.strictObject({
   assignment_revision: z.number().int().positive(),
   region_revision: z.number().int().positive(),
   revision: z.number().int().positive(),
-  /** Revision of the current identity proof; the report's authority claims the next one. Fast
-   * renewals advance the composed authority's revision, never this one. */
+  /** Revision of the current identity proof; the report's authority claims the next one. */
   authority_revision: z.number().int().nonnegative(),
   node_id: NodeId,
   region_id: RegionId,

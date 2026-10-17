@@ -1224,7 +1224,7 @@ fn ca_map() -> Value {
 fn running_pod(ready: bool) -> Value {
     json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{DATABASE}"),"uid":cid(200),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":ready,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}})
 }
-/// The cluster right after a parked database's fast wake: the kubelet has reported neither the
+/// The cluster right after a fast wake in place: the kubelet has reported neither the
 /// endpoint nor the container Ready. `attested` says whether the writer cache sees the target.
 async fn unready_wake(fixture: &Fixture, attested: bool) {
     let mut writer = writer(&cid(200));

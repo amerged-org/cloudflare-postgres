@@ -23,8 +23,8 @@
     resources: [secrets, configmaps, persistentvolumes, nodes]
     verbs: [list, watch]
 
-# The parked sleep tier shrinks the requests of a parked instance Pod and restores them at the
-# wake, in place, through the Pod's resize subresource (requests only, under the Pod's UID).
+# A pool hit gives the claimed slot Pod's postgres container the class's requests in place,
+# through the Pod's resize subresource (requests only, under the Pod's UID).
 # Database namespaces are dynamic and RBAC cannot scope by label, so the right is cluster-wide,
 # like the Pod delete of the base role.
 - op: add
@@ -34,8 +34,8 @@
     resources: [pods/resize]
     verbs: [patch]
 
-# The wake of a parked database proves the objects of its Pod unchanged by metadata-only watches
-# of them, as it does the runtime objects above, instead of reading each of them again. The base
+# Runtime attestations prove the objects of a database Pod unchanged by metadata-only watches of
+# them, as for the runtime objects above, instead of reading each of them again. The base
 # role lists and reads these kinds already.
 - op: add
   path: /rules/-

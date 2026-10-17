@@ -287,7 +287,6 @@ represents an absent limit.
 | `node_cpu_warning_threshold_ppm` | Optional warning when any node's ten-minute average CPU usage reaches it against node CPU capacity; null disables it. Needs a reporter that sends the CPU sample fields: the native controller shipped with R2. Otherwise CPU stays unknown. |
 | `node_storage_warning_threshold_ppm` | Optional warning when any node's fresh LVM sample reaches it: thin-pool data or metadata fill, otherwise volume-group allocation; null disables it. |
 | `cap_warning_enabled` | Opt-in notice for an operator-selected finite cap; false by default. |
-| `parked_tier` | Optional parked sleep tier, deleted by [decision A](../architecture/cloudflare-convergence-and-serverless-plan.md#thin-storage-simplification-decision-a-2026-10-17) (switch it off first): `enabled`, `ttl_seconds` (how long a database stays parked), `max_per_node` (the oldest demote to full hibernation first) and the parked requests. Omitted keeps it, `null` removes it, `enabled:false` demotes every parked database. |
 
 The configured RAM threshold applies to automatic new paid orders in both placement modes.
 Retain ten fresh aligned consecutive minutes for every eligible customer node, each with stable
@@ -363,8 +362,7 @@ remove PostgreSQL/Barman startup checks. Memory remains the PostgreSQL container
 backup/system overhead reported separately.
 
 A confirmed sleeping database accepts future compute configuration while remaining suspended.
-Its unchanged no-Pod fact retains zero active CPU charge (a parked database keeps its instance
-Pod and holds the parked charge instead). `deferred_until_wake` explicitly means
+Its unchanged no-Pod fact retains zero active CPU charge. `deferred_until_wake` explicitly means
 that no running PostgreSQL has yet proved the new settings. The next wake reacquires fresh hard
 CPU/RAM startup admission and must report current configuration readiness before `applied:true`.
 An uncertain stop or degraded observation is pending. A newer resource revision supersedes an
@@ -583,7 +581,8 @@ Earlier loss, deletion and decommissioning kits are withheld; any later loss dri
 separately reviewed scope that preserves or recovers the same customer EU1. Keep unchanged prior
 proofs and record new measured results in the ULTRA plan. The ordinary wake of a fully hibernated
 database is the fallback baseline. The ULTRA scope additionally requires a measured first SQL
-below one second for a woken parked database; its acceptance remains open in the go-live path.
+below one second for a cold database woken into a free pool instance; its acceptance remains open
+in the go-live path.
 Do not move production databases onto PGCF or call the product finished until the open ULTRA
 steps, including recovery, have passed.
 Record measured installation/rollout time and actual Contabo calls by lifecycle phase, including
@@ -627,9 +626,10 @@ never expose a VPS database port.
 A hibernated database wakes in 8.1–9.4 s through Cloudflare (the ULTRA plan's wake-path
 measurement, standard runtime). A client connect timeout shorter than the wake can fail before the
 database is awake. Query and statement timeouts are separate from the end-to-end request deadline;
-budget wake plus work explicitly. The parked sleep tier (region policy `parked_tier`) is the path to
-a first SQL below one second and must pass its own acceptance (go-live path: sub-second wake) before
-customer readiness; a database demoted to full hibernation always takes the ordinary wake. Before
+budget wake plus work explicitly. The [pool](../architecture/cloudflare-convergence-and-serverless-plan.md#pool-design) is the
+path to a first SQL below one second and must pass its own acceptance (go-live path: cold request
+under one second) before customer readiness; a wake that finds no free pool instance takes the
+ordinary wake. Before
 cutover, verify one fallback policy: an approved always-warm size class
 (`sleep_after_seconds:null`); prewake with `POST /v1/databases/{id}/resume`, operation/readiness
 polling and `SELECT 1` immediately before traffic; or bounded connection/request deadlines

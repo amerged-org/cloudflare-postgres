@@ -43,7 +43,7 @@ export interface NodeThinStorageRow {
   status: "selected" | "qualifying" | "ready" | "blocked";
   error_code: string | null;
   created_at: string;
-  /** Also the current slow lease's issue; fast samples never write it. */
+  /** Also the current lease's issue. */
   updated_at: string;
 }
 
@@ -226,9 +226,8 @@ export function nodeReading(row: CurrentNodeThinStorageRow, now: number) {
             row.status === "ready" &&
             row.current_qualified === 1,
         };
-      // A slow identity read can outlive its short write lease. In particular, an absent
-      // pool cannot produce fast headroom renewals, but its fresh identity still proves
-      // deletion. Preserve its original expiry and explicitly deny all write authority.
+      // A slow identity read can outlive its short write lease; an absent pool's fresh identity
+      // still proves deletion. Preserve its original expiry and explicitly deny all write authority.
       const inventory = thinStorageInventory(value);
       if (
         row.error_code === null &&
