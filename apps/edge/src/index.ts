@@ -3,40 +3,19 @@
 import { isDatabaseId, isRoleName } from "@pgcf/contracts/ids";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import {
-  parseRouteKeyring,
-  signLegacyRouteToken,
-  signRouteToken,
-  signWakeRouteToken,
-} from "@pgcf/contracts/route-token";
-import type { DatabaseWakeAdmission, Env } from "./env.ts";
+  AdmissionFailure,
+  admitRoute,
+  bounded,
+  type AdmissionTimings,
+  type Hints,
+} from "./admission.ts";
+import type { Env } from "./env.ts";
 import { decoyResponse } from "./decoy.ts";
 import { connectGateway } from "./gateway.ts";
-import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
-
-interface Hints {
-  readonly database: string;
-  readonly user: string;
-}
 
 /** Milliseconds of each admission stage that ran, logged with the admission. */
-interface Timings {
-  /** Both limiters, which run in parallel with the Actor's admission. */
-  limiters_ms?: number;
-  admit_ms?: number;
-  /** The route token version signed: v5 for a wake ticket. */
-  route?: "v5" | "v4" | "v3" | "v2";
-  token_ms?: number;
+interface Timings extends AdmissionTimings {
   gateway_connect_ms?: number;
-}
-
-class AdmissionFailure extends Error {
-  readonly sqlstate: string;
-  readonly decoy: boolean;
-  constructor(sqlstate: string, message: string, decoy = false) {
-    super(message);
-    this.sqlstate = sqlstate;
-    this.decoy = decoy;
-  }
 }
 
 function routingHints(url: URL): Hints {
@@ -51,6 +30,7 @@ function routingHints(url: URL): Hints {
   return { database: databases[0], user: users[0] };
 }
 
+/** Admits the connection and opens its WebSocket to the region's gateway. */
 async function admit(
   request: Request,
   env: Env,
@@ -61,140 +41,18 @@ async function admit(
   ctx: ExecutionContext,
   timings: Timings,
 ): Promise<{ socket: WebSocket; region: string }> {
-  const check = () => {
-    if (signal.aborted)
-      throw new AdmissionFailure("08006", "connection admission interrupted");
-  };
-  check();
-  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
-  if (network === null)
-    throw new AdmissionFailure("53300", "connection rate limit exceeded");
-  // Shared proxy networks must not couple unrelated database/role routes.
-  // These untrusted hints scope admission; PostgreSQL authenticates the user.
-  const key = JSON.stringify([hints.database, hints.user, network]);
-  // A same-account Worker on a service binding has a budget of its own per database and role; it
-  // never drains, or is drained by, the public buckets.
-  const limits: [RateLimit, string, string][] =
-    network === "binding"
-      ? [
-          [
-            env.BINDING_CONNECTION_RATE_LIMITER,
-            key,
-            "connection rate limit exceeded",
-          ],
-        ]
-      : [
-          [env.CONNECTION_RATE_LIMITER, key, "connection rate limit exceeded"],
-          [
-            env.DATABASE_CONNECTION_RATE_LIMITER,
-            hints.database,
-            "database connection rate limit exceeded",
-          ],
-        ];
-  // The API creates each database's Actor at the same hint; an existing one never moves.
-  const hint = env.DATABASE_ACTOR_LOCATION_HINT;
-  const actor = env.DATABASE_ACTOR.get(
-    env.DATABASE_ACTOR.idFromName(hints.database),
-    hint ? { locationHint: hint as DurableObjectLocationHint } : undefined,
-  );
-  const cancel = () =>
-    ctx.waitUntil(
-      Promise.resolve()
-        .then(() => actor.cancelWakeWaiter(hints.database, cid))
-        .catch(() => false),
-    );
-  signal.addEventListener("abort", cancel, { once: true });
-  // The limiters and the Actor's admission run together: none of them waits for another. The
-  // per-database bucket therefore also counts connects that admission refuses.
-  const started = Date.now();
-  const limited = async (limiter: RateLimit, limitKey: string) =>
-    limiter.limit({ key: limitKey }).finally(() => {
-      timings.limiters_ms = Math.max(
-        timings.limiters_ms ?? 0,
-        Date.now() - started,
-      );
-    });
-  let admission: PromiseSettledResult<DatabaseWakeAdmission>;
-  let outcomes: PromiseSettledResult<RateLimitOutcome>[];
-  try {
-    check();
-    [admission, ...outcomes] = await Promise.allSettled([
-      actor
-        .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
-        .finally(() => {
-          timings.admit_ms = Date.now() - started;
-        }),
-      ...limits.map(([limiter, limitKey]) => limited(limiter, limitKey)),
-    ]);
-  } finally {
-    signal.removeEventListener("abort", cancel);
-  }
-  check();
-  if (outcomes.some((outcome) => outcome.status === "rejected"))
-    throw new AdmissionFailure("53300", "connection admission unavailable");
-  for (const [index, [, , message]] of limits.entries())
-    if (
-      !(outcomes[index] as PromiseFulfilledResult<RateLimitOutcome>).value
-        .success
-    )
-      throw new AdmissionFailure("53300", message);
-  if (admission.status === "rejected") throw admission.reason;
-  const admitted = admission.value;
-  if (!admitted.ok) {
-    switch (admitted.sqlstate) {
-      case "3D000":
-        throw new AdmissionFailure(
-          "28P01",
-          "password authentication failed",
-          true,
-        );
-      case "28P01":
-        throw new AdmissionFailure(
-          "28P01",
-          "password authentication failed",
-          true,
-        );
-      case "57P03":
-        throw new AdmissionFailure(
-          "57P03",
-          "database is not accepting connections",
-        );
-      case "53300":
-        throw new AdmissionFailure(
-          "53300",
-          "database connection rate limit exceeded",
-        );
-      default:
-        throw new AdmissionFailure("08006", "gateway connection failed");
-    }
-  }
-  const route = admitted.region;
-  const connection = {
-    keyring: parseRouteKeyring(env.ROUTE_MASTER_KEYS),
-    region: route.id,
-    db: hints.database,
-    user: hints.user,
+  const { region, token } = await admitRoute(
+    request,
+    env,
+    hints,
     cid,
-  };
-  // A wake ticket is signed as route v5: the gateway holds the connection until its wake is
-  // released. The gateway dials only an admitted verified target. Temporary rollout compatibility
-  // (route-token.ts): an admission without a verified target still receives a v2 route.
-  const tokenStarted = Date.now();
-  let token: string;
-  if ("wake" in admitted) {
-    timings.route = "v5";
-    token = await signWakeRouteToken({ ...connection, wake: admitted.wake });
-  } else if (admitted.target) {
-    timings.route = admitted.target.route_revision === undefined ? "v3" : "v4";
-    token = await signRouteToken({ ...connection, target: admitted.target });
-  } else {
-    timings.route = "v2";
-    token = await signLegacyRouteToken(connection);
-  }
-  timings.token_ms = Date.now() - tokenStarted;
-  check();
+    signal,
+    deadline,
+    ctx,
+    timings,
+  );
   const gatewayStarted = Date.now();
-  const socket = await connectGateway(route, token, env, signal);
+  const socket = await connectGateway(region, token, env, signal);
   timings.gateway_connect_ms = Date.now() - gatewayStarted;
   if (signal.aborted) {
     try {
@@ -203,49 +61,9 @@ async function admit(
     } catch {
       // An upgrade already torn down by the transport needs no further close.
     }
-    check();
+    throw new AdmissionFailure("08006", "connection admission interrupted");
   }
-  return { socket, region: route.id };
-}
-
-async function boundedAdmission(
-  request: Request,
-  env: Env,
-  hints: Hints,
-  cid: string,
-  ctx: ExecutionContext,
-  timings: Timings,
-): Promise<{ socket: WebSocket; region: string }> {
-  const deadline = Date.now() + ADMISSION_DEADLINE_MS;
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  request.signal.addEventListener("abort", abort, { once: true });
-  if (request.signal.aborted) abort();
-  let refuse!: () => void;
-  const interrupted = new Promise<never>((_resolve, reject) => {
-    refuse = () =>
-      reject(new AdmissionFailure("08006", "connection admission interrupted"));
-    if (controller.signal.aborted) refuse();
-    else controller.signal.addEventListener("abort", refuse, { once: true });
-  });
-  const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
-  const admission = Promise.race([
-    interrupted,
-    admit(request, env, hints, cid, controller.signal, deadline, ctx, timings),
-  ]);
-  ctx.waitUntil(
-    admission.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  try {
-    return await admission;
-  } finally {
-    clearTimeout(timer);
-    request.signal.removeEventListener("abort", abort);
-    controller.signal.removeEventListener("abort", refuse);
-  }
+  return { socket, region: region.id };
 }
 
 function refused(failure: AdmissionFailure): Response {
@@ -281,14 +99,9 @@ export default {
     let region: string | null = null;
     let outcome = "accepted";
     try {
-      hints = routingHints(url);
-      const upstream = await boundedAdmission(
-        request,
-        env,
-        hints,
-        cid,
-        ctx,
-        timings,
+      const routed = (hints = routingHints(url));
+      const upstream = await bounded(request, ctx, (signal, deadline) =>
+        admit(request, env, routed, cid, signal, deadline, ctx, timings),
       );
       region = upstream.region;
       // Attaching an unopened socket delegates the stream to the runtime.

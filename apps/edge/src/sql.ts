@@ -10,17 +10,16 @@
  * The password of the connection string goes to the gateway in the request body only; it is
  * never logged, and neither are statements or parameters.
  */
-import { isDatabaseId, isRoleName } from "@pgcf/contracts";
+import { isDatabaseId, isRoleName } from "@pgcf/contracts/ids";
+import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token";
 import {
-  ROUTE_TOKEN_HEADER,
-  parseRouteKeyring,
-  signLegacyRouteToken,
-  signRouteToken,
-  signWakeRouteToken,
-} from "@pgcf/contracts/route-token";
-import type { DatabaseWakeAdmission, Env } from "./env.ts";
+  AdmissionFailure,
+  admitRoute,
+  bounded,
+  type AdmissionTimings,
+} from "./admission.ts";
+import type { Env } from "./env.ts";
 import type { GatewayRegion } from "./gateway.ts";
-import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
 
 /** The largest body the gateway accepts (`MAX_REQUEST_BYTES` in the gateway's sql.rs). */
 export const MAX_SQL_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -66,11 +65,7 @@ interface Transaction {
   deferrable?: boolean;
 }
 /** Milliseconds of each stage that ran, logged with the request. */
-interface Timings {
-  limiters_ms?: number;
-  admit_ms?: number;
-  route?: "v5" | "v4" | "v3" | "v2";
-  token_ms?: number;
+interface Timings extends AdmissionTimings {
   gateway_ms?: number;
   gateway_status?: number;
 }
@@ -232,159 +227,6 @@ function base64url(text: string): string {
     .replace(/=+$/, "");
 }
 
-/**
- * The admission of `index.ts`, ending in a signed route instead of a WebSocket: both limiters
- * and the Actor's admission run together, and the Actor's refusals answer as they do there.
- */
-async function admitRoute(
-  request: Request,
-  env: Env,
-  target: Connection,
-  cid: string,
-  signal: AbortSignal,
-  ctx: ExecutionContext,
-  timings: Timings,
-): Promise<{ region: GatewayRegion; token: string }> {
-  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
-  if (network === null)
-    throw new SqlFailure("53300", "connection rate limit exceeded");
-  const actor = env.DATABASE_ACTOR.get(
-    env.DATABASE_ACTOR.idFromName(target.database),
-  );
-  const cancel = () =>
-    ctx.waitUntil(
-      Promise.resolve()
-        .then(() => actor.cancelWakeWaiter(target.database, cid))
-        .catch(() => false),
-    );
-  signal.addEventListener("abort", cancel, { once: true });
-  const started = Date.now();
-  const limited = async (limiter: RateLimit, key: string) =>
-    limiter.limit({ key }).finally(() => {
-      timings.limiters_ms = Math.max(
-        timings.limiters_ms ?? 0,
-        Date.now() - started,
-      );
-    });
-  let results: [
-    PromiseSettledResult<RateLimitOutcome>,
-    PromiseSettledResult<RateLimitOutcome>,
-    PromiseSettledResult<DatabaseWakeAdmission>,
-  ];
-  try {
-    results = await Promise.allSettled([
-      // HTTP requests count in buckets of their own, so queries never take WebSocket handshakes.
-      limited(
-        env.CONNECTION_RATE_LIMITER,
-        JSON.stringify(["sql", target.database, target.user, network]),
-      ),
-      limited(
-        env.DATABASE_CONNECTION_RATE_LIMITER,
-        JSON.stringify(["sql", target.database]),
-      ),
-      actor
-        .admitWake(target.database, target.user, {
-          deadline: Date.now() + ADMISSION_DEADLINE_MS,
-          waiterId: cid,
-        })
-        .finally(() => {
-          timings.admit_ms = Date.now() - started;
-        }),
-    ]);
-  } finally {
-    signal.removeEventListener("abort", cancel);
-  }
-  if (signal.aborted)
-    throw new SqlFailure("08006", "connection admission interrupted");
-  const [connectionLimit, databaseLimit, admission] = results;
-  if (
-    connectionLimit.status === "rejected" ||
-    databaseLimit.status === "rejected"
-  )
-    throw new SqlFailure("53300", "connection admission unavailable");
-  if (!connectionLimit.value.success)
-    throw new SqlFailure("53300", "connection rate limit exceeded");
-  if (!databaseLimit.value.success)
-    throw new SqlFailure("53300", "database connection rate limit exceeded");
-  if (admission.status === "rejected") throw admission.reason;
-  const admitted = admission.value;
-  if (!admitted.ok) {
-    switch (admitted.sqlstate) {
-      case "3D000":
-      case "28P01":
-        throw authenticationFailed();
-      case "57P03":
-        throw new SqlFailure("57P03", "database is not accepting connections");
-      case "53300":
-        throw new SqlFailure(
-          "53300",
-          "database connection rate limit exceeded",
-        );
-      default:
-        throw new SqlFailure("08006", "gateway connection failed");
-    }
-  }
-  const connection = {
-    keyring: parseRouteKeyring(env.ROUTE_MASTER_KEYS),
-    region: admitted.region.id,
-    db: target.database,
-    user: target.user,
-    cid,
-  };
-  const tokenStarted = Date.now();
-  let token: string;
-  if ("wake" in admitted) {
-    timings.route = "v5";
-    token = await signWakeRouteToken({ ...connection, wake: admitted.wake });
-  } else if (admitted.target) {
-    timings.route = admitted.target.route_revision === undefined ? "v3" : "v4";
-    token = await signRouteToken({ ...connection, target: admitted.target });
-  } else {
-    timings.route = "v2";
-    token = await signLegacyRouteToken(connection);
-  }
-  timings.token_ms = Date.now() - tokenStarted;
-  return { region: admitted.region, token };
-}
-
-/** The admission, bounded as a WebSocket connection's is: 60 s, and the client's abort. */
-async function boundedAdmission(
-  request: Request,
-  env: Env,
-  target: Connection,
-  cid: string,
-  ctx: ExecutionContext,
-  timings: Timings,
-): Promise<{ region: GatewayRegion; token: string }> {
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  request.signal.addEventListener("abort", abort, { once: true });
-  if (request.signal.aborted) abort();
-  const interrupted = new Promise<never>((_resolve, reject) => {
-    const refuse = () =>
-      reject(new SqlFailure("08006", "connection admission interrupted"));
-    if (controller.signal.aborted) refuse();
-    else controller.signal.addEventListener("abort", refuse, { once: true });
-  });
-  const timer = setTimeout(abort, ADMISSION_DEADLINE_MS);
-  const admission = Promise.race([
-    interrupted,
-    admitRoute(request, env, target, cid, controller.signal, ctx, timings),
-  ]);
-  ctx.waitUntil(
-    admission.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  try {
-    return await admission;
-  } finally {
-    clearTimeout(timer);
-    request.signal.removeEventListener("abort", abort);
-  }
-}
-
 /** Sends the request to the gateway once and passes its answer through. */
 async function forward(
   region: GatewayRegion,
@@ -485,25 +327,28 @@ export async function serveSql(
   try {
     if (request.method !== "POST")
       throw new SqlFailure("08P01", "HTTP SQL requires POST");
-    target = connection(request.headers);
+    const routed = (target = connection(request.headers));
     const characteristics = transaction(request.headers);
     const { queries, batch } = statements(await readBody(request));
     if (batch && queries.length === 0) return json({ results: [] }, 200);
     const body = JSON.stringify({
-      password: base64url(target.password),
+      password: base64url(routed.password),
       queries,
       ...(batch ? { transaction: characteristics } : {}),
     });
     if (new TextEncoder().encode(body).byteLength > MAX_SQL_REQUEST_BYTES)
       throw new SqlFailure("54000", "request is too large");
-    const admitted = await boundedAdmission(
-      request,
-      env,
-      target,
-      cid,
-      ctx,
-      timings,
-    );
+    // HTTP requests count in buckets of their own, so queries never take WebSocket handshakes.
+    const admitted = await bounded(request, ctx, (signal, deadline) =>
+      admitRoute(request, env, routed, cid, signal, deadline, ctx, timings, [
+        "sql",
+      ]),
+    ).catch((error: unknown) => {
+      if (!(error instanceof AdmissionFailure)) throw error;
+      throw error.decoy
+        ? authenticationFailed()
+        : new SqlFailure(error.sqlstate, error.message);
+    });
     region = admitted.region.id;
     return await forward(
       admitted.region,

@@ -366,6 +366,60 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     });
   });
 
+  it("a caller without CF-Connecting-IP takes the binding limiter's own HTTP bucket, never a public one", async () => {
+    const limiter = () =>
+      ({
+        limit: vi.fn(async () => ({ success: true })),
+      }) as unknown as RateLimit & { limit: ReturnType<typeof vi.fn> };
+    const binding = limiter(),
+      connection = limiter(),
+      perDatabase = limiter();
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request(`${origin}/sql`, {
+        method: "POST",
+        headers: neonHeaders(),
+        body: JSON.stringify({ query: "select 1" }),
+      }),
+      admitting(awake(), {
+        BINDING_CONNECTION_RATE_LIMITER: binding,
+        CONNECTION_RATE_LIMITER: connection,
+        DATABASE_CONNECTION_RATE_LIMITER: perDatabase,
+      }),
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+    expect(binding.limit).toHaveBeenCalledExactlyOnceWith({
+      key: JSON.stringify(["sql", database, "app", "binding"]),
+    });
+    expect(connection.limit).not.toHaveBeenCalled();
+    expect(perDatabase.limit).not.toHaveBeenCalled();
+  });
+
+  it("gets the DatabaseActor with the configured location hint, and none without one", async () => {
+    const options: unknown[] = [];
+    const hinted = (hint?: string): Env => {
+      const admitted = admitting(awake());
+      return {
+        ...admitted,
+        ...(hint ? { DATABASE_ACTOR_LOCATION_HINT: hint } : {}),
+        DATABASE_ACTOR: {
+          ...admitted.DATABASE_ACTOR,
+          get: (id: DurableObjectId, option?: unknown) => {
+            options.push(option);
+            return admitted.DATABASE_ACTOR.get(id);
+          },
+        },
+      };
+    };
+    expect((await post(hinted("weur"), { query: "select 1" })).status).toBe(
+      200,
+    );
+    expect((await post(hinted(), { query: "select 1" })).status).toBe(200);
+    expect(options).toEqual([{ locationHint: "weur" }, undefined]);
+  });
+
   it("passes gateway answers through and reports anything else as an unknown outcome", async () => {
     const error = await post(admitting(awake("sql-error")), {
       query: "select 1",

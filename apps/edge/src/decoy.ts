@@ -12,7 +12,7 @@ import {
   DECOY_AUTH_MAX_BYTES,
   DECOY_SCRAM_ITERATIONS,
   decoySalt,
-} from "@pgcf/contracts";
+} from "@pgcf/contracts/edge-policy";
 export {
   DECOY_DEADLINE_MS,
   DECOY_MAX_BYTES,
@@ -20,7 +20,7 @@ export {
   DECOY_AUTH_MAX_BYTES,
   DECOY_SCRAM_ITERATIONS,
   DECOY_SALT_DOMAIN,
-} from "@pgcf/contracts";
+} from "@pgcf/contracts/edge-policy";
 
 const AUTH_MAX_BYTES = DECOY_AUTH_MAX_BYTES;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
