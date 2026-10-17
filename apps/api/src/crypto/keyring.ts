@@ -140,11 +140,3 @@ export function encryptPassword(
 ): Promise<EncryptedPassword> {
   return keyring(secret).encrypt(databaseId, role, password);
 }
-export function decryptPassword(
-  secret: string,
-  databaseId: string,
-  role: string,
-  encrypted: EncryptedPassword,
-): Promise<string> {
-  return keyring(secret).decrypt(databaseId, role, encrypted);
-}
