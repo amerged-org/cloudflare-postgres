@@ -250,6 +250,8 @@ jobs:
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Check and test the image tooling and the installer
