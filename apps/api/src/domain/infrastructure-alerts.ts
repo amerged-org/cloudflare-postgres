@@ -697,8 +697,9 @@ async function readRegionSubjects(
       UNION ALL SELECT * FROM (SELECT 'thin_storage_blocked',
           CASE WHEN t.status='blocked' OR x.exhausted IS NOT NULL THEN 'failing' ELSE 'unresolved' END state,t.node_id,COALESCE(t.error_code,x.exhausted)
         FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id
-          LEFT JOIN (SELECT o.node_id,o.node_uid,${thinPoolExhaustionSql()} exhausted FROM node_storage_observations o JOIN node_thin_storage t ON t.node_id=o.node_id) x
-            ON x.node_id=t.node_id AND x.node_uid=t.node_uid,p
+          LEFT JOIN (SELECT t.node_id,${thinPoolExhaustionSql()} exhausted FROM node_thin_storage t
+            LEFT JOIN node_storage_observations o ON o.node_id=t.node_id AND o.node_uid=t.node_uid) x
+            ON x.node_id=t.node_id,p
         WHERE n.region_id=p.region AND n.lost_at IS NULL
           AND (t.status='blocked' OR x.exhausted IS NOT NULL
             OR (t.status<>'ready' AND t.node_id IN(SELECT json_extract(s.value,'$.node_id')

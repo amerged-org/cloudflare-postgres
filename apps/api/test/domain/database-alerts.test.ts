@@ -469,6 +469,56 @@ it("alarms a thin pool without room, or below its growth point with no growth le
   expect(failing()).toEqual(["thin_pool_growth_exhausted"]);
 });
 
+it("alarms a thin pool that holds volumes while its node reports no fresh sample of it", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    hook = receiver();
+  await thinNode(f, { status: "ready", code: null });
+  const failing = () =>
+    hook.events.at(-1)!.event.thin_storage?.map((entry) => entry.error_code);
+  const sample = (observedAt: string, physical: string | null) =>
+    env.DB.prepare(
+      "UPDATE node_storage_observations SET observed_at=?,physical_json=? WHERE node_id=?",
+    )
+      .bind(observedAt, physical, f.node)
+      .run();
+  await poolSample(f, {
+    dataTotal: 32 * gib,
+    dataFree: 8 * gib,
+    metadataFree: 512 * mib,
+  });
+  const good = (await env.DB.prepare(
+    "SELECT physical_json FROM node_storage_observations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first<string>("physical_json"))!;
+  // No sample for three minutes on a node without a thin volume: nothing to watch.
+  await sample(ago(now, 180_000), good);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(await status(f, "thin_storage_blocked")).toBeUndefined();
+  // A bound thin volume on it: the pool must be observed.
+  await database(f, "thin", {
+    node_id: f.node,
+    storage_profile_json: JSON.stringify({ backend: "lvm-thin-v1" }),
+    storage_volume_json: JSON.stringify({ lv_uuid: "VOLUMX" }),
+  });
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(hook.events).toHaveLength(1);
+  expect(failing()).toEqual(["thin_pool_unobserved"]);
+  // The node reports, but its exporter scrape failed.
+  await sample(new Date().toISOString(), null);
+  await runInfrastructureHealthAlerts(hook.env, now + 2000, hook.fetcher);
+  expect(await status(f, "thin_storage_blocked")).toMatchObject({
+    active: true,
+  });
+  expect(failing()).toEqual(["thin_pool_unobserved"]);
+  await sample(new Date().toISOString(), good);
+  await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
+  expect(await status(f, "thin_storage_blocked")).toMatchObject({
+    active: false,
+  });
+});
+
 it("alarms a blocked Thin node with its error code, keeps the episode while it requalifies and clears it once ready", async () => {
   const f = await fixture(),
     now = Date.now(),

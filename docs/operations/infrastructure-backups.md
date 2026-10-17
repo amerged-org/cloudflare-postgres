@@ -306,7 +306,7 @@ same event ID while it stays active; a cleared episode sends nothing.
 | `infrastructure_backup_stale` | no complete daily backup for 36 h | fixed | Read the same route and the cron heartbeat; fix the cause before the next 00:00Z run |
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability, archive credentials and the backup plugin; WAL accumulates on the volume meanwhile |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
-| `thin_storage_blocked` | a node's Thin storage status is `blocked`, or its fresh physical sample shows the thin pool without room or unable to grow | fixed | With a `thin_storage_*` code, repeat the node's storage-profile PUT with the current `expected_revision` after the lease expires; with `thin_pool_no_room` or `thin_pool_growth_exhausted`, or none, grow the pool by hand (raise the profile's maximum or add a disk to the volume group) or free space |
+| `thin_storage_blocked` | a node's Thin storage status is `blocked`, its fresh physical sample shows the thin pool without room or unable to grow, or a pool that holds thin volumes has no fresh sample | fixed | With a `thin_storage_*` code, repeat the node's storage-profile PUT with the current `expected_revision` after the lease expires; with `thin_pool_no_room` or `thin_pool_growth_exhausted`, or none, grow the pool by hand (raise the profile's maximum or add a disk to the volume group) or free space |
 | `control_cron_stalled` | no run of the minute cron completed for 300 s | fixed | Check the Worker's cron trigger and logs; see the cron heartbeat below |
 | `control_cron_step_failing` | a cron step failed in each of its last 5 completed runs | fixed | Read the Worker logs for `cron_step_failed` with the step named in `cron.failing_steps` |
 
@@ -330,7 +330,11 @@ Rules of the database and Thin storage kinds:
   physical sample (at most 120 s old), `thin_pool_no_room` means no database starts or
   attaches on the node; `thin_pool_growth_exhausted` means the pool is below its growth
   point with no growth left (its maximum reached or the volume group too full) or its
-  metadata, which does not grow, is under twice its reserve. While growth is possible the
+  metadata, which does not grow, is under twice its reserve. `thin_pool_unobserved` means a
+  node with a bound thin volume has no physical sample of its pool at most 120 s old (the
+  storage exporter scrape fails or the controller does not post), so neither the room rule,
+  the growth nor this alert sees the pool fill: check the controller's
+  `node_storage_sample_failed` events and the exporter. While growth is possible the
   capacity cron requests the pool growth turn itself. Running databases are never stopped
   for storage; a pool that does fill fails the write and PostgreSQL stops without
   acknowledging it. A node that is selected or qualifying again keeps the episode until it

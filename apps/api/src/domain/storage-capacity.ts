@@ -222,13 +222,18 @@ export function thinPoolGrowthNeededSql(): string {
 }
 
 /**
- * Why a node's fresh sample says its pool cannot take more, for the thin storage alert: no room
- * now, or below the growth point with no growth left (the maximum reached or the volume group too
- * full). Metadata does not grow past the profile's size and a full metadata device needs repair,
- * so its alert comes at twice its reserve. NULL while the pool is fine.
+ * Why the thin storage alert fires for a node's pool, over its thin storage `t` and its latest
+ * sample `o` (absent in an outer join): no fresh sample of a pool that holds thin volumes, since
+ * nothing then sees it fill or asks it to grow; no room now; or below the growth point with no
+ * growth left (the maximum reached or the volume group too full). Metadata does not grow past the
+ * profile's size and a full metadata device needs repair, so its alert comes at twice its reserve.
+ * NULL while the pool is fine.
  */
 export function thinPoolExhaustionSql(): string {
-  return `CASE WHEN json_type(o.physical_json,'$.thin_pool') IS NOT 'object' OR NOT(${freshSampleSql}) THEN NULL
+  return `CASE WHEN o.node_id IS NULL OR json_type(o.physical_json,'$.thin_pool') IS NOT 'object' OR NOT(${freshSampleSql}) THEN
+      CASE WHEN EXISTS(SELECT 1 FROM databases v WHERE v.node_id=t.node_id AND v.storage_profile_json IS NOT NULL
+        AND v.storage_volume_json IS NOT NULL AND NOT(v.desired_state='deleted' AND v.observed_state='deleted'))
+      THEN 'thin_pool_unobserved' ELSE NULL END
     WHEN ${sampledDataFree}<${field("data_reserve_bytes")} OR ${sampledMetadataFree}<${field("metadata_reserve_bytes")} THEN 'thin_pool_no_room'
     WHEN ${sampledMetadataFree}<2*${field("metadata_reserve_bytes")}
       OR (${sampledDataFree}<${field("data_reserve_bytes")}+${field("startup_reserve_bytes")} AND NOT(${thinPoolGrowthNeededSql()})) THEN 'thin_pool_growth_exhausted'
