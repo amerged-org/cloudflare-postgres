@@ -66,8 +66,13 @@ struct Cell {
     started: Option<Instant>,
     /// When the log last named what hinted the database.
     hint_logged: Option<Instant>,
-    /// A pool slot serves the database: only a lapse of its node's write authority protects it.
+    /// A pool slot serves the database, or served it and no row pulled since has been applied:
+    /// only a lapse of its node's write authority protects it.
     served: bool,
+    /// A pool slot serves the database now: its start hold is not refreshed.
+    slot: bool,
+    /// When a pool slot stopped serving the database, until a row pulled since has been applied.
+    unserved_at: Option<Instant>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
@@ -197,6 +202,8 @@ fn apply_snapshot(
                     started: None,
                     hint_logged: None,
                     served: false,
+                    slot: false,
+                    unserved_at: None,
                 },
             );
         }
@@ -570,6 +577,23 @@ fn startup_refresh_due(db: &Value, renewals: &Renewals, clock: i128, served: boo
     timestamp_millis(&hold["expires_at"]).is_some_and(|expiry| {
         expiry - clock <= i128::from(number(&db["storage"], "guard_seconds")) * 500
     })
+}
+/// Follows whether a pool slot serves the database. Its start hold is not refreshed while a slot
+/// serves it, so once the slot stopped serving it the cached hold is stale: the database stays
+/// protected only for its node's authority until a row pulled since then has been applied.
+/// `true` when the slot stopped serving it now: its row is to be pulled.
+fn track_slot(cell: &mut Cell, serves: bool, now: Instant) -> bool {
+    let left = cell.slot && !serves;
+    cell.slot = serves;
+    if serves {
+        cell.unserved_at = None;
+    } else if left {
+        cell.unserved_at = Some(now);
+    } else if cell.unserved_at.is_some_and(|at| cell.authority_at >= at) {
+        cell.unserved_at = None;
+    }
+    cell.served = serves || cell.unserved_at.is_some();
+    left
 }
 fn preempt_storage(
     db: &Value,
@@ -1507,8 +1531,11 @@ async fn run() -> Result<(), Error> {
                 cell.due = Instant::now();
             }
         }
+        let now = Instant::now();
         for (id, cell) in cells.iter_mut() {
-            cell.served = controller.pool.serves(id);
+            if track_slot(cell, controller.pool.serves(id), now) {
+                pull_ids.insert(id.clone());
+            }
         }
         // Slots to be retired, one Unwind job each, again a second after one that did not end it.
         let now = Instant::now();
@@ -1549,7 +1576,7 @@ async fn run() -> Result<(), Error> {
         for (id, cell) in &cells {
             if !targeted_pulls.contains(id)
                 && startup_reads.get(id).is_none_or(|after| *after <= read_at)
-                && startup_refresh_due(&cell.db, &renewals, clock_ms(), cell.served)
+                && startup_refresh_due(&cell.db, &renewals, clock_ms(), cell.slot)
             {
                 pull_ids.insert(id.clone());
                 // Failed reads still stop at the original expiry; retries are bounded.
@@ -1726,6 +1753,8 @@ mod tests {
             started: None,
             hint_logged: None,
             served: false,
+            slot: false,
+            unserved_at: None,
         }
     }
     fn wake(id: &str, operation: &str) -> Value {
@@ -1975,6 +2004,72 @@ mod tests {
             1000,
             false
         ));
+    }
+    #[test]
+    fn a_database_a_slot_stops_serving_keeps_its_stale_hold_unread_until_its_row_is_pulled_again() {
+        // While a slot served the database, its start hold was not refreshed: the cached expiry
+        // is long past when the slot is retired (a restarted slot Pod, a configuration change, a
+        // refuted ticket), and the database's own Cluster takes it over.
+        let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE,"guard_seconds":10},"storage_startup":{"generation":3,"node_uid":NODE,"expires_at":"1970-01-01T00:00:02.000Z"}});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":NODE,"write_allowed":true,"expires_at":"1970-01-01T00:01:40.000Z"}]});
+        let renewals = Renewals::default();
+        let clock = 50_000;
+        let pulled = Instant::now();
+        let mut served = cell(db, pulled, false);
+        served.snapshot = Arc::new(state);
+        assert!(!track_slot(&mut served, true, pulled));
+        assert!(!startup_refresh_due(
+            &served.db,
+            &renewals,
+            clock,
+            served.slot
+        ));
+        assert!(next_kind(&served, &renewals, clock, pulled) == JobKind::Reconcile);
+        // The slot stops serving it: its row is pulled at once, and until a row pulled since then
+        // is applied, the stale hold neither aborts the takeover nor dispatches a protection.
+        let left = pulled + Duration::from_secs(30);
+        assert!(track_slot(&mut served, false, left));
+        assert!(startup_refresh_due(
+            &served.db,
+            &renewals,
+            clock,
+            served.slot
+        ));
+        assert_ne!(class(&served, &renewals, clock), Class::Storage);
+        assert!(next_kind(&served, &renewals, clock, left) == JobKind::Reconcile);
+        assert!(!preempt_storage(
+            &served.db,
+            &served.snapshot,
+            &renewals,
+            clock,
+            JobKind::Reconcile,
+            served.served
+        ));
+        // A row pulled before the slot stopped serving it says nothing newer.
+        served.authority_at = left - Duration::from_millis(1);
+        assert!(!track_slot(
+            &mut served,
+            false,
+            left + Duration::from_millis(5)
+        ));
+        assert!(next_kind(&served, &renewals, clock, left) == JobKind::Reconcile);
+        // A row pulled since then that still holds the expired hold protects it.
+        served.authority_at = left + Duration::from_millis(10);
+        assert!(!track_slot(
+            &mut served,
+            false,
+            left + Duration::from_millis(20)
+        ));
+        assert_eq!(class(&served, &renewals, clock), Class::Storage);
+        assert!(next_kind(&served, &renewals, clock, left) == JobKind::Protect);
+        // Served again, it is protected only for its node's authority.
+        assert!(!track_slot(
+            &mut served,
+            true,
+            left + Duration::from_secs(1)
+        ));
+        assert!(next_kind(&served, &renewals, clock, left) == JobKind::Reconcile);
     }
     #[test]
     fn a_slot_served_database_is_protected_only_for_node_authority_not_for_start_tokens() {
