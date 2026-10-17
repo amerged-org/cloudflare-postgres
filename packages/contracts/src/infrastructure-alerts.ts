@@ -21,7 +21,7 @@ export const InfraAlertKind = z
   ])
   .describe(
     "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: the daily D1 backup stored in the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy. " +
-      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's fresh physical sample shows the thin pool without room (thin_pool_no_room: no database starts or attaches there) or below its growth point with no growth left (thin_pool_growth_exhausted: the pool is at its maximum, the volume group is too full, or metadata is under twice its reserve), or a pool that holds thin volumes has no physical sample of at most 120 s (thin_pool_unobserved); thin_storage lists each node with its thin_pool_* error_code. " +
+      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's fresh physical sample shows the thin pool without data or metadata room (thin_pool_no_room: no database starts or attaches there), or a pool that holds thin volumes has no physical sample of at most 120 s (thin_pool_unobserved); thin_storage lists each node with its thin_pool_* error_code. " +
       "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
   );
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
@@ -43,13 +43,13 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
   regional_node_cpu_warning:
     "A node's ten-minute CPU average is above its threshold. Find the node in node_ids and reduce awake databases there or add capacity.",
   regional_node_storage_warning:
-    "A node's thin pool or volume group is filling. Grow the pool or free space by deleting or moving databases; see Thin storage admission in docs/operations/recovery.md.",
+    "A node's thin pool or volume group is filling. Free space by deleting databases on the node; the pool does not grow. See Thin storage admission in docs/operations/recovery.md.",
   database_archive_failing:
     "WAL archiving of the listed databases is failing. Check R2 reachability and the region's archive credentials; WAL accumulates on the volume until archiving works again.",
   database_base_backup_stale:
     "The listed awake databases have no completed base backup for 36 h of awake time. Check their scheduled backup and R2 access; read backup.status in GET /v1/operational-health?scope=databases.",
   thin_storage_blocked:
-    "A listed node's thin pool is short of space or unobserved. thin_pool_no_room: nothing starts there until the pool grows. thin_pool_growth_exhausted: raise maximum_data_bytes, free the volume group or move databases. thin_pool_unobserved: fix its storage sample.",
+    "A listed node's thin pool is out of room or unobserved. thin_pool_no_room: nothing starts there until deleting databases on the node frees space; the pool does not grow. thin_pool_unobserved: fix its storage sample.",
   control_cron_stalled:
     "The minute cron has not completed a run for over 5 minutes. Check the Worker's cron trigger and logs (cron_step_failed, cron_completed) and redeploy the Worker if its trigger is missing.",
   control_cron_step_failing:

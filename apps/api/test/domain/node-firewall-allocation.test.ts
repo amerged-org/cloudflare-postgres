@@ -35,7 +35,6 @@ afterEach(async () => {
 async function setup() {
   const state = await fixture(),
     instanceId = id(),
-    relayId = id(),
     now = new Date().toISOString();
   await env.DB.prepare("UPDATE regions SET provider_region='EU' WHERE id=?")
     .bind(state.region)
@@ -97,12 +96,9 @@ async function setup() {
     status: "running",
     addOns: [],
   };
-  const relay = { ...actual, id: relayId },
-    firewalls: ContaboFirewall[] = [];
+  const firewalls: ContaboFirewall[] = [];
   const provider = {
-    getInstance: vi.fn(async (target: string) =>
-      structuredClone(target === relayId ? relay : actual),
-    ),
+    getInstance: vi.fn(async () => structuredClone(actual)),
     getFirewall: vi.fn(async (target: string) =>
       structuredClone(firewalls.find((row) => row.firewallId === target)!),
     ),
@@ -142,7 +138,6 @@ async function setup() {
   const config = {
     ...env,
     BOOTSTRAP_FIREWALL_BINDINGS: "{}",
-    BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID: relayId,
   } as Env;
   const ensure = () =>
     ensureNodeInstallationFirewall(config, operationId, { provider });
@@ -156,7 +151,6 @@ async function setup() {
     addition,
     operationId,
     actual,
-    relay,
     firewalls,
     provider,
     config,

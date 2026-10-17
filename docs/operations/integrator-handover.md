@@ -899,10 +899,10 @@ measurement is fresh and below the threshold.
 | `regional_ram_warning` | regional RAM utilisation reaches it | `ram_warning_threshold_ppm` = `null` (off) |
 | `regional_node_cap_reached` | allocated nodes reach `max_nodes` | `cap_warning_enabled` = off |
 | `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed |
-| `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 or etcd backup fails, or none completed for 36 h | fixed |
+| `infrastructure_backup_failed`, `infrastructure_backup_stale` | the daily D1 backup fails, or none completed for 36 h | fixed |
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed (from the release with migration `0052`) |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count | fixed (same release) |
-| `thin_storage_blocked` | a node's Thin storage is `blocked`, with its `thin_storage_*` `error_code` or none, or its thin pool has no room or cannot grow (`thin_pool_*`) | fixed (same release) |
+| `thin_storage_blocked` | a node's thin pool has no data or metadata room, or a pool that holds thin volumes has no fresh sample (`thin_pool_*`) | fixed (same release) |
 | `control_cron_stalled`, `control_cron_step_failing` | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs | fixed (same release) |
 
 Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`
@@ -917,9 +917,8 @@ own heartbeat is judged by a Durable Object alarm that does not depend on the cr
 release there is no alert for one database's archive or base backup or a Thin `blocked` state,
 and an earlier failure in the minute cron silently skips alerting.
 
-The control plane itself is protected by a daily encrypted D1 export and one etcd snapshot per
-region in R2, read back in full ([infrastructure backups](infrastructure-backups.md)); restoring
-them has not been exercised. The plan records completed runs on 2026-10-13 and 2026-10-15; 2026-10-14 failed all three attempts and is
+The control plane itself is protected by a daily encrypted D1 export in R2, read back in full
+([infrastructure backups](infrastructure-backups.md)); restoring it has not been exercised. The plan records completed runs on 2026-10-13 and 2026-10-15; 2026-10-14 failed all three attempts and is
 open (Go-live path: *Backups*). These backups are not your database backups.
 
 What you can watch yourselves: per database `health.archiving`, `health.backup`, `health.disk`,

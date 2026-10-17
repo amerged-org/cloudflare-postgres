@@ -398,7 +398,7 @@ async function poolSample(
     .run();
 }
 
-it("alarms a thin pool without room, or below its growth point with no growth left, and clears it once it has room", async () => {
+it("alarms a thin pool without data or metadata room and clears it once it has room", async () => {
   const f = await fixture(),
     now = Date.now(),
     hook = receiver();
@@ -406,12 +406,8 @@ it("alarms a thin pool without room, or below its growth point with no growth le
     f,
     { status: "ready", code: null },
     {
-      growth_bytes: 8 * gib,
-      maximum_data_bytes: 64 * gib,
-      vg_reserve_bytes: 4 * gib,
       data_reserve_bytes: 512 * mib,
       metadata_reserve_bytes: 64 * mib,
-      startup_reserve_bytes: 32 * mib,
     },
   );
   const failing = () =>
@@ -441,30 +437,23 @@ it("alarms a thin pool without room, or below its growth point with no growth le
   expect(await status(f, "thin_storage_blocked")).toMatchObject({
     active: false,
   });
-  // Room for now, below the growth point, and the pool at its maximum.
+  // Just above the data reserve: the pool does not grow, so that is still room.
   await poolSample(f, {
-    dataTotal: 64 * gib,
+    dataTotal: 32 * gib,
     dataFree: 520 * mib,
     metadataFree: 512 * mib,
   });
   await runInfrastructureHealthAlerts(hook.env, now + 3000, hook.fetcher);
-  expect(hook.events).toHaveLength(2);
-  expect(failing()).toEqual(["thin_pool_growth_exhausted"]);
+  expect(hook.events).toHaveLength(1);
+  // Metadata below its reserve: no room either.
   await poolSample(f, {
     dataTotal: 32 * gib,
     dataFree: 8 * gib,
-    metadataFree: 512 * mib,
+    metadataFree: 32 * mib,
   });
   await runInfrastructureHealthAlerts(hook.env, now + 4000, hook.fetcher);
-  // Metadata never grows: twice its reserve is already the alarm.
-  await poolSample(f, {
-    dataTotal: 32 * gib,
-    dataFree: 8 * gib,
-    metadataFree: 100 * mib,
-  });
-  await runInfrastructureHealthAlerts(hook.env, now + 5000, hook.fetcher);
-  expect(hook.events).toHaveLength(3);
-  expect(failing()).toEqual(["thin_pool_growth_exhausted"]);
+  expect(hook.events).toHaveLength(2);
+  expect(failing()).toEqual(["thin_pool_no_room"]);
 });
 
 it("alarms a thin pool that holds volumes while its node reports no fresh sample of it", async () => {

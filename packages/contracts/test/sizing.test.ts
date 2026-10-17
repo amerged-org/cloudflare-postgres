@@ -4,16 +4,12 @@ import {
   SIDECAR,
   databaseMemoryReservationMib,
   databaseCpuReservationMillicores,
-  postgresParameters,
-  resourceQuotaFor,
 } from "../src/index.ts";
 
 const small = {
   memory_mib: 512,
   cpu_millicores: 500,
   storage_gib: 10,
-  max_connections: 100,
-  archive_timeout_seconds: 60,
 };
 
 describe("sizing", () => {
@@ -28,50 +24,8 @@ describe("sizing", () => {
     expect(databaseCpuReservationMillicores(small)).toBe(600);
   });
 
-  it("sizes the quota for two slots including the sidecar", () => {
-    expect(resourceQuotaFor(small)).toEqual({
-      requestsCpuMillicores: 2 * (500 + 100),
-      limitsCpuMillicores: 2 * (500 + 500),
-      requestsMemoryMib: 2 * (512 + 128),
-      limitsMemoryMib: 2 * (512 + 512),
-      requestsStorageGib: 10,
-      persistentVolumeClaims: 1,
-      pods: 2,
-    });
-  });
-
-  it("reserves a separate CPU request while bounding both PostgreSQL and Barman limits", () => {
+  it("reserves a separate CPU request plus the sidecar request", () => {
     const size = { ...small, cpu_millicores: 250, cpu_request_millicores: 25 };
     expect(databaseCpuReservationMillicores(size)).toBe(125);
-    expect(resourceQuotaFor(size)).toMatchObject({
-      requestsCpuMillicores: 250,
-      limitsCpuMillicores: 1500,
-    });
-  });
-
-  it("includes assigned sandbox overhead in both requests and limits for each Pod", () => {
-    expect(
-      resourceQuotaFor(
-        { ...small, cpu_request_millicores: 25 },
-        { cpu_millicores: 50, memory_mib: 64 },
-      ),
-    ).toMatchObject({
-      requestsCpuMillicores: 350,
-      limitsCpuMillicores: 2100,
-      requestsMemoryMib: 1408,
-      limitsMemoryMib: 2176,
-    });
-  });
-
-  it("derives PostgreSQL parameters from the size class", () => {
-    expect(postgresParameters(small)).toEqual({
-      shared_buffers: "128MB",
-      effective_cache_size: "256MB",
-      max_connections: "100",
-      archive_timeout: "60s",
-    });
-    expect(
-      postgresParameters({ ...small, memory_mib: 2050 }).shared_buffers,
-    ).toBe("512MB");
   });
 });

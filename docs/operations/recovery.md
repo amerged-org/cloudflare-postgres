@@ -131,9 +131,10 @@ forward-only within the configured finite maximum.
   data at least the profile's `data_reserve_bytes` and free metadata at least
   `metadata_reserve_bytes`. Without room Cloudflare refuses create, resume, restart, restore and
   wake. Logical quota totals do not reserve extents. `thin_storage_blocked` fires when the pool has
-  no room or cannot grow.
+  no room. The pool does not grow.
 - A full pool fails writes at once (`--errorwhenfull y`). PostgreSQL then stops with PANIC and no
-  commit is acknowledged without durable WAL. Grow the pool; the next start recovers from WAL.
+  commit is acknowledged without durable WAL. Free pool space by deleting databases on the node;
+  the next start recovers from WAL.
   Running writers are never stopped for storage.
 
 Thin physical allocation metrics stay null until a real measurement exists; neither a logical

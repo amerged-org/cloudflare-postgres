@@ -130,27 +130,10 @@ export function thinPoolNodeRoomSql(): string {
 }
 
 /**
- * Whether the node's thin pool should grow now: its latest fresh sample leaves less than the data
- * reserve and one start free, and the pool is below its maximum with the volume group's reserve
- * still free after the growth step.
- */
-function thinPoolGrowthNeededSql(): string {
-  return allOf(
-    freshSampleSql,
-    `${sampled("volume_group_uuid")}=t.volume_group_uuid`,
-    `${sampledDataFree}<${field("data_reserve_bytes")}+${field("startup_reserve_bytes")}`,
-    `${sampled("thin_pool.data_total_bytes")}<${field("maximum_data_bytes")}`,
-    `${sampled("free_bytes")}>=${field("vg_reserve_bytes")}+MIN(${field("growth_bytes")},${field("maximum_data_bytes")}-${sampled("thin_pool.data_total_bytes")})`,
-  );
-}
-
-/**
  * Why the thin storage alert fires for a node's pool, over its thin storage `t` and its latest
  * sample `o` (absent in an outer join): no fresh sample of a pool that holds thin volumes, since
- * nothing then sees it fill; no room now; or below the growth point with no
- * growth left (the maximum reached or the volume group too full). Metadata does not grow past the
- * profile's size and a full metadata device needs repair, so its alert comes at twice its reserve.
- * NULL while the pool is fine.
+ * nothing then sees it fill; or no room now. The pool does not grow; a filling pool is the
+ * storage warning's. NULL while the pool is fine.
  */
 export function thinPoolExhaustionSql(): string {
   return `CASE WHEN o.node_id IS NULL OR json_type(o.physical_json,'$.thin_pool') IS NOT 'object' OR NOT(${freshSampleSql}) THEN
@@ -158,8 +141,6 @@ export function thinPoolExhaustionSql(): string {
         AND v.storage_volume_json IS NOT NULL AND NOT(v.desired_state='deleted' AND v.observed_state='deleted'))
       THEN 'thin_pool_unobserved' ELSE NULL END
     WHEN ${sampledDataFree}<${field("data_reserve_bytes")} OR ${sampledMetadataFree}<${field("metadata_reserve_bytes")} THEN 'thin_pool_no_room'
-    WHEN ${sampledMetadataFree}<2*${field("metadata_reserve_bytes")}
-      OR (${sampledDataFree}<${field("data_reserve_bytes")}+${field("startup_reserve_bytes")} AND NOT(${thinPoolGrowthNeededSql()})) THEN 'thin_pool_growth_exhausted'
     ELSE NULL END`;
 }
 

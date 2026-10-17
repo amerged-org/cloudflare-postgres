@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { newNodeId } from "@pgcf/contracts";
 import type {
   NodeAddition,
   NodeOrderConfiguration,
@@ -15,21 +14,14 @@ import {
   markNodeDispatchUnknown,
   recordNodeReceipt,
   recordNodeAudit,
-  saveNodeBootstrapCheckpoint,
-  verifyNodeNetwork,
-  verifyNodeCapacity,
-  completeNodeAddition,
   cancelUnattemptedNodeAddition,
   markNodeAdditionFailed,
   nodeRegionOccupiedSlots,
 } from "../../src/domain/node-state.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
-const regions: string[] = [],
-  observed: string[] = [];
+const regions: string[] = [];
 afterEach(async () => {
-  for (const id of observed.splice(0))
-    await env.DB.prepare("DELETE FROM nodes WHERE id=?").bind(id).run();
   for (const region of regions.splice(0))
     await env.DB.batch([
       env.DB.prepare("DELETE FROM node_additions WHERE region_id=?").bind(
@@ -86,89 +78,6 @@ async function approve(addition: NodeAddition) {
       location: addition.intent.request.order.location,
     },
   );
-}
-async function audited(f: Awaited<ReturnType<typeof setup>>) {
-  const instance = providerId();
-  let addition = await reserveNodeAddition(env.DB, {
-    request_key: crypto.randomUUID(),
-    request: {
-      region_id: f.region,
-      mode: "adopt",
-      provider_instance_id: instance,
-    },
-  });
-  addition = await recordNodeReceipt(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    {
-      provider_instance_id: instance,
-      request_id: null,
-      reference: reference(),
-      received_at: new Date().toISOString(),
-    },
-  );
-  addition = await recordNodeAudit(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    {
-      provider_instance_id: instance,
-      provider_region: "test",
-      product_id: reference(),
-      image_id: crypto.randomUUID(),
-      reference: reference(),
-      observed_at: new Date().toISOString(),
-    },
-  );
-  return addition;
-}
-async function joined(addition: NodeAddition) {
-  return saveNodeBootstrapCheckpoint(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    {
-      stage: "joined",
-      reference: reference(),
-      saved_at: new Date().toISOString(),
-    },
-  );
-}
-const proofScope = (addition: NodeAddition) => ({
-  node_id: addition.intent.node_id,
-  operation_id: addition.intent.operation_id,
-  intent_hash: addition.intent_hash,
-  checkpoint_reference: addition.checkpoint!.reference,
-  proof_reference: reference(),
-});
-async function observe(addition: NodeAddition, wrongId = false) {
-  const id = wrongId ? newNodeId() : addition.intent.node_id,
-    now = new Date().toISOString();
-  observed.push(id);
-  await env.DB.prepare(
-    `INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at)
-    VALUES(?,?,?,?,1,0,8192,4000,80,128,500,?,?,?)`,
-  )
-    .bind(
-      id,
-      addition.intent.request.region_id,
-      addition.intent.requested_hostname,
-      addition.provider_instance_id,
-      now,
-      now,
-      now,
-    )
-    .run();
-  return {
-    ...proofScope(addition),
-    observed_at: now,
-    allocatable_memory_mib: 8192,
-    allocatable_cpu_millicores: 4000,
-    storage_gib_total: 80,
-    platform_reserved_memory_mib: 128,
-    platform_reserved_cpu_millicores: 500,
-  };
 }
 
 it("atomically caps actual legacy nodes plus separate outstanding reservations", async () => {
@@ -463,135 +372,4 @@ it("refuses a receipt for an instance already claimed by another pending adoptio
     (await readNodeAddition(env.DB, adoption.intent.operation_id))
       .provider_instance_id,
   ).toBeNull();
-});
-it("counts a bound actual node once, never by hostname alone, and publishes only measured verified capacity", async () => {
-  const f = await setup();
-  let addition = await joined(await audited(f));
-  await expect(
-    completeNodeAddition(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-    ),
-  ).rejects.toThrow("proofs");
-  const wrong = await observe(addition, true);
-  // The provider allocation is one VPS; this does not authorize the wrong Node identity below.
-  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
-  await expect(
-    verifyNodeCapacity(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-      wrong,
-    ),
-  ).rejects.toThrow("actual matching");
-  await env.DB.prepare("DELETE FROM nodes WHERE id=?")
-    .bind(observed.pop()!)
-    .run();
-  const capacity = await observe(addition);
-  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
-  addition = await verifyNodeCapacity(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    capacity,
-  );
-  await expect(
-    completeNodeAddition(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-    ),
-  ).rejects.toThrow("proofs");
-  addition = await verifyNodeNetwork(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    { ...proofScope(addition), verified_at: new Date().toISOString() },
-  );
-  expect(
-    await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
-      .bind(addition.intent.node_id)
-      .first("schedulable"),
-  ).toBe(0);
-  addition = await completeNodeAddition(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-  );
-  expect(addition.status).toBe("ready");
-  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
-  expect(
-    await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
-      .bind(addition.intent.node_id)
-      .first("schedulable"),
-  ).toBe(1);
-});
-it("refuses out-of-order bootstrap or proof scope and a changed measurement before release", async () => {
-  const f = await setup();
-  let addition = await audited(f);
-  addition = await saveNodeBootstrapCheckpoint(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    {
-      stage: "network_protected",
-      reference: reference(),
-      saved_at: new Date().toISOString(),
-    },
-  );
-  await expect(
-    verifyNodeNetwork(env.DB, addition.intent.operation_id, addition.revision, {
-      ...proofScope(addition),
-      verified_at: new Date().toISOString(),
-    }),
-  ).rejects.toThrow("joined");
-  await expect(
-    saveNodeBootstrapCheckpoint(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-      {
-        stage: "rescue",
-        reference: reference(),
-        saved_at: new Date().toISOString(),
-      },
-    ),
-  ).rejects.toThrow("rewind");
-  addition = await joined(addition);
-  const capacity = await observe(addition);
-  await expect(
-    verifyNodeNetwork(env.DB, addition.intent.operation_id, addition.revision, {
-      ...proofScope(addition),
-      node_id: newNodeId(),
-      verified_at: new Date().toISOString(),
-    }),
-  ).rejects.toThrow("immutable");
-  addition = await verifyNodeNetwork(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    { ...proofScope(addition), verified_at: new Date().toISOString() },
-  );
-  addition = await verifyNodeCapacity(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    capacity,
-  );
-  await env.DB.prepare("UPDATE nodes SET storage_gib_total=79 WHERE id=?")
-    .bind(addition.intent.node_id)
-    .run();
-  await expect(
-    completeNodeAddition(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-    ),
-  ).rejects.toThrow("changed");
-  expect(
-    await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
-      .bind(addition.intent.node_id)
-      .first("schedulable"),
-  ).toBe(0);
 });

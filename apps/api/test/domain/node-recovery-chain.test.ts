@@ -3,7 +3,6 @@ import { env } from "cloudflare:workers";
 import type { NodeAddition } from "@pgcf/contracts/nodes";
 import { afterEach, expect, it } from "vitest";
 import {
-  completeNodeAddition,
   configureNodeRegionPolicy,
   markNodeLost,
   nodeRegionOccupiedSlots,
@@ -11,9 +10,6 @@ import {
   recordNodeAudit,
   recordNodeReceipt,
   reserveNodeAddition,
-  saveNodeBootstrapCheckpoint,
-  verifyNodeCapacity,
-  verifyNodeNetwork,
 } from "../../src/domain/node-state.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
@@ -53,16 +49,6 @@ async function publish(
       observed_at: new Date().toISOString(),
     },
   );
-  addition = await saveNodeBootstrapCheckpoint(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    {
-      stage: "joined",
-      reference: reference(),
-      saved_at: new Date().toISOString(),
-    },
-  );
   const now = new Date().toISOString();
   const observed: NodeRow = {
     ...previous,
@@ -72,7 +58,7 @@ async function publish(
     provider_instance_id: provider,
     node_uid: uid,
     ready: 1,
-    schedulable: 0,
+    schedulable: 1,
     allocatable_memory_mib: 8192,
     allocatable_cpu_millicores: 4000,
     storage_gib_total: 80,
@@ -93,38 +79,13 @@ async function publish(
   )
     .bind(...Object.values(observed))
     .run();
-  const scope = {
-    operation_id: addition.intent.operation_id,
-    node_id: addition.intent.node_id,
-    intent_hash: addition.intent_hash,
-    checkpoint_reference: addition.checkpoint!.reference,
-    proof_reference: reference(),
-  };
-  addition = await verifyNodeNetwork(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    { ...scope, verified_at: now },
-  );
-  addition = await verifyNodeCapacity(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-    {
-      ...scope,
-      observed_at: now,
-      allocatable_memory_mib: 8192,
-      allocatable_cpu_millicores: 4000,
-      storage_gib_total: 80,
-      platform_reserved_memory_mib: 128,
-      platform_reserved_cpu_millicores: 500,
-    },
-  );
-  return completeNodeAddition(
-    env.DB,
-    addition.intent.operation_id,
-    addition.revision,
-  );
+  // No installer completes an addition in this release; the test writes the completed state.
+  await env.DB.prepare(
+    "UPDATE node_additions SET status='ready',revision=revision+1,updated_at=? WHERE operation_id=? AND status='audited'",
+  )
+    .bind(now, addition.intent.operation_id)
+    .run();
+  return readNodeAddition(env.DB, addition.intent.operation_id);
 }
 
 it("recovers completed same-provider history and chains a later loss without rewriting either predecessor", async () => {
@@ -183,9 +144,6 @@ it("recovers completed same-provider history and chains a later loss without rew
     originalTombstone,
   );
   expect(replacement.status).toBe("ready");
-  expect(replacement.checkpoint!.reference).not.toBe(
-    original.checkpoint!.reference,
-  );
   expect(await readNode(original.intent.node_id)).toEqual(originalTombstone);
   expect(await readNodeAddition(env.DB, original.intent.operation_id)).toEqual(
     original,

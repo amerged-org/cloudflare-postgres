@@ -201,13 +201,13 @@ same event ID while it stays active; a cleared episode sends nothing.
 | `regional_node_cap_reached` | allocated nodes reached `max_nodes` | `cap_warning_enabled` with a finite `max_nodes` | Raise `max_nodes` in the capacity policy or free a slot |
 | `regional_node_ram_warning` | a node's ten-minute RAM average reaches the threshold | `node_ram_warning_threshold_ppm` | Reduce awake databases on the listed node or add capacity |
 | `regional_node_cpu_warning` | a node's ten-minute CPU average reaches the threshold | `node_cpu_warning_threshold_ppm`; unknown without the node agent's CPU samples | Reduce awake databases on the listed node or add capacity |
-| `regional_node_storage_warning` | the node's thin-pool data or metadata fill, otherwise its volume-group allocation, reaches the threshold | `node_storage_warning_threshold_ppm` | Grow the pool or free space; see Thin storage admission in [recovery](recovery.md) |
+| `regional_node_storage_warning` | the node's thin-pool data or metadata fill, otherwise its volume-group allocation, reaches the threshold | `node_storage_warning_threshold_ppm` | Free space by deleting databases on the node; the pool does not grow. See Thin storage admission in [recovery](recovery.md) |
 | `regional_node_stale` | a node's observation is older than 180 s, or the node is marked lost | fixed; never-observed nodes are ignored | Check the server and its node agent; if it is gone follow the lost-node runbook |
 | `infrastructure_backup_failed` | the latest daily D1 attempt failed | fixed | Read `GET /v1/infrastructure-backups` for the artifact's `error_code`; same-day retries run by themselves |
 | `infrastructure_backup_stale` | no complete daily backup for 36 h | fixed | Read the same route and the cron heartbeat; fix the cause before the next 00:00Z run |
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability and archive credentials; WAL accumulates on the volume meanwhile |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
-| `thin_storage_blocked` | a node's fresh physical sample shows the thin pool without room or unable to grow, or a pool that holds thin volumes has no fresh sample | fixed | With `thin_pool_no_room` or `thin_pool_growth_exhausted`, grow the pool by hand (raise the profile's maximum or add a disk to the volume group) or free space; with `thin_pool_unobserved`, fix the node's storage sample |
+| `thin_storage_blocked` | a node's fresh physical sample shows the thin pool without data or metadata room, or a pool that holds thin volumes has no fresh sample | fixed | With `thin_pool_no_room`, free space by deleting databases on the node; with `thin_pool_unobserved`, fix the node's storage sample |
 | `control_cron_stalled` | no run of the minute cron completed for 300 s | fixed | Check the Worker's cron trigger and logs; see the cron heartbeat below |
 | `control_cron_step_failing` | a cron step failed in each of its last 5 completed runs | fixed | Read the Worker logs for `cron_step_failed` with the step named in `cron.failing_steps` |
 
@@ -226,9 +226,9 @@ Rules of the database and Thin storage kinds:
   agent's backup report must be fresh (at most 180 s old) and `ok` with a completion time,
   or `failing`; a sleeping database and an unknown report are excluded.
 - **Thin storage.** From the node's fresh physical sample (at most 120 s old),
-  `thin_pool_no_room` means no database starts on the node; `thin_pool_growth_exhausted`
-  means the pool is below its growth point with no growth left (its maximum reached or the
-  volume group too full) or its metadata, which does not grow, is under twice its reserve.
+  `thin_pool_no_room` means no database starts on the node: its free data is under the
+  profile's `data_reserve_bytes` or its free metadata under `metadata_reserve_bytes`. The pool
+  does not grow; `regional_node_storage_warning` reports it filling before that.
   `thin_pool_unobserved` means a node with a bound thin volume has no physical sample of its
   pool at most 120 s old, so neither the room rule nor this alert sees the pool fill. Running
   databases are never stopped for storage; a pool that does fill fails the write and
@@ -322,8 +322,9 @@ The `PGCFINF1` envelope contains: eight-byte magic, four-byte big-endian JSON AA
 length, UTF-8 authenticated JSON identity, 12-byte nonce, AES-GCM ciphertext, and a
 16-byte authentication tag. Derive its 32-byte key with HKDF-SHA256 from the retained
 master version: salt UTF-8 `pgcf-infrastructure-backup-v1`, info UTF-8 the `kid`.
-AAD binds the run/artifact/source/day/region, node and cluster identities, custody
-revision, `kid`, plaintext SHA-256 and byte count. Verify the complete encrypted
+AAD binds the run/artifact/source/day/region, `kid`, plaintext SHA-256 and byte count.
+Its node, cluster and custody-revision fields named the etcd sources of earlier runs; they
+stay null so that the layout every existing archive was written with is kept. Verify the complete encrypted
 SHA-256/length from the API receipt and GCM/AAD/plaintext hash before writing or
 restoring recovered SQL. Never restore an unverified or partial object.
 Use the existing [recovery runbook](recovery.md) for controlled D1 restoration;

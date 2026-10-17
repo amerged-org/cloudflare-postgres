@@ -29,7 +29,6 @@ pub const RESULT_PATH: &str = "/_pgcf/gateway/wake-result";
 pub const POLL_MAX_LENGTH: usize = 1024;
 pub const POLL_MAX_LIFETIME_SECONDS: u64 = 30;
 pub const RESULT_MAX_BYTES: usize = 4096;
-pub const POLL_RESPONSE_MAX_BYTES: usize = 65_536;
 pub const MAX_WAKES_PER_POLL: usize = 64;
 /// How long a held wake connection waits for its release, counted from its upgrade. Nested under
 /// the Edge's ADMISSION_DEADLINE_MS (60 s).
@@ -314,42 +313,6 @@ fn poll_mac(key: &[u8]) -> Option<Hmac<Sha256>> {
     let mut mac = Hmac::<Sha256>::new_from_slice(&derived).ok()?;
     mac.update(POLL_SIGNING_PURPOSE.as_bytes());
     Some(mac)
-}
-/// Signs a `gw1` token with the regional (derived) keyring the controller reads from
-/// Secret pgcf-system/pgcf-gateway.
-pub fn sign_poll(
-    keys: &HashMap<String, Vec<u8>>,
-    active: &str,
-    region: &str,
-    pod: &str,
-    action: &str,
-    now_ms: u64,
-) -> Result<String, &'static str> {
-    let key = keys
-        .get(active)
-        .filter(|k| k.len() >= constant("ROUTE_KEY_MIN_BYTES") as usize)
-        .ok_or("active key missing")?;
-    let iat = now_ms / 1000;
-    let claims = PollClaims {
-        v: 1,
-        region: region.into(),
-        pod: pod.into(),
-        action: action.into(),
-        kid: active.into(),
-        iat,
-        exp: iat + POLL_MAX_LIFETIME_SECONDS,
-    };
-    if !poll_claims_valid(&claims) {
-        return Err("invalid claims");
-    }
-    let payload =
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).map_err(|_| "invalid claims")?);
-    let mut mac = poll_mac(key).ok_or("invalid key")?;
-    mac.update(payload.as_bytes());
-    Ok(format!(
-        "{POLL_PREFIX}.{payload}.{}",
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    ))
 }
 /// Verifies a `gw1` token for this gateway Pod, region and action.
 pub fn verify_poll(

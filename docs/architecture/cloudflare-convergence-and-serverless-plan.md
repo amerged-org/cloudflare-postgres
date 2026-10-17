@@ -856,7 +856,8 @@ Everything goes into THIRD_PARTY.md with pinned versions and licences.
 - **Clients and Edge:** `apps/edge` (4,887 lines, deployed), `packages/cli` (1,559).
 - **API product core:** about 31.9k source lines remain after the deletions.
   - 45 files still name Kubernetes, Talos, relay, sidecar or compute-pool terms and must be adapted.
-  - The heaviest are `fleet-releases.ts`, `fleet-rollouts.ts`, `infrastructure-backups.ts`, `storage-capacity.ts`, `startup-admission.ts`, `platform/nodes.ts` and `observations.ts`.
+  - The heaviest are `fleet-releases.ts`, `infrastructure-backups.ts`, `storage-capacity.ts`, `startup-admission.ts`, `platform/nodes.ts` and `observations.ts`.
+  - `fleet-rollouts.ts` is not kept: it was built on fleet patches and goes with them (Stage 2, agreed deviation 5).
 - **Gateway and protocol:** `apps/native-gateway` minus 2,498 lines; `packages/native-protocol` minus `storage.rs` (306) and `reclaim.rs` (213).
 - **Contracts:** `packages/contracts`, minus the files in 6.6. The generated native JSON (about 25k lines) is regenerated.
 
@@ -874,7 +875,7 @@ From `apps/native-controller` (33,712 lines), the parts without Kubernetes:
 - `manifests.rs` 128-148: role ordering by membership.
 - `test_postgres.rs`: the PostgreSQL wire double for tests.
 
-From `apps/node-bootstrap/src/thin-storage.ts` 537-700: the thin-pool command decision logic (about 100 lines), ported to Rust.
+From `apps/node-bootstrap/src/thin-storage.ts` 537-700: the thin-pool command decision logic (about 100 lines), ported to Rust. Stage 2 deletes `apps/node-bootstrap`, so the source is `archive/kubernetes-runtime@6761e7f0:apps/node-bootstrap/src/thin-storage.ts`; the port drops pool growth (4.12).
 
 ### 6.5 Repository: build new
 
@@ -923,9 +924,17 @@ From `apps/node-bootstrap/src/thin-storage.ts` 537-700: the thin-pool command de
 - `node_compute_pool_policies` and `node_compute_pool_observations`;
 - `thin_storage_qualification_runs` and `thin_storage_qualification_samples`;
 - `region_bootstrap_credentials`, replaced by per-node keys;
-- `node_network_preparations` and `node_network_mutations`, which go with the network-proof path.
+- `node_network_preparations`, `node_network_mutations` and `node_network_firewalls`, which go with the network-proof path;
+- `infrastructure_backup_deferrals`, the backup hold of thin starts.
 
-Columns tied to Kubernetes, the sidecar, the compute pool and warm reclaim are dropped from `nodes`, `regions`, `node_thin_storage`, `node_region_policies`, `databases`, `fleet_node_releases` and `infrastructure_backup_artifacts`.
+Columns tied to Kubernetes, the sidecar, the compute pool, warm reclaim, thin turns and fleet patches are dropped:
+- `nodes.warm_reclaim_qualification_json`; `regions.bootstrap_material_revision` and `bootstrap_material_provenance_sha256`;
+- `node_region_policies.compute_pool_json` and `thin_storage_json`; `databases.warm_reclaim_policy_json`;
+- `fleet_releases.thin_continuity` and `thin_sampling_version`; `fleet_region_releases.rollout_json` with its index `fleet_region_rollout`, so stored rollout intents are gone;
+- `infrastructure_backup_artifacts.node_id`, `node_uid`, `cluster_uid` and `material_revision`;
+- `node_thin_storage` is rebuilt without the relay address, cluster, custody material, host lease, pool turns and qualification.
+
+`fleet_node_releases.role` (`control_relay` or `customer`) stays with the release spec until Stage 3 replaces it.
 
 **Build-order trap.** The Rust contract generators import reference code from directories that are being deleted:
 - `generate-power.ts` imports `SLEEP_SQL`, `SLEEP_REFUSALS` and `WAKE_PHASES` from `apps/regional`.
@@ -1460,7 +1469,7 @@ Each stage lists its goal, steps, acceptance and scope. AGENTS.md line 21 forbid
 **Goal:** main holds only what option C uses, and CI is green. Deleting first gives Stage 3 a clean base and removes the hidden build dependencies.
 
 **Steps:**
-1. Move these into `packages/contracts`: `SLEEP_SQL`, `SLEEP_REFUSALS`, `WAKE_PHASES`, the frame-budget, activity, telemetry and measurement constants, and the Rust and CI lock sections.
+1. Move these into `packages/contracts`: `SLEEP_SQL`, `SLEEP_REFUSALS`, `WAKE_PHASES`, and the frame-budget, activity, telemetry and measurement constants. The Rust and CI lock sections stay in `infra/platform/versions.lock.json` (6.6), where CI reads them.
 2. Delete everything in 6.6. Drop the D1 tables and columns in one migration set. The same migration deletes the test and US rows from Stage 0, and renames the region if D5 says so.
 3. Remove the obsolete CI jobs and steps:
    - the Talos test client;
@@ -1478,11 +1487,14 @@ Each stage lists its goal, steps, acceptance and scope. AGENTS.md line 21 forbid
 2. The reusable parts of `apps/native-controller` (6.4) moved into the library crate `apps/node-agent`, with their unit tests and no binary yet; the rest of the controller is deleted.
 3. The region rename (D5) waits.
 4. Migration `0062` drops the tables and columns of 6.6 and deletes no rows; the test and US rows stay for a later migration.
+5. The fleet rollout module (`fleet-rollouts.ts` in the API and in contracts, the `fleet_rollouts` cron step, `POST /v1/fleet/rollouts` and `GET /v1/fleet/rollouts/{id}`) is deleted although 6.3 listed it as kept: it was built on fleet patches and bootstrap jobs. A release reaches nodes by assignment per region (`/v1/regions/{id}/release`) or per node (`/v1/nodes/{id}/release`) until Stage 3 decides on rollouts.
 
 **Done with the deletion:**
 - The daily D1 backup runs inside the API Worker's `InfrastructureBackup` Workflow: it reads the signed export twice, streams it through AES-256-GCM into R2 multipart parts and reads the whole object back (needs `nodejs_compat`). The etcd artifact and the thin-start deferral are gone.
-- Route token v3 and admission snapshots require every current member of the region to be assigned to the region's release; fleet patches no longer exist.
+- Route token v3 and admission snapshots require every current member of the region to be assigned to the region's release; fleet patches and fleet rollouts no longer exist (agreed deviation 5).
 - The contract generators emit only what the Rust crates read. The measurement checkpoint cases recorded from the TypeScript agent are a node-agent test fixture.
+- AddNode stops at `audited`. The Talos checkpoint, network and capacity proofs and the `ready` write are gone; `NodeAddition` still parses their stored columns until Stage 3's pull installer defines its own stages.
+- `thin_pool_growth_exhausted` and the pool growth rule are gone (4.10); the alert actions say the pool does not grow.
 
 **Acceptance:**
 - One CI run on main passes every job.
@@ -1619,7 +1631,7 @@ From the canary on, the EU1 stack is production.
 | Research for this plan (2026-10-17) | Open source (nothing adoptable), OS image (Debian 13), overbooking model, backups (barman-cloud kept), supervision lab, code inventory (about 202k lines deletable) |
 | Supervision lab (laptop, Debian trixie, systemd 257, PostgreSQL 18.6) | Hardened unit start to READY 54.0 / 60.7 ms (p50/p95). First SaaS answer 60.4 / 66.9 ms with a warm cache, 98.5 / 110.3 ms cold. Stop 29.8 / 42.6 ms. 20-database storm ready in 353–375 ms. Kernel memory per mounted volume 0.13–0.55 MiB |
 | Baselines from the Kubernetes runtime (reference only) | PostgreSQL 18.6 on EU1 ready in 111–117 ms. ext4 mount on thin 68–120 ms. Release 24 cold first answer p95 1,080 ms, whole request p95 1.50 s. Old standard create to ready 30.7 s |
-| Stage 2 steps 1–5 on branch `stage2/clean-main` (2026-10-17) | 268,884 non-lockfile lines deleted and 6,699 added against main `85a2e6e3` (269,952 and 6,717 with the lockfiles). Locally green: lint, format, typecheck, the four contract generator checks, cargo fmt, clippy and tests, the Worker build, every workspace test (API 776, contracts 213, Edge 103, Rust Edge 20), the node-agent kernel test and Mermaider |
+| Stage 2 steps 1–5 on branch `stage2/clean-main` (2026-10-17) | 269,602 non-lockfile lines deleted and 6,749 added against main `85a2e6e3` (270,670 and 6,767 with the lockfiles). Locally green: lint, format, typecheck, the four contract generator checks, cargo fmt, clippy and tests, the Worker build, every workspace test (API 774, contracts 209, Edge 103, Rust Edge 20), the node-agent kernel test and Mermaider |
 
 ### 11.2 Open
 

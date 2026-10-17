@@ -22,8 +22,8 @@ flowchart TD
 ## Sources
 
 - [apps/api/src/domain/node-capacity.ts · placePendingDatabases:64](../../../apps/api/src/domain/node-capacity.ts#L64)
-- [apps/api/src/domain/node-state.ts · claimNodeDispatch:756](../../../apps/api/src/domain/node-state.ts#L756)
-- [apps/api/src/domain/node-state.ts · recordNodeAudit:894](../../../apps/api/src/domain/node-state.ts#L894)
+- [apps/api/src/domain/node-state.ts · claimNodeDispatch:752](../../../apps/api/src/domain/node-state.ts#L752)
+- [apps/api/src/domain/node-state.ts · recordNodeAudit:890](../../../apps/api/src/domain/node-state.ts#L890)
 - [apps/api/src/workflows/add-node.ts · dispatchNodeOrder:67](../../../apps/api/src/workflows/add-node.ts#L67)
 - [apps/api/src/workflows/add-node.ts · reconcileNodeProvider:110](../../../apps/api/src/workflows/add-node.ts#L110)
 - [apps/api/src/workflows/add-node.ts · AddNode:211](../../../apps/api/src/workflows/add-node.ts#L211)
