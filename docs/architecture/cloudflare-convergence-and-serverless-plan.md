@@ -53,7 +53,7 @@ A database goes cold after its idle time and wakes on the next connection. There
 Customers buy a size, for example a database with 256 MB of RAM and 1 GiB of disk. Most databases are cold most of the time. A cold database uses no RAM and no CPU, and only the disk it has actually written. So a node can carry far more sold capacity than it physically has.
 
 - **RAM is overbooked in time.** Only awake databases use memory. A 12 GB node has about 9.7 GiB for awake databases (section 4.5). Suppose every awake database reserved its full size, and on average 5 % of databases were awake. Then one node could still carry about 290 databases of 256 MB, about six times its physical RAM (*estimate*, section 4.11). Decision D3 settles how far awake databases may also be overbooked against each other, by counting their measured use instead of their full size.
-- **Disk is overbooked by thin volumes.** Each database gets a volume of its sold size, but disk is used only as it is written. An empty database writes about 120–160 MiB (*estimate*). So 300 databases sold at 1 GiB each need 300 GiB on paper but about 45 GiB in reality.
+- **Disk is overbooked by thin volumes.** Each database gets a volume of its sold size, but disk is used only as it is written. An empty database uses about 69 MiB of its volume when it is ready (*measured (EU1)*, Stage 1). So 300 databases sold at 1 GiB each need 300 GiB on paper but about 20 GiB in reality.
 - **Admission control keeps it honest.** The node never wakes more databases than its RAM can really hold. Cloudflare never places new databases on a disk that is really filling up. When too many databases wake at once, the node acts in this order:
   1. It puts idle-but-awake databases to sleep, if the owner agrees (D2).
   2. It makes the newcomer wait briefly.
@@ -154,11 +154,11 @@ Cloudflare keeps the API, D1, the Edge, the Durable Objects and the Workflows. A
 
 We build the agent ourselves from proven parts (section 6.1).
 
-**What to expect** (*estimates*, section 5.9):
-- **Node path** (from the wake to PostgreSQL ready and released): 85–155 ms with volumes kept mounted, against 469 ms measured in release 23.
-- **First answer** of a cold request: p95 of about 0.7–0.95 s (release 24: 1,080 ms).
-- **Whole five-statement request:** p95 of about 1.1–1.4 s (release 24: 1.50 s). The four later statements cost 0.27–0.46 s through Cloudflare, whatever the node does (OP L399).
-- **So option C alone does not reach the whole-request gate.** Cloudflare-side work is also needed: a connect p95 of about 0.25 s instead of up to 0.67 s, and cheaper round trips per statement. That work is Lane E of Stage 3, measured from Stage 1 on. The owner decides which number gates go-live (D1), knowing this.
+**What to expect** (section 5.9; the node part measured on EU1 in Stage 1, the rest *estimates*):
+- **Node path** (from the wake to PostgreSQL ready and released), volumes kept mounted: p50 / p95 167 / 226 ms with the unit as first written for the image, 123 / 153 ms without its `ExecStartPre=` (11.1), against 469 ms measured in release 23. The 150 ms target is missed.
+- **First answer** of a cold request: p95 of about 0.57–1.1 s (release 24: 1,080 ms).
+- **Whole five-statement request:** p95 of about 0.84–1.57 s (release 24: 1.50 s). The four later statements cost 0.27–0.46 s through Cloudflare, whatever the node does (OP L399).
+- **So option C alone does not reach the whole-request gate.** Cloudflare-side work is also needed: at today's cost per statement, a connect p95 of about 0.10–0.34 s instead of up to 0.67 s; or cheaper round trips per statement (3.1). That work is Lane E of Stage 3, measured from Stage 1 on. The owner decides which number gates go-live (D1), knowing this.
 
 **How we get there:**
 - Stage 0: stop the old stack, rotate its credentials, put this plan and the amended AGENTS.md in place, and delete the obsolete documents.
@@ -221,11 +221,11 @@ What this means:
 - The connect tail (part 1) and the statement round trips (part 4) are Cloudflare's. Only Lane E (Stage 3) works on them.
 - Service bindings help little. Release 24 measured a p95 of 1,007 ms through a service binding against 1,073 ms public, and bindings work only for Workers on the same Cloudflare account (OP L399).
 
-**Stage 1 re-estimate (2026-10-17, measured parts in 11.1).** Cold page cache, volume kept mounted, full sandbox; p95 values are summed, so they are upper bounds:
-- Node path, login, first statement and the answer's round trip through the Tunnel: p50 about 0.27 s, p95 at most 0.36 s.
-- Statements 2–5 (four Tunnel round trips of 18 / 28 ms plus execution): p50 about 0.10 s, p95 at most 0.17 s.
-- Whole request: about 0.54 s plus the Cloudflare connect at p95. With release 24's connect (182–670 ms) that is about 0.72–1.2 s. The 1 s gate therefore needs a connect p95 of at most about 0.46 s.
-- The Tunnel leg alone measured 74 ms (Workers VPC) and 110 ms (public hostname) at p95. The connect tail lies in the Edge's own work and in the hop from the client Worker to the Edge, which is Lane E's work.
+**Stage 1 re-estimate (2026-10-17, measured parts in 11.1).** Volume kept mounted, the unit as first written for the image (`lane-c/node-image` `7e3375eb`), and the database's own files evicted from the page cache while the binaries every database shares stay cached. p95 values are summed, so they are upper bounds:
+- **Node part** (node path, login and first statement, measured end to end on the node): p50 0.22 s, p95 0.32 s. With the whole page cache dropped (worst case): 0.31 / 0.41 s. Without the unit's `ExecStartPre=` (Appendix C): 0.17 / 0.27 s.
+- **At today's Cloudflare cost per statement:** releases 23 and 24 measured statements 2–5 at +0.27–0.46 s through Cloudflare, so 68–115 ms per round trip including execution. The first answer needs one more such round trip. Whole request at p95: 0.32 + 0.07–0.12 + 0.27–0.46, about **0.66–0.90 s plus the connect**. **The 1 s gate then needs a connect p95 of at most about 0.10–0.34 s** (release 24: 182–670 ms). Without the `ExecStartPre=`: 0.15–0.39 s.
+- **Lane E's lower bound:** if a round trip costs only the Tunnel leg (Workers VPC 18 / 28 ms), the five round trips add at most 0.14 s and statements 2–5 execute in 0.03 / 0.09 s on the node: about 0.55 s plus the connect, so the connect p95 could take up to about 0.45 s. The first version of this estimate assumed this lower bound for every statement.
+- The Tunnel leg's connect alone measured 74 ms (Workers VPC) and 110 ms (public hostname) at p95. The rest of the connect tail and of each statement's round trip lies in the Edge's own work and in the hop from the client Worker to the Edge: Lane E's work.
 
 ### 3.2 Warm, cold and activity
 
@@ -390,9 +390,9 @@ Purchases still need the owner's costed go (section 9.7).
 **What thin LVM is.** A thin pool is one large block of disk. Each database gets a thin volume with a nominal size, say 1 GiB. The pool hands out real disk only in small chunks (64 KiB) as the database writes. The sum of nominal sizes can therefore exceed the disk; that is the disk half of the overbooking.
 
 **Layout per node.** The agent creates it once, at first boot:
-- **Volume group `pgcf`** on the LVM partition, with a large LVM metadata area so that hundreds of volumes fit. Stage 1 measured that the default area (1,020 KiB) holds 1,000 volumes and would run out near 1,450; the installer uses 64 MiB, and LVM command time, not the area, then bounds the count (11.1).
+- **Volume group `pgcf`** on the LVM partition, with a large LVM metadata area so that hundreds of volumes fit. Stage 1 measured that the default area (1,020 KiB) holds 1,000 volumes and would run out near 1,450; the installer uses 64 MiB, enough for about 95,000. The technical bound is 1,000 volumes per node (4.11).
 - **One thin pool over the whole partition.** It holds the data, 1 GiB of pool metadata, and an equal spare for repair.
-  - On a 150 GB disk that leaves about 125 GiB of data (*estimate*; Stage 1 records EU1's real disk size).
+  - EU1's disk is 300 GiB (Stage 1). With the image's 8 GiB root that leaves about 289 GiB of data (*estimate*; the lab pool beside a 40 GiB root held 257.8 GiB).
   - The pool is created at full size: there is no growth step, no anchor volume and no unused slack.
 - **Zeroed chunks.** Chunks are zeroed before reuse, so a chunk freed by tenant A is never readable by tenant B. This is tenant isolation, verified in Stage 5.8.
 - **Fail at once.** A full pool fails writes immediately instead of hanging for 60 s.
@@ -404,7 +404,7 @@ Purchases still need the owner's costed go (section 9.7).
 - It stays mounted while the database sleeps, so its files can stay cached.
 - After every clean sleep, the agent runs `fstrim` on it, off the request path. This returns space freed inside the filesystem (dropped tables, removed WAL) to the pool. Always-warm databases are trimmed daily.
 - Storage grows online.
-- *Estimate*: an empty database writes 120–160 MiB.
+- An empty database uses 68.6 MiB of its volume when it is ready, after its first base backup (*measured (EU1)*, Stage 1).
 
 **Three pool rules.** Thresholds are operator configuration.
 
@@ -414,7 +414,7 @@ Purchases still need the owner's costed go (section 9.7).
 | No room | Free data below the reserve | ≥ 75 % | Wakes, creates and restores on the node are refused with `57P03` "storage"; critical alert; running databases keep running |
 | Full | No free data | — | Writes fail at once; affected databases stop; recovery below |
 
-- **Logical cap** (plan default, from the research). The sum of nominal volume sizes stays at or below 4 × the pool's data size. It bounds how much sold storage a full pool can hurt. On a 125 GiB pool that is 500 GiB, or 500 databases of 1 GiB, above the expected density.
+- **Logical cap** (plan default, from the research). The sum of nominal volume sizes stays at or below 4 × the pool's data size. It bounds how much sold storage a full pool can hurt. On EU1's pool of about 289 GiB that is about 1,150 GiB, or about 1,150 databases of 1 GiB; the technical volume bound (1,000, 4.11) binds first.
 - **Reserve.** It starts at 6 GiB: the old 2 GiB reserve plus the old 4 GiB slack, now inside the pool. Stage 5.5 measures the node's sustained write rate while filling the pool. If that rate × 10 s is larger, the reserve is raised to it. This way the agent's pool sample, taken every 5 s, always sees the reserve being used before the pool is full.
 - **Write limits.** Each database's write bandwidth and IOPS are capped by its size, starting at 16 MB/s and 1,000 IOPS for 256 MiB. Stage 5.5 sets the real values from the measured disk. This bounds how fast one tenant can fill the pool.
 - **Full-pool recovery.** It is built into the agent in Stage 3, with a runbook in Stage 6. A full pool makes ext4 on the affected volumes abort its journal and remount read-only, so those databases stop.
@@ -434,19 +434,19 @@ Purchases still need the owner's costed go (section 9.7).
 - **PostgreSQL settings** follow the memory size (table in Appendix C). For 256 MiB: `shared_buffers` 32 MB and `work_mem` 2 MB.
   - *Estimate* of the worst case for 256 MiB: about 215 MiB, under the 230 MiB soft limit.
   - `shared_buffers` stays small because shared memory cannot be reclaimed without swap; the reclaimable page cache does the caching.
-- **CPU:** a weight proportional to the database's CPU size. There is no quota while PostgreSQL starts, because a quota would stretch the start by up to 4×. The quota of its size is set right after ready, which takes 4.6 ms (*measured (lab)*).
+- **CPU:** a weight proportional to the database's CPU size. There is no quota while PostgreSQL starts, because a quota would stretch the start by up to 4×. The quota of its size is set right after ready, which takes 4.6 ms (*measured (lab)*; on EU1 2.1–3.0 / 3.0–5.3 ms over D-Bus, Stage 1). A quota set this way stays on the unit after it stops and throttles its next start (Stage 1: a 50 % quota slowed the start from 109.6 / 157.3 to 161.2 / 215.1 ms). The agent therefore clears it (`CPUQuota=` infinity) whenever a database's unit stops, and for every stopped unit when the agent itself starts.
 - **Out of memory:** the kernel kills a backend, never the postmaster first. PostgreSQL then runs crash recovery for that database only. Acknowledged commits survive, and it is never a node event.
 - **No swap and no zswap** in v1. Revisit only on an observed problem.
 
-### 4.5 Node budget: 12 GB, 6 vCPU (EU1: 11,943 MiB visible)
+### 4.5 Node budget: 12 GB, 6 vCPU (EU1: 11,967 MiB visible, Stage 1)
 
-All values are operator configuration. They remain *estimates* until Stages 1 and 5 measure them (OB model).
+All values are operator configuration. Stage 1 set the backup line; the others remain *estimates* until Stage 5 measures them (OB model).
 
 | Item | MiB | Note |
 | --- | --- | --- |
 | System: kernel, systemd, journald, sshd, cloudflared, gateway, agent | 768 | Agent and gateway are protected from reclaim. In the Kubernetes era: 1 GiB kubelet reserve plus about 1,041 MiB idle platform |
 | Kernel memory of mounted sleeping volumes | 150 | About 0.5 MiB per mounted volume (*measured (lab)*: 0.13–0.55 MiB), so 150 MiB at 300 volumes. Stage 5.6 measures it at scale |
-| Backup jobs | 512 | Two WAL uploads and one base backup or restore at once. Stage 1 measured 61–76 MiB per barman WAL upload and 72 MiB RSS per base backup, whose cgroup also fills with reclaimable page cache (section 7.5) |
+| Backup jobs | 512 | Two WAL uploads (`MemoryMax` 128 MiB each) and one base backup or restore (256 MiB) at once, set from Stage 1's measurements (section 7.5). This line is separate from the awake-database budget only if the backup slice sits outside `pgcf.slice` (Appendix C) |
 | Kernel and page-cache floor | 600 | About 5 % |
 | **Awake-database budget** (hard limit on all databases together) | **9,913** | Enforced by the kernel on the database slice; admission per D3 |
 
@@ -499,7 +499,7 @@ No other early sleep exists. Without a waiting wake, a database sleeps only at i
 3. **Queue** for up to 10 s, then answer `57P03` with a retry hint. Integrators already retry `57P03` with backoff for about 90 s.
 4. **Move.** Cloudflare sees the queue waits and refusals in the node rollups. An operator, or after go-live an automatic rule, moves the most active databases off the node by R2 restore under the same ID (section 9.5).
 
-An early sleep is a full sleep proof: checkpoint, WAL switch, upload and stop. A waiting wake therefore takes seconds, not milliseconds; Stage 1 measures how long. Such wakes miss the one-second target and are counted in the p95.
+An early sleep is a full sleep proof: checkpoint, WAL switch, upload and stop. A waiting wake therefore takes seconds, not milliseconds: Stage 1 measured a full sleep proof at 1.02 / 1.08 s (p50 / p95), most of it the archive wait (11.1). Such wakes miss the one-second target and are counted in the p95.
 
 ### 4.8 Placement in Cloudflare
 
@@ -507,7 +507,8 @@ At create, restore and move, a node is **eligible** when all of these hold:
 - it is online with fresh samples, and its room rule passes;
 - its pool is open for placement (4.3: data below 80 %, metadata below 50 %, below the logical cap);
 - **owner rule:** the peaks of the 30-minute averages of active RAM and of CPU load are both below 80 %;
-- the database's memory fits the node's maximum.
+- the database's memory fits the node's maximum;
+- the node holds fewer volumes than the technical volume bound (1,000, 4.11).
 
 **Fill first** (owner rule). Among eligible nodes, the fullest wins: the node with the highest active-RAM peak that stays under 80 % after adding the new database. A new node gets databases only when the others are full.
 
@@ -561,8 +562,8 @@ The overbooking model (OB) bounds the databases sold per node with a 99.9 % bino
 | 5 % | about 290 | about 6× |
 | 10 % | about 150 | about 3× |
 
-- **Disk.** At about 0.3 GiB written per database, placement closes at about 330 databases (80 % of 125 GiB). So disk binds near the same point as RAM under (b), and before RAM under (a).
-- **LVM.** Stage 1 measures how many volumes one volume group handles well. That number may bind first. It becomes a technical placement bound, not a sales limit.
+- **Disk.** At about 0.3 GiB written per database (*estimate*), placement closes at about 770 databases (80 % of about 289 GiB). So disk binds well after RAM under (b); under (a) it binds at about 770, before the volume bound.
+- **LVM.** Technical volume bound: **1,000 volumes per node**, the largest count Stage 1 measured. At 1,000 volumes lvcreate took 270 / 335 ms (p50 / p95) and a JSON listing 150–186 ms; neither is on the wake path, and the 64 MiB metadata area would hold about 95,000. The bound rises only after a measurement at a higher count. It is a technical placement bound (4.8), not a sales limit.
 - **Reality first.** Real awake shares stay unknown until `awake_seconds` is measured per database.
   - A database pinged by a health check every few minutes is effectively always awake, and placement sees that in its metrics.
   - Because the 80 % rule uses measured peaks, density follows reality without this model. The model only forecasts.
@@ -757,23 +758,23 @@ Changes:
 | 1 | The client Worker opens the WebSocket. The Edge runs both limiters and `admitWake` from DO state, signs a v5 wake ticket and opens the gateway socket through the node's Tunnel | *measured (EU1)*, release 24 "Cloudflare connect"; unchanged by option C; Lane E works on it | 182–670 ms |
 | 2 | The gateway verifies the token, checks the replay cache and queues the wake with the agent **before** answering the upgrade. It holds the StartupMessage and the pipelined password | *estimate* | 0.1–0.5 ms |
 | 3 | The agent applies the room and memory rules and reads `pg_control` with its checksum: state "shut down", identity and checkpoint against the proven-sleep record | *estimate* | 1–5 ms |
-| 4 | Mount, only if not mounted | Kept mounted: 0; at wake: *measured (EU1)* 68–120 ms | 0 or 68–120 ms |
-| 5 | Start the unit until PostgreSQL reports ready | *measured (lab)* 54.0 / 60.7 ms (p50/p95); *measured (EU1, Stage 1)* 122.3 / 174.5 ms warm, 179.6 / 214.8 ms cold | 120–215 ms |
+| 4 | Mount, only if not mounted | Kept mounted: 0; at wake: *measured (EU1, Stage 1)* 96–122 / 117–165 ms (p50 / p95) | 0 or 96–165 ms |
+| 5 | Start the unit until PostgreSQL reports ready | *measured (lab)* 54.0 / 60.7 ms (p50/p95); *measured (EU1, Stage 1)*, unit as first written for the image: 167.3 / 225.7 ms warm, 168.9 / 244.6 ms with the database's files cold; without its `ExecStartPre=` 122.7 / 146.8 ms warm | 120–245 ms |
 | 6 | Release to the gateway with uid and main PID; peer check | *estimate* | < 1 ms |
-| 7 | Unix dial, forward the held startup, SCRAM login | *measured (lab)* 4.3 / 5.0 ms; *estimate (EU1)* 5–10 ms | 5–10 ms |
-| 8 | First SaaS statement | *measured (EU1)*: about 20 ms with a warm cache, 88–149 ms with a cold cache | 20–149 ms |
-| 9 | Answer back to the Worker | *estimate* | about 20 ms |
+| 7 | Unix dial, forward the held startup, SCRAM login | *measured (lab)* 4.3 / 5.0 ms; *measured (EU1, Stage 1, libpq over the socket)* 17.2 / 37.2 ms warm, 25.3 / 38.5 ms with the database's files cold | 17–39 ms |
+| 8 | First SaaS statement | *measured (EU1, Stage 1, 509 MB dataset)*: 5.0 / 11.1 ms warm, 21.4 / 25.1 ms with the database's files cold, 29.5 / 37.6 ms with the whole page cache dropped (the Kubernetes runtime measured 88–149 ms cold) | 5–38 ms |
+| 9 | Answer back to the client Worker | *measured (EU1)*: the Tunnel leg alone 18 / 28 ms (Stage 1); a whole round trip through the Edge 68–115 ms (releases 23 and 24) | 20–115 ms |
 | 10 | After the answer, off the path: D1 claim, observation, usage, CPU quota | — | 0 ms |
 | 11 | Statements 2–5, each one round trip through Cloudflare | *measured (EU1)*, releases 23 and 24 | +0.27–0.46 s |
 
-- **Node path (steps 2–6):** *estimate* 85–155 ms with volumes kept mounted, 155–275 ms when mounting at wake. Release 23 measured 469 ms. *Target:* p95 ≤ 150 ms with volumes kept mounted. *Measured (EU1, Stage 1):* 122.6 / 174.7 ms kept mounted with a warm cache, 180.7 / 215.7 ms cold; the analysis is in 11.1.
-- **First answer:** *estimate* p50 about 0.43–0.6 s, p95 about 0.7–0.95 s.
-- **Whole request:** p95 about 1.1–1.4 s (section 3.1).
+- **Node path (steps 2–6):** *estimate* 85–155 ms with volumes kept mounted, 155–275 ms when mounting at wake. Release 23 measured 469 ms. *Target:* p95 ≤ 150 ms with volumes kept mounted. *Measured (EU1, Stage 1, no CPU quota):* with the unit as first written for the image 167.5 / 226.4 ms kept mounted with a warm cache, 169.5 / 271.3 ms with the database's files cold, 253.2 / 351.3 ms with the whole page cache dropped, and 286.9 / 366.7 ms mounting at wake (warm). Without its `ExecStartPre=`: 123.0 / 152.7 ms kept mounted, warm. The target is missed; the analysis is in 11.1.
+- **First answer:** *estimate (Stage 1)* p95 about 0.57–1.1 s: release 24's connect, the node part measured in Stage 1, and one round trip through Cloudflare (3.1).
+- **Whole request:** *estimate (Stage 1)* p95 about 0.84–1.57 s with today's Cloudflare path (section 3.1).
 - **Overlap:** the wake starts before the upgrade is answered. This hides about one Worker-to-gateway round trip of the node path.
 
 **What still decides the p95** is not the node:
 - **The Cloudflare path:** the connect tail (up to 670 ms) and the four later round trips. Lane E works on both.
-- **A cold page cache** for a database idle for days, which adds 70–130 ms to the first statement.
+- **A cold page cache** for a database idle for days. Stage 1 measured +16 / +14 ms on the first statement and +2 / +45 ms on the node path (p50 / p95, the database's files evicted, 509 MB dataset); the Kubernetes runtime saw 70–130 ms more on the first statement.
   - Volumes stay mounted while asleep, so a stopped database's files stay cached until the memory is needed. Only an unmount drops them (*measured (lab)*: a 64.3 MB table stayed fully cached after stop; unmounting dropped it to 0).
   - Under memory pressure, that cache goes first.
   - If a measured p95 misses because of it, the next step is `pg_prewarm` with `autoprewarm` (Neon found the same). This is added only on that observed problem.
@@ -785,7 +786,7 @@ Changes:
 2. The agent creates the user, the volume and the filesystem, mounts it, runs `initdb` and writes the configuration.
 3. It checks that the database's R2 prefix is empty, and refuses otherwise.
 4. It starts PostgreSQL through admission, applies the roles and takes the first base backup.
-5. It reports **ready only when that backup is DONE**; only then does the Edge route traffic. WAL without a base backup cannot be restored, so a database is never writable before it is restorable. An empty cluster backs up in seconds; Stage 1 measures it.
+5. It reports **ready only when that backup is DONE**; only then does the Edge route traffic. WAL without a base backup cannot be restored, so a database is never writable before it is restorable. An empty cluster's first base backup took 7.35 s, and create to ready 9.4 s (Stage 1).
 
 For reference, the old standard runtime reached ready in 30.7 s, with the base backup and WAL in R2 20.7 s later (*measured (EU1)*, OP L372).
 
@@ -1011,10 +1012,10 @@ Stage 1 runs the backup test with exactly these users and modes.
 3. It runs `barman-cloud-wal-archive --gzip` as the database's user (7.4). A 16 MiB segment is one synchronous PUT, and R2 answers 200 only once the data is durable.
 4. On success, the agent appends the segment to the database's **upload log** and replies OK. The log is fsynced per entry, so it survives agent restarts. PostgreSQL then marks the segment done.
 5. Any error, or a 60 s timeout, returns failure, and PostgreSQL retries.
-6. Uploads are serial per database. Node-wide concurrency follows from measured memory:
-   - concurrent uploads = (backup budget − one base backup or restore) ÷ the measured memory of one upload;
-   - the starting point is 2 uploads plus 1 base backup or restore;
-   - all limits sit in one place in operator configuration.
+6. Uploads are serial per database. Node-wide limits, set from Stage 1's measurements (11.1):
+   - per-job `MemoryMax`: **128 MiB for a WAL upload** (cgroup peak at most 75.7 MiB over 107 calls); **192 MiB for a WAL fetch** with `wal-restore -p 4` (peak at most 117.6 MiB over 83 calls); **256 MiB for a base backup or restore**. A base backup or restore holds only 64–73 MiB of process memory, but its file reads and writes fill any limit with reclaimable page cache (both reached the lab's 400 MiB limit), so that limit caps cache, not need (*estimate*: gzip, not IO, bounds a base backup, so the smaller cache does not slow it; Stage 5 confirms the duration);
+   - concurrency = (backup budget 512 MiB − one base backup or restore 256 MiB) ÷ one upload 128 MiB = **2 uploads plus 1 base backup or restore** at once. A restore's WAL fetches run one at a time inside its own slot;
+   - all limits sit in one place in operator configuration. The native WAL PUT of the cost trigger below sets the upload limit again from its own measurement.
 7. Metrics: duration, failures and the `.ready` backlog. A sustained backlog raises `database_archive_failing`.
 
 **Cost trigger.** Each call forks Python and boto3 (*measured (EU1, Stage 1)*: 61–71 MiB RSS and 0.45–1.04 CPU-s per call). The WAL path switches to a native Rust PUT in the same Barman layout if either holds:
@@ -1084,7 +1085,7 @@ This keeps the tested `power.rs` proof, and its rule that a lost outcome is neve
    - every complete segment before the checkpoint's segment is in the upload log, and none is waiting;
    - `postmaster.pid` is gone.
 
-   The checkpoint's own segment holds only what was written after the switch, with clients already locked out: the checkpoint, hint bits and autovacuum work, never a client commit. PostgreSQL 18 enables data checksums by default and therefore writes full-page images; Stage 1 measures where the checkpoint lands.
+   The checkpoint's own segment holds only what was written after the switch, with clients already locked out: the checkpoint, hint bits and autovacuum work, never a client commit. PostgreSQL 18 enables data checksums by default and therefore writes full-page images. Stage 1 found the shutdown checkpoint in segment S+1: as its first record when idle, or after 334 `FPI_FOR_HINT` records when reads set hint bits after the switch (11.1).
 9. **Record.** Write the **proven-sleep record** (system identifier, timeline, checkpoint location, last archived segment) to a local file and fsync it. Then report the sleep to D1.
 
 Only a database with a matching record is cold and safe. If steps 7–9 fail, the database is **unproven** (7.10).
@@ -1644,15 +1645,16 @@ From the canary on, the EU1 stack is production.
 | Stage 1 Block 3: Contabo facts | Firmware **BIOS** (no `/sys/firmware/efi`); disk 300 GiB (322,122,547,200 B); network **static** (cloud-init NoCloud: IPv4 /23 with gateway, IPv6 /64 via `fe80::1`; the installed image uses netplan and networkd; the rescue's extra DHCP stanza got no offer in 162 s); 6 vCPU AMD EPYC family 23 model 1 (Zen 1) with software retbleed and SRSO mitigations; 11,967 MiB RAM visible. Rescue system: Debian 12, kernel 6.1, cloud-init 22.4.2, 11,960 MiB RAM; sgdisk, sfdisk, wipefs, partprobe, curl, wget, gzip, zstd, sha256sum and python3 (with `lzma`) present, **no `xz` binary** |
 | Stage 1 Block 3: rescue cloud-init | **Yes:** rescue cloud-init runs our `write_files` and `runcmd` (two rescue boots; `runcmd` ran 1 min 53 s after the API call; SSH answered after 1 min 47–49 s; HTTPS out works). Contabo merges its own cloud-config into `userData`: its `runcmd` entries run first, and it sets `ssh_pwauth: true` and a root password through `chpasswd` even when only SSH keys are given, so the installer turns password login off itself |
 | Stage 1 Block 3: Cloudflare path (temporary Tunnel, VPC service and Worker, deleted afterwards) | cloudflared 2026.10.0 (sha256 checked) runs a remotely managed Tunnel with `--token-file` over QUIC, 4 connections in FRA. The probe Worker ran in AMS: 3 × 30 WebSocket connects to a loopback echo, each with 5 sequential round trips (p50 / p95). **Workers VPC binding** (available on the account; the WebSocket upgrade works): connect 52.5 / 73.6 ms, round trip 18.0 / 28.0 ms, connect plus 5 round trips 146 / 195 ms. **Public hostname without Access** (a TryCloudflare quick tunnel, because the account token has no DNS permission): connect 65.0 / 109.6 ms, round trip 17.0 / 26.0 ms, connect plus 5 round trips 160 / 219 ms. Plain HTTP through the VPC binding: 46 ms per request. **With Access: not measured**: the account has no Zero Trust organization and the token no Access permission (API error 9999) |
-| Stage 1 Block 1: start path (hardened unit, 256 MiB class, 509 MB SaaS dataset, start over D-Bus as the agent will; 40 runs each; p50 / p95 ms) | Kept mounted, warm cache: `pg_control` read with CRC 0.2 / 0.3, start to READY 122.3 / 174.5, **node path 122.6 / 174.7**, SCRAM login (libpq over the socket) 12.9 / 67.8, first SaaS statement 4.8 / 9.7, first answer 154.8 / 225.1. Kept mounted, cold cache (`drop_caches`): `pg_control` 0.9 / 1.7, start 179.6 / 214.8, **node path 180.7 / 215.7**, login 46.5 / 58.5, first statement 25.6 / 59.9, first answer 253.2 / 300.0. Mounted at wake: mount 89.4 / 131.9 (warm) and 91.1 / 119.8 (cold); node path 223.2 / 323.1 (warm) and 276.7 / 335.3 (cold). Fast stop 45.9–59.9 / 59.3–89.3. A 20-run set with `systemctl` gave the same picture (node path 131.6 / 169.5 kept mounted, warm). **The node-path target (p95 ≤ 150 ms kept mounted) is missed** |
-| Stage 1 Block 1: start-path analysis | systemd "Starting" to PostgreSQL's first log line 65–76 ms, then about 12 ms to ready; started directly (runuser, no systemd) 46.2 / 88.4 ms. An exec-only unit starts in 37.7 / 65.0 ms plain and 79.5 / 116.7 ms with the full sandbox: `ProtectKernelTunables`/`Modules`/`Logs` with `ProtectControlGroups` add about 25 ms, `PrivateNetwork` 8–14 ms, `IPAddressDeny` and the seccomp options 0–5 ms. The PostgreSQL unit, interleaved, 40 starts each: full sandbox 111.4 / 151.4, without `ProtectKernel*`/`ProtectControlGroups` 97.9 / 151.4, without any mount or network namespace 77.1 / 94.9. Exec is slow on this vCPU (fork and exec of `/bin/true` 3.1 ms, `postgres -V` 10.6–14.9 ms). The owner weighs sandbox depth (D7) against the 150 ms node-path target |
-| Stage 1 Block 1: checks | A private `/dev/shm` works only with `TemporaryFileSystem=/dev/shm:size=…,mode=1777` (the default 0755 root mount makes PostgreSQL fail with "could not open shared memory segment"). A parallel vacuum launched 2 workers with up to 5 DSM segments in the unit's own `/dev/shm`; the host's stayed empty. After kill -9 of the postmaster the cgroup was empty within 2 ms, with no process or `/dev/shm` file left; `postmaster.pid` and one 56-byte SysV segment stayed until the next start, and `RemoveIPC=yes` removes the segment. A per-unit `CPUWeight` inside `pgcf.slice` toggles no controller (`cpu io memory pids` stay enabled) and shows no cost above the noise (start 110.0 / 210.5 vs 130.3 / 206.8 ms, stop 28.7 / 39.9 vs 29.9 / 45.1 ms). Live `CPUQuota` change 2.1 / 3.0 ms and `MemoryMax` 1.7 / 2.3 ms over D-Bus. After `pg_switch_wal()` the shutdown checkpoint lands in the next segment: as its first record when idle, or after 334 `FPI_FOR_HINT` records when reads set hint bits after the switch (checksums on); never after a client commit. `systemd-analyze security`: 0.4 SAFE |
-| Stage 1 Block 1: LVM at scale (loop-backed pool, 1,000 thin volumes of 1 GiB with 20-character names and tags) | The default metadata area (1,044,480 B) holds 1,000 volumes: free space fell from 519,168 to 160,256 B, 358.9 B per volume, so it would run out near 1,450 volumes (extrapolated). `--metadatasize 64m` gives 68,153,344 B, enough for about 94,900 volumes by the same slope. Metadata text 461 B per volume. lvcreate p50 rose from 144 ms (first 100) to 267–270 ms (900–1,000); all creates 206–224 / 284–307 ms; lvremove 196–198 / 261–266 ms; JSON listing 76 ms at 100 and 148–150 ms at 1,000 volumes (with tags 184–186 ms). Pool metadata use 2.05 % of 1 GiB with 1,000 empty volumes. Each active, unmounted thin volume took 0.23–0.32 MiB of MemAvailable. **Bound:** the 64 MiB area is not the limit; LVM command time, which grows by about 0.13 ms per existing volume, is. EU1's pool: 276,819,869,696 B of data on the 259.9 GiB partition, zeroing on; lvm2 2.03.31 rejects `--errorwhenfull` at lvcreate for thin pools, so it is set with `lvchange` |
-| Stage 1 Block 2: backups under the real permission model | Sandboxed PostgreSQL → archive client on a Unix socket → lab agent (caller identified by `SO_PEERCRED`) → `systemd-run` as `pgcf-<id>` in `pgcf-backup.slice` with `LoadCredential=` → barman-cloud 3.20.1 → R2 with a locally signed credential (explicit actions, no delete, one prefix). wal-archive per call: full segments (57 during a bulk load) 1.448 / 1.986 s, **0.84 / 1.04 CPU-s**, RSS 66.5 / 71.1 MiB (cgroup peak at most 75.7 MiB); near-empty segments 0.754 / 0.903 s, **0.45 / 0.50 CPU-s**, RSS 61 MiB. **The cost trigger of 7.5 holds (above 0.25 CPU-s).** Serial archiving drained a 57-segment bulk load 47.8 s after the load ended. Base backup (gzip, `-J 2`) of 509 MB: 67.2 s, 62.7 CPU-s (gzip-bound), RSS 71.7 MiB, `data.tar.gz` 103,863,748 B in 5 multipart parts, DONE; page cache fills the job's cgroup up to its limit. Restore into a new volume as the new user: barman-cloud-restore 6.5 s, recovery and promotion 7.2 s; PITR: 3.3 s and 6.1 s, stopped before the first commit after the target. Both: `system_identifier` equal to `backup.info`, timeline 2 above 1, data digest equal. `wal-restore -p 4` with a spool directory per operation (empty after success; 3 files left after a failed recovery); one wal-restore call 0.58–0.64 / 0.97–1.0 s, 0.39–0.48 CPU-s, RSS 60 MiB |
+| Stage 1 Block 1: start path (256 MiB class, 509 MB SaaS dataset, start over D-Bus as the agent will; 40 runs each; p50 / p95 ms; no CPU quota on the unit or the slice, `cpu.max` read in every run) | **The unit as first written for the image** (`pgcf-pg@.service` on `lane-c/node-image` `7e3375eb`), kept mounted, warm cache: `pg_control` read with CRC 0.2 / 0.6, start to READY 167.3 / 225.7, **node path 167.5 / 226.4**, SCRAM login (libpq over the socket) 17.2 / 37.2, first SaaS statement 5.0 / 11.1, first answer 185.4 / 283.1, statements 2–5 21.4 / 70.6. Kept mounted, only the database's own files evicted (fadvise; the shared binaries stay cached): **node path 169.5 / 271.3**, login 25.3 / 38.5, first statement 21.4 / 25.1, first answer 216.8 / 322.0. Kept mounted, whole page cache dropped (`drop_caches`): node path 253.2 / 351.3, login 30.2 / 38.5, first statement 29.5 / 37.6, first answer 314.4 / 414.8. Mounted at wake: mount 100.9 / 163.8 (warm) and 111.3 / 151.8 (cold); node path 286.9 / 366.7 and 342.5 / 422.6. Fast stop 56.3–66.2 / 82.9–101.9. **The lab unit of the first runs** (same sandbox, no `ExecStartPre=`), in the same session: node path 123.0 / 152.7 warm, 126.7 / 212.3 with the database's files evicted, 198.6 / 318.8 with the whole cache dropped, 231.3 / 288.9 and 324.9 / 387.0 mounted at wake; login 18.5 / 29.4 warm. With the whole cache dropped, the node reads the binaries from disk and the sets vary widely. **The node-path target (p95 ≤ 150 ms kept mounted, warm) is missed:** by 76 ms with the unit as written, by 3 ms without its `ExecStartPre=` |
+| Stage 1 Block 1: CPU quota left over in the first runs | The first 40-run D-Bus sets ran under a 50 % `CPUQuota` that the live-property test had left as a runtime drop-in (`/run/systemd/system.control/<unit>.d/50-CPUQuota.conf`): the stopped unit kept `CPUQuotaPerSecUSec=500ms`, and at its next start `cpu.max` read `50000 100000`. Those sets are replaced by the runs above. Same lab unit, warm cache, with and without the quota: node path 122.6 / 174.7 and 123.0 / 152.7, login 12.9 / 67.8 and 18.5 / 29.4. Two 20-start sets of the same script: 161.2 / 215.1 with the quota set after each start, 109.6 / 157.3 without. **A quota set with `SetUnitProperties` persists after the stop and throttles the next start**, so the agent clears it at every stop (4.4) |
+| Stage 1 Block 1: start-path analysis (no CPU quota) | Variants of the unit as first written for the image, D-Bus start until READY, interleaved, warm cache, 40 starts each (p50 / p95 ms): as written 167.2 / 198.7; without `ExecStartPre=` 132.4 / 184.0; without the per-unit `CPUWeight` 168.1 / 257.0 (no cost at p50; one 654 ms outlier); without `ExecStartPre=` and `ProtectKernel*`/`ProtectControlGroups` 118.2 / 181.2; without `ExecStartPre=` and any mount or network namespace 85.3 / 153.6; the lab unit 126.3 / 183.9. **The `ExecStartPre=` costs about 35 ms** (one more process spawned through systemd's executor: "Starting" to PostgreSQL's first log line took 124–165 ms, against 65–76 ms for the lab unit), and the mount and network namespaces about 47 / 30 ms. Exec-only units (`/bin/sleep`, p50, 30 each): plain 36.3–40.4 ms, with the lab sandbox 90.4–91.1 ms; alone, the mount options add 40 ms (`ProtectKernel*` with `ProtectControlGroups` alone 41 ms in a second set), the network namespace 20 ms, the IP filter 1.5 ms and the seccomp options 4 ms. An earlier set of the same tests, also without a quota: full sandbox 111.4 / 151.4, without `ProtectKernel*`/`ProtectControlGroups` 97.9 / 151.4, without any namespace 77.1 / 94.9. Started directly (runuser, no systemd) 46.2–53.8 / 88.4–90.4 ms. Exec is slow on this vCPU (`postgres -V` 10.8 / 13.7 ms, `postgres -C` 21.6 / 24.2 ms). The owner weighs sandbox depth (D7) against the 150 ms node-path target |
+| Stage 1 Block 1: checks | A private `/dev/shm` works only with `TemporaryFileSystem=/dev/shm:size=…,mode=1777` (the default 0755 root mount makes PostgreSQL fail with "could not open shared memory segment"). A parallel vacuum launched 2 workers with up to 5 DSM segments in the unit's own `/dev/shm`; the host's stayed empty. After kill -9 of the postmaster the cgroup was empty within 2–5 ms, with no process or `/dev/shm` file left; `postmaster.pid` stayed until the next start, and so did one 56-byte SysV segment, except with `RemoveIPC=yes` (none left with the unit as first written for the image); the restart with crash recovery took 1.77 s. A per-unit `CPUWeight` inside `pgcf.slice` toggles no controller (`cpu io memory pids` stay enabled with the unit running and stopped) and costs nothing measurable (interleaved: 167.2 ms p50 with it, 168.1 ms without); in `system.slice` the `cpu` controller toggles with the unit (start 142.4 / 187.9 ms with a weight, 120.7 / 156.6 ms without). Live `CPUQuota` change 2.1–3.0 / 3.0–5.3 ms and `MemoryMax` 1.7–2.5 / 2.3–4.0 ms over D-Bus. After `pg_switch_wal()` the shutdown checkpoint lands in the next segment: as its first record when idle, or after 334 `FPI_FOR_HINT` records when reads set hint bits after the switch (checksums on); never after a client commit. `systemd-analyze security`: 0.4 SAFE |
+| Stage 1 Block 1: LVM at scale (loop-backed pool, 1,000 thin volumes of 1 GiB with 20-character names and tags) | The default metadata area (1,044,480 B) holds 1,000 volumes: free space fell from 519,168 to 160,256 B, 358.9 B per volume, so it would run out near 1,450 volumes (extrapolated). `--metadatasize 64m` gives 68,153,344 B, enough for about 94,900 volumes by the same slope. Metadata text 461 B per volume. lvcreate p50 rose from 144 ms (first 100) to 267–270 ms (900–1,000); all creates 206–224 / 284–307 ms; lvremove 196–198 / 261–266 ms; JSON listing 76 ms at 100 and 148–150 ms at 1,000 volumes (with tags 184–186 ms). Pool metadata use 2.05 % of 1 GiB with 1,000 empty volumes. Each active, unmounted thin volume took 0.23–0.32 MiB of MemAvailable. **Technical volume bound: 1,000 volumes per node** (4.11), the largest count measured; the 64 MiB area would hold about 95,000, and LVM command time grows by about 0.13 ms per existing volume. EU1's pool: 276,819,869,696 B of data on the 259.9 GiB partition, zeroing on; lvm2 2.03.31 rejects `--errorwhenfull` at lvcreate for thin pools, so it is set with `lvchange` |
+| Stage 1 Block 2: backups under the real permission model | Sandboxed PostgreSQL → archive client on a Unix socket → lab agent (caller identified by `SO_PEERCRED`) → `systemd-run` as `pgcf-<id>` in `pgcf-backup.slice` with `LoadCredential=` → barman-cloud 3.20.1 → R2 with a locally signed credential (explicit actions, no delete, one prefix). wal-archive per call: full segments (57 during a bulk load) 1.448 / 1.986 s, **0.84 / 1.04 CPU-s**, RSS 66.5 / 71.1 MiB (cgroup peak at most 75.7 MiB); near-empty segments 0.754 / 0.903 s, **0.45 / 0.50 CPU-s**, RSS 61 MiB. **The cost trigger of 7.5 holds (above 0.25 CPU-s).** Serial archiving drained a 57-segment bulk load 47.8 s after the load ended. Base backup (gzip, `-J 2`) of 509 MB: 67.2 s, 62.7 CPU-s (gzip-bound), RSS 71.7 MiB, `data.tar.gz` 103,863,748 B in 5 multipart parts, DONE; page cache fills the job's cgroup up to its limit. Restore into a new volume as the new user: barman-cloud-restore 6.5 s, recovery and promotion 7.2 s; PITR: 3.3 s and 6.1 s, stopped before the first commit after the target. Both: `system_identifier` equal to `backup.info`, timeline 2 above 1, data digest equal. `wal-restore -p 4` with a spool directory per operation (empty after success; 3 files left after a failed recovery); one wal-restore call 0.58–0.64 / 0.97–1.0 s, 0.39–0.48 CPU-s, RSS 60 MiB. Job cgroup peaks under the lab's 400 MiB job limit: WAL upload at most 75.7 MiB (107 calls), WAL fetch at most 117.6 MiB (83 calls), base backup and restore at the limit (page cache) with 64–73 MiB of process memory. These set the per-job limits and the concurrency in 7.5. systemd nests `pgcf-backup.slice` inside `pgcf.slice` (control group `/pgcf.slice/pgcf-backup.slice`; Appendix C) |
 | Stage 1 Block 2: restore continuity | A plugin-barman-cloud archive of benchmark database `uzytv7ue7kijtl2x5btw` restored into the plain unit with a read-only credential: 79 WAL fetches, redo 97.2 s, promoted, `system_identifier` equal, all 509 MB of SaaS data present. It needs `hot_standby = off` during recovery (a target `max_connections` of 25 below the source's 100 aborts recovery with "insufficient parameter settings"), the CloudNativePG `postgresql.conf`, `custom.conf` and `override.conf` replaced, and the roles reset (the source superuser is `postgres`) |
 | Stage 1 Block 2: credentials | Local HS256 signing works on the EU-jurisdiction bucket. DeleteObject and DeleteObjects: 403 AccessDenied. HeadBucket: 403, and never needed (wal-archive, backup, restore and wal-restore all succeeded). Writes and lists outside the prefix: 403. **A 7-day lifetime is accepted** (30 days too). On expiry barman exits 4 after R2 answers "SignatureDoesNotMatch", the same exit code as any refusal, so the agent tracks the expiry time itself; after renewal the archiver's next retry succeeded 48.6 s later, without a restart. A unit's `Environment=` (`systemd-run -E`) is readable by every local user over D-Bus; `LoadCredential=` is not. The backup role also needs EXECUTE on `pg_switch_wal()` and `pg_create_restore_point(text)`; without them barman failed after 68 s of upload |
 | Stage 1 Block 2: create and sleep costs | Empty database to ready: user, thin volume, mkfs, mount, initdb and configuration 1.8 s; start 146 ms; roles 59 ms; first base backup 7.35 s (3.2 CPU-s); **9.4 s in total**; 68.6 MiB of its thin volume used. Full sleep proof, 10 runs: **1,016.6 / 1,084.4 ms** (checkpoint 60.8 / 79.2, switch 70.1 / 102.2, archive wait 807.9 / 869.9, stop 57.8 / 89.0, `pg_control` check 3.4 / 5.4 ms) |
-| Stage 1 cleanup | Temporary Tunnel, VPC service and Worker deleted; the 113 lab objects (314.7 MB) under the lab prefix deleted; credential files removed from EU1. Locally signed credentials cannot be revoked one by one: the lab's working credentials expire by 2026-10-17 22:52 UTC, and two HeadObject-only probe credentials for one non-existent key expire on 2026-10-24 and 2026-11-16, or earlier when Stage 0 revokes the parent key. EU1 stays on Debian 13 with the lab key and its lab databases stopped |
+| Stage 1 cleanup | Temporary Tunnel, VPC service and Worker deleted; the 113 lab objects (314.7 MB) under the lab prefix deleted; credential files removed from EU1. Locally signed credentials cannot be revoked one by one: the lab's working credentials expire by 2026-10-17 22:52 UTC, and two HeadObject-only probe credentials for one non-existent key expire on 2026-10-24 and 2026-11-16, or earlier when Stage 0 revokes the parent key. EU1 stays on Debian 13 with the lab key and its lab databases stopped, with the lab unit and the unit as first written for the image installed, no runtime unit properties left and no failed units. All raw lab output, including what was only on EU1, is kept with the lab scripts outside the repository |
 | Stage 2 steps 1–5 on branch `stage2/clean-main` (2026-10-17) | 269,602 non-lockfile lines deleted and 6,749 added against main `85a2e6e3` (270,670 and 6,767 with the lockfiles). Locally green: lint, format, typecheck, the four contract generator checks, cargo fmt, clippy and tests, the Worker build, every workspace test (API 774, contracts 209, Edge 103, Rust Edge 20), the node-agent kernel test and Mermaider |
 
 ### 11.2 Open
@@ -1660,7 +1662,7 @@ From the canary on, the EU1 stack is production.
 | Stage | Status | Next step |
 | --- | --- | --- |
 | 0 Wind down | In progress: documents and AGENTS.md done; the owner is stopping the control server | Credential rotation, test leftovers, worktrees (steps 4–6) |
-| 1 Lab on EU1 | Done 2026-10-17 (11.1), except Access: not measured, because the account has no Zero Trust organization | The owner decides on the node-path miss (sandbox depth, D7) and on D1 with the re-estimate in 3.1; an Access measurement needs a Zero Trust organization |
+| 1 Lab on EU1 | Done 2026-10-17 (11.1); the start path was rerun after review without a leftover CPU quota. Access not measured: the account has no Zero Trust organization | Lane C removes `ExecStartPre=` from `pgcf-pg@.service` and gives the backup slice a top-level name (Appendix C). The owner decides on the remaining node-path miss (sandbox depth, D7) and on D1 with the re-estimate in 3.1 (at today's cost per statement, the connect p95 may take at most about 0.10–0.34 s). An Access measurement needs a Zero Trust organization |
 | 2 Clean main | In progress: steps 1–5 done on `stage2/clean-main`. Kubernetes-shaped names stay in the release spec, node observations, runtime attestation, the CNPG route target, the gateway and parts of the node agent until Stage 3 replaces them | Merge to main and one green CI run; then deploy the API with migration `0062` once the private Worker configuration has the same binding changes (step 6) |
 | 3 Build | Open | Lanes A–E |
 | 4 Install EU1 | Open (needs Stage 3) | |
@@ -1710,7 +1712,7 @@ Each has a plan default. Work proceeds on the default unless the owner says othe
 
 | # | Decision | Plan default |
 | --- | --- | --- |
-| D1 | What gates go-live: the whole 5-statement request, or the first answer? By estimate, option C reaches a first-answer p95 of about 0.7–0.95 s and a whole-request p95 of about 1.1–1.4 s. The whole-request gate also needs Lane E's Cloudflare work (3.1) | The whole request ("executed"). Both are reported, and the Stage 1 and Lane E numbers go to the owner before Stage 5 |
+| D1 | What gates go-live: the whole 5-statement request, or the first answer? By Stage 1's re-estimate, option C reaches a first-answer p95 of about 0.57–1.1 s and a whole-request p95 of about 0.84–1.57 s, depending on the Cloudflare connect. The whole-request gate also needs Lane E's Cloudflare work (3.1) | The whole request ("executed"). Both are reported, and the Stage 1 and Lane E numbers go to the owner before Stage 5 |
 | D2 | Early sleep: may the node put an idle-but-awake database to sleep before its idle time, but only while another wake waits? | Yes: only with a wake queued, one per waiting wake, never with client activity in the last 30 s, never an always-warm database. Stated in the handover |
 | D3 | Awake RAM: admit by (a) measured use, like `actual_ram` on main (more databases awake at once; a rare out-of-memory kill of one backend of another tenant, with no data loss), or by (b) full reservations (256 MB guaranteed while awake; about 37 awake 256 MiB databases per node)? | (a) measured use, matching the owner's "measured active RAM", with the slice limit as backstop |
 | D4 | Database ID after node-loss recovery | New IDs, as the handover documents today. Alternative: keep the IDs and report the recovery point |
@@ -1730,14 +1732,14 @@ Each has a plan default. Work proceeds on the default unless the owner says othe
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
 | Cloudflare path: the connect tail (182–670 ms) and four statement round trips (0.27–0.46 s) | The whole-request p95 misses even with a fast node | Lane E with its own targets; measured in Stage 1 before the build; numbers go to the owner for D1 |
-| Contabo vCPUs start PostgreSQL slower than the lab | Node path above 150 ms | Measured in Stage 1; no CPU quota during start; at most 4 starts at once |
-| Cold page cache after days idle, especially at high density | +70–130 ms on the first statement | Volumes stay mounted; 5.3 runs at the 5.6 density; `pg_prewarm` only on an observed miss |
+| Contabo vCPUs start PostgreSQL slower than the lab | Node path above 150 ms (Stage 1: 153–226 ms at p95, 11.1) | No `ExecStartPre=` in the unit; no CPU quota during start, cleared at every stop because a set quota persists; sandbox depth is D7; at most 4 starts at once |
+| Cold page cache after days idle, especially at high density | A slower first statement and node path (Stage 1: +14 and +45 ms at p95 with the database's files evicted) | Volumes stay mounted; 5.3 runs at the 5.6 density; `pg_prewarm` only on an observed miss |
 | Awake databases grow together under D3 (a) | An out-of-memory kill of a backend inside the slice; one database's sessions drop | Placement keeps 20 % headroom on measured peaks; per-database ceilings; crash recovery loses nothing; counted in 5.6; switch to (b) if it happens too often |
-| Rescue cloud-init does not run `runcmd` | The pull install is impossible | Stage 1 checks this first; fallbacks in 9.2 |
+| Rescue cloud-init does not run `runcmd` | The pull install is impossible | Stage 1 confirmed that it runs `write_files` and `runcmd`; the fallbacks in 9.2 stay in case Contabo changes it |
 | Firmware or network unknown | The image does not boot | Hybrid BIOS and UEFI image; static network settings; QEMU boot test with SeaBIOS |
 | A bad kernel or package update | A node does not come back | One node at a time; previous kernel kept; VNC and rescue |
-| LVM metadata area too small for many volumes | Volume creation fails near about 1,000 volumes, and the area cannot be fixed in place | Large metadata area at install; measured in Stage 1; technical volume bound |
-| barman too costly per WAL segment at density | Memory pressure in backup jobs; archive backlog | Concurrency set from measured memory; cost trigger to a native PUT (7.5) |
+| LVM metadata area too small for many volumes | Volume creation fails (the default area fills near 1,450 volumes, Stage 1), and the area cannot be fixed in place | 64 MiB area at install (about 95,000 volumes); technical volume bound of 1,000 per node in placement (4.11) |
+| barman too costly per WAL segment at density | Memory pressure in backup jobs; archive backlog | Per-job limits and 2 uploads plus 1 base backup or restore, set from Stage 1; the cost trigger holds, so the WAL path moves to a native PUT (7.5) |
 | Thin pool fills (writers during an archive outage, or many writers at once) | Writes fail; affected databases stop until space returns | Logical cap; placement closes at 80 %; reserve from the measured write rate; per-database write limits; alerts; automated recovery; tested on the real pool in 5.5 |
 | A tenant fills its own volume or its inodes | That database stops | Per-volume alerts at 80 % and 90 %; reserve release for recovery; resize; tested in 5.5 |
 | R2 credential renewal fails | Archiving stops, databases stay awake, WAL grows | 7-day lifetime; renewal after a third; alert at 25 % left |
@@ -1840,7 +1842,8 @@ Key external references:
 - **Stop and restart:** `KillMode=mixed`, `KillSignal=SIGINT`, `TimeoutStopSec=30`, `Restart=no`.
 - **Limits:**
   - `MemoryMax` = memory, `MemoryHigh` = 90 %, `MemorySwapMax=0`, `TasksMax=64`;
-  - `CPUWeight` by size, and `CPUQuota` set after ready;
+  - `CPUWeight` by size (no start cost inside `pgcf.slice`, Stage 1);
+  - `CPUQuota` set after ready and cleared (`CPUQuota=` infinity) when the unit stops: a set quota persists and throttles the next start (Stage 1);
   - `IOWriteBandwidthMax` and `IOWriteIOPSMax` by size.
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`, `PG_OOM_ADJUST_VALUE=0` (*measured (lab)*: postmaster -900, children 0).
 - **Sandbox:**
@@ -1850,7 +1853,7 @@ Key external references:
   - privileges: `RestrictNamespaces`, `RestrictSUIDSGID`, `NoNewPrivileges`, empty `CapabilityBoundingSet`;
   - system calls and memory: `SystemCallFilter=@system-service ~@privileged ~@resources`, `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`;
   - IPC: `RemoveIPC=yes`, which removes the SysV segment a killed postmaster leaves behind (Stage 1).
-- **Start cost:** on EU1 the mount and network namespaces add about 34 ms (p50) and 56 ms (p95) per start (Stage 1, 11.1).
+- **Start cost** (Stage 1, EU1, 11.1): the mount and network namespaces add about 34–47 ms (p50) and 30–56 ms (p95) per start; every `ExecStartPre=` adds about 35 ms (p50), because systemd spawns one more process through its executor; a per-unit `CPUWeight` in `pgcf.slice` costs nothing.
 - **Not set:**
   - `PrivatePIDs` and `PrivateIPC`: PostgreSQL's `postmaster.pid` interlock needs them off. The lab showed a second unit on the same directory being refused.
   - `unix_socket_group`: PostgreSQL would call chown, which the filter kills with SIGSYS.
@@ -1858,7 +1861,7 @@ Key external references:
 
 **PostgreSQL configuration:**
 - `listen_addresses=''`.
-- Socket directory `/run/pgcf/<id>`, owned by `pgcf-<id>`, mode 0750, with the gateway's group.
+- Socket directory `/run/pgcf/<id>`, owned by `pgcf-<id>`, mode 0750, with the gateway's group. The agent creates it at create and, because `/run` is empty after a reboot, for every database when the agent starts; never in the unit's `ExecStartPre=` (Stage 1: about 35 ms per start).
 - `recovery_init_sync_method=syncfs`.
 - `archive_mode=on`, `archive_command='/usr/libexec/pgcf/pgcf-archive %p'`, and `archive_timeout` from the class.
 - `wal_init_zero=off`, `wal_recycle=on`, `min_wal_size=32MB`, and `max_wal_size` = 25 % of the volume.
@@ -1879,7 +1882,7 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 
 **Storage:**
 - **Pool:**
-  - `pvcreate --metadatasize 64m` (Stage 1: ample for the volume counts LVM handles well); VG `pgcf`.
+  - `pvcreate --metadatasize 64m` (Stage 1: about 95,000 volumes, far above the technical bound of 1,000); VG `pgcf`.
   - Thin pool `pgcf/pgcf_thinpool` with `--chunksize 64K --zero y --poolmetadatasize 1G`, then `lvchange --errorwhenfull y` (lvm2 2.03.31 rejects that option at lvcreate for thin pools; Stage 1).
   - Verify zeroing with `lvs -o zero`.
   - About 95 MiB of pool metadata is needed for 128 GiB at 64 KiB chunks (*estimate*).
@@ -1891,7 +1894,8 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 - **Sampling:** commands use `--reportformat json`. Pool status every 5 s (`dmsetup status`, or the read-only `devicemapper` crate). Per-LV `data_percent`, and `df` space and inodes, every 60 s.
 
 **Barman jobs:**
-- Started with `systemd-run --uid=pgcf-<id> --slice=pgcf-backup.slice -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`.
+- Started with `systemd-run --uid=pgcf-<id> --slice=<backup slice> -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`, with `MemoryMax` 128M for a WAL upload, 192M for a WAL fetch and 256M for a base backup or restore (7.5).
+- **Backup slice:** a top-level name without a dash, such as `pgcfbackup.slice`. systemd reads a dash in a slice name as nesting, so `pgcf-backup.slice` sits inside `pgcf.slice` (Stage 1: control group `/pgcf.slice/pgcf-backup.slice`); its jobs would then count against the awake-database limit, which 4.5 budgets separately.
 - Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_DEFAULT_REGION=auto` through `LoadCredential=`, read by a wrapper into the job's environment. Never `systemd-run -E` or `Environment=`: every local user can read those over D-Bus (Stage 1).
 - `--endpoint-url https://<account>.eu.r2.cloudflarestorage.com` for the EU-jurisdiction bucket, and TMPDIR on node disk.
 - Base backup: `barman-cloud-backup --gzip --immediate-checkpoint -J 2 --host /run/pgcf/<db> -U pgcf_backup -d postgres <dest> database`.
