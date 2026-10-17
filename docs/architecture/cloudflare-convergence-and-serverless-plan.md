@@ -221,6 +221,12 @@ What this means:
 - The connect tail (part 1) and the statement round trips (part 4) are Cloudflare's. Only Lane E (Stage 3) works on them.
 - Service bindings help little. Release 24 measured a p95 of 1,007 ms through a service binding against 1,073 ms public, and bindings work only for Workers on the same Cloudflare account (OP L399).
 
+**Stage 1 re-estimate (2026-10-17, measured parts in 11.1).** Cold page cache, volume kept mounted, full sandbox; p95 values are summed, so they are upper bounds:
+- Node path, login, first statement and the answer's round trip through the Tunnel: p50 about 0.27 s, p95 at most 0.36 s.
+- Statements 2–5 (four Tunnel round trips of 18 / 28 ms plus execution): p50 about 0.10 s, p95 at most 0.17 s.
+- Whole request: about 0.54 s plus the Cloudflare connect at p95. With release 24's connect (182–670 ms) that is about 0.72–1.2 s. The 1 s gate therefore needs a connect p95 of at most about 0.46 s.
+- The Tunnel leg alone measured 74 ms (Workers VPC) and 110 ms (public hostname) at p95. The connect tail lies in the Edge's own work and in the hop from the client Worker to the Edge, which is Lane E's work.
+
 ### 3.2 Warm, cold and activity
 
 - **Warm:** the database's PostgreSQL is running.
@@ -384,7 +390,7 @@ Purchases still need the owner's costed go (section 9.7).
 **What thin LVM is.** A thin pool is one large block of disk. Each database gets a thin volume with a nominal size, say 1 GiB. The pool hands out real disk only in small chunks (64 KiB) as the database writes. The sum of nominal sizes can therefore exceed the disk; that is the disk half of the overbooking.
 
 **Layout per node.** The agent creates it once, at first boot:
-- **Volume group `pgcf`** on the LVM partition, with a large LVM metadata area so that hundreds of volumes fit. The default area of about 1 MiB may not hold about 1,000 volumes; Stage 1 measures this.
+- **Volume group `pgcf`** on the LVM partition, with a large LVM metadata area so that hundreds of volumes fit. Stage 1 measured that the default area (1,020 KiB) holds 1,000 volumes and would run out near 1,450; the installer uses 64 MiB, and LVM command time, not the area, then bounds the count (11.1).
 - **One thin pool over the whole partition.** It holds the data, 1 GiB of pool metadata, and an equal spare for repair.
   - On a 150 GB disk that leaves about 125 GiB of data (*estimate*; Stage 1 records EU1's real disk size).
   - The pool is created at full size: there is no growth step, no anchor volume and no unused slack.
@@ -440,7 +446,7 @@ All values are operator configuration. They remain *estimates* until Stages 1 an
 | --- | --- | --- |
 | System: kernel, systemd, journald, sshd, cloudflared, gateway, agent | 768 | Agent and gateway are protected from reclaim. In the Kubernetes era: 1 GiB kubelet reserve plus about 1,041 MiB idle platform |
 | Kernel memory of mounted sleeping volumes | 150 | About 0.5 MiB per mounted volume (*measured (lab)*: 0.13–0.55 MiB), so 150 MiB at 300 volumes. Stage 5.6 measures it at scale |
-| Backup jobs | 512 | Two WAL uploads and one base backup or restore at once. Stage 1 measures memory per process and sets the concurrency (section 7.5) |
+| Backup jobs | 512 | Two WAL uploads and one base backup or restore at once. Stage 1 measured 61–76 MiB per barman WAL upload and 72 MiB RSS per base backup, whose cgroup also fills with reclaimable page cache (section 7.5) |
 | Kernel and page-cache floor | 600 | About 5 % |
 | **Awake-database budget** (hard limit on all databases together) | **9,913** | Enforced by the kernel on the database slice; admission per D3 |
 
@@ -752,7 +758,7 @@ Changes:
 | 2 | The gateway verifies the token, checks the replay cache and queues the wake with the agent **before** answering the upgrade. It holds the StartupMessage and the pipelined password | *estimate* | 0.1–0.5 ms |
 | 3 | The agent applies the room and memory rules and reads `pg_control` with its checksum: state "shut down", identity and checkpoint against the proven-sleep record | *estimate* | 1–5 ms |
 | 4 | Mount, only if not mounted | Kept mounted: 0; at wake: *measured (EU1)* 68–120 ms | 0 or 68–120 ms |
-| 5 | Start the unit until PostgreSQL reports ready | *measured (lab)* 54.0 / 60.7 ms (p50/p95); *estimate (EU1)* 80–150 ms | 80–150 ms |
+| 5 | Start the unit until PostgreSQL reports ready | *measured (lab)* 54.0 / 60.7 ms (p50/p95); *measured (EU1, Stage 1)* 122.3 / 174.5 ms warm, 179.6 / 214.8 ms cold | 120–215 ms |
 | 6 | Release to the gateway with uid and main PID; peer check | *estimate* | < 1 ms |
 | 7 | Unix dial, forward the held startup, SCRAM login | *measured (lab)* 4.3 / 5.0 ms; *estimate (EU1)* 5–10 ms | 5–10 ms |
 | 8 | First SaaS statement | *measured (EU1)*: about 20 ms with a warm cache, 88–149 ms with a cold cache | 20–149 ms |
@@ -760,7 +766,7 @@ Changes:
 | 10 | After the answer, off the path: D1 claim, observation, usage, CPU quota | — | 0 ms |
 | 11 | Statements 2–5, each one round trip through Cloudflare | *measured (EU1)*, releases 23 and 24 | +0.27–0.46 s |
 
-- **Node path (steps 2–6):** *estimate* 85–155 ms with volumes kept mounted, 155–275 ms when mounting at wake. Release 23 measured 469 ms. *Target:* p95 ≤ 150 ms with volumes kept mounted.
+- **Node path (steps 2–6):** *estimate* 85–155 ms with volumes kept mounted, 155–275 ms when mounting at wake. Release 23 measured 469 ms. *Target:* p95 ≤ 150 ms with volumes kept mounted. *Measured (EU1, Stage 1):* 122.6 / 174.7 ms kept mounted with a warm cache, 180.7 / 215.7 ms cold; the analysis is in 11.1.
 - **First answer:** *estimate* p50 about 0.43–0.6 s, p95 about 0.7–0.95 s.
 - **Whole request:** p95 about 1.1–1.4 s (section 3.1).
 - **Overlap:** the wake starts before the upgrade is answered. This hides about one Worker-to-gateway round trip of the node path.
@@ -975,13 +981,13 @@ The API Worker holds a parent R2 key, new in Stage 0, and **signs temporary cred
 
 | Purpose | Scope | Lifetime |
 | --- | --- | --- |
-| WAL and base backups of one database generation | Prefix `<region>/<db>/g<gen>-<op>/`; actions Get, Head, Put, ListObjectsV2 and multipart; **no DeleteObject(s)** | 7 days (plan default; Stage 1 checks that R2 accepts it). Renewed after at most a third of the lifetime; an alert fires when less than 25 % is left |
+| WAL and base backups of one database generation | Prefix `<region>/<db>/g<gen>-<op>/`; actions Get, Head, Put, ListObjectsV2 and multipart; **no DeleteObject(s)** | 7 days (plan default; R2 accepts it, Stage 1). Renewed after at most a third of the lifetime; an alert fires when less than 25 % is left |
 | Restore source | Read-only on the source prefix | For the operation |
 
 - **No delete rights on nodes.** Nodes never hold a delete right or the bucket-wide key. Retention runs in the Worker (section 7.7).
 - **Margin for outages.** The 7-day lifetime leaves days of margin for a Worker, link or renewal outage. If a credential does expire, archiving fails, databases stay awake and WAL grows. The renewal alert fires long before that.
 - **Overwrites stay possible.** A credential still allows overwriting objects inside its own generation's prefix. This is accepted, because that prefix belongs to that database and generation only.
-- **HeadBucket.** Barman needs HeadBucket only for `--test` and for `barman-cloud-check-wal-archive`, and we use neither. Stage 1 verifies this.
+- **HeadBucket.** Barman needs HeadBucket only for `--test` and for `barman-cloud-check-wal-archive`, and we use neither. Stage 1 verified this: WAL archive, base backup, restore and WAL restore all ran with credentials that cannot call HeadBucket.
 
 ### 7.4 Who runs barman
 
@@ -1011,9 +1017,11 @@ Stage 1 runs the backup test with exactly these users and modes.
    - all limits sit in one place in operator configuration.
 7. Metrics: duration, failures and the `.ready` backlog. A sustained backlog raises `database_archive_failing`.
 
-**Cost trigger.** Each call forks Python and boto3 (*estimate*: 50–100 MB and 0.2–0.5 CPU-s per call; Stage 1 measures it). The WAL path switches to a native Rust PUT in the same Barman layout if either holds:
+**Cost trigger.** Each call forks Python and boto3 (*measured (EU1, Stage 1)*: 61–71 MiB RSS and 0.45–1.04 CPU-s per call). The WAL path switches to a native Rust PUT in the same Barman layout if either holds:
 - a call costs more than 0.25 CPU-s or 80 MiB;
 - a backlog persists at target density.
+
+Stage 1 measured more than 0.25 CPU-s for every call, so the first condition holds.
 
 Only after that would WAL-G or wal-rus be reconsidered.
 
@@ -1030,7 +1038,7 @@ A base backup runs:
 
 **A database is never woken just to back it up.** A sleeping database does not change, so its last backup plus archived WAL fully describe it.
 
-The job runs as the database's user, with low CPU and IO weight. It runs `barman-cloud-backup --gzip --immediate-checkpoint` over the database's socket, as the backup role. That role has `pg_backup_start`, `pg_backup_stop`, `pg_checkpoint` and `pg_monitor`. A backup counts only when `backup.info` says DONE.
+The job runs as the database's user, with low CPU and IO weight. It runs `barman-cloud-backup --gzip --immediate-checkpoint` over the database's socket, as the backup role. That role has `pg_backup_start`, `pg_backup_stop`, `pg_switch_wal`, `pg_create_restore_point`, `pg_checkpoint` and `pg_monitor`; barman checks all of them before it finishes a backup (Stage 1). A backup counts only when `backup.info` says DONE.
 
 ### 7.7 Retention (in the Worker)
 
@@ -1047,6 +1055,7 @@ Nodes never delete anything in R2.
 3. It writes the recovery settings:
    - a `restore_command` through `pgcf-wal-fetch`, which runs `barman-cloud-wal-restore -p 4` with a spool directory per operation. It never uses the shared default, where two restores could receive each other's WAL;
    - `recovery_target_time`, if this is a PITR;
+   - `hot_standby = off` until promotion: a target class with a lower `max_connections` than the source otherwise aborts recovery (Stage 1);
    - promote at the target, follow the latest timeline, and archive to the new path.
 4. Start, replay and promote. Then check that:
    - the database is out of recovery;
@@ -1199,7 +1208,7 @@ A reinstall issues a new token, and a lost node's key is revoked.
    - `pgcf-agent check` creates a scratch database on a thin volume and queries it;
    - after the VM reboots, the scratch database wakes again;
    - nothing listens except on loopback.
-5. Compress with xz (the rescue system has xz; zstd is not certain), write the sha256 sums, upload to a private R2 prefix `node-images/<version>/`, and register the release in the API.
+5. Compress with zstd (Stage 1: the Contabo rescue system has zstd and gzip but no `xz` binary), write the sha256 sums, upload to a private R2 prefix `node-images/<version>/`, and register the release in the API.
 
 v1 has no nightly reproducibility build, no A/B slots and no image signing. Integrity comes from sha256 values delivered over authenticated channels: the installer's userData and the agent's link. More is added only after an update has actually broken a node.
 
@@ -1224,7 +1233,7 @@ Stopping the control server removes the old installer's transport: the bootstrap
 4. First boot: partitioning, volume group and pool, enrollment, Tunnel, first samples.
 5. Cloudflare checks the inventory and opens placement.
 
-This needs no inbound port, no relay, no SSH key and no operator firewall sources. Stage 1 first checks whether rescue cloud-init runs `runcmd`.
+This needs no inbound port, no relay, no SSH key and no operator firewall sources. Stage 1 confirmed that rescue cloud-init runs `write_files` and `runcmd`. Contabo merges its own cloud-config, which turns SSH password login on, so the installer turns it off.
 
 **Fallbacks**, if it does not:
 - open rescue SSH, key-only with a pinned host key, for a short window (weaker);
@@ -1631,6 +1640,19 @@ From the canary on, the EU1 stack is production.
 | Research for this plan (2026-10-17) | Open source (nothing adoptable), OS image (Debian 13), overbooking model, backups (barman-cloud kept), supervision lab, code inventory (about 202k lines deletable) |
 | Supervision lab (laptop, Debian trixie, systemd 257, PostgreSQL 18.6) | Hardened unit start to READY 54.0 / 60.7 ms (p50/p95). First SaaS answer 60.4 / 66.9 ms with a warm cache, 98.5 / 110.3 ms cold. Stop 29.8 / 42.6 ms. 20-database storm ready in 353–375 ms. Kernel memory per mounted volume 0.13–0.55 MiB |
 | Baselines from the Kubernetes runtime (reference only) | PostgreSQL 18.6 on EU1 ready in 111–117 ms. ext4 mount on thin 68–120 ms. Release 24 cold first answer p95 1,080 ms, whole request p95 1.50 s. Old standard create to ready 30.7 s |
+| Stage 1 preparation: EU1 on stock Debian 13 (2026-10-17) | EU1's Contabo instance (`pgcf-eu1`, product V160; the D1 node row's provider instance) confirmed through the API, reinstalled from image `debian-13`: lab key only, root password locked, `PasswordAuthentication no`; nftables drops all inbound traffic except TCP 22 from the operator and IPv6 neighbour discovery; a lab Contabo firewall allows only TCP 22 from the operator (the Kubernetes-era firewall is detached, not deleted). SSH answered 65 s after the reinstall call. Contabo's merged cloud-config upgrades all packages (kernel 6.12.38 → 6.12.113) and its own `bootcmd` fails harmlessly; nftables needs `--force-confold` when `/etc/nftables.conf` is written first. Root shrunk to 40 GiB in rescue for a 259.9 GiB LVM partition. Versions: systemd 257.13, lvm2 2.03.31, thin-provisioning-tools 1.1.0, PGDG PostgreSQL 18.6-1.pgdg13+2, pgvector 0.8.7, barman-cli-cloud 3.20.1, boto3 1.37.9 |
+| Stage 1 Block 3: Contabo facts | Firmware **BIOS** (no `/sys/firmware/efi`); disk 300 GiB (322,122,547,200 B); network **static** (cloud-init NoCloud: IPv4 /23 with gateway, IPv6 /64 via `fe80::1`; the installed image uses netplan and networkd; the rescue's extra DHCP stanza got no offer in 162 s); 6 vCPU AMD EPYC family 23 model 1 (Zen 1) with software retbleed and SRSO mitigations; 11,967 MiB RAM visible. Rescue system: Debian 12, kernel 6.1, cloud-init 22.4.2, 11,960 MiB RAM; sgdisk, sfdisk, wipefs, partprobe, curl, wget, gzip, zstd, sha256sum and python3 (with `lzma`) present, **no `xz` binary** |
+| Stage 1 Block 3: rescue cloud-init | **Yes:** rescue cloud-init runs our `write_files` and `runcmd` (two rescue boots; `runcmd` ran 1 min 53 s after the API call; SSH answered after 1 min 47–49 s; HTTPS out works). Contabo merges its own cloud-config into `userData`: its `runcmd` entries run first, and it sets `ssh_pwauth: true` and a root password through `chpasswd` even when only SSH keys are given, so the installer turns password login off itself |
+| Stage 1 Block 3: Cloudflare path (temporary Tunnel, VPC service and Worker, deleted afterwards) | cloudflared 2026.10.0 (sha256 checked) runs a remotely managed Tunnel with `--token-file` over QUIC, 4 connections in FRA. The probe Worker ran in AMS: 3 × 30 WebSocket connects to a loopback echo, each with 5 sequential round trips (p50 / p95). **Workers VPC binding** (available on the account; the WebSocket upgrade works): connect 52.5 / 73.6 ms, round trip 18.0 / 28.0 ms, connect plus 5 round trips 146 / 195 ms. **Public hostname without Access** (a TryCloudflare quick tunnel, because the account token has no DNS permission): connect 65.0 / 109.6 ms, round trip 17.0 / 26.0 ms, connect plus 5 round trips 160 / 219 ms. Plain HTTP through the VPC binding: 46 ms per request. **With Access: not measured**: the account has no Zero Trust organization and the token no Access permission (API error 9999) |
+| Stage 1 Block 1: start path (hardened unit, 256 MiB class, 509 MB SaaS dataset, start over D-Bus as the agent will; 40 runs each; p50 / p95 ms) | Kept mounted, warm cache: `pg_control` read with CRC 0.2 / 0.3, start to READY 122.3 / 174.5, **node path 122.6 / 174.7**, SCRAM login (libpq over the socket) 12.9 / 67.8, first SaaS statement 4.8 / 9.7, first answer 154.8 / 225.1. Kept mounted, cold cache (`drop_caches`): `pg_control` 0.9 / 1.7, start 179.6 / 214.8, **node path 180.7 / 215.7**, login 46.5 / 58.5, first statement 25.6 / 59.9, first answer 253.2 / 300.0. Mounted at wake: mount 89.4 / 131.9 (warm) and 91.1 / 119.8 (cold); node path 223.2 / 323.1 (warm) and 276.7 / 335.3 (cold). Fast stop 45.9–59.9 / 59.3–89.3. A 20-run set with `systemctl` gave the same picture (node path 131.6 / 169.5 kept mounted, warm). **The node-path target (p95 ≤ 150 ms kept mounted) is missed** |
+| Stage 1 Block 1: start-path analysis | systemd "Starting" to PostgreSQL's first log line 65–76 ms, then about 12 ms to ready; started directly (runuser, no systemd) 46.2 / 88.4 ms. An exec-only unit starts in 37.7 / 65.0 ms plain and 79.5 / 116.7 ms with the full sandbox: `ProtectKernelTunables`/`Modules`/`Logs` with `ProtectControlGroups` add about 25 ms, `PrivateNetwork` 8–14 ms, `IPAddressDeny` and the seccomp options 0–5 ms. The PostgreSQL unit, interleaved, 40 starts each: full sandbox 111.4 / 151.4, without `ProtectKernel*`/`ProtectControlGroups` 97.9 / 151.4, without any mount or network namespace 77.1 / 94.9. Exec is slow on this vCPU (fork and exec of `/bin/true` 3.1 ms, `postgres -V` 10.6–14.9 ms). The owner weighs sandbox depth (D7) against the 150 ms node-path target |
+| Stage 1 Block 1: checks | A private `/dev/shm` works only with `TemporaryFileSystem=/dev/shm:size=…,mode=1777` (the default 0755 root mount makes PostgreSQL fail with "could not open shared memory segment"). A parallel vacuum launched 2 workers with up to 5 DSM segments in the unit's own `/dev/shm`; the host's stayed empty. After kill -9 of the postmaster the cgroup was empty within 2 ms, with no process or `/dev/shm` file left; `postmaster.pid` and one 56-byte SysV segment stayed until the next start, and `RemoveIPC=yes` removes the segment. A per-unit `CPUWeight` inside `pgcf.slice` toggles no controller (`cpu io memory pids` stay enabled) and shows no cost above the noise (start 110.0 / 210.5 vs 130.3 / 206.8 ms, stop 28.7 / 39.9 vs 29.9 / 45.1 ms). Live `CPUQuota` change 2.1 / 3.0 ms and `MemoryMax` 1.7 / 2.3 ms over D-Bus. After `pg_switch_wal()` the shutdown checkpoint lands in the next segment: as its first record when idle, or after 334 `FPI_FOR_HINT` records when reads set hint bits after the switch (checksums on); never after a client commit. `systemd-analyze security`: 0.4 SAFE |
+| Stage 1 Block 1: LVM at scale (loop-backed pool, 1,000 thin volumes of 1 GiB with 20-character names and tags) | The default metadata area (1,044,480 B) holds 1,000 volumes: free space fell from 519,168 to 160,256 B, 358.9 B per volume, so it would run out near 1,450 volumes (extrapolated). `--metadatasize 64m` gives 68,153,344 B, enough for about 94,900 volumes by the same slope. Metadata text 461 B per volume. lvcreate p50 rose from 144 ms (first 100) to 267–270 ms (900–1,000); all creates 206–224 / 284–307 ms; lvremove 196–198 / 261–266 ms; JSON listing 76 ms at 100 and 148–150 ms at 1,000 volumes (with tags 184–186 ms). Pool metadata use 2.05 % of 1 GiB with 1,000 empty volumes. Each active, unmounted thin volume took 0.23–0.32 MiB of MemAvailable. **Bound:** the 64 MiB area is not the limit; LVM command time, which grows by about 0.13 ms per existing volume, is. EU1's pool: 276,819,869,696 B of data on the 259.9 GiB partition, zeroing on; lvm2 2.03.31 rejects `--errorwhenfull` at lvcreate for thin pools, so it is set with `lvchange` |
+| Stage 1 Block 2: backups under the real permission model | Sandboxed PostgreSQL → archive client on a Unix socket → lab agent (caller identified by `SO_PEERCRED`) → `systemd-run` as `pgcf-<id>` in `pgcf-backup.slice` with `LoadCredential=` → barman-cloud 3.20.1 → R2 with a locally signed credential (explicit actions, no delete, one prefix). wal-archive per call: full segments (57 during a bulk load) 1.448 / 1.986 s, **0.84 / 1.04 CPU-s**, RSS 66.5 / 71.1 MiB (cgroup peak at most 75.7 MiB); near-empty segments 0.754 / 0.903 s, **0.45 / 0.50 CPU-s**, RSS 61 MiB. **The cost trigger of 7.5 holds (above 0.25 CPU-s).** Serial archiving drained a 57-segment bulk load 47.8 s after the load ended. Base backup (gzip, `-J 2`) of 509 MB: 67.2 s, 62.7 CPU-s (gzip-bound), RSS 71.7 MiB, `data.tar.gz` 103,863,748 B in 5 multipart parts, DONE; page cache fills the job's cgroup up to its limit. Restore into a new volume as the new user: barman-cloud-restore 6.5 s, recovery and promotion 7.2 s; PITR: 3.3 s and 6.1 s, stopped before the first commit after the target. Both: `system_identifier` equal to `backup.info`, timeline 2 above 1, data digest equal. `wal-restore -p 4` with a spool directory per operation (empty after success; 3 files left after a failed recovery); one wal-restore call 0.58–0.64 / 0.97–1.0 s, 0.39–0.48 CPU-s, RSS 60 MiB |
+| Stage 1 Block 2: restore continuity | A plugin-barman-cloud archive of benchmark database `uzytv7ue7kijtl2x5btw` restored into the plain unit with a read-only credential: 79 WAL fetches, redo 97.2 s, promoted, `system_identifier` equal, all 509 MB of SaaS data present. It needs `hot_standby = off` during recovery (a target `max_connections` of 25 below the source's 100 aborts recovery with "insufficient parameter settings"), the CloudNativePG `postgresql.conf`, `custom.conf` and `override.conf` replaced, and the roles reset (the source superuser is `postgres`) |
+| Stage 1 Block 2: credentials | Local HS256 signing works on the EU-jurisdiction bucket. DeleteObject and DeleteObjects: 403 AccessDenied. HeadBucket: 403, and never needed (wal-archive, backup, restore and wal-restore all succeeded). Writes and lists outside the prefix: 403. **A 7-day lifetime is accepted** (30 days too). On expiry barman exits 4 after R2 answers "SignatureDoesNotMatch", the same exit code as any refusal, so the agent tracks the expiry time itself; after renewal the archiver's next retry succeeded 48.6 s later, without a restart. A unit's `Environment=` (`systemd-run -E`) is readable by every local user over D-Bus; `LoadCredential=` is not. The backup role also needs EXECUTE on `pg_switch_wal()` and `pg_create_restore_point(text)`; without them barman failed after 68 s of upload |
+| Stage 1 Block 2: create and sleep costs | Empty database to ready: user, thin volume, mkfs, mount, initdb and configuration 1.8 s; start 146 ms; roles 59 ms; first base backup 7.35 s (3.2 CPU-s); **9.4 s in total**; 68.6 MiB of its thin volume used. Full sleep proof, 10 runs: **1,016.6 / 1,084.4 ms** (checkpoint 60.8 / 79.2, switch 70.1 / 102.2, archive wait 807.9 / 869.9, stop 57.8 / 89.0, `pg_control` check 3.4 / 5.4 ms) |
+| Stage 1 cleanup | Temporary Tunnel, VPC service and Worker deleted; the 113 lab objects (314.7 MB) under the lab prefix deleted; credential files removed from EU1. Locally signed credentials cannot be revoked one by one: the lab's working credentials expire by 2026-10-17 22:52 UTC, and two HeadObject-only probe credentials for one non-existent key expire on 2026-10-24 and 2026-11-16, or earlier when Stage 0 revokes the parent key. EU1 stays on Debian 13 with the lab key and its lab databases stopped |
 | Stage 2 steps 1–5 on branch `stage2/clean-main` (2026-10-17) | 269,602 non-lockfile lines deleted and 6,749 added against main `85a2e6e3` (270,670 and 6,767 with the lockfiles). Locally green: lint, format, typecheck, the four contract generator checks, cargo fmt, clippy and tests, the Worker build, every workspace test (API 774, contracts 209, Edge 103, Rust Edge 20), the node-agent kernel test and Mermaider |
 
 ### 11.2 Open
@@ -1638,7 +1660,7 @@ From the canary on, the EU1 stack is production.
 | Stage | Status | Next step |
 | --- | --- | --- |
 | 0 Wind down | In progress: documents and AGENTS.md done; the owner is stopping the control server | Credential rotation, test leftovers, worktrees (steps 4–6) |
-| 1 Lab on EU1 | Open | Reinstall EU1 with stock Debian 13, hardened |
+| 1 Lab on EU1 | Done 2026-10-17 (11.1), except Access: not measured, because the account has no Zero Trust organization | The owner decides on the node-path miss (sandbox depth, D7) and on D1 with the re-estimate in 3.1; an Access measurement needs a Zero Trust organization |
 | 2 Clean main | In progress: steps 1–5 done on `stage2/clean-main`. Kubernetes-shaped names stay in the release spec, node observations, runtime attestation, the CNPG route target, the gateway and parts of the node agent until Stage 3 replaces them | Merge to main and one green CI run; then deploy the API with migration `0062` once the private Worker configuration has the same binding changes (step 6) |
 | 3 Build | Open | Lanes A–E |
 | 4 Install EU1 | Open (needs Stage 3) | |
@@ -1823,10 +1845,12 @@ Key external references:
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`, `PG_OOM_ADJUST_VALUE=0` (*measured (lab)*: postmaster -900, children 0).
 - **Sandbox:**
   - network: `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
-  - filesystem: `ProtectSystem=strict` with `ReadWritePaths` limited to its data and socket directories; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `TemporaryFileSystem=/dev/shm:size=<from memory size>`;
+  - filesystem: `ProtectSystem=strict` with `ReadWritePaths` limited to its data and socket directories; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `TemporaryFileSystem=/dev/shm:size=<from memory size>,mode=1777` (without the mode PostgreSQL cannot create its segments; Stage 1);
   - kernel and processes: `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectProc=invisible`, `ProcSubset=pid`;
   - privileges: `RestrictNamespaces`, `RestrictSUIDSGID`, `NoNewPrivileges`, empty `CapabilityBoundingSet`;
-  - system calls and memory: `SystemCallFilter=@system-service ~@privileged ~@resources`, `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+  - system calls and memory: `SystemCallFilter=@system-service ~@privileged ~@resources`, `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`;
+  - IPC: `RemoveIPC=yes`, which removes the SysV segment a killed postmaster leaves behind (Stage 1).
+- **Start cost:** on EU1 the mount and network namespaces add about 34 ms (p50) and 56 ms (p95) per start (Stage 1, 11.1).
 - **Not set:**
   - `PrivatePIDs` and `PrivateIPC`: PostgreSQL's `postmaster.pid` interlock needs them off. The lab showed a second unit on the same directory being refused.
   - `unix_socket_group`: PostgreSQL would call chown, which the filter kills with SIGSYS.
@@ -1855,8 +1879,8 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 
 **Storage:**
 - **Pool:**
-  - `pvcreate --metadatasize 64m`, or the value Stage 1 sets; VG `pgcf`.
-  - Thin pool `pgcf/pgcf_thinpool` with `--chunksize 64K --zero y --errorwhenfull y --poolmetadatasize 1G`.
+  - `pvcreate --metadatasize 64m` (Stage 1: ample for the volume counts LVM handles well); VG `pgcf`.
+  - Thin pool `pgcf/pgcf_thinpool` with `--chunksize 64K --zero y --poolmetadatasize 1G`, then `lvchange --errorwhenfull y` (lvm2 2.03.31 rejects that option at lvcreate for thin pools; Stage 1).
   - Verify zeroing with `lvs -o zero`.
   - About 95 MiB of pool metadata is needed for 128 GiB at 64 KiB chunks (*estimate*).
 - **Per database:**
@@ -1868,7 +1892,8 @@ Worst case for 256 MiB (*estimate*): 32 + 25 × (2 + 4) + 16 + 15 ≈ 215 MiB.
 
 **Barman jobs:**
 - Started with `systemd-run --uid=pgcf-<id> --slice=pgcf-backup.slice -p MemoryMax=<per job> -p InaccessiblePaths=<other databases, agent state>`.
-- Environment: `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION=auto`, `--endpoint-url https://<account>.r2.cloudflarestorage.com`, and TMPDIR on node disk.
+- Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_DEFAULT_REGION=auto` through `LoadCredential=`, read by a wrapper into the job's environment. Never `systemd-run -E` or `Environment=`: every local user can read those over D-Bus (Stage 1).
+- `--endpoint-url https://<account>.eu.r2.cloudflarestorage.com` for the EU-jurisdiction bucket, and TMPDIR on node disk.
 - Base backup: `barman-cloud-backup --gzip --immediate-checkpoint -J 2 --host /run/pgcf/<db> -U pgcf_backup -d postgres <dest> database`.
 
 **cloudflared:**
