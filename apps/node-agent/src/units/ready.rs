@@ -253,6 +253,12 @@ mod tests {
         };
         let root = crate::units::test_dir("live");
         std::fs::create_dir_all(root.join("sockets")).unwrap();
+        // PostgreSQL refuses to run as root.
+        if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&root).unwrap()) == 0 {
+            eprintln!("skipped: PostgreSQL does not run as root");
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
         let initdb = Command::new(bin.join("initdb"))
             .args(["-D"])
             .arg(root.join("data"))
