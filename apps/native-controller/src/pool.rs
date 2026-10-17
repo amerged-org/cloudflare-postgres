@@ -1926,6 +1926,7 @@ impl Pool {
     ) -> Result<Served, Error> {
         let id = text(db, "id");
         if serving.ticket.is_some() {
+            crate::timing::ready_withheld(db, "wake_ticket_pending", None);
             return Ok(Served::Observed(None));
         }
         if serving.retire.is_some() {
@@ -1975,6 +1976,7 @@ impl Pool {
             return if self.unwind(rec, id, Some(db)).await? {
                 Ok(Served::HandedOver)
             } else {
+                crate::timing::ready_withheld(db, "slot_handover_pending", None);
                 Ok(Served::Observed(None))
             };
         }
@@ -1993,6 +1995,7 @@ impl Pool {
         // The gateway routes to a slot by its attestation alone: without one the pass ends
         // without an observation, and the next one forms it.
         if !db["admission"].is_null() && observation["runtime_attestation"]["v"] != 2 {
+            crate::timing::ready_withheld(db, "slot_attestation_unavailable", None);
             return Ok(Served::Observed(None));
         }
         rec.power

@@ -30,7 +30,19 @@ pub fn waking(db: &Value) -> bool {
     db["desired_state"] == "running" && db["power"]["mode"] == "running"
 }
 pub(crate) fn emit(value: Value) {
+    #[cfg(test)]
+    EMITTED.with(|emitted| emitted.borrow_mut().push(value.clone()));
     eprintln!("{value}");
+}
+#[cfg(test)]
+thread_local! {
+    /// The events this test's thread emitted.
+    static EMITTED: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// The events this test's thread emitted since the last call.
+#[cfg(test)]
+pub(crate) fn take_emitted() -> Vec<Value> {
+    EMITTED.with(|emitted| std::mem::take(&mut *emitted.borrow_mut()))
 }
 /// Writes one event line to the controller's log.
 pub fn emit_event(value: Value) {
@@ -180,6 +192,15 @@ pub fn pool_slot_event(
 ) -> Value {
     json!({"event":"pool_slot","slot":slot,"node":node,"state":state,"reason":reason,"ms":ms,"at_ms":wall_clock_ms()})
 }
+/// A pass that was to report `db` ready ended without a report: `reason` says why, and `detail`
+/// names the fault where one ended it.
+pub fn ready_withheld_event(db: &Value, reason: &str, detail: Option<&str>) -> Value {
+    json!({"event":"ready_withheld","database_id":db["id"],"generation":db["generation"],"reason":reason,"detail":detail,"at_ms":wall_clock_ms()})
+}
+/// Writes `ready_withheld_event` to the controller's log.
+pub(crate) fn ready_withheld(db: &Value, reason: &str, detail: Option<&str>) {
+    emit(ready_withheld_event(db, reason, detail));
+}
 /// The pool of one node.
 pub fn pool_state_event(node: &str, free: usize, creating: usize, serving: usize) -> Value {
     json!({"event":"pool_state","node":node,"free":free,"creating":creating,"serving":serving,"at_ms":wall_clock_ms()})
@@ -187,6 +208,21 @@ pub fn pool_state_event(node: &str, free: usize, creating: usize, serving: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_withheld_ready_report_names_the_database_its_generation_and_why() {
+        let db = json!({"id":"dbbbbbbbbbbbbbbbbbbb","generation":5});
+        let event =
+            ready_withheld_event(&db, "ready_release_unavailable", Some("stale power intent"));
+        let at = event["at_ms"].as_u64().unwrap();
+        assert_eq!(
+            event,
+            json!({"event":"ready_withheld","database_id":"dbbbbbbbbbbbbbbbbbbb","generation":5,"reason":"ready_release_unavailable","detail":"stale power intent","at_ms":at})
+        );
+        assert_eq!(
+            ready_withheld_event(&db, "wake_ticket_pending", None)["detail"],
+            Value::Null
+        );
+    }
     #[test]
     fn pool_events_name_their_path_ticket_slot_and_state() {
         let ms = std::collections::BTreeMap::from([

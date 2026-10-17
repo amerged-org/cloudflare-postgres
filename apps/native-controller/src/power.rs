@@ -2477,6 +2477,7 @@ impl PowerCoordinator {
                 .map(|map| intent_from(map, text(db, "id")))
                 .transpose()?;
             if current.as_ref().is_some_and(|v| v.mode == "quiesce") {
+                crate::timing::ready_withheld(db, "ready_fence_quiesced", None);
                 return Ok(None);
             }
             if current
@@ -2507,7 +2508,14 @@ impl PowerCoordinator {
                 value["message"] = "running fence identity unavailable; recovery required".into();
                 Ok(Some(value))
             }
-            Err(_) => Ok(None),
+            Err(fault) => {
+                crate::timing::ready_withheld(
+                    db,
+                    "ready_fence_unavailable",
+                    Some(&fault.to_string()),
+                );
+                Ok(None)
+            }
         }
     }
     /// `slot`: the database runs in a pool slot, and its own Cluster stays hibernated.
@@ -2540,6 +2548,7 @@ impl PowerCoordinator {
                 return Err(Fault::Recovery("power_storage_identity_changed"));
             }
             if !slot && cluster["metadata"]["annotations"][HIBERNATION] == "on" {
+                crate::timing::ready_withheld(db, "cluster_hibernated", None);
                 return Ok(None);
             }
             let mut progress = Progress::new(intent.clone(), Phase::Awake, physical, self.now());
@@ -2581,6 +2590,7 @@ impl PowerCoordinator {
                 self.publish_target(db, Some(&current), &observation)
             );
             if !confirmed? {
+                crate::timing::ready_withheld(db, "ready_release_unconfirmed", None);
                 return Ok(None);
             }
             let mut value = observation.clone();
@@ -2603,7 +2613,18 @@ impl PowerCoordinator {
                 value["message"] = "wake storage identity changed; recovery required".into();
                 Some(value)
             }
-            _ => None,
+            Ok(Err(fault)) => {
+                crate::timing::ready_withheld(
+                    db,
+                    "ready_release_unavailable",
+                    Some(&fault.to_string()),
+                );
+                None
+            }
+            Err(_) => {
+                crate::timing::ready_withheld(db, "ready_release_timeout", None);
+                None
+            }
         })
     }
     /// Writes the target the gateway routes the running revision of `db` to by into its fence:

@@ -914,3 +914,59 @@ async fn a_pool_hit_is_reported_ready_sleeps_through_its_slot_and_wakes_by_a_poo
     })
     .await;
 }
+
+/// The reasons the events of this test's thread give for passes that withheld `id`'s ready
+/// report.
+fn withheld(id: &str) -> Vec<String> {
+    crate::timing::take_emitted()
+        .into_iter()
+        .filter(|event| event["event"] == "ready_withheld" && event["database_id"] == id)
+        .map(|event| event["reason"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_pass_that_withholds_a_slot_served_database_s_ready_report_says_why() {
+    let mut w = World::pooled().await;
+    let gateway = RealGateway::start(&mut w, "[]").await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    w.fresh_authority();
+    let (mut client, delivered) = held_wake(&w, &gateway, 912).await;
+    until_ready(&mut client).await;
+    slot_runs(&w);
+    // Cloudflare has not committed the ticket yet: the pass reports nothing, and says so.
+    w.claimed(&delivered);
+    crate::timing::take_emitted();
+    assert_eq!(
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap(),
+        None
+    );
+    assert_eq!(withheld(&w.id), ["wake_ticket_pending"]);
+    let db = w.db.clone();
+    w.reconciler.pool.confirm_tickets(
+        |id| (id == db["id"]).then_some(&db),
+        std::time::Instant::now(),
+    );
+    // The fence the ready report is released under asks for a sleep meanwhile.
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+        |map| {
+            let mut intent: Value =
+                serde_json::from_str(map["data"]["intent.json"].as_str().unwrap()).unwrap();
+            intent["mode"] = "quiesce".into();
+            map["data"]["intent.json"] = intent.to_string().into();
+        },
+    );
+    w.fresh_authority();
+    crate::timing::take_emitted();
+    assert_eq!(
+        w.reconciler.reconcile(&w.db, &w.snapshot).await.unwrap(),
+        None
+    );
+    assert_eq!(withheld(&w.id), ["ready_fence_quiesced"]);
+}
