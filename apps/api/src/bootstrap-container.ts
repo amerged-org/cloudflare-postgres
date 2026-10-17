@@ -1978,21 +1978,12 @@ export class NodeBootstrap extends DurableObject<Env> {
       return;
     }
     try {
-      const row = await readThinStorageLeaseRow(this.env, nodeId);
-      if (row.error_code) {
-        await this.ctx.container?.destroy();
-        return;
-      }
       const prepared = await prepareThinStorageLease(this.env, nodeId);
       if (prepared) {
         await this.thinStorage(nodeId);
         return;
       }
       const current = await readThinStorageLeaseRow(this.env, nodeId);
-      if (current.error_code) {
-        await this.ctx.container?.destroy();
-        return;
-      }
       if (current.lease_expires_at)
         await this.ctx.storage.setAlarm(
           Math.max(
@@ -2002,17 +1993,9 @@ export class NodeBootstrap extends DurableObject<Env> {
         );
       else await this.#retryThinStorageTurn();
     } catch {
-      // Only an explicit API-side block ends the cadence. A failed D1 read cannot prove that an
-      // executor stopped: retain its lease and dispatched action, and leave it running for readback.
-      let blocked = false;
-      try {
-        blocked =
-          (await readThinStorageLeaseRow(this.env, nodeId)).error_code !== null;
-      } catch {
-        // No readable node row is no evidence of a safety block.
-      }
-      if (blocked) await this.ctx.container?.destroy();
-      else await this.#retryThinStorageTurn();
+      // A failed turn, a block included, keeps the cadence with backoff. A failed D1 read cannot
+      // prove that an executor stopped: its lease and dispatched action stay for readback.
+      await this.#retryThinStorageTurn();
     }
   }
 }

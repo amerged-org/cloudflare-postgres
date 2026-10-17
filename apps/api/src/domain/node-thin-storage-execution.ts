@@ -364,7 +364,8 @@ export async function reserveThinStorageLease(
   );
   if (!current) return closed();
   const row = await readThinStorageLeaseRow(env, nodeId);
-  if (row.error_code) return null;
+  // A blocked node keeps its turns: the block stays until a turn succeeds again, and a repeated
+  // turn never repeats a dispatched action whose outcome it cannot read back.
   if (row.lease_expires_at && Date.parse(row.lease_expires_at) > Date.now())
     return null;
   // Never reserve a lease or pool action that current sealed host custody cannot serve.

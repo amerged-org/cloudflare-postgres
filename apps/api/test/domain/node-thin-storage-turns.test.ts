@@ -188,6 +188,26 @@ it("blocks the node on an identity or qualification failure as before", async ()
   });
 });
 
+it("a blocked node keeps its turns, so the first one that succeeds again ends the block", async () => {
+  // Live, one audit error stopped every later turn on EU1 for hours: release, placement and growth
+  // all wait for a node without error.
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_driver_identity_changed",
+  });
+  expect(failed.node).toMatchObject({ status: "blocked" });
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET lease_expires_at=? WHERE node_id=?",
+  )
+    .bind(new Date(Date.now() - 1000).toISOString(), f.node)
+    .run();
+  // The next turn gets its lease; its accepted report clears the block.
+  const next = await prepareThinStorageLease(f.local, f.node);
+  expect(next).not.toBeNull();
+  expect(next!.lease.operation_id).not.toBe(failed.fence.operation_id);
+});
+
 it("retries concurrent inventory reads and driver replacement, but blocks an uncertain dispatched action", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
   const action = {
