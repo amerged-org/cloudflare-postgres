@@ -37,13 +37,26 @@ spec:
         runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: pgcf-cloudflared
+      # The Edge's VPC service names the gateway by its FQDN: look it up as given, never through
+      # the Pod's search list.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
+      # Ingress runs beside PostgreSQL: prefer a customer node (an admitted PGCF node that is not
+      # the control plane), so the tunnel, the gateway and the database share one node and no
+      # WireGuard hop. Soft, so the control server alone still runs it at first install. No
+      # hostname spread: it would push a replica onto the control server.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: pgcf.io/node-id
+                    operator: Exists
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
       containers:
         - name: cloudflared
           image: cloudflared
@@ -59,12 +72,12 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+          # No CPU limit: CFS throttling of QUIC and TLS bursts adds latency to every query.
           resources:
             requests:
               cpu: 50m
               memory: 64Mi
             limits:
-              cpu: 500m
               memory: 256Mi
           # The metrics port is localhost-only, so probes run inside the container.
           livenessProbe:
