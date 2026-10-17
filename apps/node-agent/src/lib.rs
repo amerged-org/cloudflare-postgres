@@ -2,7 +2,9 @@
 //! The node agent's reusable parts, moved from the native controller without their Kubernetes
 //! surroundings. The agent binary is built in Stage 3.
 pub mod api;
+pub mod archive;
 pub mod contracts;
+pub mod credentials;
 pub mod diagnostics;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dm;
