@@ -3,7 +3,7 @@ import { DatabaseId, NodeId, ProjectId, RegionId } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import type { AdmissionMutationIntent } from "./admission-state.ts";
-import { readDatabasePresence } from "./database-actor-sync.ts";
+import { databaseActor, readDatabasePresence } from "./database-actor-sync.ts";
 
 export interface AdmissionSqlGuard {
   sql: string;
@@ -254,7 +254,7 @@ export async function withAdmissionMutation<T>(
       if (local?.database_id === id) {
         if (!(await local.begin(intent))) throw conflict();
       } else {
-        const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
+        const actor = databaseActor(env, id);
         await actor.seed(presence!);
         if (!(await actor.beginAdmissionMutation(intent))) throw conflict();
       }

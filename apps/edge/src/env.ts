@@ -4,7 +4,10 @@ export type { DatabaseWakeAdmission } from "@pgcf/contracts";
 
 export interface DatabaseActorNamespace {
   idFromName(name: string): DurableObjectId;
-  get(id: DurableObjectId): {
+  get(
+    id: DurableObjectId,
+    options?: DurableObjectNamespaceGetDurableObjectOptions,
+  ): {
     admitWake(
       databaseId: string,
       user: string,
@@ -21,5 +24,7 @@ export interface Env {
   readonly BINDING_CONNECTION_RATE_LIMITER: RateLimit;
   readonly DATABASE_CONNECTION_RATE_LIMITER: RateLimit;
   readonly ROUTE_MASTER_KEYS: string;
+  /** Where the API creates DatabaseActor objects, e.g. "weur"; the Edge passes the same hint. */
+  readonly DATABASE_ACTOR_LOCATION_HINT?: string;
   readonly [binding: string]: unknown;
 }

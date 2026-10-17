@@ -90,8 +90,11 @@ async function admit(
             "database connection rate limit exceeded",
           ],
         ];
+  // The API creates each database's Actor at the same hint; an existing one never moves.
+  const hint = env.DATABASE_ACTOR_LOCATION_HINT;
   const actor = env.DATABASE_ACTOR.get(
     env.DATABASE_ACTOR.idFromName(hints.database),
+    hint ? { locationHint: hint as DurableObjectLocationHint } : undefined,
   );
   const cancel = () =>
     ctx.waitUntil(

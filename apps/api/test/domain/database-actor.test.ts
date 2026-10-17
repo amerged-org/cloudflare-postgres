@@ -11,6 +11,7 @@ import { Hono } from "hono";
 import { afterEach, expect, it, vi } from "vitest";
 import type { ApiEnv } from "../../src/env.ts";
 import {
+  databaseActor,
   reconcileDatabaseActors,
   readDatabasePresence,
   syncDatabaseActor,
@@ -255,6 +256,23 @@ it("rejects a known hint flood at the Actor's per-minute allowance before D1 or 
     minute: Math.floor(Date.now() / 60000),
     attempts: 1,
   });
+});
+
+it("gets every DatabaseActor with the configured location hint, and none without one", async () => {
+  const f = await ready();
+  const get = vi.spyOn(Object.getPrototypeOf(env.DATABASE_ACTOR), "get");
+  const hinted = { ...env, DATABASE_ACTOR_LOCATION_HINT: "weur" };
+  expect((await databaseActor(hinted, f.id).admitWake(f.id, "app")).ok).toBe(
+    true,
+  );
+  await reconcileDatabaseActors(hinted);
+  expect(get.mock.calls.length).toBeGreaterThan(1);
+  expect(get.mock.calls.map((call) => call[1])).toEqual(
+    get.mock.calls.map(() => ({ locationHint: "weur" })),
+  );
+  get.mockClear();
+  await databaseActor(env, f.id).admitWake(f.id, "app");
+  expect(get.mock.calls.map((call) => call[1])).toEqual([undefined]);
 });
 
 it("a fresh authoritative node loss overrides a warm seeded route without waking it", async () => {

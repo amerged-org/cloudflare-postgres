@@ -35,6 +35,9 @@
     // Alternatively set INFRASTRUCTURE_ALERT_WEBHOOK_URL to the receiver's HTTPS endpoint.
     // Import INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN as a private Worker secret.
     "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",
+    // Durable Object location hint for new DatabaseActor objects, near the database regions and D1.
+    // Set the same value on the Edge Worker. An existing object never moves.
+    "DATABASE_ACTOR_LOCATION_HINT": "weur",
     "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
     "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",
     "BOOTSTRAP_OPERATOR_SOURCES": "<OPERATOR_HOST_CIDRS_JSON>",

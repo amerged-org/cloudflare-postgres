@@ -54,6 +54,11 @@
       },
     },
   ],
+  "vars": {
+    // Durable Object location hint for DatabaseActor objects. Use the API Worker's value: near the
+    // database regions and D1. It applies when an object is created; an existing one never moves.
+    "DATABASE_ACTOR_LOCATION_HINT": "weur",
+  },
   "secrets": {
     "required": ["ROUTE_MASTER_KEYS"],
   },

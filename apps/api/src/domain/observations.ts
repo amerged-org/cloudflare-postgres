@@ -8,6 +8,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { databaseActor } from "./database-actor-sync.ts";
 import { agentRegion } from "./agent-auth.ts";
 import { recoverQuiescence } from "./lifecycle.ts";
 import { hint } from "./databases.ts";
@@ -808,7 +809,7 @@ export async function observations(
     let pushMilliseconds: number | null = null;
     const pushing =
       changed && becameReady
-        ? c.env.DATABASE_ACTOR.get(c.env.DATABASE_ACTOR.idFromName(row.id))
+        ? databaseActor(c.env, row.id)
             .observedReady(
               row.id,
               observation.generation,

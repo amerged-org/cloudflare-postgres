@@ -1522,6 +1522,24 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.admit_ms).toBeGreaterThanOrEqual(0);
   });
 
+  it("gets the DatabaseActor with the configured location hint, and none without one", async () => {
+    const options: unknown[] = [];
+    const namespace = (hint?: string) => ({
+      ...testEnv,
+      ...(hint ? { DATABASE_ACTOR_LOCATION_HINT: hint } : {}),
+      DATABASE_ACTOR: {
+        idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+        get: (id: DurableObjectId, option?: unknown) => {
+          options.push(option);
+          return testEnv.DATABASE_ACTOR.get(id);
+        },
+      },
+    });
+    await open({ bindings: namespace("weur") });
+    await open({ bindings: namespace() });
+    expect(options).toEqual([{ locationHint: "weur" }, undefined]);
+  });
+
   it("a caller without CF-Connecting-IP takes the binding limiter's own budget, never a public bucket", async () => {
     expect(connectionRateKey(null)).toBe("binding");
     let allow = true;

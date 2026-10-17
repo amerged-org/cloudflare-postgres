@@ -10,6 +10,7 @@ import {
   reclaimConfigurationFingerprint,
 } from "@pgcf/contracts/reclaim";
 import type { Env } from "../env.ts";
+import { databaseActor } from "./database-actor-sync.ts";
 import { DatabaseAdmissionSnapshot } from "./admission-state.ts";
 import { admissionSnapshotSql } from "./fleet-releases.ts";
 import { DatabasePresence } from "../database-actor.ts";
@@ -256,7 +257,7 @@ export async function publishDatabaseAdmission(
       if (steps) steps[step] = Date.now() - started;
     }
   };
-  const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
+  const actor = databaseActor(env, id);
   if (await timed("repair_ms", () => actor.repairAdmissionMutation()))
     await notifyAdmissionRevisions(env, [id]);
   const state = await timed("snapshot_ms", () =>

@@ -4,6 +4,21 @@ import { DatabasePresence } from "../database-actor.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { admissionSnapshotSql } from "./fleet-releases.ts";
 
+/**
+ * The DatabaseActor of a database. A new object is created at the installation's configured
+ * DATABASE_ACTOR_LOCATION_HINT (for example near its regions and D1); an existing one never moves.
+ */
+export function databaseActor(
+  env: Pick<Env, "DATABASE_ACTOR" | "DATABASE_ACTOR_LOCATION_HINT">,
+  id: string,
+) {
+  const hint = env.DATABASE_ACTOR_LOCATION_HINT;
+  return env.DATABASE_ACTOR.get(
+    env.DATABASE_ACTOR.idFromName(id),
+    hint ? { locationHint: hint as DurableObjectLocationHint } : undefined,
+  );
+}
+
 export async function readDatabasePresence(
   db: D1Database,
   id: string,
@@ -52,9 +67,7 @@ async function sync(
     if (!snapshot) return false;
     // Legacy cron convergence remains presence-only; it explicitly clears any prior v4 cache.
     // Capable regions always take the complete publisher below.
-    const closed = await env.DATABASE_ACTOR.get(
-      env.DATABASE_ACTOR.idFromName(id),
-    ).seedLegacyPresence(snapshot);
+    const closed = await databaseActor(env, id).seedLegacyPresence(snapshot);
     if (closed) {
       // Recovery still requires a positive epoch fence/readback; a clear-only legacy seed
       // never removes an orphan barrier itself.

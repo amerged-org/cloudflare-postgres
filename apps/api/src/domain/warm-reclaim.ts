@@ -14,6 +14,7 @@ import {
 } from "@pgcf/contracts/reclaim";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
+import { databaseActor } from "./database-actor-sync.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
@@ -291,11 +292,7 @@ export async function setWarmReclaimPolicy(
           "Database or warm policy revision changed",
         );
       await withAdmissionMutation(c.env, [id], async (mutation) => {
-        if (
-          !(await c.env.DATABASE_ACTOR.get(
-            c.env.DATABASE_ACTOR.idFromName(id),
-          ).revokeBeforeChange(id))
-        )
+        if (!(await databaseActor(c.env, id).revokeBeforeChange(id)))
           throw new ApiError(
             "conflict",
             "Warm reclaim revocation is not acknowledged or expired",
@@ -412,9 +409,9 @@ export async function setWarmReclaimQualification(
           if (mutation.intents.length > RECLAIM_LIMITS.max_tasks) closed();
           for (const db of mutation.intents)
             if (
-              !(await c.env.DATABASE_ACTOR.get(
-                c.env.DATABASE_ACTOR.idFromName(db.database_id),
-              ).revokeBeforeChange(db.database_id))
+              !(await databaseActor(c.env, db.database_id).revokeBeforeChange(
+                db.database_id,
+              ))
             )
               closed();
           const doc = JSON.stringify({
@@ -520,9 +517,7 @@ export async function getReclaimIntents(c: ApiContext, id: string) {
   const issued = Date.now();
   const tokens: string[] = [];
   for (const row of rows.results) {
-    const token = await c.env.DATABASE_ACTOR.get(
-      c.env.DATABASE_ACTOR.idFromName(row.id),
-    ).reclaimIntent(row.id);
+    const token = await databaseActor(c.env, row.id).reclaimIntent(row.id);
     if (token) {
       const bytes = base64urlToBytes(token.split(".")[1] ?? "");
       const claims = bytes
@@ -593,9 +588,10 @@ export async function observeReclaim(c: ApiContext, id: string, raw: unknown) {
       .first();
     if (!row) closed();
     if (
-      await c.env.DATABASE_ACTOR.get(
-        c.env.DATABASE_ACTOR.idFromName(result.database_id),
-      ).recordReclaimObservation(result.database_id, result)
+      await databaseActor(c.env, result.database_id).recordReclaimObservation(
+        result.database_id,
+        result,
+      )
     )
       accepted++;
   }

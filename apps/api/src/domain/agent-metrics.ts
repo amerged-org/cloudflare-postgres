@@ -7,6 +7,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { databaseActor } from "./database-actor-sync.ts";
 import { agentRegion } from "./agent-auth.ts";
 import { recordUsageSamples } from "./usage.ts";
 
@@ -93,9 +94,7 @@ export async function ingestAgentActivity(c: ApiContext, raw: unknown) {
       .at(-1)!;
     // A database cannot be idle before its own creation/readiness, even when a gateway process is older.
     if (boundary > activity.observed_at) continue;
-    const actor = c.env.DATABASE_ACTOR.get(
-      c.env.DATABASE_ACTOR.idFromName(activity.id),
-    );
+    const actor = databaseActor(c.env, activity.id);
     const recorded = await actor.recordActivity(activity.id, {
       revision: activity.revision,
       observed_at: activity.observed_at,
