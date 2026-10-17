@@ -8,6 +8,7 @@ import {
   DatabaseStorageVolumeReceipt,
   NodeThinStorageAuthority,
   ThinStorageProfile,
+  newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
@@ -27,6 +28,8 @@ import {
 } from "./fixtures.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { releaseCoveredStartupReservationsStatement } from "../../src/domain/startup-admission.ts";
+import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
+import type { DatabaseRow } from "../../src/domain/rows.ts";
 const mib = 1024 ** 2,
   gib = 1024 ** 3,
   sha = "a".repeat(64);
@@ -360,6 +363,47 @@ it("resumes a thin database only while its node has room", async () => {
   });
   await physicalSample(f, { dataFree: gib });
   expect((await resume()).status).toBe(202);
+});
+
+it("refuses a thin wake claim without room, but never the ticket claim a pool hit may have answered", async () => {
+  const f = await thinFixture();
+  await physicalSample(f, { dataFree: gib });
+  const created = DatabaseWithOperation.parse(
+    await (await f.create("idle")).json(),
+  );
+  const id = created.database.id;
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='suspended',suspension_reason='idle',observed_state='provisioning',observed_power='hibernated',observed_generation=generation WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  const role = (await env.DB.prepare(
+    "SELECT name FROM roles WHERE database_id=? AND deleted_at IS NULL LIMIT 1",
+  )
+    .bind(id)
+    .first<string>("name"))!;
+  const row = async () =>
+    (await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+      .bind(id)
+      .first<DatabaseRow>())!;
+  const wake = async (ticket: boolean) =>
+    (
+      await env.DB.batch(
+        powerTransitionStatements(
+          env.DB,
+          await row(),
+          "wake",
+          newOperationId(),
+          new Date().toISOString(),
+          role,
+          undefined,
+          ticket,
+        ),
+      )
+    )[0]!.meta.changes;
+  await physicalSample(f, { dataFree: 256 * mib });
+  expect(await wake(false)).toBe(0);
+  expect(await wake(true)).toBe(1);
 });
 
 /** Whether the node's NodeBootstrap Durable Object was asked for a thin storage turn. */

@@ -182,7 +182,9 @@ fn each_decision_row_returns_its_reason_in_table_order() {
             Outcome::Miss,
             Box::new(|f| f.fingerprint = "0"),
         ),
-        ("no_room", Outcome::Miss, Box::new(|f| f.room = false)),
+        // A held connect without pool room is answered 57P03 at once; the wake itself starts
+        // once the pool has room.
+        ("no_room", Outcome::Refused, Box::new(|f| f.room = false)),
         (
             "gateways_not_ready",
             Outcome::Miss,
@@ -235,6 +237,10 @@ fn each_decision_row_returns_its_reason_in_table_order() {
     facts.trigger = Trigger::Desired;
     facts.cell = Some(&claimed);
     assert!(decide(&facts).is_ok());
+    // Cloudflare's committed wake without room is a miss: its start waits for the room.
+    facts.room = false;
+    assert_eq!(decide(&facts).err(), Some((Outcome::Miss, "no_room")));
+    facts.room = true;
     facts.asleep = false;
     assert_eq!(decide(&facts).err(), Some((Outcome::Miss, "not_sleeping")));
 }
@@ -1487,8 +1493,9 @@ mod world {
             .await;
         assert!(!has(&w.since(from), "AGENT attach"));
         assert!(!w.reconciler.pool.serves(&w.id));
-        eventually("the miss", || {
-            result_of(&w, "miss").is_some_and(|r| r["reason"] == "no_room")
+        // The held connect is refused at once (57P03), not held to its timeout.
+        eventually("the refusal", || {
+            result_of(&w, "refused").is_some_and(|r| r["reason"] == "no_room")
         })
         .await;
         // Cloudflare committed the wake: the miss path starts nothing on the full pool either.

@@ -269,6 +269,14 @@ export function databaseStorageStartupSql(
   return `(${database}.storage_profile_json IS NULL OR ${thinPoolRoomSql(nodeAlias, sizeAlias, database)})`;
 }
 
+/** The room rule of a wake of `databases` (the row an UPDATE changes): a thin database wakes only
+ * while its pool has room; a retained thick filesystem allocates nothing new. */
+export function databaseWakeRoomSql(databaseAlias = "databases"): string {
+  const database = identifier(databaseAlias);
+  return `(${database}.storage_profile_json IS NULL OR EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=${database}.size_class_id
+    WHERE n.id=${database}.node_id AND ${thinPoolRoomSql("n", "s", database)}))`;
+}
+
 /** Metadata only; Native independently proves the retained thick volume before granting an exemption. */
 export async function retainedThickStorageAssignments(
   env: Env,

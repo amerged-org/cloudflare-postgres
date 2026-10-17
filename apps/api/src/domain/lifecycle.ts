@@ -7,6 +7,7 @@ import {
   Timestamp,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
+import { databaseWakeRoomSql } from "./storage-capacity.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
@@ -29,11 +30,14 @@ export function powerTransitionStatements(
   now: string,
   wakeRole?: string,
   admission?: AdmissionSqlGuard,
+  ticket = false,
 ): D1PreparedStatement[] {
   const sleeping = action === "suspend" || action === "hibernate";
-  // A wake claims no start headroom (pool design 2026-10-16): a pool hit starts in an already
-  // running slot, and the controller's miss path keeps its own start checks. The start
-  // reservation below stays, because the miss path's start tokens need it.
+  // A wake claims no RAM or CPU start headroom (pool design 2026-10-16): a pool hit starts in an
+  // already running slot, and the controller's miss path keeps its own start checks. A thin
+  // database wakes only while its pool has room, except for the claim of a wake `ticket`: the
+  // Edge answered it before the claim, a pool hit may already serve it, and the controller
+  // checked the room before that hit.
   const authorizedRole = action === "wake" ? RoleName.parse(wakeRole) : null;
   const statements = [
     db
@@ -43,7 +47,7 @@ export function powerTransitionStatements(
       AND (EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle'))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
-      AND ${sleeping || action === "wake" ? "1=1" : databaseStartupHeadroomSql("databases")}
+      AND ${sleeping || (action === "wake" && ticket) ? "1=1" : action === "wake" ? databaseWakeRoomSql("databases") : databaseStartupHeadroomSql("databases")}
       AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(

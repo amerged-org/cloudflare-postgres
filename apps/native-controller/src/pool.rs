@@ -300,8 +300,13 @@ pub fn decide(facts: &Facts) -> Result<Choice, (Outcome, &'static str)> {
     if record.configuration_sha256 != facts.fingerprint {
         return miss("configuration_changed");
     }
+    // Without pool room a held connect is refused at once (57P03) rather than held to its
+    // timeout; Cloudflare's committed wake waits for the room on the start path.
     if !facts.room {
-        return miss("no_room");
+        return match facts.trigger {
+            Trigger::Gateway(_) => Err((Outcome::Refused, "no_room")),
+            Trigger::Desired => miss("no_room"),
+        };
     }
     if !facts.gateways_ready {
         return miss("gateways_not_ready");
