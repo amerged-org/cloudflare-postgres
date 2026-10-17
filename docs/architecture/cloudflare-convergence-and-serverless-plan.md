@@ -579,6 +579,14 @@ Not gating go-live; ordered by expected need.
 - **Account separation (owner decision):** the Cloudflare account that holds PGCF's D1 and R2 is
   shared with unrelated projects; moving PGCF to its own account, or at least listing and pruning
   every token with D1, R2 or Workers write scope, removes that exposure.
+- **Topology without a control server (owner question, 2026-10-17; discuss once the EU1 and
+  control images are stable):** Cloudflare already holds each database's server and routes to it;
+  the control server only carries the Kubernetes control plane and the management relay. Each VPS
+  could be a self-contained single-node cluster (own tunnel, own etcd snapshot to R2), named eu1,
+  eu2, us1, us2, with Cloudflare placing databases and moving one from a full server by restoring
+  its R2 backup on another (local volumes make that the move path in either topology). Cost: about
+  1 GB RAM and some CPU of control plane per VPS, a relay per server, and rework of the rollout and
+  region code that assumes a control node.
 - **Capacity:** EU2 (owner's costed go) for redundancy and capacity; sleeping Thin overbooking,
   which needs an all-write bound beyond `io.max`; node drain, move with kept IDs and decommission.
 - **Operations:** alert history, acknowledgement, test send and evaluation of every region;
