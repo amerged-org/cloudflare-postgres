@@ -1278,10 +1278,12 @@ A connect during the move is held, or answered with `57P03`. Stage 5.7 tests a m
 
 - **Nodes** are named by hostname: `eu1`, `eu2`, later `us1`, `us2`.
 - **A region** is a Contabo location with its own R2 bucket, purchase policy and placement. The proposal is to rename the region `eu-dev` to `eu` in Stage 2's migration set ([D5](#115-decisions-open-for-the-owner)).
-- **EU only for now.**
-  - The US contract ends 2026-11-04.
-  - US1 was marked lost on 2026-10-11 and powered off on 2026-10-16. Its configuration is treated as compromised.
-  - `ARCHIVE_US` is kept until the US archives expire.
+- **One image for every node (owner, 2026-10-17).** EU1, US1 and every later node run the same image release. OS patches, PostgreSQL upgrades and agent releases therefore roll out 1:1 identically across all nodes; there is no per-node or per-region variant, only configuration (region, bucket, keys).
+- **EU first, then US1.**
+  - EU1 is built and accepted first (Stages 1–5).
+  - **TODO once EU1 passes Stage 5:** install US1 from the same image release as EU1. US1 is a new Contabo Cloud VPS Plus 4 (2026), server `pgcf-us1`, bought without setup; its address is in the operator's private configuration. It needs a US region row, its R2 bucket and its purchase policy, and then the same node acceptance as EU1.
+  - The previous US1 (contract ends 2026-11-04) was marked lost on 2026-10-11 and powered off on 2026-10-16; its configuration is treated as compromised and is never reused.
+  - `ARCHIVE_US` is kept until the old US archives expire.
 - **Adding a region** needs no control server: a region row, a bucket, a purchase policy and a node.
 
 ### 9.7 Capacity and purchase policy
@@ -1619,6 +1621,7 @@ From the canary on, the EU1 stack is production.
 | 5 Acceptance | Open (needs Stage 4) | |
 | 6 Docs | Open (needs Stage 5) | |
 | 7 Go-live gates | Open; G5 waits for the owner's alert destination | |
+| US1 | TODO once EU1 passes Stage 5 | Install `pgcf-us1` from the same image release as EU1 (9.6) |
 
 ### 11.3 Owner decisions taken
 
@@ -1631,7 +1634,7 @@ From the canary on, the EU1 stack is production.
 | 2026-10-14 | Sub-second on a real cold wake; don't over-test; parallelize; no separate Dev |
 | 2026-10-15 | Go-live approved; no backwards compatibility; PGCF generic; restore and PITR create a new database; PostgreSQL 18; 7-day retention for the first integrator's classes; Cloudflare account stays shared; alert sender later; EU1 loss and maintenance windows later |
 | 2026-10-16 | Binding product goal: cold under 1 s; only warm and cold |
-| 2026-10-17 | Decision A (remove the guard, simplify bloat). One release per batch; no "R1/R2" names. Per-database idle time 60–900 s. **Option C**, with no control server. Placement until 80 % of the 30-minute-average peak of active RAM or CPU; no count limit; storage, RAM and CPU per database through the admin API; thin-slice overbooking central |
+| 2026-10-17 | Decision A (remove the guard, simplify bloat). One release per batch; no "R1/R2" names. Per-database idle time 60–900 s. **Option C**, with no control server. Placement until 80 % of the 30-minute-average peak of active RAM or CPU; no count limit; storage, RAM and CPU per database through the admin API; thin-slice overbooking central. One image for every node, so patches and upgrades are identical everywhere; US1 (`pgcf-us1`) follows once EU1 works |
 
 ### 11.4 Design decisions taken in this plan
 
