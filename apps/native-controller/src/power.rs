@@ -2034,19 +2034,26 @@ impl PowerCoordinator {
                 .as_ref()
                 .map(|map| intent_from(map, text(db, "id")))
                 .transpose()?;
-            if current.as_ref().is_some_and(|v| v.mode == "quiesce") {
+            // A quiesce of this generation is a sleep under way. One of an earlier generation is
+            // a sleep that was refused or superseded: the database runs again at a newer one.
+            let generation = number(db, "generation");
+            let stale = current
+                .as_ref()
+                .is_some_and(|v| v.mode == "quiesce" && v.revision < generation);
+            if current.as_ref().is_some_and(|v| v.mode == "quiesce") && !stale {
                 crate::timing::ready_withheld(db, "ready_fence_quiesced", None);
                 return Ok(None);
             }
-            if current
-                .as_ref()
-                .is_some_and(|v| v.revision == number(db, "generation"))
-            {
+            if current.as_ref().is_some_and(|v| v.revision == generation) {
                 return Ok(current);
+            }
+            if stale && let Ok(Some(intent)) = desired_power(db) {
+                return Ok(Some(intent));
             }
             Ok(Some(PowerIntent {
                 database: text(db, "id").into(),
                 operation: current
+                    .filter(|v| v.mode != "quiesce")
                     .map(|v| v.operation)
                     .unwrap_or_else(|| text(origin, "operation_id").into()),
                 revision: number(db, "generation"),

@@ -942,6 +942,60 @@ async fn a_pass_that_withholds_a_slot_served_database_s_ready_report_says_why() 
 }
 
 #[tokio::test]
+async fn a_quiesce_left_by_a_refused_sleep_does_not_withhold_the_next_wake() {
+    // Live on EU1: a sleep refused with power_busy left the fence quiescing its generation, the
+    // API woke the database at the next generation, and every pass withheld its ready report.
+    let mut w = World::pooled().await;
+    let gateway = RealGateway::start(&mut w).await;
+    gateway.routes.lock().unwrap().insert(
+        wake::slot_tls_name(&slot_ns()),
+        w.slot_postgres.as_ref().unwrap().address,
+    );
+    w.node_storage(true);
+    let (mut client, delivered) = held_wake(&w, &gateway, 913).await;
+    until_ready(&mut client).await;
+    slot_runs(&w);
+    w.claimed(&delivered);
+    let db = w.db.clone();
+    w.reconciler.pool.confirm_tickets(
+        |id| (id == db["id"]).then_some(&db),
+        std::time::Instant::now(),
+    );
+    let stale = delivered.generation - 1;
+    w.server.edit(
+        "ConfigMap",
+        Some(SYSTEM),
+        &format!("gateway-fence-{}", w.id),
+        |map| {
+            let mut intent: Value =
+                serde_json::from_str(map["data"]["intent.json"].as_str().unwrap()).unwrap();
+            intent["mode"] = "quiesce".into();
+            intent["revision"] = stale.into();
+            map["data"]["intent.json"] = intent.to_string().into();
+        },
+    );
+    w.node_storage(true);
+    let observed = w
+        .reconciler
+        .reconcile(&w.db, &w.snapshot)
+        .await
+        .unwrap()
+        .expect("the woken database is reported");
+    assert_eq!(observed["state"], "ready", "{observed}");
+    let map = w
+        .server
+        .get(
+            "ConfigMap",
+            Some(SYSTEM),
+            &format!("gateway-fence-{}", w.id),
+        )
+        .unwrap();
+    let intent: Value = serde_json::from_str(map["data"]["intent.json"].as_str().unwrap()).unwrap();
+    assert_eq!(intent["mode"], "running");
+    assert_eq!(intent["revision"], delivered.generation);
+}
+
+#[tokio::test]
 async fn a_slot_served_database_whose_postgres_does_not_accept_is_not_reported_ready() {
     let mut w = World::pooled().await;
     let gateway = RealGateway::start(&mut w).await;
