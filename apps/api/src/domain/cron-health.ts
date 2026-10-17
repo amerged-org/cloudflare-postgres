@@ -25,7 +25,6 @@ export const CRON_STEPS = [
   "node_capacity",
   "retained_archives",
   "fleet_updates",
-  "fleet_rollouts",
 ] as const;
 export type CronStep = (typeof CRON_STEPS)[number];
 export interface CronStepFailure {

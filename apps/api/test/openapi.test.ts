@@ -9,7 +9,6 @@ import {
   Role,
   RoleCreate,
 } from "@pgcf/contracts";
-import { NODE_OPERATOR_KUBERNETES_HEADERS } from "@pgcf/contracts/node-operator";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.ts";
 import type { Env } from "../src/env.ts";
@@ -61,35 +60,22 @@ describe("actual generated API references in the Workers runtime", () => {
     const app = createApp();
     const publicDoc = await document("/v1/openapi.json");
     const agentDoc = await document("/agent/v1/openapi.json");
-    const internalDoc = await document("/internal/v1/openapi.json");
-    const docs = [publicDoc, agentDoc, internalDoc];
+    const docs = [publicDoc, agentDoc];
     expect(
       Object.keys(publicDoc.paths).every(
-        (path) =>
-          path.startsWith("/v1/") ||
-          path === "/healthz" ||
-          path === "/fleet-images/v1/raw/{digest}",
+        (path) => path.startsWith("/v1/") || path === "/healthz",
       ),
     ).toBe(true);
     expect(
       Object.keys(agentDoc.paths).every((path) => path.startsWith("/agent/")),
-    ).toBe(true);
-    expect(
-      Object.keys(internalDoc.paths).every(
-        (path) => path.startsWith("/internal/") || path === "/source-control",
-      ),
     ).toBe(true);
     const actual = new Set(
       app.routes
         .filter((route) => methods.has(route.method.toLowerCase()))
         .filter(
           (route) =>
-            /^(?:\/v1\/|\/agent\/|\/internal\/)/.test(route.path) ||
-            [
-              "/healthz",
-              "/source-control",
-              "/fleet-images/v1/raw/:digest",
-            ].includes(route.path),
+            /^(?:\/v1\/|\/agent\/)/.test(route.path) ||
+            route.path === "/healthz",
         )
         .map(
           (route) =>
@@ -115,9 +101,19 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(operation(publicDoc, "/v1/fleet/releases", "get").operationId).toBe(
       "listFleetReleases",
     );
-    expect(operation(publicDoc, "/v1/fleet/patches", "get").operationId).toBe(
-      "listFleetPatches",
-    );
+    // No route outside these two documents remains, and no callback document is served.
+    expect(
+      app.routes.some(
+        (route) =>
+          route.path.startsWith("/internal/") ||
+          route.path.startsWith("/fleet-images/") ||
+          route.path === "/source-control",
+      ),
+    ).toBe(false);
+    expect(
+      (await createApp().fetch(request("/internal/v1/openapi.json"), env))
+        .status,
+    ).toBe(404);
   });
 
   it("versions the document by its contract and names the deployed Worker beside it", async () => {
@@ -126,11 +122,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "CF_VERSION_METADATA",
     ) as WorkerVersionMetadata;
     expect(metadata?.id).toBeTruthy();
-    for (const path of [
-      "/v1/openapi.json",
-      "/agent/v1/openapi.json",
-      "/internal/v1/openapi.json",
-    ]) {
+    for (const path of ["/v1/openapi.json", "/agent/v1/openapi.json"]) {
       const doc = await document(path);
       // A Worker release changes the Worker version; only the contract changes this one.
       expect(doc.info.version, path).toBe(API_CONTRACT_VERSION);
@@ -154,7 +146,6 @@ describe("actual generated API references in the Workers runtime", () => {
   it("preserves actual JSON headers, scoped auth and WebSocket response semantics", async () => {
     const publicDoc = await document("/v1/openapi.json");
     const agents = await document("/agent/v1/openapi.json");
-    const internal = await document("/internal/v1/openapi.json");
     const listed = operation(publicDoc, "/v1/databases", "get");
     expect(listed.parameters).toContainEqual(
       expect.objectContaining({
@@ -175,42 +166,22 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(
       operation(publicDoc, "/v1/databases", "post").responses["202"]!.headers,
     ).toHaveProperty("Location");
-    const stream = operation(
-      publicDoc,
-      "/v1/nodes/{id}/operator/kubernetes",
-      "get",
-    );
-    expect(stream.parameters).toContainEqual(
+    const link = operation(agents, "/agent/v1/link", "get");
+    expect(link.parameters).toContainEqual(
       expect.objectContaining({
         name: "Upgrade",
         in: "header",
         required: true,
       }),
     );
-    expect(stream.responses["101"]!.content).toBeUndefined();
-    for (const name of Object.values(NODE_OPERATOR_KUBERNETES_HEADERS))
-      expect(stream.responses["101"]!.headers).toHaveProperty(name);
-    expect(stream.responses).toHaveProperty("400");
-    expect(stream.responses).toHaveProperty("401");
-    expect(stream.responses).toHaveProperty("403");
+    expect(link.responses["101"]!.content).toBeUndefined();
     expect(operation(agents, "/agent/v1/desired", "get").security).toEqual([
       { AgentBearer: [] },
     ]);
-    expect(
-      operation(
-        internal,
-        "/internal/v1/node-installation/{id}/transport",
-        "post",
-      ).security,
-    ).toEqual([{ CallbackBearer: [] }]);
   });
 
   it("keeps every local component reference resolvable after scope separation", async () => {
-    for (const path of [
-      "/v1/openapi.json",
-      "/agent/v1/openapi.json",
-      "/internal/v1/openapi.json",
-    ]) {
+    for (const path of ["/v1/openapi.json", "/agent/v1/openapi.json"]) {
       const doc = await document(path);
       const visit = (value: unknown): void => {
         if (value === null || typeof value !== "object") return;
@@ -232,27 +203,9 @@ describe("actual generated API references in the Workers runtime", () => {
     }
   });
 
-  it("describes the public raw image handlers without JSON or credential claims", async () => {
-    const doc = await document("/v1/openapi.json");
-    const get = operation(doc, "/fleet-images/v1/raw/{digest}", "get");
-    const head = operation(doc, "/fleet-images/v1/raw/{digest}", "head");
-    expect(get.security).toEqual([]);
-    expect(get.responses["200"]!.content).toHaveProperty("application/x-xz");
-    expect(get.responses["206"]!.headers).toHaveProperty("Content-Range");
-    expect(get.responses["404"]!.content).toBeUndefined();
-    expect(get.responses["416"]!.content).toBeUndefined();
-    expect(head.responses["200"]!.content).toBeUndefined();
-    expect(head.responses).not.toHaveProperty("206");
-    expect(head.responses).not.toHaveProperty("416");
-    expect(Object.keys(doc.paths).some((path) => path.startsWith("/v2/"))).toBe(
-      false,
-    );
-  });
-
-  it("documents supported replay headers and distinct relay refusal boundaries", async () => {
+  it("documents supported replay headers", async () => {
     const management = await document("/v1/openapi.json");
     const agent = await document("/agent/v1/openapi.json");
-    const internal = await document("/internal/v1/openapi.json");
     // Creating a database is idempotent by contract and refuses a request without its key.
     const create = operation(management, "/v1/databases", "post");
     expect(create.parameters).toContainEqual(
@@ -264,18 +217,15 @@ describe("actual generated API references in the Workers runtime", () => {
     ).toContainEqual(
       expect.objectContaining({ name: "Idempotency-Key", required: false }),
     );
-    const start = operation(
-      management,
-      "/v1/nodes/{id}/thin-qualifications",
-      "post",
-    );
-    expect(start.parameters).toContainEqual(
+    expect(
+      operation(management, "/v1/nodes/additions", "post").parameters,
+    ).toContainEqual(
       expect.objectContaining({ name: "Idempotency-Key", required: true }),
     );
     expect(
       operation(
         management,
-        "/v1/fleet/patches/{operation_id}/resume",
+        "/v1/nodes/additions/{id}/approve",
         "post",
       ).parameters?.some((parameter) => parameter.name === "Idempotency-Key"),
     ).toBe(false);
@@ -302,39 +252,8 @@ describe("actual generated API references in the Workers runtime", () => {
         .responses,
     ).toHaveProperty("409");
     expect(
-      operation(management, "/v1/regions/{id}/bootstrap-material", "post")
-        .description,
-    ).not.toContain("only Kubernetes");
-    expect(
       operation(agent, "/agent/v1/link", "get").responses["426"]!.content,
     ).toHaveProperty("text/plain");
-    const byteRelay = operation(
-      internal,
-      "/internal/v1/fleet-patches/{operation_id}/relay",
-      "get",
-    );
-    expect(
-      byteRelay.parameters?.filter((parameter) => parameter.name === "Upgrade"),
-    ).toHaveLength(1);
-    expect(byteRelay.parameters).toContainEqual(
-      expect.objectContaining({ name: "X-PGCF-Bootstrap", required: true }),
-    );
-    expect(byteRelay.responses["401"]!.content).toHaveProperty("*/*");
-    expect(byteRelay.responses["403"]?.content).toHaveProperty(
-      "application/json",
-    );
-    expect(byteRelay.responses["403"]?.content).toHaveProperty("*/*");
-    const operatorRelay = operation(
-      internal,
-      "/internal/v1/infrastructure-backups/{run}/{artifact}/kubernetes",
-      "get",
-    );
-    expect(
-      operatorRelay.parameters?.some(
-        (parameter) => parameter.name === "X-PGCF-Bootstrap",
-      ),
-    ).toBe(false);
-    expect(operatorRelay.responses).not.toHaveProperty("default");
     const keys = operation(management, "/v1/api-keys", "post");
     expect(keys.description).toContain("first administrator key");
     expect(
@@ -348,7 +267,7 @@ describe("actual generated API references in the Workers runtime", () => {
     ).toContain("409");
     console.info(
       "generated reference measurements",
-      [management, agent, internal].map((doc) => ({
+      [management, agent].map((doc) => ({
         operations: operations(doc).length,
         schemas: Object.keys(doc.components?.schemas ?? {}).length,
         bytes: new TextEncoder().encode(JSON.stringify(doc)).length,
@@ -519,11 +438,7 @@ describe("actual generated API references in the Workers runtime", () => {
     };
     const nullable = (schema: Schema | undefined) =>
       Array.isArray(schema?.type) && schema!.type.includes("null");
-    for (const path of [
-      "/v1/openapi.json",
-      "/agent/v1/openapi.json",
-      "/internal/v1/openapi.json",
-    ]) {
+    for (const path of ["/v1/openapi.json", "/agent/v1/openapi.json"]) {
       const doc = await document(path);
       const schemas = (doc.components?.schemas ?? {}) as Record<string, Schema>;
       // A component that is nullable makes every use of it nullable; nullability belongs to the use.
@@ -674,22 +589,5 @@ describe("actual generated API references in the Workers runtime", () => {
     const info = (doc as unknown as { info: { description?: string } }).info;
     expect(info.description).toMatch(/64 KiB/);
     expect(info.description).toMatch(/Content-Type: application\/json/);
-  });
-
-  it("limits callback replies to the outcomes produced by their current actions", async () => {
-    const internal = await document("/internal/v1/openapi.json");
-    const access = JSON.stringify(
-      operation(internal, "/internal/v1/node-proof/{id}/access", "post")
-        .responses["200"]!.content,
-    );
-    expect(access).toContain('"access"');
-    expect(access.includes('"scan"')).toBe(false);
-    const qualification = JSON.stringify(
-      operation(internal, "/internal/v1/thin-qualifications/{id}", "post")
-        .responses["200"]!.content,
-    );
-    expect(qualification).toContain('"running"');
-    expect(qualification.includes('"failed"')).toBe(false);
-    expect(qualification.includes('"completed"')).toBe(false);
   });
 });

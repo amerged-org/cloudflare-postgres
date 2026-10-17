@@ -5,7 +5,6 @@ import {
   DatabaseWithOperation,
   newDatabaseId,
   newNodeId,
-  newOperationId,
 } from "@pgcf/contracts";
 import { Hono } from "hono";
 import { afterEach, expect, it, vi } from "vitest";
@@ -121,41 +120,6 @@ async function assignNode(admin: string, node: string, release: string) {
     role: "customer",
   });
   expect(assigned.status).toBe(200);
-}
-/** A real patch confirms only after every gateway Pod runs the release's pinned image; its receipt is inserted as in thin-qualified-fixture.ts. */
-async function confirmPatch(
-  node: string,
-  release: { id: string; sha: string },
-) {
-  const current = await env.DB.prepare(
-    "SELECT n.node_uid,n.region_id,a.revision assignment,f.revision region FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id WHERE n.id=?",
-  )
-    .bind(node)
-    .first<{
-      node_uid: string;
-      region_id: string;
-      assignment: number;
-      region: number;
-    }>();
-  const at = new Date().toISOString();
-  await env.DB.prepare(
-    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,?,?,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,?)`,
-  )
-    .bind(
-      newOperationId(),
-      node,
-      current!.region_id,
-      current!.node_uid,
-      crypto.randomUUID(),
-      release.id,
-      release.sha,
-      current!.assignment,
-      current!.region,
-      at,
-      at,
-      at,
-    )
-    .run();
 }
 function attestation(database: string, generation: number, pod: string) {
   return JSON.stringify({
@@ -442,7 +406,6 @@ it("a v3 region admits only the controller-verified target of the observed revis
   const release = await nativeRelease(f.admin, true);
   await assignRegion(f.admin, f.region, release.id);
   await assignNode(f.admin, f.node, release.id);
-  await confirmPatch(f.node, release);
   const pod = crypto.randomUUID();
   const store = (value: string | null) =>
     env.DB.prepare("UPDATE databases SET runtime_attestation_json=? WHERE id=?")
@@ -484,7 +447,7 @@ it("a v3 region admits only the controller-verified target of the observed revis
   }
 });
 
-it("route token v3 follows the region's converged declaring release in both directions", async () => {
+it("route token v3 follows the region's declaring release once every current member is assigned to it", async () => {
   const f = await ready();
   await sync(f.id);
   const pod = crypto.randomUUID();
@@ -505,12 +468,11 @@ it("route token v3 follows the region's converged declaring release in both dire
   expect(await admission()).toEqual(legacy);
   const declared = await nativeRelease(f.admin, true);
   await assignRegion(f.admin, f.region, declared.id);
-  await assignNode(f.admin, f.node, declared.id);
-  // Assigned but not yet patched: an older gateway may still serve the region.
+  // The region declares v3 while its member is not yet assigned to that release.
   expect(await admission()).toEqual(legacy);
-  await confirmPatch(f.node, declared);
+  await assignNode(f.admin, f.node, declared.id);
   expect(await admission()).toEqual(targeted);
-  // A further current member without its confirmed patch keeps the whole region on v2.
+  // A further current member without the declaring release keeps the whole region on v2.
   const member = newNodeId(),
     at = new Date().toISOString();
   await env.DB.prepare(
@@ -526,29 +488,25 @@ it("route token v3 follows the region's converged declaring release in both dire
       crypto.randomUUID(),
     )
     .run();
-  await assignNode(f.admin, member, declared.id);
   expect(await admission()).toEqual(legacy);
-  await confirmPatch(member, declared);
+  await assignNode(f.admin, member, declared.id);
   expect(await admission()).toEqual(targeted);
-  // Rollback: assigning a release without the declaration stops v3 before any older gateway runs,
-  // even once that release has converged, and never refuses an untargeted ready database.
+  // Rollback: assigning a release without the declaration stops v3 at once, also once every member
+  // runs it, and never refuses an untargeted ready database.
   const older = await nativeRelease(f.admin, false);
   await assignRegion(f.admin, f.region, older.id);
   expect(await admission()).toEqual(legacy);
-  for (const node of [f.node, member]) {
+  for (const node of [f.node, member])
     await assignNode(f.admin, node, older.id);
-    await confirmPatch(node, older);
-  }
   expect(await admission()).toEqual(legacy);
   await store(null);
   expect(await admission()).toEqual(legacy);
-  // Rolling forward again needs fresh confirmations at the new region revision.
+  // Rolling forward again needs every member on the declaring release.
   await store(attestation(f.id, 1, pod));
   await assignRegion(f.admin, f.region, declared.id);
+  expect(await admission()).toEqual(legacy);
   for (const node of [f.node, member])
     await assignNode(f.admin, node, declared.id);
-  expect(await admission()).toEqual(legacy);
-  for (const node of [f.node, member]) await confirmPatch(node, declared);
   expect(await admission()).toEqual(targeted);
 });
 

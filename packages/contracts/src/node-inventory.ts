@@ -6,7 +6,6 @@ import {
   FleetNodeReleaseStatus,
   FleetReleaseFacts,
 } from "./releases.ts";
-import { FleetPatchStatus } from "./fleet-patches.ts";
 
 export const NodeFleetObservation = z
   .strictObject({
@@ -28,19 +27,6 @@ export const NodeFleetObservation = z
   })
   .meta({ id: "NodeFleetObservation" });
 
-export const NodeLatestPatch = FleetPatchStatus.pick({
-  operation_id: true,
-  node_uid: true,
-  release_id: true,
-  assignment_revision: true,
-  revision: true,
-  stage: true,
-  state: true,
-  error_code: true,
-  created_at: true,
-  updated_at: true,
-}).meta({ id: "NodeLatestPatch" });
-
 /** Admin inventory, distinct from the legacy Node shape returned by node mutations. */
 export const NodeInventory = Node.extend({
   role: FleetNodeRole.nullable(),
@@ -52,7 +38,5 @@ export const NodeInventory = Node.extend({
     observed_facts: true,
   }),
   observation: NodeFleetObservation,
-  // A union, so that the component NodeLatestPatch is not made nullable for every other use.
-  latest_patch: z.union([NodeLatestPatch, z.null()]),
 }).meta({ id: "NodeInventory" });
 export type NodeInventory = z.infer<typeof NodeInventory>;

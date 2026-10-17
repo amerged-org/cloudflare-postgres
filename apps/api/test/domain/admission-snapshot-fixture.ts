@@ -5,7 +5,6 @@ import {
   DesiredResponse,
   DatabaseStorageVolumeReceipt,
   DesiredDatabaseStorage,
-  newOperationId,
   presentRoles,
 } from "@pgcf/contracts";
 import {
@@ -102,7 +101,6 @@ export async function admissionSnapshotFixture(
   );
   expect(response.status).toBe(200);
   admissionFixtureReleases.push(releaseId);
-  const release = (await response.json()) as { spec_sha256: string };
   const nodeUid = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
     .bind(f.node)
     .first<string>("node_uid");
@@ -124,7 +122,6 @@ export async function admissionSnapshotFixture(
         drain_seconds: 10,
       })
     : undefined;
-  const patchId = newOperationId();
   const clusterUid = crypto.randomUUID();
   const at = new Date().toISOString();
   await env.DB.batch([
@@ -137,21 +134,6 @@ export async function admissionSnapshotFixture(
     env.DB.prepare(
       "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) VALUES(?,?,?,'customer',1,?)",
     ).bind(f.node, nodeUid, releaseId, at),
-    env.DB.prepare(
-      `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
-      VALUES(?,?,?,?,?,?,?,1,1,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,?)`,
-    ).bind(
-      patchId,
-      f.node,
-      f.region,
-      nodeUid,
-      clusterUid,
-      releaseId,
-      release.spec_sha256,
-      at,
-      at,
-      at,
-    ),
     env.DB.prepare(
       "UPDATE databases SET node_id=?,storage_profile_json=?,observed_state='ready',observed_power='awake',observed_generation=generation,power_operation=NULL,desired_postgres_release_id=?,desired_postgres_image=?,desired_postgres_version='18.7',desired_postgres_schema_revision=1 WHERE id=?",
     ).bind(
@@ -253,5 +235,5 @@ export async function admissionSnapshotFixture(
       id,
     )
     .run();
-  return { ...f, id, releaseId, patchId, nodeUid, proof, volume, now, desired };
+  return { ...f, id, releaseId, nodeUid, proof, volume, now, desired };
 }

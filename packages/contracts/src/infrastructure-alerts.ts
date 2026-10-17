@@ -20,8 +20,8 @@ export const InfraAlertKind = z
     "control_cron_step_failing",
   ])
   .describe(
-    "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: a daily D1 or etcd backup of the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy. " +
-      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's Thin storage is blocked, or its fresh physical sample shows the thin pool without room (thin_pool_no_room: no database starts or attaches there) or below its growth point with no growth left (thin_pool_growth_exhausted: the pool is at its maximum, the volume group is too full, or metadata is under twice its reserve), or a pool that holds thin volumes has no physical sample of at most 120 s (thin_pool_unobserved); thin_storage lists each node with its thin_storage_* or thin_pool_* error_code, or null while only the pool reserve is short, which refuses new starts. " +
+    "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: the daily D1 backup stored in the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy. " +
+      "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's fresh physical sample shows the thin pool without room (thin_pool_no_room: no database starts or attaches there) or below its growth point with no growth left (thin_pool_growth_exhausted: the pool is at its maximum, the volume group is too full, or metadata is under twice its reserve), or a pool that holds thin volumes has no physical sample of at most 120 s (thin_pool_unobserved); thin_storage lists each node with its thin_pool_* error_code. " +
       "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
   );
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
@@ -35,7 +35,7 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
   regional_node_stale:
     "A node stopped reporting or is marked lost. Check the server and its regional controller; if the server is gone, follow the lost-node runbook in docs/operations/recovery.md.",
   infrastructure_backup_failed:
-    "A daily D1 or etcd backup failed. Read GET /v1/infrastructure-backups for the artifact error_code and fix it; same-day retries run automatically (docs/operations/infrastructure-backups.md).",
+    "The daily D1 backup failed. Read GET /v1/infrastructure-backups for the artifact error_code and fix it; same-day retries run automatically (docs/operations/infrastructure-backups.md).",
   infrastructure_backup_stale:
     "No complete infrastructure backup for over 36 h. Read GET /v1/infrastructure-backups and the cron heartbeat in GET /v1/operational-health?scope=regions, and fix the cause before the next 00:00Z run.",
   regional_node_ram_warning:
@@ -49,7 +49,7 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
   database_base_backup_stale:
     "The listed awake databases have no completed base backup for 36 h of awake time. Check their scheduled backup and R2 access; read backup.status in GET /v1/operational-health?scope=databases.",
   thin_storage_blocked:
-    "A listed node's thin pool is short of space or unobserved, or its Thin storage blocked. thin_pool_no_room: nothing starts there until the pool grows. thin_pool_growth_exhausted: raise maximum_data_bytes, free the volume group or move databases. thin_pool_unobserved: fix its storage sample. thin_storage_*: repeat the node's storage-profile PUT once the lease expires (docs/operations/recovery.md).",
+    "A listed node's thin pool is short of space or unobserved. thin_pool_no_room: nothing starts there until the pool grows. thin_pool_growth_exhausted: raise maximum_data_bytes, free the volume group or move databases. thin_pool_unobserved: fix its storage sample.",
   control_cron_stalled:
     "The minute cron has not completed a run for over 5 minutes. Check the Worker's cron trigger and logs (cron_step_failed, cron_completed) and redeploy the Worker if its trigger is missing.",
   control_cron_step_failing:
@@ -100,7 +100,7 @@ export const InfraAlert = z.strictObject({
   utilization_ppm: Ppm.nullable().optional(),
   /** Database kinds: the affected databases, longest-standing first. */
   database_ids: z.array(DatabaseId).max(64).optional(),
-  /** thin_storage_blocked: each listed node with its thin_storage_* or thin_pool_* code, null while only the pool reserve is short. */
+  /** thin_storage_blocked: each listed node with its thin_pool_* code. */
   thin_storage: z
     .array(
       z.strictObject({

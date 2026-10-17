@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it } from "vitest";
-import {
-  DatabaseRuntimeAttestation,
-  ReclaimClaims,
-  reclaimScopeFromRuntime,
-} from "../src/reclaim.ts";
+import { DatabaseRuntimeAttestation } from "../src/reclaim.ts";
 import {
   DatabaseAdmissionIntent,
   GatewayAdmissionTarget,
@@ -60,43 +56,6 @@ const proof = {
     },
   },
 };
-it("projects a v2 runtime into only the existing strict v1 reclaim identity", () => {
-  const scope = reclaimScopeFromRuntime(
-    DatabaseRuntimeAttestation.parse(proof),
-  );
-  expect(scope).toEqual({
-    v: 1,
-    database_id: proof.database_id,
-    generation: 7,
-    storage_generation: 3,
-    node_uid: uid,
-    boot_id: uid,
-    cluster_uid: uid,
-    namespace_uid: uid,
-    cnpg_cluster_uid: uid,
-    storage_uid: uid,
-    pvc_uid: uid,
-    pv_uid: uid,
-    pod_uid: uid,
-    container_id: hash,
-    postgres_image_sha256: hash,
-    memory_request_bytes: 128,
-    memory_limit_bytes: 256,
-  });
-  expect(
-    ReclaimClaims.safeParse({
-      ...scope,
-      kid: "projection-test",
-      operation_id: `op_${"a".repeat(20)}`,
-      intent_revision: 1,
-      mode: "revoked",
-      budget_bytes: 0,
-      step_bytes: 0,
-      issued_at: 1000,
-      expires_at: 6000,
-    }).success,
-  ).toBe(true);
-});
 it("requires separate admission, CA, role and actual continuity identities in a v2 runtime proof", () => {
   expect(DatabaseRuntimeAttestation.parse(proof)).toEqual(proof);
   for (const field of [

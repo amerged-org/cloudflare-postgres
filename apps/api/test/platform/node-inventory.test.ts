@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { newNodeId, newOperationId } from "@pgcf/contracts";
+import { newNodeId } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { cleanupFixtures, fixture, request } from "../domain/fixtures.ts";
-import { thinExecutionFixture } from "../domain/thin-execution-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -27,40 +26,98 @@ type Inventory = {
     agent_version: string | null;
     agent_image_sha256: string | null;
   };
-  latest_patch: {
-    operation_id: string;
-    node_uid: string;
-    stage: string;
-  } | null;
 };
 
+/** A node assigned to its region's release, with an inventory report of that assignment. */
 async function observedFixture() {
-  const f = await thinExecutionFixture(releases),
+  const f = await fixture(),
+    release = `inventory-${crypto.randomUUID()}`,
     at = new Date().toISOString(),
-    facts = {
-      configuration_schema_revision: 1,
-      talos_version: "1.14.2",
+    names = [
+      "api",
+      "edge",
+      "node-bootstrap",
+      "regional",
+      "postgres",
+      "barman",
+      "cloudflared",
+      "cilium",
+      "flux-source",
+      "flux-kustomize",
+      "flux-helm",
+      "flux-notification",
+      "cert-manager",
+      "cloudnative-pg",
+      "openebs-lvm",
+      "native-controller",
+    ],
+    role = {
+      talos_version: "1.14.1",
+      talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
+      talos_schematic_sha256: "b".repeat(64),
+      talos_extensions: [],
       kubernetes_version: "1.36.5",
-      kubelet_version: "1.36.5",
-      components: [
-        {
-          name: "native-controller",
-          version: "observed-controller-build",
-          sha256: "e".repeat(64),
-          runtime_image_sha256: "e".repeat(64),
-        },
-      ],
-    };
-  await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE fleet_node_release_observations SET facts_json=?,observed_at=? WHERE node_id=?",
-    ).bind(JSON.stringify(facts), at, f.node),
-    // Public patch projection accepts unknown runtime facts; this is an inventory fixture.
-    env.DB.prepare(
-      "UPDATE fleet_patch_operations SET observed_json=NULL WHERE node_id=?",
-    ).bind(f.node),
-  ]);
-  return { ...f, at, facts };
+      components: names.slice(3),
+    },
+    spec = {
+      version: 1,
+      versions_lock_sha256: "c".repeat(64),
+      configuration_schema_revision: 1,
+      components: names.map((name) => ({
+        name,
+        kind: name === "api" || name === "edge" ? "worker_bundle" : "image",
+        version: "1.0.0",
+        reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+        sha256: "d".repeat(64),
+      })),
+      roles: { control_relay: role, customer: role },
+    },
+    uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+      .bind(f.node)
+      .first<string>("node_uid"))!;
+  releases.push(release);
+  expect(
+    (await request(`/v1/fleet/releases/${release}`, f.admin, "PUT", spec))
+      .status,
+  ).toBe(200);
+  expect(
+    (
+      await request(`/v1/regions/${f.region}/release`, f.admin, "PUT", {
+        expected_revision: 0,
+        release_id: release,
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await request(`/v1/nodes/${f.node}/release`, f.admin, "PUT", {
+        expected_revision: 0,
+        release_id: release,
+        node_uid: uid,
+        role: "customer",
+      })
+    ).status,
+  ).toBe(200);
+  const facts = {
+    configuration_schema_revision: 1,
+    talos_version: "1.14.2",
+    kubernetes_version: "1.36.5",
+    kubelet_version: "1.36.5",
+    components: [
+      {
+        name: "native-controller",
+        version: "observed-controller-build",
+        sha256: "e".repeat(64),
+        runtime_image_sha256: "e".repeat(64),
+      },
+    ],
+  };
+  await env.DB.prepare(
+    "INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at) SELECT n.id,n.node_uid,1,r.agent_key_hash,?,?,? FROM nodes n JOIN regions r ON r.id=n.region_id WHERE n.id=?",
+  )
+    .bind(JSON.stringify(facts), at, at, f.node)
+    .run();
+  return { ...f, uid, release, spec, at, facts };
 }
 
 async function node(id: string, key: string): Promise<Inventory> {
@@ -83,7 +140,6 @@ it("provides admin individual node and region reads with explicit unobserved inv
       agent_version: null,
       agent_image_sha256: null,
     },
-    latest_patch: null,
   });
   const region = await request(`/v1/regions/${f.region}`, f.admin);
   expect(region.status).toBe(200);
@@ -101,32 +157,15 @@ it("provides admin individual node and region reads with explicit unobserved inv
   );
 });
 
-it("lists actual observed versions and the current physical node's latest patch", async () => {
-  const f = await observedFixture(),
-    expectedPatch = newOperationId(),
-    oldPhysicalPatch = newOperationId(),
-    now = Date.now();
-  const clone = (id: string, uid: string, at: number) =>
-    env.DB.prepare(
-      "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at) SELECT ?,node_id,region_id,?,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,?,?,deadline_at FROM fleet_patch_operations WHERE node_id=? ORDER BY created_at DESC LIMIT 1",
-    ).bind(
-      id,
-      uid,
-      new Date(at).toISOString(),
-      new Date(at).toISOString(),
-      f.node,
-    );
-  await env.DB.batch([
-    clone(expectedPatch, f.uid, now + 1),
-    clone(oldPhysicalPatch, crypto.randomUUID(), now + 2),
-  ]);
+it("lists actual observed versions of the current physical node", async () => {
+  const f = await observedFixture();
   const response = await request("/v1/nodes?limit=100", f.admin);
   expect(response.status).toBe(200);
   const body = await response.json<{ data: Inventory[] }>(),
     item = body.data.find((value) => value.id === f.node)!;
   expect(item).toMatchObject({
     role: "customer",
-    release: { state: "drifted", desired_release_id: f.qualified.releaseId },
+    release: { state: "drifted", desired_release_id: f.release },
     observation: {
       state: "current",
       observed_at: f.at,
@@ -135,19 +174,13 @@ it("lists actual observed versions and the current physical node's latest patch"
       agent_version: f.facts.components[0]!.version,
       agent_image_sha256: f.facts.components[0]!.runtime_image_sha256,
     },
-    latest_patch: {
-      operation_id: expectedPatch,
-      node_uid: f.uid,
-      stage: "complete",
-    },
   });
   expect(item.observation.agent_version).not.toBe(
-    f.qualified.spec.components.find(
+    f.spec.components.find(
       (component) => component.name === "native-controller",
     )!.version,
   );
   expect(JSON.stringify(item).includes(f.agent)).toBe(false);
-  expect(item.latest_patch).not.toHaveProperty("address");
   expect(await node(f.node, f.admin)).toEqual(item);
 });
 
@@ -184,7 +217,7 @@ it("leaves the agent version unknown without an observed runtime image digest", 
   });
 });
 
-it("does not present a former physical node's observations or patch as current", async () => {
+it("does not present a former physical node's observations as current", async () => {
   const f = await observedFixture(),
     changedUid = crypto.randomUUID();
   await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
@@ -202,7 +235,6 @@ it("does not present a former physical node's observations or patch as current",
       agent_version: null,
       agent_image_sha256: null,
     },
-    latest_patch: null,
   });
 });
 

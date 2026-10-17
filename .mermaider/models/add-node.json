@@ -1,0 +1,215 @@
+{
+  "version": 1,
+  "review": "reviewed",
+  "diagram": {
+    "id": "pgcf-add-node",
+    "title": "AddNode orchestration overview from implemented source",
+    "family": "process",
+    "syntax": "flowchart",
+    "provenance": "curated",
+    "context": "implemented",
+    "nodes": [
+      {
+        "id": "01-read",
+        "label": "Read current node addition from D1",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "02-cancelled",
+        "label": "Cancelled: return",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "03-ready",
+        "label": "Ready: place pending databases and notify RegionLink",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          },
+          {
+            "path": "apps/api/src/domain/node-capacity.ts",
+            "symbol": "placePendingDatabases",
+            "line": 64,
+            "sha256": "85f6dff2c13a2bd7704ec631200576d9a3a44ac44e4c33f3e2602f15a89f4c9c"
+          }
+        ]
+      },
+      {
+        "id": "04-provider",
+        "label": "As eligible: claim order dispatch and resolve provider identity",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          },
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "dispatchNodeOrder",
+            "line": 67,
+            "sha256": "bd3caca885e8eab433e5e16ca662291d87a08b70a0cbf13a74b4cdabdf2b7475"
+          },
+          {
+            "path": "apps/api/src/domain/node-state.ts",
+            "symbol": "claimNodeDispatch",
+            "line": 756,
+            "sha256": "ba49ec54e82d4abe06a770b989e3b57c28542ba8fd07e14a20aafdd4ab3f49c1"
+          },
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "reconcileNodeProvider",
+            "line": 110,
+            "sha256": "308d5f0909e84bb61ce78cefad5ce40aa3b14ca0f6be8839120c9f4f921fca11"
+          }
+        ]
+      },
+      {
+        "id": "05-audited",
+        "label": "Audited or bootstrapping: return until the node installer exists",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          },
+          {
+            "path": "apps/api/src/domain/node-state.ts",
+            "symbol": "recordNodeAudit",
+            "line": 894,
+            "sha256": "2ac344faf3a1b8ab2eee9aaaff149ccdb305af3a502d315cd1d50e3654b258a9"
+          }
+        ]
+      },
+      {
+        "id": "06-wait",
+        "label": "Wait; re-read D1 next cycle (never trust cached outputs as authority)",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "07-operator",
+        "label": "After 288 cycles: waiting_for_operator",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge_01",
+        "from": "01-read",
+        "to": "02-cancelled",
+        "label": "cancelled",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "edge_02",
+        "from": "01-read",
+        "to": "03-ready",
+        "label": "ready",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "edge_03",
+        "from": "01-read",
+        "to": "04-provider",
+        "label": "nonterminal",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "edge_04",
+        "from": "04-provider",
+        "to": "05-audited",
+        "label": "audited or bootstrapping",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "edge_05",
+        "from": "04-provider",
+        "to": "06-wait",
+        "label": "provider work pending",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      },
+      {
+        "id": "edge_06",
+        "from": "06-wait",
+        "to": "07-operator",
+        "label": "cycle budget exhausted",
+        "evidence": [
+          {
+            "path": "apps/api/src/workflows/add-node.ts",
+            "symbol": "AddNode",
+            "line": 211,
+            "sha256": "067bda539b000711f38d65ee4c881192db8e2a223dc137badd797481a90f3c1a"
+          }
+        ]
+      }
+    ],
+    "direction": "TD"
+  }
+}

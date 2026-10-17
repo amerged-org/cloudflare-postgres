@@ -44,7 +44,6 @@ import { syncDatabaseActor } from "./database-actor-sync.ts";
 import { runNodeCapacity, startupPlacementNodes } from "./node-capacity.ts";
 import {
   startupHeadroomSql,
-  computePoolOverheadSql,
   startupReservationStatement,
   nodeCpuHeadroomSql,
   databaseCpuChargeSql,
@@ -158,7 +157,7 @@ export function databaseInsertStatement(
             WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
             AND ${startupHeadroomSql()}
-            AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?+${computePoolOverheadSql("d", "memory_mib")}) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?+${computePoolOverheadSql("n", "memory_mib")}`)}
+            AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?`)}
             AND n.platform_reserved_cpu_millicores IS NOT NULL
             AND ${nodeCpuHeadroomSql()}
             AND ${nodeStoragePlacementSql()}
@@ -315,7 +314,7 @@ export async function createDatabase(
               : []),
             c.env.DB.prepare(
               `INSERT INTO lifecycle_events (database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-            SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?+${computePoolOverheadSql("databases", "cpu_millicores")},'$.reserved_memory_mib',?+${computePoolOverheadSql("databases", "memory_mib")}) FROM databases WHERE id=? AND project_id=? AND node_id IS NOT NULL`,
+            SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?,'$.reserved_memory_mib',?) FROM databases WHERE id=? AND project_id=? AND node_id IS NOT NULL`,
             ).bind(
               now,
               node === null
@@ -491,7 +490,7 @@ export function databaseResizeStatement(
           AND ${startupHeadroomSql()}
           AND n.platform_reserved_cpu_millicores IS NOT NULL)
           AND (${storageResizeAllowedSql()}
-          AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?+${computePoolOverheadSql("d", "memory_mib")}) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?+${computePoolOverheadSql("n", "memory_mib")}`)}
+          AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?`)}
           AND ${nodeCpuHeadroomSql("n", "s", "databases")})
           AND ${nodeStoragePlacementSql("n", "s", "databases")}
           AND ((s.memory_mib=? AND s.cpu_millicores=? AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=? AND s.max_connections=?)
@@ -651,13 +650,10 @@ export async function scheduleDatabaseResize(
           {
             ...node,
             reserved_memory_mib:
-              node.reserved_memory_mib -
-              databaseMemoryReservationMib(previous) -
-              (node.compute_pool_memory_mib ?? 0),
+              node.reserved_memory_mib - databaseMemoryReservationMib(previous),
             reserved_cpu_millicores:
               node.reserved_cpu_millicores -
-              databaseCpuReservationMillicores(previous) -
-              (node.compute_pool_cpu_millicores ?? 0),
+              databaseCpuReservationMillicores(previous),
             reserved_storage_gib:
               node.reserved_storage_gib - previous.storage_gib,
           },

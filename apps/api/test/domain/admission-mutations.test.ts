@@ -6,7 +6,6 @@ import { afterEach, expect, it } from "vitest";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import {
   withAdmissionMutation,
-  withAdmissionMutationScopes,
   type AdmissionSqlGuard,
 } from "../../src/domain/admission-mutations.ts";
 import { reconcileDatabaseActors } from "../../src/domain/database-actor-sync.ts";
@@ -37,60 +36,6 @@ async function ready() {
     .run();
   return { ...f, id: created.database.id };
 }
-
-it("an atomic declared-region batch fences all delayed writes after a real abort without affecting a third region", async () => {
-  const a = await ready(),
-    b = await ready(),
-    other = await ready();
-  let delayed: D1PreparedStatement | undefined;
-  await env.DB.exec(
-    `CREATE TRIGGER scoped_abort BEFORE UPDATE OF desired_state ON databases WHEN NEW.id='${b.id}' BEGIN SELECT RAISE(ABORT,'controlled multi-region abort'); END`,
-  );
-  try {
-    await expect(
-      withAdmissionMutationScopes(
-        env,
-        [
-          { kind: "region", id: a.region },
-          { kind: "region", id: b.region },
-        ],
-        async (mutation) => {
-          const guard = mutation.guard;
-          delayed = env.DB.prepare(
-            `UPDATE databases SET desired_state='suspended' WHERE id=? AND (${guard.sql})`,
-          ).bind(a.id, ...guard.bindings);
-          expect((await actorFor(other.id).admit(other.id, "app")).ok).toBe(
-            true,
-          );
-          await mutation.batch([
-            delayed,
-            env.DB.prepare(
-              `UPDATE databases SET desired_state='suspended' WHERE id=? AND (${guard.sql})`,
-            ).bind(b.id, ...guard.bindings),
-          ]);
-        },
-      ),
-    ).rejects.toThrow("controlled multi-region abort");
-  } finally {
-    await env.DB.exec("DROP TRIGGER scoped_abort");
-  }
-  expect((await delayed!.run()).meta.changes).toBe(0);
-  for (const f of [a, b]) {
-    expect(
-      await env.DB.prepare("SELECT desired_state FROM databases WHERE id=?")
-        .bind(f.id)
-        .first("desired_state"),
-    ).toBe("running");
-    expect(
-      await env.DB.prepare(
-        "SELECT mutation_id,mutation_outcome FROM database_admission_epochs WHERE database_id=?",
-      )
-        .bind(f.id)
-        .first(),
-    ).toEqual({ mutation_id: null, mutation_outcome: "fenced" });
-  }
-  expect((await actorFor(other.id).admit(other.id, "app")).ok).toBe(true);
-});
 
 it("a committed v4 role change cannot admit the preceding ready runtime without a power operation", async () => {
   const f = await admissionSnapshotFixture(),

@@ -156,7 +156,6 @@ export async function configureNodeRegionPolicy(
   expectedRuntime?: {
     placement_mode: string | null;
     postgres_memory_request_mib: number | null;
-    compute_pool_json: string | null;
   },
 ): Promise<void> {
   const policy = NodeRegionPolicy.parse(value);
@@ -190,10 +189,10 @@ export async function configureNodeRegionPolicy(
   const admission = mutation?.scopeGuard();
   const statement = db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled)
-    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled)
+    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
       AND (${admission?.sql ?? "1=1"})
-      AND (?=0 OR ((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT compute_pool_json FROM node_region_policies WHERE region_id=r.id) IS ?))
+      AND (?=0 OR ((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id) IS ? AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ?))
       AND (?=1 OR (SELECT ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=r.id) IS ?)
       AND (?=1 OR COALESCE((SELECT autoscale_enabled FROM node_region_policies WHERE region_id=r.id),0)=?)
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
@@ -214,7 +213,7 @@ export async function configureNodeRegionPolicy(
           AND (s.memory_mib<256 OR s.memory_mib%256<>0 OR s.memory_mib>? OR s.memory_mib<?)))
     ON CONFLICT(region_id) DO UPDATE SET max_nodes=CASE WHEN ?=1 THEN excluded.max_nodes ELSE node_region_policies.max_nodes END,purchases_enabled=excluded.purchases_enabled,order_config=excluded.order_config,
       placement_mode=excluded.placement_mode,maximum_database_memory_mib=excluded.maximum_database_memory_mib,postgres_memory_request_mib=excluded.postgres_memory_request_mib,standing_cost_profile=excluded.standing_cost_profile,standing_cost_profile_hash=excluded.standing_cost_profile_hash,
-      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),compute_pool_json=CASE WHEN ?=1 THEN excluded.compute_pool_json ELSE node_region_policies.compute_pool_json END,thin_storage_json=CASE WHEN ?=1 THEN excluded.thin_storage_json ELSE node_region_policies.thin_storage_json END,
+      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),
       ram_expansion_threshold_ppm=excluded.ram_expansion_threshold_ppm,
       ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.ram_warning_threshold_ppm ELSE node_region_policies.ram_warning_threshold_ppm END,
       node_ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_ram_warning_threshold_ppm ELSE node_region_policies.node_ram_warning_threshold_ppm END,
@@ -241,8 +240,6 @@ export async function configureNodeRegionPolicy(
       policy.adopt_instance_ids === undefined
         ? null
         : JSON.stringify(policy.adopt_instance_ids),
-      policy.compute_pool == null ? null : canonical(policy.compute_pool),
-      policy.thin_storage == null ? null : canonical(policy.thin_storage),
       threshold,
       policy.ram_warning_threshold_ppm ?? null,
       policy.node_ram_warning_threshold_ppm ?? null,
@@ -256,7 +253,6 @@ export async function configureNodeRegionPolicy(
       Number(expectedRuntime !== undefined),
       expectedRuntime?.placement_mode ?? null,
       expectedRuntime?.postgres_memory_request_mib ?? null,
-      expectedRuntime?.compute_pool_json ?? null,
       Number(policy.ram_expansion_threshold_ppm !== undefined),
       previous?.ram_expansion_threshold_ppm ?? null,
       Number(policy.autoscale_enabled !== undefined),
@@ -274,8 +270,6 @@ export async function configureNodeRegionPolicy(
       policy.adopt_instance_ids === undefined
         ? null
         : JSON.stringify(policy.adopt_instance_ids),
-      Number(policy.compute_pool !== undefined),
-      Number(policy.thin_storage !== undefined),
       Number(policy.ram_warning_threshold_ppm !== undefined),
       Number(policy.node_ram_warning_threshold_ppm !== undefined),
       Number(policy.node_cpu_warning_threshold_ppm !== undefined),
@@ -1186,12 +1180,8 @@ export async function cancelAuditedNodeAdoption(
       AND receipt_json=? AND audit_json=? AND approval_json IS ?
       AND checkpoint_json IS NULL AND network_json IS NULL AND capacity_json IS NULL
       AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id AND r.provider='contabo' AND r.provider_region=?)
-      AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=node_additions.operation_id OR j.node_id=node_additions.node_id)
-      AND NOT EXISTS(SELECT 1 FROM node_installation_bindings b WHERE b.operation_id=node_additions.operation_id OR b.node_id=node_additions.node_id OR b.provider_instance_id=node_additions.provider_instance_id)
-      AND NOT EXISTS(SELECT 1 FROM node_network_preparations p WHERE p.operation_id=node_additions.operation_id)
       AND NOT EXISTS(SELECT 1 FROM node_provider_mutations m WHERE m.operation_id=node_additions.operation_id)
       AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)
-      AND NOT EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=node_additions.region_id AND c.purpose IN('region_seed','join_bundle'))
       AND NOT EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_additions.operation_id AND
         (f.node_id<>node_additions.node_id OR f.region_id<>node_additions.region_id OR f.intent_hash<>node_additions.intent_hash
           OR f.provider_instance_id<>node_additions.provider_instance_id OR f.provider_region<>? OR f.product_id<>? OR f.image_id<>?
@@ -1252,8 +1242,6 @@ export async function cancelProviderCancelledNodeAddition(
       AND checkpoint_json IS NULL AND network_json IS NULL AND capacity_json IS NULL
       AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id
         AND r.provider='contabo' AND r.provider_region=?)
-      AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j
-        WHERE j.operation_id=node_additions.operation_id OR j.node_id=node_additions.node_id)
       AND NOT EXISTS(SELECT 1 FROM nodes n
         WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)`,
     [

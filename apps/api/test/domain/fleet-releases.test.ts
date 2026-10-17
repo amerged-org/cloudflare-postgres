@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import lock from "../../../../infra/platform/versions.lock.json" with { type: "json" };
 import { afterEach, expect, it, vi } from "vitest";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { z } from "zod";
@@ -533,51 +532,6 @@ async function receiptFixture(
       .first<{ facts_json: string; observed_at: string }>())!;
   return { ...f, native, boot, key, seed, partial, observe, stored };
 }
-it("retains Native OS receipt across same-boot partial inventory without carrying stale Kubernetes components", async () => {
-  const f = await receiptFixture(),
-    partial = f.partial();
-  expect((await f.observe(partial)).status).toBe(200);
-  const row = await f.stored(),
-    facts = JSON.parse(row.facts_json);
-  expect(facts).toMatchObject({
-    talos_installer: f.native.facts.talos_installer,
-    talos_schematic_sha256: f.native.facts.talos_schematic_sha256,
-    talos_provenance: f.native.facts.talos_provenance,
-  });
-  expect(facts.components).toEqual(partial.facts.components);
-  expect((await f.observe(partial)).status).toBe(200);
-});
-it("missing boot or Talos version cannot refresh a retained Native OS receipt", async () => {
-  const f = await receiptFixture(),
-    before = await f.stored(),
-    missingBoot = f.partial();
-  delete missingBoot.facts.boot_id;
-  expect((await f.observe(missingBoot)).status).toBe(409);
-  expect(await f.stored()).toEqual(before);
-  const missingVersion = f.partial();
-  delete missingVersion.facts.talos_version;
-  expect((await f.observe(missingVersion)).status).toBe(409);
-  expect(await f.stored()).toEqual(before);
-});
-it("changed boot or Talos version invalidates prior Native OS provenance", async () => {
-  const f = await receiptFixture(),
-    reboot = f.partial();
-  reboot.facts.boot_id = crypto.randomUUID();
-  expect((await f.observe(reboot)).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_provenance",
-  );
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_installer",
-  );
-  await f.seed();
-  const changedVersion = f.partial();
-  changedVersion.facts.talos_version = "1.14.2";
-  expect((await f.observe(changedVersion)).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_provenance",
-  );
-});
 it("ordinary Regional observations cannot mint a Native deployment receipt", async () => {
   const f = await receiptFixture();
   await env.DB.prepare(
@@ -597,29 +551,7 @@ it("ordinary Regional observations cannot mint a Native deployment receipt", asy
       .first("n"),
   ).toBe(0);
 });
-it("changed assignment or agent key cannot carry a previous Native receipt", async () => {
-  const f = await receiptFixture();
-  await f.assignNode(1);
-  const next = f.partial();
-  next.assignment_revision = 2;
-  expect((await f.observe(next)).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_provenance",
-  );
-  await f.seed();
-  await env.DB.prepare(
-    "UPDATE fleet_node_release_observations SET assignment_revision=2,agent_key_hash=? WHERE node_id=?",
-  )
-    .bind("f".repeat(64), f.node)
-    .run();
-  const current = f.partial();
-  current.assignment_revision = 2;
-  expect((await f.observe(current)).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_installer",
-  );
-});
-it("a concurrent Native receipt is never overwritten by a stale partial-inventory merge", async () => {
+it("a concurrent observation is never overwritten by a stale partial inventory", async () => {
   const f = await receiptFixture(),
     partial = f.partial(),
     newFacts = structuredClone(f.native.facts);
@@ -668,49 +600,6 @@ it("a concurrent Native receipt is never overwritten by a stale partial-inventor
     observed_at: at,
   });
 });
-it("malformed old installer or schematic receipt never becomes refreshed target provenance", async () => {
-  const f = await receiptFixture(),
-    wrongInstaller = structuredClone(f.native.facts);
-  wrongInstaller.talos_installer = `registry.example/old-talos@sha256:${"e".repeat(64)}`;
-  wrongInstaller.talos_provenance!.installer = wrongInstaller.talos_installer;
-  await env.DB.prepare(
-    "UPDATE fleet_node_release_observations SET facts_json=? WHERE node_id=?",
-  )
-    .bind(JSON.stringify(wrongInstaller), f.node)
-    .run();
-  expect((await f.observe(f.partial())).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_provenance",
-  );
-  await f.seed();
-  const wrongSchematic = structuredClone(f.native.facts);
-  wrongSchematic.talos_schematic_sha256 = "f".repeat(64);
-  await env.DB.prepare(
-    "UPDATE fleet_node_release_observations SET facts_json=? WHERE node_id=?",
-  )
-    .bind(JSON.stringify(wrongSchematic), f.node)
-    .run();
-  expect((await f.observe(f.partial())).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_installer",
-  );
-});
-it("replaced physical Node UID cannot inherit another machine's Native receipt", async () => {
-  const f = await receiptFixture(),
-    replacement = crypto.randomUUID();
-  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
-    .bind(replacement, f.node)
-    .run();
-  expect((await f.assignNode(1, replacement)).status).toBe(200);
-  const partial = f.partial();
-  partial.node_uid = replacement;
-  partial.assignment_revision = 2;
-  expect((await f.observe(partial)).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
-    "talos_provenance",
-  );
-});
-
 it("requires the observed current Ready Flux source commit when the release pins its platform source", async () => {
   const { mismatches } = await import("../../src/domain/fleet-releases.ts");
   const { FleetReleaseSpec } = await import("@pgcf/contracts/releases");
@@ -743,210 +632,6 @@ it("requires the observed current Ready Flux source commit when the release pins
       platform_source_commit: "a".repeat(40),
     }),
   ).toEqual([]);
-});
-
-it("retains Native kubelet image provenance at its original timestamp only across the same current boot/key/assignment and versions", async () => {
-  // Its deliberately unqualified synthetic runtime has no registry metadata.
-  vi.spyOn(globalThis, "fetch").mockResolvedValue(
-    new Response(null, { status: 404 }),
-  );
-  const f = await receiptFixture(true),
-    proof = {
-      method: "native_runtime_readback" as const,
-      observed_at: new Date(Date.now() - 60000).toISOString(),
-      kubelet_version: "1.36.5",
-      control_plane: false,
-      images: {
-        kubelet: {
-          configuration: kubeImagePins.kubelet,
-          runtime_sha256: "1".repeat(64),
-        },
-      },
-    };
-  Object.assign(f.native.facts, {
-    kubelet_version: "1.36.5",
-    kubernetes_control_plane: false,
-    kubernetes_image_provenance: proof,
-  });
-  await f.seed();
-  const partial = f.partial();
-  Object.assign(partial.facts, {
-    kubelet_version: "v1.36.5",
-    kubernetes_control_plane: false,
-  });
-  expect((await f.observe(partial)).status).toBe(200);
-  expect(
-    JSON.parse((await f.stored()).facts_json).kubernetes_image_provenance,
-  ).toEqual(proof);
-  const forged = structuredClone(partial);
-  forged.facts.kubernetes_image_provenance = {
-    ...proof,
-    observed_at: new Date().toISOString(),
-  };
-  expect((await f.observe(forged)).status).toBe(409);
-  const changed = structuredClone(partial);
-  changed.facts.kubelet_version = "1.36.4";
-  changed.observed_at = new Date(
-    Date.parse(partial.observed_at) + 100,
-  ).toISOString();
-  expect((await f.observe(changed)).status).toBe(200);
-  expect(
-    JSON.parse((await f.stored()).facts_json).kubernetes_image_provenance,
-  ).toBeUndefined();
-});
-
-it("retains only selected boot-bound loaded extensions while ordinary reports cannot forge them or carry them across a reboot", async () => {
-  const f = await receiptFixture(false, true),
-    ext = f.native.facts.components.find(
-      (c) => c.name === "pgcf-sandbox-controller",
-    )!;
-  expect((await f.observe(f.partial())).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json).components).toContainEqual(
-    ext,
-  );
-  const forged = f.partial();
-  forged.observed_at = new Date(Date.now() + 1).toISOString();
-  forged.facts.components.push({ ...ext, sha256: "f".repeat(64) });
-  expect((await f.observe(forged)).status).toBe(409);
-  const changed = f.partial();
-  changed.observed_at = new Date(Date.now() + 2).toISOString();
-  changed.facts.boot_id = crypto.randomUUID();
-  expect((await f.observe(changed)).status).toBe(200);
-  expect(
-    JSON.parse((await f.stored()).facts_json).components,
-  ).not.toContainEqual(ext);
-});
-
-const observedCiliumIndex =
-  '{\n  "schemaVersion": 2,\n  "mediaType": "application/vnd.oci.image.index.v1+json",\n  "manifests": [\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:9d308e3f7f05972b0b0604c40d2b0f08fa2f6a55084fef1e1aaadb469e430639",\n      "size": 1247,\n      "platform": {\n        "architecture": "amd64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:02dd062a1f48a6ef52f50e7396117f9e7c82fbe9e6408dcaebe212257414bbeb",\n      "size": 1247,\n      "platform": {\n        "architecture": "arm64",\n        "os": "linux"\n      }\n    }\n  ]\n}';
-const observedApiServerIndex =
-  '{\n   "schemaVersion": 2,\n   "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",\n   "manifests": [\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:78487f7b4b1a588d9630f758f6677895eabe00d93c4cbbea3d6b06e5f476a371",\n         "platform": {\n            "architecture": "amd64",\n            "os": "linux"\n         }\n      },\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:fd2aeee57db21e3e988ae7845dd549f8fdc036a3de985dc70aad4a69ad8ceb5a",\n         "platform": {\n            "architecture": "arm64",\n            "os": "linux"\n         }\n      },\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:a932de6bf497f09570130c750b97eee9c5e3306a32ad598f31933074a12258d2",\n         "platform": {\n            "architecture": "ppc64le",\n            "os": "linux"\n         }\n      },\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:c7c14e0cee7edf77296ca3df0b9379a4e2159d87050372e1cf055b26160180e2",\n         "platform": {\n            "architecture": "s390x",\n            "os": "linux"\n         }\n      }\n   ]\n}';
-
-it("Worker ingestion canonicalizes fresh TS or Rust OCI aliases while preserving raw carrier identity and immutable deployment timestamps", async () => {
-  const reference = lock.charts
-    .find((v) => v.name === "cilium")!
-    .renderedImages.find((v) => v.startsWith("quay.io/cilium/cilium:"))!;
-  const f = await receiptFixture(true, false, (value) => {
-    Object.assign(
-      value.components.find((v) => v.name === "cilium")!,
-      {
-        reference,
-        sha256: reference.slice(-64),
-        version: lock.charts.find((v) => v.name === "cilium")!.appVersion,
-      },
-    );
-    for (const role of Object.values(value.roles))
-      Object.assign(role, { kubernetes_images: lock.target.kubernetesImages });
-  });
-  const proof = {
-    method: "native_runtime_readback" as const,
-    observed_at: new Date(Date.now() - 60_000).toISOString(),
-    kubelet_version: lock.target.kubernetesVersion,
-    control_plane: true,
-    images: Object.fromEntries(
-      Object.entries(lock.target.kubernetesImages).map(
-        ([name, configuration]) => [
-          name,
-          { configuration, runtime_sha256: configuration.slice(-64) },
-        ],
-      ),
-    ),
-  };
-  Object.assign(f.native.facts, {
-    kubelet_version: lock.target.kubernetesVersion,
-    kubernetes_control_plane: true,
-    kubernetes_image_provenance: proof,
-    kubernetes_static_images: {
-      apiServer: lock.target.kubernetesImages.apiServer.slice(-64),
-      controllerManager:
-        lock.target.kubernetesImages.controllerManager.slice(-64),
-      scheduler: lock.target.kubernetesImages.scheduler.slice(-64),
-    },
-  });
-  await f.seed();
-  const rawCilium =
-      "2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01",
-    rawKubernetesIndexDigest =
-      "4b3e69973a1d58d3c1f670d3477a9b9f14a03a271823113e8e0c9a333eb84f48";
-  const fetcher = vi
-    .spyOn(globalThis, "fetch")
-    .mockImplementation(async (url) => {
-      const value = String(url),
-        isCilium = value.includes("/cilium/cilium/");
-      return new Response(
-        isCilium ? observedCiliumIndex : observedApiServerIndex,
-        {
-          headers: {
-            "docker-content-digest": `sha256:${isCilium ? rawCilium : rawKubernetesIndexDigest}`,
-          },
-        },
-      );
-    });
-  const observation = f.partial();
-  Object.assign(observation.facts, {
-    kubelet_version: lock.target.kubernetesVersion,
-    kubernetes_control_plane: true,
-    kubernetes_static_images: { apiServer: rawKubernetesIndexDigest },
-    components: [{ name: "cilium", runtime_image_sha256: rawCilium }],
-  });
-  expect((await f.observe(observation)).status).toBe(200);
-  const facts = JSON.parse((await f.stored()).facts_json);
-  expect(facts.components).toEqual([
-    {
-      name: "cilium",
-      runtime_image_sha256: rawCilium,
-      version: lock.charts.find((v) => v.name === "cilium")!.appVersion,
-      sha256: reference.slice(-64),
-    },
-  ]);
-  expect(facts.kubernetes_static_images).toEqual({
-    apiServer: lock.target.kubernetesImages.apiServer.slice(-64),
-  });
-  expect(facts.kubernetes_image_provenance).toEqual(proof);
-  expect(
-    facts.components.find((v: { name: string }) => v.name === "regional"),
-  ).toBeUndefined();
-  expect(fetcher).toHaveBeenCalledTimes(2);
-  const repeated = structuredClone(observation);
-  repeated.observed_at = new Date(Date.now() + 1).toISOString();
-  expect((await f.observe(repeated)).status).toBe(200);
-  expect(JSON.parse((await f.stored()).facts_json).components).toEqual(
-    facts.components,
-  );
-  expect(fetcher).toHaveBeenCalledTimes(2);
-  const changed = structuredClone(observation);
-  changed.facts.boot_id = crypto.randomUUID();
-  changed.observed_at = new Date(Date.now() + 1).toISOString();
-  expect((await f.observe(changed)).status).toBe(200);
-  const changedFacts = JSON.parse((await f.stored()).facts_json);
-  expect(changedFacts.components).toEqual(changed.facts.components);
-  expect(changedFacts.kubernetes_static_images).toEqual({
-    apiServer: rawKubernetesIndexDigest,
-  });
-  expect(changedFacts).not.toHaveProperty("kubernetes_image_provenance");
-  expect(fetcher).toHaveBeenCalledTimes(2);
-  await f.seed();
-  vi.restoreAllMocks();
-  vi.spyOn(globalThis, "fetch").mockImplementation(
-    async () =>
-      new Response("{}", {
-        headers: { "docker-content-digest": `sha256:${rawCilium}` },
-      }),
-  );
-  const tampered = structuredClone(observation);
-  tampered.observed_at = new Date(Date.now() + 2).toISOString();
-  Object.assign(tampered.facts.components[0]!, {
-    version: lock.charts.find((v) => v.name === "cilium")!.appVersion,
-    sha256: reference.slice(-64),
-  });
-  expect((await f.observe(tampered)).status).toBe(200);
-  const rejectedFacts = JSON.parse((await f.stored()).facts_json);
-  expect(rejectedFacts.components).toEqual([
-    { name: "cilium", runtime_image_sha256: rawCilium },
-  ]);
-  expect(rejectedFacts.kubernetes_static_images).toEqual({
-    apiServer: rawKubernetesIndexDigest,
-  });
 });
 
 it("an ordinary report cannot claim a target component hash while reporting a contradictory unproved runtime", async () => {
@@ -1014,11 +699,6 @@ it("the agent inventory view remains parseable by the deployed strict legacy rel
     await request(`/v1/fleet/releases/${f.id}`, f.admin)
   ).json();
   expect(read).toEqual(full);
-  const { readSelectedNodeGoldenImage } =
-    await import("../../src/domain/node-golden-image.ts");
-  expect((await readSelectedNodeGoldenImage(env, f.region))!.raw).toEqual(
-    spec.talos_raw_image,
-  );
 });
 it("the agent inventory view leaves the Cloudflare-side route-token capability out for deployed strict agents", async () => {
   const f = await setup();

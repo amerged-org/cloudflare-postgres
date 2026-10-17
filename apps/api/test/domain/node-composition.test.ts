@@ -15,21 +15,14 @@ import {
 import {
   dispatchNodeOrder,
   reconcileNodeProvider,
-  ensureNodeRescue,
 } from "../../src/workflows/add-node.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { cleanupFixtures, fixture, observedBody, request } from "./fixtures.ts";
-import { standingPostjoinFixture } from "./postjoin-fixture.ts";
 const workflows: string[] = [];
-const releases: string[] = [];
 afterEach(async () => {
   for (const id of workflows.splice(0))
     await (await env.ADD_NODE.get(id)).terminate();
   await cleanupFixtures();
-  for (const id of releases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
 const providerId = () => String(BigInt("1" + randomString("0123456789", 9)));
 const order = () => ({
@@ -54,58 +47,6 @@ async function configured() {
   return { ...f, selection };
 }
 describe("node composition with actual Workers/D1", () => {
-  it("blocks RAM rescue without owned firewall readback even before a private job exists", async () => {
-    const f = await configured(),
-      instance = providerId();
-    let addition = await reserveNodeAddition(env.DB, {
-      request_key: crypto.randomUUID(),
-      request: {
-        region_id: f.region,
-        mode: "adopt",
-        provider_instance_id: instance,
-      },
-    });
-    addition = await recordNodeReceipt(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-      {
-        provider_instance_id: instance,
-        request_id: null,
-        reference: crypto.randomUUID(),
-        received_at: new Date().toISOString(),
-      },
-    );
-    addition = await recordNodeAudit(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-      {
-        provider_instance_id: instance,
-        provider_region: "EU",
-        product_id: crypto.randomUUID(),
-        image_id: crypto.randomUUID(),
-        reference: crypto.randomUUID(),
-        observed_at: new Date().toISOString(),
-      },
-    );
-    const get = vi.fn(async () => {
-        throw new Error("unexpected_provider_get");
-      }),
-      rescue = vi.fn(async () => {
-        throw new Error("unexpected_rescue_dispatch");
-      }),
-      audits = vi.fn(async () => []);
-    expect(
-      await ensureNodeRescue(env, addition.intent.operation_id, {
-        getInstance: get,
-        rescue,
-        actionAudits: audits,
-      }),
-    ).toBe(false);
-    expect(get).not.toHaveBeenCalled();
-    expect(rescue).not.toHaveBeenCalled();
-  });
   it("enforces administrator scope and canonical request replay without purchase", async () => {
     const f = await configured(),
       body = { region_id: f.region, mode: "order", order: f.selection };
@@ -332,17 +273,6 @@ describe("node composition with actual Workers/D1", () => {
       CONTABO_ORDER_DEFAULT_USER: "root",
       CONTABO_ORDER_SSH_KEY_IDS: JSON.stringify([providerId()]),
     };
-    await expect(
-      dispatchNodeOrder(settings, addition.intent.operation_id, {
-        order: post,
-      }),
-    ).rejects.toMatchObject({ code: "conflict" });
-    expect(post).not.toHaveBeenCalled();
-    expect(
-      (await readNodeAddition(env.DB, addition.intent.operation_id))
-        .dispatch_request_id,
-    ).toBeNull();
-    releases.push((await standingPostjoinFixture(f.region)).id);
     await dispatchNodeOrder(settings, addition.intent.operation_id, {
       order: post,
     });

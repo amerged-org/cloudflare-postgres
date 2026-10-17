@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { Timestamp } from "./api.ts";
-import { NodeId, RegionId } from "./ids.ts";
-import { NodeOperatorKubernetesBinding } from "./node-operator.ts";
-import { bootstrapLiteralIpSchema } from "./bootstrap-relay.ts";
+import { RegionId } from "./ids.ts";
 
-export const InfrastructureBackupKind = z.enum(["etcd", "d1"]);
+export const InfrastructureBackupKind = z.enum(["d1"]);
 const Sha256 = z.string().regex(/^[a-f0-9]{64}$/);
-const HttpsUrl = z
-  .url()
-  .max(4096)
-  .refine((value) => {
-    const url = new URL(value);
-    return (
-      url.protocol === "https:" && !url.username && !url.password && !url.hash
-    );
-  });
 const Email = z.email().max(320);
 const ConfigFields = {
   enabled: z
     .boolean()
     .describe(
-      "Daily encrypted capture of the control D1 database and each regional etcd into R2. Enabling needs the D1 identity, the INFRASTRUCTURE_BACKUP Workflow binding and the INFRASTRUCTURE_BACKUP_CF_TOKEN secret.",
+      "Daily encrypted capture of the control D1 database into R2. Enabling needs the D1 identity, the INFRASTRUCTURE_BACKUP Workflow binding and the INFRASTRUCTURE_BACKUP_CF_TOKEN secret.",
     ),
   d1_account_id: z
     .string()
@@ -81,99 +70,9 @@ export const InfrastructureBackupArtifactIdentity = z.strictObject({
   day: z.iso.date(),
   region_id: RegionId,
   source_id: z.string().min(1).max(256),
-  node_id: NodeId.nullable(),
-  node_uid: z.uuid().nullable(),
-  cluster_uid: z.uuid().nullable(),
-  material_revision: z.number().int().positive().nullable(),
 });
 export type InfrastructureBackupArtifactIdentity = z.infer<
   typeof InfrastructureBackupArtifactIdentity
->;
-export const InfrastructureBackupSource = z.strictObject({
-  node_id: NodeId,
-  node_uid: z.uuid(),
-  node_address: bootstrapLiteralIpSchema,
-  kubeconfig: z
-    .string()
-    .min(1)
-    .max(256 * 1024),
-  talosconfig: z
-    .string()
-    .min(1)
-    .max(256 * 1024),
-  binding: NodeOperatorKubernetesBinding,
-  operator_url: HttpsUrl,
-  operator_token: z.string().min(32).max(512),
-  cilium_image: z.string().regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/),
-  cilium_image_id: z.string().regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/),
-});
-export const InfrastructureBackupArtifactInput =
-  InfrastructureBackupArtifactIdentity.safeExtend({
-    d1_url: HttpsUrl.optional(),
-    source: InfrastructureBackupSource.optional(),
-  }).superRefine((value, ctx) => {
-    if (
-      value.kind === "d1" &&
-      (!value.d1_url ||
-        value.source ||
-        value.node_id ||
-        value.node_uid ||
-        value.cluster_uid ||
-        value.material_revision)
-    )
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "D1 backup requires only its signed export URL and source identity",
-      });
-    if (
-      value.kind === "etcd" &&
-      (!value.source ||
-        value.d1_url ||
-        !value.node_id ||
-        !value.node_uid ||
-        !value.cluster_uid ||
-        !value.material_revision)
-    )
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "Etcd backup requires the complete current node/cluster authority",
-      });
-    if (
-      value.source &&
-      (value.source.node_id !== value.node_id ||
-        value.source.node_uid !== value.node_uid ||
-        value.source.binding.node_uid !== value.node_uid ||
-        value.source.binding.cluster_uid !== value.cluster_uid ||
-        value.source.binding.material_revision !== value.material_revision)
-    )
-      ctx.addIssue({
-        code: "custom",
-        message: "Snapshot source does not match its bound identity",
-      });
-  });
-export const InfrastructureBackupInput = z
-  .strictObject({
-    run_id: z.uuid(),
-    artifacts: z.array(InfrastructureBackupArtifactInput).min(1).max(65),
-    encryption: z.strictObject({
-      kid: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
-      key: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-    }),
-  })
-  .superRefine((value, ctx) => {
-    if (
-      new Set(value.artifacts.map((artifact) => artifact.id)).size !==
-      value.artifacts.length
-    )
-      ctx.addIssue({
-        code: "custom",
-        message: "Duplicate infrastructure backup artifact",
-      });
-  });
-export type InfrastructureBackupInput = z.infer<
-  typeof InfrastructureBackupInput
 >;
 export const InfrastructureBackupPreparedArtifact =
   InfrastructureBackupArtifactIdentity.safeExtend({
@@ -228,7 +127,7 @@ export const InfrastructureBackupRunStatus = z.strictObject({
     .int()
     .positive()
     .describe(
-      "Attempt within the UTC day, from 1. A failed attempt is retried at least 90 minutes after it ended, at most 3 attempts per day. A due attempt held back by a fleet patch or a starting thin database takes no number: see deferral in GET /v1/infrastructure-backups.",
+      "Attempt within the UTC day, from 1. A failed attempt is retried at least 90 minutes after it ended, at most 3 attempts per day.",
     ),
   status: z
     .enum(["pending", "running", "complete", "failed"])
@@ -241,26 +140,7 @@ export const InfrastructureBackupRunStatus = z.strictObject({
   artifacts: z
     .array(InfrastructureBackupArtifactStatus)
     .max(65)
-    .describe(
-      "d1-control plus one etcd-<region> per captured regional cluster.",
-    ),
-});
-export const InfrastructureBackupDeferral = z.strictObject({
-  day: z.iso.date().describe("UTC day of the held-back attempt."),
-  reason: z
-    .enum(["deferred_by_patch", "deferred_by_thin_start"])
-    .describe(
-      "deferred_by_patch: a fleet patch operation is unfinished (not complete or host_ready, not halted, before its deadline, on a node that is not lost) or changed in the last 15 minutes. deferred_by_thin_start: a thin database start granted in the last 15 minutes is not yet ready.",
-    ),
-  first_at: Timestamp.describe("First Cron check that held an attempt back."),
-  last_at: Timestamp.describe(
-    "Latest Cron check that held an attempt back; the Cron checks every minute, so a value older than a few minutes means the wait ended.",
-  ),
-  checks: z
-    .number()
-    .int()
-    .positive()
-    .describe("Number of Cron checks that held an attempt back on this day."),
+    .describe("d1-control, the export of the control D1 database."),
 });
 export const InfrastructureBackupHealth = z.strictObject({
   kind: InfrastructureBackupKind,

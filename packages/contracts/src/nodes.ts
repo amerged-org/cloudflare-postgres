@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { ThinStorageProfile } from "./database-storage.ts";
 import { z } from "zod";
 import { Timestamp } from "./api.ts";
 import { NodeId, OperationId, RegionId } from "./ids.ts";
@@ -7,7 +6,6 @@ import {
   MonthlyInfrastructureAmount,
   InfrastructureCurrency,
 } from "./costs.ts";
-import { ComputePoolPolicy } from "./compute-pool.ts";
 
 export const ProviderInstanceId = z
   .string()
@@ -234,16 +232,6 @@ export const NodeRegionPolicy = z
       .default(null)
       .describe(
         "Standing owner approval for order additions of exactly `order`, bounded by its expiry, order count and total monthly and setup amounts; unknown prices stay null. With trigger regional_actual_ram it approves only automatic orders while regional RAM is at or above ram_expansion_threshold_ppm; without a trigger it also approves manual order additions and needs expiry and finite limits. null: every order waits for POST /v1/nodes/additions/{id}/approve.",
-      ),
-    compute_pool: ComputePoolPolicy.nullable()
-      .optional()
-      .describe(
-        "Optional prestarted compute pool of idle runtime slots on the region's nodes; non-null switches the pool runtime on. Returned only when set; omitted on PUT keeps it, null removes it.",
-      ),
-    thin_storage: ThinStorageProfile.nullable()
-      .optional()
-      .describe(
-        "Optional thin-provisioned LVM storage profile for the region's nodes. Returned only when set; omitted on PUT keeps it, null removes it.",
       ),
   })
   .superRefine((policy, context) => {

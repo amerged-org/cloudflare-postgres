@@ -55,7 +55,8 @@ const heartbeat = () =>
   }>();
 const admissionRecovery =
   "SELECT kind,scope_id,mutation_id FROM admission_scope_fences";
-const fleetRollouts = "SELECT DISTINCT json_extract(rollout_json";
+const fleetUpdates =
+  "SELECT revision,policy_json,discovery_revision,discovery_json FROM fleet_update_policy";
 
 it("records a heartbeat of every run and lists the steps it attempted", async () => {
   const at = Date.now(),
@@ -83,7 +84,7 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
     at = Date.now(),
     created: string[] = [];
   const binding: Env = {
-    ...failing(admissionRecovery, fleetRollouts),
+    ...failing(admissionRecovery, fleetUpdates),
     INFRASTRUCTURE_BACKUP_CF_TOKEN: "private-test-export-token",
     INFRASTRUCTURE_BACKUP: {
       async get() {
@@ -113,7 +114,7 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
   const result = await runCron(binding, at);
   expect(result.step_failures).toEqual([
     { step: "admission_recovery", error_code: "injected_step_failure" },
-    { step: "fleet_rollouts", error_code: "injected_step_failure" },
+    { step: "fleet_updates", error_code: "injected_step_failure" },
   ]);
   // Later steps ran: the stale node was alarmed and the due daily backup was dispatched.
   expect(await infrastructureAlertStatus(env.DB, f.region)).toContainEqual(
@@ -133,7 +134,7 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
     },
     {
       event: "cron_step_failed",
-      step: "fleet_rollouts",
+      step: "fleet_updates",
       error_code: "injected_step_failure",
       message: "injected_step_failure",
     },
@@ -143,7 +144,7 @@ it("logs, counts and reports a failing step while alerting and backup dispatch s
       consecutive_failures: 1,
       error_code: "injected_step_failure",
     },
-    fleet_rollouts: {
+    fleet_updates: {
       consecutive_failures: 1,
       error_code: "injected_step_failure",
     },
@@ -191,7 +192,7 @@ it("counts consecutive failed runs per step and forgets a step once it succeeds"
   vi.spyOn(console, "error").mockImplementation(() => {});
   const at = Date.now();
   await runCron(failing(admissionRecovery), at);
-  await runCron(failing(admissionRecovery, fleetRollouts), at + 60_000);
+  await runCron(failing(admissionRecovery, fleetUpdates), at + 60_000);
   await runCron(failing(admissionRecovery), at + 120_000);
   expect(JSON.parse((await heartbeat())!.failing_steps_json)).toEqual({
     admission_recovery: {

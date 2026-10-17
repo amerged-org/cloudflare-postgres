@@ -6,7 +6,6 @@ import { recoverAdmissionMutations } from "./domain/admission-mutations.ts";
 import { recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
-import { runFleetRollouts } from "./domain/fleet-rollouts.ts";
 import { runFleetUpdates } from "./domain/fleet-updates.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runInfrastructureBackupCron } from "./domain/infrastructure-backups.ts";
@@ -284,7 +283,6 @@ export async function runCron(
     cleanupRetainedArchives(env, now),
   );
   await attempt("fleet_updates", undefined, () => runFleetUpdates(env, now));
-  await attempt("fleet_rollouts", undefined, () => runFleetRollouts(env));
 
   if (previous !== null)
     try {

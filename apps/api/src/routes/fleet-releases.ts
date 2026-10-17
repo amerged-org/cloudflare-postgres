@@ -195,7 +195,7 @@ export function registerFleetReleases(app: ApiApp): void {
       method: "post",
       path: "/agent/v1/fleet-observations",
       description:
-        "Records a full inventory for the current registered regional agent, assignment revision and physical Node UID. Does not authorize patches.",
+        "Records a full inventory for the current registered regional agent, assignment revision and physical Node UID.",
       request: { body: body(FleetNodeReleaseObservation) },
       responses: responses(z.strictObject({ accepted: z.literal(true) })),
     },

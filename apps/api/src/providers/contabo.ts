@@ -1366,3 +1366,41 @@ export class ContaboClient {
     });
   }
 }
+
+type ProviderCredentials = Pick<
+  ContaboClientOptions,
+  "clientId" | "clientSecret" | "username" | "password"
+>;
+let providerClient:
+  { credentials: ProviderCredentials; client: ContaboClient } | undefined;
+
+/** One client per isolate and credential set, so its token cache survives between requests. */
+export function contaboClient(env: {
+  CONTABO_CLIENT_ID: string;
+  CONTABO_CLIENT_SECRET: string;
+  CONTABO_USERNAME: string;
+  CONTABO_PASSWORD: string;
+}) {
+  const credentials: ProviderCredentials = {
+    clientId: env.CONTABO_CLIENT_ID,
+    clientSecret: env.CONTABO_CLIENT_SECRET,
+    username: env.CONTABO_USERNAME,
+    password: env.CONTABO_PASSWORD,
+  };
+  if (
+    providerClient &&
+    providerClient.credentials.clientId === credentials.clientId &&
+    providerClient.credentials.clientSecret === credentials.clientSecret &&
+    providerClient.credentials.username === credentials.username &&
+    providerClient.credentials.password === credentials.password
+  )
+    return providerClient.client;
+  const client = new ContaboClient({
+    ...credentials,
+    maxPages: 4,
+    pageSize: 100,
+    timeoutMs: 20_000,
+  });
+  providerClient = { credentials, client };
+  return client;
+}

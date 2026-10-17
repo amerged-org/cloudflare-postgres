@@ -5,8 +5,6 @@ import type { CronWatchdog } from "./cron-watchdog.ts";
 
 export type Env = Cloudflare.Env & {
   CF_VERSION_METADATA: WorkerVersionMetadata;
-  PATCH_NODE: Workflow<{ operation_id: string }>;
-  THIN_QUALIFICATION: Workflow<{ run_id: string }>;
   INFRASTRUCTURE_BACKUP?: Workflow<{ run_id: string }>;
   CRON_WATCHDOG?: DurableObjectNamespace<CronWatchdog>;
   INFRASTRUCTURE_BACKUP_CF_TOKEN?: string;
@@ -19,20 +17,9 @@ export type Env = Cloudflare.Env & {
   ARCHIVE_BINDINGS?: string;
   ARCHIVE_EU?: R2Bucket;
   ARCHIVE_US?: R2Bucket;
-  NODE_BOOTSTRAP_CALLBACK_URL: string;
-  BOOTSTRAP_RELAY_URL: string;
-  BOOTSTRAP_RELAY_SERVICE?: Fetcher;
-  BOOTSTRAP_RELAY_ISSUER_REGION: string;
-  BOOTSTRAP_VERIFIER_KEYS: string;
-  NODE_PROOF_SIGNING_KEY_ID?: string;
   BOOTSTRAP_FIREWALL_BINDINGS: string;
-  BOOTSTRAP_OPERATOR_SOURCES: string;
-  BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID: string;
-  BOOTSTRAP_SCAN_CONTROL: string;
   CONTABO_ORDER_DEFAULT_USER: string;
   CONTABO_ORDER_SSH_KEY_IDS: string;
-  CONTABO_RESCUE_SSH_KEY_IDS: string;
-  CONTABO_RESCUE_CONFIGURATION?: string;
 };
 export type AuthPrincipal = Pick<ApiKey, "id" | "scope" | "project_id">;
 

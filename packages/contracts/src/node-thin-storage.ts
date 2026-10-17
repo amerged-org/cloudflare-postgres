@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { NodeHostConfigurationPrivate } from "./node-host-configuration.ts";
 import { DatabaseId, NodeId, OperationId, RegionId } from "./ids.ts";
 import {
   DatabaseStorageVolumeReceipt,
   DesiredDatabaseStorage,
   DesiredStorageStartup,
-  NodeThinStorageAuthority,
   StorageLvmUuid,
   ThinStorageProfile,
 } from "./database-storage.ts";
@@ -16,29 +14,6 @@ const NodeName = z
   .string()
   .max(253)
   .regex(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/);
-export const NodeThinStorageSelection = z.strictObject({
-  expected_revision: z.number().int().nonnegative(),
-  node_uid: z.uuid(),
-  address: z.union([z.ipv4(), z.ipv6()]),
-  volume_group_uuid: StorageLvmUuid,
-  profile: ThinStorageProfile,
-  allow_new_databases: z.boolean(),
-});
-export type NodeThinStorageSelection = z.infer<typeof NodeThinStorageSelection>;
-export const NodeThinStorageState = z.strictObject({
-  node_id: NodeId,
-  node_uid: z.uuid(),
-  region_id: RegionId,
-  revision: z.number().int().positive(),
-  profile_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  profile: ThinStorageProfile,
-  allow_new_databases: z.boolean(),
-  status: z.enum(["selected", "qualifying", "ready", "blocked"]),
-  error_code: z.string().max(128).nullable(),
-  updated_at: z.iso.datetime(),
-});
-export type NodeThinStorageState = z.infer<typeof NodeThinStorageState>;
-
 /** One current absolute-size LVM action, acknowledged before dispatch; no generic command interface. */
 export const NodeThinPoolAction = z
   .strictObject({
@@ -134,63 +109,6 @@ export const NodeThinStorageLease = z.strictObject({
     .max(4096),
 });
 export type NodeThinStorageLease = z.infer<typeof NodeThinStorageLease>;
-
-/** Private sealed custody is supplied only to the existing high-trust Native executor. */
-export const NodeThinStorageInput = z.strictObject({
-  lease: NodeThinStorageLease,
-  class_creation_allowed: z.boolean(),
-  host_extension: z.strictObject({
-    image: z.string().regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/),
-    version: z.string().max(128),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  }),
-  host_configuration: NodeHostConfigurationPrivate,
-  cluster_endpoint: z.url(),
-  talos_admin_config: z
-    .string()
-    .min(1)
-    .max(256 * 1024),
-  kubeconfig: z
-    .string()
-    .min(1)
-    .max(256 * 1024),
-  callback: z.strictObject({
-    url: z.url(),
-    bearer: z.string().min(32).max(128),
-  }),
-});
-export type NodeThinStorageInput = z.infer<typeof NodeThinStorageInput>;
-
-export const NodeThinStorageReport = z.strictObject({
-  expected_revision: z.number().int().positive(),
-  authority: NodeThinStorageAuthority,
-  boot_id: z.uuid(),
-  system_uuid: z.uuid(),
-  software: z.strictObject({
-    kernel_version: z.string().max(128),
-    host_extension_image: z.string().regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/),
-    host_configuration_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-    driver_image_id: z.string().max(1024),
-    driver_sha256: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .nullable(),
-    lvm_sha256: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .nullable(),
-    tools_sha256: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .nullable(),
-    thin_tools_version: z.string().max(32).nullable(),
-    thin_module_live: z.boolean(),
-    cgroup_host_view: z.boolean(),
-  }),
-  pool_tag: z.string().max(128).nullable(),
-  action_applied: z.boolean(),
-});
-export type NodeThinStorageReport = z.infer<typeof NodeThinStorageReport>;
 
 /** Current stop intent only: bounded old-writer drain, never a tenant startup grant. */
 export const HostStorageDrain = z.strictObject({

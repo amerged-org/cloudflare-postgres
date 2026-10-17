@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-export type DocumentationAuth =
-  "none" | "api" | "project" | "admin" | "agent" | "callback";
+export type DocumentationAuth = "none" | "api" | "project" | "admin" | "agent";
 export interface RouteMetadata {
   operationId: string;
   summary: string;
@@ -17,16 +16,6 @@ const route = (
 /** Human-authored operation identities and summaries for the actual registered interfaces.
  * This describes routes; it neither installs a handler nor changes its validation or authorization. */
 export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
-  "GET /fleet-images/v1/raw/{digest}": route(
-    "downloadFleetRawImage",
-    "Download an approved immutable Talos image",
-    "none",
-  ),
-  "HEAD /fleet-images/v1/raw/{digest}": route(
-    "getFleetRawImageHeaders",
-    "Read approved immutable Talos image headers",
-    "none",
-  ),
   "GET /healthz": route("checkWorkerHealth", "Check Worker health", "none"),
   "GET /v1/openapi.json": route(
     "getPublicApiReference",
@@ -37,12 +26,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /agent/v1/openapi.json": route(
     "getAgentApiReference",
     "Read the regional agent API reference",
-    "none",
-    [500],
-  ),
-  "GET /internal/v1/openapi.json": route(
-    "getInternalApiReference",
-    "Read the operation callback API reference",
     "none",
     [500],
   ),
@@ -80,26 +63,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/regions/{id}": route(
     "getRegion",
     "Read regional inventory",
-    "admin",
-  ),
-  "GET /v1/regions/{id}/bootstrap-material": route(
-    "getRegionBootstrapMaterial",
-    "Read regional bootstrap material status",
-    "admin",
-  ),
-  "POST /v1/regions/{id}/bootstrap-material": route(
-    "setRegionBootstrapMaterial",
-    "Synchronize verified regional version metadata",
-    "admin",
-  ),
-  "POST /v1/regions/{id}/bootstrap-material/stage": route(
-    "stageRegionBootstrapMaterial",
-    "Stage successor regional bootstrap material",
-    "admin",
-  ),
-  "POST /v1/regions/{id}/bootstrap-material/activate": route(
-    "activateRegionBootstrapMaterial",
-    "Activate staged regional bootstrap material",
     "admin",
   ),
   "GET /v1/nodes": route("listNodes", "List registered nodes", "admin"),
@@ -247,142 +210,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Cancel a node addition",
     "admin",
   ),
-  "POST /v1/nodes/additions/{id}/bootstrap": route(
-    "prepareNodeBootstrap",
-    "Prepare protected node bootstrap input",
-    "admin",
-  ),
-  "GET /v1/nodes/additions/{id}/bootstrap": route(
-    "getNodeBootstrap",
-    "Read node bootstrap status",
-    "admin",
-  ),
-  "POST /v1/nodes/additions/{id}/verify": route(
-    "verifyNodeAddition",
-    "Verify the current physical node installation",
-    "admin",
-  ),
-  "GET /v1/nodes/{id}/operator/kubernetes": route(
-    "openOperatorKubernetes",
-    "Open an administrator Kubernetes mTLS relay",
-    "admin",
-    [400, 401, 403, 404, 409, 500],
-  ),
-  "GET /v1/nodes/{id}/compute-pool/observations": route(
-    "getComputePoolObservations",
-    "Read compute pool observations and freshness",
-    "admin",
-  ),
-  "GET /v1/nodes/{id}/compute-pool": route(
-    "getComputePoolPolicy",
-    "Read selected compute pool policy",
-    "admin",
-  ),
-  "PUT /v1/nodes/{id}/compute-pool": route(
-    "setComputePoolPolicy",
-    "Select compute pool policy for the current node",
-    "admin",
-  ),
-  "GET /v1/nodes/{id}/storage-profile": route(
-    "getNodeThinStorageProfile",
-    "Read selected thin storage profile and readiness",
-    "admin",
-  ),
-  "PUT /v1/nodes/{id}/storage-profile": route(
-    "selectNodeThinStorageProfile",
-    "Select thin storage profile and database admission gate",
-    "admin",
-  ),
-  "POST /v1/nodes/{id}/thin-qualifications": route(
-    "startThinQualification",
-    "Start isolated thin storage qualification",
-    "admin",
-  ),
-  "GET /v1/thin-qualifications/{id}": route(
-    "getThinQualification",
-    "Read thin storage qualification evidence and gates",
-    "admin",
-  ),
-  "POST /v1/thin-qualifications/{id}/resume": route(
-    "resumeThinQualification",
-    "Resume a supported thin qualification turn",
-    "admin",
-  ),
-  "POST /v1/thin-qualifications/{id}/cancel": route(
-    "cancelThinQualification",
-    "Cancel thin qualification and request cleanup",
-    "admin",
-  ),
-  "GET /v1/databases/{id}/warm-reclaim": route(
-    "getWarmReclaimPolicy",
-    "Read optional database warm reclaim policy",
-    "admin",
-  ),
-  "PUT /v1/databases/{id}/warm-reclaim": route(
-    "setWarmReclaimPolicy",
-    "Set optional database warm reclaim policy",
-    "admin",
-  ),
-  "GET /v1/nodes/{id}/warm-reclaim-qualification": route(
-    "getWarmReclaimQualification",
-    "Read node warm reclaimer qualification",
-    "admin",
-  ),
-  "PUT /v1/nodes/{id}/warm-reclaim-qualification": route(
-    "setWarmReclaimQualification",
-    "Record current node warm reclaimer qualification",
-    "admin",
-  ),
-  "GET /v1/nodes/{id}/host-configuration": route(
-    "getNodeHostConfiguration",
-    "Read selected protected host configuration",
-    "admin",
-  ),
-  "PUT /v1/nodes/{id}/host-configuration": route(
-    "setNodeHostConfiguration",
-    "Select protected host configuration for the current node",
-    "admin",
-  ),
-  "PUT /v1/regions/{id}/installation-profile": route(
-    "setNodeInstallationProfile",
-    "Select immutable regional node installation profile",
-    "admin",
-  ),
-  "GET /v1/regions/{id}/installation-profile": route(
-    "getNodeInstallationProfile",
-    "Read selected regional node installation profile",
-    "admin",
-  ),
-  "POST /v1/nodes/additions/{id}/installation-binding": route(
-    "bindNodeInstallation",
-    "Bind a purchased node to its installation profile",
-    "admin",
-  ),
-  "GET /v1/nodes/additions/{id}/installation-binding": route(
-    "getNodeInstallationBinding",
-    "Read the node installation binding",
-    "admin",
-  ),
-  "GET /v1/nodes/additions/{id}/inspection": route(
-    "getNodeInstallationInspection",
-    "Read current node installation inspection status",
-    "admin",
-  ),
-  "GET /v1/nodes/additions/{id}/proof/source": route(
-    "getNodeSourceProof",
-    "Read public node source ownership proof",
-    "admin",
-  ),
-  "GET /v1/nodes/additions/{id}/proof/preparation/journal": route(
-    "getNodeProofPreparationJournal",
-    "Read node proof preparation journal",
-    "admin",
-  ),
-  "GET /v1/nodes/additions/{id}/proof/{mode}": route(
-    "getNodeProofStatus",
-    "Read selected node proof status and receipt",
-    "admin",
-  ),
   "GET /v1/regions/{id}/configuration": route(
     "getRegionConfiguration",
     "Read regional PostgreSQL and storage configuration",
@@ -426,41 +253,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   "GET /v1/nodes/{id}/release": route(
     "getNodeFleetRelease",
     "Read node release assignment and runtime convergence",
-    "admin",
-  ),
-  "POST /v1/nodes/{id}/patches": route(
-    "startFleetPatch",
-    "Start a fenced fleet patch on a selected node",
-    "admin",
-  ),
-  "GET /v1/fleet/patches": route(
-    "listFleetPatches",
-    "List retained fleet patch operations",
-    "admin",
-  ),
-  "GET /v1/fleet/patches/{operation_id}": route(
-    "getFleetPatch",
-    "Read fleet patch progress and physical readback",
-    "admin",
-  ),
-  "POST /v1/fleet/patches/{operation_id}/resume": route(
-    "resumeFleetPatch",
-    "Resume a supported fleet patch stage",
-    "admin",
-  ),
-  "POST /v1/fleet/patches/{operation_id}/halt": route(
-    "haltFleetPatch",
-    "Halt a fleet patch at its supported boundary",
-    "admin",
-  ),
-  "POST /v1/fleet/rollouts": route(
-    "startFleetRollout",
-    "Atomically assign and start an ordered fleet rollout",
-    "admin",
-  ),
-  "GET /v1/fleet/rollouts/{id}": route(
-    "getFleetRollout",
-    "Read whole fleet rollout progress",
     "admin",
   ),
   "GET /v1/fleet/update-policy": route(
@@ -598,135 +390,9 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Report measured database and node usage",
     "agent",
   ),
-  "GET /agent/v1/nodes/{id}/compute-pool": route(
-    "getAgentComputePoolLease",
-    "Read the current compute pool execution lease",
-    "agent",
-  ),
-  "POST /agent/v1/nodes/{id}/compute-pool": route(
-    "reportAgentComputePool",
-    "Report current compute pool runtime observations",
-    "agent",
-  ),
-  "GET /agent/v1/nodes/{id}/storage-guard": route(
-    "getAgentStorageGuard",
-    "Read current signed host storage guard state",
-    "agent",
-  ),
-  "GET /agent/v1/nodes/{id}/reclaim": route(
-    "getAgentReclaimIntents",
-    "Read current qualified memory reclaim intents",
-    "agent",
-  ),
-  "POST /agent/v1/nodes/{id}/reclaim-observations": route(
-    "reportAgentReclaim",
-    "Report qualified memory reclaim outcomes",
-    "agent",
-  ),
   "POST /agent/v1/fleet-observations": route(
     "reportAgentFleetInventory",
     "Report authenticated component runtime inventory",
     "agent",
-  ),
-  "POST /internal/v1/node-installation/{id}/transport": route(
-    "issueNodeInspectionTransport",
-    "Issue scoped node inspection byte transport",
-    "callback",
-  ),
-  "POST /internal/v1/node-installation/{id}/inspection": route(
-    "reportNodeInspection",
-    "Record the authorized node inspection report",
-    "callback",
-  ),
-  "GET /internal/v1/node-installation/{id}/relay": route(
-    "openNodeInspectionRelay",
-    "Open scoped node inspection byte relay",
-    "callback",
-  ),
-  "POST /internal/v1/node-bootstrap/{operation_id}": route(
-    "executeNodeBootstrapCallback",
-    "Read bootstrap authority or checkpoint bootstrap execution",
-    "callback",
-  ),
-  "GET /internal/v1/node-bootstrap/{operation_id}/relay": route(
-    "openNodeBootstrapRelay",
-    "Open scoped bootstrap byte relay",
-    "callback",
-  ),
-  "POST /internal/v1/node-thin-storage/{id}": route(
-    "executeNodeThinStorageTurn",
-    "Read thin storage authority or report mutation progress",
-    "callback",
-  ),
-  "GET /internal/v1/node-thin-storage/{id}/relay": route(
-    "openNodeThinStorageRelay",
-    "Open scoped thin storage byte relay",
-    "callback",
-  ),
-  "POST /internal/v1/thin-qualifications/{id}": route(
-    "executeThinQualificationTurn",
-    "Read qualification authority or checkpoint measured evidence",
-    "callback",
-  ),
-  "GET /internal/v1/thin-qualifications/{id}/relay": route(
-    "openThinQualificationRelay",
-    "Open scoped qualification byte relay",
-    "callback",
-  ),
-  "POST /internal/v1/fleet-patches/{operation_id}": route(
-    "executeFleetPatchTurn",
-    "Read patch authority or checkpoint fleet patch progress",
-    "callback",
-  ),
-  "GET /internal/v1/fleet-patches/{operation_id}/relay": route(
-    "openFleetPatchRelay",
-    "Open scoped fleet patch byte relay",
-    "callback",
-  ),
-  "POST /internal/v1/node-proof/{id}/transport": route(
-    "issueNodeProofTransport",
-    "Issue scoped node proof byte transport",
-    "callback",
-  ),
-  "GET /internal/v1/node-proof/{id}/relay": route(
-    "openNodeProofRelay",
-    "Open scoped node proof byte relay",
-    "callback",
-  ),
-  "POST /internal/v1/node-proof/{id}/access": route(
-    "collectNodeProofAccess",
-    "Collect authorized node proof access evidence",
-    "callback",
-  ),
-  "POST /internal/v1/node-proof/{id}/report": route(
-    "reportNodeProof",
-    "Record the scoped physical node proof report",
-    "callback",
-  ),
-  "POST /internal/v1/node-proof/{id}/ownership": route(
-    "checkpointNodeProofOwnership",
-    "Read or checkpoint scoped node proof ownership state",
-    "callback",
-  ),
-  "POST /internal/v1/fleet-rollouts/{rollout}/regions/{region}/rotation": route(
-    "checkpointFleetRegionRotation",
-    "Checkpoint authorized regional authority rotation",
-    "callback",
-  ),
-  "GET /internal/v1/fleet-rollouts/{rollout}/regions/{region}/rotation/kubernetes/{node}":
-    route(
-      "openFleetRotationKubernetes",
-      "Open fenced regional rotation Kubernetes relay",
-      "callback",
-    ),
-  "GET /internal/v1/infrastructure-backups/{run}/{artifact}/kubernetes": route(
-    "openBackupKubernetes",
-    "Open scoped infrastructure backup Kubernetes relay",
-    "callback",
-  ),
-  "POST /source-control": route(
-    "checkNodeProofSourceControl",
-    "Read the authorized node proof source-control nonce",
-    "callback",
   ),
 };

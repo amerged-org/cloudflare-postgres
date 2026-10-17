@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import {
-  bytesToHex,
-  base64urlToBytes,
-  OperationId,
-  NodeId,
-  RegionId,
-} from "@pgcf/contracts";
+import { OperationId, RegionId } from "@pgcf/contracts";
 import {
   NodeAdditionRequest,
   NodeRegionPolicy,
@@ -13,19 +7,12 @@ import {
   CostedNodeApproval,
   NodeMarkLost,
 } from "@pgcf/contracts/nodes";
-import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
-import {
-  NodeBootstrapAdmissionBinding,
-  NodeBootstrapCheckpoint,
-} from "@pgcf/contracts/node-bootstrap";
-import { NodeProofNetworkPlan } from "@pgcf/contracts/node-proof";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import {
   withAdmissionMutation,
   type AdmissionMutation,
 } from "../domain/admission-mutations.ts";
-import { installationHash } from "../domain/node-installation.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -35,33 +22,14 @@ import {
   configureNodeRegionPolicy,
   readNodeAddition,
   reserveNodeAddition,
-  verifyNodeCapacity,
-  verifyNodeNetwork,
   markNodeLost,
   approveStandingNodePurchase,
 } from "../domain/node-state.ts";
 import {
-  bootstrapJobInput,
-  bootstrapJobStatus,
-  configureBootstrapJob,
-  NodeBootstrapConfiguration,
-  readBootstrapJob,
-  admissionAuthority,
-  hasBootstrapNetworkAuthority,
-} from "../domain/bootstrap-jobs.ts";
-import { contaboClient } from "../domain/bootstrap-relay.ts";
-import {
   cancelAlreadyCancelledProviderAddition,
   stopCancelledNodeAdditionWorkflow,
 } from "../domain/cancel-provider-addition.ts";
-import { hasAllocatedContaboHardware } from "../providers/contabo.ts";
-import { ip, readNodeNetworkSnapshot } from "../domain/node-network.ts";
-import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
-import {
-  loadRegionJoinBundle,
-  loadCurrentRegionMaterialReference,
-} from "../crypto/bootstrap-credentials.ts";
 import { readNodeStorageObservation } from "../domain/node-storage.ts";
 
 export async function getNodeStorage(
@@ -131,10 +99,6 @@ export async function setNodeDatabasePlacement(
     );
   return c.json({ node_id: id, ...body });
 }
-export const NodeVerificationRequest = z.strictObject({
-  expected_revision: z.number().int().positive(),
-  sha256: z.string().regex(/^[a-f0-9]{64}$/),
-});
 export async function startAddNode(
   env: Env,
   operationId: string,
@@ -301,8 +265,6 @@ export async function getCapacityPolicy(
       maximum_database_memory_mib: number | null;
       postgres_memory_request_mib: number | null;
       standing_cost_profile: string | null;
-      compute_pool_json: string | null;
-      thin_storage_json: string | null;
     }>();
   if (!row)
     throw new ApiError("not_found", "Region capacity policy is not configured");
@@ -324,12 +286,6 @@ export async function getCapacityPolicy(
       placement_mode: row.placement_mode,
       maximum_database_memory_mib: row.maximum_database_memory_mib,
       postgres_memory_request_mib: row.postgres_memory_request_mib,
-      ...(row.compute_pool_json
-        ? { compute_pool: JSON.parse(row.compute_pool_json) }
-        : {}),
-      ...(row.thin_storage_json
-        ? { thin_storage: JSON.parse(row.thin_storage_json) }
-        : {}),
       standing_cost_profile:
         row.standing_cost_profile === null
           ? null
@@ -350,39 +306,18 @@ export async function setCapacityPolicy(
       "Policy region differs from the route",
     );
   const previous = await c.env.DB.prepare(
-    "SELECT placement_mode,postgres_memory_request_mib,compute_pool_json FROM node_region_policies WHERE region_id=?",
+    "SELECT placement_mode,postgres_memory_request_mib FROM node_region_policies WHERE region_id=?",
   )
     .bind(id)
     .first<{
       placement_mode: string;
       postgres_memory_request_mib: number | null;
-      compute_pool_json: string | null;
     }>();
-  const templateRuntime = (value: unknown) => {
-    if (!value) return null;
-    const policy = value as NonNullable<
-      z.infer<typeof NodeCapacityPolicy>["compute_pool"]
-    >;
-    return {
-      profile: policy.profile,
-      per_slot_cpu_millicores: policy.per_slot_cpu_millicores,
-      per_slot_memory_mib: policy.per_slot_memory_mib,
-    };
-  };
   const changesRuntime =
     policy.placement_mode !== (previous?.placement_mode ?? "reserved") ||
     (policy.placement_mode === "actual_ram" &&
       policy.postgres_memory_request_mib !==
-        (previous?.postgres_memory_request_mib ?? null)) ||
-    (policy.compute_pool !== undefined &&
-      (await installationHash(templateRuntime(policy.compute_pool))) !==
-        (await installationHash(
-          templateRuntime(
-            previous?.compute_pool_json
-              ? JSON.parse(previous.compute_pool_json)
-              : null,
-          ),
-        )));
+        (previous?.postgres_memory_request_mib ?? null));
   const execute = async (mutation?: AdmissionMutation) =>
     configureNodeRegionPolicy(
       c.env.DB,
@@ -402,503 +337,17 @@ export async function setCapacityPolicy(
         maximum_database_memory_mib: policy.maximum_database_memory_mib,
         postgres_memory_request_mib: policy.postgres_memory_request_mib,
         standing_cost_profile: policy.standing_cost_profile,
-        ...(policy.compute_pool === undefined
-          ? {}
-          : { compute_pool: policy.compute_pool }),
-        ...(policy.thin_storage === undefined
-          ? {}
-          : { thin_storage: policy.thin_storage }),
         autoscale_enabled: policy.autoscale_enabled,
         adopt_instance_ids: policy.adopt_instance_ids,
       },
       mutation,
-      previous ?? {
-        placement_mode: null,
-        postgres_memory_request_mib: null,
-        compute_pool_json: null,
-      },
+      previous ?? { placement_mode: null, postgres_memory_request_mib: null },
     );
   if (changesRuntime)
     await withAdmissionMutation(c.env, [], execute, { kind: "region", id });
   else await execute();
   return getCapacityPolicy(c, id);
 }
-export async function configureNodeBootstrap(
-  c: ApiContext,
-  id: string,
-  raw: z.infer<typeof NodeBootstrapConfiguration>,
-): Promise<Response> {
-  await requireScope(c, "admin");
-  const body = NodeBootstrapConfiguration.parse(raw),
-    addition = await readNodeAddition(c.env.DB, id);
-  if (!addition.audit || !addition.provider_instance_id)
-    throw new ApiError(
-      "conflict",
-      "Bootstrap requires audited provider inventory",
-    );
-  await validateRescueConfiguration(c.env, addition.provider_instance_id, body);
-  const actual = await contaboClient(c.env).getInstance(
-    addition.provider_instance_id,
-    {
-      requestId: crypto.randomUUID(),
-      accounting: { operation_id: id, stage: "inspection" },
-    },
-  );
-  if (
-    !hasAllocatedContaboHardware(actual) ||
-    actual.id !== body.spec.provider_instance_id ||
-    actual.region !== addition.audit.provider_region ||
-    actual.productId !== addition.audit.product_id ||
-    actual.macAddress.toLowerCase() !== body.spec.hardware.mac ||
-    actual.ipConfig.v4.ip !== body.spec.hardware.ipv4 ||
-    actual.ipConfig.v4.gateway !== body.spec.hardware.gateway ||
-    actual.ipConfig.v4.netmaskCidr !== body.spec.hardware.prefix_length
-  )
-    throw new ApiError(
-      "conflict",
-      "Bootstrap hardware differs from current actual provider inventory",
-    );
-  const status = await configureBootstrapJob(c.env, id, body);
-  c.executionCtx.waitUntil(startAddNode(c.env, id));
-  return c.json(status, 202);
-}
-export async function getNodeBootstrap(
-  c: ApiContext,
-  id: string,
-): Promise<Response> {
-  await requireScope(c, "admin");
-  return c.json(bootstrapJobStatus(await readBootstrapJob(c.env.DB, id)));
-}
-
-const Timestamp = z.iso.datetime({ precision: 3 });
-const Ip = z.union([z.ipv4(), z.ipv6()]);
-const Proof = z.strictObject({
-  purpose: z.literal("pgcf-node-verification/v1"),
-  operation_id: OperationId,
-  node_id: NodeId,
-  region_id: RegionId,
-  provider_instance_id: ProviderInstanceId,
-  intent_hash: z.string().regex(/^[a-f0-9]{64}$/),
-  input_hash: z.string().regex(/^[a-f0-9]{64}$/),
-  checkpoint_reference: z.string().min(1).max(128),
-  cluster_uid: z.uuid(),
-  node_uid: z.uuid(),
-  node_resource_version: z
-    .string()
-    .regex(/^[0-9]+$/)
-    .max(128),
-  observed_at: Timestamp,
-  expires_at: Timestamp,
-  addresses: z.strictObject({ ipv4: z.ipv4(), ipv6: z.ipv6().nullable() }),
-  wireguard: z.strictObject({
-    mode: z.literal("wireguard"),
-    peers: z
-      .array(
-        z.strictObject({
-          node_id: NodeId,
-          provider_instance_id: ProviderInstanceId,
-          address: Ip,
-          public_key: z.string().regex(/^[A-Za-z0-9+/]{43}=$/),
-          last_handshake_at: Timestamp,
-        }),
-      )
-      .max(100),
-    packet_observations: z
-      .array(
-        z.strictObject({
-          source_node_id: NodeId,
-          destination_node_id: NodeId,
-          captured_at: Timestamp,
-          encrypted_packets: z.number().int().positive(),
-          plaintext_pod_packets: z.literal(0),
-        }),
-      )
-      .max(200),
-  }),
-  scans: z
-    .array(
-      z.strictObject({
-        family: z.enum(["ipv4", "ipv6"]),
-        address: Ip,
-        source: Ip,
-        observed_at: Timestamp,
-        scanned_ports: z.literal(65535),
-        open_ports: z.array(z.number().int().min(1).max(65535)).max(100),
-        control: z.strictObject({
-          address: Ip,
-          port: z.number().int().min(1).max(65535),
-          connected: z.literal(true),
-        }),
-      }),
-    )
-    .min(1)
-    .max(2),
-});
-const ProofEnvelope = z.strictObject({
-  kid: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/),
-  payload: Proof,
-  signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/),
-});
-export const nodeVerificationProofSchema = Proof;
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  const object = value as Record<string, unknown>;
-  return `{${Object.keys(object)
-    .sort()
-    .map((name) => `${JSON.stringify(name)}:${canonical(object[name])}`)
-    .join(",")}}`;
-}
-export const canonicalNodeVerificationProof = canonical;
-export async function verifyNodeProof(
-  c: ApiContext,
-  id: string,
-  raw: z.infer<typeof NodeVerificationRequest>,
-): Promise<Response> {
-  await requireScope(c, "admin");
-  const next = await verifyNodeProofArtifact(c.env, id, raw);
-  c.executionCtx.waitUntil(startAddNode(c.env, id));
-  return c.json(next, 202);
-}
-
-export async function verifyNodeProofArtifact(
-  env: Env,
-  id: string,
-  raw: z.infer<typeof NodeVerificationRequest>,
-) {
-  const body = NodeVerificationRequest.parse(raw),
-    addition = await readNodeAddition(env.DB, id);
-  if (
-    addition.revision !== body.expected_revision ||
-    addition.checkpoint?.stage !== "joined" ||
-    addition.status !== "bootstrapping"
-  )
-    throw new ApiError(
-      "conflict",
-      "Verification requires the current joined node checkpoint",
-    );
-  const row = await readBootstrapJob(env.DB, id),
-    input = await bootstrapJobInput(env, row);
-  const proofKey = `node-verification/${id}/${addition.checkpoint.reference}/proof.json`;
-  const object = await env.ARCHIVE.get(proofKey);
-  if (!object || object.size > 256 * 1024)
-    throw new ApiError(
-      "conflict",
-      "Bound node verification artifact is unavailable",
-    );
-  const bytes = await object.arrayBuffer();
-  if (
-    bytes.byteLength > 256 * 1024 ||
-    bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))) !==
-      body.sha256
-  )
-    throw new ApiError("conflict", "Node verification artifact digest differs");
-  const envelope = ProofEnvelope.parse(
-    JSON.parse(
-      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
-    ),
-  );
-  const keys = await importBootstrapVerificationKeys(
-      JSON.parse(env.BOOTSTRAP_VERIFIER_KEYS),
-    ),
-    key = keys.get(envelope.kid),
-    signature = base64urlToBytes(envelope.signature);
-  if (
-    !key ||
-    !signature ||
-    !(await crypto.subtle.verify(
-      "Ed25519",
-      key,
-      Uint8Array.from(signature),
-      new TextEncoder().encode(
-        `pgcf-node-verification/v1\n${canonical(envelope.payload)}`,
-      ),
-    ))
-  )
-    throw new ApiError(
-      "forbidden",
-      "Node proof lacks the dedicated trusted verifier signature",
-    );
-  const proof = envelope.payload,
-    now = Date.now(),
-    at = Date.parse(proof.observed_at),
-    expires = Date.parse(proof.expires_at);
-  if (
-    proof.operation_id !== id ||
-    proof.node_id !== addition.intent.node_id ||
-    proof.region_id !== row.region_id ||
-    proof.provider_instance_id !== addition.provider_instance_id ||
-    proof.intent_hash !== addition.intent_hash ||
-    proof.input_hash !== row.input_hash ||
-    proof.checkpoint_reference !== addition.checkpoint.reference ||
-    at < Date.parse(addition.checkpoint.saved_at) ||
-    at > now + 5000 ||
-    at < now - 300_000 ||
-    expires <= now ||
-    expires > at + 600_000 ||
-    proof.addresses.ipv4 !== input.spec.hardware.ipv4 ||
-    (input.spec.cluster_uid !== null &&
-      proof.cluster_uid !== input.spec.cluster_uid)
-  )
-    throw new ApiError(
-      "conflict",
-      "Node proof identity, checkpoint or freshness differs from the operation",
-    );
-  const protectedCluster = await loadRegionJoinBundle(
-    env.DB,
-    env.CREDENTIAL_KEYS,
-    await loadCurrentRegionMaterialReference(
-      env.DB,
-      row.region_id,
-      "join_bundle",
-    ),
-  );
-  if (
-    protectedCluster.kube_system_uid !== proof.cluster_uid ||
-    protectedCluster.cluster_endpoint !== input.spec.cluster_endpoint
-  )
-    throw new ApiError(
-      "conflict",
-      "Proof cluster identity differs from actual sealed Kubernetes readback",
-    );
-  const network = await readNodeNetworkSnapshot(env, id),
-    proofIpv4 = ip(proof.addresses.ipv4),
-    proofIpv6 = proof.addresses.ipv6 === null ? null : ip(proof.addresses.ipv6);
-  if (
-    !network ||
-    (!(await admissionAuthority(env, row)).admission_authorized &&
-      !(await hasBootstrapNetworkAuthority(env, row)))
-  )
-    throw new ApiError(
-      "conflict",
-      "Current sealed installation and network authority are required",
-    );
-  const plan = NodeProofNetworkPlan.parse(JSON.parse(network.plan_json)),
-    target = plan.members.find(
-      (member) =>
-        member.node_id === row.node_id &&
-        member.provider_instance_id === proof.provider_instance_id,
-    );
-  if (
-    !target ||
-    target.primary.ipv4.length !== 1 ||
-    ip(target.primary.ipv4[0]!) !== proofIpv4 ||
-    target.primary.ipv6.length !== (proofIpv6 === null ? 0 : 1) ||
-    (proofIpv6 !== null && ip(target.primary.ipv6[0]!) !== proofIpv6)
-  )
-    throw new ApiError(
-      "conflict",
-      "Proof addresses differ from the sealed network assignment",
-    );
-  if (
-    target.addresses.ipv4.some((address) => ip(address) !== proofIpv4) ||
-    target.addresses.ipv6.some((address) => ip(address) !== proofIpv6)
-  )
-    throw new ApiError(
-      "conflict",
-      "Additional provider addresses require complete verified outside-allowlist scan coverage",
-    );
-  const peers = await env.DB.prepare(
-    "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL",
-  )
-    .bind(row.region_id, row.node_id)
-    .all<{ id: string; provider_instance_id: string | null }>();
-  if (
-    proof.wireguard.peers.length !== peers.results.length ||
-    new Set(proof.wireguard.peers.map((peer) => peer.node_id)).size !==
-      peers.results.length
-  )
-    throw new ApiError(
-      "conflict",
-      "WireGuard proof must cover every actual approved regional peer",
-    );
-  for (const peer of peers.results) {
-    const evidence = proof.wireguard.peers.find(
-      (value) => value.node_id === peer.id,
-    );
-    if (
-      !evidence ||
-      peer.provider_instance_id === null ||
-      evidence.provider_instance_id !== peer.provider_instance_id ||
-      Date.parse(evidence.last_handshake_at) < at - 180_000 ||
-      Date.parse(evidence.last_handshake_at) > at + 5000 ||
-      !proof.wireguard.packet_observations.some(
-        (packet) =>
-          [packet.source_node_id, packet.destination_node_id].includes(
-            peer.id,
-          ) &&
-          [packet.source_node_id, packet.destination_node_id].includes(
-            row.node_id,
-          ) &&
-          Date.parse(packet.captured_at) >= at - 180_000 &&
-          Date.parse(packet.captured_at) <= at + 5000,
-      )
-    )
-      throw new ApiError(
-        "conflict",
-        "Actual peer handshake and encrypted packet evidence are incomplete",
-      );
-  }
-  const addresses = [
-    { family: "ipv4", address: proof.addresses.ipv4 },
-    ...(proof.addresses.ipv6 === null
-      ? []
-      : [{ family: "ipv6", address: proof.addresses.ipv6 }]),
-  ];
-  if (proof.scans.length !== addresses.length)
-    throw new ApiError(
-      "conflict",
-      "Every assigned address needs an outside-allowlist scan",
-    );
-  for (const expected of addresses) {
-    const scan = proof.scans.find(
-      (value) =>
-        value.family === expected.family && value.address === expected.address,
-    );
-    if (
-      !scan ||
-      scan.open_ports.length !== 0 ||
-      Date.parse(scan.observed_at) < at - 180_000 ||
-      Date.parse(scan.observed_at) > at + 5000 ||
-      scan.source === proof.addresses.ipv4 ||
-      scan.source === proof.addresses.ipv6 ||
-      proof.wireguard.peers.some((peer) => peer.address === scan.source)
-    )
-      throw new ApiError(
-        "conflict",
-        "Complete controlled outside-allowlist scan proof is required",
-      );
-  }
-  const node = await env.DB.prepare(
-    "SELECT * FROM nodes WHERE id=? AND region_id=? AND provider_instance_id=? AND k8s_node_name=? AND ready=1 AND node_uid=?",
-  )
-    .bind(
-      row.node_id,
-      row.region_id,
-      proof.provider_instance_id,
-      input.spec.hostname,
-      proof.node_uid,
-    )
-    .first<{
-      last_observed_at: string;
-      allocatable_memory_mib: number;
-      allocatable_cpu_millicores: number;
-      storage_gib_total: number;
-      platform_reserved_memory_mib: number;
-      platform_reserved_cpu_millicores: number;
-    }>();
-  if (
-    !node ||
-    Date.parse(node.last_observed_at) < at - 180_000 ||
-    Date.parse(node.last_observed_at) > now + 5000
-  )
-    throw new ApiError(
-      "conflict",
-      "Current actual node identity and measured capacity are required",
-    );
-  let admissionBinding = NodeBootstrapAdmissionBinding.parse({
-    checkpoint_revision: Number(
-      addition.checkpoint.reference.split(":").at(-1),
-    ),
-    node_uid: proof.node_uid,
-    resource_version: proof.node_resource_version,
-    kube_system_uid: proof.cluster_uid,
-    quarantine: {
-      key: "pgcf.io/quarantine",
-      value: "bootstrap",
-      effect: "NoSchedule",
-    },
-  });
-  if (row.admission_binding_json !== null) {
-    const saved = NodeBootstrapAdmissionBinding.parse(
-      JSON.parse(row.admission_binding_json),
-    );
-    if (
-      saved.checkpoint_revision !== admissionBinding.checkpoint_revision ||
-      saved.node_uid !== admissionBinding.node_uid ||
-      saved.kube_system_uid !== admissionBinding.kube_system_uid ||
-      canonical(saved.quarantine) !== canonical(admissionBinding.quarantine)
-    )
-      throw new ApiError(
-        "conflict",
-        "Original quarantine release identity cannot change",
-      );
-    const checkpoint = NodeBootstrapCheckpoint.parse(
-      JSON.parse(row.checkpoint_json),
-    );
-    if (
-      checkpoint.stage !== "awaiting_verification" ||
-      checkpoint.release_node_uid !== null ||
-      checkpoint.release_resource_version !== null ||
-      checkpoint.admission_receipt !== null
-    )
-      admissionBinding = saved;
-  }
-  const scope = {
-    operation_id: id,
-    node_id: row.node_id,
-    intent_hash: addition.intent_hash,
-    checkpoint_reference: addition.checkpoint.reference,
-    proof_reference: `${proofKey}#${body.sha256}`,
-  };
-  if (canonical(await readNodeNetworkSnapshot(env, id)) !== canonical(network))
-    throw new ApiError(
-      "conflict",
-      "Sealed network authority changed during verification",
-    );
-  let next = await verifyNodeNetwork(env.DB, id, addition.revision, {
-    ...scope,
-    verified_at: proof.observed_at,
-  });
-  next = await verifyNodeCapacity(env.DB, id, next.revision, {
-    ...scope,
-    observed_at: node.last_observed_at,
-    allocatable_memory_mib: node.allocatable_memory_mib,
-    allocatable_cpu_millicores: node.allocatable_cpu_millicores,
-    storage_gib_total: node.storage_gib_total,
-    platform_reserved_memory_mib: node.platform_reserved_memory_mib,
-    platform_reserved_cpu_millicores: node.platform_reserved_cpu_millicores,
-  });
-  if (Date.parse(proof.expires_at) <= Date.now())
-    throw new ApiError("conflict", "Node proof expired before admission");
-  const serializedBinding = JSON.stringify(admissionBinding);
-  const updated = await env.DB.prepare(
-    `UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=?,updated_at=?
-     WHERE operation_id=? AND input_hash=? AND revision=? AND checkpoint_json=? AND admission_binding_json IS ?
-     AND authorized=1 AND admitted=0 AND cancelled=0`,
-  )
-    .bind(
-      serializedBinding,
-      proof.expires_at,
-      new Date().toISOString(),
-      id,
-      row.input_hash,
-      row.revision,
-      row.checkpoint_json,
-      row.admission_binding_json,
-    )
-    .run();
-  if (updated.meta.changes !== 1)
-    throw new ApiError(
-      "conflict",
-      "Bootstrap admission changed while verification was in progress",
-    );
-  const admitted = await readBootstrapJob(env.DB, id);
-  if (
-    admitted.admission_binding_json !== serializedBinding ||
-    admitted.admission_expires_at !== proof.expires_at ||
-    !admitted.authorized ||
-    !admitted.admission_authorized ||
-    admitted.admitted ||
-    admitted.cancelled
-  )
-    throw new ApiError(
-      "conflict",
-      "Bootstrap admission changed before authorization readback",
-    );
-  return next;
-}
-
 export async function capacityDecision(
   c: ApiContext,
   id: string,

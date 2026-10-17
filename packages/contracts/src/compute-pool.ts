@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { NodeId, RegionId } from "./ids.ts";
 import { FleetReleaseId } from "./releases.ts";
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 export const COMPUTE_POOL_LIMITS = {
@@ -62,82 +61,3 @@ export function computePoolOverhead(
     memory_mib: policy?.per_slot_memory_mib ?? 0,
   };
 }
-export const ComputePoolPolicyUpdate = z.strictObject({
-  expected_revision: z.number().int().min(0).max(2147483646),
-  node_uid: z.uuid(),
-  policy: ComputePoolPolicy,
-});
-export type ComputePoolPolicyUpdate = z.infer<typeof ComputePoolPolicyUpdate>;
-export const ComputePoolPolicyState = z.strictObject({
-  node_id: NodeId,
-  node_uid: z.uuid(),
-  region_id: RegionId,
-  revision: z.number().int().positive(),
-  policy: ComputePoolPolicy,
-  updated_at: z.iso.datetime(),
-});
-export type ComputePoolPolicyState = z.infer<typeof ComputePoolPolicyState>;
-export const ComputePoolLease = ComputePoolPolicyState.safeExtend({
-  purpose: z.literal("pgcf-compute-pool/v1"),
-  material_revision: z.number().int().positive(),
-  assignment_revision: z.number().int().positive(),
-  region_revision: z.number().int().positive(),
-  node_observed_at: z.iso.datetime(),
-  issued_at: z.iso.datetime(),
-  expires_at: z.iso.datetime(),
-});
-export const ComputePoolObservation = z
-  .strictObject({
-    node_id: NodeId,
-    node_uid: z.uuid(),
-    policy_revision: z.number().int().positive(),
-    material_revision: z.number().int().positive(),
-    observed_at: z.iso.datetime(),
-    profile: ComputeRuntimeProfile,
-    idle_memory_current_bytes: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(Number.MAX_SAFE_INTEGER)
-      .nullable(),
-    idle_cpu_usage_usec: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(Number.MAX_SAFE_INTEGER)
-      .nullable(),
-    slots: z
-      .array(
-        z.strictObject({
-          slot_id: z.string().regex(/^[a-f0-9]{32}$/),
-          holder_pid: z.number().int().positive(),
-          shim_pid: z.number().int().positive(),
-          live: z.boolean(),
-          sandbox_id: z.string().min(1).max(128).nullable(),
-          pod_uid: z.string().min(1).max(128).nullable(),
-          runtime_release_id: FleetReleaseId.nullable(),
-          assignment_mode: z.enum(["prestarted", "on_demand"]).nullable(),
-        }),
-      )
-      .max(256),
-  })
-  .superRefine((value, context) => {
-    if (
-      new Set(value.slots.map((slot) => slot.slot_id)).size !==
-      value.slots.length
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Duplicate runtime identity",
-      });
-    if (
-      value.slots.some(
-        (slot) => (slot.sandbox_id === null) !== (slot.pod_uid === null),
-      )
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Partial tenant assignment is invalid",
-      });
-  });
-export type ComputePoolObservation = z.infer<typeof ComputePoolObservation>;

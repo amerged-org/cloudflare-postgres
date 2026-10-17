@@ -5,7 +5,6 @@ import {
   PlacementRegion,
   type RegionCreate,
   type RegionRouteKeyring,
-  type RegionBootstrapMaterialUpdate,
   bytesToHex,
   RegionGatewayConfiguration,
   type RegionConfigurationUpdate,
@@ -17,11 +16,6 @@ import {
 } from "@pgcf/contracts/route-token";
 import { ApiError } from "../app.ts";
 import { withAdmissionMutation } from "../domain/admission-mutations.ts";
-import {
-  agentKeyReference,
-  encryptAgentKey,
-  bootstrapCredentialInsert,
-} from "../crypto/bootstrap-credentials.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";
 import { regionAcceptsPlacementSql } from "../domain/placement.ts";
@@ -30,13 +24,8 @@ import {
   withIdempotency,
 } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
-import {
-  readRegionBootstrapMaterial,
-  synchronizeRegionBootstrapMaterial,
-} from "../domain/region-material-revisions.ts";
 import { nodeInventoryRow, regionRow, type Row } from "./rows.ts";
 import { readFleetNodeReleaseInventories } from "../domain/fleet-releases.ts";
-import { readLatestFleetPatchStatuses } from "../domain/fleet-patches.ts";
 
 export async function createRegion(
   c: ApiContext,
@@ -57,11 +46,6 @@ export async function createRegion(
     replay: async () => refuseCredentialReplay(),
     execute: async (lease) => {
       const agentKey = newAgentKey(body.id);
-      const custody = await encryptAgentKey(
-        c.env.CREDENTIAL_KEYS,
-        agentKeyReference(body.id),
-        agentKey,
-      );
       const routeKeyring = JSON.parse(
         serializeRouteKeyring(
           await deriveRegionKeyring(
@@ -89,7 +73,6 @@ export async function createRegion(
             now,
             now,
           ),
-          bootstrapCredentialInsert(c.env.DB, custody, now),
           lease.completeStatement(body.id, 201),
         ]);
       } catch (error) {
@@ -172,22 +155,15 @@ export async function listNodes(c: ApiContext): Promise<Response> {
 }
 
 async function inventoryRows(c: ApiContext, rows: Row[]) {
-  const ids = rows.map((row) => String(row.id));
-  const [releases, patches] = await Promise.all([
-    readFleetNodeReleaseInventories(c.env.DB, ids),
-    readLatestFleetPatchStatuses(
-      c.env.DB,
-      rows.map((row) => ({
-        node_id: String(row.id),
-        node_uid: row.node_uid as string | null,
-      })),
-    ),
-  ]);
+  const releases = await readFleetNodeReleaseInventories(
+    c.env.DB,
+    rows.map((row) => String(row.id)),
+  );
   return rows.map((row) => {
     const release = releases.get(String(row.id));
     if (!release || release.status.node_uid !== row.node_uid)
       throw new ApiError("conflict", "Node inventory identity changed");
-    return nodeInventoryRow(row, release, patches.get(String(row.id)));
+    return nodeInventoryRow(row, release);
   });
 }
 
@@ -209,24 +185,8 @@ export async function getRegion(c: ApiContext, id: string) {
   return c.json(regionRow(row), 200);
 }
 
-export async function getRegionBootstrapMaterial(
-  c: ApiContext,
-  id: string,
-): Promise<Response> {
-  await requireScope(c, "admin");
-  return c.json(await readRegionBootstrapMaterial(c.env, id));
-}
-export async function updateRegionBootstrapMaterial(
-  c: ApiContext,
-  id: string,
-  body: RegionBootstrapMaterialUpdate,
-): Promise<Response> {
-  await requireScope(c, "admin");
-  return c.json(await synchronizeRegionBootstrapMaterial(c.env, id, body));
-}
-
-// The heartbeat is deliberately excluded. Credential/material changes, even those made
-// outside this endpoint, fence routing updates without disclosing custody in the response.
+// The heartbeat is deliberately excluded. Credential changes, even those made outside this
+// endpoint, fence routing updates without disclosing custody in the response.
 const configurationFields = [
   "id",
   "provider",
@@ -238,8 +198,6 @@ const configurationFields = [
   "agent_key_hash",
   "created_at",
   "updated_at",
-  "bootstrap_material_revision",
-  "bootstrap_material_provenance_sha256",
 ] as const;
 
 async function regionConfigurationRow(c: ApiContext, id: string): Promise<Row> {

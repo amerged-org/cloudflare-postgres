@@ -19,33 +19,12 @@ import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
 import { registerRegionConfiguration } from "./routes/region-configuration.ts";
 import { registerFleetReleases } from "./routes/fleet-releases.ts";
-import { registerFleetImages } from "./routes/fleet-images.ts";
-import { registerFleetRollouts } from "./routes/fleet-rollouts.ts";
-import { registerFleetRegionAuthority } from "./routes/fleet-region-authority.ts";
-import { authorizeFleetRegionRotation } from "./domain/fleet-region-authority.ts";
-import { registerFleetPatches } from "./routes/fleet-patches.ts";
 import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodes } from "./routes/nodes.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
-import { registerNodeOperator } from "./routes/node-operator.ts";
-import { authenticateThinStorage } from "./domain/node-thin-storage-execution.ts";
-import { RECLAIM_LIMITS } from "@pgcf/contracts/reclaim";
-import { authenticateReclaimRequest } from "./domain/warm-reclaim.ts";
-import { registerReclaim } from "./routes/reclaim.ts";
-import { registerNodeThinStorage } from "./routes/node-thin-storage.ts";
-import { registerThinQualification } from "./routes/thin-qualification.ts";
-import { authenticateThinQualification } from "./domain/thin-qualification.ts";
-import { registerComputePool } from "./routes/compute-pool.ts";
-import { registerNodeHostConfiguration } from "./routes/node-host-configuration.ts";
-import { registerNodeInstallation } from "./routes/node-installation.ts";
-import { registerNodeProof } from "./routes/node-proof.ts";
-import { authenticateNodeProofRequest } from "./domain/node-proof-session.ts";
-import { authenticateNodeInstallationInspection } from "./domain/node-installation.ts";
-import { authenticateBootstrapCallback } from "./domain/bootstrap-jobs.ts";
 import { NodeStateError } from "./domain/node-state.ts";
-import { requireScope } from "./middleware/auth.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
@@ -65,24 +44,6 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/costs",
   "/v1/operational-health",
   "/v1/nodes/:id/mark-lost",
-  "/v1/nodes/:id/compute-pool",
-  "/v1/nodes/:id/storage-profile",
-  "/v1/databases/:id/warm-reclaim",
-  "/v1/nodes/:id/warm-reclaim-qualification",
-  "/agent/v1/nodes/:id/reclaim",
-  "/agent/v1/nodes/:id/reclaim-observations",
-  "/v1/nodes/:id/host-configuration",
-  "/v1/nodes/:id/compute-pool/observations",
-  "/agent/v1/nodes/:id/compute-pool",
-  "/agent/v1/nodes/:id/storage-guard",
-  "/internal/v1/node-thin-storage/:id",
-  "/internal/v1/node-thin-storage/:id/relay",
-  "/v1/nodes/:id/thin-qualifications",
-  "/v1/thin-qualifications/:id",
-  "/v1/thin-qualifications/:id/resume",
-  "/v1/thin-qualifications/:id/cancel",
-  "/internal/v1/thin-qualifications/:id",
-  "/internal/v1/thin-qualifications/:id/relay",
   "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",
@@ -102,40 +63,15 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/fleet/releases/:id",
   "/v1/regions/:id/release",
   "/v1/nodes/:id/release",
-  "/v1/nodes/:id/patches",
-  "/v1/fleet/rollouts",
-  "/v1/fleet/rollouts/:id",
-  "/v1/fleet/patches/:operation_id",
-  "/v1/fleet/patches/:operation_id/resume",
-  "/v1/fleet/patches/:operation_id/halt",
-  "/internal/v1/fleet-patches/:operation_id",
-  "/internal/v1/fleet-patches/:operation_id/relay",
   "/agent/v1/fleet-observations",
   "/v1/nodes",
-  "/v1/nodes/:id/operator/kubernetes",
   "/v1/nodes/:id/storage",
   "/v1/nodes/additions",
   "/v1/nodes/additions/:id",
   "/v1/nodes/additions/:id/approve",
   "/v1/nodes/additions/:id/cancel",
-  "/v1/nodes/additions/:id/bootstrap",
-  "/v1/nodes/additions/:id/verify",
-  "/v1/nodes/additions/:id/installation-binding",
-  "/v1/regions/:id/installation-profile",
-  "/v1/regions/:id/bootstrap-material",
-  "/internal/v1/node-installation/:id/inspection",
-  "/internal/v1/node-installation/:id/transport",
-  "/internal/v1/node-installation/:id/relay",
-  "/source-control",
-  "/internal/v1/node-proof/:id/transport",
-  "/internal/v1/node-proof/:id/relay",
-  "/internal/v1/node-proof/:id/access",
-  "/internal/v1/node-proof/:id/report",
-  "/internal/v1/node-proof/:id/ownership",
   "/v1/regions/:id/capacity-policy",
   "/v1/regions/:id/capacity-decision",
-  "/internal/v1/node-bootstrap/:operation_id",
-  "/internal/v1/node-bootstrap/:operation_id/relay",
   "/v1/databases",
   "/v1/databases/:id",
   "/v1/databases/:id/idle-time",
@@ -186,8 +122,8 @@ export function apiError(
 
 async function readJsonBody(
   request: Request,
-  maximum = JSON_BODY_MAX_BYTES,
 ): Promise<{ text: string; byteLength: number }> {
+  const maximum = JSON_BODY_MAX_BYTES;
   const reader = request.body!.getReader();
   const bytes = new Uint8Array(maximum);
   let length = 0;
@@ -343,74 +279,8 @@ export function createApp(): ApiApp {
   });
 
   app.use("*", async (c, next) => {
-    const path = new URL(c.req.url).pathname;
-    const callback = /^\/internal\/v1\/node-bootstrap\/(op_[a-z0-9]{20})$/.exec(
-      path,
-    );
-    const privateBootstrap =
-      /^\/v1\/nodes\/additions\/op_[a-z0-9]{20}\/bootstrap$/.test(path) &&
-      c.req.method === "POST";
-    const inspection =
-      /^\/internal\/v1\/node-installation\/(op_[a-z0-9]{20})\/(?:inspection|transport)$/.exec(
-        path,
-      );
-    const privateProfile =
-      /^\/v1\/regions\/[^/]+\/installation-profile$/.test(path) &&
-      c.req.method === "PUT";
-    const privateRotation =
-      /^\/v1\/regions\/[^/]+\/bootstrap-material\/stage$/.test(path) &&
-      c.req.method === "POST";
-    let maximum = JSON_BODY_MAX_BYTES;
-    const proof =
-      /^\/internal\/v1\/node-proof\/(op_[a-z0-9]{20})\/(?:transport|access|report|ownership)$/.exec(
-        path,
-      );
-    const thinStorage =
-      /^\/internal\/v1\/node-thin-storage\/(nod_[a-z0-9]{20})$/.exec(path);
-    const thinQualification =
-      /^\/internal\/v1\/thin-qualifications\/(op_[a-z0-9]{20})$/.exec(path);
-    const reclaim =
-      /^\/agent\/v1\/nodes\/(nod_[a-z0-9]{20})\/reclaim-observations$/.exec(
-        path,
-      );
-    const authorityRotation =
-      /^\/internal\/v1\/fleet-rollouts\/(op_[a-z0-9]{20})\/regions\/([a-z0-9][a-z0-9_-]{0,63})\/rotation$/.exec(
-        path,
-      );
-    if (authorityRotation && c.req.method === "POST") {
-      await authorizeFleetRegionRotation(
-        c.env,
-        authorityRotation[1]!,
-        authorityRotation[2]!,
-        c.req.header("authorization") ?? null,
-      );
-      maximum = 512 * 1024;
-    } else if (reclaim && c.req.method === "POST") {
-      await authenticateReclaimRequest(c, reclaim[1]!);
-      maximum = RECLAIM_LIMITS.max_envelope_bytes;
-    } else if (thinStorage && c.req.method === "POST") {
-      await authenticateThinStorage(c, thinStorage[1]!);
-      maximum = 2 * 1024 * 1024;
-    } else if (thinQualification && c.req.method === "POST") {
-      await authenticateThinQualification(c, thinQualification[1]!);
-      maximum = 512 * 1024;
-    } else if (proof && c.req.method === "POST") {
-      await authenticateNodeProofRequest(c, proof[1]!);
-      maximum = 512 * 1024;
-    } else if (path === "/source-control" && c.req.method === "POST") {
-      await authenticateNodeProofRequest(c);
-      maximum = 1024;
-    } else if (callback && c.req.method === "POST") {
-      await authenticateBootstrapCallback(c, callback[1]!);
-      maximum = 512 * 1024;
-    } else if (inspection && c.req.method === "POST") {
-      await authenticateNodeInstallationInspection(c, inspection[1]!);
-    } else if (privateBootstrap || privateProfile || privateRotation) {
-      await requireScope(c, "admin");
-      maximum = 512 * 1024;
-    }
     if (c.req.raw.body !== null) {
-      const { text, byteLength } = await readJsonBody(c.req.raw, maximum);
+      const { text, byteLength } = await readJsonBody(c.req.raw);
       // A bodyless HTTP request can arrive as a non-null zero-byte stream.
       if (byteLength !== 0) {
         const mediaType = c.req.header("Content-Type")?.split(";")[0]?.trim();
@@ -458,22 +328,10 @@ export function createApp(): ApiApp {
   registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
-  registerNodeOperator(app);
   registerInfrastructureBackups(app);
-  registerComputePool(app);
-  registerNodeThinStorage(app);
-  registerThinQualification(app);
-  registerReclaim(app);
-  registerNodeHostConfiguration(app);
-  registerNodeInstallation(app);
-  registerNodeProof(app);
   registerOperationalHealth(app);
   registerRegionConfiguration(app);
   registerFleetReleases(app);
-  registerFleetImages(app);
-  registerFleetPatches(app);
-  registerFleetRollouts(app);
-  registerFleetRegionAuthority(app);
   registerFleetUpdates(app);
   registerResourceProfiles(app);
   registerRegionArchiveSources(app);

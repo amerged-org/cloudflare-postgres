@@ -58,6 +58,15 @@
         "mermaid": "docs/architecture/mermaider/d1-core.mmd"
       },
       "navLabel": "Data model"
+    },
+    {
+      "id": "pgcf-add-node",
+      "model": ".mermaider/models/add-node.json",
+      "output": {
+        "markdown": "docs/architecture/mermaider/add-node.md",
+        "mermaid": "docs/architecture/mermaider/add-node.mmd"
+      },
+      "navLabel": "Provisioning"
     }
   ],
   "hooks": {

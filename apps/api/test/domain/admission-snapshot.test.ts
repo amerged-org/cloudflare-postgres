@@ -447,19 +447,8 @@ it("missing capability markers keep desired admission fields and cached snapshot
   if (admitted.ok) expect(admitted.target?.route_revision).toBeUndefined();
 });
 
-it("unconfirmed patches and a new unassigned current node cannot activate snapshot wire", async () => {
+it("a new unassigned current node cannot activate snapshot wire", async () => {
   const f = await admissionSnapshotFixture();
-  await env.DB.prepare(
-    "UPDATE fleet_patch_operations SET state='pending' WHERE operation_id=?",
-  )
-    .bind(f.patchId)
-    .run();
-  expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(false);
-  await env.DB.prepare(
-    "UPDATE fleet_patch_operations SET state='confirmed' WHERE operation_id=?",
-  )
-    .bind(f.patchId)
-    .run();
   expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(true);
   await env.DB.prepare(
     `INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at)

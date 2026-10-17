@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { allOf } from "./sql-conjunction.ts";
 import { bytesToHex } from "@pgcf/contracts";
 import {
   FleetRelease,
@@ -17,8 +16,6 @@ import type { ApiContext } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { agentRegion } from "./agent-auth.ts";
-import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
-import { assertThinQualificationReceipt } from "./thin-qualification.ts";
 import { page } from "../platform/pagination.ts";
 import {
   withAdmissionMutation,
@@ -102,12 +99,6 @@ export async function approveFleetRelease(
   const spec = FleetReleaseSpec.parse(raw),
     specJson = canonical(spec),
     hash = await sha256(specJson);
-  // Gate flags are never typed by hand: only a completed qualification run's receipt is accepted.
-  if (spec.thin_storage_qualification)
-    await assertThinQualificationReceipt(
-      c.env.DB,
-      spec.thin_storage_qualification,
-    );
   const read = async () => {
     const current = await release(c.env.DB, id);
     if (current.spec_sha256 !== hash || canonical(current.spec) !== specJson)
@@ -369,41 +360,10 @@ async function nodeReleaseStatus(
           : "converged";
     }
   }
-  if (
-    state === "converged" &&
-    (await db
-      .prepare(
-        `SELECT 1 waiting FROM fleet_patch_operations h WHERE h.node_id=? AND h.node_uid=? AND h.release_id=? AND h.assignment_revision=? AND h.stage='host_ready' AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.finalization_of=h.operation_id AND f.stage='complete' AND f.state='confirmed') LIMIT 1`,
-      )
-      .bind(row.node_id, row.node_uid, row.release_id, row.revision)
-      .first())
-  ) {
-    state = "pending";
-    differences.push("unobserved/regional_runtime_activation");
-  }
-  if (
-    state === "converged" &&
-    desired?.spec.roles[row.role!].host_configuration_required &&
-    !(await db
-      .prepare(
-        `SELECT 1 current FROM node_host_configurations h JOIN regions r ON r.id=h.region_id WHERE h.node_id=? AND h.node_uid=? AND h.release_id=? AND h.material_revision=r.bootstrap_material_revision AND EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.node_id=h.node_id AND f.node_uid=h.node_uid AND f.release_id=h.release_id AND f.assignment_revision=? AND f.material_revision=h.material_revision AND f.stage='complete' AND f.state='confirmed' AND CASE WHEN EXISTS(SELECT 1 FROM node_region_policies x WHERE x.region_id=h.region_id AND x.compute_pool_json IS NOT NULL) THEN EXISTS(SELECT 1 FROM node_compute_pool_policies p JOIN node_compute_pool_observations o ON o.node_id=p.node_id WHERE p.node_id=h.node_id AND o.node_uid=h.node_uid AND o.policy_revision=p.revision AND o.material_revision=h.material_revision AND julianday(o.observed_at)>=julianday('now','-120 seconds')) ELSE json_extract(f.observed_json,'$.host_configuration_sha256')=h.sha256 END)`,
-      )
-      .bind(row.node_id, row.node_uid, row.release_id, row.revision)
-      .first())
-  ) {
-    state = "pending";
-    differences.push("unobserved/current_material_runtime");
-  }
   if (state === "converged") {
     const { thinStorageObservation } = await import("./node-thin-storage.ts"),
       storage = await thinStorageObservation(db, row.node_id);
-    // A receipt binds members that take databases; control/relay without placement stays thick.
-    if (
-      ((desired?.spec.thin_storage_qualification &&
-        row.database_placement_enabled === 1) ||
-        storage.selected) &&
-      !storage.observed
-    ) {
+    if (storage.selected && !storage.observed) {
       state = "pending";
       differences.push("unobserved/current_material_storage");
     }
@@ -597,167 +557,39 @@ export async function observeFleetNodeRelease(
     Date.parse(input.observed_at) > now + 5000
   )
     return conflict("Fleet observation is not fresh");
-  // Only the qualified Native patch completion writes a new deployment receipt.
-  // Ordinary Regional inventory can retain that receipt, never create one.
+  // Deployment provenance is a receipt, never a report.
   if (
     input.facts.talos_provenance !== undefined ||
     input.facts.kubernetes_image_provenance !== undefined
   )
-    return conflict(
-      "Deployment provenance is written by the qualified patch executor",
-    );
+    return conflict("Deployment provenance is not an agent report");
   const before = await nodeRow(c.env.DB, input.node_id);
   if (before.region_id !== region.id || !before.release_id || !before.role)
     return conflict("Fleet observation authority or node identity changed");
   const selected = await release(c.env.DB, before.release_id),
-    role = selected.spec.roles[before.role],
     old = before.facts_json
       ? FleetNodeReleaseObservation.shape.facts.parse(
           JSON.parse(before.facts_json),
         )
-      : null,
-    receipt = old?.talos_provenance,
-    version = (value: string | undefined) => value?.replace(/^v/, "");
-  if (
-    input.facts.components.some((component) =>
-      role.talos_extensions.includes(component.name),
-    )
-  )
-    return conflict(
-      "Loaded OS extension facts are written by the qualified patch executor",
+      : null;
+  const facts = structuredClone(input.facts);
+  for (const actual of facts.components) {
+    const pin = selected.spec.components.find(
+      (component) =>
+        component.name === actual.name && component.kind === "image",
     );
-  const receiptCurrent = !!(
-    receipt &&
-    old &&
-    before.node_uid === input.node_uid &&
-    before.assigned_uid === input.node_uid &&
-    before.observed_uid === input.node_uid &&
-    before.lost_at === null &&
-    before.revision === input.assignment_revision &&
-    before.observed_revision === input.assignment_revision &&
-    before.agent_key_hash === region.agent_key_hash &&
-    before.observed_agent_key_hash === region.agent_key_hash &&
-    receipt.node_uid === input.node_uid &&
-    receipt.boot_id === old.boot_id &&
-    receipt.installer === old.talos_installer &&
-    receipt.installer === role.talos_installer &&
-    old.talos_schematic_sha256 === role.talos_schematic_sha256 &&
-    version(old.talos_version) === version(role.talos_version)
-  );
-  // Missing runtime identity cannot extend the lifetime of the previous proof.
-  // Keep its original timestamp so a later valid report can recover or it becomes stale.
-  if (receiptCurrent && (!input.facts.boot_id || !input.facts.talos_version))
-    return conflict(
-      "Fresh boot identity and Talos version are required for deployment provenance",
-    );
-  const preserve =
-    receiptCurrent &&
-    input.facts.boot_id === old!.boot_id &&
-    version(input.facts.talos_version) === version(old!.talos_version) &&
-    (input.facts.talos_installer === undefined ||
-      input.facts.talos_installer === old!.talos_installer) &&
-    (input.facts.talos_schematic_sha256 === undefined ||
-      input.facts.talos_schematic_sha256 === old!.talos_schematic_sha256);
-  const kubeProof = old?.kubernetes_image_provenance;
-  const preserveKube =
-    preserve &&
-    !!kubeProof &&
-    input.facts.kubernetes_control_plane === kubeProof.control_plane &&
-    version(input.facts.kubelet_version) ===
-      version(kubeProof.kubelet_version) &&
-    version(input.facts.kubelet_version) === version(old?.kubelet_version) &&
-    version(input.facts.kubelet_version) === version(role.kubernetes_version) &&
-    !!role.kubernetes_images &&
-    Object.entries(kubeProof.images).every(
-      ([name, value]) =>
-        value.configuration ===
-          role.kubernetes_images?.[
-            name as keyof typeof role.kubernetes_images
-          ] && value.runtime_sha256 === value.configuration.slice(-64),
-    );
-  // Raw imageIDs may name the immutable OCI parent. Only fresh same-boot reports
-  // may map that parent to the release's unique Linux/AMD64 manifest.
-  const currentFacts = structuredClone(input.facts);
-  const deadline = new AbortController(),
-    timer = preserveKube
-      ? setTimeout(() => deadline.abort(), 20_000)
-      : undefined;
-  const signal = deadline.signal;
-  try {
-    for (const actual of currentFacts.components) {
-      const pin = selected.spec.components.find(
-        (component) =>
-          component.name === actual.name && component.kind === "image",
-      );
-      if (!pin || !actual.runtime_image_sha256) continue;
-      const normalized =
-        actual.runtime_image_sha256 === pin.sha256
-          ? pin.sha256
-          : preserveKube
-            ? await normalizeRuntimeImageManifest(
-                pin.reference,
-                pin.sha256,
-                actual.runtime_image_sha256,
-                { signal },
-              )
-            : undefined;
-      if (normalized) {
-        actual.version ??= pin.version;
-        actual.sha256 ??= normalized;
-      } else if (actual.sha256 === pin.sha256) {
-        // An unproved contradictory runtime cannot retain a claimed target pin.
-        delete actual.sha256;
-        if (actual.version === pin.version) delete actual.version;
-      }
+    if (!pin || !actual.runtime_image_sha256) continue;
+    if (actual.runtime_image_sha256 === pin.sha256) {
+      actual.version ??= pin.version;
+      actual.sha256 ??= pin.sha256;
+    } else if (actual.sha256 === pin.sha256) {
+      // An unproved contradictory runtime cannot retain a claimed target pin.
+      delete actual.sha256;
+      if (actual.version === pin.version) delete actual.version;
     }
-    if (preserveKube) {
-      for (const name of [
-        "apiServer",
-        "controllerManager",
-        "scheduler",
-      ] as const) {
-        const reported = currentFacts.kubernetes_static_images?.[name],
-          expected = role.kubernetes_images?.[name];
-        if (!reported || !expected) continue;
-        const normalized = await normalizeRuntimeImageManifest(
-          expected,
-          expected.slice(-64),
-          reported,
-          { signal },
-        );
-        if (normalized)
-          currentFacts.kubernetes_static_images![name] = normalized;
-      }
-      if (Date.parse(input.observed_at) < Date.now() - 180_000)
-        return conflict("Fleet observation is not fresh");
-    }
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
-  const facts = preserve
-    ? {
-        ...currentFacts,
-        talos_installer: old!.talos_installer,
-        talos_schematic_sha256: old!.talos_schematic_sha256,
-        talos_provenance: receipt,
-        components: [
-          ...currentFacts.components,
-          ...old!.components.filter(
-            (component) =>
-              role.talos_extensions.includes(component.name) &&
-              selected.spec.components.some(
-                (pin) =>
-                  pin.name === component.name &&
-                  pin.version === component.version &&
-                  pin.sha256 === component.sha256,
-              ),
-          ),
-        ],
-        ...(preserveKube ? { kubernetes_image_provenance: kubeProof } : {}),
-      }
-    : currentFacts;
-  // Fence the exact prior observation. A concurrent Native receipt must win over
-  // a partial merge prepared before that receipt was committed.
+  // Fence the exact prior observation, so that a concurrent report cannot be overwritten by an
+  // older one.
   const previous =
     before.facts_json === null
       ? {
@@ -846,89 +678,28 @@ export async function observeFleetNodeRelease(
   return c.json({ accepted: true }, 200);
 }
 
-/**
- * Every gateway of the region verifies route token v3: its assigned release declares v3 and every
- * current assigned member confirmed a patch of that release at its assignment and the region
- * revision. A patch confirms only once every gateway Pod runs the release's pinned image. A new
- * region or node assignment clears it before any patch can start an older gateway.
- */
+/** The region's release declares route token v3 or v4 and every current member is assigned to it. */
 export function routeTokenV3Sql(region: string) {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_route_token_region_alias");
   return `EXISTS(SELECT 1 FROM fleet_region_releases vf JOIN fleet_releases vs ON vs.id=vf.release_id
     WHERE vf.region_id=${region}.id AND json_extract(vs.spec_json,'$.route_token_version') IN(3,4)
     AND EXISTS(SELECT 1 FROM nodes vn JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL)
-    AND NOT EXISTS(SELECT 1 FROM nodes vn JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL
-      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations vp WHERE vp.node_id=vn.id AND vp.node_uid=vn.node_uid AND vp.release_id=vf.release_id
-        AND vp.assignment_revision=va.revision AND vp.region_revision=vf.revision AND vp.stage='complete' AND vp.state='confirmed')))`;
+    AND NOT EXISTS(SELECT 1 FROM nodes vn LEFT JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL
+      AND (va.node_id IS NULL OR va.node_uid<>vn.node_uid OR va.release_id<>vf.release_id)))`;
 }
 
-/**
- * A qualification run or a thin selection needs the region at exactly the release it is made for:
- * the region's release declares the sampling protocol and every assigned member confirmed a patch
- * of that release at its assignment and the region revision.
- */
-export function thinStorageSamplingSql(region: string) {
-  if (!/^[a-z][a-z0-9_]*$/.test(region))
-    throw new Error("invalid_sampling_region_alias");
-  const members =
-      "SELECT count(*) FROM nodes sn,fleet_node_releases sa WHERE sa.node_id=sn.id AND sn.region_id=sf.region_id AND sn.lost_at IS NULL",
-    confirmed = `SELECT count(*) FROM nodes sn,fleet_node_releases sa WHERE ${allOf(
-      "sa.node_id=sn.id",
-      "sn.region_id=sf.region_id",
-      "sn.lost_at IS NULL",
-      "sa.node_uid=sn.node_uid",
-      "sa.release_id=sf.release_id",
-      `EXISTS(SELECT 1 FROM fleet_patch_operations sp WHERE ${allOf(
-        "sp.node_id=sn.id",
-        "sp.node_uid=sn.node_uid",
-        "sp.release_id=sf.release_id",
-        "sp.spec_sha256=ss.spec_sha256",
-        "sp.assignment_revision=sa.revision",
-        "sp.region_revision=sf.revision",
-        "sp.stage='complete'",
-        "sp.state='confirmed'",
-        "sp.error_code IS NULL",
-      )})`,
-    )}`;
-  return `EXISTS(SELECT 1 FROM fleet_region_releases sf,fleet_releases ss WHERE ${allOf(
-    `sf.region_id=${region}.id`,
-    "ss.id=sf.release_id",
-    "ss.thin_sampling_version=1",
-    `(${members})>0`,
-    `(${confirmed})=(${members})`,
-  )})`;
-}
-export async function thinStorageSamplingCapable(
-  db: D1Database,
-  regionId: string,
-) {
-  return Boolean(
-    await db
-      .prepare(
-        `SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")}`,
-      )
-      .bind(regionId)
-      .first(),
-  );
-}
-/** Full snapshot wire fields require every current physical member's exact confirmed release. */
+/** Full snapshot wire fields require every current physical member's exact assigned and observed release. */
 export function admissionSnapshotSql(region: string) {
   if (!/^[a-z][a-z0-9_]*$/.test(region))
     throw new Error("invalid_admission_region_alias");
   return `EXISTS(SELECT 1 FROM fleet_region_releases af JOIN fleet_releases ars ON ars.id=af.release_id
     WHERE af.region_id=${region}.id AND json_extract(ars.spec_json,'$.route_token_version')=4
       AND json_extract(ars.spec_json,'$.runtime_attestation_version')=2 AND json_extract(ars.spec_json,'$.admission_snapshot_version')=1
-      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations pending_patch WHERE pending_patch.region_id=af.region_id
-        AND pending_patch.stage NOT IN('complete','host_ready')
-        AND NOT(pending_patch.stage IN('flux','platform','regional') AND pending_patch.state='halted' AND pending_patch.error_code IS 'operator_hold_superseded'))
       AND EXISTS(SELECT 1 FROM nodes an WHERE an.region_id=af.region_id AND an.lost_at IS NULL)
       AND NOT EXISTS(SELECT 1 FROM nodes an LEFT JOIN fleet_node_releases aa ON aa.node_id=an.id
         WHERE an.region_id=af.region_id AND an.lost_at IS NULL
           AND (aa.node_id IS NULL OR aa.node_uid<>an.node_uid OR aa.release_id<>af.release_id
-            OR NOT EXISTS(SELECT 1 FROM fleet_patch_operations ap WHERE ap.node_id=an.id AND ap.node_uid=an.node_uid
-              AND ap.release_id=af.release_id AND ap.spec_sha256=ars.spec_sha256 AND ap.assignment_revision=aa.revision
-              AND ap.region_revision=af.revision AND ap.stage='complete' AND ap.state='confirmed' AND ap.error_code IS NULL)
             OR EXISTS(SELECT 1 FROM fleet_node_release_observations ao WHERE ao.node_id=an.id AND (ao.node_uid<>an.node_uid OR ao.assignment_revision<>aa.revision OR ao.agent_key_hash<>${region}.agent_key_hash
               OR EXISTS(SELECT 1 FROM json_each(ars.spec_json,'$.components') ac WHERE json_extract(ac.value,'$.name') IN('native-controller','native-gateway') AND NOT EXISTS(SELECT 1 FROM json_each(ao.facts_json,'$.components') oc WHERE json_extract(oc.value,'$.name')=json_extract(ac.value,'$.name') AND json_extract(oc.value,'$.sha256')=json_extract(ac.value,'$.sha256'))))))))`;
 }

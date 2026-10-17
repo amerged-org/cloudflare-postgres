@@ -2,7 +2,7 @@
 // What authenticating an agent request costs D1, and how soon a rotated agent key takes effect.
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
-import { hashApiKey, newAgentKey } from "@pgcf/contracts";
+import { hashApiKey, newAgentKey, newNodeId } from "@pgcf/contracts";
 import { countStatements } from "./d1-statements.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
@@ -11,9 +11,15 @@ afterEach(async () => {
   await cleanupFixtures();
 });
 
-/** The cheapest agent route that authenticates and then finds nothing to lease. */
-const poll = (f: { node: string }, key: string) =>
-  request(`/agent/v1/nodes/${f.node}/compute-pool`, key);
+/** A cheap agent route that authenticates and then finds no such node. */
+const poll = (_f: { node: string }, key: string) =>
+  request("/agent/v1/fleet-observations", key, "POST", {
+    node_id: newNodeId(),
+    node_uid: crypto.randomUUID(),
+    assignment_revision: 1,
+    observed_at: new Date().toISOString(),
+    facts: { components: [] },
+  });
 const regionReads = (sql: string[]) =>
   sql.filter((text) => /FROM regions WHERE id=\?/.test(text)).length;
 /** The bound the design allows: a rotation is visible in every isolate within this. */

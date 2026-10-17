@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, it, vi } from "vitest";
-import { contaboClient } from "../../src/domain/bootstrap-relay.ts";
+import { contaboClient } from "../../src/providers/contabo.ts";
 import type { Env } from "../../src/env.ts";
 
 afterEach(() => vi.restoreAllMocks());

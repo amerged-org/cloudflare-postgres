@@ -7,7 +7,6 @@ import {
   assertBackupRun,
   configureInfrastructureBackups,
   initializeInfrastructureBackup,
-  prepareInfrastructureBackupInput,
   readInfrastructureBackupConfig,
   runInfrastructureBackupCron,
 } from "../../src/domain/infrastructure-backups.ts";
@@ -74,7 +73,7 @@ async function hash(value: unknown) {
   );
 }
 
-it("preserves pending and running capture authority, expiry and accepted input when only alert email changes", async () => {
+it("preserves pending and running capture authority, expiry and artifacts when only alert email changes", async () => {
   const f = await configured(),
     pending = await run(f.config.revision),
     recipient = {
@@ -92,12 +91,9 @@ it("preserves pending and running capture authority, expiry and accepted input w
   expect(
     await initializeInfrastructureBackup(f.binding, pending.id),
   ).toHaveLength(1);
-  const before = await prepareInfrastructureBackupInput(
-      f.binding,
-      pending.id,
-      "https://archive.invalid/control.sql",
+  const beforeHash = await hash(
+      (await assertBackupRun(f.binding, pending.id)).artifacts,
     ),
-    beforeHash = await hash(before),
     second = await configureInfrastructureBackups(f.binding, {
       ...recipient,
       notification_sender: "alerts@example.invalid",
@@ -110,16 +106,7 @@ it("preserves pending and running capture authority, expiry and accepted input w
     config_revision: second.revision,
     expires_at: pending.expires,
   });
-  // Compare a digest so an assertion failure never prints encryption material or a capture input.
-  expect(
-    await hash(
-      await prepareInfrastructureBackupInput(
-        f.binding,
-        pending.id,
-        "https://archive.invalid/control.sql",
-      ),
-    ),
-  ).toBe(beforeHash);
+  expect(await hash(active.artifacts)).toBe(beforeHash);
 });
 
 it("revokes changed export/archive authority and never resurrects it with a later email-only update", async () => {

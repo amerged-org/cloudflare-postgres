@@ -690,14 +690,6 @@ describe("API platform on real Workers D1", () => {
     )
       .bind(node, region.id, `node-${crypto.randomUUID()}`, now, now)
       .run();
-    await env.DB.prepare(
-      "UPDATE nodes SET warm_reclaim_qualification_json=? WHERE id=?",
-    )
-      .bind(
-        JSON.stringify({ version: 1, private_observation: "internal-proof" }),
-        node,
-      )
-      .run();
     const stored = await env.DB.prepare("SELECT * FROM nodes WHERE id=?")
       .bind(node)
       .first<Record<string, unknown>>();
@@ -716,7 +708,6 @@ describe("API platform on real Workers D1", () => {
     ).data;
     expect(observed).toHaveLength(1);
     expect(listing.status).toBe(200);
-    expect(observed[0]).not.toHaveProperty("warm_reclaim_qualification_json");
     expect(observed[0]).toMatchObject({
       id: node,
       ready: true,

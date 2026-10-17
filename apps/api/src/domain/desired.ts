@@ -121,14 +121,13 @@ async function desiredPage(
       : region,
     admissionSnapshotCapable(env.DB, regionId),
     env.DB.prepare(
-      "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json FROM node_region_policies WHERE region_id=?",
+      "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib FROM node_region_policies WHERE region_id=?",
     )
       .bind(regionId)
       .first<{
         placement_mode: string;
         maximum_database_memory_mib: number | null;
         postgres_memory_request_mib: number | null;
-        compute_pool_json: string | null;
       }>(),
     desiredRegionStorageNodes(env, regionId),
     readDesiredFleetRelease(env.DB, regionId),
@@ -329,9 +328,6 @@ async function desiredPage(
     ...(fleetRelease ? { fleet_release: fleetRelease } : {}),
     region: {
       id: regionRow.id,
-      ...(policy?.compute_pool_json
-        ? { compute_pool: JSON.parse(policy.compute_pool_json) }
-        : {}),
       ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
       ...(recoverySources === undefined
         ? {}
