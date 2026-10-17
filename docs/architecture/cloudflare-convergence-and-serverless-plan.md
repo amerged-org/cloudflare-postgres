@@ -1358,7 +1358,7 @@ Each stage lists its goal, steps, acceptance and scope. AGENTS.md line 21 forbid
 2. **The old work** is on `archive/kubernetes-runtime` (`6761e7f0`). Done.
 3. **Documents.**
    - Done with this plan's commit: this plan replaces `docs/architecture/cloudflare-convergence-and-serverless-plan.md` at the same path; PLAN.md keeps its link and gets a new focus line; AGENTS.md line 7 states the decided runtime; the proposal page `runtime-without-kubernetes.md` is deleted (this plan carries its content).
-   - After the owner has read this plan, AGENTS.md is amended further (line numbers as on `4bfbe546`):
+   - Done in Stage 2: after the owner had read this plan, AGENTS.md was amended further (line numbers as on `4bfbe546`):
      - line 4: the Cloudflare control plane is Workers, D1, Durable Objects, Workflows, R2, Secrets, Tunnel and Access (Containers removed);
      - line 5: "Only PostgreSQL data lives on VPS; nodes execute Cloudflare's desired state and report observations; a node decides only wake admission, early sleep and recovery starts, from local facts under rules Cloudflare sets, and reports each decision.";
      - lines 14 and 17: "Dev" becomes "the EU1 stack";
@@ -1366,8 +1366,8 @@ Each stage lists its goal, steps, acceptance and scope. AGENTS.md line 21 forbid
      - line 24: "Approved runtime: native Rust for the node agent, the gateway and the archive clients; Rust/Wasm for the Edge Worker (open decision D12).";
      - line 27: replaced by a pointer to this plan and to the `infra/node-image` and `apps/node-agent` READMEs;
      - line 31: add node keys, Tunnel and enrollment tokens, and R2 keys.
-   - Delete `docs/architecture/rust-runtime-and-cold-starts.md`, `wake-path-v2-and-scale.md` and `region-controller.md`, and `docs/operations/fleet-patches.md`. They live on the archive branch.
-   - Run the pinned mermaider `update`, then `check`.
+   - Done in Stage 2: delete `docs/architecture/rust-runtime-and-cold-starts.md`, `wake-path-v2-and-scale.md` and `region-controller.md`, and `docs/operations/fleet-patches.md`. They live on the archive branch.
+   - Done in Stage 2: run the pinned mermaider `update`, then `check`.
 4. **Credentials.** The control server and EU1 held copies, so treat them as compromised until rotated:
    - create a new R2 parent key for local signing, and store it as a Worker secret;
    - revoke the old bucket-wide R2 keys once no live consumer remains;
@@ -1472,6 +1472,17 @@ Each stage lists its goal, steps, acceptance and scope. AGENTS.md line 21 forbid
 4. Update THIRD_PARTY.md: remove the Talos, Kubernetes, CNPG, OpenEBS, Cilium, Flux, cert-manager, containerd and Helm notices.
 5. Run the pinned mermaider `update`, then `check`.
 6. Deploy the API with the remaining product core and migration 0061 (idle time).
+
+**Agreed deviations (2026-10-17):**
+1. `apps/native-gateway` keeps `targets.rs` and `kubernetes.rs` until the gateway local mode replaces them (Stage 3, lane B); the gateway builds as it is.
+2. The reusable parts of `apps/native-controller` (6.4) moved into the library crate `apps/node-agent`, with their unit tests and no binary yet; the rest of the controller is deleted.
+3. The region rename (D5) waits.
+4. Migration `0062` drops the tables and columns of 6.6 and deletes no rows; the test and US rows stay for a later migration.
+
+**Done with the deletion:**
+- The daily D1 backup runs inside the API Worker's `InfrastructureBackup` Workflow: it reads the signed export twice, streams it through AES-256-GCM into R2 multipart parts and reads the whole object back (needs `nodejs_compat`). The etcd artifact and the thin-start deferral are gone.
+- Route token v3 and admission snapshots require every current member of the region to be assigned to the region's release; fleet patches no longer exist.
+- The contract generators emit only what the Rust crates read. The measurement checkpoint cases recorded from the TypeScript agent are a node-agent test fixture.
 
 **Acceptance:**
 - One CI run on main passes every job.
@@ -1608,14 +1619,15 @@ From the canary on, the EU1 stack is production.
 | Research for this plan (2026-10-17) | Open source (nothing adoptable), OS image (Debian 13), overbooking model, backups (barman-cloud kept), supervision lab, code inventory (about 202k lines deletable) |
 | Supervision lab (laptop, Debian trixie, systemd 257, PostgreSQL 18.6) | Hardened unit start to READY 54.0 / 60.7 ms (p50/p95). First SaaS answer 60.4 / 66.9 ms with a warm cache, 98.5 / 110.3 ms cold. Stop 29.8 / 42.6 ms. 20-database storm ready in 353–375 ms. Kernel memory per mounted volume 0.13–0.55 MiB |
 | Baselines from the Kubernetes runtime (reference only) | PostgreSQL 18.6 on EU1 ready in 111–117 ms. ext4 mount on thin 68–120 ms. Release 24 cold first answer p95 1,080 ms, whole request p95 1.50 s. Old standard create to ready 30.7 s |
+| Stage 2 steps 1–5 on branch `stage2/clean-main` (2026-10-17) | 268,884 non-lockfile lines deleted and 6,699 added against main `85a2e6e3` (269,952 and 6,717 with the lockfiles). Locally green: lint, format, typecheck, the four contract generator checks, cargo fmt, clippy and tests, the Worker build, every workspace test (API 776, contracts 213, Edge 103, Rust Edge 20), the node-agent kernel test and Mermaider |
 
 ### 11.2 Open
 
 | Stage | Status | Next step |
 | --- | --- | --- |
-| 0 Wind down | In progress: the owner is stopping the control server | Documents and AGENTS.md with this plan; credential rotation |
+| 0 Wind down | In progress: documents and AGENTS.md done; the owner is stopping the control server | Credential rotation, test leftovers, worktrees (steps 4–6) |
 | 1 Lab on EU1 | Open | Reinstall EU1 with stock Debian 13, hardened |
-| 2 Clean main | Open | Move the generator sources into contracts |
+| 2 Clean main | In progress: steps 1–5 done on `stage2/clean-main`. Kubernetes-shaped names stay in the release spec, node observations, runtime attestation, the CNPG route target, the gateway and parts of the node agent until Stage 3 replaces them | Merge to main and one green CI run; then deploy the API with migration `0062` once the private Worker configuration has the same binding changes (step 6) |
 | 3 Build | Open | Lanes A–E |
 | 4 Install EU1 | Open (needs Stage 3) | |
 | 5 Acceptance | Open (needs Stage 4) | |
