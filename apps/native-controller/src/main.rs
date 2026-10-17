@@ -541,10 +541,13 @@ fn startup_retracted(previous: &Value, current: &Value) -> bool {
     })
 }
 /// Before the first writer token, only CF can renew this generation's startup hold.
-/// Fast node headroom is not permission to extend its cached expiry locally.
-fn startup_refresh_due(db: &Value, renewals: &Renewals, clock: i128) -> bool {
+/// Fast node headroom is not permission to extend its cached expiry locally. A database a pool
+/// slot serves gets no writer token and is never protected for its hold (rule 6.7): its hold is
+/// not refreshed.
+fn startup_refresh_due(db: &Value, renewals: &Renewals, clock: i128, served: bool) -> bool {
     let hold = &db["storage_startup"];
-    if db["storage"].is_null()
+    if served
+        || db["storage"].is_null()
         || text(db, "desired_state") != "running"
         || hold["generation"] != db["generation"]
         || hold["node_uid"] != db["storage"]["node_uid"]
@@ -1546,7 +1549,7 @@ async fn run() -> Result<(), Error> {
         for (id, cell) in &cells {
             if !targeted_pulls.contains(id)
                 && startup_reads.get(id).is_none_or(|after| *after <= read_at)
-                && startup_refresh_due(&cell.db, &renewals, clock_ms())
+                && startup_refresh_due(&cell.db, &renewals, clock_ms(), cell.served)
             {
                 pull_ids.insert(id.clone());
                 // Failed reads still stop at the original expiry; retries are bounded.
@@ -1781,9 +1784,9 @@ mod tests {
     #[test]
     fn tokenless_startup_refreshes_before_expiry_and_shortened_grants_revoke() {
         let db = json!({"id":"db","generation":2,"desired_state":"running","storage":{"node_uid":"same","guard_seconds":10},"storage_startup":{"operation_id":operation(2),"generation":2,"node_uid":"same","budget_bytes":5368709120_u64,"expires_at":"1970-01-01T00:00:10.000Z"}});
-        assert!(!startup_refresh_due(&db, &Renewals::default(), 4000));
-        assert!(startup_refresh_due(&db, &Renewals::default(), 5000));
-        assert!(startup_refresh_due(&db, &Renewals::default(), 10000));
+        assert!(!startup_refresh_due(&db, &Renewals::default(), 4000, false));
+        assert!(startup_refresh_due(&db, &Renewals::default(), 5000, false));
+        assert!(startup_refresh_due(&db, &Renewals::default(), 10000, false));
         let mut newer = db.clone();
         newer["storage_startup"]["expires_at"] = "1970-01-01T00:00:20.000Z".into();
         assert!(!startup_retracted(&db, &newer));
@@ -1793,6 +1796,16 @@ mod tests {
         assert!(startup_retracted(&db, &newer));
         newer["storage_startup"] = Value::Null;
         assert!(startup_retracted(&db, &newer));
+    }
+    #[test]
+    fn a_slot_served_database_never_pulls_its_start_hold_again() {
+        // A pool hit's claim leaves a start hold, and write tokens are the database's own Pod's,
+        // not the slot's (rule 6.7). Refreshing the hold pulled the row every second for as long
+        // as the database was served and Cloudflare had not taken a ready report.
+        let db = json!({"id":"db","generation":2,"desired_state":"running","storage":{"node_uid":"same","guard_seconds":10},"storage_startup":{"operation_id":operation(2),"generation":2,"node_uid":"same","budget_bytes":5368709120_u64,"expires_at":"1970-01-01T00:00:10.000Z"}});
+        for clock in [5000, 10000, 60000] {
+            assert!(!startup_refresh_due(&db, &Renewals::default(), clock, true));
+        }
     }
     #[tokio::test]
     async fn latest_cell_expiry_or_revocation_still_preempts_and_schedules_protection() {
