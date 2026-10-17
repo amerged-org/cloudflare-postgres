@@ -3,9 +3,9 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import {
   type DesiredResponse,
+  LinkDesiredHint,
   archiveDestinationPath,
   newDatabaseId,
-  newNodeId,
   newOperationId,
   newRolePassword,
 } from "@pgcf/contracts";
@@ -69,8 +69,8 @@ it("sends real DO hints after hibernation and replaces the previous agent socket
   expect(JSON.parse(await next)).toEqual({ type: "desired", ids: [id] });
   second.close(1000);
 });
-/** A valid desired page of one database; `samples` sampled nodes make it as large as needed. */
-function page(region: string, id: string, samples = 0): DesiredResponse {
+/** A valid desired page of one database; `sources` recovery sources make it as large as needed. */
+function page(region: string, id: string, sources = 0): DesiredResponse {
   return {
     region: {
       id: region,
@@ -79,15 +79,19 @@ function page(region: string, id: string, samples = 0): DesiredResponse {
         endpoint_url: `https://${["archive", "invalid"].join(".")}`,
         region: "auto",
       },
-      ...(samples
+      ...(sources
         ? {
-            storage_samples: Array.from({ length: samples }, () => ({
-              node_id: newNodeId(),
-              name: "node-sampled",
-              node_uid: crypto.randomUUID(),
-              period_milliseconds: 2000,
-              qualification_run: null,
-            })),
+            recovery_sources: Object.fromEntries(
+              Array.from({ length: sources }, (_, n) => [
+                `source-${n}`,
+                {
+                  bucket: "pgcf-backups",
+                  endpoint_url: `https://${["archive", "invalid"].join(".")}`,
+                  access_key_id: "k".repeat(4096),
+                  secret_access_key: "s".repeat(4096),
+                },
+              ]),
+            ),
           }
         : {}),
     },
@@ -156,8 +160,13 @@ it("carries a wake's page only when it is valid for its one database and fits th
     type: "desired",
     ids: [id, other],
   });
-  const large = page(region, id, 600);
+  const large = page(region, id, 8);
   expect(JSON.stringify(large).length).toBeGreaterThan(64 * 1024);
+  // Dropped because it is too large, not because it is invalid.
+  expect(
+    LinkDesiredHint.safeParse({ type: "desired", ids: [id], desired: large })
+      .success,
+  ).toBe(true);
   expect(await received(large)).toEqual({ type: "desired", ids: [id] });
   socket.close(1000);
 });
