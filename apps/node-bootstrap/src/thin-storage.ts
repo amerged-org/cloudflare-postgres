@@ -1706,7 +1706,6 @@ export async function runThinStorage(
       const accounted = new Set<string>();
       // Each instance Pod of an active thin volume: its io.max is read with the closing LVM report.
       const writers: {
-        db: (typeof lease.databases)[number];
         lv: ObjectValue;
         podUid: string;
         io: NodeThinStorageAuthority["volumes"][number]["io"];
@@ -1850,7 +1849,7 @@ export async function runThinStorage(
         for (const pod of db.storage && text(lv.lv_attr)[4] === "a"
           ? thinWriterPods(pods)
           : [])
-          writers.push({ db, lv, podUid: uid(metadata(pod).uid), io });
+          writers.push({ lv, podUid: uid(metadata(pod).uid), io });
         accounted.add(lvmUid(lv.lv_uuid));
         volumes.push(volume);
       }
@@ -1866,37 +1865,23 @@ export async function runThinStorage(
       const closing = await node.closingRead(
         writers.map((writer) => writer.podUid),
       );
-      for (const { db, lv, podUid, io } of writers) {
+      // A writer's io.max is reported when it is read. A Pod outside the driver's limits (a pool slot)
+      // has none; Cloudflare compares a reading with the database's profile, never the turn.
+      for (const { lv, podUid, io } of writers) {
         const frame = closing.limits.get(podUid)!;
-        let limits: ReturnType<typeof thinIoLimit>;
+        if (frame.exit_code !== 0) continue;
         try {
-          if (frame.exit_code !== 0)
-            throw new BootstrapError("thin_storage_command_failed");
-          limits = thinIoLimit(
-            frame.stdout,
-            bytes(lv.lv_kernel_major),
-            bytes(lv.lv_kernel_minor),
-          );
-        } catch (error) {
-          // An unstarted cgroup is bounded by its current full logical startup hold.
-          // Established writers have no such substitute for an actual IO readback.
-          if (
-            db.startup &&
-            db.startup.generation === db.generation &&
-            db.startup.node_uid === lease.node_uid &&
-            db.startup.budget_bytes >= bytes(lv.lv_size) &&
-            Date.parse(db.startup.expires_at) > Date.now()
-          )
-            continue;
-          throw error;
+          io.push({
+            pod_uid: podUid,
+            ...thinIoLimit(
+              frame.stdout,
+              bytes(lv.lv_kernel_major),
+              bytes(lv.lv_kernel_minor),
+            ),
+          });
+        } catch {
+          continue;
         }
-        if (
-          !db.storage ||
-          limits.write_bytes_per_second > db.storage.write_bytes_per_second ||
-          limits.write_iops_per_second > db.storage.write_iops_per_second
-        )
-          throw new BootstrapError("thin_storage_io_limit_unqualified");
-        io.push({ pod_uid: podUid, ...limits });
       }
       const final = closing.lvm;
       if (

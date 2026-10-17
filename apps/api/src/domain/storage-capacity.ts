@@ -196,8 +196,8 @@ export function thinPoolRoomSql(
 /** The node part of the room rule over its thin storage `t` and its latest sample `o`: what the
  * desired page serves as storage_nodes[].write_allowed for the databases the node holds. */
 export function thinPoolNodeRoomSql(): string {
-  // Room is space in the pool: an audit turn's error (for example a pool slot writing without
-  // io.max) is alerted, never a reason to refuse every start on the node.
+  // Room is space in the pool: an audit turn's error is alerted, never a reason to refuse every
+  // start on the node.
   return allOf(
     "json_extract(t.authority_json,'$.pool_uuid') IS NOT NULL",
     `${sampled("volume_group_uuid")}=t.volume_group_uuid`,

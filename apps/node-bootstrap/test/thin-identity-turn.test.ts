@@ -213,14 +213,14 @@ test("a logical volume created during the turn is an inventory that changed, not
   );
 });
 
-test("an established writer without a readable io.max blocks the proof, a held start does not", async () => {
+test("a writer without a readable io.max is reported without a reading, never a failed turn", async () => {
   const world = identityWorld();
-  // Only the writer's Pods lose their cgroups; the held start never had one.
+  // A Pod outside the driver's io limits (a pool slot) must not end every proof of the node.
   world.cgroups.clear();
-  await assert.rejects(
-    identityTurn(world),
-    failedWith("thin_storage_io_limit_missing"),
-  );
+  const { report } = await identityTurn(world);
+  assert.ok(report.authority.volumes.length > 0);
+  for (const volume of report.authority.volumes)
+    assert.deepEqual(volume.io, []);
 });
 
 test("a driver tool that exits non-zero is a failed command after its repeats", async () => {
