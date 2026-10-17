@@ -5,11 +5,9 @@
 # writes the node's network settings and enrollment seed, reports every checkpoint over HTTPS
 # and reboots into the image. It never opens a port and never prints a token.
 #
-# PENDING STAGE 1 (plan 10, Stage 1 block 3; plan 9.2): whether the rescue system's cloud-init
-# runs write_files and runcmd, which tools it carries (bash, curl, xz, sgdisk, GNU dd, blkid,
-# lsblk), how its network is configured, how the disk appears and whether a reboot leaves rescue
-# mode are not yet recorded. Every one of these is asserted below, so a wrong assumption fails
-# loudly at the first checkpoint instead of writing the disk.
+# The rescue system (Stage 1, plan 11.1) is Debian 12 on BIOS firmware with a static network; it
+# has zstd but no xz. Every tool and hardware fact is asserted before the disk is touched, so a
+# wrong assumption fails loudly at a checkpoint instead of writing the disk.
 set -Eeuo pipefail
 umask 077
 
@@ -18,7 +16,7 @@ work=/run/pgcf-install
 ram=$work/ram
 target=$work/target
 
-names=" PGCF_IMAGE_URL PGCF_IMAGE_XZ_SHA256 PGCF_IMAGE_XZ_BYTES PGCF_IMAGE_RAW_SHA256 PGCF_IMAGE_RAW_BYTES PGCF_DISK_BYTES PGCF_MEMORY_MIN_KIB PGCF_MAC PGCF_IPV4 PGCF_IPV4_PREFIX PGCF_IPV4_GATEWAY PGCF_IPV6 PGCF_IPV6_PREFIX PGCF_IPV6_GATEWAY PGCF_DNS PGCF_HOSTNAME PGCF_PROGRESS_URL PGCF_PROGRESS_TOKEN PGCF_NODE_ID PGCF_REGION PGCF_API_URL PGCF_ENROLLMENT_TOKEN "
+names=" PGCF_IMAGE_URL PGCF_IMAGE_ZST_SHA256 PGCF_IMAGE_ZST_BYTES PGCF_IMAGE_RAW_SHA256 PGCF_IMAGE_RAW_BYTES PGCF_DISK_BYTES PGCF_MEMORY_MIN_KIB PGCF_MAC PGCF_IPV4 PGCF_IPV4_PREFIX PGCF_IPV4_GATEWAY PGCF_IPV6 PGCF_IPV6_PREFIX PGCF_IPV6_GATEWAY PGCF_DNS PGCF_HOSTNAME PGCF_PROGRESS_URL PGCF_PROGRESS_TOKEN PGCF_NODE_ID PGCF_REGION PGCF_API_URL PGCF_ENROLLMENT_TOKEN "
 for name in $names; do unset "$name"; done
 # KEY=value lines only; nothing in the file is ever executed.
 while IFS= read -r line || [ -n "$line" ]; do
@@ -53,8 +51,8 @@ ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 token='^[A-Za-z0-9._~-]+$'
 https='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/?&=+-]*)?$'
 need PGCF_IMAGE_URL "$https"
-need PGCF_IMAGE_XZ_SHA256 "$hex64"
-need PGCF_IMAGE_XZ_BYTES "$count"
+need PGCF_IMAGE_ZST_SHA256 "$hex64"
+need PGCF_IMAGE_ZST_BYTES "$count"
 need PGCF_IMAGE_RAW_SHA256 "$hex64"
 need PGCF_IMAGE_RAW_BYTES "$count"
 need PGCF_DISK_BYTES "$count"
@@ -103,9 +101,17 @@ failed() {
 trap failed ERR
 
 step=tools
-for tool in awk blkid blockdev curl dd ip lsblk mount mountpoint sgdisk sha256sum stat umount xz; do
+for tool in awk blkid blockdev curl dd ip lsblk mount mountpoint passwd sgdisk sha256sum stat udevadm umount zstd; do
 	command -v "$tool" >/dev/null
 done
+
+# Contabo's merged rescue configuration sets a root password and turns SSH password login on;
+# cloud-config.yaml turns password login off, and the password is locked here.
+step=lockdown
+passwd --lock root >/dev/null
+# The API refuses the progress token once `rebooting` or `failed` arrived, so a second run (for
+# example after a reboot back into rescue) stops here, before the disk.
+step=started
 report started
 
 step=hardware
@@ -128,25 +134,28 @@ report hardware_ok
 
 step=download
 mkdir -p "$ram"
-mountpoint -q "$ram" || mount -t tmpfs -o "mode=0700,size=$((${PGCF_IMAGE_XZ_BYTES} + ${PGCF_IMAGE_RAW_BYTES} + 67108864))" tmpfs "$ram"
+mountpoint -q "$ram" || mount -t tmpfs -o "mode=0700,size=$((${PGCF_IMAGE_ZST_BYTES} + ${PGCF_IMAGE_RAW_BYTES} + 67108864))" tmpfs "$ram"
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-	--retry 3 --connect-timeout 30 --max-time 1800 --output "$ram/image.raw.xz" "${PGCF_IMAGE_URL}"
-[ "$(stat -c %s "$ram/image.raw.xz")" = "${PGCF_IMAGE_XZ_BYTES}" ]
-[ "$(sha256sum <"$ram/image.raw.xz" | awk '{ print $1 }')" = "${PGCF_IMAGE_XZ_SHA256}" ]
-xz --decompress --stdout "$ram/image.raw.xz" >"$ram/image.raw"
-rm -f "$ram/image.raw.xz"
+	--retry 3 --connect-timeout 30 --max-time 1800 --output "$ram/image.raw.zst" "${PGCF_IMAGE_URL}"
+[ "$(stat -c %s "$ram/image.raw.zst")" = "${PGCF_IMAGE_ZST_BYTES}" ]
+[ "$(sha256sum <"$ram/image.raw.zst" | awk '{ print $1 }')" = "${PGCF_IMAGE_ZST_SHA256}" ]
+zstd --quiet --decompress --stdout "$ram/image.raw.zst" >"$ram/image.raw"
+rm -f "$ram/image.raw.zst"
 [ "$(stat -c %s "$ram/image.raw")" = "${PGCF_IMAGE_RAW_BYTES}" ]
 [ "$(sha256sum <"$ram/image.raw" | awk '{ print $1 }')" = "${PGCF_IMAGE_RAW_SHA256}" ]
 report image_verified
 
 # Nothing touches the disk before here.
 step=write
-for part in $(lsblk --noheadings --paths --list --output NAME "$disk"); do
-	if grep -q "^$part " /proc/mounts; then
-		echo "$part is in use" >&2
-		false
-	fi
-done
+# A reinstalled node's disk carries the agent's volume group, which the rescue system may have
+# activated. Nothing may sit on the disk or be mounted from it while it is written.
+if command -v vgchange >/dev/null; then vgchange --activate n >/dev/null; fi
+in_use=$(lsblk --noheadings --paths --list --output NAME,TYPE,MOUNTPOINT "$disk" |
+	awk '($2 != "disk" && $2 != "part") || $3 != "" { print $1 }')
+if [ -n "$in_use" ]; then
+	echo "in use: $in_use" >&2
+	false
+fi
 dd if="$ram/image.raw" of="$disk" bs=4M oflag=direct conv=fsync status=none
 blockdev --flushbufs "$disk"
 written=$(dd if="$disk" iflag=direct,count_bytes bs=4M count="${PGCF_IMAGE_RAW_BYTES}" status=none | sha256sum | awk '{ print $1 }')
@@ -155,7 +164,10 @@ rm -f "$ram/image.raw"
 # The image ends at its own size; move the backup GPT to the end of the real disk.
 sgdisk --move-second-header "$disk" >/dev/null
 sgdisk --verify "$disk" >/dev/null
+# udev probes the disk after every write; re-read the partition table once it has finished.
+udevadm settle
 blockdev --rereadpt "$disk"
+udevadm settle
 report disk_written
 
 step=configure

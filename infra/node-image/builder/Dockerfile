@@ -40,7 +40,7 @@ RUN set -eu; \
     apt-get install --yes --no-install-recommends \
       apt-utils ca-certificates cpio curl dosfstools e2fsprogs git \
       grub-common $grub kmod mtools python3 \
-      systemd systemd-repart xz-utils zstd; \
+      systemd systemd-repart zstd; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     git init --quiet /opt/mkosi; \

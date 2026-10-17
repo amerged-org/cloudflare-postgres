@@ -24,8 +24,8 @@ Everything that goes into the image is pinned in [packages.lock.json](packages.l
 `SOURCE_DATE_EPOCH` is the snapshot time, and [mkosi.conf](mkosi.conf) fixes the repart seed
 (partition and filesystem identifiers) and the root filesystem's directory hash seed. The snakeoil
 key and certificate that `ssl-cert` generates at install time are removed with their random hash
-link. Two independent builds of the same lock and definition produce byte-identical raw and xz
-images.
+link. Two independent builds of the same lock and definition produce byte-identical raw images, and
+zstd writes the same compressed bytes for any number of threads.
 
 ## Building
 
@@ -44,8 +44,9 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
 - **build** downloads every locked `.deb` (size and sha256 checked, three attempts each), serves
   them as the only repository (mkosi `LocalMirror=`) and builds offline. The build fails if the
   installed set differs from the lock in any package or version. It writes `pgcf-node.raw`,
-  `pgcf-node.raw.xz`, `SHA256SUMS` and `pgcf-node.json` (release name, snapshot, lock sha256, raw
-  and compressed size and sha256) to `<work>/out`. `--binaries` is the directory holding
+  `pgcf-node.raw.zst`, `SHA256SUMS` and `pgcf-node.json` (release name, snapshot, lock sha256, raw
+  and compressed size and sha256) to `<work>/out`. The image is compressed with zstd because the
+  Contabo rescue system that installs it has no `xz` (Stage 1). `--binaries` is the directory holding
   `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive` and `pgcf-wal-fetch`; they land in
   `/var/lib/pgcf/bin/<release>/` with `current` linking to it.
 - The work directory defaults to `.local/node-image`. With Docker in a VM (Colima, Docker Desktop)
@@ -112,13 +113,16 @@ package from creating a default cluster.
   Never `pg_ctl`: it polls every 100 ms and hangs under `Type=notify`. PGDG builds `--with-systemd`,
   so the postmaster sends `READY=1` when it accepts connections. `listen_addresses` is empty and the
   socket directory is `/run/pgcf/<id>` on the command line, so no configuration file can change
-  either.
+  either. `TimeoutStartSec=infinity`: `READY=1` follows crash recovery or a restore's replay, which
+  outlasts systemd's default 90 s (Stage 1 replayed a restore for 97 s), so the agent owns the start
+  deadline.
 - **User:** `pgcf-<id>`, a fixed uid from the agent's node-local range in `/etc/passwd`. Never
   `DynamicUser`, which recycles uids.
 - **Socket directory:** `/run/pgcf/<id>`, owner `pgcf-<id>`, group `pgcf-gateway`, mode 0750, so
-  only the database and the gateway reach the socket. A privileged `ExecStartPre` creates it (it is
-  not a `RuntimeDirectory=`, because systemd resets such a directory's group to the unit's own
-  before every start). It stays after a stop; the agent removes it with the database.
+  only the database and the gateway reach the socket. The agent creates it before the first start
+  after boot and removes it with the database; a start without it fails. It is not a
+  `RuntimeDirectory=`, because systemd resets such a directory's group to the unit's own before
+  every start, and no `ExecStartPre` creates it, because that would add a process to every wake.
 - **Mount check:** `AssertPathIsMountPoint=/var/lib/pgcf/db/<id>`: a start on an unmounted volume
   fails (`Condition…` would "succeed" with the unit inactive). `After=` the mount unit only orders
   the stop before the unmount at shutdown; nothing ties the database's life to the mount.
@@ -126,8 +130,9 @@ package from creating a default cluster.
   `Restart=no`: every start goes through the agent's admission.
 - **Limits:** `MemorySwapMax=0`, `TasksMax=64` and, until the agent applies the database's size, the
   smallest class (`MemoryMax=256M`, `MemoryHigh=230M`). The agent sets `MemoryMax`, `MemoryHigh` (90 %),
-  `CPUWeight`, `CPUQuota` (after ready), `IOWriteBandwidthMax`, `IOWriteIOPSMax` and `TasksMax` as
-  persistent unit properties (`SetUnitProperties`), never by `daemon-reload`.
+  `CPUWeight`, `IOWriteBandwidthMax`, `IOWriteIOPSMax` and `TasksMax` as persistent unit properties
+  (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready and cleared
+  (`CPUQuota=infinity`) at stop: a unit property outlives the stop and would throttle the next start.
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`,
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
@@ -171,7 +176,9 @@ restart never stops a database, because the databases are independent units.
   100%FREE pgcf`, then `lvchange --errorwhenfull y pgcf/pgcf_thinpool`. On a 33 GiB partition this
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
 - Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
-  the data directory `data` inside.
+  the data directory `data` inside. Before a database's first start after boot the agent creates
+  `/run/pgcf/<id>` (owner `pgcf-<id>`, group `pgcf-gateway`, mode 0750); it clears the database's
+  `CPUQuota` whenever the database stops.
 - Its sockets are `/run/pgcf/agent/gateway.sock` (gateway only) and `/run/pgcf/agent/archive.sock`
   (databases, identified by uid); the archive clients are reached as
   `/usr/libexec/pgcf/pgcf-archive` and `/usr/libexec/pgcf/pgcf-wal-fetch`.
@@ -203,17 +210,41 @@ restart never stops a database, because the databases are independent units.
 [installer/](installer) holds the pull installer (plan 9.2): `cloud-config.yaml`, which carries
 `install.sh` and its parameters as base64, and [userdata.ts](installer/userdata.ts), which renders
 it, validates every parameter and refuses anything at or above Contabo's 32 KiB userData limit. The
-script checks the hardware (memory, MAC, IPv4 address and gateway, exactly one disk of the expected
-size), downloads the image into RAM, verifies the compressed and raw sha256 and sizes before
-touching the disk, writes the disk, reads it back, moves the backup GPT, writes the network
-settings, hostname, `resolv.conf` and the enrollment seed, reports each checkpoint (`started`,
-`hardware_ok`, `image_verified`, `disk_written`, `configured`, `rebooting`, or `failed` with the
-step) to the progress URL with the progress token from a header file, and reboots.
+script checks its tools, locks the rescue system's root password, checks the hardware (memory, MAC,
+IPv4 address and gateway, exactly one disk of the expected size), downloads the zstd image into
+RAM, verifies the compressed and raw sha256 and sizes before touching the disk, writes the disk,
+reads it back, moves the backup GPT, writes the network settings, hostname, `resolv.conf` and the
+enrollment seed, reports each checkpoint (`started`, `hardware_ok`, `image_verified`,
+`disk_written`, `configured`, `rebooting`, or `failed` with the step) to the progress URL with the
+progress token from a header file, and reboots.
 
-**Pending Stage 1:** whether Contabo's rescue cloud-init runs `write_files` and `runcmd`, which
-tools the rescue system carries (`install.sh` checks for each before doing anything), how its
-network and disk appear, and whether a reboot leaves rescue mode. If rescue does not run the
-script, plan 9.2 names the fallbacks.
+The installer is built on what Stage 1 recorded about Contabo's rescue system (plan 11.1):
+
+- Its cloud-init (22.4.2, Debian 12) runs `write_files` and `runcmd`. Contabo merges its own
+  configuration into the userData: its `runcmd` entries run first, and it sets a root password and
+  turns SSH password login on. `cloud-config.yaml` writes an sshd drop-in that turns password login
+  off; cloud-init writes it before sshd starts, and sshd reads it before Contabo's setting.
+  `install.sh` locks the root password before it reports `started`.
+- It has `sgdisk`, `curl`, GNU `dd`, `zstd` and `sha256sum`, but no `xz`, so the image is
+  compressed with zstd. The test in [userdata.test.ts](installer/userdata.test.ts) keeps the
+  script's tool list within what the rescue system carries.
+- Firmware is BIOS and the network is static: the parameters carry the IPv4 address, prefix and
+  gateway, and optionally IPv6 (EU1: a /23 with a gateway, and a /64 through `fe80::1`).
+- The disk's size in bytes equals the provider's figure (EU1: 300 GiB, 322,122,547,200 bytes), so
+  `PGCF_DISK_BYTES` is Contabo's `diskMb` times 1 MiB.
+
+A reinstalled node's disk still carries the agent's volume group. The installer deactivates it when
+the rescue system has LVM, and refuses to write while anything else sits on the disk or is mounted
+from it. At the first boot `systemd-repart` wipes the signatures of the new LVM partition, so the
+old volume group does not come back; the new pool's zeroing keeps old blocks from reaching a
+database.
+
+The API side (lane D) renders the userData and serves the progress route (`POST` of
+`{"checkpoint", "detail"}` with the Bearer token). It refuses the token once `rebooting` or `failed`
+has arrived, so a second run in rescue, for example after a reboot that leads back into rescue,
+stops at `started` before it touches the disk. Stage 1 left rescue through the API's
+`actions/restart`; whether the script's own reboot leaves rescue is recorded at the first install
+(Stage 4). If enrollment does not follow `rebooting`, AddNode restarts the instance through the API.
 
 ## Boot test
 
@@ -226,5 +257,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume |
+| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE and has no start timeout; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume |
 | Second | no failed unit; loopback only; inbound policy drop; the binaries; the pool; `pgcf-agent check` wakes the same scratch database |

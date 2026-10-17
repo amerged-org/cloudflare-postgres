@@ -123,6 +123,12 @@ database_unit_sandbox() {
 	systemd-analyze security --no-pager pgcf-pg@pgcfboottest0000000.service | tail -n 1 | grep -q 'SAFE'
 }
 
+# PostgreSQL reports ready only after crash recovery or a restore's replay, which Stage 1 measured
+# above systemd's default 90 s start timeout; the agent owns the deadline.
+database_unit_waits_for_recovery() {
+	[ "$(systemctl show --property=TimeoutStartUSec --value pgcf-pg@pgcfboottest0000000.service)" = infinity ]
+}
+
 check no_failed_units no_failed_units
 check loopback_only loopback_only
 check inbound_dropped inbound_dropped
@@ -131,6 +137,7 @@ if [ "$phase" = 1 ]; then
 	check root_grown root_grown
 	check lvm_partition lvm_partition
 	check database_unit_sandbox database_unit_sandbox
+	check database_unit_waits_for_recovery database_unit_waits_for_recovery
 fi
 check pool wait_for 120 pool
 check scratch_database scratch_database

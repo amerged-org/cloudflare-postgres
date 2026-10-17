@@ -2,7 +2,9 @@
 # One PostgreSQL per database; the instance is the database ID. The agent is the only starter:
 # nothing enables this unit, and systemd never restarts it on its own (every start goes through
 # the agent's admission). The agent sets the per-database limits (MemoryMax, MemoryHigh, CPUWeight,
-# CPUQuota after ready, IO limits, TasksMax) as persistent unit properties, never by reloading.
+# IO limits, TasksMax) as persistent unit properties, never by reloading; CPUQuota only after
+# ready, cleared again at stop. It creates the socket directory /run/pgcf/<id> (owner pgcf-<id>,
+# group pgcf-gateway, mode 0750) before the first start after boot and removes it with the database.
 [Unit]
 Description=PGCF database %i
 Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
@@ -19,11 +21,9 @@ Group=pgcf-%i
 Slice=pgcf.slice
 # postgres itself, never pg_ctl: the postmaster sends READY=1 when it accepts connections.
 ExecStart=/usr/lib/postgresql/18/bin/postgres -D /var/lib/pgcf/db/%i/data -c listen_addresses= -c unix_socket_directories=/run/pgcf/%i
-# The socket directory belongs to the database user and the gateway's group, mode 0750, so only
-# the database and the gateway reach the socket. Not a RuntimeDirectory=: systemd would reset its
-# group to the database's own before every start. It stays after a stop (empty after a clean one);
-# the agent removes it with the database.
-ExecStartPre=+/usr/bin/install -d -m 0750 -o pgcf-%i -g pgcf-gateway /run/pgcf/%i
+# READY=1 comes only after crash recovery or a restore's replay, which can outlast any fixed
+# timeout (Stage 1 replayed for 97 s); the agent owns the start deadline.
+TimeoutStartSec=infinity
 KillMode=mixed
 KillSignal=SIGINT
 TimeoutStopSec=30
@@ -45,8 +45,8 @@ PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 ProtectSystem=strict
-# "-": the socket directory does not exist yet while ExecStartPre= sets up its namespace.
-ReadWritePaths=/var/lib/pgcf/db/%i -/run/pgcf/%i
+# The socket directory must exist: a start without it fails instead of running unreachable.
+ReadWritePaths=/var/lib/pgcf/db/%i /run/pgcf/%i
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

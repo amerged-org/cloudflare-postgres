@@ -4,8 +4,8 @@
 
 export interface InstallerParameters {
   imageUrl: string;
-  imageXzSha256: string;
-  imageXzBytes: number;
+  imageZstSha256: string;
+  imageZstBytes: number;
   imageRawSha256: string;
   imageRawBytes: number;
   diskBytes: number;
@@ -52,8 +52,8 @@ export function installerParameters(p: InstallerParameters): string {
   }
   const values: [string, string][] = [
     ["PGCF_IMAGE_URL", match(p.imageUrl, https, "imageUrl")],
-    ["PGCF_IMAGE_XZ_SHA256", match(p.imageXzSha256, hex64, "imageXzSha256")],
-    ["PGCF_IMAGE_XZ_BYTES", count(p.imageXzBytes, "imageXzBytes")],
+    ["PGCF_IMAGE_ZST_SHA256", match(p.imageZstSha256, hex64, "imageZstSha256")],
+    ["PGCF_IMAGE_ZST_BYTES", count(p.imageZstBytes, "imageZstBytes")],
     ["PGCF_IMAGE_RAW_SHA256", match(p.imageRawSha256, hex64, "imageRawSha256")],
     ["PGCF_IMAGE_RAW_BYTES", count(p.imageRawBytes, "imageRawBytes")],
     ["PGCF_DISK_BYTES", count(p.diskBytes, "diskBytes")],

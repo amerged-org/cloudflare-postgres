@@ -1199,7 +1199,7 @@ A reinstall issues a new token, and a lost node's key is revoked.
    - `pgcf-agent check` creates a scratch database on a thin volume and queries it;
    - after the VM reboots, the scratch database wakes again;
    - nothing listens except on loopback.
-5. Compress with xz (the rescue system has xz; zstd is not certain), write the sha256 sums, upload to a private R2 prefix `node-images/<version>/`, and register the release in the API.
+5. Compress with zstd (Stage 1: the Contabo rescue system has zstd and gzip but no `xz` binary), write the sha256 sums, upload to a private R2 prefix `node-images/<version>/`, and register the release in the API.
 
 v1 has no nightly reproducibility build, no A/B slots and no image signing. Integrity comes from sha256 values delivered over authenticated channels: the installer's userData and the agent's link. More is added only after an update has actually broken a node.
 
@@ -1224,7 +1224,7 @@ Stopping the control server removes the old installer's transport: the bootstrap
 4. First boot: partitioning, volume group and pool, enrollment, Tunnel, first samples.
 5. Cloudflare checks the inventory and opens placement.
 
-This needs no inbound port, no relay, no SSH key and no operator firewall sources. Stage 1 first checks whether rescue cloud-init runs `runcmd`.
+This needs no inbound port, no relay, no SSH key and no operator firewall sources. Stage 1 confirmed that rescue cloud-init runs `write_files` and `runcmd`. Contabo merges its own cloud-config, which turns SSH password login on, so the installer turns it off.
 
 **Fallbacks**, if it does not:
 - open rescue SSH, key-only with a pinned host key, for a short window (weaker);

@@ -10,11 +10,17 @@ import { installerParameters, renderUserData, userDataLimit, type InstallerParam
 const template = readFileSync(new URL("cloud-config.yaml", import.meta.url), "utf8");
 const script = readFileSync(new URL("install.sh", import.meta.url), "utf8");
 
+// Stage 1 (plan 11.1): the Contabo rescue system is Debian 12. It carries sgdisk, curl, dd, zstd,
+// sha256sum and lsblk (probed) and the Debian base tools below, but no xz.
+const rescueTools = new Set(
+  "awk blkid blockdev curl dd ip lsblk mount mountpoint passwd sgdisk sha256sum stat udevadm umount zstd".split(" "),
+);
+
 // The longest values the API can pass: presigned URLs and tokens at their limits.
 const longest: InstallerParameters = {
-  imageUrl: `https://example.r2.cloudflarestorage.com/node-images/${"a".repeat(40)}/pgcf-node.raw.xz?${"X-Amz-Signature=0123456789abcdef&".repeat(30)}x=1`,
-  imageXzSha256: "1".repeat(64),
-  imageXzBytes: 400 * 1024 ** 2,
+  imageUrl: `https://example.r2.cloudflarestorage.com/node-images/${"a".repeat(40)}/pgcf-node.raw.zst?${"X-Amz-Signature=0123456789abcdef&".repeat(30)}x=1`,
+  imageZstSha256: "1".repeat(64),
+  imageZstBytes: 400 * 1024 ** 2,
   imageRawSha256: "2".repeat(64),
   imageRawBytes: 2 * 1024 ** 3,
   diskBytes: 150 * 1000 ** 3,
@@ -34,9 +40,14 @@ const longest: InstallerParameters = {
   enrollmentToken: "e".repeat(512),
 };
 
+function fileEntry(userData: string, path: string): string {
+  const entry = userData.split("  - path: ").find((part) => part.startsWith(`${path}\n`));
+  assert.ok(entry, `${path} is in the userData`);
+  return entry;
+}
+
 function decodedFile(userData: string, path: string): string {
-  const block = userData.split("  - path: ").find((part) => part.startsWith(path));
-  const encoded = /content: (\S+)/.exec(block ?? "")?.[1];
+  const encoded = /content: (\S+)/.exec(fileEntry(userData, path))?.[1];
   assert.ok(encoded, `${path} is in the userData`);
   return Buffer.from(encoded, "base64").toString("utf8");
 }
@@ -70,6 +81,19 @@ test("install.sh accepts exactly what the renderer produces", () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("install.sh needs only tools the Contabo rescue system carries", () => {
+  const tools = /^for tool in ([a-z0-9 ]+); do$/m.exec(script)?.[1]?.split(" ");
+  assert.ok(tools, "install.sh checks its tools before it starts");
+  assert.deepEqual(tools.filter((tool) => !rescueTools.has(tool)), [], "tools the rescue system lacks");
+});
+
+test("the installer turns off the password login that Contabo's rescue configuration turns on", () => {
+  const dropIn = fileEntry(renderUserData(template, script, longest), "/etc/ssh/sshd_config.d/00-pgcf-install.conf");
+  assert.match(dropIn, /^ +PasswordAuthentication no$/m);
+  assert.match(dropIn, /^ +KbdInteractiveAuthentication no$/m);
+  assert.match(script, /^passwd --lock root\b/m, "install.sh locks the root password Contabo sets");
 });
 
 test("values that could break out of a KEY=value line or a file are refused", () => {

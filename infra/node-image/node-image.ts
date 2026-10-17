@@ -204,23 +204,25 @@ async function buildImage(work: string, binaries: string | undefined, release: s
   const problems = compareInstalled(lock, installed);
   if (problems.length > 0) throw new Error(`image differs from the lock:\n${problems.join("\n")}`);
 
+  // zstd, because the Contabo rescue system that installs the image has no xz (Stage 1). Its
+  // output does not depend on the number of threads, so every builder writes the same bytes.
   const raw = join(out, "pgcf-node.raw");
-  const xz = `${raw}.xz`;
+  const zst = `${raw}.zst`;
   run("docker", [
-    "run", "--rm", "--entrypoint", "xz",
-    "--volume", `${out}:/out`, tag, "--threads=0", "-6", "--keep", "--force", "/out/pgcf-node.raw",
+    "run", "--rm", "--entrypoint", "zstd",
+    "--volume", `${out}:/out`, tag, "--quiet", "-19", "-T0", "--keep", "--force", "/out/pgcf-node.raw",
   ]);
   const summary = {
     release,
     debian_snapshot: lock.debian.snapshot,
     lock_sha256: await sha256File(lockPath),
     raw: { sha256: await sha256File(raw), size: (await stat(raw)).size },
-    xz: { sha256: await sha256File(xz), size: (await stat(xz)).size },
+    zst: { sha256: await sha256File(zst), size: (await stat(zst)).size },
   };
   await writeFile(join(out, "pgcf-node.json"), `${JSON.stringify(summary, null, 2)}\n`);
   await writeFile(
     join(out, "SHA256SUMS"),
-    `${summary.raw.sha256}  pgcf-node.raw\n${summary.xz.sha256}  pgcf-node.raw.xz\n`,
+    `${summary.raw.sha256}  pgcf-node.raw\n${summary.zst.sha256}  pgcf-node.raw.zst\n`,
   );
   console.log(JSON.stringify(summary));
 }
