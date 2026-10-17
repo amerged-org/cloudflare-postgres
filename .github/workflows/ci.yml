@@ -224,3 +224,71 @@ jobs:
       - name: Remove private acceptance files
         if: always()
         run: rm -f "$RUNNER_TEMP/pgcf-e6-native.json"
+
+  node-image:
+    if: github.event_name != 'workflow_dispatch' || !inputs.external_probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      PGCF_QEMU_VERSION: 1:8.2.2+ds-0ubuntu1.18
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Choose the image work directory
+        run: printf 'PGCF_NODE_IMAGE_WORK=%s\n' "$RUNNER_TEMP/pgcf-node-image" >> "$GITHUB_ENV"
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check and test the image tooling and the installer
+        run: |
+          pnpm exec tsc -p infra/node-image/tsconfig.json
+          bash -n infra/node-image/builder/build.sh infra/node-image/installer/install.sh infra/node-image/boot-test/guest.sh
+          node --test infra/node-image/*.test.ts infra/node-image/installer/*.test.ts
+      - name: Build the node binaries with the pinned Rust toolchain
+        run: |
+          PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          rustup toolchain install "$PGCF_RUST_VERSION" --profile minimal
+          cargo build --release --locked \
+            --bin pgcf-agent --bin pgcf-native-gateway --bin pgcf-archive --bin pgcf-wal-fetch
+          mkdir -p "$PGCF_NODE_IMAGE_WORK/binaries"
+          for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do
+            install -m 0755 "target/release/$binary" "$PGCF_NODE_IMAGE_WORK/binaries/"
+          done
+      - name: Download the locked packages and build the image
+        run: |
+          node infra/node-image/node-image.ts build --work "$PGCF_NODE_IMAGE_WORK" \
+            --binaries "$PGCF_NODE_IMAGE_WORK/binaries" --release "sha-${GITHUB_SHA::12}"
+      - name: Boot the image in QEMU and assert the boot test
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends "qemu-system-x86=$PGCF_QEMU_VERSION"
+          sudo chmod 0666 /dev/kvm
+          node infra/node-image/boot-test.ts --image "$PGCF_NODE_IMAGE_WORK/out/pgcf-node.raw" --accel kvm
+      - name: Show the image release
+        run: cat "$PGCF_NODE_IMAGE_WORK/out/pgcf-node.json" "$PGCF_NODE_IMAGE_WORK/out/SHA256SUMS"
+      - name: Keep the boot logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pgcf-node-image-boot-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pgcf-node-image/out/boot-test/console.log
+            ${{ runner.temp }}/pgcf-node-image/out/boot-test/results.log
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove the image work files
+        if: always()
+        run: sudo rm -rf "$PGCF_NODE_IMAGE_WORK"

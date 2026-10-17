@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# All database units. The CPU, memory, IO and task controllers stay enabled here, so a database
+# start or stop never toggles a controller in system.slice. The agent replaces the memory ceiling
+# with the operator's awake-database budget (persistent unit property); 80 % is the fail-safe
+# default until it does.
+[Unit]
+Description=PGCF databases
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+Before=slices.target
+
+[Slice]
+CPUWeight=100
+IOWeight=100
+MemoryAccounting=yes
+TasksAccounting=yes
+MemoryMax=80%
+MemorySwapMax=0

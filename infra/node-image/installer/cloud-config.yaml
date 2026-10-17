@@ -1,0 +1,16 @@
+#cloud-config
+# SPDX-License-Identifier: Apache-2.0
+# PGCF pull installer, passed as userData to Contabo's rescue action (plan 9.2) and rendered by
+# userdata.ts: the two placeholders become base64 of install.sh and of the KEY=value parameters.
+# PENDING STAGE 1: that rescue cloud-init runs write_files and runcmd is not yet confirmed.
+write_files:
+  - path: /run/pgcf-install/install.sh
+    permissions: "0700"
+    encoding: b64
+    content: @@INSTALL_SH@@
+  - path: /run/pgcf-install/params
+    permissions: "0600"
+    encoding: b64
+    content: @@PARAMS@@
+runcmd:
+  - [/bin/bash, /run/pgcf-install/install.sh, /run/pgcf-install/params]

@@ -1,0 +1,47 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Runs inside the image after package installation.
+set -euo pipefail
+: "${PGCF_DEBIAN_SNAPSHOT:?}" "${PGCF_PGDG_URL:?}" "${PGCF_PGDG_SUITE:?}"
+
+# GRUB loads ext2 and the rest of its modules from its prefix on the ESP (/efi/grub), next to
+# grub.cfg and the environment block that holds a one-shot next_entry.
+for target in i386-pc x86_64-efi; do
+	mkdir -p "/efi/grub/$target"
+	cp /usr/lib/grub/"$target"/*.mod /usr/lib/grub/"$target"/*.lst "/efi/grub/$target/"
+done
+grub-editenv /efi/grub/grubenv create
+
+# ssl-cert generates a snakeoil key and certificate at install time: a secret, and a random
+# certificate hash link in /etc/ssl/certs that would make every build differ. Nothing uses them.
+rm -f /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem
+find /etc/ssl/certs -xtype l -delete
+
+# Debian's kernel packages maintain these links; GRUB boots through them.
+for link in /vmlinuz /vmlinuz.old /initrd.img /initrd.img.old; do
+	test -e "$link" || { echo "missing $link" >&2; exit 1; }
+done
+
+# apt on the node resolves exactly this image's package set: the same snapshot and PGDG archive.
+install -m 0644 "$SRCDIR/keys/pgdg.asc" /usr/share/keyrings/pgdg.asc
+cat >/etc/apt/sources.list.d/trixie.sources <<SOURCES
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian/$PGCF_DEBIAN_SNAPSHOT
+Suites: trixie trixie-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian-security/$PGCF_DEBIAN_SNAPSHOT
+Suites: trixie-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+
+Types: deb
+URIs: $PGCF_PGDG_URL
+Suites: $PGCF_PGDG_SUITE
+Components: main
+Signed-By: /usr/share/keyrings/pgdg.asc
+SOURCES

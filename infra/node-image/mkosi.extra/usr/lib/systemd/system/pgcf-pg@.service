@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+# One PostgreSQL per database; the instance is the database ID. The agent is the only starter:
+# nothing enables this unit, and systemd never restarts it on its own (every start goes through
+# the agent's admission). The agent sets the per-database limits (MemoryMax, MemoryHigh, CPUWeight,
+# CPUQuota after ready, IO limits, TasksMax) as persistent unit properties, never by reloading.
+[Unit]
+Description=PGCF database %i
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+# A start on an unmounted volume must fail, not silently skip.
+AssertPathIsMountPoint=/var/lib/pgcf/db/%i
+# Stop before the volume is unmounted at shutdown, without tying the database's life to the mount.
+After=var-lib-pgcf-db-%i.mount
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=pgcf-%i
+Group=pgcf-%i
+Slice=pgcf.slice
+# postgres itself, never pg_ctl: the postmaster sends READY=1 when it accepts connections.
+ExecStart=/usr/lib/postgresql/18/bin/postgres -D /var/lib/pgcf/db/%i/data -c listen_addresses= -c unix_socket_directories=/run/pgcf/%i
+# The socket directory belongs to the database user and the gateway's group, mode 0750, so only
+# the database and the gateway reach the socket. Not a RuntimeDirectory=: systemd would reset its
+# group to the database's own before every start. It stays after a stop (empty after a clean one);
+# the agent removes it with the database.
+ExecStartPre=+/usr/bin/install -d -m 0750 -o pgcf-%i -g pgcf-gateway /run/pgcf/%i
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=no
+OOMPolicy=continue
+OOMScoreAdjust=-900
+Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+Environment=PG_OOM_ADJUST_VALUE=0
+UMask=0077
+
+# Smallest class until the agent applies the database's own size.
+MemoryMax=256M
+MemoryHigh=230M
+MemorySwapMax=0
+TasksMax=64
+CPUWeight=100
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+# "-": the socket directory does not exist yet while ExecStartPre= sets up its namespace.
+ReadWritePaths=/var/lib/pgcf/db/%i -/run/pgcf/%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+TemporaryFileSystem=/dev/shm:size=64M,mode=1777
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=yes

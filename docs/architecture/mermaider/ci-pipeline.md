@@ -11,11 +11,13 @@ github.event_name == 'workflow_dispatch' && inputs.external_probe && github.ref 
 flowchart LR
     n_d92200072b60["external_probe<br/>if: github.event_name ==<br/>'workflow_dispatch' #38;#38;<br/>inputs.external_probe #38;#38; github.ref<br/>== 'refs/heads/…"]
     n_58381b3e9536["check<br/>if: github.event_name !=<br/>'workflow_dispatch' ||<br/>!inputs.external_probe"]
+    n_20a964d54b2b["node-image<br/>if: github.event_name !=<br/>'workflow_dispatch' ||<br/>!inputs.external_probe"]
 ```
 
 ## Sources
 
 - [.github/workflows/ci.yml:24](../../../.github/workflows/ci.yml#L24)
 - [.github/workflows/ci.yml:184](../../../.github/workflows/ci.yml#L184)
+- [.github/workflows/ci.yml:229](../../../.github/workflows/ci.yml#L229)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

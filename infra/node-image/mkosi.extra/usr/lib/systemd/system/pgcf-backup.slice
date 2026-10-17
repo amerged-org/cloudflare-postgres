@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# barman-cloud jobs, each a transient unit the agent starts as the database's own user.
+[Unit]
+Description=PGCF backup jobs
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+Before=slices.target
+
+[Slice]
+CPUWeight=20
+IOWeight=20
+MemoryAccounting=yes
+TasksAccounting=yes
+MemoryMax=512M
+MemorySwapMax=0
