@@ -88,6 +88,26 @@ impl SleepRecord {
             && manifests::pinned_image(&self.image)
             && self.written_at_ms <= 9_007_199_254_740_991
     }
+    /// The record of a sleep whose proof found PostgreSQL running on `system`, under the
+    /// configuration and image of `db`. The attach of the next wake reads the volume's
+    /// `pg_control` itself: a data directory that did not shut down cleanly is never served.
+    pub(crate) fn proved(
+        db: &Value,
+        image: &str,
+        system: &crate::power::SystemIdentity,
+        via: Via,
+        now_ms: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            v: 1,
+            system_identifier: system.identifier.clone(),
+            timeline: u32::try_from(system.timeline).ok()?,
+            configuration_sha256: sleep_fingerprint(db, image).ok()?,
+            image: db["postgres"]["image"].as_str().unwrap_or(image).into(),
+            written_at_ms: now_ms,
+            via,
+        })
+    }
     pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("sleep record serializes")
     }
@@ -753,6 +773,8 @@ struct State {
     deliveries: HashMap<String, Vec<(GatewayPod, String, u64)>>,
     /// When each node may create a slot again.
     retry: HashMap<String, Instant>,
+    /// When the retirement of each slot that waits to see PostgreSQL shut down began to wait.
+    stopping: HashMap<String, Instant>,
 }
 /// What a decision found to claim.
 struct Plan {
@@ -847,6 +869,9 @@ pub struct Pool {
     pub(crate) postgres: Option<SocketAddr>,
     /// How long PostgreSQL of a claimed slot may take to accept.
     pub(crate) start_budget: Duration,
+    /// How long a retirement waits to see PostgreSQL of a fenced slot shut down on the tenant
+    /// data before it goes on as with the data directory's state unknown.
+    pub(crate) stop_budget: Duration,
 }
 impl Pool {
     pub fn new(k8s: Kubernetes, image: String) -> Result<Self, Error> {
@@ -857,6 +882,7 @@ impl Pool {
             state: Mutex::default(),
             postgres: None,
             start_budget: Duration::from_secs(3),
+            stop_budget: Duration::from_secs(30),
         })
     }
     /// Whether a slot serves database `id`.
@@ -1675,8 +1701,13 @@ impl Pool {
         {
             held.state = SlotState::Discarding;
         }
-        let namespace = self.k8s.read("Namespace", None, &ns).await?;
-        if namespace.is_some() {
+        // A namespace that is being deleted was fenced and recorded before its delete, below.
+        if let Some(namespace) = self
+            .k8s
+            .read("Namespace", None, &ns)
+            .await?
+            .filter(|n| n["metadata"]["deletionTimestamp"].is_null())
+        {
             if let Some(cluster) = self.k8s.read("Cluster", Some(&ns), "database").await?
                 && !crate::power::fenced(&cluster)
             {
@@ -1688,21 +1719,23 @@ impl Pool {
                     .await?;
             }
             if let Some(db) = record {
-                let Some(control) = self.shut_down(rec, &slot.node, volume, pod).await? else {
+                let Some(control) = self.shut_down(rec, id, slot, volume, pod).await? else {
                     return Ok(false);
                 };
                 self.record(id, db, control.as_ref()).await?;
             }
-            if let Some(namespace) =
-                namespace.filter(|n| n["metadata"]["deletionTimestamp"].is_null())
-            {
-                self.k8s.delete(&namespace, "Background").await?;
-            }
+            self.k8s.delete(&namespace, "Background").await?;
         }
         self.k8s.index_slot(&ns, None);
         // The holder goes once the kernel reports the device closed: the slot's Pod is gone.
         // Without a Ready agent on the node (a restart or a rollout of it) it is not yet.
         let Some(agent) = rec.power.attach.agent(&slot.node).await? else {
+            crate::timing::emit(crate::timing::slot_retire_waiting_event(
+                id,
+                &slot.hex,
+                "holder_release",
+                "agent_unavailable",
+            ));
             return Ok(false);
         };
         {
@@ -1730,10 +1763,25 @@ impl Pool {
             {
                 Ok(_) => {}
                 Err(CallError::Refused(code)) if code == "holder_mismatch" => {}
-                Err(_) => return Ok(false),
+                Err(error) => {
+                    crate::timing::emit(crate::timing::slot_retire_waiting_event(
+                        id,
+                        &slot.hex,
+                        "holder_release",
+                        match &error {
+                            CallError::Refused(code) => code,
+                            CallError::Unavailable => "agent_unavailable",
+                        },
+                    ));
+                    return Ok(false);
+                }
             }
         }
-        let removed = self.state.lock().unwrap().slots.remove(&slot.hex);
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            state.stopping.remove(&slot.hex);
+            state.slots.remove(&slot.hex)
+        };
         if removed.is_some() {
             crate::timing::emit(crate::timing::pool_slot_event(
                 &slot.hex,
@@ -1746,12 +1794,14 @@ impl Pool {
         Ok(true)
     }
     /// Polls the slot's `postgres` container until PostgreSQL is seen shut down on the tenant
-    /// data: `Some(Some(control))`; `Some(None)` when the container is gone and the state of the
-    /// data directory is unknown; `None` when it is not known yet.
+    /// data: `Some(Some(control))`; `Some(None)` when the container is gone, or PostgreSQL was
+    /// not seen shut down within the stop budget since the retirement began to wait, and the
+    /// state of the data directory is unknown; `None` when it is not known yet.
     async fn shut_down(
         &self,
         rec: &Reconciler,
-        node: &str,
+        id: &str,
+        slot: &Slot,
         volume: &Volume,
         pod: &SlotPod,
     ) -> Result<Option<Option<Control>>, Error> {
@@ -1759,47 +1809,79 @@ impl Pool {
         if pod.postgres.is_empty() {
             return Ok(Some(None));
         }
-        let Some(agent) = rec.power.attach.agent(node).await? else {
-            return Ok(None);
-        };
-        let keys = rec.power.attach_keys().await?;
+        let began = *self
+            .state
+            .lock()
+            .unwrap()
+            .stopping
+            .entry(slot.hex.clone())
+            .or_insert_with(Instant::now);
+        let given_up = began + self.stop_budget;
+        let deadline = given_up.min(Instant::now() + Duration::from_secs(5));
         let request = InspectRequest {
             volume: volume.clone(),
             postgres_container: Some(pod.postgres.clone()),
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match rec
-                .power
-                .attach
-                .call::<_, InspectResponse>(
-                    &keys,
-                    &agent,
-                    Action::Inspect,
-                    &volume.lv_uuid,
-                    &request,
-                    Duration::from_secs(1),
-                    now_ms(),
-                )
-                .await
-            {
-                Ok(seen) => {
-                    if let Some(control) = seen.control.filter(|control| {
-                        control.shut_down() && seen.postmaster_running == Some(false)
-                    }) {
-                        return Ok(Some(Some(control)));
+        // What the agent said last, for the log: never anything of the data.
+        let mut seen = String::from("agent_unavailable");
+        if let Some(agent) = rec.power.attach.agent(&slot.node).await? {
+            let keys = rec.power.attach_keys().await?;
+            loop {
+                match rec
+                    .power
+                    .attach
+                    .call::<_, InspectResponse>(
+                        &keys,
+                        &agent,
+                        Action::Inspect,
+                        &volume.lv_uuid,
+                        &request,
+                        Duration::from_secs(1),
+                        now_ms(),
+                    )
+                    .await
+                {
+                    Ok(answer) => {
+                        if let Some(control) = answer.control.as_ref().filter(|control| {
+                            control.shut_down() && answer.postmaster_running == Some(false)
+                        }) {
+                            return Ok(Some(Some(control.clone())));
+                        }
+                        seen = format!(
+                            "control_state={} postmaster_running={}",
+                            answer
+                                .control
+                                .as_ref()
+                                .map_or("unread".into(), |control| control.state.to_string()),
+                            answer
+                                .postmaster_running
+                                .map_or("unknown".into(), |running| running.to_string())
+                        );
                     }
+                    Err(CallError::Refused(code)) if code == "container_missing" => {
+                        return Ok(Some(None));
+                    }
+                    Err(CallError::Refused(code)) => seen = code,
+                    Err(CallError::Unavailable) => seen = "agent_unavailable".into(),
                 }
-                Err(CallError::Refused(code)) if code == "container_missing" => {
-                    return Ok(Some(None));
+                if Instant::now() >= deadline {
+                    break;
                 }
-                Err(_) => {}
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let unseen = Instant::now() >= given_up;
+        crate::timing::emit(crate::timing::slot_retire_waiting_event(
+            id,
+            &slot.hex,
+            if unseen {
+                "postgres_stop_unseen"
+            } else {
+                "postgres_stop"
+            },
+            &seen,
+        ));
+        Ok(unseen.then_some(None))
     }
     /// The sleep record a retired slot leaves: from `control` when it is the data directory the
     /// record names, under the configuration of `db` (or the record's own); otherwise none, so
@@ -2093,7 +2175,10 @@ impl Pool {
         }))
     }
     /// The sleep of a database a slot serves (rule 6.4): the existing sleep proof on the slot,
-    /// then the slot's retirement, then the hibernated record.
+    /// the sleep record of the data directory the proof found, then the slot's retirement, then
+    /// the hibernated record. The retirement does not wait to see PostgreSQL shut down in the
+    /// slot: the proof named the data directory, and the attach of the next wake reads its
+    /// `pg_control` from the volume itself.
     pub async fn sleep(
         &self,
         rec: &Reconciler,
@@ -2116,10 +2201,27 @@ impl Pool {
             if observed.is_some() {
                 return Ok(observed);
             }
-            if rec.power.sleep_phase(db).await != Some("hibernating") {
+            // Hibernated already: a controller that restarted after it wrote that finds the slot
+            // still to be retired.
+            let Some((phase @ ("hibernating" | "hibernated"), system)) =
+                rec.power.sleep_phase(db).await
+            else {
                 return Ok(None);
+            };
+            let record = system.as_ref().and_then(|system| {
+                SleepRecord::proved(db, &self.image, system, Via::Slot, now_ms())
+            });
+            if phase == "hibernating"
+                && let Some(record) = &record
+            {
+                write_sleep_record(&self.k8s, id, Some(record)).await?;
             }
-            self.unwind_later(id, "sleep");
+            if let Some(held) = self.state.lock().unwrap().serving.get_mut(id) {
+                held.retire.get_or_insert(Retire {
+                    reason: "sleep",
+                    inspect: record.is_none(),
+                });
+            }
         }
         if !self.unwind(rec, id, Some(db)).await? {
             return Ok(None);
@@ -2336,8 +2438,8 @@ impl Pool {
         nodes
     }
     /// The slot and serving facts a controller that starts finds (rule 6.1): free and created
-    /// slots, slots that serve a database whose release is in its fence, and claims that never
-    /// were released, which are retired; so is a slot without a claim whose Pod holds a volume (an
+    /// slots, slots that serve a database whose release is in its fence or whose sleep began
+    /// there after it, and claims that never were released, which are retired; so is a slot without a claim whose Pod holds a volume (an
     /// attach the claim never followed). Holders of slot Pods that no longer exist are released.
     /// Answers the databases whose slots are to be retired.
     pub async fn rediscover(&self, rec: &Reconciler) -> Result<Vec<String>, Error> {
@@ -2506,17 +2608,25 @@ impl Pool {
                 .as_ref()
                 .and_then(|fence| fence["data"]["admission_target"].as_str())
                 .and_then(|raw| serde_json::from_str(raw).ok());
-            let released = fence.as_ref().is_some_and(|fence| {
-                crate::power::fence_intent(fence, &id).as_ref() == Some(&intent)
-            }) && current.as_ref().is_some_and(|current| {
-                target
-                    .as_ref()
-                    .is_some_and(|target| target["pod_uid"] == current.uid.as_str())
-            });
+            // A sleep of the database that began after the claim, while the gateways route to
+            // the slot: the slot is still the database's, and its sleep goes on there.
+            let held = fence
+                .as_ref()
+                .and_then(|fence| crate::power::fence_intent(fence, &id));
+            let sleeping = held
+                .as_ref()
+                .is_some_and(|held| held.mode != "running" && held.revision > claim.generation);
+            let released = (held.as_ref() == Some(&intent) || sleeping)
+                && current.as_ref().is_some_and(|current| {
+                    target
+                        .as_ref()
+                        .is_some_and(|target| target["pod_uid"] == current.uid.as_str())
+                });
             let confirmed = released
-                && fence
-                    .as_ref()
-                    .is_some_and(|fence| crate::power::woke_under(fence, &intent, now_ms()));
+                && (sleeping
+                    || fence
+                        .as_ref()
+                        .is_some_and(|fence| crate::power::woke_under(fence, &intent, now_ms())));
             let storage = storages
                 .iter()
                 .find(|storage| storage["metadata"]["name"] == format!("storage-{id}"));

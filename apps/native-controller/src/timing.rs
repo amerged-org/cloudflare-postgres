@@ -201,6 +201,12 @@ pub fn ready_withheld_event(db: &Value, reason: &str, detail: Option<&str>) -> V
 pub(crate) fn ready_withheld(db: &Value, reason: &str, detail: Option<&str>) {
     emit(ready_withheld_event(db, reason, detail));
 }
+/// A retirement of a slot that serves `database` waits at `step` (`postgres_stop`,
+/// `holder_release`), or went on without having seen PostgreSQL shut down
+/// (`postgres_stop_unseen`); `detail` is what the node agent answered last.
+pub fn slot_retire_waiting_event(database: &str, slot: &str, step: &str, detail: &str) -> Value {
+    json!({"event":"slot_retire_waiting","database_id":database,"slot":slot,"step":step,"detail":detail,"at_ms":wall_clock_ms()})
+}
 /// The pool of one node.
 pub fn pool_state_event(node: &str, free: usize, creating: usize, serving: usize) -> Value {
     json!({"event":"pool_state","node":node,"free":free,"creating":creating,"serving":serving,"at_ms":wall_clock_ms()})

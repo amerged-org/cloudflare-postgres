@@ -1327,7 +1327,7 @@ mod world {
     }
 
     #[tokio::test]
-    async fn a_slot_served_sleep_proves_the_archived_segment_fences_records_deletes_and_releases() {
+    async fn a_slot_served_sleep_proves_the_archived_segment_records_fences_deletes_and_releases() {
         let mut w = World::pooled().await;
         confirmed(&mut w).await;
         // The database goes idle again.
@@ -1348,7 +1348,8 @@ mod world {
             .expect("the sleep completes in one pass");
         assert_eq!(observed["state"], "hibernated", "{observed}");
         let lines = w.since(from);
-        // The proof is made on the slot: the closed segment's .done before the slot is fenced.
+        // The proof is made on the slot: the closed segment's .done, then the sleep record of the
+        // data directory the proof found, before the slot is fenced.
         let switched = at(&lines, "SLOT SQL pgcf_maintenance WITH switched AS");
         let archived = lines
             .iter()
@@ -1370,8 +1371,10 @@ mod world {
         );
         let deleted = at(&lines, &format!("DELETE /api/v1/namespaces/{}", slot_ns()));
         let released = at(&lines, "AGENT release ok");
-        assert!(switched < archived && archived < fenced, "{lines:#?}");
-        assert!(fenced < recorded && recorded < deleted && deleted < released);
+        assert!(switched < archived && archived < recorded, "{lines:#?}");
+        assert!(recorded < fenced && fenced < deleted && deleted < released);
+        // The retirement does not wait to see PostgreSQL shut down in the slot.
+        assert!(!has(&lines[fenced..], "AGENT inspect"), "{lines:#?}");
         // The tenant's own Cluster was never started.
         assert!(!has(
             &lines,
@@ -1389,6 +1392,236 @@ mod world {
         assert_eq!(holder(&w), None);
         assert!(!w.reconciler.pool.serves(&w.id));
         assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+    }
+
+    /// The database a slot serves goes idle: Cloudflare asks for its sleep at the next generation.
+    fn idle(w: &mut World) {
+        let generation = w.db["generation"].as_u64().unwrap() + 1;
+        w.db["generation"] = generation.into();
+        w.db["desired_state"] = "suspended".into();
+        w.db["power"] = json!({"operation":format!("op_{}","f".repeat(20)),"revision":generation,"mode":"quiesce","reason":"idle"});
+        w.db["size"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_request_mib");
+    }
+    /// One turn of the controller's loop for the world's database, as `main` runs it: the tickets
+    /// against the desired row; an Unwind job while the pool retires the database's slot, else a
+    /// reconcile pass; then the pool's tick (refresh, discards) and the slot's hint. Answers the
+    /// observation the turn posts.
+    async fn turn(w: &mut World) -> Result<Option<Value>, Error> {
+        let db = w.db.clone();
+        let rec = &w.reconciler;
+        rec.pool
+            .confirm_tickets(|id| (id == db["id"]).then_some(&db), Instant::now());
+        w.node_storage(true);
+        let rec = &w.reconciler;
+        let observed = if rec.pool.unwinding().contains(&w.id) {
+            rec.pool.unwind(rec, &w.id, Some(&db)).await.map(|_| None)
+        } else {
+            rec.reconcile(&db, &w.snapshot).await
+        };
+        // The API double runs no CNPG for a slot it would create: only the discards are made.
+        let ready = rec.pool.refresh(rec).await;
+        for work in rec.pool.refill_work([&db], ready, Instant::now()) {
+            if let PoolWork::Discard(hex) = work {
+                rec.pool.discard(&hex).await?;
+            }
+        }
+        if let Some(id) = rec.pool.observe(SLOT_HEX).await? {
+            assert_eq!(id, w.id);
+        }
+        observed
+    }
+    /// The controller's loop until it posts the hibernated observation of the world's
+    /// generation, at most `turns` turns.
+    async fn until_hibernated(w: &mut World, turns: usize) -> Value {
+        for _ in 0..turns {
+            if let Ok(Some(observed)) = turn(w).await
+                && observed["state"] == "hibernated"
+            {
+                assert_eq!(observed["generation"], w.db["generation"], "{observed}");
+                return observed;
+            }
+        }
+        panic!(
+            "never hibernated: serving {:?}, slot {:?}, holder {:?}",
+            w.reconciler.pool.serving(&w.id),
+            w.server.get("Namespace", None, &slot_ns()).is_some(),
+            holder(w)
+        );
+    }
+    /// A controller that starts anew: a new pool that rediscovers the slots.
+    async fn restart(w: &mut World) {
+        let mut rec = fresh_reconciler(w);
+        rec.pool.postgres = w.reconciler.pool.postgres;
+        rec.pool.start_budget = w.reconciler.pool.start_budget;
+        rec.power.postgres = w.reconciler.power.postgres;
+        rec.pool.rediscover(&rec).await.unwrap();
+        w.reconciler = rec;
+        w.gateways_polled().await;
+    }
+    /// What a completed sleep of a slot-served database leaves: the slot gone, its holder
+    /// released, a sleep record of the tenant data, no serving entry; and the next wake is a
+    /// pool hit again.
+    async fn slept_and_hits_again(w: &mut World) {
+        assert!(!w.reconciler.pool.serves(&w.id));
+        assert!(w.reconciler.pool.unwinding().is_empty());
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert_eq!(holder(w), None);
+        let slept = record(w).expect("a sleep record");
+        assert_eq!(slept.system_identifier, Sql::default().system_identifier);
+        assert!(crate::power::sleep_completed(&fence(w), now_ms()));
+        w.free_slot().await;
+        delivered_wake(w).await;
+        assert!(
+            w.reconciler.pool.serves(&w.id),
+            "the next wake is a pool hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_loop_ends_a_slot_served_sleep_while_the_postmaster_takes_its_time() {
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        idle(&mut w);
+        // As live: pg_control says shut down a while before postmaster.pid goes.
+        w.gateway.agent.lock().unwrap().postmaster_lingers = 200;
+        until_hibernated(&mut w, 20).await;
+        slept_and_hits_again(&mut w).await;
+    }
+
+    #[tokio::test]
+    async fn the_loop_ends_a_slot_served_sleep_whose_postmaster_is_never_seen_gone() {
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        idle(&mut w);
+        w.gateway.agent.lock().unwrap().postmaster_lingers = u32::MAX;
+        until_hibernated(&mut w, 40).await;
+        assert!(!w.reconciler.pool.serves(&w.id));
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert_eq!(holder(&w), None);
+    }
+
+    /// The steps of a slot-served sleep, each cut off once: a controller that restarts there
+    /// finishes the sleep, while the node agent never sees the slot's postmaster gone (as live).
+    #[tokio::test]
+    async fn a_controller_restarted_at_any_step_of_a_slot_served_sleep_finishes_it() {
+        let slot_cluster = format!(
+            "/apis/postgresql.cnpg.io/v1/namespaces/{}/clusters/database",
+            slot_ns()
+        );
+        let steps: Vec<(&str, String)> = vec![
+            ("before the first pass", String::new()),
+            (
+                "before the sleep record",
+                format!("/api/v1/namespaces/{SYSTEM}/configmaps/storage-"),
+            ),
+            ("before the slot's fence", slot_cluster),
+            (
+                "before the namespace delete",
+                format!("/api/v1/namespaces/{}", slot_ns()),
+            ),
+            ("before the holder release", "release".into()),
+            ("before the hibernated post", "posted".into()),
+            ("while the slot namespace terminates", "terminating".into()),
+        ];
+        for (step, cut) in steps {
+            let mut w = World::pooled().await;
+            confirmed(&mut w).await;
+            idle(&mut w);
+            w.gateway.agent.lock().unwrap().postmaster_lingers = u32::MAX;
+            match cut.as_str() {
+                "" => {}
+                "release" => {
+                    w.gateway.agent.lock().unwrap().release_timeouts = 1;
+                    let _ = turn(&mut w).await;
+                }
+                "posted" => {
+                    let observed = turn(&mut w).await.unwrap().unwrap();
+                    assert_eq!(observed["state"], "hibernated", "{step}");
+                }
+                "terminating" => {
+                    // The sleep completed; the slot's namespace and its Pod are still being
+                    // deleted when the controller starts.
+                    until_hibernated(&mut w, 20).await;
+                    w.server.put(json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":slot_ns(),"uid":uid(61),"deletionTimestamp":"2026-10-17T11:12:00Z","labels":{"pgcf.io/slot":SLOT_HEX,"pgcf.io/slot-node":NODE}}}));
+                    w.server.edit("Pod", Some(&slot_ns()), "database-1", |pod| {
+                        pod["metadata"]["deletionTimestamp"] = "2026-10-17T11:12:00Z".into();
+                    });
+                }
+                path => {
+                    let path = path.to_string();
+                    w.server.state.lock().unwrap().refuse =
+                        Some(Box::new(move |at, _| at.starts_with(&path).then_some(500)));
+                    assert!(
+                        !matches!(turn(&mut w).await, Ok(Some(ref o)) if o["state"] == "hibernated"),
+                        "{step}"
+                    );
+                }
+            }
+            w.server.state.lock().unwrap().refuse = None;
+            restart(&mut w).await;
+            if cut == "terminating" {
+                let _ = turn(&mut w).await;
+                // Its termination ends.
+                w.server
+                    .state
+                    .lock()
+                    .unwrap()
+                    .objects
+                    .remove(&crate::test_server::path("Namespace", None, &slot_ns()));
+            }
+            until_hibernated(&mut w, 20).await;
+            slept_and_hits_again(&mut w).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retirement_that_never_sees_postgres_shut_down_goes_on_after_the_stop_budget() {
+        let mut w = World::pooled().await;
+        confirmed(&mut w).await;
+        w.gateway.agent.lock().unwrap().postmaster_lingers = u32::MAX;
+        w.reconciler.pool.stop_budget = Duration::from_secs(1);
+        crate::timing::take_emitted();
+        w.reconciler.pool.unwind_later(&w.id, "expired");
+        let mut retired = false;
+        for _ in 0..3 {
+            if w.reconciler
+                .pool
+                .unwind(&w.reconciler, &w.id, Some(&w.db))
+                .await
+                .unwrap()
+            {
+                retired = true;
+                break;
+            }
+        }
+        assert!(retired, "the retirement ends");
+        let steps: Vec<(String, String)> = crate::timing::take_emitted()
+            .into_iter()
+            .filter(|event| event["event"] == "slot_retire_waiting")
+            .map(|event| {
+                (
+                    event["step"].as_str().unwrap().into(),
+                    event["detail"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            steps.last(),
+            Some(&(
+                "postgres_stop_unseen".to_string(),
+                "control_state=1 postmaster_running=true".to_string()
+            )),
+            "{steps:?}"
+        );
+        // What the data directory holds is unknown: no record, so the next wake is the own
+        // Cluster's.
+        assert_eq!(record(&w), None);
+        assert_eq!(holder(&w), None);
+        assert!(w.server.get("Namespace", None, &slot_ns()).is_none());
+        assert!(!w.reconciler.pool.serves(&w.id));
     }
 
     /// Cloudflare deletes the database: the desired row at the next generation. The data directory

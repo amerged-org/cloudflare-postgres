@@ -111,6 +111,10 @@ pub struct AgentDouble {
     pub release_timeouts: u32,
     /// What happens to the API objects right after a successful attach (once).
     pub after_attach: Option<AfterAttach>,
+    /// How many inspections of a fenced slot still find `postmaster.pid` while `pg_control`
+    /// already says shut down, as while the postmaster ends after its shutdown checkpoint;
+    /// `u32::MAX` is a postmaster never seen gone.
+    pub postmaster_lingers: u32,
 }
 pub type AfterAttach = Box<dyn FnOnce(&mut crate::test_server::State) + Send>;
 fn agent_answer(
@@ -301,7 +305,7 @@ fn agent_answer(
                 return refuse("invalid");
             }
             let lv = request.volume.lv_uuid.clone();
-            let Some(device) = agent.devices.get(&lv) else {
+            let Some(device) = agent.devices.get(&lv).cloned() else {
                 return (
                     200,
                     json!({"exists":false,"open_count":0,"suspended":false,"holder":null,"control":null,"postmaster_running":null}),
@@ -323,11 +327,15 @@ fn agent_answer(
                     seen.state = 6;
                 }
                 control = serde_json::to_value(seen).unwrap();
-                running = (!stopped).into();
+                let lingers = stopped && agent.postmaster_lingers > 0;
+                if lingers && agent.postmaster_lingers != u32::MAX {
+                    agent.postmaster_lingers -= 1;
+                }
+                running = (!stopped || lingers).into();
             }
             (
                 200,
-                json!({"exists":true,"open_count":open_count(device),"suspended":device.suspended,"holder":agent.holders.get(&lv),"control":control,"postmaster_running":running}),
+                json!({"exists":true,"open_count":open_count(&device),"suspended":device.suspended,"holder":agent.holders.get(&lv),"control":control,"postmaster_running":running}),
             )
         }
         Action::Holders => (

@@ -994,11 +994,15 @@ impl PowerCoordinator {
             &keys,
         )?)
     }
-    /// The phase of the power record in the database's gateway fence, if it holds one.
-    pub(crate) async fn sleep_phase(&self, db: &Value) -> Option<&'static str> {
+    /// The phase of the power record in the database's gateway fence, if it holds one, and the
+    /// data directory the proof of its sleep found PostgreSQL running on.
+    pub(crate) async fn sleep_phase(
+        &self,
+        db: &Value,
+    ) -> Option<(&'static str, Option<SystemIdentity>)> {
         let map = self.fence(db).await.ok()??;
         let progress = progress_from(&map, self.now()).ok()??;
-        Some(phase_name(progress.phase))
+        Some((phase_name(progress.phase), progress.system))
     }
     /// Releases the gateways to a pool slot (pool design 2026-10-16): one CAS write of the fence
     /// `map` as it was read when the slot was claimed, with the running intent and the slot's
@@ -1105,19 +1109,13 @@ impl PowerCoordinator {
             return Ok(());
         }
         let record = system.and_then(|system| {
-            Some(crate::pool::SleepRecord {
-                v: 1,
-                system_identifier: system.identifier.clone(),
-                timeline: u32::try_from(system.timeline).ok()?,
-                configuration_sha256: crate::pool::sleep_fingerprint(db, &self.postgres_image)
-                    .ok()?,
-                image: db["postgres"]["image"]
-                    .as_str()
-                    .unwrap_or(&self.postgres_image)
-                    .into(),
-                written_at_ms: self.now(),
-                via: crate::pool::Via::Cnpg,
-            })
+            crate::pool::SleepRecord::proved(
+                db,
+                &self.postgres_image,
+                system,
+                crate::pool::Via::Cnpg,
+                self.now(),
+            )
         });
         crate::pool::write_sleep_record(&self.k8s, text(db, "id"), record.as_ref()).await?;
         let Some(volume) = crate::pool::volume_of(db, &anchor.volume_identity) else {
