@@ -1,8 +1,10 @@
 # Native regional gateway
 
 This Rust gateway implements the regional WebSocket/PostgreSQL transport and lifecycle controls.
-It is the gateway deployed on the EU fleet (Deployment `pgcf-gateway`). Local protocol tests do
-not establish database, backup or restore acceptance; the ULTRA plan records those.
+Its Kubernetes routing (EndpointSlice, Pod and ConfigMap watches, pool-slot targets) stays until
+gateway local mode replaces it in Stage 3 of the ULTRA plan; it is not deployed while the node
+runtime is rebuilt. Local protocol tests do not establish database, backup or restore acceptance;
+the ULTRA plan records those.
 
 The production entry point is configured through `PGCF_REGION_ID`, the derived
 `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_POD_UID`, `PGCF_GATEWAY_PORT`, `PGCF_GATEWAY_MEMORY_BYTES` and
@@ -59,11 +61,8 @@ behavior vectors from the shared Zod contracts and TypeScript implementations. T
 contracts test command checks the generated files. Rust tests exercise those vectors and real
 loopback WebSocket/TLS connections, including lifecycle controls and fence races.
 
-The Dockerfile uses the immutable Rust compiler from `versions.lock.json` and produces a static,
-non-root scratch image. CI supplies the exact source commit. `--version` reports the compiled
-source, Rust and input-lock identities without loading credentials or contacting a cluster.
-Local unstamped builds report a null source revision and cannot pass release qualification.
-Upstream notices and actual input-lock/schema bytes remain under `/licenses`.
+`--version` reports the compiled source, Rust and input-lock identities without loading
+credentials or contacting a cluster. Local unstamped builds report a null source revision.
 
 Writer routing uses the authenticated Kubernetes EndpointSlice cache: one Ready
 writer Pod UID, node and private IP, with PostgreSQL TLS verified against the

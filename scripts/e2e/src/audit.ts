@@ -9,13 +9,3 @@ export function credentialOccurrences(
     0,
   );
 }
-
-export function redactKnownCredentials(
-  source: string,
-  credentials: readonly string[],
-): string {
-  let result = source;
-  for (const credential of credentials)
-    if (credential) result = result.replaceAll(credential, "[credential]");
-  return result;
-}

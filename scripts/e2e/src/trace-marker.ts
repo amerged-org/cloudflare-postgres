@@ -9,14 +9,3 @@ export function isTraceMarker(value: unknown): value is string {
       (value.length === 50 && SEGMENTED_MARKER.test(value)))
   );
 }
-
-export function formatTraceMarker(entropy: string): string {
-  if (
-    typeof entropy !== "string" ||
-    entropy.length !== 48 ||
-    !LEGACY_MARKER.test(entropy)
-  )
-    throw new TypeError("invalid_trace_marker");
-  // Dot separators preserve every random byte without a contiguous hex-token match.
-  return `${entropy.slice(0, 16)}.${entropy.slice(16, 32)}.${entropy.slice(32)}`;
-}

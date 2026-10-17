@@ -1,8 +1,8 @@
 # Source-backed architecture diagrams
 
 These views are maintained by [Mermaider](https://github.com/sebmer-com/mermaider).
-The selection and reviewed process model live in `.mermaider/`; generated files
-carry source references and are checked against the current repository contents.
+The selection lives in `.mermaider/`; generated files carry source references and
+are checked against the current repository contents.
 
 Open [the diagram gallery](index.html) in a local browser and select a view from
 the short sidebar labels. Drag or use arrow keys to move the diagram; use Fit for
@@ -17,7 +17,6 @@ as source; download it or open the local checkout to use the gallery.
 | [Edge resources](edge-resources.md) | Bindings declared by the TypeScript Edge configuration template. |
 | [CI pipeline](ci-pipeline.md) | Job dependencies and conditions in the single CI workflow. |
 | [Core D1 data model](d1-core.md) | Selected core tables and keys after replaying every API migration, including later schema changes. |
-| [AddNode orchestration](add-node.md) | A reviewed, source-backed interpretation of the implemented provisioning workflow. |
 
 The D1 view selects nine core tables to remain readable; the migration stream also
 contains provisioning, usage, fleet, storage and capacity tables. Its omission of
@@ -27,15 +26,8 @@ declared foreign key or display every constraint.
 Configuration templates describe declared resources, not actual deployed
 identities. The TypeScript Edge view does not mark the approved Rust replacement
 as deployed. See [PLAN.md](../../../PLAN.md) for current acceptance status and
-[Rust runtime and cold starts](../rust-runtime-and-cold-starts.md) for the approved
-target and migration gates. No live acceptance gate is closed by these diagrams.
-
-The AddNode diagram is an overview of `AddNode.run` and its referenced helpers,
-not a mechanically inferred state machine. It includes the asynchronous wait
-cycle, uncertain provider readback, authority checks and optional postjoin gates.
-Helper bodies and the orchestrator are bound by declaration hashes. A changed
-declaration requires review before its evidence hash is renewed. A fresh output
-fingerprint by itself never renews that review.
+[the ULTRA plan](../cloudflare-convergence-and-serverless-plan.md) for the target
+runtime and delivery stages. No live acceptance gate is closed by these diagrams.
 
 ## Maintain the views
 
@@ -53,9 +45,7 @@ node .local/tools/mermaider/dist/cli.js check --repo .
 
 Use the discovery catalogue to propose additional views; the saved selection is
 not expanded automatically. This pilot inventories the API, TypeScript Edge,
-shared contracts and CI sources; widen `include` when selecting a new area. Before
-accepting an AddNode change, read the changed
-implementation and update the model's claims and evidence together. Use
+shared contracts and CI sources; widen `include` when selecting a new area. Use
 `mermaider evidence --repo . --path <source> --symbol <declaration>` to obtain the
 current declaration hash after reviewing it.
 

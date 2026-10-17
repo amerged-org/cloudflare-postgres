@@ -6,17 +6,14 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.ts",
-    "accept": "node src/run.ts"
+    "test": "node --test test/*.test.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.2.0",
     "@pgcf/contracts": "workspace:*",
-    "pg": "^8.23.0",
     "ws": "8.22.0"
   },
   "devDependencies": {
-    "@types/pg": "^8.15.0",
     "@types/ws": "8.18.2",
     "wrangler": "^4.142.0"
   }
