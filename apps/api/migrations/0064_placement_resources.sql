@@ -13,6 +13,11 @@ ALTER TABLE databases ADD COLUMN own_storage_gib INTEGER
 -- at its full memory until the first 30-minute average that includes it exists (plan 4.8).
 ALTER TABLE databases ADD COLUMN placed_at TEXT;
 
+-- Placement no longer records a thin storage profile on the database, so the two triggers that
+-- demanded one on every node with thin storage would refuse every placement there.
+DROP TRIGGER IF EXISTS database_selected_thin_insert;
+DROP TRIGGER IF EXISTS database_selected_thin_placement;
+
 CREATE VIEW database_resources AS
 SELECT d.id database_id,
   COALESCE(d.own_memory_mib,s.memory_mib) memory_mib,

@@ -886,6 +886,13 @@ it("adds per-database resources, node samples and the capacity alert kinds while
       JSON.stringify({ kind, occurred_at: NOW }),
     );
   expect(() => alert("database_volume_warning")).toThrow(/CHECK/);
+  const thinTriggers = () =>
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN('database_selected_thin_insert','database_selected_thin_placement')",
+      )
+      .all();
+  expect(thinTriggers()).toHaveLength(2);
   db.exec(
     readFileSync(new URL("0064_placement_resources.sql", directory), "utf8"),
   );
@@ -910,6 +917,8 @@ it("adds per-database resources, node samples and the capacity alert kinds while
     })),
   );
   // A database's own values replace its class's in the view; null takes the class's.
+  // Placement writes no thin storage profile, so the triggers that demanded one are gone.
+  expect(thinTriggers()).toEqual([]);
   const effective = () =>
     db.prepare("SELECT * FROM database_resources WHERE database_id=?").get(id);
   expect(effective()).toEqual({
