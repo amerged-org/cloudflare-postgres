@@ -274,7 +274,9 @@ it("has room while the node's fresh physical sample leaves the profile's data an
   expect(await room(f)).toBe(0);
   await physicalSample(f, { dataFree: gib }, 100_000);
   expect(await room(f)).toBe(1);
-  // Neither the node's write authority nor its freshness enters the rule; an error does.
+  // Neither the node's write authority, its freshness nor an audit turn's error enters the rule:
+  // room is space in the pool. A writer without io.max (a pool slot) failed the audit live and
+  // refused every wake on the node.
   await publish(f, {
     ...f.authority,
     write_allowed: false,
@@ -283,11 +285,11 @@ it("has room while the node's fresh physical sample leaves the profile's data an
   });
   expect(await room(f)).toBe(1);
   await env.DB.prepare(
-    "UPDATE node_thin_storage SET error_code='thin_storage_report_unqualified' WHERE node_id=?",
+    "UPDATE node_thin_storage SET error_code='thin_storage_io_limit_missing' WHERE node_id=?",
   )
     .bind(f.node)
     .run();
-  expect(await room(f)).toBe(0);
+  expect(await room(f)).toBe(1);
 });
 
 it("judges a database by its own pool, and a new volume by the node's openness to new databases", async () => {
