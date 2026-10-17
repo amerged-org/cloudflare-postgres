@@ -210,28 +210,6 @@ export async function idleIntent(w: AwakeWriter) {
   return { operation, generation: before.generation + 1 };
 }
 
-/** The controller's confirmed idle sleep. */
-export function hibernated(
-  w: AwakeWriter,
-  intent: { operation: string; generation: number },
-) {
-  return request(
-    "/agent/v1/observations",
-    w.f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(w.id, intent.generation, "hibernated"),
-        power: {
-          operation: intent.operation,
-          revision: intent.generation,
-          state: "hibernated",
-        },
-        archive: { continuous: false, ready_wal_files: null },
-      },
-    ]),
-  );
-}
 export async function leaseEntry(f: Fixture, id: string) {
   const response = await request(
     `/agent/v1/nodes/${f.node}/storage-guard`,

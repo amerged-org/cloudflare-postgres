@@ -44,7 +44,6 @@ import {
   thinPoolGrowthNeededSql,
   selectedStorageProfileSql,
 } from "./storage-capacity.ts";
-import { thinStorageTurnsFor } from "./databases.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 /** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
 export async function startupPlacementNodes(
@@ -220,7 +219,6 @@ export async function runNodeCapacity(
     await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify(
       placed,
     );
-    await thinStorageTurnsFor(env, placed);
   }
   const result = {
     region_id: regionId,

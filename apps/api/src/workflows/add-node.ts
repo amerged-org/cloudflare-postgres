@@ -29,7 +29,6 @@ import {
   assertNodeRecoveryAuthority,
 } from "../domain/node-state.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
-import { thinStorageTurnsFor } from "../domain/databases.ts";
 import {
   ensureNodeFirewall,
   ensureNodeNetwork,
@@ -438,7 +437,6 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
                 addition.intent.request.region_id,
               ),
             ).notify(ids);
-            await thinStorageTurnsFor(this.env, ids);
           }
           return { placed: ids.length };
         });

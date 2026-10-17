@@ -12,7 +12,6 @@ import {
   request,
 } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { awakeWriter, hibernated, idleIntent } from "./thin-writer-fixture.ts";
 import {
   type Fixture,
   forgetTurns,
@@ -513,7 +512,7 @@ it("rearms the cadence after a real D1 read error without destroying an executor
   expect(result.destroyed).toBe(0);
 });
 
-it("keeps transient backoff when another headroom sample requests a turn", async () => {
+it("keeps transient backoff when another request asks for a turn", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
   const failed = await turn(f, {
     state: "failed",
@@ -575,7 +574,7 @@ it("asks for an identity turn at once when a thin database is ready without a re
   const postgres = f.qualified.spec.components.find(
     (c) => c.name === "postgres",
   )!;
-  // The placement asked for a turn already; a ready report without a receipt asks again.
+  // A ready report without a receipt asks for the turn that reads it.
   await forgetTurns(f);
   expect(await turnRequested(f)).toBe(false);
   const ready = await request(
@@ -619,41 +618,6 @@ it("a due identity turn without an executor reserves no lease and keeps its cade
   ).toEqual({ lease_id: null, lease_revision: 0 });
   expect(result.alarm).toBeGreaterThanOrEqual(result.before + 5000);
   expect(result.failures).toBe(1);
-});
-
-it("asks for the node's next identity turn at once when a thin database is placed", async () => {
-  const f = await thinExecutionFixture(releases);
-  await identityProof(f, {
-    physical: {
-      ...f.authority.physical,
-      free_bytes: 80 * gib,
-      thin_pool: {
-        ...f.authority.physical.thin_pool!,
-        data_total_bytes: 16 * gib,
-      },
-    },
-  });
-  expect(await turnRequested(f)).toBe(false);
-  // Only an identity proof reads the new volume into its receipt, which the first token needs.
-  DatabaseWithOperation.parse(await (await f.create()).json());
-  expect(await turnRequested(f)).toBe(true);
-});
-
-it("asks for the node's next identity turn at once when a sleeping thin database resumes", async () => {
-  const w = await awakeWriter(await thinExecutionFixture(releases));
-  const intent = await idleIntent(w);
-  await w.evidence({ generation: intent.generation, io: [] });
-  expect(await (await hibernated(w, intent)).json()).toEqual({ accepted: 1 });
-  await forgetTurns(w.f);
-  const resumed = await request(
-    `/v1/databases/${w.id}/resume`,
-    w.f.integrator,
-    "POST",
-    undefined,
-    crypto.randomUUID(),
-  );
-  expect(resumed.status).toBe(202);
-  expect(await turnRequested(w.f)).toBe(true);
 });
 
 it("a due identity turn moves a later alarm to now", async () => {

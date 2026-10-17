@@ -199,9 +199,6 @@ function retainedPoolAuthority(
     : null;
 }
 
-/** A start waits for the node's next inventory this long after its hold was granted. A start that
- * is older is stuck on something else, and a stuck start must not keep identity turns running. */
-export const THIN_START_WAIT_SECONDS = 120;
 export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM (
   SELECT h.operation_id FROM database_start_admissions h WHERE h.node_id=node_thin_storage.node_id AND h.node_uid=node_thin_storage.node_uid AND h.storage_budget_bytes>0
 ) storage_hold WHERE NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
@@ -213,7 +210,7 @@ export async function storageHolds(
   now = Date.now(),
 ) {
   const rows = await env.DB.prepare(
-    `SELECT h.operation_id,h.database_id,h.generation,h.storage_budget_bytes,h.granted_at,h.ready_at,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
+    `SELECT h.operation_id,h.database_id,h.generation,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id`,
   )
     .bind(nodeId, nodeUid)
     .all<{
@@ -221,8 +218,6 @@ export async function storageHolds(
       database_id: string;
       generation: number;
       storage_budget_bytes: number;
-      granted_at: string;
-      ready_at: string | null;
       storage_volume_json: string | null;
       binding_json: string | null;
       storage_profile_json: string | null;
@@ -252,15 +247,6 @@ export async function storageHolds(
   return {
     bytes,
     count: rows.results.length,
-    /** Starts the controller has not reported ready yet: each waits for the next inventory, which
-     * carries its new Pod's io.max, and the controller cannot ready the database before that. */
-    waiting: rows.results
-      .filter(
-        (hold) =>
-          hold.ready_at === null &&
-          now - Date.parse(hold.granted_at) <= THIN_START_WAIT_SECONDS * 1000,
-      )
-      .map(({ database_id, generation }) => ({ database_id, generation })),
     newVolumes: unknownVolumes,
     ids: new Set(rows.results.map((r) => r.database_id)),
     operations: rows.results.map((r) => r.operation_id),
@@ -1217,22 +1203,6 @@ export async function requestThinStorageTurn(env: Env, nodeId: string) {
   await env.NODE_BOOTSTRAP.get(
     env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
   ).thinStorageDue(nodeId);
-}
-/** A thin database just placed on a node, or starting there again, needs the node's next identity
- * proof: only a proof reads a new volume into its receipt or measures the Pod writing to it, and the
- * first write token waits for that. Ask for the turn now instead of at the next cadence. */
-export async function requestThinStorageTurnsFor(
-  env: Env,
-  databaseIds: readonly string[],
-) {
-  if (databaseIds.length === 0) return;
-  const nodes = await env.DB.prepare(
-    "SELECT DISTINCT d.node_id FROM databases d JOIN node_thin_storage t ON t.node_id=d.node_id WHERE d.id IN(SELECT value FROM json_each(?)) AND d.storage_profile_json IS NOT NULL",
-  )
-    .bind(JSON.stringify(databaseIds))
-    .all<{ node_id: string }>();
-  for (const { node_id } of nodes.results)
-    await requestThinStorageTurn(env, node_id).catch(() => undefined);
 }
 export async function processNodeThinStorage(env: Env, nodeId: string) {
   const input = await prepareThinStorageLease(env, nodeId);
