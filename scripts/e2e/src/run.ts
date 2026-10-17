@@ -38,7 +38,7 @@ import {
   requireEnv,
   string,
 } from "./core.ts";
-import { cloudflareInventory } from "./phase0-accept.ts";
+import { cloudflareInventory } from "./cloudflare-inventory.ts";
 import { assertOpenSubset, scanPorts } from "./scan.ts";
 import { networkingAudit, chaosEgressPolicy } from "./security.ts";
 import { captureTrace } from "./trace.ts";

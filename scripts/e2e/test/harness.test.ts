@@ -13,12 +13,6 @@ import {
   timingSummary,
 } from "../src/core.ts";
 import { assertOpenSubset, scanPorts } from "../src/scan.ts";
-import {
-  checkCloudflareInventory,
-  checkGitTopology,
-  checkLayout,
-  checkReady,
-} from "../src/phase0-accept.ts";
 import { quantityBytes, vgSamples } from "../src/clients.ts";
 import { networkingAudit } from "../src/security.ts";
 import { credentialOccurrences, redactKnownCredentials } from "../src/audit.ts";
@@ -260,51 +254,6 @@ test("VG free uses the real pinned LVMNode shape and requires every node", () =>
   ]);
   assert.throws(() => vgSamples(sample, ["pgcf-node-missing"], "pgcf"));
   assert.throws(() => quantityBytes("NaN"));
-});
-
-test("Phase 0 checker catches stale layout, branches and scoped Cloudflare resources", () => {
-  assert.equal(
-    checkLayout(["PLAN.md", "apps/api/src/index.ts", "scripts/e2e/src/run.ts"])
-      .pass,
-    true,
-  );
-  assert.equal(checkLayout(["apps/old-controller/index.ts"]).pass, false);
-  const worktree =
-    "worktree /synthetic\nHEAD generated\nbranch refs/heads/main\n";
-  assert.equal(checkGitTopology(worktree, "main\n").pass, true);
-  assert.equal(checkGitTopology(worktree, "main\npgcf/old\n").pass, false);
-  assert.equal(
-    checkCloudflareInventory(
-      [
-        { kind: "worker", name: "pgcf-api-dev" },
-        { kind: "worker", name: "foreign" },
-      ],
-      [{ kind: "worker", name: "pgcf-api-dev" }],
-    ).pass,
-    true,
-  );
-  assert.equal(
-    checkCloudflareInventory([{ kind: "worker", name: "pgcf-old-dev" }], [])
-      .pass,
-    false,
-  );
-});
-
-test("Phase 0 Ready requires the current release generation", () => {
-  const resource = {
-    items: [
-      {
-        metadata: { name: "pgcf-release", generation: 2 },
-        status: {
-          observedGeneration: 2,
-          conditions: [{ type: "Ready", status: "True" }],
-        },
-      },
-    ],
-  };
-  assert.equal(checkReady(resource, "releases", ["pgcf-release"]).pass, true);
-  resource.items[0]!.status.observedGeneration = 1;
-  assert.equal(checkReady(resource, "releases", ["pgcf-release"]).pass, false);
 });
 
 test("network audit allows known platform host networking and rejects data/regional exposures", () => {

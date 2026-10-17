@@ -173,7 +173,6 @@ export function objectNamespace(value: unknown): string {
 }
 
 const EVENTS = new Set([
-  "phase0",
   "E0",
   "E1",
   "E2",

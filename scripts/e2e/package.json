@@ -7,7 +7,6 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "phase0": "node src/phase0-accept.ts",
     "accept": "node src/run.ts"
   },
   "dependencies": {
