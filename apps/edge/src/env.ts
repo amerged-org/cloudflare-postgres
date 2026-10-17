@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { DatabaseWakeAdmission } from "@pgcf/contracts";
-export type { DatabaseWakeAdmission } from "@pgcf/contracts";
+import type { DatabaseWakeAdmission } from "@pgcf/contracts/database-admission";
+export type { DatabaseWakeAdmission } from "@pgcf/contracts/database-admission";
 
 export interface DatabaseActorNamespace {
   idFromName(name: string): DurableObjectId;

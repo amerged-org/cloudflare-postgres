@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { isDatabaseId, isRoleName } from "@pgcf/contracts";
+// Specific modules, never the contracts barrel: a cold isolate evaluates only what it imports.
+import { isDatabaseId, isRoleName } from "@pgcf/contracts/ids";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import {
   parseRouteKeyring,

@@ -22,9 +22,9 @@ flowchart LR
 ## Sources
 
 - [apps/edge/wrangler.example.jsonc:3](../../../apps/edge/wrangler.example.jsonc#L3)
-- [apps/edge/wrangler.example.jsonc:17](../../../apps/edge/wrangler.example.jsonc#L17)
-- [apps/edge/wrangler.example.jsonc:28](../../../apps/edge/wrangler.example.jsonc#L28)
-- [apps/edge/wrangler.example.jsonc:37](../../../apps/edge/wrangler.example.jsonc#L37)
-- [apps/edge/wrangler.example.jsonc:46](../../../apps/edge/wrangler.example.jsonc#L46)
+- [apps/edge/wrangler.example.jsonc:19](../../../apps/edge/wrangler.example.jsonc#L19)
+- [apps/edge/wrangler.example.jsonc:30](../../../apps/edge/wrangler.example.jsonc#L30)
+- [apps/edge/wrangler.example.jsonc:39](../../../apps/edge/wrangler.example.jsonc#L39)
+- [apps/edge/wrangler.example.jsonc:48](../../../apps/edge/wrangler.example.jsonc#L48)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

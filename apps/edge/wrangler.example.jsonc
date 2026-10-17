@@ -3,6 +3,8 @@
   "name": "pgcf-edge-dev",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-02",
+  // A smaller bundle compiles faster in a cold isolate.
+  "minify": true,
   "limits": {
     "cpu_ms": 300000,
   },
