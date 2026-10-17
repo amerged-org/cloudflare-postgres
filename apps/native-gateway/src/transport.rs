@@ -5,13 +5,16 @@ use crate::{
     control::{self, Control, HttpHead},
     hold::{Held, Verdict, WakeQueue},
     kubernetes::{FenceState, Kubernetes},
+    local::{self, LocalTable},
     sessions::{Action, Sessions, SharedSessions},
     targets::{TargetIdentity, TargetUnavailable, Targets},
     telemetry::GatewayMeasurements,
+    upstream::Upstream,
 };
 use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use pgcf_native_protocol::{
     activity::PostgresActivity,
+    agent::{self, Mode},
     constant,
     route::{Keyring, ReplayCache, RouteClaims, valid_websocket_key, verify},
     startup::{Event, StartupReader, error_response},
@@ -31,7 +34,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{OwnedSemaphorePermit, RwLock, watch},
+    sync::{Notify, OwnedSemaphorePermit, RwLock, watch},
     time::timeout,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -89,6 +92,81 @@ pub trait PostgresDial: Send + Sync {
         &'a self,
         target: &'a DatabaseTarget,
     ) -> BoxFuture<'a, Result<TlsStream<TcpStream>, Failure>>;
+}
+/// Where the gateway learns its writers and how it reaches them.
+pub enum Discovery {
+    /// The Kubernetes fence and writer watches, and TLS to the writer Pod.
+    Kubernetes(Arc<dyn PostgresDial>),
+    /// The node agent's table, and the database's Unix socket on the node.
+    Local(Arc<RwLock<LocalTable>>),
+}
+/// The writer a session is admitted on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Writer {
+    Pod(TargetIdentity),
+    /// The database's PostgreSQL unit on this node.
+    Unit(agent::Writer),
+}
+impl Writer {
+    /// What a route names of the writer: its Pod UID or the unit's invocation ID.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Pod(target) => &target.pod_uid,
+            Self::Unit(unit) => &unit.instance,
+        }
+    }
+    /// The `route` class of `conn_stages`.
+    fn route(&self) -> &'static str {
+        match self {
+            Self::Pod(target) if target.unready => "attested",
+            Self::Pod(_) => "ready",
+            Self::Unit(_) => "unit",
+        }
+    }
+}
+pub(crate) type Epoch = (u64, u64);
+/// Why a route is not admitted on a writer: its `conn_stages` outcome (also the error the upgrade
+/// is refused with), the discovery's reason, and the class of the writer it was checked against.
+pub(crate) struct Refusal {
+    pub(crate) outcome: &'static str,
+    pub(crate) reason: Option<TargetUnavailable>,
+    pub(crate) route: Option<&'static str>,
+}
+fn refusal(outcome: &'static str) -> Refusal {
+    Refusal {
+        outcome,
+        reason: None,
+        route: None,
+    }
+}
+/// Why bytes were not written to a session's writer.
+pub(crate) enum Blocked {
+    /// The fence or the table moved past the session's admission: nothing was written.
+    Fenced,
+    /// The session's writer is not the database's any more: nothing was written.
+    TargetChanged,
+    /// The write failed or timed out: its bytes may have reached PostgreSQL.
+    Lost,
+}
+/// What a dial connects to: the TLS target of a Pod, or a unit's socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DialPlan {
+    Pod(DatabaseTarget),
+    Unit(agent::Writer),
+}
+/// Why a dial gave no connection.
+pub(crate) enum DialError {
+    Connect,
+    /// A unit's socket answered from another process than the unit's.
+    Peer,
+}
+impl DialError {
+    pub(crate) fn outcome(&self) -> &'static str {
+        match self {
+            Self::Connect => "postgres_connect_error",
+            Self::Peer => "peer_mismatch",
+        }
+    }
 }
 /// Dials PostgreSQL with the TLS authority the watch showed (or, without one, the API server's),
 /// verified with a configuration built once per database and authority.
@@ -173,8 +251,10 @@ impl TlsConfigs {
 }
 pub struct Gateway {
     pub config: Arc<Config>,
-    pub dial: Arc<dyn PostgresDial>,
+    pub discovery: Discovery,
+    /// Kubernetes mode: the fences of the watched ConfigMaps.
     pub fences: Arc<RwLock<FenceState>>,
+    /// Kubernetes mode: the writers of the watched endpoints and Pods.
     pub targets: Arc<RwLock<Targets>>,
     pub sessions: SharedSessions,
     pub measurements: Arc<Mutex<GatewayMeasurements>>,
@@ -188,7 +268,15 @@ pub struct Gateway {
     pub(crate) memory: Arc<MemoryBudget>,
 }
 impl Gateway {
+    /// A gateway in Kubernetes mode for the gateway Pod `pod`.
     pub fn new(config: Arc<Config>, pod: String, dial: Arc<dyn PostgresDial>) -> Arc<Self> {
+        Self::with_discovery(config, pod, Discovery::Kubernetes(dial))
+    }
+    /// A gateway in local mode, whose writers the node agent's table names.
+    pub fn local(config: Arc<Config>) -> Arc<Self> {
+        Self::with_discovery(config, String::new(), Discovery::Local(Arc::default()))
+    }
+    fn with_discovery(config: Arc<Config>, pod: String, discovery: Discovery) -> Arc<Self> {
         let fences = Arc::new(RwLock::new(FenceState::default()));
         let sessions = Arc::new(Mutex::new(Sessions::default()));
         let measurements = Arc::new(Mutex::new(GatewayMeasurements::new()));
@@ -204,7 +292,7 @@ impl Gateway {
         Arc::new(Self {
             memory: MemoryBudget::new(config.maximum_memory, config.database_memory),
             config,
-            dial,
+            discovery,
             fences,
             targets: Arc::new(RwLock::new(Targets::default())),
             sessions,
@@ -222,7 +310,7 @@ impl Gateway {
         self: &Arc<Self>,
         claims: &RouteClaims,
         wire: WireBudget,
-        target: &TargetIdentity,
+        target: &Writer,
         replay: bool,
     ) -> Result<(SessionLease, watch::Receiver<Action>), u16> {
         let mut admission = self.admission.lock().unwrap();
@@ -266,11 +354,330 @@ impl Gateway {
         ))
     }
 }
+impl Gateway {
+    /// The node agent's table, in local mode.
+    pub fn local_table(&self) -> Option<&Arc<RwLock<LocalTable>>> {
+        match &self.discovery {
+            Discovery::Local(table) => Some(table),
+            Discovery::Kubernetes(_) => None,
+        }
+    }
+    /// Whether the gateway admits new work: its writers are current and it is not draining.
+    pub(crate) async fn ready(&self) -> bool {
+        let current = match &self.discovery {
+            Discovery::Kubernetes(_) => {
+                // Global order whenever both are held: fences, then targets.
+                let state = self.fences.read().await;
+                let physical = self.targets.read().await;
+                state.synchronized()
+                    && physical.synchronized()
+                    // A writer the kubelet has not reported Ready is recognized only by the Pod
+                    // watch, and a woken database is published on the attestation alone.
+                    && physical.pods_synchronized()
+            }
+            Discovery::Local(table) => table.read().await.synchronized(),
+        };
+        current && !self.draining.load(Ordering::Acquire)
+    }
+    /// The writer a route is admitted on and the epoch it is admitted at. `released` is the
+    /// writer a held wake was released to.
+    pub(crate) async fn admit(
+        &self,
+        claims: &RouteClaims,
+        released: Option<&str>,
+    ) -> Result<(Writer, Epoch), Refusal> {
+        let draining = self.draining.load(Ordering::Acquire);
+        match &self.discovery {
+            Discovery::Kubernetes(_) => {
+                let state = self.fences.read().await;
+                let epoch = state.bound_epoch(&claims.db);
+                if draining || !state.admits(&claims.db) {
+                    return Err(refusal("fenced"));
+                }
+                let revision_current = route_revision_current(&state, claims);
+                drop(state);
+                let target = self
+                    .targets
+                    .read()
+                    .await
+                    .target(&claims.db)
+                    .map_err(|reason| Refusal {
+                        outcome: "target_unavailable",
+                        reason: Some(reason),
+                        route: None,
+                    })?;
+                if !revision_current
+                    || released.is_some_and(|pod| target.pod_uid != pod)
+                    || !route_target_current(claims, &target)
+                    || !admitted_runtime_current(&*self.fences.read().await, claims, &target)
+                {
+                    return Err(Refusal {
+                        route: Some(Writer::Pod(target).route()),
+                        ..refusal("route_stale")
+                    });
+                }
+                Ok((Writer::Pod(target), epoch))
+            }
+            Discovery::Local(table) => {
+                let table = table.read().await;
+                let epoch = table.bound_epoch(&claims.db);
+                if draining || !table.synchronized() {
+                    return Err(refusal("fenced"));
+                }
+                let Some(record) = table.record(&claims.db) else {
+                    return Err(refusal("target_unavailable"));
+                };
+                let (Mode::Running, Some(unit)) = (record.mode, &record.writer) else {
+                    return Err(refusal("fenced"));
+                };
+                // Only an admission route names the unit and the route revision it was admitted
+                // for.
+                if claims.v != 4
+                    || claims.rev != Some(record.generation)
+                    || claims.route_revision != Some(record.route_revision)
+                    || claims.pod.as_deref() != Some(unit.instance.as_str())
+                    || released.is_some_and(|instance| instance != unit.instance)
+                {
+                    return Err(Refusal {
+                        route: Some("unit"),
+                        ..refusal("route_stale")
+                    });
+                }
+                Ok((Writer::Unit(unit.clone()), epoch))
+            }
+        }
+    }
+    /// What signals a change of the fences and writers a held wake waits on.
+    pub(crate) async fn signals(&self) -> [Arc<Notify>; 2] {
+        match &self.discovery {
+            Discovery::Kubernetes(_) => [
+                self.fences.read().await.changed.clone(),
+                self.targets.read().await.changed.clone(),
+            ],
+            Discovery::Local(table) => {
+                let changed = table.read().await.changed.clone();
+                [changed.clone(), changed]
+            }
+        }
+    }
+    /// Whether `writer` is still the database's writer.
+    pub(crate) async fn permits(&self, database: &str, writer: &Writer) -> bool {
+        match (&self.discovery, writer) {
+            (Discovery::Kubernetes(_), Writer::Pod(target)) => {
+                self.targets.read().await.permits(database, target)
+            }
+            (Discovery::Local(table), Writer::Unit(unit)) => {
+                table.read().await.permits(database, unit)
+            }
+            _ => false,
+        }
+    }
+    /// Whether the database is still admitted at `epoch`.
+    async fn admitted_at(&self, database: &str, epoch: Epoch) -> bool {
+        match &self.discovery {
+            Discovery::Kubernetes(_) => {
+                let state = self.fences.read().await;
+                state.bound_epoch(database) == epoch && state.admits(database)
+            }
+            Discovery::Local(table) => {
+                let table = table.read().await;
+                table.bound_epoch(database) == epoch && table.admits(database)
+            }
+        }
+    }
+    /// Writes `bytes` to a session's writer while the database is admitted at `epoch` and
+    /// `writer` is its writer, holding both for the bounded write: a fence or table change that
+    /// would stop the write waits for it.
+    pub(crate) async fn write_admitted(
+        &self,
+        database: &str,
+        epoch: Epoch,
+        writer: &Writer,
+        postgres: &mut Upstream,
+        bytes: &[u8],
+    ) -> Result<(), Blocked> {
+        match (&self.discovery, writer) {
+            (Discovery::Kubernetes(_), Writer::Pod(target)) => {
+                let state = self.fences.read().await;
+                if state.bound_epoch(database) != epoch || !state.admits(database) {
+                    return Err(Blocked::Fenced);
+                }
+                let physical = self.targets.read().await;
+                if !physical.permits(database, target) {
+                    return Err(Blocked::TargetChanged);
+                }
+                bounded_write(postgres, bytes).await
+            }
+            (Discovery::Local(table), Writer::Unit(unit)) => {
+                let table = table.read().await;
+                if table.bound_epoch(database) != epoch || !table.admits(database) {
+                    return Err(Blocked::Fenced);
+                }
+                if !table.permits(database, unit) {
+                    return Err(Blocked::TargetChanged);
+                }
+                bounded_write(postgres, bytes).await
+            }
+            _ => Err(Blocked::TargetChanged),
+        }
+    }
+    /// Writes `bytes` of a running session while its database runs on `writer`; false, with
+    /// nothing written, while the database is quiescing or retired. The guards are held through
+    /// the bounded write, so new bytes never cross a published change.
+    pub(crate) async fn write_running(
+        &self,
+        database: &str,
+        writer: &Writer,
+        postgres: &mut Upstream,
+        bytes: &[u8],
+    ) -> Result<bool, Blocked> {
+        match (&self.discovery, writer) {
+            (Discovery::Kubernetes(_), Writer::Pod(target)) => {
+                // Match startup/health ordering while retaining both guards through the write.
+                let state = self.fences.read().await;
+                let physical = self.targets.read().await;
+                if !physical.permits(database, target) {
+                    return Err(Blocked::TargetChanged);
+                }
+                if !state.synchronized() {
+                    return Err(Blocked::Fenced);
+                }
+                if state
+                    .records
+                    .get(database)
+                    .is_some_and(|fence| fence.intent.mode != "running")
+                {
+                    return Ok(false);
+                }
+                bounded_write(postgres, bytes).await.map(|()| true)
+            }
+            // Without the channel the last table stands: only the agent stops a database, and
+            // it does so over the channel or by stopping the unit, which ends the session.
+            (Discovery::Local(table), Writer::Unit(unit)) => {
+                let table = table.read().await;
+                if !table.permits(database, unit) {
+                    return Err(Blocked::TargetChanged);
+                }
+                if table.mode(database) != Some(Mode::Running) {
+                    return Ok(false);
+                }
+                bounded_write(postgres, bytes).await.map(|()| true)
+            }
+            _ => Err(Blocked::TargetChanged),
+        }
+    }
+    /// What a session of the database does now, given what it was last asked: run, hold its
+    /// bytes while the database quiesces, or close.
+    async fn mode(&self, database: &str, requested: Action) -> Action {
+        let mode = match &self.discovery {
+            Discovery::Kubernetes(_) => match self
+                .fences
+                .read()
+                .await
+                .records
+                .get(database)
+                .map(|fence| fence.intent.mode.as_str())
+            {
+                Some("retired") => Mode::Retired,
+                Some("quiesce") => Mode::Quiesce,
+                _ => Mode::Running,
+            },
+            Discovery::Local(table) => table.read().await.mode(database).unwrap_or(Mode::Running),
+        };
+        match mode {
+            Mode::Retired | Mode::Sleeping => Action::Retire,
+            Mode::Quiesce => {
+                if matches!(requested, Action::CloseIdle | Action::CloseAuthentication) {
+                    requested
+                } else {
+                    Action::Quiesce
+                }
+            }
+            Mode::Running => Action::Running,
+        }
+    }
+    /// What a dial of `writer` for `claims` connects to, while it is the database's writer and,
+    /// with `epoch`, while the database is still admitted at that epoch; or the outcome that
+    /// stops it.
+    pub(crate) async fn plan(
+        &self,
+        claims: &RouteClaims,
+        epoch: Option<Epoch>,
+        writer: &Writer,
+    ) -> Result<DialPlan, &'static str> {
+        let database = &claims.db;
+        match (&self.discovery, writer) {
+            (Discovery::Kubernetes(_), Writer::Pod(bound)) => {
+                let state = self.fences.read().await;
+                if let Some(epoch) = epoch {
+                    if state.bound_epoch(database) != epoch || !state.admits(database) {
+                        return Err("fenced");
+                    }
+                    if !admitted_runtime_current(&state, claims, bound) {
+                        return Err("route_stale");
+                    }
+                }
+                let admitted = if claims.v == 4 {
+                    state
+                        .records
+                        .get(database)
+                        .and_then(|fence| fence.admission_target.clone())
+                } else {
+                    None
+                };
+                drop(state);
+                // The route was checked against this writer; a replacement is never dialled.
+                let physical = self.targets.read().await;
+                if !physical.permits(database, bound) {
+                    return Err("target_changed");
+                }
+                let watched = physical.ca_material(database);
+                Ok(DialPlan::Pod(database_target(
+                    database, bound, admitted, watched,
+                )))
+            }
+            (Discovery::Local(table), Writer::Unit(unit)) => {
+                let table = table.read().await;
+                if epoch.is_some_and(|epoch| {
+                    table.bound_epoch(database) != epoch || !table.admits(database)
+                }) {
+                    return Err("fenced");
+                }
+                if !table.permits(database, unit) {
+                    return Err("target_changed");
+                }
+                Ok(DialPlan::Unit(unit.clone()))
+            }
+            _ => Err("target_changed"),
+        }
+    }
+    pub(crate) async fn dial_plan(&self, plan: &DialPlan) -> Result<Upstream, DialError> {
+        match (&self.discovery, plan) {
+            (Discovery::Kubernetes(dial), DialPlan::Pod(target)) => dial
+                .dial(target)
+                .await
+                .map(Upstream::from)
+                .map_err(|_| DialError::Connect),
+            (_, DialPlan::Unit(unit)) => match local::dial(unit).await {
+                Ok(stream) => Ok(Upstream::Unix(stream)),
+                Err(local::DialFailure::Peer) => Err(DialError::Peer),
+                Err(local::DialFailure::Connect(_)) => Err(DialError::Connect),
+            },
+            (Discovery::Local(_), DialPlan::Pod(_)) => Err(DialError::Connect),
+        }
+    }
+}
+async fn bounded_write(postgres: &mut Upstream, bytes: &[u8]) -> Result<(), Blocked> {
+    match timeout(WRITE_BOUND, write_upstream(postgres, bytes)).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(Blocked::Lost),
+    }
+}
 pub(crate) struct SessionLease {
     gateway: Arc<Gateway>,
     database: String,
     pub(crate) id: String,
-    pub(crate) target: TargetIdentity,
+    pub(crate) target: Writer,
     wire: WireBudget,
 }
 impl Drop for SessionLease {
@@ -394,22 +801,16 @@ pub async fn serve_socket(
         Ok(Ok(head)) => head,
         _ => return control::reply_text(&mut socket, 400, "Bad Request\n").await,
     };
-    if let Some((status, body)) = gateway.control.handle(&head, &mut socket).await {
+    // The controller's control port exists only in Kubernetes mode; the agent's requests come
+    // over its local channel.
+    if gateway.local_table().is_none()
+        && let Some((status, body)) = gateway.control.handle(&head, &mut socket).await
+    {
         return control::reply(&mut socket, status, body).await;
     }
     let path = head.path.split('?').next().unwrap_or("");
     if head.method == "GET" && (path == "/healthz" || path == "/readyz") {
-        let ready = {
-            // Global order whenever both are held: fences, then targets.
-            let state = gateway.fences.read().await;
-            let physical = gateway.targets.read().await;
-            state.synchronized()
-                && physical.synchronized()
-                // A writer the kubelet has not reported Ready is recognized only by the Pod
-                // watch, and a woken database is published on the attestation alone.
-                && physical.pods_synchronized()
-                && !gateway.draining.load(Ordering::Acquire)
-        };
+        let ready = gateway.ready().await;
         return control::reply_text(
             &mut socket,
             if path == "/readyz" && !ready {
@@ -455,10 +856,10 @@ pub async fn serve_socket(
             match wake_state(&gateway, &ticket).await {
                 // Released at its generation already: routed at once, as a running database is.
                 WakeState::Released {
-                    pod,
+                    writer,
                     route_revision,
                     ..
-                } => (admitted_wake(&ticket, &pod, route_revision), stages),
+                } => (admitted_wake(&ticket, &writer, route_revision), stages),
                 WakeState::Stale => {
                     stages.outcome = "route_stale";
                     return control::reply(
@@ -494,36 +895,21 @@ pub async fn serve_socket(
             let stages = Stages::new(&claims.db, received);
             (claims, stages)
         };
-    let state = gateway.fences.read().await;
-    let epoch = state.bound_epoch(&claims.db);
-    if gateway.draining.load(Ordering::Acquire) || !state.admits(&claims.db) {
-        drop(state);
-        stages.outcome = "fenced";
-        return control::reply(&mut socket, 503, serde_json::json!({"error":"fenced"})).await;
-    }
-    let revision_current = route_revision_current(&state, &claims);
-    drop(state);
-    let target = match gateway.targets.read().await.target(&claims.db) {
-        Ok(target) => target,
-        Err(reason) => {
-            stages.outcome = "target_unavailable";
-            stages.target_reason = Some(reason);
+    let (target, epoch) = match gateway.admit(&claims, None).await {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            stages.outcome = refused.outcome;
+            stages.target_reason = refused.reason;
+            stages.route = refused.route;
             return control::reply(
                 &mut socket,
                 503,
-                serde_json::json!({"error":"target_unavailable"}),
+                serde_json::json!({ "error": refused.outcome }),
             )
             .await;
         }
     };
-    stages.route = Some(if target.unready { "attested" } else { "ready" });
-    if !revision_current
-        || !route_target_current(&claims, &target)
-        || !admitted_runtime_current(&*gateway.fences.read().await, &claims, &target)
-    {
-        stages.outcome = "route_stale";
-        return control::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"})).await;
-    }
+    stages.route = Some(target.route());
     let Some(base) = session_memory(&gateway, &claims.db) else {
         stages.outcome = "memory_capacity";
         return memory_refused(&mut socket, &gateway, &claims.db).await;
@@ -625,13 +1011,14 @@ async fn memory_refused(
     )
     .await
 }
-/// What the fence shows of a wake ticket.
+/// What the fence, or the agent's table, shows of a wake ticket.
 pub(crate) enum WakeState {
-    /// Running at the ticket's generation and operation, with an admission target of that
-    /// generation whose Pod is the writer the watches show. Its route revision is the ticket's or
-    /// a later one: Cloudflare's own claim of the wake moves the revision on.
+    /// Running at the ticket's generation and operation on `writer`: in Kubernetes mode with an
+    /// admission target of that generation whose Pod is the writer the watches show, in local
+    /// mode on the unit the agent released. Its route revision is the ticket's or a later one:
+    /// Cloudflare's own claim of the wake moves the revision on.
     Released {
-        pod: String,
+        writer: String,
         slot: bool,
         route_revision: u64,
     },
@@ -640,6 +1027,34 @@ pub(crate) enum WakeState {
     Stale,
 }
 pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
+    let Discovery::Local(table) = &gateway.discovery else {
+        return pod_wake_state(gateway, ticket).await;
+    };
+    let table = table.read().await;
+    let Some(record) = table.record(&ticket.db) else {
+        return WakeState::Waiting;
+    };
+    if record.mode == Mode::Retired
+        || record.generation > ticket.generation
+        || (record.generation == ticket.generation
+            && (record.operation != ticket.op || record.route_revision < ticket.route_revision))
+    {
+        return WakeState::Stale;
+    }
+    match (&record.mode, &record.writer) {
+        (Mode::Running, Some(unit))
+            if table.synchronized() && record.generation == ticket.generation =>
+        {
+            WakeState::Released {
+                writer: unit.instance.clone(),
+                slot: false,
+                route_revision: record.route_revision,
+            }
+        }
+        _ => WakeState::Waiting,
+    }
+}
+async fn pod_wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeState {
     // Global order whenever both are held: fences, then targets.
     let state = gateway.fences.read().await;
     let Some(fence) = state.records.get(&ticket.db) else {
@@ -665,7 +1080,7 @@ pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeSt
     let writer = gateway.targets.read().await.target(&ticket.db);
     match writer {
         Ok(writer) if writer.pod_uid == target.pod_uid => WakeState::Released {
-            pod: target.pod_uid.clone(),
+            writer: target.pod_uid.clone(),
             slot: wake::slot_namespace_of_tls_name(&target.tls_server_name).is_some(),
             route_revision: target.route_revision,
         },
@@ -673,9 +1088,9 @@ pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeSt
     }
 }
 /// The route a released wake is admitted under: the ticket's connection at its generation, the
-/// released Pod, and the route revision of the admission target that released it.
-pub(crate) fn admitted_wake(ticket: &WakeClaims, pod: &str, route_revision: u64) -> RouteClaims {
-    let mut claims = ticket.admitted(Some(pod));
+/// released writer (a Pod, or a unit's invocation ID), and the route revision that released it.
+pub(crate) fn admitted_wake(ticket: &WakeClaims, writer: &str, route_revision: u64) -> RouteClaims {
+    let mut claims = ticket.admitted(Some(writer));
     claims.route_revision = Some(route_revision);
     claims
 }
@@ -697,10 +1112,10 @@ async fn held_state(
     }
     match wake_state(gateway, ticket).await {
         WakeState::Released {
-            pod,
+            writer,
             slot,
             route_revision,
-        } => Some(Ok((pod, slot, route_revision))),
+        } => Some(Ok((writer, slot, route_revision))),
         WakeState::Stale => Some(Err(HeldEnd::Stale)),
         WakeState::Waiting => None,
     }
@@ -827,7 +1242,7 @@ async fn serve_held(
         let read = read_startup(&mut websocket, &route, &gateway, &id, &wire, &mut stages);
         tokio::pin!(read);
         loop {
-            let fences_changed = gateway.fences.read().await.changed.clone();
+            let [fences_changed, _] = gateway.signals().await;
             let fences = fences_changed.notified();
             tokio::pin!(fences);
             fences.as_mut().enable();
@@ -860,8 +1275,7 @@ async fn serve_held(
     };
     let released = loop {
         // Armed before the fence is read, so a change between the read and the wait wakes it.
-        let fences_changed = gateway.fences.read().await.changed.clone();
-        let targets_changed = gateway.targets.read().await.changed.clone();
+        let [fences_changed, targets_changed] = gateway.signals().await;
         let fences = fences_changed.notified();
         let targets = targets_changed.notified();
         tokio::pin!(fences, targets);
@@ -896,7 +1310,7 @@ async fn serve_held(
         }
     };
     stages.verdict = Some(held.release());
-    let (pod, slot, route_revision) = match released {
+    let (writer, slot, route_revision) = match released {
         Ok(released) => released,
         Err(end) => {
             end_held(&mut websocket, &mut stages, end).await;
@@ -909,30 +1323,18 @@ async fn serve_held(
         stages.wake_path = "pool_hit";
     }
     // From here the connection is the admitted route of the woken writer.
-    let claims = admitted_wake(&ticket, &pod, route_revision);
-    let state = gateway.fences.read().await;
-    let epoch = state.bound_epoch(&database);
-    let revision_current = state.admits(&database) && route_revision_current(&state, &claims);
-    drop(state);
-    let target = match gateway.targets.read().await.target(&database) {
-        Ok(target) => target,
-        Err(reason) => {
-            stages.outcome = "target_unavailable";
-            stages.target_reason = Some(reason);
+    let claims = admitted_wake(&ticket, &writer, route_revision);
+    let (target, epoch) = match gateway.admit(&claims, Some(&writer)).await {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            stages.outcome = refused.outcome;
+            stages.target_reason = refused.reason;
+            stages.route = refused.route;
             let _ = send_error(&mut websocket, "08006", "database connection failed").await;
             return Ok(());
         }
     };
-    stages.route = Some(if target.unready { "attested" } else { "ready" });
-    if !revision_current
-        || target.pod_uid != pod
-        || !route_target_current(&claims, &target)
-        || !admitted_runtime_current(&*gateway.fences.read().await, &claims, &target)
-    {
-        stages.outcome = "route_stale";
-        let _ = send_error(&mut websocket, "08006", "database connection failed").await;
-        return Ok(());
-    }
+    stages.route = Some(target.route());
     let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, false) {
         Ok(value) => value,
         Err(_) => {
@@ -978,7 +1380,7 @@ async fn serve_held(
 struct Admitted<'a> {
     claims: &'a RouteClaims,
     session: &'a SessionLease,
-    epoch: (u64, u64),
+    epoch: Epoch,
 }
 /// The client's StartupMessage, with what it sent behind it, checked against the route.
 struct Started {
@@ -997,7 +1399,7 @@ struct Started {
 /// admit it, then relays the session.
 async fn run_session(
     websocket: &mut WebSocket,
-    mut postgres: TlsStream<TcpStream>,
+    mut postgres: Upstream,
     started: Started,
     admitted: Admitted<'_>,
     actions: &mut watch::Receiver<Action>,
@@ -1030,24 +1432,25 @@ async fn run_session(
             initial.extend_from_slice(&rest);
         }
         update(gateway, id, &activity, true, false);
-        let state = gateway.fences.read().await;
-        if state.bound_epoch(&claims.db) != epoch || !state.admits(&claims.db) {
-            stages.outcome = "fenced";
-            return Err("startup fenced before first upstream write".into());
+        match gateway
+            .write_admitted(&claims.db, epoch, target, &mut postgres, &initial)
+            .await
+        {
+            Ok(()) => {}
+            Err(Blocked::Fenced) => {
+                stages.outcome = "fenced";
+                return Err("startup fenced before first upstream write".into());
+            }
+            Err(Blocked::TargetChanged) => {
+                stages.outcome = "target_changed";
+                return Err("writer changed before first upstream write".into());
+            }
+            Err(Blocked::Lost) => {
+                stages.outcome = "postgres_error";
+                return Err("first upstream write failed".into());
+            }
         }
-        let physical = gateway.targets.read().await;
-        if !physical.permits(&claims.db, target) {
-            stages.outcome = "target_changed";
-            return Err("writer changed before first upstream write".into());
-        }
-        let written = timeout(WRITE_BOUND, write_upstream(&mut postgres, &initial)).await;
-        if !matches!(written, Ok(Ok(()))) {
-            stages.outcome = "postgres_error";
-        }
-        written??;
         stages.written = Some(Instant::now());
-        drop(physical);
-        drop(state);
         let mut held = None;
         if let Some(password) = password {
             let login = tokio::select! {
@@ -1257,18 +1660,15 @@ async fn send_client(
 /// A write is done only when its TLS records reached the socket. Under backpressure tokio-rustls
 /// returns from `write_all` with records still queued, which only a later write would send,
 /// while the client already waits for PostgreSQL's reply; callers bound both steps together.
-pub(crate) async fn write_upstream(
-    postgres: &mut TlsStream<TcpStream>,
-    bytes: &[u8],
-) -> std::io::Result<()> {
+pub(crate) async fn write_upstream(postgres: &mut Upstream, bytes: &[u8]) -> std::io::Result<()> {
     postgres.write_all(bytes).await?;
     postgres.flush().await
 }
 /// Ends a failed PostgreSQL session with close_notify and FIN within 500 ms, so PostgreSQL
 /// sees a clean end of stream instead of an unexpected EOF. A stream with queued TLS records is
 /// only dropped: its close_notify would first deliver bytes to a writer that may have changed.
-pub(crate) async fn close_upstream(postgres: &mut TlsStream<TcpStream>) {
-    if !postgres.get_ref().1.wants_write() {
+pub(crate) async fn close_upstream(postgres: &mut Upstream) {
+    if !postgres.queued() {
         let _ = timeout(Duration::from_millis(500), postgres.shutdown()).await;
     }
 }
@@ -1385,65 +1785,44 @@ async fn read_startup(
 async fn dial_started(
     claims: &RouteClaims,
     session: &SessionLease,
-    epoch: (u64, u64),
+    epoch: Epoch,
     stages: &mut Stages,
     early: &mut Option<EarlyDial>,
-) -> Result<TlsStream<TcpStream>, Failure> {
+) -> Result<Upstream, Failure> {
     let gateway = &*session.gateway;
-    let id = &session.id;
-    let bound = &session.target;
     let database = &claims.db;
-    let state = gateway.fences.read().await;
-    if state.bound_epoch(database) != epoch || !state.admits(database) {
-        stages.outcome = "fenced";
-        return Err("fence changed during startup".into());
-    }
-    if !admitted_runtime_current(&state, claims, bound) {
-        return Err("admitted runtime changed before dial".into());
-    }
-    let admitted = if claims.v == 4 {
-        state
-            .records
-            .get(database)
-            .and_then(|fence| fence.admission_target.clone())
-    } else {
-        None
-    };
-    drop(state);
-    // The route was checked against this writer; a replacement is never dialled.
-    let watched = {
-        let physical = gateway.targets.read().await;
-        if !physical.permits(database, bound) {
-            stages.outcome = "target_changed";
-            return Err("writer changed before dial".into());
-        }
-        physical.ca_material(database)
-    };
+    let plan = gateway
+        .plan(claims, Some(epoch), &session.target)
+        .await
+        .map_err(|outcome| {
+            stages.outcome = outcome;
+            "writer not admitted before dial"
+        })?;
     gateway
         .sessions
         .lock()
         .unwrap()
-        .update(id, false, true, true);
-    let target = database_target(database, bound, admitted, watched);
+        .update(&session.id, false, true, true);
     // The dial that began with the admission is this one if it was for this target; a target that
     // changed since is dialled anew, and the old connection is dropped unused.
     let (dialed, took) = match early.take() {
-        Some(early) if early.target == target => early.finish().await,
+        Some(early) if early.plan == plan => early.finish().await,
         other => {
             drop(other);
             let dialing = Instant::now();
-            let dialed = gateway.dial.dial(&target).await;
+            let dialed = gateway.dial_plan(&plan).await;
             (dialed, dialing.elapsed())
         }
     };
     stages.dial = Some(took);
-    let mut postgres = dialed.inspect_err(|_| stages.outcome = "postgres_connect_error")?;
-    let state = gateway.fences.read().await;
-    if state.bound_epoch(database) != epoch || !state.admits(database) {
-        drop(state);
+    let mut postgres = dialed.map_err(|error| {
+        stages.outcome = error.outcome();
+        "PostgreSQL dial failed"
+    })?;
+    if !gateway.admitted_at(database, epoch).await {
         stages.outcome = "fenced";
         close_upstream(&mut postgres).await;
-        return Err("fence changed during TLS negotiation".into());
+        return Err("fence changed during the dial".into());
     }
     Ok(postgres)
 }
@@ -1452,10 +1831,10 @@ async fn startup(
     socket: &mut WebSocket,
     claims: &RouteClaims,
     session: &SessionLease,
-    epoch: (u64, u64),
+    epoch: Epoch,
     stages: &mut Stages,
     early: &mut Option<EarlyDial>,
-) -> Result<(TlsStream<TcpStream>, Started), Failure> {
+) -> Result<(Upstream, Started), Failure> {
     let mut started = read_startup(
         socket,
         claims,
@@ -1498,18 +1877,18 @@ pub(crate) fn database_target(
         pod_uid: bound.pod_uid.clone(),
     }
 }
-/// A dial of PostgreSQL that began when the route was admitted: the connection is TLS-verified and
-/// has had no byte of the client written to it.
+/// A dial of PostgreSQL that began when the route was admitted: the connection is TLS-verified,
+/// or its peer is the unit, and it has had no byte of the client written to it.
 struct EarlyDial {
-    target: DatabaseTarget,
-    task: tokio::task::JoinHandle<(Result<TlsStream<TcpStream>, Failure>, Duration)>,
+    plan: DialPlan,
+    task: tokio::task::JoinHandle<(Result<Upstream, DialError>, Duration)>,
 }
 impl EarlyDial {
     /// The connection, or why there is none, and how long the dial itself took.
-    async fn finish(mut self) -> (Result<TlsStream<TcpStream>, Failure>, Duration) {
+    async fn finish(mut self) -> (Result<Upstream, DialError>, Duration) {
         match (&mut self.task).await {
             Ok(dialed) => dialed,
-            Err(_) => (Err("PostgreSQL dial ended".into()), Duration::ZERO),
+            Err(_) => (Err(DialError::Connect), Duration::ZERO),
         }
     }
 }
@@ -1523,34 +1902,15 @@ impl Drop for EarlyDial {
 async fn early_dial(
     gateway: &Arc<Gateway>,
     claims: &RouteClaims,
-    bound: &TargetIdentity,
+    bound: &Writer,
 ) -> Option<EarlyDial> {
-    let admitted = if claims.v == 4 {
-        gateway
-            .fences
-            .read()
-            .await
-            .records
-            .get(&claims.db)
-            .and_then(|fence| fence.admission_target.clone())
-    } else {
-        None
-    };
-    // The route was checked against this writer; a replacement is never dialled.
-    let watched = {
-        let physical = gateway.targets.read().await;
-        if !physical.permits(&claims.db, bound) {
-            return None;
-        }
-        physical.ca_material(&claims.db)
-    };
-    let target = database_target(&claims.db, bound, admitted, watched);
-    let (dialer, wanted) = (gateway.clone(), target.clone());
+    let plan = gateway.plan(claims, None, bound).await.ok()?;
+    let (dialer, wanted) = (gateway.clone(), plan.clone());
     Some(EarlyDial {
-        target,
+        plan,
         task: tokio::spawn(async move {
             let began = Instant::now();
-            let dialed = dialer.dial.dial(&wanted).await;
+            let dialed = dialer.dial_plan(&wanted).await;
             (dialed, began.elapsed())
         }),
     })
@@ -1573,7 +1933,7 @@ fn certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn relay(
     websocket: &mut WebSocket,
-    postgres: &mut TlsStream<TcpStream>,
+    postgres: &mut Upstream,
     session: &SessionLease,
     activity: &mut PostgresActivity,
     mut held: Option<(Vec<u8>, Vec<Lease>)>,
@@ -1594,13 +1954,13 @@ async fn relay(
     let database = id.split_once('/').expect("bound session identity").0;
     update(gateway, id, activity, false, false);
     loop {
-        if !gateway.targets.read().await.permits(database, target) {
+        if !gateway.permits(database, target).await {
             stages.outcome = "target_changed";
             close(websocket, CloseCode::Restart, "writer changed").await;
             break;
         }
         let requested = *actions.borrow_and_update();
-        let mut mode = current_mode(gateway, database, requested).await;
+        let mut mode = gateway.mode(database, requested).await;
         if mode == Action::Running
             && let Some((bytes, lease)) = held.take()
         {
@@ -1609,7 +1969,7 @@ async fn relay(
                 drop(lease);
             } else {
                 held = Some((bytes, lease));
-                mode = current_mode(gateway, database, requested).await;
+                mode = gateway.mode(database, requested).await;
             }
         }
         update(gateway, id, activity, held.is_some(), false);
@@ -1724,60 +2084,35 @@ pub(crate) fn route_target_current(claims: &RouteClaims, target: &TargetIdentity
         _ => false,
     }
 }
-async fn current_mode(gateway: &Gateway, database: &str, requested: Action) -> Action {
-    let state = gateway.fences.read().await;
-    match state
-        .records
-        .get(database)
-        .map(|fence| fence.intent.mode.as_str())
-    {
-        Some("retired") => Action::Retire,
-        Some("quiesce") => {
-            if matches!(requested, Action::CloseIdle | Action::CloseAuthentication) {
-                requested
-            } else {
-                Action::Quiesce
-            }
-        }
-        _ => Action::Running,
-    }
-}
+/// Forwards client bytes while the database runs on the session's writer; false while they wait.
 async fn forward_if_running(
     gateway: &Gateway,
     database: &str,
-    target: &TargetIdentity,
-    postgres: &mut TlsStream<TcpStream>,
+    target: &Writer,
+    postgres: &mut Upstream,
     bytes: &[u8],
     stages: &mut Stages,
 ) -> Result<bool, Failure> {
-    // Match startup/health ordering while retaining both guards through the bounded write.
-    let state = gateway.fences.read().await;
-    let physical = gateway.targets.read().await;
-    if !physical.permits(database, target) {
-        stages.outcome = "target_changed";
-        return Err("writer changed".into());
-    }
-    if !state.synchronized() {
-        stages.outcome = "fenced";
-        return Err("power authority unavailable".into());
-    }
-    if state
-        .records
-        .get(database)
-        .is_some_and(|fence| fence.intent.mode != "running")
-    {
-        return Ok(false);
-    }
     // The bounded enqueue and fence publication share this read/write boundary.
     // Bytes already being written stay busy; new bytes cannot cross a published fence.
-    let written = timeout(WRITE_BOUND, write_upstream(postgres, bytes)).await;
-    if !matches!(written, Ok(Ok(()))) {
-        stages.outcome = "postgres_error";
+    match gateway
+        .write_running(database, target, postgres, bytes)
+        .await
+    {
+        Ok(written) => Ok(written),
+        Err(Blocked::TargetChanged) => {
+            stages.outcome = "target_changed";
+            Err("writer changed".into())
+        }
+        Err(Blocked::Fenced) => {
+            stages.outcome = "fenced";
+            Err("power authority unavailable".into())
+        }
+        Err(Blocked::Lost) => {
+            stages.outcome = "postgres_error";
+            Err("PostgreSQL write failed".into())
+        }
     }
-    written??;
-    drop(physical);
-    drop(state);
-    Ok(true)
 }
 /// TLS verification finishes before the first PostgreSQL StartupMessage,
 /// credential or query byte. Unknown writes are never redialed or replayed.

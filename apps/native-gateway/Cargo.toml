@@ -27,4 +27,5 @@ zeroize = "=1.9.1"
 base64 = "=0.23.1"
 
 [dev-dependencies]
+pgcf-test-postgres = { path = "../../packages/test-postgres" }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }

@@ -18,6 +18,12 @@ Pinned Rust, Edge build and CI toolchain versions are in [infra/platform/version
 | [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE)           | Outbound Tunnel of each node; the node image pins its binary.                                                                           |
 | [Neon serverless driver](https://github.com/neondatabase/serverless)                      | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE)                      | Client library compatible with the edge endpoint (WebSocket `Pool`/`Client`). Used by clients and tests, not bundled into the platform. |
 
+**PostgreSQL test server:** CI installs PostgreSQL 18.6 from the PGDG apt repository, the
+`postgresql-18` and `postgresql-client-18` packages at `18.6-1.pgdg24.04+2`, verified by the
+repository key fingerprint `B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8`. It serves only the Rust
+tests of the gateway and the archive clients, which start real servers; it is in no PGCF image
+and on no node. The packages retain the PostgreSQL License and their own notices.
+
 **Barman license note:** the upstream package metadata declares `GPL-3.0-only`, while the README
 and source headers say GPL version 3 or later. Record the declaration at the pinned release.
 

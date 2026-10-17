@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
-members = ["apps/edge-rust", "apps/node-agent", "packages/native-protocol", "apps/native-gateway"]
+members = ["apps/edge-rust", "apps/node-agent", "packages/native-protocol", "apps/native-gateway", "apps/pgcf-archive", "apps/pgcf-wal-fetch", "packages/test-postgres"]
 resolver = "3"

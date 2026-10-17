@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Portable protocol validation. Generated source contracts remain authoritative.
 pub mod activity;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod agent;
 #[path = "constants.generated.rs"]
 pub mod generated;
 pub mod route;

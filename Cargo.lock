@@ -1176,6 +1176,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pgcf-archive"
+version = "0.1.0"
+dependencies = [
+ "pgcf-test-postgres",
+]
+
+[[package]]
 name = "pgcf-edge-rust"
 version = "0.1.0"
 dependencies = [
@@ -1205,6 +1212,7 @@ dependencies = [
  "hmac",
  "httparse",
  "pgcf-native-protocol",
+ "pgcf-test-postgres",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1253,6 +1261,18 @@ dependencies = [
  "tokio-rustls",
  "webpki-roots",
  "x509-parser",
+]
+
+[[package]]
+name = "pgcf-test-postgres"
+version = "0.1.0"
+
+[[package]]
+name = "pgcf-wal-fetch"
+version = "0.1.0"
+dependencies = [
+ "pgcf-archive",
+ "pgcf-test-postgres",
 ]
 
 [[package]]

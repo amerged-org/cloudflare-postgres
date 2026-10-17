@@ -6,6 +6,38 @@ gateway local mode replaces it in Stage 3 of the ULTRA plan; it is not deployed 
 runtime is rebuilt. Local protocol tests do not establish database, backup or restore acceptance;
 the ULTRA plan records those.
 
+## Local mode
+
+`PGCF_GATEWAY_MODE=local` runs the gateway on a node beside the node agent (ULTRA plan 5.7). It
+listens on `127.0.0.1:PGCF_GATEWAY_PORT` only, for cloudflared, and needs no Kubernetes identity
+or permission. Its writers are the agent's table, which the agent sends over its local channel
+(`PGCF_AGENT_SOCKET`, default `/run/pgcf/agent/gateway.sock`; the messages are
+`pgcf_native_protocol::agent`, one JSON object per line). Only the gateway's user may connect to
+that socket; the databases reach the agent on its separate archive socket.
+
+- The agent sends its whole table first and then every change. Each database names its generation
+  and operation, its route revision, its mode (`running`, `quiesce`, `sleeping`, `retired`) and,
+  while PostgreSQL runs, its unit: the Unix socket, the database's uid, the unit's main PID and the
+  unit's invocation ID.
+- A route is admitted only on a running unit, and only as an admission route (v4) whose
+  generation, route revision and `pod` (the unit's invocation ID, until the route version that
+  names node and instance replaces v4) are the table's. The dial is the database's socket; the
+  connection is kept only when the kernel's peer credentials are the unit's uid and main PID.
+  Nothing is written to any other process, and a failed check logs the outcome `peer_mismatch`.
+- A wake ticket (v5) is held as in Kubernetes mode; the gateway sends the agent the wake before it
+  answers the upgrade (`wake`, again after 3 s without a result). The release is the table entry
+  that shows the unit running at the ticket's generation and operation; a `wake_result` labels
+  the connections or refuses them with 57P03.
+- The agent's `control` requests replace the controller's control port: `begin` (quiesce),
+  `close` (close idle sessions with 1000 "database sleeping") and `status`, each for a generation,
+  answered with the session counts. `activity` answers the gateway's measurements of a database.
+- Without the channel the gateway admits nothing new and releases no wake; established sessions
+  keep their unit, which only the agent stops. A database the next table leaves out, or the agent
+  removes, closes its sessions. The agent's first message on every channel is its table.
+
+The tests in `tests/local.rs` run this mode against a real PostgreSQL 18 that the test starts
+(`PGCF_TEST_POSTGRES_BINDIR`, see `packages/test-postgres`), with the test as the agent.
+
 The production entry point is configured through `PGCF_REGION_ID`, the derived
 `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_POD_UID`, `PGCF_GATEWAY_PORT`, `PGCF_GATEWAY_MEMORY_BYTES` and
 `PGCF_GATEWAY_DATABASE_MEMORY_BYTES`. It reads only the projected Kubernetes ServiceAccount

@@ -24,8 +24,8 @@ use crate::{
     budget::{Lease, WireBudget},
     control::{self, HttpHead},
     sessions::Action,
-    targets::TargetIdentity,
-    transport::{self, Gateway, SessionLease, WakeState},
+    transport::{self, Blocked, Epoch, Gateway, SessionLease, WakeState, Writer},
+    upstream::Upstream,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
@@ -45,7 +45,6 @@ use tokio::{
     sync::{OwnedSemaphorePermit, oneshot, watch},
     time::timeout,
 };
-use tokio_rustls::client::TlsStream;
 use zeroize::Zeroizing;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 pub const PATH: &str = "/sql";
@@ -246,11 +245,11 @@ impl Drop for Stages {
 struct Backend {
     lease: SessionLease,
     actions: watch::Receiver<Action>,
-    postgres: TlsStream<TcpStream>,
+    postgres: Upstream,
     database: String,
     user: String,
     /// The fence epoch the session was admitted at.
-    epoch: (u64, u64),
+    epoch: Epoch,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
     authenticated: Instant,
@@ -575,27 +574,27 @@ async fn read_more(
 }
 
 /// Waits, as a held WebSocket connection does, until the fence releases the ticket's wake; the
-/// answer is the route the request is admitted under and the released Pod.
+/// answer is the route the request is admitted under and the released writer.
 async fn wake(
     gateway: &Arc<Gateway>,
     ticket: &WakeClaims,
     stop: &watch::Receiver<bool>,
     stages: &mut Stages,
 ) -> Result<(RouteClaims, String), Refused> {
-    let released = |pod: String, slot: bool, route_revision: u64, stages: &mut Stages| {
+    let released = |writer: String, slot: bool, route_revision: u64, stages: &mut Stages| {
         if slot {
             stages.wake_path = "pool_hit";
         }
-        let claims = transport::admitted_wake(ticket, &pod, route_revision);
-        (claims, pod)
+        let claims = transport::admitted_wake(ticket, &writer, route_revision);
+        (claims, writer)
     };
     // Released at its generation already: routed at once, as a running database is.
     match transport::wake_state(gateway, ticket).await {
         WakeState::Released {
-            pod,
+            writer,
             route_revision,
             ..
-        } => return Ok(released(pod, false, route_revision, stages)),
+        } => return Ok(released(writer, false, route_revision, stages)),
         WakeState::Stale => return Err(not_accepting("route_stale")),
         WakeState::Waiting => {}
     }
@@ -608,8 +607,7 @@ async fn wake(
     let mut stop = stop.clone();
     loop {
         // Armed before the fence is read, so a change between the read and the wait wakes it.
-        let fences_changed = gateway.fences.read().await.changed.clone();
-        let targets_changed = gateway.targets.read().await.changed.clone();
+        let [fences_changed, targets_changed] = gateway.signals().await;
         let fences = fences_changed.notified();
         let targets = targets_changed.notified();
         tokio::pin!(fences, targets);
@@ -626,12 +624,12 @@ async fn wake(
         }
         match transport::wake_state(gateway, ticket).await {
             WakeState::Released {
-                pod,
+                writer,
                 slot,
                 route_revision,
             } => {
                 let _ = held.release();
-                return Ok(released(pod, slot, route_revision, stages));
+                return Ok(released(writer, slot, route_revision, stages));
             }
             WakeState::Stale => return Err(not_accepting("route_stale")),
             WakeState::Waiting => {}
@@ -649,34 +647,17 @@ async fn wake(
         }
     }
 }
-/// The writer the route was admitted on, if the fence and the watches still show it, and the
-/// fence epoch it is admitted at.
+/// The writer the route was admitted on, if the fence and the watches (or the agent's table)
+/// still show it, and the fence epoch it is admitted at.
 async fn current(
     gateway: &Gateway,
     claims: &RouteClaims,
     released: Option<&str>,
-) -> Result<(TargetIdentity, (u64, u64)), Refused> {
-    let state = gateway.fences.read().await;
-    let epoch = state.bound_epoch(&claims.db);
-    if gateway.draining.load(Ordering::Acquire) || !state.admits(&claims.db) {
-        return Err(not_accepting("fenced"));
-    }
-    let revision_current = transport::route_revision_current(&state, claims);
-    drop(state);
-    let target = gateway
-        .targets
-        .read()
+) -> Result<(Writer, Epoch), Refused> {
+    gateway
+        .admit(claims, released)
         .await
-        .target(&claims.db)
-        .map_err(|_| not_accepting("target_unavailable"))?;
-    if !revision_current
-        || released.is_some_and(|pod| target.pod_uid != pod)
-        || !transport::route_target_current(claims, &target)
-        || !transport::admitted_runtime_current(&*gateway.fences.read().await, claims, &target)
-    {
-        return Err(not_accepting("route_stale"));
-    }
-    Ok((target, epoch))
+        .map_err(|refusal| not_accepting(refusal.outcome))
 }
 
 /// What the pool had for a request.
@@ -692,8 +673,8 @@ enum Checkout {
 async fn checkout(
     gateway: &Gateway,
     claims: &RouteClaims,
-    target: &TargetIdentity,
-    epoch: (u64, u64),
+    target: &Writer,
+    epoch: Epoch,
     password: &Password,
 ) -> Checkout {
     let key = (claims.db.clone(), claims.user.clone());
@@ -734,13 +715,9 @@ async fn checkout(
             continue;
         };
         if backend.epoch == epoch
-            && backend.lease.target.pod_uid == target.pod_uid
+            && backend.lease.target.id() == target.id()
             && backend.authenticated.elapsed() < LIFETIME
-            && gateway
-                .targets
-                .read()
-                .await
-                .permits(&claims.db, &backend.lease.target)
+            && gateway.permits(&claims.db, &backend.lease.target).await
         {
             return Checkout::Taken(Box::new(backend));
         }
@@ -752,8 +729,8 @@ async fn checkout(
 async fn open(
     gateway: &Arc<Gateway>,
     claims: &RouteClaims,
-    target: &TargetIdentity,
-    epoch: (u64, u64),
+    target: &Writer,
+    epoch: Epoch,
     password: &Password,
     known: Option<Salted>,
     stages: &mut Stages,
@@ -765,47 +742,29 @@ async fn open(
     let (lease, actions) = gateway
         .reserve(claims, wire, target, false)
         .map_err(|_| capacity())?;
-    let admitted = {
-        let state = gateway.fences.read().await;
-        if state.bound_epoch(database) != epoch
-            || !state.admits(database)
-            || !transport::admitted_runtime_current(&state, claims, target)
-        {
-            return Err(not_accepting("fenced"));
-        }
-        (claims.v == 4)
-            .then(|| {
-                state
-                    .records
-                    .get(database)
-                    .and_then(|fence| fence.admission_target.clone())
-            })
-            .flatten()
-    };
     // The route was checked against this writer; a replacement is never dialled.
-    let watched = {
-        let physical = gateway.targets.read().await;
-        if !physical.permits(database, target) {
-            return Err(not_accepting("target_changed"));
-        }
-        physical.ca_material(database)
-    };
+    let plan = gateway
+        .plan(claims, Some(epoch), target)
+        .await
+        .map_err(|outcome| {
+            not_accepting(if outcome == "target_changed" {
+                outcome
+            } else {
+                "fenced"
+            })
+        })?;
     gateway
         .sessions
         .lock()
         .unwrap()
         .update(&lease.id, false, true, true);
     let dialing = Instant::now();
-    let dialed = timeout(
-        transport::STARTUP_BOUND,
-        gateway.dial.dial(&transport::database_target(
-            database, target, admitted, watched,
-        )),
-    )
-    .await;
+    let dialed = timeout(transport::STARTUP_BOUND, gateway.dial_plan(&plan)).await;
     stages.dial = Some(dialing.elapsed());
-    let Ok(Ok(postgres)) = dialed else {
-        return Err(connection_failed("postgres_connect_error"));
+    let postgres = match dialed {
+        Ok(Ok(postgres)) => postgres,
+        Ok(Err(error)) => return Err(connection_failed(error.outcome())),
+        Err(_) => return Err(connection_failed("postgres_connect_error")),
     };
     gateway
         .sessions
@@ -918,25 +877,20 @@ async fn write_guarded(
     backend: &mut Backend,
     bytes: &[u8],
 ) -> Result<(), Guard> {
-    let state = gateway.fences.read().await;
-    let physical = gateway.targets.read().await;
-    if !physical.permits(&backend.database, &backend.lease.target)
-        || state.bound_epoch(&backend.database) != backend.epoch
-        || !state.admits(&backend.database)
-    {
-        return Err(Guard::Fenced);
-    }
-    let written = timeout(
-        transport::WRITE_BOUND,
-        transport::write_upstream(&mut backend.postgres, bytes),
-    )
-    .await;
-    drop(physical);
-    drop(state);
-    match written {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(Guard::Lost),
-    }
+    let Backend {
+        lease,
+        postgres,
+        database,
+        epoch,
+        ..
+    } = backend;
+    gateway
+        .write_admitted(database, *epoch, &lease.target, postgres, bytes)
+        .await
+        .map_err(|blocked| match blocked {
+            Blocked::Fenced | Blocked::TargetChanged => Guard::Fenced,
+            Blocked::Lost => Guard::Lost,
+        })
 }
 enum Guard {
     /// Nothing was written.
@@ -944,7 +898,7 @@ enum Guard {
     /// The write failed: its bytes may have reached PostgreSQL.
     Lost,
 }
-async fn read_message(postgres: &mut TlsStream<TcpStream>) -> std::io::Result<(u8, Vec<u8>)> {
+async fn read_message(postgres: &mut Upstream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut header = [0; 5];
     postgres.read_exact(&mut header).await?;
     let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
@@ -1209,7 +1163,7 @@ async fn retired(actions: &mut watch::Receiver<Action>) {
     }
 }
 async fn results(
-    postgres: &mut TlsStream<TcpStream>,
+    postgres: &mut Upstream,
     mut answer: Answer,
 ) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
     let mut error = None;

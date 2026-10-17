@@ -9,7 +9,10 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps/edge-rust/ apps/edge-rust/
 COPY apps/native-gateway/ apps/native-gateway/
 COPY apps/node-agent/ apps/node-agent/
+COPY apps/pgcf-archive/ apps/pgcf-archive/
+COPY apps/pgcf-wal-fetch/ apps/pgcf-wal-fetch/
 COPY packages/native-protocol/ packages/native-protocol/
+COPY packages/test-postgres/ packages/test-postgres/
 COPY packages/contracts/native/ packages/contracts/native/
 RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && cargo test --no-run --locked -p pgcf-node-agent --lib \
