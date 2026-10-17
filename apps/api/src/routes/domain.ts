@@ -5,6 +5,7 @@ import {
   ConnectionUri,
   Database,
   DatabaseCreate,
+  DatabaseIdleTime,
   DatabaseResize,
   DatabaseRestore,
   DatabaseRestored,
@@ -36,6 +37,7 @@ import {
   listDatabaseOperations,
   listDatabases,
   resizeDatabase,
+  setDatabaseIdleTime,
 } from "../domain/databases.ts";
 import { changePower } from "../domain/lifecycle.ts";
 import { desired } from "../domain/desired.ts";
@@ -89,6 +91,8 @@ const exampleDatabase = {
   node_id: "nod_abcdefghij1234567890",
   name: "orders",
   size_class_id: "small",
+  sleep_after_seconds: 300,
+  effective_sleep_after_seconds: 300,
   desired_state: "running",
   observed_state: "ready",
   suspension_reason: null,
@@ -253,6 +257,25 @@ export function registerDomain(app: ApiApp): void {
         c,
         DatabaseId.parse(c.req.param("id")),
         DatabaseResize.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "put",
+      path: "/v1/databases/{id}/idle-time",
+      security,
+      tags: ["Databases"],
+      description:
+        "Sets the database's own idle time before it sleeps (`sleep_after_seconds`, 60 to 900 s); null hands it back to the size class, whose null is always warm. The answer is the database with the `effective_sleep_after_seconds` that now applies. It is accepted in every state but deleted, also while another change is in progress, creates no operation and no new generation, and applies from the next idle check.",
+      request: { headers, params, body: body(DatabaseIdleTime) },
+      responses: responses(Database),
+    },
+    async (c) =>
+      setDatabaseIdleTime(
+        c,
+        DatabaseId.parse(c.req.param("id")),
+        DatabaseIdleTime.parse(await c.req.json()),
       ),
   );
   register(

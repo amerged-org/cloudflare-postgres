@@ -42,7 +42,7 @@ interface ReclaimState {
 import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
 import { wakeHintPage } from "./domain/desired.ts";
-import type { DatabaseRow } from "./domain/rows.ts";
+import { effectiveSleepAfterSql, type DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 import {
   AdmissionMutationIntent,
@@ -1933,10 +1933,10 @@ export class DatabaseActor extends DurableObject<Env> {
     )
       return { ok: false, reason: "activity_unavailable" };
     const row = await this.env.DB.prepare(
-      "SELECT d.*,s.sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.deleted_at IS NULL",
+      `SELECT d.*,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? AND d.deleted_at IS NULL`,
     )
       .bind(databaseId)
-      .first<DatabaseRow & { sleep_after_seconds: number | null }>();
+      .first<DatabaseRow & { effective_sleep_after_seconds: number | null }>();
     if (
       !row ||
       row.generation !== revision ||
@@ -1949,9 +1949,9 @@ export class DatabaseActor extends DurableObject<Env> {
     if (
       row.warm_reclaim_policy_json === null &&
       (activity.active_connections !== 0 ||
-        row.sleep_after_seconds === null ||
+        row.effective_sleep_after_seconds === null ||
         Date.now() - Date.parse(activity.last_activity_at) <
-          row.sleep_after_seconds * 1000)
+          row.effective_sleep_after_seconds * 1000)
     )
       return { ok: false, reason: "not_idle" };
     return undefined;
@@ -1988,10 +1988,12 @@ export class DatabaseActor extends DurableObject<Env> {
       )
         return { ok: false, reason: "activity_unavailable" };
       const row = await this.env.DB.prepare(
-        "SELECT d.*,s.sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.deleted_at IS NULL",
+        `SELECT d.*,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? AND d.deleted_at IS NULL`,
       )
         .bind(databaseId)
-        .first<DatabaseRow & { sleep_after_seconds: number | null }>();
+        .first<
+          DatabaseRow & { effective_sleep_after_seconds: number | null }
+        >();
       if (
         !row ||
         row.generation !== revision ||
@@ -2020,9 +2022,9 @@ export class DatabaseActor extends DurableObject<Env> {
       if (warm) return { ok: false, reason: "not_idle" };
       if (
         activity.active_connections !== 0 ||
-        row.sleep_after_seconds === null ||
+        row.effective_sleep_after_seconds === null ||
         Date.now() - Date.parse(activity.last_activity_at) <
-          row.sleep_after_seconds * 1000
+          row.effective_sleep_after_seconds * 1000
       )
         return { ok: false, reason: "not_idle" };
       await this.revokeReclaimLocked();

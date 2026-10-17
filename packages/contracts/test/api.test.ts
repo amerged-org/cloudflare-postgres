@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   ApiKeyCreate,
+  DatabaseCreate,
+  DatabaseIdleTime,
   DatabasePatch,
   DatabaseResize,
   OperationKind,
@@ -475,6 +477,44 @@ describe("request bodies", () => {
     expect(DatabasePatch.safeParse({ size_class_id: "small" }).success).toBe(
       true,
     );
+  });
+
+  it("takes a database's own idle time of 60 to 900 s, or null for its class's", () => {
+    const create = {
+      project_id: newProjectId(),
+      region_id: "eu-1",
+      name: "orders",
+      size_class_id: "small",
+    };
+    for (const value of [60, 900, null]) {
+      expect(
+        DatabaseCreate.safeParse({ ...create, sleep_after_seconds: value })
+          .success,
+      ).toBe(true);
+      expect(
+        DatabaseIdleTime.safeParse({ sleep_after_seconds: value }).success,
+      ).toBe(true);
+    }
+    for (const value of [59, 901, 60.5]) {
+      expect(
+        DatabaseCreate.safeParse({ ...create, sleep_after_seconds: value })
+          .success,
+      ).toBe(false);
+      expect(
+        DatabaseIdleTime.safeParse({ sleep_after_seconds: value }).success,
+      ).toBe(false);
+    }
+    for (const body of [
+      {},
+      { sleep_after_seconds: 120, size_class_id: "small" },
+    ])
+      expect(DatabaseIdleTime.safeParse(body).success).toBe(false);
+    // The size class alone is resized; the idle time has its own resource.
+    for (const body of [
+      { sleep_after_seconds: 120 },
+      { size_class_id: "small", sleep_after_seconds: 120 },
+    ])
+      expect(DatabaseResize.safeParse(body).success).toBe(false);
   });
 
   it("validates list queries and idempotency keys", () => {

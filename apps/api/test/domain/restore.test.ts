@@ -372,6 +372,11 @@ it("restores a source catalog into a separate target region without changing sou
 
 it("restores into one separate target on replay with credentials encrypted for its ID", async () => {
   const f = await archived();
+  await env.DB.prepare(
+    "UPDATE databases SET sleep_after_seconds=300 WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
   const body = { mode: "full", name: "restored" };
   const first = await request(
     `/v1/databases/${f.id}/restore`,
@@ -382,11 +387,16 @@ it("restores into one separate target on replay with credentials encrypted for i
   );
   expect(first.status).toBe(202);
   const result = (await first.json()) as {
-    target_database: { id: string; observed_state: string };
+    target_database: {
+      id: string;
+      observed_state: string;
+      sleep_after_seconds: number | null;
+    };
     operation: { id: string; kind: string };
   };
   expect(result.target_database.id).not.toBe(f.id);
   expect(result.target_database.observed_state).toBe("pending");
+  expect(result.target_database.sleep_after_seconds).toBe(300);
   expect(result.operation.kind).toBe("database.restore");
   const replay = await request(
     `/v1/databases/${f.id}/restore`,

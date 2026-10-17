@@ -81,7 +81,7 @@ creation or resize. Disabled classes (`enabled: false`) are listed but refused.
 | `cpu_millicores`, `cpu_request_millicores` | 100 to 256,000; request optional and at most the limit | CPU limit and scheduling request (the request defaults to the limit) |
 | `storage_gib` | 1 to 65,536 | Hard volume size |
 | `max_connections` | 10 to 10,000 | PostgreSQL `max_connections` |
-| `sleep_after_seconds` | 60 to 2,592,000, or `null` | Idle time before hibernation; `null` is always warm |
+| `sleep_after_seconds` | 60 to 2,592,000, or `null` | Idle time before hibernation of a database that sets none of its own; `null` is always warm |
 | `archive_timeout_seconds` | 30 to 3,600 | PostgreSQL `archive_timeout`: bounds how old unarchived WAL can get |
 | `backup_retention_days` | 1 to 3,650 | Barman retention window; also how long a deleted database stays restorable |
 
@@ -139,7 +139,7 @@ open work.
 ## 2. Lifecycle API
 
 The machine-readable reference is `GET /v1/openapi.json` (no key needed). Its `info.version` is
-the version of the API contract (`1.0.0` for this document): it changes when the contract changes
+the version of the API contract (`1.1.0` for this document): it changes when the contract changes
 and not with a Worker release, which is named in `info.x-worker-version`. Rules a schema cannot
 state are in descriptions ([Appendix C](#appendix-c-what-the-served-openapi-document-states-in-words)).
 Its operation IDs are listed below. Examples assume:
@@ -193,6 +193,7 @@ pgcf() { curl -sS -H "Authorization: Bearer $PGCF_KEY" -H 'Accept: application/j
 | `listDatabases` | `GET /v1/databases` | filters `project_id`, `region_id`, `node_id`, `desired_state`, `observed_state` and `name` (exact, case-sensitive; unique among the live databases of a project, so one match inside your project); excludes deleted |
 | `getDatabase` | `GET /v1/databases/{id}` | also returns a deleted database (`desired_state: deleted`) |
 | `resizeDatabase` | `PATCH /v1/databases/{id}` | body `{size_class_id}` only; no rename |
+| `setDatabaseIdleTime` | `PUT /v1/databases/{id}/idle-time` | body `{sleep_after_seconds}`; 200 with the database, no operation ([3.5](#35-idle-sleep-and-wake-on-connect)); `Idempotency-Key` required |
 | `deleteDatabase` | `DELETE /v1/databases/{id}` | 202 |
 | `suspendDatabase`, `resumeDatabase` | `POST /v1/databases/{id}/suspend`, `/resume` | 202 |
 | `restoreDatabase` | `POST /v1/databases/{id}/restore` | 202, creates a new database |
@@ -222,8 +223,8 @@ pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \
 What happens: the database record (generation 1), the owner role `app` with a server-generated
 password and an internal maintenance role (`pgcf_maintenance`, reserved) are written; the
 placement step picks a node whose fresh observations fit the class. The first base backup is
-requested at once and WAL archiving starts with the first start. The class's `sleep_after_seconds`
-counts from readiness.
+requested at once and WAL archiving starts with the first start. The idle time
+(`effective_sleep_after_seconds`) counts from readiness.
 
 - Ready means the operation is `succeeded`, the database `observed_state` is `ready` and
   `observed_generation` equals `generation`. Poll `GET /v1/operations/{id}`; the database stays
@@ -625,7 +626,7 @@ Recommended policy (derived from those numbers, not a PGCF guarantee):
 | Retry `57P03`, `08006`, `53300` | exponential backoff with jitter: 1 s, 2 s, 4 s, then 8 s, for about 90 s in total | transient by definition |
 | Retry `28P01`, `3D000`, `28000`, `0A000`, `08P01` | never | configuration or credentials; fix, do not loop |
 | After a dropped connection | reconnect; never replay a write unless it is idempotent | PGCF never replays SQL; whether an in-flight `COMMIT` took effect is unknown to you and to PGCF |
-| Latency-sensitive paths | pre-wake with `POST /resume`, or use an always-warm class (`sleep_after_seconds: null`) | removes the wake from the request |
+| Latency-sensitive paths | pre-wake with `POST /resume`, keep the database awake longer (`sleep_after_seconds`), or use an always-warm class (`sleep_after_seconds: null`) | removes the wake from the request |
 
 A `57P03` that arrives immediately, in well under a second, is not a wake timeout. At the 60 s
 mark the Edge aborts the admission and answers `08006` ("connection admission interrupted"); the
@@ -642,9 +643,14 @@ Actor's own deadline answers `57P03` and can win that race. To tell the causes a
 
 ### 3.5 Idle sleep and wake on connect
 
-With `sleep_after_seconds` set, a database hibernates when it has had **no busy session and no
-client activity for that many seconds** (minimum 60). A session is busy while it is
-authenticating, in a transaction (including `idle in transaction`), running a statement, in
+A database hibernates when it has had **no busy session and no client activity for
+`effective_sleep_after_seconds`**: its own `sleep_after_seconds` (60 to 900, set on create or with
+`PUT /v1/databases/{id}/idle-time`; `null` hands it back to the class), else its class's; a class
+with `null` is always warm (`effective_sleep_after_seconds` is then `null`). The `PUT` is accepted
+in every state but deleted, also during a resize; it creates no operation and no new generation,
+and the value applies from the next idle check. A database with a qualified warm-reclaim policy
+(`/v1/databases/{id}/warm-reclaim`) keeps its warm-idle path instead. A session is busy while
+it is authenticating, in a transaction (including `idle in transaction`), running a statement, in
 `COPY`, or when its state is uncertain; a prepared transaction also stops the sleep (`power_busy`).
 A merely open, idle connection is not busy and does not keep the database awake: the gateway
 closes it with WebSocket close code 1000 and reason `database sleeping` when the database goes
@@ -803,7 +809,7 @@ volume stops writes and nothing grows a quota for you. `health.disk.status` beco
 ### 4.4 Your checklist
 
 - Cap databases per tenant and per class; cap simultaneously awake databases.
-- Choose `sleep_after_seconds` per class; never leave transactions open.
+- Choose `sleep_after_seconds` per database or per class; never leave transactions open.
 - Keep the sum of `storage_gib` within 4.3 and watch each database's size.
 - Keep your pool `max` below `max_connections`, reuse connections and stay under the Edge
   connection-rate limits (3.6).

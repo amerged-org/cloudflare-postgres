@@ -138,6 +138,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/internal/v1/node-bootstrap/:operation_id/relay",
   "/v1/databases",
   "/v1/databases/:id",
+  "/v1/databases/:id/idle-time",
   "/v1/databases/:id/suspend",
   "/v1/databases/:id/restore",
   "/v1/databases/:id/resume",

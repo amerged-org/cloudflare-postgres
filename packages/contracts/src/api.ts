@@ -27,7 +27,7 @@ import {
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.0.0";
+export const API_CONTRACT_VERSION = "1.1.0";
 
 /** ISO-8601 UTC timestamp exactly as Date#toISOString renders it. */
 export const Timestamp = z.iso
@@ -229,7 +229,15 @@ const SizeClassFields = {
   cpu_request_millicores: z.number().int().positive().max(256_000).optional(),
   storage_gib: z.number().int().min(1).max(65_536),
   max_connections: z.number().int().min(10).max(10_000),
-  sleep_after_seconds: z.number().int().min(60).max(2_592_000).nullable(),
+  sleep_after_seconds: z
+    .number()
+    .int()
+    .min(60)
+    .max(2_592_000)
+    .nullable()
+    .describe(
+      "Idle time before a database of the class that sets none of its own sleeps; null is always warm.",
+    ),
   archive_timeout_seconds: z.number().int().min(30).max(3600),
   backup_retention_days: z.number().int().min(1).max(3650),
   enabled: z.boolean(),
@@ -483,6 +491,17 @@ export const DatabaseStorage = z.strictObject({
 });
 export type DatabaseStorage = z.infer<typeof DatabaseStorage>;
 
+/** A database's own idle time before it sleeps; null hands it back to its size class. */
+const DatabaseSleepAfter = z
+  .number()
+  .int()
+  .min(60)
+  .max(900)
+  .nullable()
+  .describe(
+    "The database's own idle time before it sleeps, 60 to 900 s; null when its size class's applies.",
+  );
+
 export const Database = z
   .strictObject({
     id: DatabaseId,
@@ -491,6 +510,16 @@ export const Database = z
     node_id: NodeId.nullable(),
     name: DatabaseName,
     size_class_id: SizeClassId,
+    sleep_after_seconds: DatabaseSleepAfter,
+    effective_sleep_after_seconds: z
+      .number()
+      .int()
+      .min(60)
+      .max(2_592_000)
+      .nullable()
+      .describe(
+        "The idle-sleep threshold: seconds without client activity before the database sleeps, its own sleep_after_seconds, else its size class's; null when the database is always warm. A database with a qualified warm-reclaim policy (/v1/databases/{id}/warm-reclaim) keeps its warm-idle path instead.",
+      ),
     desired_state: DesiredState,
     observed_state: ObservedState,
     suspension_reason: z.enum(["manual", "idle"]).nullable().optional(),
@@ -526,6 +555,7 @@ export const DatabaseCreate = z
     region_id: RegionId,
     name: DatabaseName,
     size_class_id: SizeClassId,
+    sleep_after_seconds: DatabaseSleepAfter.optional(),
   })
   .meta({ id: "DatabaseCreate" });
 export type DatabaseCreate = z.infer<typeof DatabaseCreate>;
@@ -546,6 +576,11 @@ export const DatabaseResize = z
   .strictObject({ size_class_id: SizeClassId })
   .meta({ id: "DatabaseResize" });
 export type DatabaseResize = z.infer<typeof DatabaseResize>;
+
+export const DatabaseIdleTime = z
+  .strictObject({ sleep_after_seconds: DatabaseSleepAfter })
+  .meta({ id: "DatabaseIdleTime" });
+export type DatabaseIdleTime = z.infer<typeof DatabaseIdleTime>;
 
 export const DatabaseRestore = z
   .discriminatedUnion("mode", [

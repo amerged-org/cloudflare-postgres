@@ -501,6 +501,29 @@ it("adds separate scheduling CPU without rewriting legacy limits and rejects inv
   ).toThrow();
 });
 
+it("adds a database's own idle time of 60 to 900 s, NULL leaving it to the class", () => {
+  db.exec(
+    readFileSync(
+      new URL(
+        "../../../apps/api/migrations/0061_database_sleep_after.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const id = newDatabaseId();
+  insertDatabase(id);
+  expect(
+    db.prepare("SELECT sleep_after_seconds FROM databases WHERE id=?").get(id),
+  ).toEqual({ sleep_after_seconds: null });
+  for (const value of [60, 900, null])
+    run("UPDATE databases SET sleep_after_seconds=? WHERE id=?", value, id);
+  for (const value of [59, 901])
+    expect(() =>
+      run("UPDATE databases SET sleep_after_seconds=? WHERE id=?", value, id),
+    ).toThrow(/CHECK/);
+});
+
 describe("0001_init.sql", () => {
   it("adds nullable platform CPU measurement without rewriting existing node values", () => {
     const before = db.prepare("SELECT * FROM nodes WHERE id=?").get(nodeId)!;

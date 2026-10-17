@@ -450,7 +450,7 @@ it("an idle probe that finds the database busy does not hold the gate across its
       active_connections: 1,
     }),
   ).toBe(true);
-  const read = holdRead("SELECT d.*,s.sleep_after_seconds FROM databases d");
+  const read = holdRead("SELECT d.*,COALESCE(d.sleep_after_seconds,");
   const probing = actor(f.id).requestIdle(f.id, woken.generation);
   for (let i = 0; i < 400 && read.held() === 0; i++) await sleep(5);
   expect(read.held()).toBe(1);

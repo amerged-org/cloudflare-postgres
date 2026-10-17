@@ -254,6 +254,7 @@ export async function restoreDatabase(
             project_id: source.project_id,
             region_id: targetRegionId,
             size_class_id: source.size_class_id,
+            sleep_after_seconds: source.sleep_after_seconds ?? null,
             name: body.name,
           },
           size,

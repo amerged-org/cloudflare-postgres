@@ -78,6 +78,8 @@ function fixtures() {
     node_id: newNodeId(),
     name: "fixture",
     size_class_id: "small",
+    sleep_after_seconds: null,
+    effective_sleep_after_seconds: 60,
     desired_state: "running" as const,
     observed_state: "ready" as const,
     generation: 1,

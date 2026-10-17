@@ -3,6 +3,7 @@ import {
   archiveDestinationPath,
   DatabaseCreate,
   DatabaseListQuery,
+  type DatabaseIdleTime,
   type DatabaseResize,
   databaseMemoryReservationMib,
   databaseCpuReservationMillicores,
@@ -55,6 +56,7 @@ import {
 import {
   databaseForRequest,
   databaseView,
+  effectiveSleepAfterSql,
   isConstraintError,
   operationForRequest,
   operationsForDatabase,
@@ -118,8 +120,8 @@ export function databaseInsertStatement(
   if (snapshot.nodeId === null) {
     return db
       .prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,status_message,created_at,updated_at,${postgresColumns})
-      SELECT ?,p.id,r.id,NULL,?,s.id,'running',1,?,'Waiting for verified regional capacity',?,?,${postgresSelection}
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,${postgresColumns})
+      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,${postgresSelection}
       FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
       AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
@@ -130,6 +132,7 @@ export function databaseInsertStatement(
       .bind(
         snapshot.id,
         snapshot.body.name,
+        snapshot.body.sleep_after_seconds ?? null,
         snapshot.archivePath,
         snapshot.now,
         snapshot.now,
@@ -149,8 +152,8 @@ export function databaseInsertStatement(
   }
   return db
     .prepare(
-      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at,storage_profile_json,${postgresColumns})
-            SELECT ?,p.id,n.region_id,n.id,?,s.id,'running',1,?,?,?,${selectedStorageProfileSql()},${postgresSelection} FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
+      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,storage_profile_json,${postgresColumns})
+            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,${selectedStorageProfileSql()},${postgresSelection} FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
             WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
@@ -165,6 +168,7 @@ export function databaseInsertStatement(
     .bind(
       snapshot.id,
       snapshot.body.name,
+      snapshot.body.sleep_after_seconds ?? null,
       snapshot.archivePath,
       snapshot.now,
       snapshot.now,
@@ -398,7 +402,7 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     bindings.push(query.observed_state);
   }
   const result = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
   )
     .bind(...bindings, ...cursor.bindings, pagination.limit + 1)
     .all<DatabaseRow>();
@@ -786,6 +790,46 @@ export async function resizeDatabase(
       );
       hint(c, row.region_id, [id]);
       return databaseOperationResponse(c, op);
+    },
+  });
+}
+
+/**
+ * Each idle check reads the idle time from the row, so setting it is a single write in any state
+ * but deleted: no generation, no operation, and updated_at stays as the resize CAS read it. The
+ * write and its Idempotency-Key completion commit in one batch, so a key never stands for a value
+ * that was not stored.
+ */
+export async function setDatabaseIdleTime(
+  c: ApiContext,
+  id: string,
+  body: DatabaseIdleTime,
+): Promise<Response> {
+  const row = await databaseForRequest(c, id, true);
+  const view = async () =>
+    c.json(databaseView(await databaseForRequest(c, id, true)), 200);
+  return withIdempotency(c, {
+    replay: view,
+    execute: async (lease) => {
+      const live = "deleted_at IS NULL AND desired_state<>'deleted'";
+      const deleted = () =>
+        new ApiError("conflict", "Database is deleted", {
+          reason: "database_deleted",
+        });
+      if (row.desired_state === "deleted" || row.deleted_at !== null)
+        throw deleted();
+      const [write] = await c.env.DB.batch([
+        c.env.DB.prepare(
+          `UPDATE databases SET sleep_after_seconds=? WHERE id=? AND project_id=? AND ${live}
+           AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)`,
+        ).bind(body.sleep_after_seconds, id, row.project_id),
+        lease.completeStatement(id, 200, {
+          sql: `EXISTS(SELECT 1 FROM databases WHERE id=? AND sleep_after_seconds IS ? AND ${live})`,
+          bindings: [id, body.sleep_after_seconds],
+        }),
+      ]);
+      if (write!.meta.changes !== 1) throw deleted();
+      return view();
     },
   });
 }

@@ -486,6 +486,7 @@ describe("actual generated API references in the Workers runtime", () => {
       ["/v1/databases/{id}/suspend", "post"],
       ["/v1/databases/{id}/resume", "post"],
       ["/v1/databases/{id}/restore", "post"],
+      ["/v1/databases/{id}/idle-time", "put"],
     ] as const)
       expect(
         operation(doc, path, method).parameters,
@@ -622,6 +623,31 @@ describe("actual generated API references in the Workers runtime", () => {
     const read = operation(doc, "/v1/databases/{id}", "get");
     expect(read.description).toMatch(/desired_state/);
     expect(read.description).toMatch(/deleted/);
+    // A database's own idle time is its own resource: its bounds, what null means and the value
+    // that applies; PATCH changes the size class alone.
+    const idle = operation(doc, "/v1/databases/{id}/idle-time", "put");
+    expect(idle.operationId).toBe("setDatabaseIdleTime");
+    expect(idle.description).toMatch(/sleep_after_seconds.*60 to 900.*null/s);
+    expect(JSON.stringify(idle)).toContain(
+      '"#/components/schemas/DatabaseIdleTime"',
+    );
+    expect(JSON.stringify(idle.responses["200"])).toContain(
+      '"#/components/schemas/Database"',
+    );
+    expect(
+      operation(doc, "/v1/databases/{id}", "patch").description ?? "",
+    ).not.toMatch(/sleep_after_seconds/);
+    const resize = (doc.components!.schemas as Record<string, object>)
+      .DatabaseResize!;
+    expect(resize).toMatchObject({ required: ["size_class_id"] });
+    expect(JSON.stringify(resize)).not.toMatch(/sleep_after_seconds/);
+    expect(
+      JSON.stringify(
+        (doc.components!.schemas as Record<string, unknown>).Database,
+      ),
+    ).toMatch(
+      /effective_sleep_after_seconds.*null when the database is always warm.*\/v1\/databases\/\{id\}\/warm-reclaim/,
+    );
     expect(
       operation(doc, "/v1/databases/{id}/archive", "get").summary,
     ).not.toMatch(/status/);

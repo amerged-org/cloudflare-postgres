@@ -42,6 +42,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/databases/{id}": [400, 401, 404, 500],
   // scheduleDatabaseResize is the public database path that can refuse capacity with 503.
   "PATCH /v1/databases/{id}": [400, 401, 404, 409, 500, 503],
+  // 409: the database is deleted.
+  "PUT /v1/databases/{id}/idle-time": [400, 401, 404, 409, 500],
   "DELETE /v1/databases/{id}": [400, 401, 404, 409, 500],
   "POST /v1/databases/{id}/restore": [400, 401, 404, 409, 500],
   "POST /v1/databases/{id}/suspend": [400, 401, 404, 409, 500],
@@ -184,6 +186,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/regions/{id}/bootstrap-material/activate",
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
+  "PUT /v1/databases/{id}/idle-time",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
   "POST /v1/databases/{id}/suspend",
@@ -224,6 +227,7 @@ export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/nodes/{id}/thin-qualifications",
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
+  "PUT /v1/databases/{id}/idle-time",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
   "POST /v1/databases/{id}/suspend",

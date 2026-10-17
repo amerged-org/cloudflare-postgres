@@ -24,6 +24,9 @@ export interface DatabaseRow extends DatabaseHealthSource {
   node_id: string | null;
   name: string;
   size_class_id: string;
+  sleep_after_seconds?: number | null;
+  /** Read with effectiveSleepAfterSql. */
+  effective_sleep_after_seconds?: number | null;
   pg_major: 18;
   desired_postgres_release_id?: string | null;
   desired_postgres_image?: string | null;
@@ -94,6 +97,10 @@ export interface RegionRow {
 export interface SizeRow extends Omit<SizeClass, "enabled"> {
   enabled: number;
 }
+/** The idle time before a database sleeps: its own, else its size class's; null is always warm. */
+export function effectiveSleepAfterSql(database: string): string {
+  return `COALESCE(${database}.sleep_after_seconds,(SELECT sleep_after_seconds FROM size_classes WHERE id=${database}.size_class_id))`;
+}
 
 /**
  * `now` is read once by a list so that every row is judged at the same instant. Backup and disk
@@ -109,6 +116,8 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
     node_id: row.node_id,
     name: row.name,
     size_class_id: row.size_class_id,
+    sleep_after_seconds: row.sleep_after_seconds ?? null,
+    effective_sleep_after_seconds: row.effective_sleep_after_seconds,
     desired_state: row.desired_state,
     observed_state:
       row.desired_state === "suspended" &&
@@ -181,7 +190,7 @@ export async function databaseForRequest(
 ): Promise<DatabaseRow> {
   await getAuth(c);
   const row = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
   )
     .bind(id)
     .first<DatabaseRow>();

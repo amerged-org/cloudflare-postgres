@@ -610,7 +610,47 @@ it("expires or cancels waiters and stops shared polling when the final waiter le
   );
 });
 
-it("requires fresh authenticated zero-connection activity and an enabled idle threshold", async () => {
+it("sleeps after the database's own idle time, else its class's, else never", async () => {
+  const f = await ready();
+  const set = (
+    table: "databases" | "size_classes",
+    id: string,
+    value: number | null,
+  ) =>
+    env.DB.prepare(`UPDATE ${table} SET sleep_after_seconds=? WHERE id=?`)
+      .bind(value, id)
+      .run();
+  expect(
+    await actor(f.id).recordActivity(f.id, {
+      revision: 1,
+      observed_at: new Date().toISOString(),
+      last_activity_at: new Date(Date.now() - 120_000).toISOString(),
+      active_connections: 0,
+    }),
+  ).toBe(true);
+  await set("size_classes", f.size, 60);
+  await set("databases", f.id, 600);
+  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
+    ok: false,
+    reason: "not_idle",
+  });
+  await set("size_classes", f.size, 1800);
+  await set("databases", f.id, null);
+  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
+    ok: false,
+    reason: "not_idle",
+  });
+  // A class without a value is always warm; a database's own value still sleeps it.
+  await set("size_classes", f.size, null);
+  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
+    ok: false,
+    reason: "not_idle",
+  });
+  await set("databases", f.id, 60);
+  expect((await actor(f.id).requestIdle(f.id, 1)).ok).toBe(true);
+});
+
+it("requires fresh authenticated zero-connection activity", async () => {
   const f = await ready();
   expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
     ok: false,

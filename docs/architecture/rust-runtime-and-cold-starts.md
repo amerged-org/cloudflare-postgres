@@ -122,8 +122,9 @@ present it as a hit of a pool.
 
 `warm_idle` is not a stopped database, a frozen process or zero resident memory. Kernel page-in on access is not restoration of a process snapshot. Host filesystem cache may survive real hibernation, but no cache-retention guarantee is made.
 
-`sleep_after_seconds: null` is always warm. A finite idle threshold puts the database to sleep as CNPG
-hibernation. Warm reclaim is a separate per-database policy (`PUT /v1/databases/{id}/warm-reclaim`)
+A database sleeps after its own `sleep_after_seconds` (60–900 s), else its size class's;
+`sleep_after_seconds: null` on the class is always warm. A finite idle threshold puts the database to
+sleep as CNPG hibernation. Warm reclaim is a separate per-database policy (`PUT /v1/databases/{id}/warm-reclaim`)
 for an approved compatible resource class and a qualified node; a database with a qualified warm
 policy never takes the idle-sleep path. An optional later threshold may move a warm-idle database
 into real hibernation through the existing safe shutdown path.
