@@ -39,7 +39,11 @@ function base64(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
 }
 
-/** Unknown routes only. Never authenticate, retain a password, or forward frontend bytes. */
+/**
+ * Unknown routes only. Never authenticate, retain a password, or forward frontend bytes. A
+ * password pipelined in the message of the startup is asked for and refused as the gateway
+ * refuses a wrong one; any other client gets the SCRAM exchange PostgreSQL offers.
+ */
 export function decoyResponse(
   hints: { database: string; user: string },
   secret: string,
@@ -52,7 +56,7 @@ export function decoyResponse(
   socket.accept();
   let reader: StartupReader | undefined = new StartupReader(STARTUP_MAX_LENGTH);
   let buffer = new Uint8Array(0),
-    phase: "startup" | "first" | "final" = "startup",
+    phase: "startup" | "pipelined" | "offer" | "first" | "final" = "startup",
     nonce = "",
     binding = "",
     closed = false,
@@ -135,6 +139,32 @@ export function decoyResponse(
           }
           reader = undefined;
           buffer = new Uint8Array(event.rest);
+          phase = buffer[0] === 0x70 ? "pipelined" : "offer";
+        }
+        if (phase === "pipelined") {
+          // As the gateway decides: a whole password message (one string and its terminator) is
+          // asked for in cleartext, as is one longer than the bound; a SASL message is not.
+          if (buffer.length < 5) break;
+          const length = new DataView(
+            buffer.buffer,
+            buffer.byteOffset,
+            buffer.byteLength,
+          ).getUint32(1);
+          if (length >= 4 && length <= AUTH_MAX_BYTES) {
+            if (buffer.length < length + 1) break;
+            const body = buffer.subarray(5, length + 1);
+            if (body.at(-1) !== 0 || body.indexOf(0) !== body.length - 1)
+              phase = "offer";
+          }
+          if (phase === "pipelined") {
+            socket.send(authentication(3, ""));
+            // No password authenticates here; it is dropped unread.
+            buffer.fill(0);
+            finish("28P01");
+            break;
+          }
+        }
+        if (phase === "offer") {
           phase = "first";
           if (buffer.length > AUTH_MAX_BYTES + 1) {
             finish("28P01");

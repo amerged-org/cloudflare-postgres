@@ -1446,6 +1446,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]

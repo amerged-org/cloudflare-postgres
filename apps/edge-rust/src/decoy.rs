@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The unknown-route PostgreSQL exchange. It cannot authenticate or forward bytes.
+//! The unknown-route PostgreSQL exchange. It cannot authenticate or forward bytes. A password
+//! pipelined in the message of the startup is asked for and refused as the gateway refuses a
+//! wrong one; any other client gets the SCRAM exchange PostgreSQL offers.
 use crate::policy::Hints;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
@@ -19,6 +21,10 @@ pub struct Output {
 #[derive(PartialEq, Eq)]
 enum Phase {
     Startup,
+    /// A `p` message leads what was pipelined behind the startup: a password or a SASL message.
+    Pipelined,
+    /// The SCRAM mechanisms are offered next.
+    Offer,
     First,
     Final,
 }
@@ -173,15 +179,47 @@ impl Decoy {
                         }
                         self.reader = None;
                         self.buffer = rest;
-                        self.phase = Phase::First;
-                        if self.buffer.len() > constant("DECOY_AUTH_MAX_BYTES") as usize + 1 {
-                            self.finish(&mut out, Some("28P01"));
-                            break;
-                        }
-                        out.frames
-                            .push(authentication(10, "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"));
+                        self.phase = if self.buffer.first() == Some(&b'p') {
+                            Phase::Pipelined
+                        } else {
+                            Phase::Offer
+                        };
                     }
                 }
+            }
+            if self.phase == Phase::Pipelined {
+                // As the gateway decides: a whole password message (one string and its
+                // terminator) is asked for in cleartext, as is one longer than the bound; a SASL
+                // message is not.
+                if self.buffer.len() < 5 {
+                    break;
+                }
+                let length = u32::from_be_bytes(self.buffer[1..5].try_into().unwrap()) as usize;
+                if (4..=constant("DECOY_AUTH_MAX_BYTES") as usize).contains(&length) {
+                    if self.buffer.len() <= length {
+                        break;
+                    }
+                    let body = &self.buffer[5..=length];
+                    if body.iter().position(|v| *v == 0) != Some(body.len().wrapping_sub(1)) {
+                        self.phase = Phase::Offer;
+                    }
+                }
+                if self.phase == Phase::Pipelined {
+                    out.frames.push(authentication(3, ""));
+                    // No password authenticates here; it is dropped unread.
+                    self.buffer.fill(0);
+                    self.finish(&mut out, Some("28P01"));
+                    break;
+                }
+            }
+            if self.phase == Phase::Offer {
+                self.phase = Phase::First;
+                if self.buffer.len() > constant("DECOY_AUTH_MAX_BYTES") as usize + 1 {
+                    self.finish(&mut out, Some("28P01"));
+                    break;
+                }
+                out.frames
+                    .push(authentication(10, "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"));
             }
             if self.buffer.len() < 5 {
                 break;

@@ -51,7 +51,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         database_memory,
     });
     let api = Arc::new(Kubernetes::in_cluster().await?);
-    let gateway = Gateway::new(config, pod, Arc::new(ClusterPostgresDial(api.clone())));
+    let gateway = Gateway::new(config, pod, Arc::new(ClusterPostgresDial::new(api.clone())));
     let (stop, receiver) = watch::channel(false);
     let endpoints = tokio::spawn(targets::synchronize(
         api.clone(),

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
+    auth::{self, Login, Pipelined},
     budget::{BudgetedStream, Lease, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, MemoryBudget, WireBudget},
     control::{self, Control, HttpHead},
     hold::{Held, Verdict, WakeQueue},
@@ -41,6 +42,7 @@ use tokio_tungstenite::{
         protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
     },
 };
+use zeroize::Zeroizing;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type WebSocket = WebSocketStream<BudgetedStream>;
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
@@ -78,6 +80,9 @@ pub struct DatabaseTarget {
     pub address: std::net::IpAddr,
     pub pod_uid: String,
     pub ca_sha256: Option<String>,
+    /// The database's TLS authority as the watch showed it when the target was chosen: never
+    /// one other than the admitted `ca_sha256`.
+    pub ca: Option<Arc<[u8]>>,
 }
 pub trait PostgresDial: Send + Sync {
     fn dial<'a>(
@@ -85,7 +90,20 @@ pub trait PostgresDial: Send + Sync {
         target: &'a DatabaseTarget,
     ) -> BoxFuture<'a, Result<TlsStream<TcpStream>, Failure>>;
 }
-pub struct ClusterPostgresDial(pub Arc<Kubernetes>);
+/// Dials PostgreSQL with the TLS authority the watch showed (or, without one, the API server's),
+/// verified with a configuration built once per database and authority.
+pub struct ClusterPostgresDial {
+    api: Arc<Kubernetes>,
+    configs: TlsConfigs,
+}
+impl ClusterPostgresDial {
+    pub fn new(api: Arc<Kubernetes>) -> Self {
+        Self {
+            api,
+            configs: TlsConfigs::default(),
+        }
+    }
+}
 impl PostgresDial for ClusterPostgresDial {
     fn dial<'a>(
         &'a self,
@@ -93,20 +111,22 @@ impl PostgresDial for ClusterPostgresDial {
     ) -> BoxFuture<'a, Result<TlsStream<TcpStream>, Failure>> {
         Box::pin(async move {
             for attempt in 0..2 {
-                let ca = self.0.database_ca(&target.database, attempt == 1).await?;
-                if target.ca_sha256.as_ref().is_some_and(|expected| {
-                    Sha256::digest(&ca)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                        != *expected
-                }) {
+                let ca = match (&target.ca, attempt) {
+                    (Some(ca), 0) => ca.to_vec(),
+                    _ => self.api.database_ca(&target.database, attempt == 1).await?,
+                };
+                if target
+                    .ca_sha256
+                    .as_ref()
+                    .is_some_and(|expected| sha256_hex(&ca) != *expected)
+                {
                     if attempt == 0 {
                         continue;
                     }
                     return Err("admitted TLS authority changed".into());
                 }
-                match dial_postgres(target.address, &target.host, target.port, &ca).await {
+                let config = self.configs.get(&target.database, &ca)?;
+                match dial_postgres(target.address, &target.host, target.port, config).await {
                     Ok(postgres) => return Ok(postgres),
                     Err(error) => {
                         if attempt == 1 || !certificate_error(error.as_ref()) {
@@ -117,6 +137,38 @@ impl PostgresDial for ClusterPostgresDial {
             }
             Err("TLS connection unavailable".into())
         })
+    }
+}
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+/// The rustls client configuration of each database's TLS authority, built once: a dial after a
+/// wake verifies without parsing the authority again.
+#[derive(Default)]
+pub struct TlsConfigs(Mutex<HashMap<String, (String, Arc<ClientConfig>)>>);
+impl TlsConfigs {
+    const MAXIMUM: usize = 2000;
+    pub fn get(&self, database: &str, ca: &[u8]) -> Result<Arc<ClientConfig>, Failure> {
+        let digest = sha256_hex(ca);
+        if let Some((cached, config)) = self.0.lock().unwrap().get(database)
+            && *cached == digest
+        {
+            return Ok(config.clone());
+        }
+        let config = client_config(ca)?;
+        let mut configs = self.0.lock().unwrap();
+        if configs.len() >= Self::MAXIMUM && !configs.contains_key(database) {
+            configs.clear();
+        }
+        configs.insert(database.into(), (digest, config.clone()));
+        Ok(config)
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
     }
 }
 pub struct Gateway {
@@ -823,7 +875,6 @@ async fn serve_held(
             message = websocket.next() => match message {
                 Some(Ok(Message::Binary(bytes))) => {
                     started.leases.push(wire.take_message().inspect_err(|_| stages.outcome = "websocket_error")?);
-                    started.initial.extend_from_slice(&bytes);
                     started.rest.extend_from_slice(&bytes);
                 }
                 Some(Ok(Message::Ping(value))) => send_client(&mut websocket, Message::Pong(value), &mut stages).await?,
@@ -887,16 +938,17 @@ async fn serve_held(
     {
         // The session is measured from its reservation; what the client sent while held is its.
         let mut metrics = gateway.measurements.lock().unwrap();
-        metrics.ingress(&session.id, started.initial.len());
+        metrics.ingress(&session.id, started.startup.len() + started.rest.len());
         metrics.client_activity(&session.id);
     }
     let mut early = None;
     let dialed = tokio::select! {
-        result=timeout(STARTUP_BOUND,dial_started(&claims,&session,epoch,&mut stages,&mut early))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        result=timeout(STARTUP_BOUND,async{take_password(&mut websocket,&mut started,&session,&mut stages).await?;dial_started(&claims,&session,epoch,&mut stages,&mut early).await})=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
         _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
         _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
     let Ok(postgres) = dialed else {
+        // A refused password was answered and its socket closed: this send then fails unseen.
         let _ = send_error(&mut websocket, "08006", "database connection failed").await;
         return Ok(());
     };
@@ -924,11 +976,16 @@ struct Admitted<'a> {
 }
 /// The client's StartupMessage, with what it sent behind it, checked against the route.
 struct Started {
-    /// The StartupMessage and the bytes behind it, written to PostgreSQL first.
-    initial: Vec<u8>,
+    /// The StartupMessage, written to PostgreSQL first.
+    startup: Vec<u8>,
     leases: Vec<Lease>,
-    /// The bytes behind the StartupMessage.
-    rest: Vec<u8>,
+    /// The bytes behind the StartupMessage; once a pipelined password is taken, those behind it.
+    rest: Zeroizing<Vec<u8>>,
+    /// Whether the client pipelined its password in the message of its StartupMessage, so the
+    /// gateway asked for it with AuthenticationCleartextPassword and logs in to PostgreSQL itself;
+    /// none while the PasswordMessage that began there is incomplete.
+    cleartext: Option<bool>,
+    password: Option<auth::Password>,
 }
 /// Writes the checked StartupMessage to the dialled writer while the fence and the writer still
 /// admit it, then relays the session.
@@ -951,13 +1008,21 @@ async fn run_session(
     let wire = &session.wire;
     let target = &session.target;
     let Started {
-        initial,
+        startup,
         leases: initial_leases,
         rest,
+        password,
+        ..
     } = started;
     let result = async {
         let mut activity = PostgresActivity::new();
         activity.observe_frontend(&rest);
+        // A client that logs in itself sends what it pipelined with its StartupMessage; for one
+        // the gateway logs in for, those bytes wait for the login.
+        let mut initial = startup;
+        if password.is_none() {
+            initial.extend_from_slice(&rest);
+        }
         update(gateway, id, &activity, true, false);
         let state = gateway.fences.read().await;
         if state.bound_epoch(&claims.db) != epoch || !state.admits(&claims.db) {
@@ -977,13 +1042,57 @@ async fn run_session(
         stages.written = Some(Instant::now());
         drop(physical);
         drop(state);
-        drop(initial_leases);
+        let mut held = None;
+        if let Some(password) = password {
+            let login = tokio::select! {
+                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
+                _=stop.changed()=>Err("gateway_draining"),
+                _=actions.changed()=>Err("fenced"),
+            };
+            drop(password);
+            let answer = match login {
+                Err(outcome) => {
+                    stages.outcome = outcome;
+                    let _ = send_error(websocket, "08006", "database connection failed").await;
+                    return Err("login failed".into());
+                }
+                Ok(Login::Authenticated(answer)) => answer,
+                Ok(Login::Refused) => {
+                    stages.outcome = "authentication_failed";
+                    refuse(websocket).await;
+                    return Err("password refused".into());
+                }
+                Ok(Login::Failed(answer)) => {
+                    stages.outcome = "postgres_refused";
+                    let _ = send_client(websocket, Message::Binary(answer.into()), stages).await;
+                    let _ = timeout(Duration::from_millis(500), websocket.close(None)).await;
+                    return Err("login refused".into());
+                }
+            };
+            activity.observe_backend(&answer);
+            {
+                let mut metrics = gateway.measurements.lock().unwrap();
+                if activity.authenticated() {
+                    metrics.authenticate(id);
+                }
+                metrics.egress(id, answer.len());
+            }
+            update(gateway, id, &activity, true, false);
+            send_client(websocket, Message::Binary(answer.into()), stages).await?;
+            stages.first_backend = Some(Instant::now());
+            if !rest.is_empty() {
+                held = Some((rest.to_vec(), initial_leases));
+            }
+        } else {
+            drop(initial_leases);
+        }
         wire.allow_relay();
         relay(
             websocket,
             &mut postgres,
             session,
             &mut activity,
+            held,
             actions,
             stop,
             stages,
@@ -1029,6 +1138,103 @@ async fn close(socket: &mut WebSocket, code: CloseCode, reason: &str) {
         })),
     )
     .await;
+}
+/// Refuses a password as the decoys refuse it: their 28P01 and their close.
+async fn refuse(socket: &mut WebSocket) {
+    let _ = timeout(
+        Duration::from_millis(500),
+        socket.send(Message::Binary(auth::refusal().into())),
+    )
+    .await;
+    close(socket, CloseCode::Normal, "connection refused").await;
+}
+/// AuthenticationCleartextPassword, for a client that pipelined its password.
+async fn ask_password(
+    socket: &mut WebSocket,
+    gateway: &Gateway,
+    id: &str,
+    stages: &mut Stages,
+) -> Result<(), Failure> {
+    socket
+        .send(Message::Binary(auth::CLEARTEXT_REQUEST.to_vec().into()))
+        .await
+        .inspect_err(|_| stages.outcome = "websocket_error")?;
+    gateway
+        .measurements
+        .lock()
+        .unwrap()
+        .egress(id, auth::CLEARTEXT_REQUEST.len());
+    Ok(())
+}
+/// Completes a password the client began to pipeline behind its StartupMessage and takes it out
+/// of the bytes for PostgreSQL. One the gateway cannot accept is refused as the decoys refuse it,
+/// before PostgreSQL hears of the connection.
+async fn take_password(
+    socket: &mut WebSocket,
+    started: &mut Started,
+    session: &SessionLease,
+    stages: &mut Stages,
+) -> Result<(), Failure> {
+    if started.cleartext == Some(false) || started.password.is_some() {
+        return Ok(());
+    }
+    loop {
+        let taken = auth::take_password(&mut started.rest);
+        if started.cleartext.is_none() && !matches!(taken, Pipelined::Incomplete) {
+            let asked = !matches!(taken, Pipelined::Absent | Pipelined::Sasl);
+            if asked {
+                ask_password(socket, &session.gateway, &session.id, stages).await?;
+            }
+            started.cleartext = Some(asked);
+        }
+        match taken {
+            Pipelined::Absent | Pipelined::Sasl => return Ok(()),
+            Pipelined::Password(password) => {
+                started.password = Some(password);
+                return Ok(());
+            }
+            Pipelined::Refused => {
+                stages.outcome = "authentication_failed";
+                refuse(socket).await;
+                return Err("password refused".into());
+            }
+            Pipelined::Incomplete => {}
+        }
+        match socket.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                started.leases.push(
+                    session
+                        .wire
+                        .take_message()
+                        .inspect_err(|_| stages.outcome = "websocket_error")?,
+                );
+                {
+                    let mut metrics = session.gateway.measurements.lock().unwrap();
+                    metrics.ingress(&session.id, bytes.len());
+                    metrics.client_activity(&session.id);
+                }
+                started.rest.extend_from_slice(&bytes);
+            }
+            Some(Ok(Message::Ping(value))) => {
+                send_client(socket, Message::Pong(value), stages).await?
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Text(_))) => {
+                stages.outcome = "text_frame";
+                let _ = session.wire.take_message()?;
+                close(socket, CloseCode::Unsupported, "binary frames required").await;
+                return Err("text password".into());
+            }
+            Some(Err(_)) => {
+                stages.outcome = "websocket_error";
+                return Err("password failed".into());
+            }
+            _ => {
+                stages.outcome = "client_closed";
+                return Err("password closed".into());
+            }
+        }
+    }
 }
 /// Sends one message to the client within 10 s; a failure ends the connection.
 async fn send_client(
@@ -1134,7 +1340,7 @@ async fn read_startup(
                 Event::Startup {
                     database,
                     user,
-                    mut raw,
+                    raw,
                     rest,
                     ..
                 } => {
@@ -1149,11 +1355,16 @@ async fn read_startup(
                         .await?;
                         return Err("startup route mismatch".into());
                     }
-                    raw.extend_from_slice(&rest);
+                    let cleartext = auth::asks_password(&rest);
+                    if cleartext == Some(true) {
+                        ask_password(socket, gateway, id, stages).await?;
+                    }
                     return Ok(Started {
-                        initial: raw,
+                        startup: raw,
                         leases,
-                        rest,
+                        rest: Zeroizing::new(rest),
+                        cleartext,
+                        password: None,
                     });
                 }
             }
@@ -1191,16 +1402,20 @@ async fn dial_started(
     };
     drop(state);
     // The route was checked against this writer; a replacement is never dialled.
-    if !gateway.targets.read().await.permits(database, bound) {
-        stages.outcome = "target_changed";
-        return Err("writer changed before dial".into());
-    }
+    let watched = {
+        let physical = gateway.targets.read().await;
+        if !physical.permits(database, bound) {
+            stages.outcome = "target_changed";
+            return Err("writer changed before dial".into());
+        }
+        physical.ca_material(database)
+    };
     gateway
         .sessions
         .lock()
         .unwrap()
         .update(id, false, true, true);
-    let target = database_target(database, bound, admitted);
+    let target = database_target(database, bound, admitted, watched);
     // The dial that began with the admission is this one if it was for this target; a target that
     // changed since is dialled anew, and the old connection is dropped unused.
     let (dialed, took) = match early.take() {
@@ -1232,7 +1447,7 @@ async fn startup(
     stages: &mut Stages,
     early: &mut Option<EarlyDial>,
 ) -> Result<(TlsStream<TcpStream>, Started), Failure> {
-    let started = read_startup(
+    let mut started = read_startup(
         socket,
         claims,
         &session.gateway,
@@ -1241,17 +1456,28 @@ async fn startup(
         stages,
     )
     .await?;
+    take_password(socket, &mut started, session, stages).await?;
     let postgres = dial_started(claims, session, epoch, stages, early).await?;
     Ok((postgres, started))
 }
 /// The PostgreSQL a route is dialled at: the Pod it names, under the TLS name and authority the
-/// fence admitted for it (a v4 route), or the database's Service name.
+/// fence admitted for it (a v4 route), or the database's Service name. The watched authority
+/// `watched` is dialled with only when it is the admitted one.
 fn database_target(
     database: &str,
     bound: &TargetIdentity,
     admitted: Option<crate::kubernetes::AdmissionTarget>,
+    watched: Option<Vec<u8>>,
 ) -> DatabaseTarget {
+    let ca = watched
+        .filter(|ca| {
+            admitted
+                .as_ref()
+                .is_none_or(|target| sha256_hex(ca) == target.ca_sha256)
+        })
+        .map(Arc::from);
     DatabaseTarget {
+        ca,
         host: admitted
             .as_ref()
             .map(|target| target.tls_server_name.clone())
@@ -1302,10 +1528,14 @@ async fn early_dial(
         None
     };
     // The route was checked against this writer; a replacement is never dialled.
-    if !gateway.targets.read().await.permits(&claims.db, bound) {
-        return None;
-    }
-    let target = database_target(&claims.db, bound, admitted);
+    let watched = {
+        let physical = gateway.targets.read().await;
+        if !physical.permits(&claims.db, bound) {
+            return None;
+        }
+        physical.ca_material(&claims.db)
+    };
+    let target = database_target(&claims.db, bound, admitted, watched);
     let (dialer, wanted) = (gateway.clone(), target.clone());
     Some(EarlyDial {
         target,
@@ -1329,11 +1559,15 @@ fn certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
     }
     false
 }
+/// `held` is what the client sent that waits for the session to run: the bytes it pipelined
+/// behind a password the gateway logged in with.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     websocket: &mut WebSocket,
     postgres: &mut TlsStream<TcpStream>,
     session: &SessionLease,
     activity: &mut PostgresActivity,
+    mut held: Option<(Vec<u8>, Vec<Lease>)>,
     actions: &mut watch::Receiver<Action>,
     stop: &mut watch::Receiver<bool>,
     stages: &mut Stages,
@@ -1343,7 +1577,6 @@ async fn relay(
     let target = &session.target;
     let wire = &session.wire;
     let mut read = vec![0u8; MAX_FRAME_BYTES];
-    let mut held: Option<(Vec<u8>, Lease)> = None;
     let mut alive = true;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.tick().await;
@@ -1401,7 +1634,7 @@ async fn relay(
                         activity.observe_frontend(&bytes);update(gateway,id,activity,true,false);
                         if held.is_some(){stages.outcome="database_retired";close(websocket,CloseCode::Restart,"database retired").await;break;}
                         if forward_if_running(gateway,database,target,postgres,&bytes,stages).await?{drop(lease);}
-                        else{held=Some((bytes.to_vec(),lease));}
+                        else{held=Some((bytes.to_vec(),vec![lease]));}
                     },
                     Some(Ok(Message::Pong(_)))=>alive=true,
                     Some(Ok(Message::Ping(value)))=>send_client(websocket,Message::Pong(value),stages).await?,
@@ -1540,10 +1773,14 @@ async fn forward_if_running(
 /// TLS verification finishes before the first PostgreSQL StartupMessage,
 /// credential or query byte. Unknown writes are never redialed or replayed.
 pub async fn negotiate_tls(
-    mut stream: TcpStream,
+    stream: TcpStream,
     hostname: &str,
     ca: &[u8],
 ) -> Result<TlsStream<TcpStream>, Failure> {
+    negotiate(stream, hostname, client_config(ca)?).await
+}
+/// A client configuration that trusts only the database's TLS authority.
+fn client_config(ca: &[u8]) -> Result<Arc<ClientConfig>, Failure> {
     let mut roots = RootCertStore::empty();
     let certificates = CertificateDer::pem_slice_iter(ca).collect::<Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
@@ -1552,9 +1789,17 @@ pub async fn negotiate_tls(
     for certificate in certificates {
         roots.add(certificate)?;
     }
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    Ok(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+async fn negotiate(
+    mut stream: TcpStream,
+    hostname: &str,
+    config: Arc<ClientConfig>,
+) -> Result<TlsStream<TcpStream>, Failure> {
     let mut request = Vec::new();
     request.extend_from_slice(&8u32.to_be_bytes());
     request.extend_from_slice(&(constant("SSL_REQUEST_CODE") as u32).to_be_bytes());
@@ -1564,7 +1809,7 @@ pub async fn negotiate_tls(
     if response[0] != b'S' {
         return Err("PostgreSQL refused TLS".into());
     }
-    Ok(TlsConnector::from(Arc::new(config))
+    Ok(TlsConnector::from(config)
         .connect(ServerName::try_from(hostname.to_string())?, stream)
         .await?)
 }
@@ -1572,11 +1817,11 @@ async fn dial_postgres(
     address: std::net::IpAddr,
     host: &str,
     port: u16,
-    ca: &[u8],
+    config: Arc<ClientConfig>,
 ) -> Result<TlsStream<TcpStream>, Failure> {
     let stream = TcpStream::connect((address, port)).await?;
     stream.set_nodelay(true)?;
-    negotiate_tls(stream, host, ca).await
+    negotiate(stream, host, config).await
 }
 
 #[cfg(test)]
@@ -1647,5 +1892,76 @@ mod admission_revision_tests {
         actual.ca.as_mut().unwrap().ca_secret_resource_version = "81".into();
         actual.container_id = Some("c".repeat(64));
         assert!(!admitted_runtime_current(&state, &claims, &actual));
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::*;
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+    fn bound() -> TargetIdentity {
+        TargetIdentity {
+            address: "10.0.0.7".parse().unwrap(),
+            pod_uid: "01234567-89ab-4def-8123-0123456789ab".into(),
+            node: "customer-eu1".into(),
+            container_id: None,
+            ca: None,
+            unready: false,
+        }
+    }
+    fn admitted(ca: &[u8]) -> crate::kubernetes::AdmissionTarget {
+        let pod = bound().pod_uid;
+        serde_json::from_value(serde_json::json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":pod,"container_id":"a".repeat(64),"ca_secret_uid":pod,"ca_secret_resource_version":"81","ca_sha256":sha256_hex(ca),"tls_server_name":"pgcf-slot-0a1b2c3d.svc"})).unwrap()
+    }
+    #[test]
+    fn a_dial_takes_the_watched_ca_only_when_it_is_the_admitted_one() {
+        let database = "a".repeat(20);
+        let target = database_target(
+            &database,
+            &bound(),
+            Some(admitted(b"ca one")),
+            Some(b"ca one".to_vec()),
+        );
+        assert_eq!(target.ca.as_deref(), Some(b"ca one".as_slice()));
+        assert_eq!(target.ca_sha256, Some(sha256_hex(b"ca one")));
+        // A watch that moved on never stands in for the admitted authority.
+        let target = database_target(
+            &database,
+            &bound(),
+            Some(admitted(b"ca one")),
+            Some(b"ca two".to_vec()),
+        );
+        assert_eq!(target.ca, None);
+        assert_eq!(target.ca_sha256, Some(sha256_hex(b"ca one")));
+        // A route without an admitted authority dials with the database's watched one.
+        let target = database_target(&database, &bound(), None, Some(b"ca two".to_vec()));
+        assert_eq!(target.ca.as_deref(), Some(b"ca two".as_slice()));
+        assert_eq!(target.ca_sha256, None);
+    }
+    #[test]
+    fn a_tls_configuration_is_built_once_per_database_and_authority() {
+        let pem = |name: &str| {
+            rcgen::generate_simple_self_signed(vec![name.into()])
+                .unwrap()
+                .cert
+                .pem()
+                .into_bytes()
+        };
+        let (one, two) = (pem("one.svc"), pem("two.svc"));
+        let configs = TlsConfigs::default();
+        let first = configs.get("a", &one).unwrap();
+        assert!(Arc::ptr_eq(&first, &configs.get("a", &one).unwrap()));
+        let other = configs.get("b", &one).unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
+        // A database's new authority replaces its old configuration.
+        let renewed = configs.get("a", &two).unwrap();
+        assert!(!Arc::ptr_eq(&first, &renewed));
+        assert_eq!(configs.len(), 2);
+        assert!(configs.get("a", b"no certificate").is_err());
     }
 }

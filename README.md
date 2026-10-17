@@ -133,7 +133,7 @@ sequenceDiagram
   R-->>A: ready
   A-->>E: awake
   E->>P: native WebSocket via Tunnel and gateway (signed route token)
-  C->>P: gateway validates Startup, PostgreSQL SCRAM end to end
+  C->>P: gateway validates Startup, logs in with a pipelined password (SCRAM inside the cluster)
 ```
 
 | Part                  | Where                | Job                                                                                                          |
@@ -146,9 +146,9 @@ sequenceDiagram
 | Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin                                |
 
 The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the single database hostname.
-Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with `pipelineConnect=false`
-and a `wsProxy` URL containing both URL-encoded hints. Requests to the bare `/v2` endpoint or with
-missing or invalid hints are unsupported. Actor admission checks the database and role against D1.
+Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with its default
+`pipelineConnect: "password"` and a `wsProxy` URL containing both URL-encoded hints. Requests to
+the bare `/v2` endpoint or with missing or invalid hints are unsupported. Actor admission checks the database and role against D1.
 The Edge signs a route token that lives 30 seconds and names the database, role, region, database
 generation and verified primary Pod (v3; v4 adds the admission route revision), and returns the
 unopened upstream WebSocket for native forwarding. Admission failures return a small failure-only
@@ -159,7 +159,12 @@ signed Tunnel route is the fallback.
 The gateway checks the actual PostgreSQL StartupMessage database and user against the signed
 route before opening PostgreSQL. It owns SSL/GSS preludes, CancelRequest, startup parsing and the
 startup deadline, negotiates verified TLS to PostgreSQL, and measures stream bytes and connection
-events. SCRAM authentication runs end to end with PostgreSQL; uncertain writes are never replayed.
+events. A client that pipelines its password in the message of its StartupMessage (the Neon
+driver's default) is asked for it with AuthenticationCleartextPassword over the encrypted
+WebSocket; the gateway then logs in to PostgreSQL with SCRAM-SHA-256 inside the cluster, trusts
+PostgreSQL only after its server signature, and never logs or stores the password. Any other
+client, such as the CLI, authenticates with SCRAM end to end with PostgreSQL. Uncertain writes are
+never replayed.
 
 ### PostgreSQL tools
 
