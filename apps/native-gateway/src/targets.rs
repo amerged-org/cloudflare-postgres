@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Authenticated discovery and physical write authority, outside connection hot paths.
-use crate::{
-    control,
-    kubernetes::{AdmissionTarget, Intent, Kubernetes, admission_target},
-    storage::{StorageBinding, StorageGate, StorageTrust},
-};
+//! Authenticated writer discovery, outside connection hot paths.
+use crate::kubernetes::{AdmissionTarget, Intent, Kubernetes, admission_target};
 use futures_util::StreamExt;
 use pgcf_native_protocol::{valid_pattern, valid_schema, wake, wire};
-use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,7 +18,6 @@ pub struct TargetIdentity {
     pub address: IpAddr,
     pub pod_uid: String,
     pub node: String,
-    pub storage: Option<StorageBinding>,
     pub container_id: Option<String>,
     pub ca: Option<CaIdentity>,
     /// The writer is admitted on the controller's attestation instead of the kubelet's report:
@@ -43,28 +37,12 @@ pub struct CaIdentity {
 pub enum TargetUnavailable {
     DiscoveryUnavailable,
     WriterIdentityUnavailable,
-    StorageAuthorityMissing,
-    StorageAuthorityInvalid,
-    StorageAuthorityScopeOrFreshnessChanged,
-    StorageAuthorityRegressedOrConflicted,
-    StorageAuthorityExpired,
-    StorageAuthorityRefused,
 }
 impl TargetUnavailable {
     pub fn code(self) -> &'static str {
         match self {
             Self::DiscoveryUnavailable => "discovery_unavailable",
             Self::WriterIdentityUnavailable => "writer_identity_unavailable",
-            Self::StorageAuthorityMissing => "storage_authority_missing",
-            Self::StorageAuthorityInvalid => "storage_authority_invalid",
-            Self::StorageAuthorityScopeOrFreshnessChanged => {
-                "storage_authority_scope_or_freshness_changed"
-            }
-            Self::StorageAuthorityRegressedOrConflicted => {
-                "storage_authority_regressed_or_conflicted"
-            }
-            Self::StorageAuthorityExpired => "storage_authority_expired",
-            Self::StorageAuthorityRefused => "storage_authority_refused",
         }
     }
 }
@@ -72,16 +50,6 @@ impl std::fmt::Display for TargetUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.code())
     }
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyStorageBinding {
-    pub database_id: String,
-    pub storage_uid: String,
-    pub namespace_uid: String,
-    pub cluster_uid: String,
-    pub physical_generation: u64,
-    pub volume_identity: Value,
 }
 /// How long the controller's attestation may stand in for the kubelet's report, counted from the
 /// first time this gateway relied on it for a Pod and container. It is the bound a connection has
@@ -129,16 +97,11 @@ impl Witness {
 }
 #[derive(Default)]
 pub struct Targets {
-    legacy: HashMap<String, LegacyStorageBinding>,
     identities: HashMap<String, TargetIdentity>,
     slices: HashMap<String, Value>,
     pods: HashMap<String, Value>,
     maps: HashMap<String, Value>,
-    gates: HashMap<String, StorageGate>,
     witnesses: HashMap<String, Witness>,
-    // The existing gate clears its current claims when verification fails. Retain only the
-    // finite reason from that same evaluation, never an additional authorization decision.
-    authority_refusals: HashMap<String, TargetUnavailable>,
     slices_observed: Option<Instant>,
     pods_observed: Option<Instant>,
     maps_observed: Option<Instant>,
@@ -162,13 +125,6 @@ fn uuid(v: &Value, key: &str) -> Result<String, &'static str> {
 fn json(v: &Value, key: &str) -> Result<Value, &'static str> {
     let raw = text(v, key)?;
     serde_json::from_str(raw).map_err(|_| "invalid storage identity")
-}
-fn safe_integer(v: &Value) -> Result<u64, &'static str> {
-    let n = v.as_f64().ok_or("invalid generation")?;
-    if !n.is_finite() || n < 1.0 || n.fract() != 0.0 || n > 9_007_199_254_740_991.0 {
-        return Err("invalid generation");
-    }
-    Ok(n as u64)
 }
 fn owned_map(v: &Value) -> Result<Option<String>, &'static str> {
     if !crate::kubernetes::typed(v, "v1", "ConfigMap")
@@ -217,35 +173,6 @@ fn owned_pod(v: &Value) -> Result<String, &'static str> {
     uuid(&v["metadata"], "uid")
 }
 impl Targets {
-    pub fn with_legacy(raw: &str) -> Result<Self, &'static str> {
-        if raw.len() > 1024 * 1024 {
-            return Err("legacy custody configuration too large");
-        }
-        let values: Value =
-            serde_json::from_str(raw).map_err(|_| "invalid legacy custody configuration")?;
-        let records = values
-            .as_array()
-            .filter(|v| v.len() <= 2000)
-            .ok_or("legacy custody capacity exceeded")?;
-        let mut legacy = HashMap::new();
-        for raw in records {
-            if !pgcf_native_protocol::valid_legacy_storage_binding(raw) {
-                return Err("invalid generated legacy custody contract");
-            }
-            let mut normalized = raw.clone();
-            normalized["physical_generation"] = safe_integer(&raw["physical_generation"])?.into();
-            let record: LegacyStorageBinding = serde_json::from_value(normalized)
-                .map_err(|_| "invalid legacy custody configuration")?;
-            if legacy.insert(record.database_id.clone(), record).is_some() {
-                return Err("duplicate legacy custody identity");
-            }
-        }
-        Ok(Self {
-            legacy,
-            ..Self::default()
-        })
-    }
-
     /// The running `postgres` container of the Pod. `attested` is the container the controller
     /// verified as running PostgreSQL: only that exact container is accepted before the
     /// kubelet reports it ready.
@@ -427,12 +354,7 @@ impl Targets {
         self.pods_observed
             .is_some_and(|at| at.elapsed() < Duration::from_secs(70))
     }
-    pub fn replace(
-        &mut self,
-        kind: &str,
-        items: &[Value],
-        trust: Option<&StorageTrust>,
-    ) -> Result<(), &'static str> {
+    pub fn replace(&mut self, kind: &str, items: &[Value]) -> Result<(), &'static str> {
         if items.len() > 4000 {
             return Err("discovery capacity exceeded");
         }
@@ -461,16 +383,11 @@ impl Targets {
             self.maps = next;
             self.maps_observed = Some(Instant::now());
         }
-        self.refresh_gates(trust);
+        self.refresh_targets();
         self.changed.notify_waiters();
         Ok(())
     }
-    pub fn event(
-        &mut self,
-        kind: &str,
-        event: &Value,
-        trust: Option<&StorageTrust>,
-    ) -> Result<(), &'static str> {
+    pub fn event(&mut self, kind: &str, event: &Value) -> Result<(), &'static str> {
         if event["object"]["metadata"]["resourceVersion"]
             .as_str()
             .is_none_or(|v| v.is_empty() || v.len() > 128)
@@ -530,7 +447,7 @@ impl Targets {
             vec![text(&object["metadata"]["labels"], "pgcf.io/database-id")?.to_string()]
         };
         for database in databases {
-            self.refresh_gate(&database, trust);
+            self.refresh_target(&database);
         }
         self.changed.notify_waiters();
         Ok(())
@@ -550,15 +467,10 @@ impl Targets {
             for target in self.identities.values_mut() {
                 target.container_id = None;
             }
+        } else if kind == "endpointslices" {
+            self.slices_observed = None;
         } else {
-            if kind == "endpointslices" {
-                self.slices_observed = None;
-            } else {
-                self.maps_observed = None;
-            }
-            for gate in self.gates.values_mut() {
-                gate.disconnect();
-            }
+            self.maps_observed = None;
         }
         self.changed.notify_waiters();
     }
@@ -670,16 +582,9 @@ impl Targets {
             .map(|(address, uid, node)| (address, uid, node, true))
             .ok_or("writer target unavailable")
     }
-    /// The storage binding the writer's I/O authority is checked against. A pool slot has none:
-    /// it is routed on the controller's attestation of its Pod and container, on the node of the
-    /// database's volume.
-    fn binding(
-        &self,
-        database: &str,
-        pod_uid: &str,
-        node: &str,
-        slot: bool,
-    ) -> Result<Option<StorageBinding>, &'static str> {
+    /// Whether the writer runs on the node of the database's volume, while neither the database's
+    /// storage nor its fence is being deleted. A pool slot's writer is held to the same node.
+    fn placed(&self, database: &str, node: &str) -> Result<(), &'static str> {
         let storage = self
             .maps
             .get(&format!("storage-{database}"))
@@ -693,85 +598,12 @@ impl Targets {
         {
             return Err("database retiring");
         }
-        let state = json(&storage["data"], "state")?;
-        if state["node"] != node {
+        if json(&storage["data"], "state")?["node"] != node {
             return Err("writer node changed");
         }
-        if slot {
-            return Ok(None);
-        }
-        if state["storage"].is_null() {
-            let retained = self
-                .legacy
-                .get(database)
-                .ok_or("database requires signed thin authority")?;
-            let power = json(&fence["data"], "power.json")?;
-            let anchor = &power["anchor"];
-            let identity = json(
-                &storage["metadata"]["annotations"],
-                "pgcf.io/volume-identity",
-            )?;
-            if storage["metadata"]["uid"] != retained.storage_uid
-                || state["namespaceUid"] != retained.namespace_uid
-                || state["clusterUid"] != retained.cluster_uid
-                || identity != retained.volume_identity
-                || safe_integer(&anchor["physicalGeneration"])? != retained.physical_generation
-                || anchor["storageUid"] != retained.storage_uid
-                || !anchor["storage"].is_null()
-                || json(anchor, "storageState")? != state
-                || json(anchor, "volumeIdentity")? != identity
-            {
-                return Err("retained legacy custody changed");
-            }
-            return Ok(None);
-        }
-        let power = json(&fence["data"], "power.json")?;
-        let anchor = &power["anchor"];
-        if storage["metadata"]["uid"] != anchor["storageUid"]
-            || storage["metadata"]["annotations"]["pgcf.io/gateway-fence-uid"]
-                != fence["metadata"]["uid"]
-            || json(anchor, "storageState")? != state
-            || json(anchor, "volumeIdentity")?
-                != json(
-                    &storage["metadata"]["annotations"],
-                    "pgcf.io/volume-identity",
-                )?
-        {
-            return Err("sealed storage identity changed");
-        }
-        let profile = &state["storage"];
-        let hash = text(profile, "profile_sha256")?;
-        if profile["backend"] != "lvm-thin-v1"
-            || hash.len() != 64
-            || !hash
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-            || profile["storage_class"] != format!("pgcf-lvm-thin-v1-{}", &hash[..16])
-            || anchor["storage"] != *profile
-        {
-            return Err("unapproved storage profile");
-        }
-        let identity = json(
-            &storage["metadata"]["annotations"],
-            "pgcf.io/volume-identity",
-        )?;
-        let intent = json(&fence["data"], "intent.json")?;
-        Ok(Some(StorageBinding {
-            database_id: database.into(),
-            generation: safe_integer(&intent["revision"])?,
-            storage_uid: uuid(&storage["metadata"], "uid")?,
-            node_uid: uuid(profile, "node_uid")?,
-            volume_group_uuid: text(profile, "volume_group_uuid")?.into(),
-            pool_uuid: text(profile, "pool_uuid")?.into(),
-            profile_sha256: hash.into(),
-            volume_handle: text(&identity, "handle")?.into(),
-            lv_uuid: text(&identity, "lvUuid")?.into(),
-            pvc_uid: uuid(&identity, "claimUid")?,
-            pv_uid: uuid(&identity, "volumeUid")?,
-            pod_uid: pod_uid.into(),
-        }))
+        Ok(())
     }
-    fn refresh_gates(&mut self, trust: Option<&StorageTrust>) {
+    fn refresh_targets(&mut self) {
         let names = self
             .maps
             .keys()
@@ -779,20 +611,12 @@ impl Targets {
             .collect::<Vec<_>>();
         self.identities
             .retain(|database, _| self.maps.contains_key(&format!("storage-{database}")));
-        self.gates.retain(|database, _| {
-            self.maps.contains_key(&format!("storage-{database}"))
-                || self.maps.contains_key(&format!("gateway-fence-{database}"))
-        });
-        self.authority_refusals.retain(|database, _| {
-            self.maps.contains_key(&format!("storage-{database}"))
-                || self.maps.contains_key(&format!("gateway-fence-{database}"))
-        });
         self.witnesses.retain(|database, _| {
             self.maps.contains_key(&format!("storage-{database}"))
                 || self.maps.contains_key(&format!("gateway-fence-{database}"))
         });
         for database in names {
-            self.refresh_gate(&database, trust);
+            self.refresh_target(&database);
         }
     }
     /// The CNPG writer: the Pod of the Ready endpoint, or the controller's attested Pod while the
@@ -818,6 +642,7 @@ impl Targets {
                         ),
                         None => reported.clone(),
                     };
+                    self.placed(database, &node)?;
                     Ok(TargetIdentity {
                         address,
                         // Not reported Ready by the kubelet: its endpoint, or a container that only
@@ -825,12 +650,6 @@ impl Targets {
                         unready: !ready || container_id != reported,
                         container_id,
                         ca: self.current_ca(database),
-                        storage: self.binding(
-                            database,
-                            &pod_uid,
-                            &node,
-                            wake::is_slot_namespace(&self.writer_namespace(database)),
-                        )?,
                         pod_uid,
                         node,
                     })
@@ -840,66 +659,21 @@ impl Targets {
         }
         identity
     }
-    fn refresh_gate(&mut self, database: &str, trust: Option<&StorageTrust>) {
-        let now = control::now();
+    fn refresh_target(&mut self, database: &str) {
         let identity = self.writer_identity(database);
         if !self.maps.contains_key(&format!("storage-{database}"))
             && !self.maps.contains_key(&format!("gateway-fence-{database}"))
         {
             self.identities.remove(database);
-            self.gates.remove(database);
-            self.authority_refusals.remove(database);
             self.witnesses.remove(database);
             return;
         }
-        if self.gates.len() >= 4000 && !self.gates.contains_key(database) {
-            self.identities.remove(database);
-            return;
-        }
-        let gate = self.gates.entry(database.to_string()).or_default();
-        let Ok(identity) = identity else {
-            self.identities.remove(database);
-            gate.disconnect();
-            return;
+        match identity {
+            Ok(identity) => self.identities.insert(database.into(), identity),
+            Err(_) => self.identities.remove(database),
         };
-        if let Some(binding) = &identity.storage {
-            let outcome = (|| {
-                let trust = trust.ok_or(TargetUnavailable::StorageAuthorityMissing)?;
-                let raw = text(
-                    &self.maps[&format!("storage-{database}")]["data"],
-                    wire("storageAuthorityLedgerKey"),
-                )
-                .map_err(|_| TargetUnavailable::StorageAuthorityMissing)?;
-                let verified = trust
-                    .verify(raw, now)
-                    .map_err(|_| TargetUnavailable::StorageAuthorityInvalid)?;
-                gate.update(verified, binding, now)
-                    .map_err(|reason| match reason {
-                        "storage authority identity or freshness changed" => {
-                            TargetUnavailable::StorageAuthorityScopeOrFreshnessChanged
-                        }
-                        "storage authority regressed or conflicted" => {
-                            TargetUnavailable::StorageAuthorityRegressedOrConflicted
-                        }
-                        _ => TargetUnavailable::StorageAuthorityInvalid,
-                    })
-            })();
-            if let Err(reason) = outcome {
-                gate.disconnect();
-                self.authority_refusals.insert(database.into(), reason);
-            } else {
-                self.authority_refusals.remove(database);
-            }
-        } else {
-            self.authority_refusals.remove(database);
-        }
-        self.identities.insert(database.into(), identity);
     }
-    fn current_target(
-        &self,
-        database: &str,
-        now: u64,
-    ) -> Result<&TargetIdentity, TargetUnavailable> {
+    fn current_target(&self, database: &str) -> Result<&TargetIdentity, TargetUnavailable> {
         if !valid_pattern("database", database) || !self.synchronized() {
             return Err(TargetUnavailable::DiscoveryUnavailable);
         }
@@ -918,33 +692,10 @@ impl Targets {
         {
             return Err(TargetUnavailable::WriterIdentityUnavailable);
         }
-        if target.storage.as_ref().is_some_and(|binding| {
-            !self
-                .gates
-                .get(database)
-                .is_some_and(|gate| gate.permits(binding, now))
-        }) {
-            return Err(self
-                .authority_refusals
-                .get(database)
-                .copied()
-                .unwrap_or_else(|| {
-                    if self
-                        .gates
-                        .get(database)
-                        .and_then(StorageGate::deadline)
-                        .is_some_and(|expiry| expiry <= now)
-                    {
-                        TargetUnavailable::StorageAuthorityExpired
-                    } else {
-                        TargetUnavailable::StorageAuthorityRefused
-                    }
-                }));
-        }
         Ok(target)
     }
-    pub fn target(&self, database: &str, now: u64) -> Result<TargetIdentity, TargetUnavailable> {
-        let mut target = self.current_target(database, now)?.clone();
+    pub fn target(&self, database: &str) -> Result<TargetIdentity, TargetUnavailable> {
+        let mut target = self.current_target(database)?.clone();
         if !self.pods_synchronized() {
             // The Pod watch is what recognized a writer the kubelet has not reported Ready.
             if target.unready {
@@ -954,59 +705,17 @@ impl Targets {
         }
         Ok(target)
     }
-    pub fn write_budget(&self, database: &str, now: u64) -> Duration {
-        if self
-            .identities
-            .get(database)
-            .is_some_and(|target| target.storage.is_some())
-        {
-            Duration::from_millis(
-                self.gates
-                    .get(database)
-                    .and_then(StorageGate::deadline)
-                    .unwrap_or(now)
-                    .saturating_sub(now)
-                    .min(10_000),
-            )
-        } else {
-            Duration::from_secs(10)
-        }
-    }
-    pub fn storage_generation(&self, database: &str) -> Option<u64> {
-        self.identities
-            .get(database)
-            .and_then(|v| v.storage.as_ref().map(|v| v.generation))
-    }
-    pub fn permits(&self, database: &str, target: &TargetIdentity, now: u64) -> bool {
-        let Ok(current) = self.current_target(database, now) else {
-            return false;
-        };
-        if current.address != target.address
-            || current.pod_uid != target.pod_uid
-            || current.node != target.node
-            || (target.container_id.is_some()
-                && (current.container_id != target.container_id || !self.pods_synchronized()))
-            || (target.ca.is_some() && current.ca != target.ca)
-        {
-            return false;
-        }
-        match (&current.storage, &target.storage) {
-            (None, None) => true,
-            (Some(a), Some(b)) => {
-                a.database_id == b.database_id
-                    && a.storage_uid == b.storage_uid
-                    && a.node_uid == b.node_uid
-                    && a.volume_group_uuid == b.volume_group_uuid
-                    && a.pool_uuid == b.pool_uuid
-                    && a.profile_sha256 == b.profile_sha256
-                    && a.volume_handle == b.volume_handle
-                    && a.lv_uuid == b.lv_uuid
-                    && a.pvc_uid == b.pvc_uid
-                    && a.pv_uid == b.pv_uid
-                    && a.pod_uid == b.pod_uid
-            }
-            _ => false,
-        }
+    /// Whether `target` is still the database's writer: the same Pod, address and node, and the
+    /// same container and TLS authority when the session was bound to them.
+    pub fn permits(&self, database: &str, target: &TargetIdentity) -> bool {
+        self.current_target(database).is_ok_and(|current| {
+            current.address == target.address
+                && current.pod_uid == target.pod_uid
+                && current.node == target.node
+                && (target.container_id.is_none()
+                    || (current.container_id == target.container_id && self.pods_synchronized()))
+                && (target.ca.is_none() || current.ca == target.ca)
+        })
     }
 }
 
@@ -1026,7 +735,6 @@ fn discovery(kind: &str) -> (String, &'static str) {
 pub async fn synchronize(
     api: Arc<Kubernetes>,
     state: Arc<RwLock<Targets>>,
-    trust: Option<StorageTrust>,
     kind: &'static str,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -1060,16 +768,11 @@ pub async fn synchronize(
                     list["items"].as_array(),
                     list["metadata"]["resourceVersion"].as_str(),
                 )
-                && state
-                    .write()
-                    .await
-                    .replace(kind, items, trust.as_ref())
-                    .is_ok()
+                && state.write().await.replace(kind, items).is_ok()
             {
-                clean_rollover =
-                    watch_stream(&api, version, &state, trust.as_ref(), kind, &mut stop)
-                        .await
-                        .is_ok();
+                clean_rollover = watch_stream(&api, version, &state, kind, &mut stop)
+                    .await
+                    .is_ok();
             }
         }
 
@@ -1088,7 +791,6 @@ async fn watch_stream(
     api: &Kubernetes,
     version: &str,
     state: &RwLock<Targets>,
-    trust: Option<&StorageTrust>,
     kind: &str,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1112,7 +814,7 @@ async fn watch_stream(
             if byte == b'\n' {
                 if !line.is_empty() {
                     let event: Value = serde_json::from_slice(&line)?;
-                    state.write().await.event(kind, &event, trust)?;
+                    state.write().await.event(kind, &event)?;
                     line.clear();
                 }
             } else {
@@ -1137,9 +839,7 @@ mod tests {
         let uid = "22222222-2222-4222-8222-222222222222";
         let mut state = Targets::default();
         let mut pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":"pgcf-db-aaaaaaaaaaaaaaaaaaaa","uid":uid,"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":true,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-13T10:00:00Z"}}}]}});
-        state
-            .replace("pods", std::slice::from_ref(&pod), None)
-            .unwrap();
+        state.replace("pods", std::slice::from_ref(&pod)).unwrap();
         let address = "10.0.0.7".parse().unwrap();
         assert_eq!(
             state.runtime_container(uid, address, "customer-us1", None),
@@ -1149,7 +849,7 @@ mod tests {
             format!("containerd://{}", "b".repeat(64)).into();
         pod["metadata"]["resourceVersion"] = "2".into();
         state
-            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .event("pods", &json!({"type":"MODIFIED","object":pod}))
             .unwrap();
         assert_eq!(
             state.runtime_container(uid, address, "customer-us1", None),
@@ -1173,19 +873,18 @@ mod tests {
             .unwrap()
             .pem();
         let mut map = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":"pgcf-system","name":format!("ca-{database}"),"uid":uid,"resourceVersion":"1","labels":{"pgcf.io/database-id":database},"annotations":{"pgcf.io/source-ca-secret-uid":uid,"pgcf.io/source-ca-secret-resource-version":"7"}},"data":{"ca.crt":ca}});
-        state.replace("configmaps", &[map.clone()], None).unwrap();
+        state.replace("configmaps", &[map.clone()]).unwrap();
         let before = state.current_ca(&database).unwrap();
         map["metadata"]["annotations"]["pgcf.io/source-ca-secret-resource-version"] = "8".into();
         state
             .event(
                 "configmaps",
                 &json!({"type":"MODIFIED","object":map.clone()}),
-                None,
             )
             .unwrap();
         assert_ne!(before, state.current_ca(&database).unwrap());
         map["metadata"]["annotations"] = Value::Null;
-        state.replace("configmaps", &[map], None).unwrap();
+        state.replace("configmaps", &[map]).unwrap();
         assert!(state.current_ca(&database).is_none());
         state.disconnect("configmaps");
         assert!(state.current_ca(&database).is_none());
@@ -1197,22 +896,18 @@ mod tests {
         let mut object = slice("22222222-2222-4222-8222-222222222222", "10.0.0.7");
         object.as_object_mut().unwrap().remove("apiVersion");
         object.as_object_mut().unwrap().remove("kind");
-        state
-            .replace("endpointslices", &[object.clone()], None)
-            .unwrap();
+        state.replace("endpointslices", &[object.clone()]).unwrap();
         let map = json!({"metadata":{"namespace":"pgcf-system","name":"storage-aaaaaaaaaaaaaaaaaaaa","uid":"55555555-5555-4555-8555-555555555555","labels":{"pgcf.io/database-id":"aaaaaaaaaaaaaaaaaaaa"}},"data":{}});
-        state.replace("configmaps", &[map], None).unwrap();
+        state.replace("configmaps", &[map]).unwrap();
         assert!(state.synchronized());
         object["kind"] = "Service".into();
-        assert!(state.replace("endpointslices", &[object], None).is_err());
+        assert!(state.replace("endpointslices", &[object]).is_err());
     }
     #[test]
     fn exact_ready_target_is_required_and_ambiguous_writers_are_rejected() {
         let mut state = Targets::default();
         let mut object = slice("22222222-2222-4222-8222-222222222222", "10.0.0.7");
-        state
-            .replace("endpointslices", &[object.clone()], None)
-            .unwrap();
+        state.replace("endpointslices", &[object.clone()]).unwrap();
         assert_eq!(
             state
                 .endpoint("aaaaaaaaaaaaaaaaaaaa", None)
@@ -1222,15 +917,13 @@ mod tests {
             "10.0.0.7"
         );
         object["endpoints"][0]["conditions"]["ready"] = false.into();
-        state
-            .replace("endpointslices", &[object.clone()], None)
-            .unwrap();
+        state.replace("endpointslices", &[object.clone()]).unwrap();
         assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
         object["endpoints"][0]["conditions"]["ready"] = true.into();
         let mut replacement = slice("33333333-3333-4333-8333-333333333333", "10.0.0.8");
         replacement["metadata"]["uid"] = "44444444-4444-4444-8444-444444444444".into();
         state
-            .replace("endpointslices", &[object, replacement], None)
+            .replace("endpointslices", &[object, replacement])
             .unwrap();
         assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
     }
@@ -1239,7 +932,7 @@ mod tests {
         let mut state = Targets::default();
         let mut object = slice("22222222-2222-4222-8222-222222222222", "10.0.0.7");
         object["endpoints"][0]["targetRef"]["uid"] = Value::Null;
-        state.replace("endpointslices", &[object], None).unwrap();
+        state.replace("endpointslices", &[object]).unwrap();
         assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
     }
     #[test]
@@ -1250,34 +943,26 @@ mod tests {
                 .replace(
                     "endpointslices",
                     &[slice("22222222-2222-4222-8222-222222222222", ip)],
-                    None,
                 )
                 .unwrap();
             assert!(state.endpoint("aaaaaaaaaaaaaaaaaaaa", None).is_err());
         }
     }
     #[test]
-    fn immutable_legacy_configuration_rejects_unknown_or_duplicate_identities() {
-        assert!(Targets::with_legacy("{}").is_err());
-        assert!(Targets::with_legacy("[{\"database_id\":\"invalid\"}]").is_err());
-        assert!(Targets::with_legacy("[]").unwrap().legacy.is_empty());
-    }
-
-    #[test]
     fn target_refusal_distinguishes_discovery_from_missing_writer_identity() {
         let mut state = Targets::default();
         assert_eq!(
             state
-                .target("aaaaaaaaaaaaaaaaaaaa", 0)
+                .target("aaaaaaaaaaaaaaaaaaaa")
                 .unwrap_err()
                 .to_string(),
             "discovery_unavailable"
         );
-        state.replace("endpointslices", &[], None).unwrap();
-        state.replace("configmaps", &[], None).unwrap();
+        state.replace("endpointslices", &[]).unwrap();
+        state.replace("configmaps", &[]).unwrap();
         assert_eq!(
             state
-                .target("aaaaaaaaaaaaaaaaaaaa", 0)
+                .target("aaaaaaaaaaaaaaaaaaaa")
                 .unwrap_err()
                 .to_string(),
             "writer_identity_unavailable"
@@ -1297,7 +982,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect()
     }
-    /// A retained thick database whose parked Pod `wake_id(3)` was resumed: the fence runs at
+    /// A database without thin storage whose parked Pod `wake_id(3)` was resumed: the fence runs at
     /// revision 7 and carries the controller's target for that Pod's `postgres` container, and
     /// the kubelet has reported neither the endpoint nor the container Ready.
     struct Wake {
@@ -1312,7 +997,6 @@ mod tests {
             let volume =
                 json!({"handle":format!("pvc-{}",id(5)),"claimUid":id(5),"volumeUid":id(6)});
             let storage = json!({"node":"customer-us1","namespaceUid":id(7),"clusterUid":id(8)});
-            let cohort = json!([{"database_id":WAKE,"storage_uid":id(2),"namespace_uid":id(7),"cluster_uid":id(8),"physical_generation":1,"volume_identity":volume}]);
             let labels = json!({"pgcf.io/database-id":WAKE});
             let target = json!({"v":1,"generation":7,"route_revision":19,"admission_epoch":11,"pod_uid":id(3),"container_id":"a".repeat(64),"ca_secret_uid":id(21),"ca_secret_resource_version":"81","ca_sha256":sha256_hex(WAKE_CA),"tls_server_name":format!("database-rw.pgcf-db-{WAKE}.svc")});
             let intent = json!({"database":WAKE,"operation":format!("op_{}","b".repeat(20)),"revision":7,"mode":"running"});
@@ -1321,7 +1005,7 @@ mod tests {
                 json!({"ready":false,"serving":false,"terminating":false});
             let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":format!("pgcf-db-{WAKE}"),"uid":id(3),"resourceVersion":"1","labels":{"cnpg.io/cluster":"database"}},"spec":{"nodeName":"customer-us1"},"status":{"podIP":"10.0.0.7","containerStatuses":[{"name":"postgres","ready":false,"containerID":format!("containerd://{}","a".repeat(64)),"state":{"running":{"startedAt":"2026-10-15T10:00:00Z"}}}]}});
             Self {
-                state: Targets::with_legacy(&cohort.to_string()).unwrap(),
+                state: Targets::default(),
                 slices: vec![writer],
                 pods: vec![pod],
                 maps: vec![
@@ -1341,12 +1025,12 @@ mod tests {
         }
         fn apply(&mut self) {
             let state = &mut self.state;
-            state.replace("endpointslices", &self.slices, None).unwrap();
-            state.replace("pods", &self.pods, None).unwrap();
-            state.replace("configmaps", &self.maps, None).unwrap();
+            state.replace("endpointslices", &self.slices).unwrap();
+            state.replace("pods", &self.pods).unwrap();
+            state.replace("configmaps", &self.maps).unwrap();
         }
         fn route(&self) -> Result<TargetIdentity, TargetUnavailable> {
-            self.state.target(WAKE, control::now())
+            self.state.target(WAKE)
         }
         fn edit(&mut self, key: &str, change: impl FnOnce(&mut Value)) {
             let mut value: Value =
@@ -1375,7 +1059,7 @@ mod tests {
         assert_eq!(target.pod_uid, wake_id(3));
         assert_eq!(target.container_id, Some("a".repeat(64)));
         assert_eq!(target.ca.as_ref().unwrap().ca_sha256, sha256_hex(WAKE_CA));
-        assert!(wake.state.permits(WAKE, &target, control::now()));
+        assert!(wake.state.permits(WAKE, &target));
         // The kubelet's reflection arrives: the same writer, so the connection that triggered
         // the wake is not interrupted by it.
         wake.slices[0]["endpoints"][0]["conditions"] = json!({"ready":true});
@@ -1390,7 +1074,7 @@ mod tests {
             },
             target
         );
-        assert!(wake.state.permits(WAKE, &target, control::now()));
+        assert!(wake.state.permits(WAKE, &target));
     }
     #[test]
     fn an_unready_pod_is_not_routed_without_an_attested_target() {
@@ -1427,7 +1111,7 @@ mod tests {
         let mut other = wake.slices[0].clone();
         other["metadata"]["labels"]["kubernetes.io/service-name"] = "database-ro".into();
         let mut state = Targets::default();
-        assert!(state.replace("endpointslices", &[other], None).is_err());
+        assert!(state.replace("endpointslices", &[other]).is_err());
     }
     #[test]
     fn a_terminating_attested_pod_is_never_routed() {
@@ -1521,7 +1205,7 @@ mod tests {
         let target = wake.route().unwrap();
         wake.state.disconnect("pods");
         assert!(wake.route().is_err());
-        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        assert!(!wake.state.permits(WAKE, &target));
         // The watch comes back and shows the same container: the route returns.
         wake.apply();
         assert_eq!(wake.route().unwrap(), target);
@@ -1552,23 +1236,23 @@ mod tests {
         wake.apply();
         assert!(wake.route().is_err());
         for target in [&attested, &ready] {
-            assert!(!wake.state.permits(WAKE, target, control::now()));
+            assert!(!wake.state.permits(WAKE, target));
         }
         // Neither the next list nor a watch event of the same Pod brings the route back.
         wake.apply();
         assert!(wake.route().is_err());
         let pod = wake.pods[0].clone();
         wake.state
-            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .event("pods", &json!({"type":"MODIFIED","object":pod}))
             .unwrap();
         assert!(wake.route().is_err());
-        assert!(!wake.state.permits(WAKE, &ready, control::now()));
+        assert!(!wake.state.permits(WAKE, &ready));
         // The kubelet's report is what routes it again.
         wake.kubelet(true);
         wake.apply();
         let again = wake.route().unwrap();
         assert!(!again.unready);
-        assert!(wake.state.permits(WAKE, &ready, control::now()));
+        assert!(wake.state.permits(WAKE, &ready));
     }
     #[test]
     fn a_new_revision_of_the_attestation_is_not_spent_by_an_earlier_ready() {
@@ -1627,11 +1311,11 @@ mod tests {
         wake.state.pods_observed = Instant::now().checked_sub(Duration::from_secs(71));
         assert!(wake.state.pods_observed.is_some());
         assert!(wake.route().is_err());
-        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        assert!(!wake.state.permits(WAKE, &target));
         // Its next event is the proof of the Pod again.
         let pod = wake.pods[0].clone();
         wake.state
-            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .event("pods", &json!({"type":"MODIFIED","object":pod}))
             .unwrap();
         assert_eq!(wake.route().unwrap(), target);
     }
@@ -1664,16 +1348,10 @@ mod tests {
         for (reason, withdraw) in withdrawals {
             let mut wake = Wake::armed();
             let target = wake.route().unwrap();
-            assert!(
-                wake.state.permits(WAKE, &target, control::now()),
-                "{reason}"
-            );
+            assert!(wake.state.permits(WAKE, &target), "{reason}");
             withdraw(&mut wake);
             wake.apply();
-            assert!(
-                !wake.state.permits(WAKE, &target, control::now()),
-                "{reason}"
-            );
+            assert!(!wake.state.permits(WAKE, &target), "{reason}");
         }
     }
     /// The controller's attestation of the wake fixture's Pod, as the fence carries it.
@@ -1703,20 +1381,20 @@ mod tests {
         let mut wake = Wake::armed();
         let target = wake.route().unwrap();
         assert!(target.unready);
-        assert!(wake.state.permits(WAKE, &target, control::now()));
+        assert!(wake.state.permits(WAKE, &target));
         // This gateway has relied on the attestation for as long as a connection has to start,
         // and no event of the cluster marks that moment.
         wake.state.witnesses.get_mut(WAKE).unwrap().relied_since =
             Instant::now().checked_sub(ATTESTED_ROUTE_BOUND + Duration::from_millis(1));
         assert!(wake.state.witnesses[WAKE].relied_since.is_some());
         assert!(wake.route().is_err());
-        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        assert!(!wake.state.permits(WAKE, &target));
         // A list, an event of the Pod or a flap of the report does not count it again.
         wake.apply();
         assert!(wake.route().is_err());
         let pod = wake.pods[0].clone();
         wake.state
-            .event("pods", &json!({"type":"MODIFIED","object":pod}), None)
+            .event("pods", &json!({"type":"MODIFIED","object":pod}))
             .unwrap();
         assert!(wake.route().is_err());
         // The kubelet's report routes the Pod as any Ready endpoint, whatever the attestation.
@@ -1724,7 +1402,7 @@ mod tests {
         wake.apply();
         let ready = wake.route().unwrap();
         assert!(!ready.unready);
-        assert!(wake.state.permits(WAKE, &ready, control::now()));
+        assert!(wake.state.permits(WAKE, &ready));
         // ... and it is not an unready writer again for the attestation it was spent on.
         wake.kubelet(false);
         wake.apply();
@@ -1742,7 +1420,7 @@ mod tests {
         wake.apply();
         let target = wake.route().unwrap();
         assert!(target.unready);
-        assert!(wake.state.permits(WAKE, &target, control::now()));
+        assert!(wake.state.permits(WAKE, &target));
     }
     // A database woken into a pool slot: its fence attests the slot's Pod, which runs in the
     // slot's own namespace and not in `pgcf-db-<id>`.
@@ -1792,7 +1470,7 @@ mod tests {
         for (kind, object) in [("pods", &pod), ("endpointslices", &slice)] {
             for change in ["MODIFIED", "DELETED", "ADDED"] {
                 wake.state
-                    .event(kind, &json!({"type":change,"object":object}), None)
+                    .event(kind, &json!({"type":change,"object":object}))
                     .unwrap();
             }
         }
@@ -1801,37 +1479,34 @@ mod tests {
         for namespace in ["pgcf-slot-0A1B2C3D", "pgcf-slot-0a1b2c3", "kube-system"] {
             let (slice, pod) = free_slot(namespace, 70);
             let mut state = Targets::default();
-            assert!(state.replace("pods", &[pod], None).is_err(), "{namespace}");
+            assert!(state.replace("pods", &[pod]).is_err(), "{namespace}");
             assert!(
-                state.replace("endpointslices", &[slice], None).is_err(),
+                state.replace("endpointslices", &[slice]).is_err(),
                 "{namespace}"
             );
         }
     }
     #[test]
-    fn a_slot_target_is_routed_by_its_attestation_without_a_storage_gate() {
+    fn a_slot_target_is_routed_by_its_attestation() {
         let mut wake = slot_wake();
         wake.apply();
-        // A thin database with no signed authority at all: the slot is routed on the
-        // controller's attestation alone.
         let target = wake.route().unwrap();
         assert_eq!(target.pod_uid, wake_id(40));
         assert_eq!(target.address.to_string(), "10.0.0.7");
         assert_eq!(target.container_id, Some("a".repeat(64)));
-        assert!(target.storage.is_none());
         assert!(target.unready);
         assert_eq!(wake.state.slot_databases(SLOT), vec![WAKE.to_string()]);
-        assert!(wake.state.permits(WAKE, &target, control::now()));
+        assert!(wake.state.permits(WAKE, &target));
         // An event of the slot Pod is an event of the database it serves.
         let mut restarted = wake.pods[0].clone();
         restarted["status"]["containerStatuses"][0]["containerID"] =
             format!("containerd://{}", "b".repeat(64)).into();
         restarted["metadata"]["resourceVersion"] = "2".into();
         wake.state
-            .event("pods", &json!({"type":"MODIFIED","object":restarted}), None)
+            .event("pods", &json!({"type":"MODIFIED","object":restarted}))
             .unwrap();
         assert!(wake.route().is_err());
-        assert!(!wake.state.permits(WAKE, &target, control::now()));
+        assert!(!wake.state.permits(WAKE, &target));
     }
     #[test]
     fn a_slot_target_requires_the_attested_running_postgres_container_on_its_node() {
@@ -1867,10 +1542,7 @@ mod tests {
             change(&mut wake);
             wake.apply();
             assert!(wake.route().is_err(), "{reason}");
-            assert!(
-                !wake.state.permits(WAKE, &target, control::now()),
-                "{reason}"
-            );
+            assert!(!wake.state.permits(WAKE, &target), "{reason}");
         }
     }
 }

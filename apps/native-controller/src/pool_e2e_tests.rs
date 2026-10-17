@@ -12,7 +12,6 @@ use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_gateway::{
     kubernetes::parse_snapshot,
-    targets::Targets,
     transport::{self, Config, DatabaseTarget, Gateway, PostgresDial},
 };
 use pgcf_native_protocol::{
@@ -162,7 +161,7 @@ async fn deliver(gateway: &Gateway, objects: &Arc<Mutex<State>>, refused: &Mutex
         ("pods", pods),
         ("configmaps", maps),
     ] {
-        if let Err(reason) = targets.replace(kind, &items, None) {
+        if let Err(reason) = targets.replace(kind, &items) {
             refused.lock().unwrap().push(format!("{kind}: {reason}"));
         }
     }
@@ -190,7 +189,7 @@ impl Drop for RealGateway {
     }
 }
 impl RealGateway {
-    async fn start(w: &mut World, legacy: &str) -> Self {
+    async fn start(w: &mut World) -> Self {
         let objects = w.server.state.clone();
         let routes: Arc<Mutex<HashMap<String, SocketAddr>>> = Arc::default();
         let dialled: Arc<Mutex<Vec<DatabaseTarget>>> = Arc::default();
@@ -211,7 +210,6 @@ impl RealGateway {
                 dialled: dialled.clone(),
             }),
         );
-        *gateway.targets.write().await = Targets::with_legacy(legacy).unwrap();
         let refused: Arc<Mutex<Vec<String>>> = Arc::default();
         deliver(&gateway, &objects, &refused).await;
         let (stop, stopped) = watch::channel(false);
@@ -500,7 +498,7 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
 #[tokio::test]
 async fn a_held_client_is_answered_by_the_slot_its_wake_was_attached_to() {
     let mut w = World::pooled().await;
-    let gateway = RealGateway::start(&mut w, "[]").await;
+    let gateway = RealGateway::start(&mut w).await;
     gateway.routes.lock().unwrap().insert(
         wake::slot_tls_name(&slot_ns()),
         w.slot_postgres.as_ref().unwrap().address,
@@ -587,31 +585,6 @@ async fn a_held_client_is_answered_by_the_slot_its_wake_was_attached_to() {
     .await;
 }
 
-/// The gateway's retained custody of a database without thin storage, as its configuration
-/// names it (`PGCF_GATEWAY_LEGACY_BINDINGS_JSON`): the identities its power record anchors.
-fn legacy_binding(w: &World) -> String {
-    let storage = w
-        .server
-        .get("ConfigMap", Some(SYSTEM), &format!("storage-{}", w.id))
-        .unwrap();
-    let fence = w
-        .server
-        .get(
-            "ConfigMap",
-            Some(SYSTEM),
-            &format!("gateway-fence-{}", w.id),
-        )
-        .unwrap();
-    let power: Value = serde_json::from_str(fence["data"]["power.json"].as_str().unwrap()).unwrap();
-    let identity: Value = serde_json::from_str(
-        storage["metadata"]["annotations"]["pgcf.io/volume-identity"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    json!([{"database_id":w.id,"storage_uid":storage["metadata"]["uid"],"namespace_uid":namespace_uid(),"cluster_uid":cluster_uid(),"physical_generation":power["anchor"]["physicalGeneration"],"volume_identity":identity}]).to_string()
-}
-
 #[tokio::test]
 async fn a_pool_miss_holds_the_client_until_the_database_s_own_cluster_is_released() {
     // A database without thin storage slept through its own Cluster: a pool miss.
@@ -624,8 +597,7 @@ async fn a_pool_miss_holds_the_client_until_the_database_s_own_cluster_is_releas
     w.hibernated_by_cnpg();
     let observed = w.sleep_pass().await.expect("a hibernated observation");
     assert_eq!(observed["state"], "hibernated", "{observed}");
-    let legacy = legacy_binding(&w);
-    let gateway = RealGateway::start(&mut w, &legacy).await;
+    let gateway = RealGateway::start(&mut w).await;
     gateway.routes.lock().unwrap().insert(
         format!("database-rw.{}.svc", w.ns),
         w.postgres.as_ref().unwrap().address,
