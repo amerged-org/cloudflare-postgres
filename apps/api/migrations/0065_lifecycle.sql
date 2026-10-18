@@ -5,14 +5,18 @@
 -- only ever grow: nothing here lifts one, and the triggers below refuse to.
 -- Timestamps are ISO-8601 UTC TEXT as Date#toISOString renders them (see 0001).
 
--- Orders to one node. `fence` stops everything on it, `superseded` retires one storage generation
--- of one database, `move` makes the source of a move prove its sleep and hold its wakes. A fence
--- stays on the node's page for good; the other two leave it when they end.
+-- Explicit orders to one node that no other row stands for (plan 7.11, 9.3, 9.5). A wake is the
+-- pending resume of a database and a fence is a lost node, so neither has a row. `move` makes the
+-- source of a move prove its sleep and hold its wakes, `superseded` retires one storage generation
+-- of one database, and `maintenance` is the node's maintenance cycle. An order leaves the node's
+-- page once it has ended: the node writes a retired generation to disk before it acts, so nothing
+-- is lifted by it. A retired generation only ever grows: nothing here lifts one, and the triggers
+-- below refuse to.
 CREATE TABLE lifecycle_orders (
   operation TEXT PRIMARY KEY NOT NULL
     CHECK (length(operation) = 23 AND substr(operation, 1, 3) = 'op_' AND NOT substr(operation, 4) GLOB '*[^a-z0-9]*'),
   node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK (type IN ('move', 'superseded', 'fence')),
+  type TEXT NOT NULL CHECK (type IN ('move', 'superseded', 'maintenance')),
   database_id TEXT REFERENCES databases(id) ON DELETE CASCADE,
   storage_generation INTEGER CHECK (storage_generation IS NULL OR storage_generation >= 1),
   remove_volume INTEGER NOT NULL DEFAULT 0 CHECK (remove_volume IN (0, 1)),
@@ -20,15 +24,13 @@ CREATE TABLE lifecycle_orders (
   closed_at TEXT CHECK (closed_at IS NULL OR (length(closed_at) = 24 AND closed_at GLOB '????-??-??T??:??:??.???Z')),
   result_status TEXT CHECK (result_status IS NULL OR result_status IN ('done', 'failed')),
   result_reason TEXT CHECK (result_reason IS NULL OR (length(result_reason) BETWEEN 1 AND 64 AND NOT result_reason GLOB '*[^a-z0-9_]*')),
-  CHECK ((type = 'fence') = (database_id IS NULL)),
-  CHECK ((type = 'fence') = (storage_generation IS NULL)),
+  CHECK ((type = 'maintenance') = (database_id IS NULL)),
+  CHECK ((type = 'maintenance') = (storage_generation IS NULL)),
   CHECK (type = 'superseded' OR remove_volume = 0),
-  CHECK (type <> 'fence' OR closed_at IS NULL),
   CHECK ((result_status = 'failed') = (result_reason IS NOT NULL) OR result_status IS NULL),
   CHECK (result_status IS NOT NULL OR result_reason IS NULL)
 );
 CREATE INDEX lifecycle_orders_open_idx ON lifecycle_orders(node_id, created_at, operation) WHERE closed_at IS NULL;
-CREATE UNIQUE INDEX lifecycle_orders_fence_idx ON lifecycle_orders(node_id) WHERE type = 'fence';
 CREATE INDEX lifecycle_orders_superseded_idx ON lifecycle_orders(database_id, node_id) WHERE type = 'superseded';
 -- An order never reopens, never changes what it orders and never takes back a volume removal.
 CREATE TRIGGER lifecycle_orders_monotonic BEFORE UPDATE ON lifecycle_orders

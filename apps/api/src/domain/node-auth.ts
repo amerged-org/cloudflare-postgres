@@ -26,7 +26,8 @@ export interface NodeKeyRow {
   node_uid: string;
   region_id: string;
   public_key: string;
-  lost_at: string | null;
+  /** Declared lost, whether or not the node is marked lost yet (1), else 0. */
+  fenced: number;
 }
 
 /** The token of a signed request and the record of the node it claims to come from. */
@@ -61,7 +62,9 @@ export const nodeLookup: MiddlewareHandler<ApiEnv> = async (c, next) => {
     subject === null
       ? null
       : await c.env.DB.prepare(
-          "SELECT id,node_uid,region_id,public_key,lost_at FROM nodes WHERE id=? AND node_uid=? AND public_key IS NOT NULL",
+          `SELECT id,node_uid,region_id,public_key,
+            (lost_at IS NOT NULL OR EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=nodes.id)) fenced
+           FROM nodes WHERE id=? AND node_uid=? AND public_key IS NOT NULL`,
         )
           .bind(subject.node, subject.uid)
           .first<NodeKeyRow>();
@@ -99,7 +102,7 @@ export const nodeAuthentication: MiddlewareHandler<ApiEnv> = async (
   });
   if (!verified.ok)
     throw new ApiError("unauthorized", "Invalid node credentials");
-  const fenced = row.lost_at !== null;
+  const fenced = row.fenced === 1;
   if (
     fenced &&
     !(NODE_FENCED_PATHS as readonly string[]).includes(url.pathname)

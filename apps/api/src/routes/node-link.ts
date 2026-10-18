@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, z, type RouteConfig } from "@hono/zod-openapi";
 import {
+  ARCHIVE_CREDENTIAL_ID_PATTERN,
+  ArchiveCredential,
   ErrorBody,
   InstallerProgress,
   NODE_API_PATHS,
@@ -19,6 +21,7 @@ import {
 } from "@pgcf/contracts";
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
+import { archiveCredentialResponse } from "../domain/archive-credentials.ts";
 import { callingNode, nodeAuthentication } from "../domain/node-auth.ts";
 import { desiredResponse } from "../domain/node-desired.ts";
 import { enrollNode, recordInstallerProgress } from "../domain/node-install.ts";
@@ -137,6 +140,24 @@ export function registerNodeLink(app: ApiApp): void {
     },
     async (c) =>
       desiredResponse(c, callingNode(c), NodeDesiredQuery.parse(c.req.query())),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: `${NODE_API_PATHS.archiveCredentials}{id}`,
+      tags,
+      security: node,
+      description:
+        "Reads the temporary R2 credential the node's desired page names, signed now. A credential that is not the node's, has expired or is withheld from a node declared lost is not found. The secret is in the body only and the response is never cached.",
+      request: {
+        params: z.object({
+          id: z.string().regex(ARCHIVE_CREDENTIAL_ID_PATTERN),
+        }),
+      },
+      responses: nodeResponses(ArchiveCredential),
+    },
+    async (c) => archiveCredentialResponse(c, callingNode(c).id),
   );
   register(
     app,

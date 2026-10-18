@@ -524,67 +524,59 @@ export async function setNodePolicy(f: Pick<Fixture, "region" | "admin">) {
   if (response.status !== 200) throw new Error("node_policy_fixture_failed");
 }
 /**
- * The desired page a node pulls. It needs what the operator and the credential issuer provide
- * before a node can pull it: the region's node policy and, for each database, the reference of its
- * archive credential.
+ * The desired page a node pulls. It needs what the operator provides before a node can pull it:
+ * the region's node policy. The page issues the archive credentials it names.
  */
 export async function desiredPage(
   f: Pick<Fixture, "region" | "admin" | "node" | "nodeUid" | "nodeKey">,
   query = "",
 ) {
   await setNodePolicy(f);
-  const lacking = await env.DB.prepare(
-    `SELECT d.id FROM databases d WHERE d.node_id=? AND d.desired_state IN('running','suspended','deleted')
-       AND NOT EXISTS(SELECT 1 FROM database_archive_credentials c WHERE c.database_id=d.id
-         AND c.archive_path=d.archive_path AND c.access='read_write'
-         AND (d.desired_state='deleted' OR c.expires_at>?))`,
-  )
-    .bind(f.node, new Date().toISOString())
-    .all<{ id: string }>();
-  for (const { id } of lacking.results) await grantCredential(id);
   const response = await nodeRequest(f, `/node/v1/desired${query}`);
   if (response.status !== 200) throw new Error("desired_page_fixture_failed");
   return NodeDesiredPage.parse(await response.json());
 }
 /**
- * The reference of a temporary credential, as the credential issuer leaves it: `database` holds
- * it for `path` (its own archive by default) for `lifetimeMs`.
+ * A temporary credential as an earlier page left it: `node` holds it for `path` (the database's
+ * own archive by default) from `issuedAgoMs` ago for `lifetimeMs`.
  */
 export async function grantCredential(
   database: string,
   options: {
+    node?: string;
     path?: string;
     access?: "read_write" | "read_only";
     lifetimeMs?: number;
+    issuedAgoMs?: number;
   } = {},
 ) {
-  const path =
-    options.path ??
-    (await env.DB.prepare("SELECT archive_path FROM databases WHERE id=?")
-      .bind(database)
-      .first<string>("archive_path"))!;
+  const row = (await env.DB.prepare(
+    "SELECT node_id,archive_path FROM databases WHERE id=?",
+  )
+    .bind(database)
+    .first<{ node_id: string; archive_path: string }>())!;
   const id = `crd_${randomString("abcdefghijklmnopqrstuvwxyz0123456789", 20)}`,
-    now = Date.now();
+    now = Date.now(),
+    issued = new Date(now - (options.issuedAgoMs ?? 1000)).toISOString(),
+    expires = new Date(
+      now + (options.lifetimeMs ?? 7 * 86_400_000),
+    ).toISOString();
   await env.DB.prepare(
-    "INSERT INTO database_archive_credentials(id,database_id,archive_path,access,created_at,expires_at) VALUES(?,?,?,?,?,?)",
+    "INSERT INTO archive_credentials(id,node_id,database_id,archive_path,access,issued_at,expires_at) VALUES(?,?,?,?,?,?,?)",
   )
     .bind(
       id,
+      options.node ?? row.node_id,
       database,
-      path,
+      options.path ?? row.archive_path,
       options.access ?? "read_write",
-      new Date(now - 1000).toISOString(),
-      new Date(now + (options.lifetimeMs ?? 7 * 86_400_000)).toISOString(),
+      issued,
+      expires,
     )
     .run();
-  return {
-    id,
-    expires_at: new Date(
-      now + (options.lifetimeMs ?? 7 * 86_400_000),
-    ).toISOString(),
-  };
+  return { id, expires_at: expires };
 }
-/** A database created through the API on the fixture's node, with its credential and the region's policy. */
+/** A database created through the API on the fixture's node, with the region's policy. */
 export async function served(f: Fixture, name = "database") {
   await setNodePolicy(f);
   const response = await f.create(name);
@@ -593,11 +585,9 @@ export async function served(f: Fixture, name = "database") {
     database: { id: string };
     operation: { id: string };
   };
-  const credential = await grantCredential(created.database.id);
   return {
     id: created.database.id,
     operation: created.operation.id,
-    credential,
   };
 }
 

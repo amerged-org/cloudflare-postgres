@@ -5,18 +5,21 @@ import { env } from "cloudflare:workers";
 import { expect } from "vitest";
 import {
   DatabaseWithOperation,
-  newRolePassword,
   NodeDesiredPage,
+  NodeDesiredQuery,
   type NodeDatabaseObservation,
   type NodeObservationReport,
   type NodeOrderResult,
   type ProvenSleepRecord,
 } from "@pgcf/contracts";
+import { nodeDesiredPage } from "../../src/domain/node-desired.ts";
+import { isNodeFenced } from "../../src/domain/lifecycle-orders.ts";
 import {
   addNode as addReportingNode,
   cleanupFixtures,
   fixture,
   report as nodeReport,
+  setNodePolicy,
 } from "./fixtures.ts";
 
 export const PARENT_KEY = {
@@ -79,6 +82,7 @@ export async function addNode(regionId: string): Promise<string> {
 /** A ready database on the fixture's node, with the archive path the create flow gave it. */
 export async function lifecycle() {
   const f = await fixture(8192);
+  await setNodePolicy(f);
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = created.database.id;
   // The node reports the first generation ready with a base backup it took before, as its link does.
@@ -133,75 +137,16 @@ export const failed = (operation: string, reason: string): NodeOrderResult => ({
   reason,
 });
 
-/**
- * A desired page as the node contract defines it, around what this module contributes: the
- * database entries (each with the page's own archive credential) and the node's open orders.
- */
-export async function desiredPage(
-  nodeId: string,
-  databases: {
-    row: DatabaseRecord;
-    operation: string;
-    credential: { id: string; expires_at: string };
-    origin?: unknown;
-  }[],
-  orders: unknown[],
-) {
+/** The desired page of a node as the API builds it for the node's own pull. */
+export async function pageOf(nodeId: string): Promise<NodeDesiredPage> {
   const node = (await env.DB.prepare(
-    "SELECT id,node_uid uid,k8s_node_name hostname,region_id FROM nodes WHERE id=?",
+    "SELECT id,node_uid uid,region_id FROM nodes WHERE id=?",
   )
     .bind(nodeId)
-    .first())!;
-  return NodeDesiredPage.parse({
-    node,
-    release: null,
-    policy: {
-      admission: {
-        memory_rule: "measured",
-        memory_floor_mib: 600,
-        awake_budget_mib: 9913,
-        reservation_overhead_mib: 8,
-        start_concurrency: 4,
-        queue_wait_ms: 10_000,
-        retry_after_seconds: 5,
-      },
-      early_sleep: { enabled: true, min_idle_seconds: 30 },
-      storage: {
-        reserve_bytes: 6 * 1024 ** 3,
-        metadata_no_room_percent: 75,
-        sample_max_age_seconds: 10,
-      },
-      backup: {
-        wal_uploads: 2,
-        base_backups: 1,
-        memory_mib: { wal_upload: 128, wal_fetch: 192, base_backup: 256 },
-      },
-      io: { write_bytes_per_second: 16_000_000, write_iops: 1000 },
-    },
-    credentials_revision: 1,
-    orders,
-    databases: databases.map(({ row, operation, credential, origin }) => ({
-      id: row.id,
-      generation: row.generation,
-      operation,
-      desired_state: row.desired_state,
-      route_revision: 1,
-      storage_generation: row.storage_generation,
-      pg_major: 18,
-      resources: { memory_mib: 512, cpu_millicores: 500, storage_gib: 5 },
-      settings: { max_connections: 50, archive_timeout_seconds: 60 },
-      sleep_after_seconds: 300,
-      roles: [
-        {
-          name: "app",
-          owner: true,
-          password: newRolePassword(),
-          revision: 1,
-        },
-      ],
-      archive: { path: row.archive_path, credential },
-      ...(origin === undefined ? {} : { origin }),
-    })),
-    next: null,
-  });
+    .first<{ id: string; uid: string; region_id: string }>())!;
+  return nodeDesiredPage(
+    env,
+    { ...node, fenced: await isNodeFenced(env.DB, nodeId) },
+    NodeDesiredQuery.parse({}),
+  );
 }

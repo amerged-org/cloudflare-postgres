@@ -2,9 +2,8 @@
 import { env } from "cloudflare:workers";
 import { NodeLoss } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
-import { openNodeOrders } from "../../src/domain/lifecycle-orders.ts";
-import { cleanup, lifecycle } from "./lifecycle-fixture.ts";
-import { refusal, request } from "./fixtures.ts";
+import { BACKUP, cleanup, lifecycle, pageOf } from "./lifecycle-fixture.ts";
+import { nodeRequest, refusal, reportBody, request } from "./fixtures.ts";
 
 afterEach(cleanup);
 const uidOf = async (node: string) =>
@@ -87,7 +86,7 @@ it("declares a node lost with its fence, reads the fencing back, and takes the o
     node_id: f.node,
     reason: "dead",
   });
-  const orders = await openNodeOrders(env.DB, f.node);
+  const orders = (await pageOf(f.node)).orders;
   expect(orders.map((order) => order.type)).toEqual(["fence", "superseded"]);
   const status = await request(`/v1/nodes/${f.node}/loss`, f.admin);
   expect(status.status).toBe(200);
@@ -95,7 +94,19 @@ it("declares a node lost with its fence, reads the fencing back, and takes the o
     node_id: f.node,
     reason: "dead",
     status: "fencing",
-    databases: [{ id: f.id, storage_generation: 1, recovery_point: null }],
+    databases: [
+      {
+        id: f.id,
+        storage_generation: 1,
+        // What the node reported when the database became ready: no sleep proven yet.
+        recovery_point: {
+          state: "ready",
+          proven_sleep: null,
+          backup: BACKUP,
+          observed_at: expect.any(String),
+        },
+      },
+    ],
     reinstall: { blocked: [f.id], overridden: false },
   });
   expect(
@@ -131,4 +142,46 @@ it("declares a node lost with its fence, reads the fencing back, and takes the o
       reinstall: unknown;
     },
   ).toMatchObject({ reinstall: { overridden: true } });
+});
+
+it("fences a node on its own key as soon as the administrator declares it lost", async () => {
+  const f = await lifecycle();
+  const retired = async () =>
+    (await nodeRequest(f, "/node/v1/desired")).json() as Promise<{
+      databases: unknown[];
+      orders: { type: string; operation: string }[];
+    }>;
+  expect((await retired()).databases).toHaveLength(1);
+  expect(
+    (
+      await request(`/v1/nodes/${f.node}/mark-lost`, f.admin, "POST", {
+        expected_node_uid: await uidOf(f.node),
+        reason: "dead",
+      })
+    ).status,
+  ).toBe(200);
+  // Its page holds the fence and the retired generation, and no database.
+  const page = await retired();
+  expect(page.databases).toEqual([]);
+  expect(page.orders.map((order) => order.type)).toEqual([
+    "fence",
+    "superseded",
+  ]);
+  // Every other path is refused with the fence.
+  const refused = await nodeRequest(f, "/node/v1/volumes", {
+    method: "POST",
+    body: { observed_at: new Date().toISOString(), volumes: [] },
+  });
+  expect(refused.status).toBe(403);
+  expect(await refused.json()).toEqual({ error: "node_fenced" });
+  // It reports that it obeyed; the retired generation leaves the page, the fence stays.
+  const superseded = page.orders[1]!.operation;
+  const reported = await nodeRequest(f, "/node/v1/observations", {
+    method: "POST",
+    body: reportBody([], [{ operation: superseded, status: "done" }]),
+  });
+  expect(await reported.json()).toEqual({ databases: [], orders: 1 });
+  expect((await retired()).orders.map((order) => order.type)).toEqual([
+    "fence",
+  ]);
 });

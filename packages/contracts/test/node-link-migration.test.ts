@@ -153,9 +153,15 @@ it("drops the releases of the Talos spec and the per-node release tables", () =>
     "node_minutes",
     "node_volumes",
     "node_event_ids",
-    "node_orders",
   ])
     expect(tables).toContain(kept);
+  // The orders and the archive credentials are the lifecycle's (0065), not this migration's.
+  for (const absent of [
+    "node_orders",
+    "database_archive_credentials",
+    "archive_credentials",
+  ])
+    expect(tables).not.toContain(absent);
   // A release is a node image: nothing may still demand a PostgreSQL image in a region's release,
   // or no database could be created once a region has one.
   expect(
@@ -187,7 +193,7 @@ it("widens the alert kinds with the refused enrollment and keeps the episodes", 
   ]);
 });
 
-it("keeps one row per node and minute, one volume per storage generation and one order per operation", () => {
+it("keeps one row per node and minute and one volume per storage generation", () => {
   populate();
   apply("0063_node_link.sql");
   const minute = Math.floor(Date.parse(NOW) / 60_000);
@@ -231,6 +237,13 @@ it("keeps one row per node and minute, one volume per storage generation and one
       NOW,
     ),
   ).toThrow(/CHECK/);
+});
+
+it("keeps one order per operation and refuses what is no order", () => {
+  populate();
+  apply("0063_node_link.sql");
+  apply("0064_placement_resources.sql");
+  apply("0065_lifecycle.sql");
   run(
     `INSERT INTO size_classes(id,memory_mib,cpu_millicores,storage_gib,max_connections,archive_timeout_seconds,backup_retention_days,created_at,updated_at)
      VALUES('small',512,500,10,100,60,7,?,?)`,
@@ -256,7 +269,7 @@ it("keeps one row per node and minute, one volume per storage generation and one
     remove = 0,
   ) =>
     run(
-      `INSERT INTO node_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at)
+      `INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at)
        VALUES(?,?,?,?,?,?,?)`,
       operation,
       node,
@@ -286,21 +299,43 @@ it("keeps one row per node and minute, one volume per storage generation and one
     expect(() =>
       order(`op_${"x".repeat(20)}`, type, on, generation, remove),
     ).toThrow(/CHECK/);
-  // The result ends an order and a failure names its reason.
+  // A failure names its reason, and a result is done or failed.
   expect(() =>
     run(
-      "UPDATE node_orders SET result='failed',resulted_at=? WHERE operation=?",
-      NOW,
+      "UPDATE lifecycle_orders SET result_status='failed' WHERE operation=?",
+      `op_${"v".repeat(20)}`,
+    ),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run(
+      "UPDATE lifecycle_orders SET result_status='paused' WHERE operation=?",
       `op_${"v".repeat(20)}`,
     ),
   ).toThrow(/CHECK/);
   run(
-    "UPDATE node_orders SET result='failed',reason='no_recovery_point',resulted_at=? WHERE operation=?",
-    NOW,
+    "UPDATE lifecycle_orders SET result_status='failed',result_reason='no_recovery_point' WHERE operation=?",
     `op_${"v".repeat(20)}`,
   );
+  // An order never reopens, changes what it orders or takes back a volume removal.
+  run(
+    "UPDATE lifecycle_orders SET closed_at=? WHERE operation=?",
+    NOW,
+    `op_${"s".repeat(20)}`,
+  );
+  for (const change of [
+    "closed_at=NULL",
+    "remove_volume=0",
+    "storage_generation=2",
+    "node_id='nod_zzzzzzzzzzzzzzzzzzzz'",
+  ])
+    expect(() =>
+      run(
+        `UPDATE lifecycle_orders SET ${change} WHERE operation=?`,
+        `op_${"s".repeat(20)}`,
+      ),
+    ).toThrow(/lifecycle_order_immutable/);
   run("DELETE FROM databases WHERE id=?", database);
-  expect(db.prepare("SELECT operation FROM node_orders").all()).toEqual([
+  expect(db.prepare("SELECT operation FROM lifecycle_orders").all()).toEqual([
     { operation: `op_${"m".repeat(20)}` },
   ]);
 });

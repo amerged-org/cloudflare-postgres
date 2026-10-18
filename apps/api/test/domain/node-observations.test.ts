@@ -602,10 +602,10 @@ describe("the results of a node's orders", () => {
       now = new Date().toISOString();
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO node_orders(operation,node_id,type,created_at) VALUES(?,?,'maintenance',?)",
+        "INSERT INTO lifecycle_orders(operation,node_id,type,created_at) VALUES(?,?,'maintenance',?)",
       ).bind(maintenance, f.node, now),
       env.DB.prepare(
-        "INSERT INTO node_orders(operation,node_id,type,database_id,storage_generation,created_at) VALUES(?,?,'move',?,1,?)",
+        "INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,created_at) VALUES(?,?,'move',?,1,?)",
       ).bind(move, f.node, db.id, now),
     ]);
     const send = (orders: unknown[]) =>
@@ -625,7 +625,7 @@ describe("the results of a node's orders", () => {
     expect(
       (
         await env.DB.prepare(
-          "SELECT type,result,reason FROM node_orders WHERE node_id=? ORDER BY type",
+          "SELECT type,result_status result,result_reason reason FROM lifecycle_orders WHERE node_id=? ORDER BY type",
         )
           .bind(f.node)
           .all()

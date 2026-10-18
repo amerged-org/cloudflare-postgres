@@ -8,24 +8,26 @@ import { isNodeFenced, recordOrderResults } from "./lifecycle-orders.ts";
  * What the lifecycle takes from a node's observation report (`POST /node/v1/observations`): the
  * results of its orders, the move steps they unlock, and the newest recovery point of each of its
  * databases. The intake of observations calls this once per authenticated report from the node,
- * after or beside its own bookkeeping of the databases' observed state; a fenced node's report is
- * read for its orders only. Every step is idempotent, so a report may be applied twice.
+ * after its own bookkeeping of the databases' observed state; a fenced node's report is read for
+ * its orders only. Returns how many results of orders it took. Every step is idempotent, so a
+ * report may be applied twice.
  */
 export async function applyLifecycleObservations(
   env: Env,
   nodeId: string,
   report: NodeObservationReport,
   now = Date.now(),
-): Promise<void> {
-  await recordOrderResults(
+): Promise<number> {
+  const taken = await recordOrderResults(
     env.DB,
     nodeId,
     report.orders,
     new Date(now).toISOString(),
   );
-  if (await isNodeFenced(env.DB, nodeId)) return;
+  if (await isNodeFenced(env.DB, nodeId)) return taken;
   await progressMoves(env, nodeId, report, now);
   await recordRecoveryPoints(env.DB, nodeId, report, now);
+  return taken;
 }
 
 /**

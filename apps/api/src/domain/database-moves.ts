@@ -22,6 +22,7 @@ import {
   newArchiveCredentialId,
 } from "./archive-credentials.ts";
 import { supersededStatement } from "./lifecycle-orders.ts";
+import { hintNode } from "./node-hints.ts";
 import {
   choosePlacement,
   placementGuard,
@@ -178,7 +179,7 @@ async function targetFits(
  * move when the same one is already running.
  */
 export async function startDatabaseMove(
-  env: Pick<Env, "DB">,
+  env: Pick<Env, "DB" | "NODE_ACTOR">,
   input: { databaseId: string; targetNodeId: string },
   now = Date.now(),
 ): Promise<DatabaseMove> {
@@ -280,7 +281,10 @@ export async function startDatabaseMove(
     throw new ApiError("conflict", "Database changed; retry the request", {
       reason: "generation_changed",
     });
-  return (await activeMove(db, databaseId))!;
+  const move = (await activeMove(db, databaseId))!;
+  // The source pulls its page to find the order and prove its sleep.
+  await hintNode(env, move.source_node_id).catch(() => 0);
+  return move;
 }
 
 /**
@@ -365,14 +369,14 @@ export async function moveTargets(
 /**
  * Ends a move that did not finish, and with it its `move` order, so that the source serves
  * again. `failure` is a short lowercase class. A target that staged a storage generation on
- * another node is told to retire it and remove its volume.
+ * another node is told to retire it and remove its volume. Returns the nodes whose pages changed.
  */
 export async function failMove(
   db: D1Database,
   operation: string,
   failure: string,
   at: string,
-): Promise<void> {
+): Promise<string[]> {
   const move = await db
     .prepare(
       "SELECT status,database_id,source_node_id,target_node_id,target_storage_generation FROM database_moves WHERE operation=?",
@@ -386,7 +390,7 @@ export async function failMove(
       target_storage_generation: number | null;
     }>();
   if (!move || (move.status !== "proving" && move.status !== "restoring"))
-    return;
+    return [];
   const statements: D1PreparedStatement[] = [];
   if (
     move.status === "restoring" &&
@@ -421,18 +425,19 @@ export async function failMove(
       )
       .bind(at, operation, operation),
   ]);
+  return [move.source_node_id, move.target_node_id];
 }
 
 /**
  * Fails the moves that a lost node can no longer carry out or serve: every move still running
  * from it or toward it. The database of a move restoring away from a lost node stays on it,
- * and its recovery is the node's.
+ * and its recovery is the node's. Returns the other nodes of those moves, whose pages changed.
  */
 export async function failMovesOfLostNode(
   db: D1Database,
   nodeId: string,
   at: string,
-): Promise<number> {
+): Promise<string[]> {
   const moves = (
     await db
       .prepare(
@@ -441,8 +446,12 @@ export async function failMovesOfLostNode(
       .bind(nodeId, nodeId)
       .all<{ operation: string }>()
   ).results;
-  for (const move of moves) await failMove(db, move.operation, "node_lost", at);
-  return moves.length;
+  const nodes = new Set<string>();
+  for (const move of moves)
+    for (const node of await failMove(db, move.operation, "node_lost", at))
+      nodes.add(node);
+  nodes.delete(nodeId);
+  return [...nodes];
 }
 
 interface DatabaseState {
@@ -655,7 +664,12 @@ export async function progressMoves(
   report: NodeObservationReport,
   now: number,
 ): Promise<void> {
-  const at = iso(now);
+  const at = iso(now),
+    touched = new Set<string>();
+  const fail = async (move: MoveRow, failure: string) => {
+    for (const node of await failMove(env.DB, move.operation, failure, at))
+      touched.add(node);
+  };
   const active = (
     await env.DB.prepare(
       `SELECT ${VIEW_COLUMNS},source_acknowledged_at,source_archive_path,target_generation,target_archive_path,backup_id,proven_sleep_json FROM database_moves
@@ -671,7 +685,7 @@ export async function progressMoves(
       .bind(move.database_id)
       .first<DatabaseState>();
     if (!database || database.deleted_at !== null) {
-      await failMove(env.DB, move.operation, "database_deleted", at);
+      await fail(move, "database_deleted");
       continue;
     }
     const observed = report.databases.find((d) => d.id === move.database_id);
@@ -679,7 +693,7 @@ export async function progressMoves(
       if (move.source_node_id !== nodeId) continue;
       const result = report.orders.find((o) => o.operation === move.operation);
       if (result?.status === "failed") {
-        await failMove(env.DB, move.operation, result.reason!, at);
+        await fail(move, result.reason!);
         continue;
       }
       if (result?.status === "done" && move.source_acknowledged_at === null) {
@@ -704,7 +718,7 @@ export async function progressMoves(
         continue;
       try {
         if (!(await sourceArchiveHolds(env, database, observed))) {
-          await failMove(env.DB, move.operation, "no_recovery_point", at);
+          await fail(move, "no_recovery_point");
           continue;
         }
       } catch (error) {
@@ -722,14 +736,14 @@ export async function progressMoves(
         );
         continue;
       }
-      if (!(await beginRestore(env, move, database, observed, now)))
-        await failMove(
-          env.DB,
-          move.operation,
+      if (await beginRestore(env, move, database, observed, now))
+        touched.add(move.target_node_id);
+      else
+        await fail(
+          move,
           (await targetFits(env.DB, move.database_id, move.target_node_id, now))
             ? "database_changed"
             : "target_not_eligible",
-          at,
         );
     } else {
       if (move.target_node_id !== nodeId || !observed) continue;
@@ -740,7 +754,7 @@ export async function progressMoves(
         database.archive_path !== move.source_archive_path ||
         database.generation !== move.target_generation! - 1
       ) {
-        await failMove(env.DB, move.operation, "database_changed", at);
+        await fail(move, "database_changed");
         continue;
       }
       if (
@@ -749,12 +763,7 @@ export async function progressMoves(
       )
         continue;
       if (observed.state === "error") {
-        await failMove(
-          env.DB,
-          move.operation,
-          observed.error ?? "build_failed",
-          at,
-        );
+        await fail(move, observed.error ?? "build_failed");
         continue;
       }
       const end = ProvenSleepRecord.parse(JSON.parse(move.proven_sleep_json!));
@@ -768,17 +777,19 @@ export async function progressMoves(
         observed.state === "asleep" &&
         observed.proven_sleep!.system_identifier !== end.system_identifier
       ) {
-        await failMove(env.DB, move.operation, "identity_mismatch", at);
+        await fail(move, "identity_mismatch");
         continue;
       }
       if (!promoted) continue;
       try {
-        if (
-          !(await completeMove(env, move, database, now)) &&
+        if (await completeMove(env, move, database, now)) {
+          touched.add(move.source_node_id);
+          touched.add(move.target_node_id);
+        } else if (
           (await activeMove(env.DB, move.database_id))?.operation ===
-            move.operation
+          move.operation
         )
-          await failMove(env.DB, move.operation, "database_changed", at);
+          await fail(move, "database_changed");
       } catch (error) {
         // Another change holds the database for the moment; the next report tries again.
         if (
@@ -789,4 +800,6 @@ export async function progressMoves(
       }
     }
   }
+  // Each node whose order or staged entry changed pulls its page.
+  await Promise.allSettled([...touched].map((node) => hintNode(env, node)));
 }

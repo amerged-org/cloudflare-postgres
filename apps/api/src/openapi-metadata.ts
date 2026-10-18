@@ -386,6 +386,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read the node's desired page",
     "node",
   ),
+  "GET /node/v1/archive-credentials/{id}": route(
+    "getNodeArchiveCredential",
+    "Read a temporary R2 credential the node's desired page names",
+    "node",
+  ),
   "POST /node/v1/observations": route(
     "reportNodeObservations",
     "Report the state of the node's databases and the results of its orders",

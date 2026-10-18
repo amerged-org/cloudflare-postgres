@@ -8,6 +8,7 @@ import {
   isNodeFenced,
   openNodeOrders,
 } from "../../src/domain/lifecycle-orders.ts";
+import { fenceOperation } from "../../src/domain/node-desired.ts";
 import {
   declareNodeLost,
   nodeLossStatus,
@@ -16,7 +17,7 @@ import {
 } from "../../src/domain/node-loss.ts";
 import {
   cleanup,
-  desiredPage,
+  pageOf,
   done,
   lifecycle,
   observation,
@@ -97,13 +98,8 @@ it("declares a node lost: the fence and a superseded order for each database, no
   ).toMatchObject({ ready: 0, schedulable: 0 });
   expect(await isNodeFenced(env.DB, f.node)).toBe(true);
   const orders = await openNodeOrders(env.DB, f.node);
-  expect(orders[0]).toEqual({
-    type: "fence",
-    operation: expect.stringMatching(/^op_[a-z0-9]{20}$/),
-  });
   expect(
     orders
-      .slice(1)
       .map((order) => ({ ...order }))
       .sort((a, b) =>
         (a as { database: string }).database.localeCompare(
@@ -121,8 +117,14 @@ it("declares a node lost: the fence and a superseded order for each database, no
   );
   // The databases stay at their old generation on the lost node: they are fenced, not rewritten.
   expect(await f.row()).toEqual(before);
-  // What the lost node sees when it comes back is a page under the node contract.
-  await desiredPage(f.node, [], orders);
+  // What the lost node sees when it comes back: the fence first, then the retired generations,
+  // and no database.
+  const page = await pageOf(f.node);
+  expect(page.databases).toEqual([]);
+  expect(page.orders).toEqual([
+    { type: "fence", operation: await fenceOperation(f.node) },
+    ...orders,
+  ]);
   // The same declaration again changes nothing.
   expect(await f.declare(at + 60_000)).toEqual(loss);
   expect(await openNodeOrders(env.DB, f.node)).toEqual(orders);
@@ -202,6 +204,11 @@ it("never places a database on a fenced node, and reads nothing from it but its 
   // A node that comes back reports that it obeyed; the superseded orders end, the fence never.
   const orders = await openNodeOrders(env.DB, f.node);
   const superseded = orders.filter((order) => order.type === "superseded");
+  const points = async () =>
+    (await env.DB.prepare("SELECT * FROM database_recovery_points").all())
+      .results;
+  const known = await points();
+  expect(known).toHaveLength(1);
   await applyLifecycleObservations(
     env,
     f.node,
@@ -217,18 +224,15 @@ it("never places a database on a fenced node, and reads nothing from it but its 
       superseded.map((order) => done(order.operation)),
     ),
   );
-  expect((await openNodeOrders(env.DB, f.node)).map((o) => o.type)).toEqual([
-    "fence",
-  ]);
-  expect(await count("database_recovery_points")).toBe(0);
+  expect((await pageOf(f.node)).orders.map((o) => o.type)).toEqual(["fence"]);
+  // A fenced node's report changes no recovery point.
+  expect(await points()).toEqual(known);
   await applyLifecycleObservations(
     env,
     f.node,
-    report([], [done(orders[0]!.operation)]),
+    report([], [done(await fenceOperation(f.node))]),
   );
-  expect((await openNodeOrders(env.DB, f.node)).map((o) => o.type)).toEqual([
-    "fence",
-  ]);
+  expect((await pageOf(f.node)).orders.map((o) => o.type)).toEqual(["fence"]);
 });
 
 it("fences in the order the plan sets: Tunnel, power off, then a stopped instance", async () => {

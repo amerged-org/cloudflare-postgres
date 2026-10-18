@@ -23,15 +23,17 @@ import {
   addNode,
   BACKUP,
   cleanup,
-  desiredPage,
   done,
   failed,
   keyedEnv,
   lifecycle,
   observation,
+  pageOf,
   PROOF,
   report,
 } from "./lifecycle-fixture.ts";
+import { nextMessage, openLink } from "./node-fixtures.ts";
+import { nodeRequest, observationOf, reportBody } from "./fixtures.ts";
 import {
   GIB,
   MIB,
@@ -139,6 +141,92 @@ const status = async (operation: string) =>
     .bind(operation)
     .first())!;
 const ordersOf = (node: string) => openNodeOrders(env.DB, node);
+
+it("moves on what the source reports to the node API, and tells the nodes to pull", async () => {
+  const f = await ready();
+  const other = await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+    .bind(f.other)
+    .first<string>("node_uid");
+  const sourceLink = await openLink(f),
+    targetLink = await openLink({ node: f.other, nodeUid: other! });
+  const toSource = nextMessage(sourceLink),
+    toTarget = nextMessage(targetLink);
+  const move = await start(f);
+  // The source pulls its page to find the order.
+  expect(JSON.parse(await toSource)).toMatchObject({ type: "desired" });
+  expect((await pageOf(f.node)).orders).toEqual([
+    expect.objectContaining({ type: "move", operation: move.operation }),
+  ]);
+  // The source stops the database and reports it asleep; D1 takes the sleep, which advances its
+  // generation, and the node's next report answers that generation.
+  const send = async (generation: number, orders: unknown[]) =>
+    nodeRequest(f, "/node/v1/observations", {
+      method: "POST",
+      body: reportBody(
+        [await observationOf(f.id, generation, "asleep", { backup: BACKUP })],
+        orders,
+      ),
+    });
+  const first = await send((await f.row()).generation, [done(move.operation)]);
+  expect(first.status).toBe(200);
+  expect(await first.json()).toEqual({
+    databases: [{ id: f.id, verdict: "accept" }],
+    orders: 1,
+  });
+  expect(await status(move.operation)).toMatchObject({
+    status: "proving",
+    source_acknowledged_at: expect.any(String),
+  });
+  const row = await f.row();
+  expect(row.generation).toBe(2);
+  expect((await send(row.generation, [done(move.operation)])).status).toBe(200);
+  expect(await status(move.operation)).toMatchObject({
+    status: "restoring",
+    source_acknowledged_at: expect.any(String),
+  });
+  // The target pulls its page and finds the staged generation.
+  expect(JSON.parse(await toTarget)).toMatchObject({ type: "desired" });
+  expect((await pageOf(f.other)).databases).toEqual([
+    expect.objectContaining({
+      id: f.id,
+      operation: move.operation,
+      generation: row.generation + 1,
+      storage_generation: 2,
+      origin: expect.objectContaining({ kind: "move" }),
+    }),
+  ]);
+  // The node's report also left the recovery point the loss status reads.
+  expect(
+    await env.DB.prepare(
+      "SELECT state,node_id FROM database_recovery_points WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ state: "asleep", node_id: f.node });
+  sourceLink.close(1000);
+  targetLink.close(1000);
+});
+
+it("puts the staged entry of a suspended database on the target's page, which lists no other suspended database", async () => {
+  const f = await ready();
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='suspended',suspension_reason='manual',observed_state='provisioning',observed_power='hibernated',observed_generation=generation,power_operation=NULL WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  // A suspended database is not on its node's page: the node keeps it asleep by itself.
+  expect((await pageOf(f.node)).databases).toEqual([]);
+  const move = await restoring(f);
+  expect((await pageOf(f.other)).databases).toEqual([
+    expect.objectContaining({
+      id: f.id,
+      operation: move.operation,
+      desired_state: "suspended",
+      storage_generation: 2,
+    }),
+  ]);
+  expect((await pageOf(f.node)).databases).toEqual([]);
+});
 
 it("refuses a move that cannot start and says why", async () => {
   const f = await ready();
@@ -289,7 +377,7 @@ it("puts no move order on a node that is declared lost between the checks and th
   });
   await expect(
     startDatabaseMove(
-      { DB: racing },
+      { ...env, DB: racing },
       { databaseId: f.id, targetNodeId: f.other },
     ),
   ).rejects.toMatchObject({ code: "conflict" });
@@ -609,34 +697,33 @@ it("gives the target the staged entry, with the origin and credentials, and the 
       now,
     ),
   ).rejects.toThrow("archive_credential_refused");
-  // Both pages are valid under the node contract: the source's own entry, the target's staged one.
-  const own = await ensureArchiveCredential(
-    env.DB,
-    { nodeId: f.node, archivePath: row.archive_path, access: "read_write" },
-    now,
-  );
-  await desiredPage(
-    f.node,
-    [{ row, operation: f.operation, credential: own }],
-    await ordersOf(f.node),
-  );
-  await desiredPage(
-    f.other,
-    [
-      {
-        row: {
-          ...row,
-          generation: staged.generation,
-          storage_generation: staged.storage_generation,
-          archive_path: staged.archive.path,
-        },
-        operation: staged.operation,
-        credential: staged.archive.credential,
-        origin: staged.origin,
-      },
-    ],
-    [],
-  );
+  // The source's page keeps its own entry and the move order; the target's holds the staged one.
+  const sourcePage = await pageOf(f.node);
+  const own = (await env.DB.prepare(
+    "SELECT id,expires_at FROM archive_credentials WHERE node_id=? AND archive_path=? AND access='read_write'",
+  )
+    .bind(f.node, row.archive_path)
+    .first<{ id: string; expires_at: string }>())!;
+  expect(sourcePage.databases).toEqual([
+    expect.objectContaining({
+      id: f.id,
+      generation: row.generation,
+      operation: f.operation,
+      storage_generation: 1,
+      archive: { path: row.archive_path, credential: own },
+    }),
+  ]);
+  expect(sourcePage.orders).toEqual(await ordersOf(f.node));
+  expect((await pageOf(f.other)).databases).toEqual([
+    expect.objectContaining({
+      id: f.id,
+      generation: staged.generation,
+      operation: staged.operation,
+      storage_generation: staged.storage_generation,
+      archive: staged.archive,
+      origin: staged.origin,
+    }),
+  ]);
 });
 
 it("finishes when the target is ready: the database moves behind the admission fence and the source retires its volume", async () => {
@@ -887,8 +974,11 @@ it("ends a restoring move when either node is lost, and the lost node's page sta
       failure: "node_lost",
     });
     expect(await f.row()).toEqual(before);
-    // A page under the node contract: the fence and superseded orders, no move order.
-    await desiredPage(node, [], await ordersOf(node));
+    // The fenced page holds the fence and the retired generations, no move order and no database.
+    const page = await pageOf(node);
+    expect(page.databases).toEqual([]);
+    expect(page.orders.map((order) => order.type)).not.toContain("move");
+    expect(page.orders[0]).toMatchObject({ type: "fence" });
     if (lost === "target") expect(await ordersOf(f.node)).toEqual([]);
     await cleanup();
   }
@@ -902,23 +992,19 @@ it("moves between two volumes of the same node, whose page then serves the stage
   const orders = await ordersOf(f.node);
   expect(orders).toEqual([expect.objectContaining({ type: "move" })]);
   const staged = (await moveTargets(env.DB, f.node, Date.now())).get(f.id)!;
-  await desiredPage(
-    f.node,
-    [
-      {
-        row: {
-          ...row,
-          generation: staged.generation,
-          storage_generation: staged.storage_generation,
-          archive_path: staged.archive.path,
-        },
-        operation: staged.operation,
-        credential: staged.archive.credential,
-        origin: staged.origin,
-      },
-    ],
-    orders,
-  );
+  // The page serves the staged generation in place of the entry of the database, with the move order.
+  const page = await pageOf(f.node);
+  expect(page.databases).toEqual([
+    expect.objectContaining({
+      id: f.id,
+      generation: staged.generation,
+      operation: staged.operation,
+      storage_generation: 2,
+      archive: staged.archive,
+      origin: staged.origin,
+    }),
+  ]);
+  expect(page.orders).toEqual(orders);
   await reportTarget(f, move, { state: "ready" }, f.node);
   expect(await status(move.operation)).toMatchObject({ status: "done" });
   expect(await f.row()).toMatchObject({

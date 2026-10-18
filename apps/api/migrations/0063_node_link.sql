@@ -191,44 +191,6 @@ CREATE TABLE node_event_ids (
 ) STRICT;
 CREATE INDEX node_event_ids_age ON node_event_ids(received_at);
 
--- The orders that no other row stands for (plan 7.11, 9.3, 9.5): a move, a retired storage
--- generation and a maintenance cycle. A wake is the pending resume of a database, and a fence is
--- a lost node, so neither has a row. `superseded` outlives its result; the others end with it.
-CREATE TABLE node_orders (
-  operation TEXT PRIMARY KEY NOT NULL
-    CHECK (length(operation) = 23 AND substr(operation, 1, 3) = 'op_' AND NOT substr(operation, 4) GLOB '*[^a-z0-9]*'),
-  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK(type IN('move','superseded','maintenance')),
-  database_id TEXT REFERENCES databases(id) ON DELETE CASCADE,
-  storage_generation INTEGER CHECK(storage_generation IS NULL OR storage_generation>=1),
-  remove_volume INTEGER NOT NULL DEFAULT 0 CHECK(remove_volume IN(0,1)),
-  created_at TEXT NOT NULL,
-  result TEXT CHECK(result IS NULL OR result IN('done','failed')),
-  reason TEXT CHECK(reason IS NULL OR length(reason) BETWEEN 1 AND 64),
-  resulted_at TEXT,
-  CHECK((type='maintenance')=(database_id IS NULL)),
-  CHECK((type='maintenance')=(storage_generation IS NULL)),
-  CHECK(type='superseded' OR remove_volume=0),
-  CHECK((result IS NULL)=(resulted_at IS NULL)),
-  CHECK((result='failed')=(reason IS NOT NULL))
-) STRICT;
-CREATE INDEX node_orders_open ON node_orders(node_id, created_at, operation);
-
--- The references of the temporary R2 credentials a database holds (plan 7.3): the credential issuer
--- writes a row for each it signs, and the desired page names the newest valid one of each archive
--- path. A database whose credential is not issued yet is not on the page.
-CREATE TABLE database_archive_credentials (
-  id TEXT PRIMARY KEY NOT NULL
-    CHECK (length(id) = 24 AND substr(id, 1, 4) = 'crd_' AND NOT substr(id, 5) GLOB '*[^a-z0-9]*'),
-  database_id TEXT NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
-  archive_path TEXT NOT NULL CHECK(archive_path LIKE 's3://%' AND length(archive_path)<=512),
-  access TEXT NOT NULL CHECK(access IN('read_write','read_only')),
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL CHECK(expires_at>created_at)
-) STRICT;
-CREATE INDEX database_archive_credentials_current
-  ON database_archive_credentials(database_id, archive_path, access, expires_at);
-
 -- The rules Cloudflare sets for the decisions a node takes alone (plan 4.5): one policy per region.
 ALTER TABLE node_region_policies ADD COLUMN node_policy_json TEXT
   CHECK(node_policy_json IS NULL OR json_valid(node_policy_json));

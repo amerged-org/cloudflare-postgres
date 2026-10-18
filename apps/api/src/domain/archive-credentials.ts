@@ -133,6 +133,85 @@ export async function ensureArchiveCredential(
   };
 }
 
+/**
+ * The credentials a desired page names for a set of scopes of one node, keyed `<access>|<path>`:
+ * for each the newest one younger than a third of its lifetime, else a new one, issued in one
+ * batch. A scope the node may not hold a credential for (see `ensureArchiveCredential`) has no
+ * entry, so that a page of hundreds of databases costs two statements and not two per database.
+ */
+export async function ensureArchiveCredentials(
+  db: D1Database,
+  nodeId: string,
+  scopes: readonly Pick<ArchiveCredentialScope, "archivePath" | "access">[],
+  now: number,
+): Promise<Map<string, ArchiveCredentialReference>> {
+  const wanted = new Map<
+    string,
+    Pick<ArchiveCredentialScope, "archivePath" | "access">
+  >();
+  for (const scope of scopes)
+    wanted.set(`${scope.access}|${scope.archivePath}`, scope);
+  const found = new Map<string, ArchiveCredentialReference>();
+  if (wanted.size === 0) return found;
+  const fresh = await db
+    .prepare(
+      `SELECT id,archive_path,access,expires_at FROM archive_credentials
+      WHERE node_id=? AND archive_path IN(SELECT value FROM json_each(?)) AND issued_at>? AND expires_at>?
+      ORDER BY issued_at DESC,id DESC`,
+    )
+    .bind(
+      nodeId,
+      JSON.stringify([
+        ...new Set([...wanted.values()].map((s) => s.archivePath)),
+      ]),
+      iso(now - RENEW_AFTER_MS),
+      iso(now),
+    )
+    .all<{
+      id: string;
+      archive_path: string;
+      access: ArchiveAccess;
+      expires_at: string;
+    }>();
+  for (const row of fresh.results) {
+    const key = `${row.access}|${row.archive_path}`;
+    if (wanted.has(key) && !found.has(key))
+      found.set(key, { id: row.id, expires_at: row.expires_at });
+  }
+  const missing: { key: string; id: string; statement: D1PreparedStatement }[] =
+    [];
+  for (const [key, scope] of wanted) {
+    if (found.has(key)) continue;
+    const id = newArchiveCredentialId();
+    try {
+      missing.push({
+        key,
+        id,
+        statement: archiveCredentialStatement(
+          db,
+          { nodeId, ...scope },
+          id,
+          now,
+        ),
+      });
+    } catch {
+      // A path that is no archive path has no credential.
+    }
+  }
+  for (let i = 0; i < missing.length; i += 90) {
+    const chunk = missing.slice(i, i + 90),
+      results = await db.batch(chunk.map((value) => value.statement));
+    chunk.forEach((value, index) => {
+      if (results[index]!.meta.changes === 1)
+        found.set(value.key, {
+          id: value.id,
+          expires_at: iso(now + ARCHIVE_CREDENTIAL_LIFETIME_SECONDS * 1000),
+        });
+    });
+  }
+  return found;
+}
+
 interface DeliveryRow {
   id: string;
   node_id: string;

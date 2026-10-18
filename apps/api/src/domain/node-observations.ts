@@ -13,6 +13,7 @@ import type { ApiContext, Env } from "../env.ts";
 import { databaseActor } from "./database-actor-sync.ts";
 import { recoverQuiescence, powerTransitionStatements } from "./lifecycle.ts";
 import { hintDatabases } from "./node-hints.ts";
+import { applyLifecycleObservations } from "./lifecycle-observations.ts";
 import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 import {
   withAdmissionMutation,
@@ -759,41 +760,32 @@ async function takeObservation(
 }
 
 /**
- * How the order of a node ended. A wake that failed ends the resume that asked; a move, a retired
- * generation and a maintenance cycle keep their result in `node_orders`. A fence is a lost node
- * and has no row.
+ * How a wake the node was ordered ended: a wake that failed ends the resume that asked. The other
+ * orders keep their results with the lifecycle (`applyLifecycleObservations`); a fence is a lost
+ * node and has no row.
  */
-async function takeOrderResult(
+async function failedWake(
   env: Env,
   node: NodeCaller,
   result: NodeOrderResult,
 ): Promise<number> {
+  if (result.status !== "failed") return 0;
   const now = new Date().toISOString();
-  const [stored, failedWake] = await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE node_orders SET result=?,reason=?,resulted_at=? WHERE operation=? AND node_id=? AND result IS NULL",
-    ).bind(
-      result.status,
-      result.reason ?? null,
-      now,
-      result.operation,
-      node.id,
-    ),
-    env.DB.prepare(
-      `UPDATE operations SET status='failed',error_code=?,error_message=?,updated_at=?,completed_at=?
-       WHERE id=? AND kind='database.resume' AND status IN('pending','running') AND ?='failed'
-         AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id=? AND d.power_operation=operations.id)`,
-    ).bind(
+  const failed = await env.DB.prepare(
+    `UPDATE operations SET status='failed',error_code=?,error_message=?,updated_at=?,completed_at=?
+     WHERE id=? AND kind='database.resume' AND status IN('pending','running')
+       AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id=? AND d.power_operation=operations.id)`,
+  )
+    .bind(
       result.reason ?? "wake_failed",
       `The node could not start the database: ${result.reason ?? "unknown"}`,
       now,
       now,
       result.operation,
-      result.status,
       node.id,
-    ),
-  ]);
-  return (stored!.meta.changes ?? 0) + (failedWake!.meta.changes ?? 0);
+    )
+    .run();
+  return failed.meta.changes;
 }
 
 /** `POST /node/v1/observations` (plan 5.3): what a node reports of its databases and its orders. */
@@ -823,6 +815,8 @@ export async function nodeObservations(
       });
   let orders = 0;
   for (const result of report.orders)
-    orders += await takeOrderResult(c.env, node, result);
+    orders += await failedWake(c.env, node, result);
+  // The results of the other orders, the moves they unlock and the recovery points of the databases.
+  orders += await applyLifecycleObservations(c.env, node.id, report);
   return c.json({ databases, orders });
 }

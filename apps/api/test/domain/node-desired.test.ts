@@ -5,7 +5,7 @@ import {
   NodeDesiredPage,
   newOperationId,
 } from "@pgcf/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import { fenceOperation } from "../../src/domain/node-desired.ts";
 import {
@@ -16,6 +16,7 @@ import {
   nodePolicy,
   nodeRequest,
   report,
+  reportBody,
   request,
   served,
   setNodePolicy,
@@ -29,7 +30,7 @@ async function pull(f: F, query = "") {
   expect(response.status).toBe(200);
   return NodeDesiredPage.parse(await response.json());
 }
-/** The database moves to its second storage generation: a new archive path with its credential. */
+/** The database moves to its second storage generation: a new archive path. */
 async function nextStorage(id: string) {
   const path = (await env.DB.prepare(
     "SELECT archive_path FROM databases WHERE id=?",
@@ -42,7 +43,6 @@ async function nextStorage(id: string) {
   )
     .bind(next, id)
     .run();
-  await grantCredential(id);
 }
 const entry = async (f: F, id: string) =>
   (await pull(f)).databases.find((database) => database.id === id);
@@ -68,16 +68,15 @@ describe("the desired page of a node", () => {
     });
   });
 
-  it("names a database once its credential exists, with its class resources, roles and archive", async () => {
+  it("names a database with the credential it issues, its class resources, roles and archive", async () => {
     const f = await fixture();
     await setNodePolicy(f);
     const created = DatabaseWithOperation.parse(
       await (await f.create("page")).json(),
     );
     const id = created.database.id;
-    expect(await entry(f, id)).toBeUndefined();
-    const credential = await grantCredential(id);
     const database = (await entry(f, id))!;
+    const credential = database.archive.credential;
     const row = (await env.DB.prepare(
       "SELECT archive_path FROM databases WHERE id=?",
     )
@@ -120,56 +119,119 @@ describe("the desired page of a node", () => {
     ]);
   });
 
-  it("leaves out a database whose credential has expired, but not a deleted one", async () => {
+  it("issues the credential of a database on the first pull, names it again while it is young and renews it after a third of its life", async () => {
     const f = await fixture();
     const db = await served(f);
+    const stored = (access = "read_write") =>
+      env.DB.prepare(
+        "SELECT id,node_id,access,archive_path FROM archive_credentials WHERE database_id=? AND access=? ORDER BY issued_at,id",
+      )
+        .bind(db.id, access)
+        .all();
+    expect((await stored()).results).toEqual([]);
+    const first = (await entry(f, db.id))!.archive.credential;
+    const path = (await env.DB.prepare(
+      "SELECT archive_path FROM databases WHERE id=?",
+    )
+      .bind(db.id)
+      .first<string>("archive_path"))!;
+    expect((await stored()).results).toEqual([
+      {
+        id: first.id,
+        node_id: f.node,
+        access: "read_write",
+        archive_path: path,
+      },
+    ]);
+    expect(Date.parse(first.expires_at)).toBeGreaterThan(
+      Date.now() + 6 * 86_400_000,
+    );
+    // Young: the same credential, nothing new issued.
+    expect((await entry(f, db.id))!.archive.credential).toEqual(first);
+    expect((await stored()).results).toHaveLength(1);
+    // Past a third of its life: a new one is named, and the old one stays valid until it expires.
     await env.DB.prepare(
-      "UPDATE database_archive_credentials SET expires_at=?,created_at=? WHERE database_id=?",
+      "UPDATE archive_credentials SET issued_at=? WHERE id=?",
+    )
+      .bind(new Date(Date.now() - 3 * 86_400_000).toISOString(), first.id)
+      .run();
+    const renewed = (await entry(f, db.id))!.archive.credential;
+    expect(renewed.id).not.toBe(first.id);
+    expect((await stored()).results).toHaveLength(2);
+    // An expired credential is never named.
+    await env.DB.prepare(
+      "UPDATE archive_credentials SET issued_at=?,expires_at=? WHERE database_id=?",
     )
       .bind(
+        new Date(Date.now() - 9 * 86_400_000).toISOString(),
         new Date(Date.now() - 1000).toISOString(),
-        new Date(Date.now() - 2000).toISOString(),
         db.id,
       )
       .run();
-    expect(await entry(f, db.id)).toBeUndefined();
-    await grantCredential(db.id, { lifetimeMs: 60_000 });
-    const renewed = (await entry(f, db.id))!;
-    expect(Date.parse(renewed.archive.credential.expires_at)).toBeGreaterThan(
-      Date.now(),
-    );
-    // The newest valid credential is the one named.
-    const newer = await grantCredential(db.id, { lifetimeMs: 3 * 86_400_000 });
-    expect((await entry(f, db.id))!.archive.credential).toEqual(newer);
-    // A read-only credential of the same path is no write credential.
-    await env.DB.prepare(
-      "DELETE FROM database_archive_credentials WHERE database_id=?",
-    )
-      .bind(db.id)
-      .run();
-    await grantCredential(db.id, { access: "read_only" });
-    expect(await entry(f, db.id)).toBeUndefined();
-    await env.DB.prepare(
-      "DELETE FROM database_archive_credentials WHERE database_id=?",
-    )
-      .bind(db.id)
-      .run();
-    await grantCredential(db.id, { lifetimeMs: 60_000 });
+    const again = (await entry(f, db.id))!.archive.credential;
+    expect([first.id, renewed.id]).not.toContain(again.id);
+    expect(Date.parse(again.expires_at)).toBeGreaterThan(Date.now());
+  });
+
+  it("names a write credential for the database's archive although a read-only one exists for it", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    const read = await grantCredential(db.id, { access: "read_only" });
+    const write = (await entry(f, db.id))!.archive.credential;
+    expect(write.id).not.toBe(read.id);
+    expect(
+      await env.DB.prepare("SELECT access FROM archive_credentials WHERE id=?")
+        .bind(write.id)
+        .first<string>("access"),
+    ).toBe("read_write");
+  });
+
+  it("keeps a deleted database on the page with a credential", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    const written = await grantCredential(db.id, {
+      lifetimeMs: 60_000,
+      issuedAgoMs: 30 * 86_400_000,
+    });
     expect(
       (await request(`/v1/databases/${db.id}`, f.integrator, "DELETE")).status,
     ).toBe(202);
-    await env.DB.prepare(
-      "UPDATE database_archive_credentials SET expires_at=?,created_at=? WHERE database_id=?",
-    )
-      .bind(
-        new Date(Date.now() - 1000).toISOString(),
-        new Date(Date.now() - 2000).toISOString(),
-        db.id,
-      )
-      .run();
     const deleted = (await entry(f, db.id))!;
     expect(deleted.desired_state).toBe("deleted");
     expect(deleted.roles).toEqual([]);
+    expect(deleted.archive.credential.id).not.toBe(written.id);
+  });
+
+  it("reads the credentials of a whole page in one query and writes the missing ones together", async () => {
+    const f = await fixture();
+    for (const name of ["one", "two", "three"]) await served(f, name);
+    const prototype = Object.getPrototypeOf(env.DB),
+      prepare = prototype.prepare;
+    const counted = async () => {
+      const queries: string[] = [];
+      const spy = vi.spyOn(prototype, "prepare").mockImplementation(function (
+        this: D1Database,
+        ...args: unknown[]
+      ) {
+        queries.push(String(args[0]));
+        return prepare.apply(this, args);
+      });
+      try {
+        expect((await pull(f)).databases).toHaveLength(3);
+      } finally {
+        spy.mockRestore();
+      }
+      return {
+        reads: queries.filter((q) =>
+          /^\s*SELECT[^]*FROM archive_credentials/.test(q),
+        ).length,
+        writes: queries.filter((q) =>
+          q.includes("INSERT INTO archive_credentials"),
+        ).length,
+      };
+    };
+    expect(await counted()).toEqual({ reads: 1, writes: 3 });
+    expect(await counted()).toEqual({ reads: 1, writes: 0 });
   });
 
   it("stops asking for a create once the database was ready", async () => {
@@ -375,51 +437,35 @@ describe("the release and the orders on a node's page", () => {
     expect((await pull(f)).orders).toEqual([]);
   });
 
-  it("lists the open orders that have no other row, and keeps a retired generation after its result", async () => {
+  it("lists the open orders that have no other row, and drops them as their results are reported", async () => {
     const f = await fixture();
     const db = await served(f);
     const move = newOperationId(),
       superseded = newOperationId(),
       maintenance = newOperationId(),
-      done = newOperationId();
+      closed = newOperationId();
     const now = new Date().toISOString(),
       later = (milliseconds: number) =>
         new Date(Date.parse(now) + milliseconds).toISOString();
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO node_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'move',?,1,0,?)",
+        "INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'move',?,1,0,?)",
       ).bind(move, f.node, db.id, now),
       env.DB.prepare(
-        "INSERT INTO node_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'superseded',?,0+1,1,?)",
+        "INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'superseded',?,0+1,1,?)",
       ).bind(superseded, f.node, db.id, later(1)),
       env.DB.prepare(
-        "INSERT INTO node_orders(operation,node_id,type,created_at) VALUES(?,?,'maintenance',?)",
+        "INSERT INTO lifecycle_orders(operation,node_id,type,created_at) VALUES(?,?,'maintenance',?)",
       ).bind(maintenance, f.node, later(2)),
       env.DB.prepare(
-        "INSERT INTO node_orders(operation,node_id,type,created_at,result,resulted_at) VALUES(?,?,'maintenance',?,'done',?)",
-      ).bind(done, f.node, now, now),
+        "INSERT INTO lifecycle_orders(operation,node_id,type,created_at,closed_at,result_status) VALUES(?,?,'maintenance',?,?,'done')",
+      ).bind(closed, f.node, now, now),
     ]);
     // A retired generation of a database the page still serves must be an older one.
     await nextStorage(db.id);
-    const page = await pull(f);
-    expect(page.orders).toEqual([
+    const open = [
       { type: "move", operation: move, database: db.id, storage_generation: 1 },
-      {
-        type: "superseded",
-        operation: superseded,
-        database: db.id,
-        storage_generation: 1,
-        remove_volume: true,
-      },
       { type: "maintenance", operation: maintenance },
-    ]);
-    // The result ends a move and a maintenance cycle; a retired generation never ends.
-    await env.DB.prepare(
-      "UPDATE node_orders SET result='done',resulted_at=? WHERE operation IN(?,?,?)",
-    )
-      .bind(now, move, superseded, maintenance)
-      .run();
-    expect((await pull(f)).orders).toEqual([
       {
         type: "superseded",
         operation: superseded,
@@ -427,7 +473,28 @@ describe("the release and the orders on a node's page", () => {
         storage_generation: 1,
         remove_volume: true,
       },
-    ]);
+    ];
+    expect((await pull(f)).orders).toEqual(open);
+    // The node reports the results. A maintenance cycle and a retired generation end with theirs;
+    // a move ends with the move, which closes its order itself.
+    const reported = await nodeRequest(f, "/node/v1/observations", {
+      method: "POST",
+      body: reportBody(
+        [],
+        [move, superseded, maintenance].map((operation) => ({
+          operation,
+          status: "done",
+        })),
+      ),
+    });
+    expect(await reported.json()).toEqual({ databases: [], orders: 3 });
+    expect((await pull(f)).orders).toEqual([open[0]]);
+    await env.DB.prepare(
+      "UPDATE lifecycle_orders SET closed_at=? WHERE operation=?",
+    )
+      .bind(now, move)
+      .run();
+    expect((await pull(f)).orders).toEqual([]);
   });
 
   it("holds the fence, the retired generations and nothing else for a node declared lost", async () => {
@@ -436,12 +503,12 @@ describe("the release and the orders on a node's page", () => {
     await assignRelease(f);
     const superseded = newOperationId();
     await env.DB.prepare(
-      "INSERT INTO node_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'superseded',?,1,0,?)",
+      "INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,remove_volume,created_at) VALUES(?,?,'superseded',?,1,0,?)",
     )
       .bind(superseded, f.node, db.id, new Date().toISOString())
       .run();
     await env.DB.prepare(
-      "INSERT INTO node_orders(operation,node_id,type,created_at) VALUES(?,?,'maintenance',?)",
+      "INSERT INTO lifecycle_orders(operation,node_id,type,created_at) VALUES(?,?,'maintenance',?)",
     )
       .bind(newOperationId(), f.node, new Date().toISOString())
       .run();
@@ -499,21 +566,31 @@ describe("a restore on the page", () => {
         now,
       ),
     ]);
-    // Without the read-only credential of the source the restore cannot start.
-    expect(await entry(f, target.id)).toBeUndefined();
-    const read = await grantCredential(target.id, {
-      path: sourcePath,
-      access: "read_only",
-    });
-    expect((await entry(f, target.id))!.origin).toEqual({
+    const origin = (await entry(f, target.id))!.origin as {
+      kind: "restore";
+      source: { credential: { id: string; expires_at: string } };
+    };
+    expect(origin).toEqual({
       kind: "restore",
       source: {
         database_id: source.id,
         path: sourcePath,
         backup_id: "20261017T110000",
         target_time: "2026-10-17T11:30:00.000Z",
-        credential: read,
+        credential: origin.source.credential,
       },
+    });
+    // The page issued it: read-only, for the source's archive, to this node.
+    expect(
+      await env.DB.prepare(
+        "SELECT node_id,access,archive_path FROM archive_credentials WHERE id=?",
+      )
+        .bind(origin.source.credential.id)
+        .first(),
+    ).toEqual({
+      node_id: f.node,
+      access: "read_only",
+      archive_path: sourcePath,
     });
     await env.DB.prepare(
       "UPDATE database_restores SET verified_at=? WHERE target_database_id=?",
@@ -521,5 +598,38 @@ describe("a restore on the page", () => {
       .bind(now, target.id)
       .run();
     expect((await entry(f, target.id))!.origin).toBeUndefined();
+  });
+
+  it("leaves out a restore whose source archive lies in another region, which this node holds no credential for", async () => {
+    const f = await fixture();
+    const source = await served(f, "source");
+    const target = await served(f, "target");
+    const operation = newOperationId(),
+      now = new Date().toISOString();
+    const foreignPath = (await env.DB.prepare(
+      "SELECT archive_path FROM databases WHERE id=?",
+    )
+      .bind(source.id)
+      .first<string>("archive_path"))!.replace(
+      `/${f.region}/`,
+      `/${f.foreign}/`,
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.restore','pending',project_id,id,1,?,? FROM databases WHERE id=?",
+      ).bind(operation, now, now, target.id),
+      env.DB.prepare(
+        "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,created_at) VALUES(?,?,?,?,1,?,?)",
+      ).bind(
+        target.id,
+        operation,
+        source.id,
+        foreignPath,
+        "20261017T110000",
+        now,
+      ),
+    ]);
+    expect(await entry(f, target.id)).toBeUndefined();
+    expect(await entry(f, source.id)).toBeDefined();
   });
 });

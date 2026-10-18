@@ -5,17 +5,17 @@ import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
 import { failMovesOfLostNode } from "./database-moves.ts";
 import { fenceActionsFromEnv } from "./fence-actions.ts";
+import { hintNode } from "./node-hints.ts";
 import { reinstallBlockers, reinstallOverridden } from "./reinstall-guard.ts";
 import { markNodeLost, NodeStateError } from "./node-state.ts";
 
 /**
  * Node loss (ULTRA plan 9.4, 7.11). An operator declares a node lost; staleness never does. The
  * declaration writes the fence in one batch before anything else: the row restricts the node's key
- * to the fenced scope at once, the `fence` order and one `superseded` order per database (at its
- * current storage generation, volume kept) wait on the node's page for the day it comes back, and
- * every move from or toward the node ends, which ends its `move` order too: a fenced page holds
- * none. Then the node is marked lost, which closes its
- * databases at the Edge. D1 generations are not bumped here: the databases are recovered from R2
+ * to the fenced scope at once (its page then holds the `fence` order), one `superseded` order per
+ * database (at its current storage generation, volume kept) waits on the node's page for the day it
+ * comes back, and every move from or toward the node ends, which ends its `move` order too: a
+ * fenced page holds none. Then the node is marked lost, which closes its databases at the Edge. D1 generations are not bumped here: the databases are recovered from R2
  * by restores, which are new databases, and only after `fenced`.
  *
  * `runNodeFencing` finishes the fence in the plan's order, one step per run and each retried until
@@ -74,16 +74,15 @@ export async function declareNodeLost(
       "INSERT OR IGNORE INTO node_losses(node_id,region_id,declared_at,reason) VALUES(?,?,?,?)",
     ).bind(nodeId, node.region_id, at, request.reason),
     env.DB.prepare(
-      "INSERT OR IGNORE INTO lifecycle_orders(operation,node_id,type,created_at) VALUES('op_'||lower(hex(randomblob(10))),?,'fence',?)",
-    ).bind(nodeId, at),
-    env.DB.prepare(
       `INSERT INTO lifecycle_orders(operation,node_id,type,database_id,storage_generation,created_at)
       SELECT 'op_'||lower(hex(randomblob(10))),d.node_id,'superseded',d.id,d.storage_generation,? FROM databases d
       WHERE d.node_id=? AND d.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM lifecycle_orders o WHERE o.node_id=d.node_id AND o.type='superseded'
         AND o.database_id=d.id AND o.storage_generation=d.storage_generation AND o.closed_at IS NULL)`,
     ).bind(at, nodeId),
   ]);
-  await failMovesOfLostNode(env.DB, nodeId, at);
+  // The other node of a move that ended pulls its page: an order ended there, or a staged volume goes.
+  const others = await failMovesOfLostNode(env.DB, nodeId, at);
+  await Promise.allSettled(others.map((node) => hintNode(env, node)));
   if (node.lost_at !== null) return markNodeLost(env.DB, nodeId, request);
   return withAdmissionMutation(
     env,

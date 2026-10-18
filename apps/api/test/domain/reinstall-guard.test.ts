@@ -184,6 +184,7 @@ it("guards AddNode in recover mode when it is requested and again when it is car
   });
   await f.reported("asleep");
   // Marked lost without a fence of its own: only the proofs stand between the request and the disk.
+  // A lost node is fenced, so its later reports change no proof (a wake that D1 committed does).
   await markNodeLost(env.DB, f.node, {
     expected_node_uid: f.uid,
     reason: "gone",
@@ -203,7 +204,9 @@ it("guards AddNode in recover mode when it is requested and again when it is car
     assertNodeRecoveryAuthority(env.DB, addition),
   ).resolves.toBeUndefined();
   // The database woke between the request and the install: the guard holds at the install too.
-  await f.reported("ready");
+  await env.DB.prepare("UPDATE databases SET generation=2 WHERE id=?")
+    .bind(f.id)
+    .run();
   await expect(
     assertNodeRecoveryAuthority(env.DB, addition),
   ).rejects.toMatchObject({ code: "conflict" });
