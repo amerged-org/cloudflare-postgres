@@ -31,12 +31,13 @@ mod usage;
 
 pub use command::{CommandRunner, Output, SystemRunner};
 pub use error::Error;
-pub use ids::{VolumeId, database_id_valid};
+pub use ids::VolumeId;
 pub use pool::{NoRoom, Policy, PoolMode, PoolSample};
 #[cfg(target_os = "linux")]
 pub use store::{Inventory, Removal, Storage};
 pub use usage::{Alert, FsUsage, MountInfo, ReserveAction, VolumeInfo};
 
+use crate::units::DB_ROOT;
 use std::{path::PathBuf, time::Duration};
 
 /// How often the agent reads the pool (plan 4.3: the sample is at most 10 s old for the room rule).
@@ -71,7 +72,7 @@ impl Default for Config {
             device: PathBuf::from("/dev/disk/by-partlabel/pgcf-lvm"),
             group: "pgcf".into(),
             pool: "pgcf_thinpool".into(),
-            mount_root: PathBuf::from("/var/lib/pgcf/db"),
+            mount_root: PathBuf::from(DB_ROOT),
             pv_metadata_bytes: 64 << 20,
             pool_metadata_bytes: 1 << 30,
             logical_cap_factor: 4,

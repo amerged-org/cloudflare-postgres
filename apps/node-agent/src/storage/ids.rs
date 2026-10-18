@@ -1,20 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The names of a database's volume: LV name, tags and device-mapper name.
 use super::Error;
+use pgcf_native_protocol::valid_pattern;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const TAG_DATABASE: &str = "pgcf.db.";
 const TAG_GENERATION: &str = "pgcf.gen.";
-
-/// `^[a-z][a-z0-9]{19}$` (contracts `DatabaseId`).
-pub fn database_id_valid(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    bytes.len() == 20
-        && bytes[0].is_ascii_lowercase()
-        && bytes[1..]
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
 
 /// One storage generation of one database: a restore or a move builds the next one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,7 +16,7 @@ pub struct VolumeId {
 
 impl VolumeId {
     pub fn new(database: &str, generation: u64) -> Result<Self, Error> {
-        if !database_id_valid(database) {
+        if !valid_pattern("database", database) {
             return Err(Error::InvalidId("database id"));
         }
         if !(1..=MAX_SAFE_INTEGER).contains(&generation) {
