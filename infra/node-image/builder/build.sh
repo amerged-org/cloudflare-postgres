@@ -7,7 +7,7 @@
 #   build    Build offline from the sha256-verified locked packages only.
 #
 # Mounts: /src = infra/node-image (read-only), /debs = verified .debs (read-only),
-# /binaries = PGCF binaries (read-only, build only), /out = results for the host.
+# /binaries = the four PGCF binaries (read-only, build only), /out = results for the host.
 # Environment: PGCF_DEBIAN_SNAPSHOT, PGCF_SOURCE_DATE_EPOCH, PGCF_RELEASE, PGCF_PGDG_URL and
 # PGCF_PGDG_SUITE, all from packages.lock.json.
 set -euo pipefail
@@ -85,9 +85,10 @@ build)
   )
   stage=$work/binaries
   mkdir -p "$stage/var/lib/pgcf/bin/$PGCF_RELEASE"
-  if compgen -G '/binaries/*' >/dev/null; then
-    install -m 0755 /binaries/* "$stage/var/lib/pgcf/bin/$PGCF_RELEASE/"
-  fi
+  # Exactly the four binaries node-image.ts digested into pgcf-node.json; a missing one fails the build.
+  for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do
+    install -m 0755 "/binaries/$binary" "$stage/var/lib/pgcf/bin/$PGCF_RELEASE/"
+  done
   ln -s "$PGCF_RELEASE" "$stage/var/lib/pgcf/bin/current"
   mkosi "${mkosi_args[@]}" \
     --local-mirror="file://$repo" \

@@ -45,10 +45,13 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
   them as the only repository (mkosi `LocalMirror=`) and builds offline. The build fails if the
   installed set differs from the lock in any package or version. It writes `pgcf-node.raw`,
   `pgcf-node.raw.zst`, `SHA256SUMS` and `pgcf-node.json` (release name, snapshot, lock sha256, raw
-  and compressed size and sha256) to `<work>/out`. The image is compressed with zstd because the
-  Contabo rescue system that installs it has no `xz` (Stage 1). `--binaries` is the directory holding
-  `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive` and `pgcf-wal-fetch`; they land in
-  `/var/lib/pgcf/bin/<release>/` with `current` linking to it.
+  and compressed size and sha256, and the size and sha256 of each binary) to `<work>/out`. The
+  image is compressed with zstd because the Contabo rescue system that installs it has no `xz`
+  (Stage 1). `--binaries` is required: the directory holding `pgcf-agent`, `pgcf-native-gateway`,
+  `pgcf-archive` and `pgcf-wal-fetch`, all four non-empty or the build stops before it downloads
+  anything. Exactly these four land in `/var/lib/pgcf/bin/<release>/` with `current` linking to
+  it, and their digests go into `pgcf-node.json`, because the registration must pin the files the
+  nodes installed from the image run.
 - The work directory defaults to `.local/node-image`. With Docker in a VM (Colima, Docker Desktop)
   it must be under a directory the VM shares, such as the home directory.
 - The builder runs natively: amd64 in CI, arm64 on Apple silicon, where mkosi builds the x86-64
@@ -71,7 +74,8 @@ characters (CI uses `sha-<12 hex digits of the commit>`).
 ```sh
 # 1. The four binaries, built for linux/amd64 with the pinned Rust toolchain (CI does this too):
 cargo build --release --locked --bin pgcf-agent --bin pgcf-native-gateway --bin pgcf-archive --bin pgcf-wal-fetch
-mkdir -p .local/node-image/binaries && install -m 0755 target/release/pgcf-* .local/node-image/binaries/
+mkdir -p .local/node-image/binaries
+for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do install -m 0755 "target/release/$binary" .local/node-image/binaries/; done
 # 2. The image, with the local Docker builder (see Building above):
 node infra/node-image/node-image.ts build --binaries .local/node-image/binaries --release sha-0123456789ab
 # 3. Upload the six files and register the release:
@@ -92,24 +96,36 @@ The third step reads these variables, in memory only, and never prints their val
 
 What the script does, and what the API checks:
 
-- It refuses a build whose compressed image or package lock is not the one `pgcf-node.json`
-  describes, and a release name that is no version.
+- It refuses a build whose compressed image, package lock or any of the four binaries is not the
+  one `pgcf-node.json` describes (so binaries rebuilt since the image was built are refused: build
+  the image again), and a release name that is no version.
 - It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
   `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
-  that is already there with the same content (size and md5) is skipped, so a run that stopped
-  half way is repeated; one with another content stops the run, because a registered release is
-  never overwritten.
+  that is already there with the same content (size, md5 and the sha256 R2 reports for it) is
+  skipped, so a run that stopped half way is repeated. A file with the same size and md5 that R2
+  holds no sha256 for, because another tool stored it, is sent again with the checksum: the API
+  refuses a file without it. One with another content stops the run, because a registered release
+  is never overwritten.
 - It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file. The API refuses
   the registration unless the bucket holds every file at that size with that sha256, and it names
   every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
-  own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential.
+  own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential. The script
+  prints the release id and spec sha256 of the answer, and fails if the stored spec is another
+  version or pins other digests than the ones it registered.
 - `PUT /v1/regions/<region>/release` then assigns the release to a region: its nodes pull it, and
   AddNode installs new nodes from it. It is a compare-and-set on the region's revision:
 
   ```sh
-  curl -sS "$PGCF_API_URL/v1/regions/<region>/release" -H "Authorization: Bearer $PGCF_API_KEY"   # revision
-  curl -sS -X PUT "$PGCF_API_URL/v1/regions/<region>/release" -H "Authorization: Bearer $PGCF_API_KEY" \
-    -H 'Content-Type: application/json' -d '{"expected_revision":<revision>,"release_id":"<version>"}'
+  (
+    # The key goes through a 0600 header file in a 0700 directory, never into curl's arguments,
+    # which other users and process accounting can read (printf is a shell builtin).
+    umask 077
+    dir=$(mktemp -d) && trap 'rm -rf "$dir"' EXIT
+    printf 'Authorization: Bearer %s\n' "$PGCF_API_KEY" >"$dir/auth.header"
+    curl -sS "$PGCF_API_URL/v1/regions/<region>/release" -H "@$dir/auth.header"   # revision
+    curl -sS -X PUT "$PGCF_API_URL/v1/regions/<region>/release" -H "@$dir/auth.header" \
+      -H 'Content-Type: application/json' -d '{"expected_revision":<revision>,"release_id":"<version>"}'
+  )
   ```
 
 The Worker serves the files from its R2 binding. `GET` and `HEAD` of `/node/v1/releases/<version>/<file>`

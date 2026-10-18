@@ -9,7 +9,7 @@
 //                pgcf-node.raw.zst and pgcf-node.json. The release name is the one the image was
 //                built as (`--release`), which is also the image version a node enrolls as.
 //   --binaries   the directory the build took pgcf-agent, pgcf-native-gateway, pgcf-archive and
-//                pgcf-wal-fetch from.
+//                pgcf-wal-fetch from; they must be the files the image was built with.
 //   --lock       the package lock the image was built from (default infra/node-image/packages.lock.json).
 //   --dry-run    reads the files, prints the manifest and stops before any network call.
 //
@@ -25,14 +25,15 @@
 //
 // The API refuses the registration unless every file is in the bucket at the registered size with
 // the sha256 R2 verified at upload, so each file is sent with `x-amz-checksum-sha256`. A file that
-// is already there with the same content is not sent again; one that differs is never overwritten,
-// because a registered release is immutable.
+// is already there with the same content and that sha256 is not sent again; one stored without the
+// sha256 is sent again, and one that differs is never overwritten, because a registered release is
+// immutable.
 import { createHash, createHmac } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
-import { parseArgs } from "node:util";
+import { isDeepStrictEqual, parseArgs } from "node:util";
 import {
   FleetRelease,
   FleetReleaseRegistration,
@@ -41,6 +42,8 @@ import {
   RELEASE_IMAGE_FILE,
   RELEASE_LOCK_FILE,
   releaseObjectKey,
+  type FleetPinnedFile,
+  type FleetReleaseSpec,
   type ReleaseFile,
 } from "../../packages/contracts/src/releases.ts";
 
@@ -73,6 +76,11 @@ export interface BuildSummary {
   lock_sha256: string;
   raw: { sha256: string; size: number };
   zst: { sha256: string; size: number };
+  /** The binaries baked into the image, which are the ones the release pins. */
+  binaries: Record<
+    (typeof RELEASE_BINARY_FILES)[number],
+    { sha256: string; size: number }
+  >;
 }
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const isDigest = (value: unknown): value is { sha256: string; size: number } =>
@@ -99,7 +107,10 @@ export function parseBuildSummary(text: string): BuildSummary {
     typeof summary.lock_sha256 !== "string" ||
     !sha256Pattern.test(summary.lock_sha256) ||
     !isDigest(summary.raw) ||
-    !isDigest(summary.zst)
+    !isDigest(summary.zst) ||
+    typeof summary.binaries !== "object" ||
+    summary.binaries === null ||
+    !RELEASE_BINARY_FILES.every((file) => isDigest(summary.binaries?.[file]))
   )
     throw new Error("the build summary is not what node-image.ts build writes");
   return summary as BuildSummary;
@@ -123,8 +134,10 @@ const defaultLock = join(
 );
 
 /**
- * What a build produced, as the API registers it. The image and the lock must be the ones the
- * build summarized, so a stale file or another build's lock is refused here, before a byte is sent.
+ * What a build produced, as the API registers it. The image, the lock and the binaries must be the
+ * ones the build summarized, so a stale file, another build's lock or binaries rebuilt since are
+ * refused here, before a byte is sent: a node installed from the image runs the binaries baked into
+ * it, and the release must pin exactly those.
  */
 export async function releaseManifest(options: {
   imageDir: string;
@@ -174,8 +187,14 @@ export async function releaseManifest(options: {
     (typeof RELEASE_BINARY_FILES)[number],
     typeof image
   >;
-  for (const file of RELEASE_BINARY_FILES)
+  for (const file of RELEASE_BINARY_FILES) {
     binaries[file] = await add(file, join(options.binariesDir, file));
+    if (
+      binaries[file].sha256 !== summary.binaries[file].sha256 ||
+      binaries[file].size_bytes !== summary.binaries[file].size
+    )
+      throw new Error(`${file} is not the one the image was built with`);
+  }
   return {
     version: version.data,
     registration: FleetReleaseRegistration.parse({
@@ -292,42 +311,55 @@ const objectUrl = (credentials: R2Credentials, key: string) =>
   new URL(`/${credentials.bucket}/${key}`, credentials.endpoint);
 
 /**
- * Whether the object is in the bucket already: `absent`, or `same` when its size and md5 (the ETag
- * of a single-part upload) are the file's. Another content is an error, because a release is
- * never overwritten.
+ * Whether the object is in the bucket already: `absent`; `same` when its size and md5 (the ETag of
+ * a single-part upload) are the file's and R2 holds the file's sha256 for it, which is what the API
+ * requires of every file; `unverified` when size and md5 match but R2 holds no sha256, because
+ * another tool stored the object: it is sent again with the checksum, identical bytes. Another
+ * content is an error, because a release is never overwritten.
  */
 export async function existingObject(
   credentials: R2Credentials,
   upload: Upload,
   fetchImpl: Fetch = fetch,
-): Promise<"absent" | "same"> {
-  const url = objectUrl(credentials, upload.key);
+): Promise<"absent" | "unverified" | "same"> {
+  const url = objectUrl(credentials, upload.key),
+    // R2 returns the stored checksum on HEAD only when asked.
+    headers = { "x-amz-checksum-mode": "ENABLED" };
   const response = await fetchImpl(url, {
     method: "HEAD",
-    headers: signV4({
-      method: "HEAD",
-      url,
-      headers: {},
-      payloadHash: emptyPayload,
-      credentials,
-      region: "auto",
-      now: new Date(),
-    }),
+    headers: {
+      ...headers,
+      ...signV4({
+        method: "HEAD",
+        url,
+        headers,
+        payloadHash: emptyPayload,
+        credentials,
+        region: "auto",
+        now: new Date(),
+      }),
+    },
   });
   if (response.status === 404) return "absent";
   if (response.status !== 200)
     throw new Error(`R2 answered ${response.status} for HEAD ${upload.key}`);
-  const etag = response.headers.get("etag")?.replaceAll('"', "").toLowerCase();
+  const etag = response.headers.get("etag")?.replaceAll('"', "").toLowerCase(),
+    checksum = response.headers.get("x-amz-checksum-sha256");
   if (
     response.headers.get("content-length") !==
       String(upload.digest.size_bytes) ||
-    etag !== upload.digest.md5
+    etag !== upload.digest.md5 ||
+    (checksum !== null && checksum !== sha256Header(upload))
   )
     throw new Error(
       `${upload.key} is in the bucket with another content; a registered release is never overwritten, so build a new version`,
     );
-  return "same";
+  return checksum === null ? "unverified" : "same";
 }
+
+/** The file's sha256 as `x-amz-checksum-sha256` carries it. */
+const sha256Header = (upload: Upload) =>
+  Buffer.from(upload.digest.sha256, "hex").toString("base64");
 
 /** One signed PUT of the file, streamed, with the sha256 for R2 to verify. */
 export async function uploadObject(
@@ -338,10 +370,7 @@ export async function uploadObject(
   const url = objectUrl(credentials, upload.key),
     headers = {
       "content-length": String(upload.digest.size_bytes),
-      "x-amz-checksum-sha256": Buffer.from(
-        upload.digest.sha256,
-        "hex",
-      ).toString("base64"),
+      "x-amz-checksum-sha256": sha256Header(upload),
     };
   const response = await fetchImpl(url, {
     method: "PUT",
@@ -367,12 +396,35 @@ export async function uploadObject(
 
 // ---------- The management API ----------
 
-/** Registers the manifest as the release `version`; the API checks the bucket before it records it. */
+const pin = ({ sha256, size_bytes }: FleetPinnedFile) => ({
+  sha256,
+  size_bytes,
+});
+/** The digests a stored release pins, in the shape of a registration. */
+const registeredPins = (spec: FleetReleaseSpec): FleetReleaseRegistration => ({
+  image: {
+    ...pin(spec.image),
+    raw_sha256: spec.image.raw_sha256,
+    raw_bytes: spec.image.raw_bytes,
+  },
+  binaries: Object.fromEntries(
+    RELEASE_BINARY_FILES.map((file) => [file, pin(spec.binaries[file])]),
+  ) as FleetReleaseRegistration["binaries"],
+  os: {
+    debian_snapshot: spec.os.debian_snapshot,
+    package_lock: pin(spec.os.package_lock),
+  },
+});
+
+/**
+ * Registers the manifest as the release `version`; the API checks the bucket before it records it.
+ * Its answer is the whole stored release, which must be this version with the registered digests.
+ */
 export async function registerRelease(
   api: { apiUrl: string; apiKey: string },
   manifest: Manifest,
   fetchImpl: Fetch = fetch,
-): Promise<{ id: string; spec_sha256: string }> {
+): Promise<FleetRelease> {
   const origin = new URL(api.apiUrl);
   if (origin.protocol !== "https:")
     throw new Error("PGCF_API_URL must be an https URL");
@@ -396,7 +448,16 @@ export async function registerRelease(
       `the API refused the release: ${response.status} ${error?.code ?? "error"}: ${error?.message ?? "no message"}`,
     );
   }
-  return FleetRelease.pick({ id: true, spec_sha256: true }).parse(body);
+  const release = FleetRelease.parse(body);
+  if (release.id !== manifest.version)
+    throw new Error(
+      `the API stored the release as "${release.id}", not "${manifest.version}"`,
+    );
+  if (!isDeepStrictEqual(registeredPins(release.spec), manifest.registration))
+    throw new Error(
+      "the API stored a release whose pins differ from the registered ones",
+    );
+  return release;
 }
 
 // ---------- The command ----------
@@ -446,12 +507,15 @@ async function main(
     );
   if (credentials === undefined || api === undefined) return;
   for (const upload of manifest.uploads) {
-    if ((await existingObject(credentials, upload)) === "same") {
+    const existing = await existingObject(credentials, upload);
+    if (existing === "same") {
       console.log(`  ${upload.key} is in the bucket already`);
       continue;
     }
     await uploadObject(credentials, upload);
-    console.log(`  uploaded ${upload.key}`);
+    console.log(
+      `  uploaded ${upload.key}${existing === "unverified" ? " (R2 held no sha256 for it)" : ""}`,
+    );
   }
   const release = await registerRelease(api, manifest);
   console.log(`registered ${release.id} (spec sha256 ${release.spec_sha256})`);

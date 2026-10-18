@@ -2,7 +2,7 @@
 // Node image driver. Usage (from the repository root):
 //   node infra/node-image/node-image.ts resolve [--work DIR]
 //   node infra/node-image/node-image.ts fetch   [--work DIR]
-//   node infra/node-image/node-image.ts build   [--work DIR] [--binaries DIR] [--release NAME]
+//   node infra/node-image/node-image.ts build   --binaries DIR [--work DIR] [--release NAME]
 // The work directory defaults to .local/node-image; with Docker in a VM it must be a path the VM
 // shares (Colima and Docker Desktop share the home directory).
 import { spawnSync } from "node:child_process";
@@ -12,6 +12,7 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/p
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { digestBinaries } from "./binaries.ts";
 import {
   aptListName,
   compareInstalled,
@@ -191,8 +192,10 @@ async function fetchLocked(work: string): Promise<PackageLock> {
   return lock;
 }
 
-async function buildImage(work: string, binaries: string | undefined, release: string): Promise<void> {
+async function buildImage(work: string, binaries: string, release: string): Promise<void> {
   if (!releasePattern.test(release)) throw new Error("invalid release name");
+  // Before the download and the build: a missing binary fails now, and the summary pins these files.
+  const binaryDigests = await digestBinaries(binaries);
   const lock = await fetchLocked(work);
   const out = join(work, "out");
   await rm(out, { recursive: true, force: true });
@@ -218,6 +221,7 @@ async function buildImage(work: string, binaries: string | undefined, release: s
     lock_sha256: await sha256File(lockPath),
     raw: { sha256: await sha256File(raw), size: (await stat(raw)).size },
     zst: { sha256: await sha256File(zst), size: (await stat(zst)).size },
+    binaries: binaryDigests,
   };
   await writeFile(join(out, "pgcf-node.json"), `${JSON.stringify(summary, null, 2)}\n`);
   await writeFile(
@@ -239,10 +243,11 @@ switch (command) {
     break;
   case "build": {
     const binaries = option("binaries");
-    await buildImage(work, binaries ? resolve(binaries) : undefined, option("release", "local")!);
+    if (!binaries) throw new Error("--binaries DIR is required: the image bakes in the four binaries a release pins");
+    await buildImage(work, resolve(binaries), option("release", "local")!);
     break;
   }
   default:
-    console.error("usage: node-image.ts resolve|fetch|build [--work DIR] [--binaries DIR] [--release NAME]");
+    console.error("usage: node-image.ts resolve|fetch [--work DIR] | build --binaries DIR [--work DIR] [--release NAME]");
     process.exit(2);
 }

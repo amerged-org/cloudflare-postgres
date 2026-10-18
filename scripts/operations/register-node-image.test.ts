@@ -5,7 +5,10 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { FleetReleaseRegistration } from "../../packages/contracts/src/releases.ts";
+import {
+  FleetReleaseRegistration,
+  fleetReleaseSpec,
+} from "../../packages/contracts/src/releases.ts";
 import {
   digestFile,
   existingObject,
@@ -15,10 +18,19 @@ import {
   releaseManifest,
   signV4,
   uploadObject,
+  type Manifest,
 } from "./register-node-image.ts";
 
 const sha = (text: string, algorithm = "sha256") =>
   createHash(algorithm).update(text).digest("hex");
+
+const BINARIES = [
+  "pgcf-agent",
+  "pgcf-native-gateway",
+  "pgcf-archive",
+  "pgcf-wal-fetch",
+];
+const binaryBytes = (name: string) => `binary ${name}`;
 
 // What `node infra/node-image/node-image.ts build` writes beside the image.
 function summary(release: string, files: { zst: string; lock: string }) {
@@ -28,14 +40,17 @@ function summary(release: string, files: { zst: string; lock: string }) {
     lock_sha256: sha(files.lock),
     raw: { sha256: sha("the raw disk"), size: 2 * 1024 ** 3 },
     zst: { sha256: sha(files.zst), size: Buffer.byteLength(files.zst) },
+    binaries: Object.fromEntries(
+      BINARIES.map((name) => [
+        name,
+        {
+          sha256: sha(binaryBytes(name)),
+          size: Buffer.byteLength(binaryBytes(name)),
+        },
+      ]),
+    ),
   };
 }
-const BINARIES = [
-  "pgcf-agent",
-  "pgcf-native-gateway",
-  "pgcf-archive",
-  "pgcf-wal-fetch",
-];
 
 /** A build output directory, a binaries directory and the lock the image was built from. */
 async function build(release = "sha-0123456789ab") {
@@ -51,7 +66,7 @@ async function build(release = "sha-0123456789ab") {
   );
   await writeFile(join(root, "packages.lock.json"), files.lock);
   for (const name of BINARIES)
-    await writeFile(join(binariesDir, name), `binary ${name}`);
+    await writeFile(join(binariesDir, name), binaryBytes(name));
   return {
     root,
     options: {
@@ -88,6 +103,15 @@ test("the build's summary is read as the builder writes it and nothing else", ()
     { ...good, zst: { ...good.zst, sha256: "abc" } },
     { ...good, raw: { ...good.raw, size: 0 } },
     { ...good, lock_sha256: "x" },
+    { ...good, binaries: undefined },
+    { ...good, binaries: { ...good.binaries, "pgcf-agent": undefined } },
+    {
+      ...good,
+      binaries: {
+        ...good.binaries,
+        "pgcf-wal-fetch": { sha256: "abc", size: 1 },
+      },
+    },
   ])
     assert.throws(() => parseBuildSummary(JSON.stringify(bad)), /summary/);
   assert.throws(() => parseBuildSummary("not json"), /summary/);
@@ -153,6 +177,17 @@ test("a release is refused when the files are not the ones the build summarized"
     await writeFile(b.options.lockPath, '{"packages":["changed"]}\n');
     await assert.rejects(releaseManifest(b.options), /package lock/);
     await writeFile(b.options.lockPath, b.files.lock);
+    // A binary is not the one the image was built with: the nodes installed from it would run
+    // other code than the release pins.
+    await writeFile(join(b.options.binariesDir, "pgcf-agent"), "rebuilt");
+    await assert.rejects(
+      releaseManifest(b.options),
+      /pgcf-agent is not the one the image was built with/,
+    );
+    await writeFile(
+      join(b.options.binariesDir, "pgcf-agent"),
+      binaryBytes("pgcf-agent"),
+    );
     // A binary is missing or empty.
     await rm(join(b.options.binariesDir, "pgcf-archive"));
     await assert.rejects(releaseManifest(b.options), /pgcf-archive/);
@@ -257,7 +292,8 @@ const upload = {
   digest: { sha256: sha("x"), md5: sha("x", "md5"), size_bytes: 1 },
 };
 
-test("an object that is already in the bucket is left alone when it is the same and refused when it differs", async () => {
+test("an object that is already in the bucket is left alone when R2 holds its sha256, sent again when it holds none, and refused when it differs", async () => {
+  const checksum = Buffer.from(upload.digest.sha256, "hex").toString("base64");
   const answer =
     (status: number, headers: Record<string, string> = {}) =>
     async (url: string | URL | Request, init?: RequestInit) => {
@@ -266,12 +302,20 @@ test("an object that is already in the bucket is left alone when it is the same 
         String(url),
         "https://account.eu.r2.cloudflarestorage.com/bucket/node-images/sha-0123456789ab/pgcf-agent",
       );
+      const sent = new Headers(init?.headers);
       assert.match(
-        new Headers(init?.headers).get("authorization") ?? "",
+        sent.get("authorization") ?? "",
         /^AWS4-HMAC-SHA256 Credential=id-value\//,
+      );
+      // R2 reports the checksum only when asked, and the header is signed like any other.
+      assert.equal(sent.get("x-amz-checksum-mode"), "ENABLED");
+      assert.match(
+        sent.get("authorization") ?? "",
+        /SignedHeaders=host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date,/,
       );
       return new Response(null, { status, headers });
     };
+  const stored = { "content-length": "1", etag: `"${upload.digest.md5}"` };
   assert.equal(
     await existingObject(credentials, upload, answer(404)),
     "absent",
@@ -280,9 +324,28 @@ test("an object that is already in the bucket is left alone when it is the same 
     await existingObject(
       credentials,
       upload,
-      answer(200, { "content-length": "1", etag: `"${upload.digest.md5}"` }),
+      answer(200, { ...stored, "x-amz-checksum-sha256": checksum }),
     ),
     "same",
+  );
+  // The same bytes stored without the sha256 (another tool put them) would fail the registration,
+  // so they are sent again with it: the content is identical, so the release stays immutable.
+  assert.equal(
+    await existingObject(credentials, upload, answer(200, stored)),
+    "unverified",
+  );
+  await assert.rejects(
+    existingObject(
+      credentials,
+      upload,
+      answer(200, {
+        ...stored,
+        "x-amz-checksum-sha256": Buffer.from(sha("y"), "hex").toString(
+          "base64",
+        ),
+      }),
+    ),
+    /another content/,
   );
   await assert.rejects(
     existingObject(
@@ -357,6 +420,18 @@ test("an upload is one signed PUT of the file with the sha256 R2 verifies, and i
   }
 });
 
+// What `PUT /v1/fleet/releases/{version}` answers: the whole stored release, its spec named by the Worker.
+const stored = (manifest: Manifest, id = manifest.version) => ({
+  id,
+  spec: fleetReleaseSpec(
+    "https://api.example.org",
+    manifest.version,
+    manifest.registration,
+  ),
+  spec_sha256: "a".repeat(64),
+  approved_at: "2026-10-16T12:00:00.000Z",
+});
+
 test("the registration is one admin PUT of the manifest to the version, and the answer's refusal is shown without the key", async () => {
   const b = await build();
   try {
@@ -367,13 +442,11 @@ test("the registration is one admin PUT of the manifest to the version, and the 
       manifest,
       async (url, init) => {
         seen.push({ url: String(url), init: init! });
-        return Response.json({
-          id: manifest.version,
-          spec_sha256: "a".repeat(64),
-        });
+        return Response.json(stored(manifest));
       },
     );
     assert.equal(release.id, manifest.version);
+    assert.equal(release.spec_sha256, "a".repeat(64));
     assert.equal(
       seen[0]!.url,
       "https://api.example.org/v1/fleet/releases/sha-0123456789ab",
@@ -412,6 +485,23 @@ test("the registration is one admin PUT of the manifest to the version, and the 
         assert.doesNotMatch(error.message, /pgcf_sk_secret/);
         return true;
       },
+    );
+    // A stored release that is not the registered one is not a success, whatever the status says.
+    const answer = (body: unknown) => async () => Response.json(body);
+    const api = { apiUrl: "https://api.example.org", apiKey: "k" };
+    await assert.rejects(
+      registerRelease(api, manifest, answer(stored(manifest, "other"))),
+      /stored the release as "other"/,
+    );
+    const changed = stored(manifest);
+    changed.spec.binaries["pgcf-agent"].sha256 = sha("another agent");
+    await assert.rejects(
+      registerRelease(api, manifest, answer(changed)),
+      /pins differ/,
+    );
+    await assert.rejects(
+      registerRelease(api, manifest, answer({ id: manifest.version })),
+      { name: "ZodError" },
     );
     await assert.rejects(
       registerRelease(
