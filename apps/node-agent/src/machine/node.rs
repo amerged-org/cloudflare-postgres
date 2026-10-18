@@ -85,6 +85,34 @@ impl Node {
             users: Mutex::new(users),
         })
     }
+    /// The user of the scratch database that `pgcf-agent check` makes, or finds: a system account
+    /// of the system's own uid range. The agent's table of uids stays the running agent's alone;
+    /// a second process, the check, never writes it.
+    pub async fn scratch_account(&self, database: &str) -> io::Result<Account> {
+        if let Some(account) = self.account(database) {
+            return Ok(account);
+        }
+        let name = account_name(database);
+        run("groupadd", &["--system", &name]).await?;
+        run(
+            "useradd",
+            &[
+                "--system",
+                "-g",
+                &name,
+                "-M",
+                "-s",
+                "/usr/sbin/nologin",
+                "-d",
+                "/nonexistent",
+                &name,
+            ],
+        )
+        .await?;
+        self.account(database)
+            .ok_or_else(|| io::Error::other("the account is missing after it was made"))
+    }
+
     fn users(&self) -> std::sync::MutexGuard<'_, Users> {
         self.users.lock().unwrap_or_else(PoisonError::into_inner)
     }

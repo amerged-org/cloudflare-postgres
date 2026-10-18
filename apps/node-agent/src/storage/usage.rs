@@ -172,7 +172,7 @@ pub enum Removal {
 
 impl Removal {
     /// Whether the order lets the volume of `id` go.
-    fn releases(self, id: &VolumeId) -> bool {
+    pub(super) fn releases(self, id: &VolumeId) -> bool {
         match self {
             Removal::DatabaseDeleted { storage_generation } => {
                 id.generation() <= storage_generation

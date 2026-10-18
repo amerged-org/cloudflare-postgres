@@ -10,7 +10,9 @@
 //! across an `await`. Every start of PostgreSQL goes through `Admission`.
 mod apply;
 mod build;
+pub mod check;
 mod entry;
+mod metering;
 mod power;
 mod report;
 #[cfg(test)]
@@ -30,6 +32,7 @@ use crate::{
     layout::Layout,
     machine::Machine,
     state::{DatabaseState, Files},
+    usage::Meter,
 };
 use pgcf_native_protocol::agent as protocol;
 use std::{
@@ -207,6 +210,8 @@ pub struct Core<M: Machine> {
     endpoints: Mutex<HashMap<String, String>>,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
     reports: Mutex<report::Reports>,
+    /// What each database used (`usage.rs`).
+    meter: Meter,
     /// Something in `reports` changed.
     pub(crate) changed: Notify,
 }
@@ -222,6 +227,7 @@ impl<M: Machine> Core<M> {
         tokio::sync::mpsc::UnboundedReceiver<crate::admission::EarlySleep>,
         Vec<crate::admission::Permit>,
     ) {
+        let layout = parts.machine.layout().clone();
         let policy = Arc::new(RwLock::new(parts.policy.clone()));
         let admitter = Admitter::rebuild(
             parts.policy.admission.clone(),
@@ -258,6 +264,7 @@ impl<M: Machine> Core<M> {
             endpoints: Mutex::new(HashMap::new()),
             dbs: Mutex::new(HashMap::new()),
             reports: Mutex::new(report::Reports::default()),
+            meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
         });
         (core, early, resumed)
@@ -395,11 +402,19 @@ fn table_entry(id: &str, view: &View) -> Option<protocol::Database> {
 impl<M: Machine> Core<M> {
     /// Changes a database's view. Its entry on the gateway's table and its observation follow.
     pub(crate) fn set(&self, db: &Db, change: impl FnOnce(&mut View)) {
-        let entry = {
+        let (entry, served) = {
             let mut view = db.view();
+            let before = metering::is_served(view.phase);
             change(&mut view);
-            table_entry(&db.id, &view)
+            let after = metering::is_served(view.phase);
+            (
+                table_entry(&db.id, &view),
+                (before != after).then_some(after),
+            )
         };
+        if let Some(served) = served {
+            self.meter.awake(&db.id, served, now_ms());
+        }
         match entry {
             Some(entry) => {
                 if let Err(error) = self.gateway.set(entry) {

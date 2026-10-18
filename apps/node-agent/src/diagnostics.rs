@@ -160,7 +160,13 @@ mod tests {
         let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = refused.local_addr().unwrap();
         drop(refused);
-        let http = crate::test_api::plain_http(std::time::Duration::from_secs(2))
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .tls_certs_only(Vec::new())
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
             .get(format!("http://{address}/secret-path"))
             .send()
             .await

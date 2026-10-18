@@ -2,12 +2,11 @@
 //! The kernel side of a volume: mounting it with the new mount API, unmounting, `statvfs`, and
 //! the mount table and ext4's error counter.
 use super::FsUsage;
-use crate::mount::detached;
 use std::{
     ffi::CString,
     io,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
     path::Path,
@@ -15,10 +14,75 @@ use std::{
 
 // linux/mount.h
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+const FSOPEN_CLOEXEC: libc::c_uint = 0x1;
+const FSCONFIG_SET_STRING: libc::c_uint = 1;
+const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+const FSMOUNT_CLOEXEC: libc::c_uint = 0x1;
+const MOUNT_ATTR_NOSUID: libc::c_uint = 0x2;
+const MOUNT_ATTR_NODEV: libc::c_uint = 0x4;
+const MOUNT_ATTR_NOEXEC: libc::c_uint = 0x8;
 
 fn path_text(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn owned(fd: libc::c_long) -> io::Result<OwnedFd> {
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = libc::c_int::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?;
+    // SAFETY: the kernel just returned this descriptor and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+fn ok(value: libc::c_long) -> io::Result<()> {
+    if value < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+fn text(value: &str) -> io::Result<CString> {
+    CString::new(value).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// A detached mount of `fstype`, with `source` when given.
+pub(crate) fn detached(fstype: &str, source: Option<&str>) -> io::Result<OwnedFd> {
+    let fstype = text(fstype)?;
+    // SAFETY: plain syscalls with valid NUL-terminated strings; results are checked.
+    let context =
+        owned(unsafe { libc::syscall(libc::SYS_fsopen, fstype.as_ptr(), FSOPEN_CLOEXEC) })?;
+    if let Some(source) = source {
+        let (key, value) = (text("source")?, text(source)?);
+        ok(unsafe {
+            libc::syscall(
+                libc::SYS_fsconfig,
+                context.as_raw_fd(),
+                FSCONFIG_SET_STRING,
+                key.as_ptr(),
+                value.as_ptr(),
+                0,
+            )
+        })?;
+    }
+    ok(unsafe {
+        libc::syscall(
+            libc::SYS_fsconfig,
+            context.as_raw_fd(),
+            FSCONFIG_CMD_CREATE,
+            std::ptr::null::<libc::c_char>(),
+            std::ptr::null::<libc::c_void>(),
+            0,
+        )
+    })?;
+    owned(unsafe {
+        libc::syscall(
+            libc::SYS_fsmount,
+            context.as_raw_fd(),
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        )
+    })
 }
 
 fn attach(mount: OwnedFd, target: &Path) -> io::Result<()> {

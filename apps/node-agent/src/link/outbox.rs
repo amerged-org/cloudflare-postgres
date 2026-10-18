@@ -4,13 +4,12 @@
 //! that a retried post counts once (the API keeps the row it already holds). The file drops the
 //! rows a pass answered once per pass, not per batch: draining a full queue would otherwise
 //! rewrite and fsync it hundreds of times on the disk the databases share. Bodies are cut by the
-//! arithmetic of `measurements.rs`. A metric the node cannot know stays `null` in its row, never a
+//! arithmetic of `batches`. A metric the node cannot know stays `null` in its row, never a
 //! manufactured zero.
 use super::{file, request::Api};
 use crate::{
     Error,
     api::Refusal,
-    measurements::batches,
     node_link::{constant, schema_valid},
 };
 use serde_json::{Value, json};
@@ -18,7 +17,7 @@ use std::{
     collections::{HashSet, VecDeque},
     io::ErrorKind,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -29,9 +28,48 @@ const USAGE_MAX_ROWS: usize = 20_000;
 /// Events are timing facts; beyond this many unanswered ones the oldest are dropped.
 const EVENTS_MAX: usize = 10_000;
 
-/// The rows or events one batch is cut from. `measurements::batches` puts at most one cohort in
-/// a body and needs to see no more than that.
+/// The rows or events one batch is cut from. `batches` puts at most one cohort in a body and
+/// needs to see no more than that.
 const BATCH_WINDOW: usize = 100;
+
+/// The bounds of a body: how many records one holds and how many bytes.
+static BOUNDS: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!(
+        "../../../../packages/contracts/native/measurements.generated.json"
+    ))
+    .expect("generated measurement contract")
+});
+fn bound(name: &str) -> usize {
+    BOUNDS["constants"][name]
+        .as_u64()
+        .and_then(|bound| usize::try_from(bound).ok())
+        .expect("generated measurement bound")
+}
+/// `values` cut into bodies of the field `field`, each within the cohort and the byte bound.
+fn batches(field: &str, values: Vec<Value>) -> Result<Vec<Vec<Value>>, Error> {
+    let (cohort, bytes) = (bound("MEASUREMENT_COHORT"), bound("MEASUREMENT_BODY_BYTES"));
+    let mut result = Vec::new();
+    let mut current: Vec<Value> = Vec::new();
+    for value in values {
+        let mut candidate = current.clone();
+        candidate.push(value.clone());
+        if current.len() == cohort || serde_json::to_vec(&json!({field: candidate}))?.len() > bytes
+        {
+            if current.is_empty() {
+                return Err("record exceeds body bound".into());
+            }
+            result.push(std::mem::take(&mut current));
+        }
+        if serde_json::to_vec(&json!({field: [&value]}))?.len() > bytes {
+            return Err("record exceeds body bound".into());
+        }
+        current.push(value);
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    Ok(result)
+}
 /// `USAGE_HOUR_MS` of the usage contract.
 const HOUR_MS: i128 = 3_600_000;
 

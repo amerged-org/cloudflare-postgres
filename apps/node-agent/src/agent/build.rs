@@ -73,7 +73,12 @@ fn volume_error(error: &storage::Error) -> &'static str {
 /// whatever is there is unlinked, which follows nothing, and the file is created exclusively,
 /// which fails on a link that appears in between, and handed over by its descriptor. This is done
 /// only while the database's unit is stopped.
-fn write_owned(dir: &Path, name: &str, content: &str, account: &Account) -> io::Result<()> {
+pub(super) fn write_owned(
+    dir: &Path,
+    name: &str,
+    content: &str,
+    account: &Account,
+) -> io::Result<()> {
     let path = dir.join(name);
     match std::fs::remove_file(&path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),

@@ -78,7 +78,7 @@ impl Default for Timing {
 
 /// One line on the agent's log: the class of a failure, never its text, which can carry an address.
 fn log(event: &str, error: &Error) {
-    crate::timing::emit(line(event, error));
+    crate::timing::emit_event(line(event, error));
 }
 /// The line of `log`. Cloudflare's refusal, of a request or of the upgrade, is named by its HTTP
 /// status, which tells a rejected signature (401) from a limit (429) and an outage (503), and

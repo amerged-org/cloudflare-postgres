@@ -7,6 +7,10 @@ rust-version = "1.99"
 license = "Apache-2.0"
 publish = false
 
+[[bin]]
+name = "pgcf-agent"
+path = "src/main.rs"
+
 [dependencies]
 webpki-roots = "=1.0.9"
 base64 = "=0.23.1"

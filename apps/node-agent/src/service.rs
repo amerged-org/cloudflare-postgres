@@ -36,6 +36,8 @@ pub struct Intervals {
     pub sample: Duration,
     /// Every volume's space and inodes (`NODE_VOLUME_REPORT_INTERVAL_MS`).
     pub volumes: Duration,
+    /// The usage meter's rows: what a crash of the agent can lose of awake time.
+    pub usage: Duration,
     /// The thin pool (plan 4.3).
     pub pool: Duration,
     /// The whole desired page, which a message the link lost would leave unread.
@@ -57,6 +59,7 @@ impl Default for Intervals {
                     .as_u64()
                     .expect("generated interval"),
             ),
+            usage: Duration::from_secs(60),
             pool: crate::storage::POOL_SAMPLE_INTERVAL,
             full_pull: Duration::from_secs(60),
             batch: Duration::from_millis(200),
@@ -211,6 +214,8 @@ impl<M: Machine> Service<M> {
         service.spawn(async move { s.sample().await });
         let s = service.clone();
         service.spawn(async move { s.volumes().await });
+        let s = service.clone();
+        service.spawn(async move { s.usage().await });
         let s = service.clone();
         service.spawn(async move { s.pool().await });
         let s = service.clone();
@@ -519,6 +524,27 @@ impl<M: Machine> Service<M> {
         }
     }
 
+    /// The usage rows: what each database used since the last tick, queued for Cloudflare.
+    async fn usage(&self) {
+        let mut tick = tokio::time::interval(self.intervals.usage);
+        loop {
+            tick.tick().await;
+            self.queue_usage().await;
+        }
+    }
+
+    pub(crate) async fn queue_usage(&self) {
+        if let Err(error) = self
+            .core
+            .meter_tick(|rows| self.link.queue_usage(rows))
+            .await
+        {
+            crate::timing::emit_event(json!({
+                "event": "usage_not_queued", "class": crate::diagnostics::error_code(&error),
+            }));
+        }
+    }
+
     /// The thin pool every 5 s, for the room rule.
     async fn pool(&self) {
         let mut tick = tokio::time::interval(self.intervals.pool);
@@ -570,6 +596,7 @@ mod tests {
         Intervals {
             sample: Duration::from_millis(300),
             volumes: Duration::from_millis(300),
+            usage: Duration::from_millis(300),
             pool: Duration::from_millis(300),
             full_pull: Duration::from_secs(30),
             batch: Duration::from_millis(50),
@@ -658,6 +685,15 @@ mod tests {
             [("eu-dev".to_string(), 3, false)]
         );
         assert_eq!(machine.slice_memory_mib(), Some(9913));
+        // The database is served, and the meter says for how long.
+        eventually(30, "the usage of the served database", || {
+            cloud
+                .acknowledged("/node/v1/usage")
+                .iter()
+                .flat_map(|report| report["rows"].as_array().cloned().unwrap_or_default())
+                .any(|row| row["database"] == id && row["awake_ms"].as_u64() > Some(0))
+        })
+        .await;
 
         // The page suspends it, and the cloud is told that it sleeps with its proof.
         let mut gateway = FakeGateway::connect(&machine.layout().gateway_socket()).await;
