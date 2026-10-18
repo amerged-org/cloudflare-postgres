@@ -1,0 +1,460 @@
+{
+  "version": 1,
+  "constants": {
+    "AGENT_GATEWAY_SOCKET": "/run/pgcf/agent/gateway.sock",
+    "AGENT_CHANNEL_MAX_LINE_BYTES": 4194304,
+    "AGENT_CHANNEL_MAX_DATABASES": 10000,
+    "UNIX_SOCKET_PATH_MAX_BYTES": 100,
+    "WAKE_REDELIVER_MS": 3000,
+    "WAKE_PHASES": [
+      "admission",
+      "queue_wait",
+      "pg_control",
+      "mount",
+      "start",
+      "release"
+    ],
+    "WAKE_OUTCOMES": ["started", "refused"],
+    "WAKE_REASONS": [
+      "no_room",
+      "no_headroom",
+      "deleted",
+      "suspended",
+      "moving",
+      "maintenance",
+      "fenced",
+      "superseded",
+      "unproven",
+      "storage_full",
+      "desired_stale",
+      "wake_in_progress",
+      "identity_mismatch",
+      "control_version",
+      "volume_missing",
+      "uuid_mismatch",
+      "volume_suspended",
+      "volume_open",
+      "holder_busy",
+      "mount_failed",
+      "start_timeout",
+      "release_failed"
+    ],
+    "ADMISSION_REFUSALS": ["no_room", "no_headroom"],
+    "ADMISSION_REFUSAL_DETAILS": {
+      "no_room": "storage",
+      "no_headroom": "node at awake capacity"
+    },
+    "AGENT_ARCHIVE_SOCKET": "/run/pgcf/agent/archive.sock",
+    "ARCHIVE_SOCKET_ENVIRONMENT": "PGCF_AGENT_ARCHIVE_SOCKET",
+    "ARCHIVE_PROTOCOL": "pgcf-archive/1",
+    "ARCHIVE_MAX_LINE_BYTES": 256,
+    "ARCHIVE_AGENT_BOUND_MS": 60000,
+    "ARCHIVE_CLIENT_BOUND_MS": 70000
+  },
+  "gateway_channel": {
+    "agent": [
+      {
+        "name": "table",
+        "line": "{\"type\":\"table\",\"databases\":[{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}},{\"database\":\"ebbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"sleeping\",\"route_revision\":7}]}",
+        "valid": true
+      },
+      {
+        "name": "empty-table",
+        "line": "{\"type\":\"table\",\"databases\":[]}",
+        "valid": true
+      },
+      {
+        "name": "quiesce",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"quiesce\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": true
+      },
+      {
+        "name": "retired",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"retired\",\"route_revision\":7}}",
+        "valid": true
+      },
+      {
+        "name": "removed",
+        "line": "{\"type\":\"removed\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": true
+      },
+      {
+        "name": "refused",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\",\"retry_after_seconds\":5}}",
+        "valid": true
+      },
+      {
+        "name": "refused-no-room",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_room\"}}",
+        "valid": true
+      },
+      {
+        "name": "refused-move-hold",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"moving\"}}",
+        "valid": true
+      },
+      {
+        "name": "started",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"steps_ms\":{\"admission\":1,\"release\":1,\"start\":61}}}",
+        "valid": true
+      },
+      {
+        "name": "started-without-steps",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\"}}",
+        "valid": true
+      },
+      {
+        "name": "begin",
+        "line": "{\"type\":\"control\",\"id\":9,\"action\":\"begin\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3}",
+        "valid": true
+      },
+      {
+        "name": "activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": true
+      },
+      {
+        "name": "table-twice",
+        "line": "{\"type\":\"table\",\"databases\":[{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}},{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"sleeping\",\"route_revision\":7}]}",
+        "valid": false
+      },
+      {
+        "name": "running-without-writer",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7}}",
+        "valid": false
+      },
+      {
+        "name": "sleeping-with-writer",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"sleeping\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "root-uid",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":0,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "pid-one",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":1,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "bare-instance",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/dbbbbbbbbbbbbbbbbbbb/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e5b7a4c1e9a3b2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "relative-socket",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"run/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "parent-socket",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/run/pgcf/../etc/.s.PGSQL.5432\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "long-socket",
+        "line": "{\"type\":\"database\",\"database\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3,\"operation\":\"op_cccccccccccccccccccc\",\"mode\":\"running\",\"route_revision\":7,\"writer\":{\"socket\":\"/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"uid\":61001,\"pid\":4242,\"instance\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}}",
+        "valid": false
+      },
+      {
+        "name": "unknown-field",
+        "line": "{\"type\":\"removed\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"extra\":1}",
+        "valid": false
+      },
+      {
+        "name": "unknown-type",
+        "line": "{\"type\":\"stop\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": false
+      },
+      {
+        "name": "started-with-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"reason\":\"no_room\"}}",
+        "valid": false
+      },
+      {
+        "name": "refused-without-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\"}}",
+        "valid": false
+      },
+      {
+        "name": "no-headroom-without-retry-hint",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\"}}",
+        "valid": false
+      },
+      {
+        "name": "no-room-with-retry-hint",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_room\",\"retry_after_seconds\":5}}",
+        "valid": false
+      },
+      {
+        "name": "started-with-retry-hint",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"retry_after_seconds\":5}}",
+        "valid": false
+      },
+      {
+        "name": "retry-hint-above-300",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"no_headroom\",\"retry_after_seconds\":301}}",
+        "valid": false
+      },
+      {
+        "name": "kubernetes-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"thick_storage\"}}",
+        "valid": false
+      },
+      {
+        "name": "pool-hit",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"hit\"}}",
+        "valid": false
+      },
+      {
+        "name": "pool-miss",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"miss\",\"reason\":\"no_room\"}}",
+        "valid": false
+      },
+      {
+        "name": "unknown-reason",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"refused\",\"reason\":\"busy\"}}",
+        "valid": false
+      },
+      {
+        "name": "step-name",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"steps_ms\":{\"Start\":1}}}",
+        "valid": false
+      },
+      {
+        "name": "step-too-long",
+        "line": "{\"type\":\"wake_result\",\"result\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"outcome\":\"started\",\"steps_ms\":{\"start\":600001}}}",
+        "valid": false
+      },
+      {
+        "name": "generation-zero",
+        "line": "{\"type\":\"control\",\"id\":9,\"action\":\"close\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":0}",
+        "valid": false
+      },
+      {
+        "name": "unknown-action",
+        "line": "{\"type\":\"control\",\"id\":9,\"action\":\"stop\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"generation\":3}",
+        "valid": false
+      }
+    ],
+    "gateway": [
+      {
+        "name": "wake",
+        "line": "{\"type\":\"wake\",\"wake\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"route_revision\":7,\"role_revision_hash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"queued_at_ms\":1760702400000}}",
+        "valid": true
+      },
+      {
+        "name": "status",
+        "line": "{\"type\":\"status\",\"id\":9,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"idle\",\"connections\":2,\"busy_connections\":0,\"pending_dials\":0}",
+        "valid": true
+      },
+      {
+        "name": "activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": true
+      },
+      {
+        "name": "activity-unavailable",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"unavailable\",\"countersSince\":null,\"ingressBytes\":null,\"egressBytes\":null,\"totalConnections\":null,\"connectionMilliseconds\":null,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":null}}",
+        "valid": true
+      },
+      {
+        "name": "activity-process-absence",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"current_process_absence\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":0,\"egressBytes\":0,\"totalConnections\":0,\"connectionMilliseconds\":0,\"connections\":2,\"authenticatedConnections\":0,\"busyConnections\":0,\"pendingDials\":1,\"lastActivityAt\":null}}",
+        "valid": true
+      },
+      {
+        "name": "activity-partial-history",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"partial\",\"countersSince\":\"2026-10-17T11:30:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": true
+      },
+      {
+        "name": "activity-invented-keys",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"busyConnections\":0,\"connections\":1,\"lastActivityAt\":\"2026-10-17T12:00:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-with-region",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\",\"region\":\"eu-dev\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-with-pod",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\",\"pod\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-without-last-activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1}}",
+        "valid": false
+      },
+      {
+        "name": "activity-report-null",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":null}",
+        "valid": false
+      },
+      {
+        "name": "activity-report-array",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":[1]}",
+        "valid": false
+      },
+      {
+        "name": "activity-report-text",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":\"report\"}",
+        "valid": false
+      },
+      {
+        "name": "activity-id-above-2-53",
+        "line": "{\"type\":\"activity\",\"id\":9007199254740992,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-busy-above-authenticated",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":2,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T11:59:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-unavailable-with-counters",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"unavailable\",\"countersSince\":null,\"ingressBytes\":0,\"egressBytes\":null,\"totalConnections\":null,\"connectionMilliseconds\":null,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":null}}",
+        "valid": false
+      },
+      {
+        "name": "activity-before-counters",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"complete\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":10,\"egressBytes\":20,\"totalConnections\":3,\"connectionMilliseconds\":4000,\"connections\":2,\"authenticatedConnections\":1,\"busyConnections\":1,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T10:59:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "activity-absence-with-activity",
+        "line": "{\"type\":\"activity\",\"id\":10,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"report\":{\"processEpoch\":\"0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"epoch\":\"1a6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c\",\"startedAt\":\"2026-10-17T11:00:00.000Z\",\"counterStartedAt\":\"2026-10-17T11:00:00.000Z\",\"observedAt\":\"2026-10-17T12:00:00.000Z\",\"history\":\"current_process_absence\",\"countersSince\":\"2026-10-17T11:00:00.000Z\",\"ingressBytes\":0,\"egressBytes\":0,\"totalConnections\":0,\"connectionMilliseconds\":0,\"connections\":2,\"authenticatedConnections\":0,\"busyConnections\":0,\"pendingDials\":1,\"lastActivityAt\":\"2026-10-17T12:00:00.000Z\"}}",
+        "valid": false
+      },
+      {
+        "name": "upper-hash",
+        "line": "{\"type\":\"wake\",\"wake\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":4,\"route_revision\":7,\"role_revision_hash\":\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\",\"queued_at_ms\":1760702400000}}",
+        "valid": false
+      },
+      {
+        "name": "generation-zero",
+        "line": "{\"type\":\"wake\",\"wake\":{\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"operation\":\"op_cccccccccccccccccccc\",\"generation\":0,\"route_revision\":7,\"role_revision_hash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"queued_at_ms\":1760702400000}}",
+        "valid": false
+      },
+      {
+        "name": "unknown-status",
+        "line": "{\"type\":\"status\",\"id\":9,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"asleep\",\"connections\":0,\"busy_connections\":0,\"pending_dials\":0}",
+        "valid": false
+      },
+      {
+        "name": "status-id-above-2-53",
+        "line": "{\"type\":\"status\",\"id\":9007199254740992,\"database\":\"dbbbbbbbbbbbbbbbbbbb\",\"status\":\"idle\",\"connections\":0,\"busy_connections\":0,\"pending_dials\":0}",
+        "valid": false
+      },
+      {
+        "name": "unknown-type",
+        "line": "{\"type\":\"release\",\"database\":\"dbbbbbbbbbbbbbbbbbbb\"}",
+        "valid": false
+      }
+    ]
+  },
+  "archive": {
+    "requests": [
+      {
+        "line": "pgcf-archive/1 archive 000000010000000000000003",
+        "valid": true,
+        "request": { "type": "archive", "name": "000000010000000000000003" }
+      },
+      {
+        "line": "pgcf-archive/1 archive 00000002.history",
+        "valid": true,
+        "request": { "type": "archive", "name": "00000002.history" }
+      },
+      {
+        "line": "pgcf-archive/1 archive 000000010000000000000003.00000028.backup",
+        "valid": true,
+        "request": {
+          "type": "archive",
+          "name": "000000010000000000000003.00000028.backup"
+        }
+      },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003.partial pg_wal/RECOVERYXLOG",
+        "valid": true,
+        "request": {
+          "type": "fetch",
+          "name": "000000010000000000000003.partial",
+          "destination": "pg_wal/RECOVERYXLOG"
+        }
+      },
+      {
+        "line": "pgcf-archive/1 fetch 00000002.history pg_wal/RECOVERYHISTORY",
+        "valid": true,
+        "request": {
+          "type": "fetch",
+          "name": "00000002.history",
+          "destination": "pg_wal/RECOVERYHISTORY"
+        }
+      },
+      {
+        "line": "pgcf-archive/1 archive 000000010000000000000003 extra",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/2 archive 000000010000000000000003",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 archive  000000010000000000000003",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 archive 0000000a0000000000000003",
+        "valid": false
+      },
+      { "line": "pgcf-archive/1 archive RECOVERYXLOG", "valid": false },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003 base/1",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003 pg_wal/../postgresql.conf",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 fetch 000000010000000000000003 pg_wal/.hidden",
+        "valid": false
+      },
+      {
+        "line": "pgcf-archive/1 delete 000000010000000000000003",
+        "valid": false
+      },
+      { "line": "", "valid": false }
+    ],
+    "replies": [
+      { "line": "ok", "valid": true, "reply": { "type": "ok" } },
+      { "line": "missing", "valid": true, "reply": { "type": "missing" } },
+      { "line": "failed", "valid": true, "reply": { "type": "failed" } },
+      {
+        "line": "failed upload_timeout",
+        "valid": true,
+        "reply": { "type": "failed", "reason": "upload_timeout" }
+      },
+      { "line": "OK", "valid": false },
+      { "line": "ok ", "valid": false },
+      { "line": "failed ", "valid": false },
+      { "line": "failed Access Denied", "valid": false },
+      { "line": "", "valid": false }
+    ],
+    "formats": [
+      { "reply": { "type": "ok" }, "line": "ok\n" },
+      {
+        "reply": { "type": "failed", "reason": "upload_timeout" },
+        "line": "failed upload_timeout\n"
+      },
+      {
+        "reply": { "type": "failed", "reason": "Access Denied\n" },
+        "line": "failed\n"
+      }
+    ]
+  }
+}

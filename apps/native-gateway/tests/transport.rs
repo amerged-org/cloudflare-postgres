@@ -1181,6 +1181,7 @@ fn wake_result(generation: u64, outcome: Outcome) -> WakeResult {
         generation,
         outcome,
         reason: (outcome == Outcome::Refused).then(|| "deleted".into()),
+        retry_after_seconds: None,
         steps_ms: Default::default(),
     }
 }

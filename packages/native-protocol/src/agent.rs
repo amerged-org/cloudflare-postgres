@@ -320,6 +320,7 @@ mod tests {
                 generation: 4,
                 outcome: Outcome::Refused,
                 reason: Some("no_headroom".into()),
+                retry_after_seconds: Some(5),
                 steps_ms: Default::default(),
             },
         };

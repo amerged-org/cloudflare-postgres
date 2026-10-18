@@ -1,0 +1,15 @@
+{
+  "report": [
+    {
+      "pv": [
+        {
+          "pv_name": "/dev/loop0",
+          "vg_name": "pgcf",
+          "pv_size": "1002438656",
+          "pv_mda_size": "68153344"
+        }
+      ]
+    }
+  ],
+  "log": []
+}

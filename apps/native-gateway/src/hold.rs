@@ -318,6 +318,7 @@ mod tests {
             generation,
             outcome,
             reason: (outcome == Outcome::Refused).then(|| "no_headroom".into()),
+            retry_after_seconds: (outcome == Outcome::Refused).then_some(5),
             steps_ms: Default::default(),
         }
     }

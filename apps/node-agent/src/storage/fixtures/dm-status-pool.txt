@@ -1,0 +1,1 @@
+pgcf-pgcf_thinpool-tpool: 0 1048576 thin-pool 3 216/2048 148/8192 - rw discard_passdown error_if_no_space - 512 

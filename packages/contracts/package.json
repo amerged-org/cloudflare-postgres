@@ -30,7 +30,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node native/generate.ts --check && vitest run --passWithNoTests"
+    "test": "node native/generate.ts --check && node native/generate-node.ts --check && vitest run --passWithNoTests"
   },
   "dependencies": {
     "zod": "^4.6.5"

@@ -575,6 +575,7 @@ async fn a_held_wake_reaches_the_unit_the_agent_started_for_it() {
             generation: 2,
             outcome: Outcome::Started,
             reason: None,
+            retry_after_seconds: None,
             steps_ms: Default::default(),
         },
     });
@@ -628,6 +629,7 @@ async fn a_refused_wake_ends_its_held_connections_with_57p03() {
             generation: 2,
             outcome: Outcome::Refused,
             reason: Some("no_headroom".into()),
+            retry_after_seconds: Some(5),
             steps_ms: Default::default(),
         },
     });
@@ -812,6 +814,7 @@ fn started(generation: u64, operation: &str) -> ToGateway {
             generation,
             outcome: Outcome::Started,
             reason: None,
+            retry_after_seconds: None,
             steps_ms: [("start".to_string(), 80)].into(),
         },
     }
@@ -941,6 +944,7 @@ async fn every_connection_is_labelled_warm_or_cold() {
             generation: 4,
             outcome: Outcome::Refused,
             reason: Some("no_headroom".into()),
+            retry_after_seconds: Some(5),
             steps_ms: Default::default(),
         },
     });

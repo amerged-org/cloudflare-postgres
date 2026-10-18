@@ -38,25 +38,19 @@ import {
   BucketName,
   HttpsUrl,
   OperationStatus,
-  ROLE_CONNECTION_LIMIT_MAX,
   ROLE_LIMIT,
-  ROLE_MEMBER_OF_MAX,
   Timestamp,
   TEXT_MAX_LENGTH,
 } from "./api.ts";
-import { RolePassword } from "./auth.ts";
-import { MaintenanceCredential, MAINTENANCE_ROLE } from "./maintenance.ts";
+import { MaintenanceCredential } from "./maintenance.ts";
+import { DatabaseId, OperationId, NodeId, RegionId, RoleName } from "./ids.ts";
 import {
-  DATABASE_ID_PATTERN,
-  DatabaseId,
-  OPERATION_ID_PATTERN,
-  OperationId,
-  NodeId,
-  OWNER_ROLE_NAME,
-  REGION_ID_PATTERN,
-  RegionId,
-  RoleName,
-} from "./ids.ts";
+  ARCHIVE_DESTINATION_PATTERN,
+  ARCHIVE_SERVER_NAME,
+  DesiredRole,
+  DesiredRoleRemoval,
+  refineRoles,
+} from "./node-link.ts";
 
 export const AGENT_PROTOCOL_VERSION = 1;
 export const DESIRED_PAGE_LIMIT_MAX = 200;
@@ -85,39 +79,12 @@ export function postgresImageIdMatches(
     imageId.endsWith(`sha256:${digest}`)
   );
 }
-/** Barman `serverName` for every database; the path prefix already makes it unique. */
-export const ARCHIVE_SERVER_NAME = "database";
 
 const K8sNodeName = z
   .string()
   .max(253)
   .regex(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/);
 const Count = z.number().int().nonnegative();
-
-// ---------- Archive path ----------
-
-export function archiveDestinationPath(
-  bucket: string,
-  regionId: string,
-  databaseId: string,
-  generation: number,
-  operationId: string,
-): string {
-  if (!BucketName.safeParse(bucket).success)
-    throw new TypeError("invalid bucket name");
-  if (!REGION_ID_PATTERN.test(regionId))
-    throw new TypeError("invalid region id");
-  if (!DATABASE_ID_PATTERN.test(databaseId))
-    throw new TypeError("invalid database id");
-  if (!Number.isSafeInteger(generation) || generation < 1)
-    throw new TypeError("invalid generation");
-  if (!OPERATION_ID_PATTERN.test(operationId))
-    throw new TypeError("invalid operation id");
-  return `s3://${bucket}/${regionId}/${databaseId}/g${generation}-${operationId}`;
-}
-
-export const ARCHIVE_DESTINATION_PATTERN =
-  /^s3:\/\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\/([a-z][a-z0-9-]{1,30}[a-z0-9])\/([a-z][a-z0-9]{19})\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$/;
 
 // ---------- Desired state (GET /agent/v1/desired) ----------
 
@@ -164,63 +131,6 @@ export const DesiredSize = z
     },
   );
 export type DesiredSize = z.infer<typeof DesiredSize>;
-
-/**
- * A role the database holds. The attributes appear only where they differ from a plain role
- * (no expiry, no limit, no membership, NOBYPASSRLS), so a database without them keeps the wire
- * shape every deployed consumer accepts.
- */
-export const DesiredRole = z.strictObject({
-  name: RoleName,
-  owner: z.boolean(),
-  password: RolePassword,
-  revision: z.number().int().min(1),
-  valid_until: Timestamp.describe(
-    "VALID UNTIL; applied at whole seconds, truncated. Absent means no expiry.",
-  ).optional(),
-  connection_limit: z
-    .number()
-    .int()
-    .min(1)
-    .max(ROLE_CONNECTION_LIMIT_MAX)
-    .describe("CONNECTION LIMIT. Absent means unlimited.")
-    .optional(),
-  member_of: z
-    .array(RoleName)
-    .max(ROLE_MEMBER_OF_MAX)
-    .describe(
-      "Other present roles of this record the role is a member of. Absent means none.",
-    )
-    .optional(),
-  bypass_rls: z
-    .literal(true)
-    .describe("BYPASSRLS. Absent means NOBYPASSRLS.")
-    .optional(),
-});
-export type DesiredRole = z.infer<typeof DesiredRole>;
-/**
- * A role deleted through the API whose removal from PostgreSQL is not yet confirmed. The region
- * sets it to NOLOGIN, ends its sessions, then drops it, and reports the outcome in the
- * observation's `roles`.
- */
-export const DesiredRoleRemoval = z
-  .strictObject({
-    name: RoleName,
-    state: z.literal("absent"),
-  })
-  .describe("A deleted role the region must remove; it carries no credential.");
-export type DesiredRoleRemoval = z.infer<typeof DesiredRoleRemoval>;
-export function isRoleRemoval(
-  role: DesiredRole | DesiredRoleRemoval,
-): role is DesiredRoleRemoval {
-  return "state" in role;
-}
-/** The roles a database holds now, without those awaiting removal. */
-export function presentRoles(db: {
-  roles: readonly (DesiredRole | DesiredRoleRemoval)[];
-}): DesiredRole[] {
-  return db.roles.filter((role): role is DesiredRole => !isRoleRemoval(role));
-}
 
 export const DesiredCreation = z.strictObject({
   operation_id: OperationId,
@@ -348,69 +258,7 @@ export const DesiredDatabase = z
         });
       }
     }
-    const names = new Set<string>();
-    let owners = 0;
-    for (const role of db.roles) {
-      if (role.name === MAINTENANCE_ROLE)
-        ctx.addIssue({
-          code: "custom",
-          path: ["roles"],
-          message: "Internal maintenance role cannot be a customer role",
-        });
-      if (names.has(role.name)) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["roles"],
-          message: `duplicate role ${role.name}`,
-        });
-      }
-      names.add(role.name);
-      if (isRoleRemoval(role)) {
-        if (role.name === OWNER_ROLE_NAME)
-          ctx.addIssue({
-            code: "custom",
-            path: ["roles"],
-            message: "The owner role cannot be removed",
-          });
-        continue;
-      }
-      if (role.owner) {
-        owners += 1;
-        if (role.name !== OWNER_ROLE_NAME) {
-          ctx.addIssue({
-            code: "custom",
-            path: ["roles"],
-            message: `owner role must be ${OWNER_ROLE_NAME}`,
-          });
-        }
-      }
-    }
-    // A membership names another role the database holds now; the owner is never a target.
-    const present = new Map(
-      presentRoles(db).map((role) => [role.name, role] as const),
-    );
-    for (const role of presentRoles(db))
-      for (const target of role.member_of ?? [])
-        if (
-          target === role.name ||
-          target === OWNER_ROLE_NAME ||
-          present.get(target)?.owner !== false
-        )
-          ctx.addIssue({
-            code: "custom",
-            path: ["roles"],
-            message: `${role.name} is a member of ${target}, which is not another role of this database`,
-          });
-    if (
-      owners > 1 ||
-      (["running", "suspended"].includes(db.desired_state) && owners !== 1)
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["roles"],
-        message: "running databases require exactly one owner role",
-      });
-    }
+    refineRoles(db.roles, db.desired_state !== "deleted", ctx);
   });
 export type DesiredDatabase = z.infer<typeof DesiredDatabase>;
 
@@ -785,12 +633,6 @@ export const LinkHello = z.strictObject({
 });
 export type LinkHello = z.infer<typeof LinkHello>;
 
-export const LinkWelcome = z.strictObject({
-  type: z.literal("welcome"),
-  protocol: z.literal(AGENT_PROTOCOL_VERSION),
-});
-export type LinkWelcome = z.infer<typeof LinkWelcome>;
-
 /** The largest link message either end accepts; a hint's page is carried only within it. */
 export const LINK_MESSAGE_MAX_BYTES = 64 * 1024;
 
@@ -821,15 +663,6 @@ export const LinkDesiredHint = z
       });
   });
 export type LinkDesiredHint = z.infer<typeof LinkDesiredHint>;
-
-export const AgentLinkMessage = z.discriminatedUnion("type", [LinkHello]);
-export type AgentLinkMessage = z.infer<typeof AgentLinkMessage>;
-
-export const ServerLinkMessage = z.discriminatedUnion("type", [
-  LinkWelcome,
-  LinkDesiredHint,
-]);
-export type ServerLinkMessage = z.infer<typeof ServerLinkMessage>;
 
 // ---------- Authenticated agent measurements ----------
 

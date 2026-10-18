@@ -30,41 +30,36 @@ pub const REDELIVER_MS: u64 = 3_000;
 pub const TICKET_LEASE_MS: u64 = 10_000;
 pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
-/// Every reason a wake result may name.
-pub const REASONS: [&str; 32] = [
-    "no_desired_row",
-    "not_sleeping",
-    "wake_in_progress",
-    "desired_stale",
+/// Every reason the node agent's wake result may name (`WAKE_REASONS` of
+/// `packages/contracts/src/node-local.ts`).
+pub const REASONS: [&str; 22] = [
     "no_room",
-    "thick_storage",
-    "volume_identity_missing",
-    "no_power_record",
-    "no_sleep_record",
-    "image_changed",
-    "configuration_changed",
-    "no_free_slot",
     "no_headroom",
-    "gateways_not_ready",
-    "agent_unavailable",
-    "holder_busy",
-    "volume_open",
-    "volume_suspended",
+    "deleted",
+    "suspended",
+    "moving",
+    "maintenance",
+    "fenced",
+    "superseded",
+    "unproven",
+    "storage_full",
+    "desired_stale",
+    "wake_in_progress",
+    "identity_mismatch",
+    "control_version",
     "volume_missing",
     "uuid_mismatch",
-    "unclean",
-    "control_version",
-    "identity_mismatch",
-    "container_missing",
+    "volume_suspended",
+    "volume_open",
+    "holder_busy",
     "mount_failed",
-    "audit_failed",
-    "bind_failed",
     "start_timeout",
-    "sql_identity_mismatch",
     "release_failed",
-    "deleted",
-    "not_in_region",
 ];
+/// The one refusal that waiting can undo, and so the only one with a retry hint.
+pub const RETRY_REASON: &str = "no_headroom";
+/// The longest retry hint, in seconds.
+pub const RETRY_AFTER_MAX_SECONDS: u32 = 300;
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 
 /// Route token v5 claims. `v: 5` is the wake flag: a v5 token exists only for a wake ticket.
@@ -323,17 +318,25 @@ pub struct WakeResult {
     pub outcome: Outcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The HINT of the 57P03, exactly with `no_headroom` (`RETRY_REASON`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub steps_ms: BTreeMap<String, u64>,
 }
 impl WakeResult {
+    /// `started`, or `refused` with a reason of `REASONS`. Exactly the refusal that waiting can
+    /// undo carries the retry hint.
     pub fn valid(&self) -> bool {
         valid_pattern("database", &self.database)
             && valid_pattern("operation", &self.operation)
             && positive(self.generation)
-            && match (&self.outcome, &self.reason) {
-                (Outcome::Started, None) => true,
-                (Outcome::Refused, Some(reason)) => REASONS.contains(&reason.as_str()),
+            && match (&self.outcome, &self.reason, self.retry_after_seconds) {
+                (Outcome::Started, None, None) => true,
+                (Outcome::Refused, Some(reason), seconds) if REASONS.contains(&reason.as_str()) => {
+                    (reason == RETRY_REASON) == seconds.is_some()
+                        && seconds.is_none_or(|s| (1..=RETRY_AFTER_MAX_SECONDS).contains(&s))
+                }
                 _ => false,
             }
             && self.steps_ms.len() <= 16
@@ -343,5 +346,57 @@ impl WakeResult {
                     && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
                     && *value <= 600_000
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(outcome: Outcome, reason: Option<&str>, hint: Option<u32>) -> WakeResult {
+        WakeResult {
+            database: "a".repeat(20),
+            operation: format!("op_{}", "b".repeat(20)),
+            generation: 3,
+            outcome,
+            reason: reason.map(String::from),
+            retry_after_seconds: hint,
+            steps_ms: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn the_agents_answers_are_started_or_refused_and_only_no_headroom_carries_the_hint() {
+        let valid = |r: WakeResult| r.valid();
+        assert!(valid(result(Outcome::Started, None, None)));
+        assert!(!valid(result(Outcome::Started, Some("no_room"), None)));
+        assert!(!valid(result(Outcome::Started, None, Some(5))));
+        for reason in REASONS {
+            let hint = (reason == RETRY_REASON).then_some(5);
+            assert!(
+                valid(result(Outcome::Refused, Some(reason), hint)),
+                "{reason}"
+            );
+        }
+        assert!(!valid(result(Outcome::Refused, Some("no_headroom"), None)));
+        assert!(!valid(result(Outcome::Refused, Some("no_room"), Some(5))));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("no_headroom"),
+            Some(0)
+        )));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("no_headroom"),
+            Some(RETRY_AFTER_MAX_SECONDS + 1)
+        )));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("a_reason_nobody_named"),
+            None
+        )));
+        assert!(!valid(result(Outcome::Refused, None, None)));
+        // The Kubernetes pool's reasons are gone.
+        assert!(!valid(result(Outcome::Refused, Some("no_free_slot"), None)));
     }
 }

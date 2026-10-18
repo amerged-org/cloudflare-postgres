@@ -1120,8 +1120,8 @@ That covers a crash, a reboot or a Contabo shutdown that stopped PostgreSQL with
 - **Planned move:** the target starts only after the source's proven sleep (section 9.5).
 - **Node loss requires fencing first** (section 9.4).
   - A node is never declared lost from staleness alone.
-  - Before any generation moves, its Tunnel and keys are revoked, and it is powered off through the Contabo API.
-  - If it comes back, the agent receives "superseded generation" orders and never starts or archives those databases again.
+  - Before any generation moves, its Tunnel is deleted and its Tunnel token revoked, its node key is restricted to the fenced scope (section 9.4), and it is powered off through the Contabo API.
+  - If it comes back, the agent receives its `fence` and "superseded generation" orders and never starts or archives those databases again.
 - **Reinstall guard.** The API refuses to reinstall an instance, or to run AddNode in recover mode on it, while any database's current generation on it lacks a proven-sleep record. Only an explicit owner override bypasses this. A reinstall overwrites the disk, and with it any unarchived WAL.
 
 ---
@@ -1178,7 +1178,7 @@ These are the kernel features containers use, plus a user per database and no te
 4. Over the enrolled link, the agent receives the Tunnel token and R2 temporary credentials, stored as encrypted systemd credentials. Without a vTPM this protects only against offline disk reads, not against the hypervisor.
 5. The seed is deleted after enrollment.
 
-A reinstall issues a new token, and a lost node's key is revoked.
+A reinstall issues a new token, and a lost node's key is restricted to the fenced scope (section 9.4).
 
 **Route keys per node.** A node holds only its own derived key, so a compromised node cannot forge tokens for other nodes.
 
@@ -1270,11 +1270,11 @@ Debian keeps the previous kernel. A bad kernel is recovered from the boot menu o
 
 1. A node that misses its link for 180 s raises `regional_node_stale`. **Staleness alone never declares a node lost.**
 2. The operator declares the node lost (later the API may, under an explicit rule). Fencing comes first, in this order:
-   1. Delete the node's Tunnel, and revoke its Tunnel token and node key.
+   1. Delete the node's Tunnel, revoke its Tunnel token, and restrict its node key to the fenced scope: the key still signs `GET /node/v1/desired` and `POST /node/v1/observations` and nothing else, so it can fetch no credential and join no link. Every other signed request is answered `403 {"error":"node_fenced"}`, which the agent treats as a fence.
    2. Power it off with the Contabo API (`actions/stop`), and confirm the instance status.
    3. Only then bump each database's generation and restore it from R2 onto another node.
 3. IDs follow [D4](#115-decisions-open-for-the-owner). Each database's recovery point is reported.
-4. If the old node comes back, its agent receives "superseded generation" orders. It neither starts nor archives those databases, and their volumes are deleted after the operator confirms.
+4. If the old node comes back, its desired page holds a `fence` order and the "superseded generation" orders, and no database. The agent writes them to disk (fsync) before it acts, never lifts one because it left the page, and checks them before any recovery start at boot. It neither starts nor archives those databases, and their volumes are deleted after the operator confirms (`remove_volume`). A fence ends only with a reinstall, which is a new install with a new key.
 5. The replacement VPS comes from AddNode (a purchase under the costed policy), or from a reinstall of the same instance through 9.2. Either is subject to the reinstall guard (section 7.11).
 
 There is no control server, so there is no control-loss procedure.
@@ -1284,7 +1284,7 @@ There is no control server, so there is no control-loss procedure.
 A move is one operation, triggered through the API (admin) or by the operator. One database moves by R2 restore and **keeps its ID**:
 1. Proven sleep on the source.
 2. D1 bumps the generation, with a new archive path.
-3. The target restores from the source's last backup plus WAL, through admission.
+3. The target restores from the source's last backup plus WAL, through admission. The move order carries the source's proven-sleep record (`end`). The target lets recovery end only after every segment through the record's last archived segment was fetched and replayed, and reports `ready` only after it promoted a database with the record's `system_identifier` on a later timeline. Otherwise it reports `no_recovery_point` and the source's volume stays.
 4. The target takes its first base backup.
 5. D1 switches the route (mutation barrier).
 6. The source deletes its volume.

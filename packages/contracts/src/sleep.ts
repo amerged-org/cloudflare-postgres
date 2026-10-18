@@ -35,16 +35,3 @@ export const SLEEP_SQL = Object.freeze({
   SWITCH,
   ARCHIVE_STATUS,
 });
-export const WAKE_PHASES = [
-  "wake_prepare",
-  "desired_apply",
-  "archive_metrics",
-  "ca_publication",
-  "desired_applied",
-  "role_runtime_auth",
-  "volume_identity",
-  "runtime_unchanged",
-  "fence_release",
-  "observation_post",
-] as const;
-export type WakePhase = (typeof WAKE_PHASES)[number];

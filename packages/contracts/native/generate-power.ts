@@ -2,7 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { format } from "prettier";
 import { ID_ALPHABET } from "../src/ids.ts";
-import { SLEEP_SQL, SLEEP_REFUSALS, WAKE_PHASES } from "../src/sleep.ts";
+import { SLEEP_SQL, SLEEP_REFUSALS } from "../src/sleep.ts";
 import { GATEWAY_RETIRE_HOLD_MS } from "../src/gateway-control.ts";
 import { physicalReclamationVectors } from "./power-vectors.ts";
 const contract = {
@@ -11,7 +11,6 @@ const contract = {
     ID_ALPHABET,
     SLEEP_SQL,
     SLEEP_REFUSALS,
-    WAKE_PHASES,
     GATEWAY_RETIRE_HOLD_MS,
   },
 };
