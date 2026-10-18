@@ -112,7 +112,10 @@ const settle = (f: Fixture) =>
   )
     .bind(f.id)
     .run();
-/** The target reports the storage generation the move staged. */
+/**
+ * The target reports the storage generation the move staged; its backup is the first one after it
+ * promoted the cluster on the timeline after the source's.
+ */
 async function reportTarget(
   f: Fixture,
   move: { operation: string },
@@ -129,6 +132,7 @@ async function reportTarget(
         generation: staged.target_generation as number,
         operation: move.operation,
         storage_generation: staged.target_storage_generation as number,
+        backup: { ...BACKUP, timeline: PROOF.timeline + 1 },
         ...patch,
       }),
     ]),
@@ -836,6 +840,30 @@ it("ends a move whose target sleeps with another cluster's proof", async () => {
     failure: "identity_mismatch",
   });
   expect(await f.row()).toEqual(before);
+});
+
+it("ends a move whose target reports ready with a backup of the source's own timeline: it never promoted", async () => {
+  const f = await ready(),
+    move = await restoring(f),
+    before = await f.row();
+  await reportTarget(f, move, {
+    state: "ready",
+    backup: { ...BACKUP, timeline: PROOF.timeline },
+  });
+  expect(await status(move.operation)).toMatchObject({
+    status: "failed",
+    failure: "not_promoted",
+  });
+  expect(await f.row()).toEqual(before);
+  // The source serves again, and the target removes what it staged.
+  expect(await ordersOf(f.node)).toEqual([]);
+  expect(await ordersOf(f.other)).toEqual([
+    expect.objectContaining({
+      type: "superseded",
+      storage_generation: 2,
+      remove_volume: true,
+    }),
+  ]);
 });
 
 it("leaves the database with its source when the target cannot build, retires what the target staged, and the next attempt stages a new generation", async () => {

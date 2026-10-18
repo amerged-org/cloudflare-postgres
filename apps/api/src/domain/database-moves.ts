@@ -48,7 +48,9 @@ import { isConstraintError } from "./rows.ts";
  *    unchanged one, and the source keeps holding. The target restores through admission, replays
  *    to the proven end and takes its first base backup.
  * 3. `done`: the target reports the staged storage generation ready, or asleep after the proven
- *    sleep of a later timeline of the same cluster; either includes the DONE backup. Behind the
+ *    sleep of a later timeline of the same cluster; either includes the DONE backup, which is on a
+ *    timeline after the source's proof. A ready target without such a backup never promoted, and
+ *    the move fails. Behind the
  *    admission fence, one batch then moves the database to the target with the staged
  *    generation, ends the `move` order, and orders the source to retire its storage generation
  *    and remove the volume.
@@ -767,9 +769,11 @@ export async function progressMoves(
         continue;
       }
       const end = ProvenSleepRecord.parse(JSON.parse(move.proven_sleep_json!));
-      // The target promoted this cluster on a later timeline and holds its first DONE backup.
+      // The target promoted this cluster on a later timeline and holds its first DONE backup, which
+      // it took after the promotion, so on that later timeline too.
       const promoted =
         observed.backup !== null &&
+        observed.backup.timeline > end.timeline &&
         (observed.state === "ready" ||
           (observed.state === "asleep" &&
             observed.proven_sleep!.timeline > end.timeline));
@@ -778,6 +782,12 @@ export async function progressMoves(
         observed.proven_sleep!.system_identifier !== end.system_identifier
       ) {
         await fail(move, "identity_mismatch");
+        continue;
+      }
+      // A target that runs the staged generation without having promoted it cannot serve it; the
+      // source serves again.
+      if (observed.state === "ready" && observed.backup !== null && !promoted) {
+        await fail(move, "not_promoted");
         continue;
       }
       if (!promoted) continue;
