@@ -1068,14 +1068,6 @@ mod tests {
             let fixture = Fixture::new("near-bound");
             let volume = volume();
             let runner = fixture.runner();
-            // The first start of a new executable can take longer than the bounds below.
-            let (db, warmup) = wal_job(&volume, Duration::from_secs(30));
-            assert!(
-                runner
-                    .run(&db, &warmup, 128, &credential())
-                    .await
-                    .succeeded()
-            );
             // A unit still running at its bound is ended by systemd.
             let (db, job) = wal_job(&volume, Duration::from_secs(1));
             fixture.set("delay", "3");

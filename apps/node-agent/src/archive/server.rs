@@ -270,7 +270,8 @@ impl Server {
         };
         let target = registration.database.data_directory().join(destination);
         // A segment of the wrong size came out of the spool, where a prefetch that failed left it
-        // (see `Recovery::segment_bytes`): it is fetched once more, without prefetch.
+        // (see `Recovery::segment_bytes`): it is fetched once more, without prefetch, and barman
+        // replaces what it delivered.
         for prefetch in [WAL_PREFETCH, 0] {
             let job = Job::wal_fetch(
                 &recovery.source,
@@ -297,7 +298,8 @@ impl Server {
             if whole {
                 return Reply::Ok;
             }
-            let _ = std::fs::remove_file(&target);
+            // The second fetch replaces the file: the agent runs as root and deletes nothing in
+            // a directory its database's user can rearrange.
         }
         Reply::Failed(Some("fetch_wrong_size"))
     }
@@ -662,7 +664,6 @@ mod tests {
         let second = "000000010000000000000002";
         node.fixture.put_object(SOURCE, second, &whole[..100]);
         assert_eq!(node.fetch(second).await, "failed fetch_wrong_size\n");
-        assert!(!destination.exists());
         // Only a segment has the size of one: a history file, a partial or backup history file
         // are as long as they are.
         node.fixture
