@@ -12,6 +12,7 @@ mod dm;
 pub mod gateway;
 pub mod health;
 pub mod holder;
+pub mod layout;
 pub mod link;
 pub mod measurements;
 #[cfg(target_os = "linux")]
@@ -19,15 +20,16 @@ pub mod mount;
 pub mod node_link;
 pub mod pg_control;
 pub mod postgres;
+pub mod roles;
+pub mod scram;
+pub mod settings;
 pub mod sleep;
 pub mod sleep_record;
 pub mod storage;
 #[cfg(test)]
 mod test_api;
 #[cfg(test)]
-mod test_postgres;
-#[cfg(test)]
-mod test_sql;
+mod testpg;
 pub mod timing;
 pub mod units;
 pub mod volume;
