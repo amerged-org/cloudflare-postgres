@@ -13,11 +13,14 @@ import {
 } from "./admission.ts";
 import type { Env } from "./env.ts";
 import { decoyResponse } from "./decoy.ts";
-import { connectGateway } from "./gateway.ts";
+import { connectGateway, GatewayRefusal } from "./gateway.ts";
 
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 interface Timings extends AdmissionTimings {
   gateway_connect_ms?: number;
+  /** A gateway that refused the upgrade: its status and its error code (`{"error": …}`). */
+  gateway_status?: number;
+  gateway_error?: string;
   /** When the gateway stage began, for the handler to read; never logged. */
   gateway_started?: number;
 }
@@ -117,6 +120,10 @@ export default {
       // after the upgrade, so a statement's time is the gateway's `conn_stages`, not an Edge line.
       return new Response(null, { status: 101, webSocket: upstream.socket });
     } catch (error) {
+      if (error instanceof GatewayRefusal) {
+        timings.gateway_status = error.status;
+        if (error.code !== undefined) timings.gateway_error = error.code;
+      }
       const failure =
         error instanceof AdmissionFailure
           ? error

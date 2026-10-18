@@ -28,7 +28,10 @@ export default {
       connection.method = request.method;
       connection.body = await request.text();
       if (url.searchParams.get("mode") === "reject")
-        return new Response("unavailable", { status: 503 });
+        return Response.json(
+          { error: "route_refused", detail: "free text the Edge must not log" },
+          { status: 503 },
+        );
       if (url.searchParams.get("mode") === "sql-error")
         return Response.json(
           {
@@ -68,7 +71,10 @@ export default {
       connection.waiting = false;
     }
     if (url.searchParams.get("mode") === "reject")
-      return new Response(null, { status: 503 });
+      return Response.json(
+        { error: "route_refused", detail: "free text the Edge must not log" },
+        { status: 503 },
+      );
     if (url.searchParams.get("mode") === "slow")
       await new Promise((resolve) => setTimeout(resolve, 25));
     const pair = new WebSocketPair();

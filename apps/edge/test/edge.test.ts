@@ -1613,6 +1613,11 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(log.outcome).toBe("08006");
     expect(log.gateway_connect_ms).toBeGreaterThanOrEqual(0);
     expect(log.edge_ms).toBe(log.duration_ms - log.gateway_connect_ms);
+    // Live, a node's gateway refused every upgrade and the log said only "08006": a refusal now
+    // names the gateway's status and its error code, and nothing else of its answer.
+    expect(log.gateway_status).toBe(503);
+    expect(log.gateway_error).toBe("route_refused");
+    expect(JSON.stringify(log)).not.toContain("free text");
   });
 
   it("counts the wait on a gateway upgrade that the client interrupted as the gateway's, not the Edge's", async () => {
