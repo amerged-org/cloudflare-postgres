@@ -12,7 +12,7 @@ export function regionalRamWindowSql(regionExpression: string): string {
   const region = regionSqlExpression(regionExpression);
   return `WITH members AS (
     SELECT id,node_uid,last_observed_at FROM nodes WHERE region_id=${region} AND ready=1 AND schedulable=1
-      AND database_placement_enabled=1 AND lost_at IS NULL
+      AND database_placement_enabled=1 AND database_placement_closed_at IS NULL AND lost_at IS NULL
   ), latest AS (
     SELECT n.id,n.node_uid,n.last_observed_at,MAX(m.minute) minute,MAX(m.observed_at) observed_at
     FROM members n LEFT JOIN node_memory_samples m ON m.node_id=n.id AND m.node_uid=n.node_uid

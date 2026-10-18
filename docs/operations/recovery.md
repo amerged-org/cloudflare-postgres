@@ -133,7 +133,9 @@ with the owner's go for a reboot. The endpoints require an admin API key.
    `lock_not_read`, `packages_not_installed`, `reboot_failed` or `check_failed`).
 4. `done` reopens placement, if this cycle closed it (`placement_closed_at` is not null). A
    placement that an operator closed before or during the cycle stays closed: open it with
-   `PUT /v1/nodes/{id}/database-placement`.
+   `PUT /v1/nodes/{id}/database-placement`. Either way the API hints the node when it records
+   the result, and the node serves wakes again as soon as it has pulled its page; if the hint is
+   lost, at its next full pull, within 60 s.
 5. After `failed`, placement stays closed and the node serves wakes again; its databases are
    asleep. Read the node's events and logs, fix the cause, and submit the request again with a
    new key: the new cycle takes over the closure the failed one left, so that its `done`

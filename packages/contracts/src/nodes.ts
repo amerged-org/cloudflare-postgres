@@ -44,13 +44,15 @@ export const NodeMaintenance = z
     result_reason: z
       .string()
       .nullable()
-      .describe("The class of the failure the node reported, such as boot."),
+      .describe(
+        "The class of the failure the node reported, such as check_failed or reboot_failed.",
+      ),
     placement_closed_at: Timestamp.nullable().describe(
       "When this cycle closed placement on the node; null if placement was already closed, which the cycle then leaves as it is. A cycle that is done reopens placement only if the node's database_placement_closed_at still has this value.",
     ),
     created_at: Timestamp,
     closed_at: Timestamp.nullable().describe(
-      "When the node answered; a done cycle reopens placement at the same time.",
+      "When the node answered. A done cycle reopens placement at that time only if it closed placement itself and nobody has closed it again since.",
     ),
   })
   .meta({ id: "NodeMaintenance" });

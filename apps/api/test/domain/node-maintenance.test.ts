@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { NodeMaintenance } from "@pgcf/contracts/nodes";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { openNodeOrders } from "../../src/domain/lifecycle-orders.ts";
 import {
   assignRelease,
@@ -50,12 +51,21 @@ async function answer(f: F, status: "done" | "failed", operation: string) {
         {
           operation,
           status,
-          ...(status === "failed" ? { reason: "boot" } : {}),
+          ...(status === "failed" ? { reason: "check_failed" } : {}),
         },
       ],
     ),
   });
   expect(response.status).toBe(200);
+}
+/** What the node's actor sends its agent: each call is a hint to pull the desired page. */
+async function hints(f: F) {
+  const notify = await runInDurableObject(
+    env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(f.node)),
+    (instance) => vi.spyOn(Object.getPrototypeOf(instance), "notify"),
+  );
+  notify.mockClear();
+  return notify;
 }
 const closedAt = async (f: F) =>
   env.DB.prepare("SELECT database_placement_closed_at c FROM nodes WHERE id=?")
@@ -141,8 +151,23 @@ describe("the maintenance cycle of one node", () => {
       NodeMaintenance.parse(
         await (await read(failed, second.operation)).json(),
       ),
-    ).toMatchObject({ status: "failed", result_reason: "boot" });
+    ).toMatchObject({ status: "failed", result_reason: "check_failed" });
     expect(await openNodeOrders(env.DB, failed.node)).toEqual([]);
+  });
+
+  it("hints the node to pull its whole page when its order ends, so that it serves wakes again at once", async () => {
+    for (const status of ["done", "failed"] as const) {
+      const f = await converged();
+      const order = await started(f);
+      const notify = await hints(f);
+      await answer(f, status, order.operation);
+      // No ids: the page that clears the node's hold on wakes is the whole page.
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify.mock.calls[0]![0]).toBeUndefined();
+      // The same answer again ends nothing and hints nothing.
+      await answer(f, status, order.operation);
+      expect(notify).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("takes over the closure a failed cycle left, so that the next cycle that is done reopens it", async () => {

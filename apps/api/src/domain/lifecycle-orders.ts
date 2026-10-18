@@ -246,29 +246,33 @@ export async function startNodeMaintenance(
 }
 
 /**
- * Records how the node says its orders ended and returns how many it took. The first result of an
- * order stands, except that a retired generation is retried until it reports `done`, which ends its
- * order, as a maintenance cycle ends with its result; a fence has no row. A maintenance cycle that
- * is done reopens the placement it closed, in the batch that ends it, if the node's close time is
- * still the one the cycle wrote; a failed cycle leaves placement closed. The orders of a move are
- * settled by the move itself (`database-moves.ts`), which reads the same results.
+ * Records how the node says its orders ended and returns how many it took, and whether one of them
+ * ended a maintenance order: the node holds its wakes until it pulls a whole page without that
+ * order, so the caller hints it. The first result of an order stands, except that a retired
+ * generation is retried until it reports `done`, which ends its order, as a maintenance cycle ends
+ * with its result; a fence has no row. A maintenance cycle that is done reopens the placement it
+ * closed, in the batch that ends it, if the node's close time is still the one the cycle wrote; a
+ * failed cycle leaves placement closed. The orders of a move are settled by the move itself
+ * (`database-moves.ts`), which reads the same results.
  */
 export async function recordOrderResults(
   db: D1Database,
   nodeId: string,
   results: readonly NodeOrderResult[],
   now: string,
-): Promise<number> {
-  let taken = 0;
+): Promise<{ taken: number; maintenanceEnded: boolean }> {
+  let taken = 0,
+    maintenanceEnded = false;
   for (let i = 0; i < results.length; i += 50) {
     const chunk = results.slice(i, i + 50);
-    const outcomes = await db.batch(
+    const outcomes = await db.batch<{ type: string }>(
       chunk.flatMap((result) => [
         db
           .prepare(
             `UPDATE lifecycle_orders SET result_status=?,result_reason=?,
             closed_at=CASE WHEN (type='superseded' AND ?='done') OR type='maintenance' THEN ? ELSE closed_at END
-            WHERE operation=? AND node_id=? AND closed_at IS NULL AND (result_status IS NULL OR type='superseded')`,
+            WHERE operation=? AND node_id=? AND closed_at IS NULL AND (result_status IS NULL OR type='superseded')
+            RETURNING type`,
           )
           .bind(
             result.status,
@@ -294,9 +298,13 @@ export async function recordOrderResults(
     // The statement that ends an order is the first of its result's one or two.
     let at = 0;
     for (const result of chunk) {
-      taken += outcomes[at]!.meta.changes;
+      const updated = outcomes[at]!.results;
+      taken += updated.length;
+      maintenanceEnded ||= updated.some(
+        (order) => order.type === "maintenance",
+      );
       at += result.status === "done" ? 2 : 1;
     }
   }
-  return taken;
+  return { taken, maintenanceEnded };
 }
