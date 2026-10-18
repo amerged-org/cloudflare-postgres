@@ -173,7 +173,9 @@ impl WakeQueue {
             }
         }
     }
-    /// Records the agent's result for the ticket it names. False when no such ticket is held.
+    /// Records the agent's result for the ticket it names. False when no such ticket is held. A
+    /// wake the agent is still on is no result: the connections keep waiting for the first
+    /// delivery's answer, and the ticket is delivered again.
     pub fn result(&self, result: &WakeResult) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let Some(ticket) = inner.tickets.get_mut(&result.database).filter(|ticket| {
@@ -182,6 +184,9 @@ impl WakeQueue {
         }) else {
             return false;
         };
+        if result.again() {
+            return true;
+        }
         ticket.answered = true;
         ticket.answer.send_replace(Some(result.clone()));
         if ticket.waiters == 0 {
@@ -418,5 +423,30 @@ mod tests {
                 .is_empty()
         );
         assert!(queue.ticket(DATABASE).is_none());
+    }
+
+    #[test]
+    fn a_wake_the_agent_is_still_on_is_not_an_answer_and_the_ticket_is_asked_again() {
+        let queue = WakeQueue::new();
+        let start = Instant::now();
+        let redeliver = Duration::from_millis(REDELIVER_MS);
+        let a = operation('a');
+        let held = queue.hold(&claims(DATABASE, 1, 2, &a), 100, start).unwrap();
+        assert_eq!(queue.take(start).len(), 1);
+        // The agent answers the redelivery of a wake it already serves: the connections keep
+        // waiting for the answer of the first one, and the ticket is delivered again.
+        let mut busy = result(2, &a, Outcome::Refused);
+        busy.reason = Some("wake_in_progress".into());
+        busy.retry_after_seconds = None;
+        assert!(queue.result(&busy));
+        assert!(held.verdict().is_none());
+        assert_eq!(queue.take(start + redeliver).len(), 1);
+        // The answer of the wake itself ends the wait.
+        assert!(queue.result(&result(2, &a, Outcome::Refused)));
+        assert_eq!(
+            held.verdict().unwrap().reason.as_deref(),
+            Some("no_headroom")
+        );
+        assert!(queue.take(start + 10 * redeliver).is_empty());
     }
 }

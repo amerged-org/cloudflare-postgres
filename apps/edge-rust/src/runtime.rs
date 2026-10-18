@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     gateway, host,
-    policy::{self, Failure, Hints},
+    policy::{self, Failure, Hints, Signable},
 };
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
@@ -9,6 +9,7 @@ use pgcf_native_protocol::{
     constant,
     route::{self, Keyring},
     startup::error_response,
+    wake,
 };
 use serde_json::{Value, json};
 use wasm_bindgen_futures::JsFuture;
@@ -70,14 +71,14 @@ async fn admit(
     })
     .map_err(|_| Failure::gateway())?;
     let promise = actor
-        .ensure_awake(&hints.database, &hints.user, &options)
+        .admit_wake(&hints.database, &hints.user, &options)
         .map_err(|_| Failure::gateway())?;
     let result = JsFuture::from(promise)
         .await
         .map_err(|_| Failure::gateway());
     drop(cancel);
     host::check(&signal)?;
-    let (route, target) = policy::admission(
+    let admitted = policy::admission(
         &serde_wasm_bindgen::from_value::<Value>(result?).map_err(|_| Failure::gateway())?,
     )?;
     let allowed = env
@@ -100,32 +101,53 @@ async fn admit(
             .to_string(),
     )
     .map_err(|_| Failure::gateway())?;
+    let region = &admitted.region;
     let connection = route::Connection {
-        region: &route.id,
+        region: &region.id,
+        node: &admitted.node,
         database: &hints.database,
         user: &hints.user,
         cid: &cid,
         now_ms: host::now(),
         ttl_seconds: constant("ROUTE_TOKEN_SIGN_TTL_SECONDS"),
     };
-    // The gateway dials only the admitted verified target. Temporary rollout compatibility
-    // (route-token.ts): an admission without a verified target still receives a v2 route.
-    let token = match &target {
-        Some(target) => route::sign(
+    // An awake database is signed as route v6, which names the unit the node reported; a
+    // sleeping one as the v5 wake ticket the gateway holds until the agent has started the unit.
+    // Both are sealed with the key of the node the database runs on.
+    let token = match &admitted.signable {
+        Signable::Awake {
+            revision,
+            route_revision,
+            instance,
+        } => route::sign(
             &ring,
             &connection,
-            &route::RouteTarget {
-                revision: target.revision,
-                pod_uid: &target.pod_uid,
-                route_revision: target.route_revision,
+            &route::NodeTarget {
+                revision: *revision,
+                route_revision: *route_revision,
+                instance,
             },
         ),
-        None => route::sign_legacy(&ring, &connection),
+        Signable::Wake {
+            operation,
+            generation,
+            route_revision,
+            role_revision_hash,
+        } => wake::sign_wake(
+            &ring,
+            &connection,
+            &wake::Ticket {
+                operation,
+                generation: *generation,
+                route_revision: *route_revision,
+                role_revision_hash,
+            },
+        ),
     }
     .map_err(|_| Failure::gateway())?;
     host::check(&signal)?;
-    let socket = gateway::connect(&route, &token, &env, &signal).await?;
-    Ok((socket, route.id))
+    let socket = gateway::connect(region, &token, &env, &signal).await?;
+    Ok((socket, admitted.region.id))
 }
 async fn bounded(
     request: &Request,

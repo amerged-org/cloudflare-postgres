@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it } from "vitest";
-import {
-  memoryCapacityWindow,
-  type MemorySample,
-} from "../../src/domain/memory-capacity.ts";
+import { memoryCapacityWindow, type MemorySample } from "./memory-fixture.ts";
 
 const uid = "11111111-1111-4111-8111-111111111111";
 const now = Date.parse("2026-10-06T12:10:30.000Z");

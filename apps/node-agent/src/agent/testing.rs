@@ -49,7 +49,7 @@ pub(crate) struct Rig {
     pub early: UnboundedReceiver<EarlySleep>,
     pub root: PathBuf,
     /// The wakes the gateway sends; kept open so the feed has somewhere to put them.
-    _wakes: UnboundedReceiver<WakeRequest>,
+    wakes: Option<UnboundedReceiver<WakeRequest>>,
     tasks: Vec<tokio::task::JoinHandle<std::convert::Infallible>>,
 }
 impl Drop for Rig {
@@ -255,7 +255,7 @@ impl Rig {
             gateway,
             early,
             root,
-            _wakes: wakes,
+            wakes: Some(wakes),
             tasks: vec![server, feed],
         }
     }
@@ -338,13 +338,32 @@ impl Rig {
 
     /// A database built and ready: accepted from the page, then created.
     pub(crate) async fn create(&self) -> (Entry, Arc<super::Db>) {
-        let entry = self.entry();
+        self.create_from(&self.entry_json()).await
+    }
+
+    /// A database built and ready from the JSON of its entry, which the test keeps to move the
+    /// page on.
+    pub(crate) async fn create_from(&self, json: &Value) -> (Entry, Arc<super::Db>) {
+        let entry = self.entry_for(json);
         let db = self.core.db(&entry.id);
         assert!(self.core.accept(&db, entry.clone()));
         let _flow = db.lock.lock().await;
         self.core.build(&db, &entry).await.expect("the build");
         drop(_flow);
         (entry, db)
+    }
+
+    /// Answers the wakes of the gateway as the service does: the core decides, the feed tells the
+    /// gateway.
+    pub(crate) fn serve_wakes(&mut self) -> tokio::task::JoinHandle<()> {
+        let mut wakes = self.wakes.take().expect("the wakes are served once");
+        let (core, gateway) = (self.core.clone(), self.gateway.clone());
+        tokio::spawn(async move {
+            while let Some(request) = wakes.recv().await {
+                let (core, gateway) = (core.clone(), gateway.clone());
+                tokio::spawn(async move { gateway.wake_result(core.wake(&request).await) });
+            }
+        })
     }
 
     /// The wake ticket the Edge would send for the entry's next generation.

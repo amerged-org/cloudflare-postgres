@@ -139,7 +139,7 @@ jobs:
       - name: Check the native runtime and Worker contracts
         run: |
           node packages/contracts/native/generate.ts --check
-          node packages/contracts/native/generate-controller.ts --check
+          node packages/contracts/native/generate-node.ts --check
           node packages/contracts/native/generate-power.ts --check
           node packages/contracts/native/generate-measurements.ts --check
           cargo fmt --all -- --check

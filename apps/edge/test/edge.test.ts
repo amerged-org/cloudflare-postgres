@@ -11,7 +11,6 @@ import {
   newOperationId,
   isDatabaseId,
   isRoleName,
-  nodePublicKey,
   type NodeKey,
 } from "@pgcf/contracts";
 import {

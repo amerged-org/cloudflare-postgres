@@ -32,23 +32,24 @@ and source headers say GPL version 3 or later. Record the declaration at the pin
 The native gateway (`apps/native-gateway`), the node agent library (`apps/node-agent`), the
 shared protocol crate (`packages/native-protocol`), the archive clients (`apps/pgcf-archive`,
 `apps/pgcf-wal-fetch`) and the PostgreSQL test harness (`packages/test-postgres`) are first-party
-Apache-2.0. The archive clients and the test harness use only the Rust standard library. Each
-`Cargo.toml` pins its direct crates exactly; `Cargo.lock` binds their archive checksums and
-transitive versions. No upstream source is vendored here.
+Apache-2.0. The archive clients and the test harness use only the Rust standard library (the
+archive clients' tests also read the contract's vectors with serde_json). Each `Cargo.toml` pins its
+direct crates exactly; `Cargo.lock` binds their archive checksums and transitive versions. No
+upstream source is vendored here.
 
 The gateway's direct crates are httparse 1.10.1, time 0.3.55, futures-util 0.3.34, serde 1.0.229,
 serde_json 1.0.151, sha2 0.11.0, hmac 0.13.0 and base64 0.23.1 (all `MIT OR Apache-2.0`), zeroize
 1.9.1 (`Apache-2.0 OR MIT`), ring 0.17.14 (`Apache-2.0 AND ISC`), and tokio 1.53.2 and
-tokio-tungstenite 0.30.0 (MIT). The protocol crate adds regex 1.13.1 (`MIT OR Apache-2.0`). The
-node agent adds reqwest 0.13.5, rustls-pki-types 1.15.1, x509-parser 0.18.1, tokio-postgres 0.7.18
-and libc 0.2.190 (`MIT OR Apache-2.0`), rustls 0.23.45 and tokio-rustls 0.26.6 (`Apache-2.0 OR ISC
-OR MIT` and `MIT OR Apache-2.0`), jsonschema 0.58.6, tokio-postgres-rustls 0.14.0 and zbus 5.19.0
-(MIT; zbus drives the database units over systemd's D-Bus API), and webpki-roots 1.0.9
-(`CDLA-Permissive-2.0`). The agent signs the node's requests with its Ed25519 key through ring and
-speaks the link's TLS WebSocket to Cloudflare through tokio-rustls and tokio-tungstenite. Its tests
-also use rcgen 0.14.10 (`MIT OR Apache-2.0`). rustls-pki-types is used directly for PEM parsing; the
-unmaintained rustls-pemfile wrapper is not used. The gateway's SCRAM client uses hmac and zeroize
-directly, with sha2, and takes its random nonces from ring.
+tokio-tungstenite 0.30.0 (MIT). The protocol crate adds regex 1.13.1 (`MIT OR Apache-2.0`) and,
+outside Wasm, time 0.3.55 (the agent channel's timestamps). The node agent adds reqwest 0.13.5,
+rustls-pki-types 1.15.1, tokio-postgres 0.7.18 and libc 0.2.190 (`MIT OR Apache-2.0`), rustls
+0.23.45 and tokio-rustls 0.26.6 (`Apache-2.0 OR ISC OR MIT` and `MIT OR Apache-2.0`), jsonschema
+0.58.6 and zbus 5.19.0 (MIT; zbus drives the database units over systemd's D-Bus API), and
+webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). The agent signs the node's requests with its Ed25519
+key through ring and speaks the link's TLS WebSocket to Cloudflare through tokio-rustls and
+tokio-tungstenite. Its tests also use rcgen 0.14.10 (`MIT OR Apache-2.0`). rustls-pki-types is used
+directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not used. The gateway's SCRAM
+client uses hmac and zeroize directly, with sha2, and takes its random nonces from ring.
 
 Rust 1.99.0 and the immutable compiler test image are recorded in
 [versions.lock.json](infra/platform/versions.lock.json). The compiler image is used for isolated

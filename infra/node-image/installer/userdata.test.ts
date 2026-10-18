@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { NodeEnrollmentSeed } from "../../../packages/contracts/src/node-link.ts";
 import { installerParameters, renderUserData, userDataLimit, type InstallerParameters } from "./userdata.ts";
 
 const template = readFileSync(new URL("cloud-config.yaml", import.meta.url), "utf8");
@@ -44,10 +45,10 @@ const longest: InstallerParameters = {
   hostname: "eu1",
   progressUrl: `https://api.example.org/v1/compute/install-progress/${"p".repeat(64)}`,
   progressToken: "t".repeat(512),
-  nodeId: "n".repeat(64),
-  region: "eu",
+  nodeId: `nod_${"n".repeat(20)}`,
+  region: "eu-dev",
   apiUrl: "https://api.example.org",
-  enrollmentToken: "e".repeat(512),
+  enrollmentToken: `pgcf_et_${"e".repeat(43)}`,
 };
 
 function fileEntry(userData: string, path: string): string {
@@ -191,4 +192,63 @@ test("values that could break out of a KEY=value line or a file are refused", ()
   assert.throws(() => installerParameters({ ...longest, imageUrl: "http://example.org/image" }), /invalid imageUrl/);
   assert.throws(() => installerParameters({ ...longest, imageRawBytes: longest.diskBytes }), /does not fit/);
   assert.throws(() => installerParameters({ ...longest, enrollmentToken: "short" }), /invalid enrollmentToken/);
+});
+
+test("the installer takes exactly the node id, region and enrollment token the agent's seed takes", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pgcf-installer-"));
+  try {
+    const seeds = [
+      {},
+      // The identifiers of the contract.
+      { nodeId: `nod_${"a1b2c3d4e5".repeat(2)}` },
+      { enrollmentToken: `pgcf_et_${"A-_z0".repeat(8)}abc` },
+      // What the contract refuses: another prefix or length, capitals, separators, a short token.
+      { nodeId: "n".repeat(64) },
+      { nodeId: "nod_short" },
+      { nodeId: `nod_${"n".repeat(21)}` },
+      { nodeId: `nod_${"N".repeat(20)}` },
+      { nodeId: `nod-${"n".repeat(20)}` },
+      { region: "eu" },
+      { region: "EU-dev" },
+      { enrollmentToken: "e".repeat(64) },
+      { enrollmentToken: `pgcf_et_${"e".repeat(42)}` },
+      { enrollmentToken: `pgcf_et_${"e".repeat(44)}` },
+    ];
+    for (const [index, seed] of seeds.entries()) {
+      const parameters = { ...longest, ...seed };
+      const contract = NodeEnrollmentSeed.safeParse({
+        node_id: parameters.nodeId,
+        region: parameters.region,
+        api_url: parameters.apiUrl,
+        enrollment_token: parameters.enrollmentToken,
+      }).success;
+      let rendered = true;
+      try {
+        installerParameters(parameters);
+      } catch {
+        rendered = false;
+      }
+      assert.equal(rendered, contract, `${JSON.stringify(seed)}: the renderer`);
+      // install.sh validates what it is given by itself, whatever rendered it.
+      const file = join(directory, `params-${index}`);
+      writeFileSync(
+        file,
+        Object.entries({
+          PGCF_NODE_ID: parameters.nodeId,
+          PGCF_REGION: parameters.region,
+          PGCF_ENROLLMENT_TOKEN: parameters.enrollmentToken,
+        }).reduce(
+          (text, [name, value]) => text.replace(new RegExp(`^${name}=.*$`, "m"), `${name}=${value}`),
+          installerParameters(longest),
+        ),
+        { mode: 0o600 },
+      );
+      const result = spawnSync("bash", [new URL("install.sh", import.meta.url).pathname, file, "--validate-only"], {
+        encoding: "utf8",
+      });
+      assert.equal(result.status === 0, contract, `${JSON.stringify(seed)}: install.sh ${result.stderr}`);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

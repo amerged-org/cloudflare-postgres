@@ -13,23 +13,18 @@
     "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
     "./pg-wire": "./src/pg-wire.ts",
-    "./gateway-control": "./src/gateway-control.ts",
-    "./gateway-activity": "./src/gateway-activity.ts",
     "./gateway-limits": "./src/gateway-limits.ts",
     "./sleep": "./src/sleep.ts",
-    "./archive-health": "./src/archive-health.ts",
     "./measurements": "./src/measurements.ts",
     "./costs": "./src/costs.ts",
     "./nodes": "./src/nodes.ts",
     "./releases": "./src/releases.ts",
-    "./database-storage": "./src/database-storage.ts",
     "./client": "./src/client.ts",
-    "./reclaim": "./src/reclaim.ts",
     "./infrastructure-backups": "./src/infrastructure-backups.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node native/generate.ts --check && node native/generate-node.ts --check && vitest run --passWithNoTests"
+    "test": "node native/generate.ts --check && node native/generate-node.ts --check && node native/generate-power.ts --check && node native/generate-measurements.ts --check && vitest run --passWithNoTests"
   },
   "dependencies": {
     "zod": "^4.6.5"

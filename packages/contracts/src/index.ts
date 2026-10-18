@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // route-token and pg-wire are separate entry points (@pgcf/contracts/route-token, /pg-wire).
-export * from "./agent.ts";
 export * from "./node-link.ts";
 export * from "./node-local.ts";
 export * from "./api.ts";
@@ -10,9 +9,7 @@ export * from "./errors.ts";
 export * from "./ids.ts";
 export * from "./sizing.ts";
 export * from "./database-resources.ts";
-export * from "./gateway-control.ts";
 export * from "./maintenance.ts";
-export * from "./gateway-activity.ts";
 export * from "./costs.ts";
 
 export * from "./nodes.ts";
@@ -25,5 +22,3 @@ export * from "./infrastructure-alerts.ts";
 export * from "./database-admission.ts";
 
 export * from "./edge-policy.ts";
-
-export * from "./reclaim.ts";

@@ -176,11 +176,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Record an immutable infrastructure cost fact",
     "admin",
   ),
-  "GET /v1/nodes/{id}/storage": route(
-    "getNodeStorage",
-    "Read observed physical node storage",
-    "admin",
-  ),
   "PUT /v1/nodes/{id}/database-placement": route(
     "setNodeDatabasePlacement",
     "Set the node gate for new database placement",

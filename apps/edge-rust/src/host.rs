@@ -18,8 +18,8 @@ extern "C" {
     #[wasm_bindgen(extends=js_sys::Object)]
     #[derive(Clone)]
     pub type ActorRpc;
-    #[wasm_bindgen(method,catch,js_name=ensureAwake)]
-    pub fn ensure_awake(
+    #[wasm_bindgen(method,catch,js_name=admitWake)]
+    pub fn admit_wake(
         this: &ActorRpc,
         database: &str,
         user: &str,

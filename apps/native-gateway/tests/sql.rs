@@ -40,6 +40,8 @@ use tokio::{
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 const DATABASE: &str = "aaaaaaaaaaaaaaaaaaaa";
 const REGION: &str = "eu-test";
+/// The node the gateway serves, which every route names.
+const NODE: &str = "nod_aaaaaaaaaaaaaaaaaaaa";
 /// The unit's invocation ID, which the routes name.
 const INSTANCE: &str = "01234567-89ab-4def-8123-0123456789ab";
 const ROUTE_REVISION: u64 = 19;
@@ -62,9 +64,9 @@ fn token(prefix: &str, purpose: &str, claims: Value) -> String {
 fn route(id: usize) -> String {
     let now = http::now() / 1000;
     token(
-        wire("admissionRouteTokenPrefix"),
-        wire("admissionRouteSignatureDomain"),
-        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"pod":INSTANCE,"route_revision":ROUTE_REVISION}),
+        wire("nodeRouteTokenPrefix"),
+        wire("nodeRouteSignatureDomain"),
+        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"route_revision":ROUTE_REVISION,"node":NODE,"inst":INSTANCE}),
     )
 }
 fn wake_operation() -> String {
@@ -485,6 +487,7 @@ impl Fixture {
         let calls = Arc::new(AtomicUsize::new(0));
         let gateway = Gateway::new(Arc::new(Config {
             region: REGION.into(),
+            node: NODE.into(),
             keyring: Keyring {
                 active: "test".into(),
                 keys: HashMap::from([("test".into(), vec![7; 32])]),

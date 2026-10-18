@@ -34,6 +34,8 @@ use tokio_tungstenite::{
 
 const DATABASE: &str = "aaaaaaaaaaaaaaaaaaaa";
 const REGION: &str = "eu-test";
+/// The node the gateway serves, which every route names.
+const NODE: &str = "nod_aaaaaaaaaaaaaaaaaaaa";
 const PASSWORD: &str = "local mode secret";
 /// The unit's invocation ID, as the agent reports it.
 const INSTANCE: &str = "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c";
@@ -60,9 +62,9 @@ fn route(id: usize, generation: u64, instance: &str) -> String {
 fn route_at(id: usize, generation: u64, instance: &str, route_revision: u64) -> String {
     let now = http::now() / 1000;
     token(
-        wire("admissionRouteTokenPrefix"),
-        wire("admissionRouteSignatureDomain"),
-        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"pod":instance,"route_revision":route_revision}),
+        wire("nodeRouteTokenPrefix"),
+        wire("nodeRouteSignatureDomain"),
+        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":instance}),
     )
 }
 /// The wake ticket Cloudflare signs for a sleeping database.
@@ -174,6 +176,7 @@ impl Node {
         });
         let gateway = Gateway::new(Arc::new(Config {
             region: REGION.into(),
+            node: NODE.into(),
             keyring: Keyring {
                 active: "test".into(),
                 keys: HashMap::from([("test".into(), vec![7; 32])]),

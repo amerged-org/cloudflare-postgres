@@ -6,11 +6,10 @@ import {
 } from "../src/database-admission.ts";
 import {
   ROUTE_TOKEN_HEADER,
-  ROUTE_TOKEN_KEY_DOMAIN,
+  ROUTE_TOKEN_NODE_KEY_DOMAIN,
   ROUTE_TOKEN_SIGN_TTL_SECONDS,
   parseRouteKeyring,
-  signLegacyRouteToken,
-  signRouteToken,
+  signNodeRouteToken,
 } from "../src/route-token.ts";
 import {
   ADMISSION_DEADLINE_MS,
@@ -38,7 +37,7 @@ export function edgeContract() {
       DECOY_SCRAM_ITERATIONS,
     },
     wire: {
-      routeKeyDomain: ROUTE_TOKEN_KEY_DOMAIN,
+      routeKeyDomain: ROUTE_TOKEN_NODE_KEY_DOMAIN,
       routeHeader: ROUTE_TOKEN_HEADER,
       decoySaltDomain: DECOY_SALT_DOMAIN,
     },
@@ -83,6 +82,7 @@ export async function edgeVectors() {
   for (const input of [
     {
       region: "eu-test",
+      node: `nod_${"a".repeat(20)}`,
       db: "a".repeat(20),
       user: "app",
       cid: "01234567-89ab-4def-8123-0123456789ab",
@@ -90,21 +90,13 @@ export async function edgeVectors() {
       ttlSeconds: 30,
       target: {
         revision: 7,
-        pod_uid: "01234567-89ab-4def-8123-0123456789ad",
         route_revision: 19,
+        instance: "01234567-89ab-4def-8123-0123456789ad",
       },
     },
     {
-      region: "eu-test",
-      db: "a".repeat(20),
-      user: "app",
-      cid: "01234567-89ab-4def-8123-0123456789ab",
-      now: 1000000,
-      ttlSeconds: 30,
-      target: { revision: 7, pod_uid: "01234567-89ab-4def-8123-0123456789ad" },
-    },
-    {
       region: "us-test",
+      node: `nod_${"b".repeat(20)}`,
       db: "b".repeat(20),
       user: "another",
       cid: "01234567-89ab-4def-8123-0123456789ac",
@@ -112,26 +104,16 @@ export async function edgeVectors() {
       ttlSeconds: 1,
       target: {
         revision: Number.MAX_SAFE_INTEGER,
-        pod_uid: "01234567-89ab-4def-8123-0123456789ae",
+        route_revision: Number.MAX_SAFE_INTEGER,
+        instance: "01234567-89ab-4def-8123-0123456789ae",
       },
-    },
-    // Temporary rollout compatibility: an admission without a verified target.
-    {
-      region: "eu-test",
-      db: "c".repeat(20),
-      user: "app",
-      cid: "01234567-89ab-4def-8123-0123456789af",
-      now: 1000000,
-      ttlSeconds: 30,
     },
   ])
     signing.push({
       ...input,
       active: keyring.active,
       key: [...keyring.keys.get(keyring.active)!],
-      expected: input.target
-        ? await signRouteToken({ keyring, ...input, target: input.target })
-        : await signLegacyRouteToken({ keyring, ...input }),
+      expected: await signNodeRouteToken({ keyring, ...input }),
     });
   return {
     ips: ips.map((ip) => ({ ip, expected: connectionRateKey(ip) })),

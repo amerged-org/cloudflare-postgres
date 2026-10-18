@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
-    route::{self, Connection, Keyring, ReplayCache},
+    route::{self, Connection, Keyring, NodeTarget, ReplayCache},
     startup::{Event, StartupReader},
     wake::{self, Ticket},
+    wire,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -13,22 +14,27 @@ fn vectors() -> Value {
     ))
     .unwrap()
 }
-#[test]
-fn authoritative_typescript_route_vectors() {
-    let vectors = vectors();
-    let key = vectors["key"]
+fn key() -> Vec<u8> {
+    vectors()["key"]
         .as_array()
         .unwrap()
         .iter()
         .map(|v| v.as_u64().unwrap() as u8)
-        .collect();
-    let keys = HashMap::from([("test".into(), key)]);
-    for case in vectors["routes"].as_array().unwrap() {
+        .collect()
+}
+#[test]
+fn authoritative_typescript_route_vectors() {
+    let vectors = vectors();
+    let keys = HashMap::from([("test".into(), key())]);
+    let cases = vectors["nodeRoutes"].as_array().unwrap();
+    assert!(cases.len() > 10);
+    for case in cases {
         let got = route::verify(
             case["token"].as_str(),
             &keys,
             case["region"].as_str().unwrap(),
-            case["now"].as_f64().unwrap(),
+            case["node"].as_str().unwrap(),
+            case["now"].as_u64().unwrap(),
         );
         let result = match got {
             Ok(claims) => json!({ "ok":true,"claims":claims }),
@@ -36,6 +42,31 @@ fn authoritative_typescript_route_vectors() {
         };
         assert_eq!(result, case["expected"], "{}", case["name"]);
     }
+    // The Rust signer produces the TypeScript signer's exact token, sealed with the node's key.
+    let signed = &vectors["nodeSigned"];
+    let (input, target) = (&signed["input"], &signed["input"]["target"]);
+    let token = route::sign(
+        &Keyring {
+            active: "test".into(),
+            keys: keys.clone(),
+        },
+        &Connection {
+            region: input["region"].as_str().unwrap(),
+            node: input["node"].as_str().unwrap(),
+            database: input["db"].as_str().unwrap(),
+            user: input["user"].as_str().unwrap(),
+            cid: input["cid"].as_str().unwrap(),
+            now_ms: input["now"].as_u64().unwrap(),
+            ttl_seconds: input["ttlSeconds"].as_u64().unwrap(),
+        },
+        &NodeTarget {
+            revision: target["revision"].as_u64().unwrap(),
+            route_revision: target["route_revision"].as_u64().unwrap(),
+            instance: target["instance"].as_str().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(token, signed["token"].as_str().unwrap());
 }
 #[test]
 fn authoritative_typescript_startup_vectors() {
@@ -59,31 +90,22 @@ fn authoritative_typescript_startup_vectors() {
 }
 #[test]
 fn replay_has_independent_database_capacity_and_expiry() {
-    let vectors = vectors();
-    let key = vectors["key"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u8)
-        .collect();
-    let mut claims = route::verify(
-        vectors["routes"][0]["token"].as_str(),
-        &HashMap::from([("test".into(), key)]),
-        "eu-test",
-        1_000_000.0,
-    )
-    .unwrap();
     let mut cache = ReplayCache::new(1);
-    assert_eq!(cache.use_token(&claims, 1_000_000), Ok(()));
-    assert_eq!(cache.use_token(&claims, 1_000_000), Err("replayed"));
-    claims.cid = "00000000-0000-0000-0000-000000000002".into();
-    assert_eq!(cache.use_token(&claims, 1_000_000), Err("full"));
-    claims.db = "b".repeat(20);
-    assert_eq!(cache.use_token(&claims, 1_000_000), Ok(()));
-    assert_eq!(cache.use_token(&claims, 1_035_001), Err("full"));
-    claims.iat = 1036;
-    claims.exp = 1066;
-    assert_eq!(cache.use_token(&claims, 1_036_000), Ok(()));
+    let (database, cid) = ("a".repeat(20), "00000000-0000-0000-0000-000000000001");
+    assert_eq!(cache.use_token(&database, cid, 1030, 1_000_000), Ok(()));
+    assert_eq!(
+        cache.use_token(&database, cid, 1030, 1_000_000),
+        Err("replayed")
+    );
+    let next = "00000000-0000-0000-0000-000000000002";
+    assert_eq!(
+        cache.use_token(&database, next, 1030, 1_000_000),
+        Err("full")
+    );
+    let other = "b".repeat(20);
+    assert_eq!(cache.use_token(&other, next, 1030, 1_000_000), Ok(()));
+    assert_eq!(cache.use_token(&other, next, 1030, 1_035_001), Err("full"));
+    assert_eq!(cache.use_token(&other, next, 1066, 1_036_000), Ok(()));
 }
 #[test]
 fn arbitrary_startup_chunks_remain_bounded_and_never_panic() {
@@ -137,6 +159,7 @@ fn authoritative_typescript_wake_route_vectors() {
         },
         &Connection {
             region: input["region"].as_str().unwrap(),
+            node: input["node"].as_str().unwrap(),
             database: input["db"].as_str().unwrap(),
             user: input["user"].as_str().unwrap(),
             cid: input["cid"].as_str().unwrap(),
@@ -191,5 +214,17 @@ fn wake_wire_constants_match_the_generated_contract() {
         pgcf_native_protocol::CONTRACT["wakeRouteClaims"]["properties"]["v"]["const"]
             .as_u64()
             .unwrap()
+    );
+}
+#[test]
+fn node_route_wire_constants_match_the_generated_contract() {
+    assert_eq!(wire("nodeRouteTokenPrefix"), "v6");
+    assert_eq!(wire("nodeRouteSignatureDomain"), "pgcf-route/v6\n");
+    assert_eq!(wire("nodeRouteKeyDomain"), "pgcf-route-key/v2\n");
+    assert_eq!(
+        pgcf_native_protocol::CONTRACT["nodeRouteClaims"]["properties"]["v"]["const"]
+            .as_u64()
+            .unwrap(),
+        6
     );
 }

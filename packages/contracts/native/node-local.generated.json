@@ -39,6 +39,7 @@
       "start_timeout",
       "release_failed"
     ],
+    "WAKE_AGAIN_REASON": "wake_in_progress",
     "ADMISSION_REFUSALS": ["no_room", "no_headroom"],
     "ADMISSION_REFUSAL_DETAILS": {
       "no_room": "storage",

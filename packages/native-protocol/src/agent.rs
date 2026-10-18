@@ -318,7 +318,7 @@ pub enum FromGateway {
     Activity {
         id: u64,
         database: String,
-        report: ActivityReport,
+        report: Box<ActivityReport>,
     },
 }
 

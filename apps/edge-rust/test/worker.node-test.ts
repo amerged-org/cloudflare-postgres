@@ -14,7 +14,7 @@ import {
 } from "../../../packages/contracts/src/pg-wire.ts";
 import {
   parseRouteKeyring,
-  deriveRegionKeyring,
+  deriveNodeKeyring,
   verifyRouteToken,
 } from "../../../packages/contracts/src/route-token.ts";
 
@@ -173,7 +173,8 @@ test(
       async function seed() {
         const database = id("d"),
           project = "prj_" + randomUUID().replaceAll("-", "").slice(0, 20),
-          node = "nod_" + randomUUID().replaceAll("-", "").slice(0, 20);
+          node = "nod_" + randomUUID().replaceAll("-", "").slice(0, 20),
+          instance = randomUUID();
         await DB.batch([
           DB.prepare(
             "INSERT INTO projects(id,name,created_at,updated_at) VALUES(?,'edge-rust',?,?)",
@@ -203,7 +204,7 @@ test(
               node_id: node,
               generation: 2,
               storage_generation: 1,
-              instance: randomUUID(),
+              instance,
               observed_at: Date.now(),
             }),
             now,
@@ -224,7 +225,7 @@ test(
             .status,
           204,
         );
-        return { database, project, node };
+        return { database, project, node, instance };
       }
       const stats = async () =>
         (await gateway.fetch("/stats")).json() as Promise<Observation[]>;
@@ -243,6 +244,23 @@ test(
           waiters: number;
         }>;
       }
+      const nodeKeys = async (node: string) =>
+        (
+          await deriveNodeKeyring(
+            parseRouteKeyring(JSON.stringify(keyring)),
+            node,
+          )
+        ).keys;
+      // Keeps the Actor from answering the admissions of one database until released.
+      const hold = async (database: string, action: "hold" | "release") =>
+        assert.equal(
+          (
+            await actor.fetch(`/${action}?database=${database}`, {
+              method: "POST",
+            })
+          ).status,
+          204,
+        );
       async function sleeping(database: string) {
         const operation = "op_" + randomUUID().replaceAll("-", "").slice(0, 20);
         await DB.batch([
@@ -429,7 +447,7 @@ test(
         "Wasm signs only admitted identity and strips caller credentials and route header",
         async () => {
           await reset();
-          const { database } = await seed();
+          const { database, node, instance } = await seed();
           const c = await open(database, {
             query: new URLSearchParams({
               database,
@@ -448,19 +466,20 @@ test(
           assert.equal(row.headers.authorization, undefined);
           assert.equal(row.headers.cookie, undefined);
           assert.notEqual(row.token, "forged");
-          const keys = await deriveRegionKeyring(
-            parseRouteKeyring(JSON.stringify(keyring)),
-            region,
-          );
           const verified = await verifyRouteToken(row.token, {
             region,
-            keys: keys.keys,
+            node,
+            keys: await nodeKeys(node),
           });
           assert.ok(verified.ok);
           const claims = verified.claims;
           assert.equal(claims.db, database);
           assert.equal(claims.user, "app");
           assert.equal(claims.rg, region);
+          // An awake database is routed as v6: the unit the node reported, for its node.
+          assert.equal(claims.v, 6);
+          assert.ok("inst" in claims && claims.inst === instance);
+          assert.ok("node" in claims && claims.node === node);
           assert.equal(claims.exp - claims.iat, 30);
           assert.equal(row.path, "/pg");
           c.socket.close(1000);
@@ -629,78 +648,51 @@ test(
         },
       );
       await t.test(
-        "ten real Actor waiters coalesce one wake and use only exact fresh readiness",
+        "ten connects to a sleeping database get the one wake ticket of its node, signed as v5",
         async () => {
           await reset();
-          const { database } = await seed();
+          const { database, node } = await seed();
           await sleeping(database);
-          const started = Date.now();
-          const pending = Promise.all(
+          const connections = await Promise.all(
             Array.from({ length: 10 }, () => open(database)),
           );
-          await until(async () => (await diagnostics(database)).waiters === 10);
-          assert.equal((await stats()).length, 0);
-          assert.equal(
-            await DB.prepare(
-              "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.wake'",
-            )
-              .bind(database)
-              .first("n"),
-            1,
-          );
+          assert.equal(connections.length, 10);
+          const rows = await stats();
+          assert.equal(rows.length, 10);
           const observed = await diagnostics(database);
           assert.equal(observed.received.length, 10);
           assert.equal(
             new Set(observed.received.map((v) => v.options.waiterId)).size,
             10,
           );
-          for (const value of observed.received) {
-            assert.equal(value.database, database);
-            assert.equal(value.user, "app");
-            assert.ok(
-              value.options.deadline >=
-                started + ADMISSION_DEADLINE_MS - 1000 &&
-                value.options.deadline <= Date.now() + ADMISSION_DEADLINE_MS,
-            );
-          }
-          await DB.prepare(
-            "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=3 WHERE id=?",
-          )
-            .bind(database)
-            .run();
-          await delay(250);
-          assert.equal((await stats()).length, 0);
-          await DB.prepare("UPDATE regions SET gateway_url=? WHERE id=?")
-            .bind(gatewayOrigin + "/fresh", region)
-            .run();
-          await DB.prepare(
-            "UPDATE databases SET observed_generation=generation WHERE id=?",
-          )
-            .bind(database)
-            .run();
-          const connections = await pending;
-          assert.equal(connections.length, 10);
-          assert.equal((await stats()).length, 10);
-          const keys = await deriveRegionKeyring(
-            parseRouteKeyring(JSON.stringify(keyring)),
-            region,
-          );
+          const keys = await nodeKeys(node);
           const tokens = await Promise.all(
-            (await stats()).map((v) =>
-              verifyRouteToken(v.token, { region, keys: keys.keys }),
-            ),
+            rows.map((v) => verifyRouteToken(v.token, { region, keys })),
           );
-          const ids = tokens.map((v) => {
+          const claims = tokens.map((v) => {
             assert.ok(v.ok);
-            return v.claims.cid;
+            assert.equal(v.claims.v, 5);
+            return v.claims as { cid: string; op: string; gen: number };
           });
-          assert.deepEqual(
-            [...ids].sort(),
-            observed.received.map((v) => v.options.waiterId).sort(),
-          );
+          // Every connect of the same wake carries the same operation and generation; the
+          // connections themselves are told apart by their ids.
+          assert.equal(new Set(claims.map((v) => v.op)).size, 1);
+          assert.equal(new Set(claims.map((v) => v.gen)).size, 1);
           assert.equal(
-            (await stats()).every((v) => v.path === "/fresh"),
-            true,
+            [...claims.map((v) => v.cid)].sort().join(),
+            observed.received
+              .map((v) => v.options.waiterId)
+              .sort()
+              .join(),
+          );
+          // Cloudflare claims the wake in D1 once, after the answers.
+          await until(
+            async () =>
+              (await DB.prepare(
+                "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.wake'",
+              )
+                .bind(database)
+                .first("n")) === 1,
           );
           assert.equal((await diagnostics(database)).waiters, 0);
         },
@@ -710,10 +702,10 @@ test(
         async () => {
           await reset();
           const { database } = await seed();
-          await sleeping(database);
+          await hold(database, "hold");
           const c = await open(database, { worker: "abort-edge" });
           assert.equal(await sqlstate(c), "08006");
-          await until(async () => (await diagnostics(database)).waiters === 0);
+          await hold(database, "release");
           const observed = await diagnostics(database);
           assert.equal(observed.received.length, 1);
           assert.equal(observed.cancellations, 1);
@@ -770,7 +762,7 @@ test(
           await reset();
           const { database } = await seed();
           const timeoutDB = await seed();
-          await sleeping(timeoutDB.database);
+          await hold(timeoutDB.database, "hold");
           const began = Date.now();
           const timedOut = open(timeoutDB.database);
           const idle: Awaited<ReturnType<typeof open>>[] = [];
@@ -787,6 +779,7 @@ test(
           assert.ok(["08006", "57P03"].includes(await sqlstate(refusal)));
           assert.ok(Date.now() - began >= ADMISSION_DEADLINE_MS - 100);
           assert.ok(Date.now() - began < ADMISSION_DEADLINE_MS + 5000);
+          await hold(timeoutDB.database, "release");
           assert.equal((await diagnostics(timeoutDB.database)).waiters, 0);
           assert.equal((await stats()).length, 1000);
           assert.equal(

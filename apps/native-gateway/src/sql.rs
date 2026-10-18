@@ -30,7 +30,7 @@ use crate::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use pgcf_native_protocol::{
     agent::Writer,
-    route::{RouteClaims, verify},
+    route::{Route, verify},
     wake::{self, Outcome, WakeClaims},
 };
 use serde::{Deserialize, Serialize};
@@ -378,8 +378,8 @@ async fn handle(
     drop(body);
     stages.statements = request.statements.len();
     let (claims, released) = match route {
-        Route::Admitted(claims) => (claims, None),
-        Route::Wake(ticket) => {
+        Presented::Admitted(claims) => (claims, None),
+        Presented::Wake(ticket) => {
             let (claims, unit) = attempt!(wake(gateway, &ticket, stop, stages).await);
             (claims, Some(unit))
         }
@@ -447,45 +447,57 @@ async fn handle(
     }
 }
 
-enum Route {
-    Admitted(RouteClaims),
+/// What a request presents: a v6 route that names the unit it runs on, or a v5 wake ticket that
+/// waits for the agent's release.
+enum Presented {
+    Admitted(Route),
     Wake(WakeClaims),
 }
-impl Route {
+impl Presented {
     fn database(&self) -> &str {
         match self {
-            Route::Admitted(claims) => &claims.db,
-            Route::Wake(ticket) => &ticket.db,
+            Presented::Admitted(claims) => &claims.db,
+            Presented::Wake(ticket) => &ticket.db,
         }
     }
 }
 /// The route the Edge signed, used once.
-fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Route, Refused> {
+fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Presented, Refused> {
     let denied = || refused("route_denied", "08006", "gateway connection failed");
     if head.count("x-pgcf-route") > 1 {
         return Err(denied());
     }
     let token = head.one("x-pgcf-route");
-    let keys = &gateway.config.keyring.keys;
-    let region = &gateway.config.region;
-    let (route, claims) = if token
+    let config = &gateway.config;
+    let presented = if token
         .is_some_and(|token| token.starts_with(&format!("{}.", wake::ROUTE_PREFIX)))
     {
-        let ticket = wake::verify_wake(token, keys, region, http::now()).map_err(|_| denied())?;
-        let claims = ticket.admitted(None);
-        (Route::Wake(ticket), claims)
+        let ticket = wake::verify_wake(token, &config.keyring.keys, &config.region, http::now())
+            .map_err(|_| denied())?;
+        Presented::Wake(ticket)
     } else {
-        let claims = verify(token, keys, region, http::now() as f64).map_err(|_| denied())?;
-        (Route::Admitted(claims.clone()), claims)
+        let claims = verify(
+            token,
+            &config.keyring.keys,
+            &config.region,
+            &config.node,
+            http::now(),
+        )
+        .map_err(|_| denied())?;
+        Presented::Admitted(Route::from(&claims))
+    };
+    let (database, cid, exp) = match &presented {
+        Presented::Admitted(route) => (&route.db, &route.cid, route.exp),
+        Presented::Wake(ticket) => (&ticket.db, &ticket.cid, ticket.exp),
     };
     gateway
         .admission
         .lock()
         .unwrap()
         .replay
-        .use_token(&claims, http::now())
+        .use_token(database, cid, exp, http::now())
         .map_err(|_| denied())?;
-    Ok(route)
+    Ok(presented)
 }
 /// The request body, by Content-Length or chunked. Every buffer that held it is zeroized.
 async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<Vec<u8>>, Refused> {
@@ -601,7 +613,7 @@ async fn wake(
     ticket: &WakeClaims,
     stop: &watch::Receiver<bool>,
     stages: &mut Stages,
-) -> Result<(RouteClaims, String), Refused> {
+) -> Result<(Route, String), Refused> {
     let released = |writer: String, route_revision: u64| {
         let claims = transport::admitted_wake(ticket, &writer, route_revision);
         (claims, writer)
@@ -675,7 +687,7 @@ async fn wake(
 /// it is admitted at.
 async fn current(
     gateway: &Gateway,
-    claims: &RouteClaims,
+    claims: &Route,
     released: Option<&str>,
 ) -> Result<(Writer, Epoch), Refused> {
     gateway.admit(claims, released).await.map_err(not_accepting)
@@ -693,7 +705,7 @@ enum Checkout {
 /// sessions of one role share it unless its password was rotated.
 async fn checkout(
     gateway: &Gateway,
-    claims: &RouteClaims,
+    claims: &Route,
     target: &Writer,
     epoch: Epoch,
     password: &Password,
@@ -749,7 +761,7 @@ async fn checkout(
 /// Dials the admitted writer and authenticates a new session with the request's password.
 async fn open(
     gateway: &Arc<Gateway>,
-    claims: &RouteClaims,
+    claims: &Route,
     target: &Writer,
     epoch: Epoch,
     password: &Password,

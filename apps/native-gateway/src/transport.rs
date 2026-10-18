@@ -13,7 +13,7 @@ use pgcf_native_protocol::{
     activity::PostgresActivity,
     agent::{Mode, Writer},
     constant,
-    route::{Keyring, ReplayCache, RouteClaims, valid_websocket_key, verify},
+    route::{Keyring, ReplayCache, Route, valid_websocket_key, verify},
     startup::{Event, StartupReader, error_response_with},
     wake::{self, Outcome, WakeClaims},
 };
@@ -50,6 +50,8 @@ pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
 pub(crate) const WRITE_BOUND: Duration = Duration::from_secs(10);
 pub struct Config {
     pub region: String,
+    /// The node this gateway serves; its keyring verifies only the routes made for it.
+    pub node: String,
     pub keyring: Keyring,
     pub maximum_memory: usize,
     pub database_memory: usize,
@@ -110,7 +112,7 @@ impl Gateway {
     /// connection, whose route was checked against the replay cache when it was held.
     pub(crate) fn reserve(
         self: &Arc<Self>,
-        claims: &RouteClaims,
+        claims: &Route,
         wire: WireBudget,
         target: &Writer,
         replay: bool,
@@ -131,7 +133,7 @@ impl Gateway {
         if replay {
             admission
                 .replay
-                .use_token(claims, http::now())
+                .use_token(&claims.db, &claims.cid, claims.exp, http::now())
                 .map_err(replay_status)?;
         }
         if !self.measurements.lock().unwrap().begin(&claims.db, &id) {
@@ -163,7 +165,7 @@ impl Gateway {
     /// outcome it is refused with. `released` is the unit a held wake was released to.
     pub(crate) async fn admit(
         &self,
-        claims: &RouteClaims,
+        claims: &Route,
         released: Option<&str>,
     ) -> Result<(Writer, Epoch), &'static str> {
         let table = self.table.read().await;
@@ -177,11 +179,10 @@ impl Gateway {
         let (Mode::Running, Some(unit)) = (record.mode, &record.writer) else {
             return Err("fenced");
         };
-        // Only an admission route names the unit and the route revision it was admitted for.
-        if claims.v != 4
-            || claims.rev != Some(record.generation)
-            || claims.route_revision != Some(record.route_revision)
-            || claims.pod.as_deref() != Some(unit.instance.as_str())
+        // The route names the generation, the route revision and the unit it was admitted for.
+        if claims.generation != record.generation
+            || claims.route_revision != record.route_revision
+            || claims.instance != unit.instance
             || released.is_some_and(|instance| instance != unit.instance)
         {
             return Err("route_stale");
@@ -484,9 +485,10 @@ pub async fn serve_socket(
             route,
             &gateway.config.keyring.keys,
             &gateway.config.region,
-            http::now() as f64,
+            &gateway.config.node,
+            http::now(),
         ) {
-            Ok(claims) => claims,
+            Ok(claims) => Route::from(&claims),
             Err(reason) => return route_denied(&mut socket, reason).await,
         };
         let stages = Stages::new(&claims.db, received);
@@ -641,10 +643,8 @@ pub(crate) async fn wake_state(gateway: &Gateway, ticket: &WakeClaims) -> WakeSt
 }
 /// The route a released wake is admitted under: the ticket's connection at its generation, the
 /// released unit's invocation ID, and the route revision that released it.
-pub(crate) fn admitted_wake(ticket: &WakeClaims, writer: &str, route_revision: u64) -> RouteClaims {
-    let mut claims = ticket.admitted(Some(writer));
-    claims.route_revision = Some(route_revision);
-    claims
+pub(crate) fn admitted_wake(ticket: &WakeClaims, writer: &str, route_revision: u64) -> Route {
+    Route::released(ticket, writer, route_revision)
 }
 /// Where a held wake connection stands: released to a writer, ended, or (none) still waiting.
 async fn held_state(
@@ -752,12 +752,12 @@ async fn serve_held(
         return memory_refused(&mut socket, &gateway, &database).await;
     };
     // The replay of the route the connection is admitted under is checked now, once.
-    let replay = gateway
-        .admission
-        .lock()
-        .unwrap()
-        .replay
-        .use_token(&ticket.admitted(None), http::now());
+    let replay = gateway.admission.lock().unwrap().replay.use_token(
+        &ticket.db,
+        &ticket.cid,
+        ticket.exp,
+        http::now(),
+    );
     if let Err(reason) = replay {
         stages.outcome = "admission_denied";
         return http::reply(
@@ -799,7 +799,7 @@ async fn serve_held(
     drop(handshake_permit);
     let deadline = tokio::time::Instant::from_std(upgraded + WAKE_BOUND);
     let id = format!("{database}/{}", ticket.cid);
-    let route = ticket.admitted(None);
+    let route = Route::released(&ticket, "", ticket.route_revision);
     // Until the StartupMessage is read, the read itself is what the wait polls besides the table
     // and the agent's result: a refusal, the bound or the table moving on end it as well.
     let read = {
@@ -933,7 +933,7 @@ async fn serve_held(
 }
 /// A route admitted on a writer, with its reserved session and the table epoch it was admitted at.
 struct Admitted<'a> {
-    claims: &'a RouteClaims,
+    claims: &'a Route,
     session: &'a SessionLease,
     epoch: Epoch,
 }
@@ -1233,7 +1233,7 @@ pub(crate) async fn close_upstream(postgres: &mut UnixStream) {
 /// the client reaches PostgreSQL here.
 async fn read_startup(
     socket: &mut WebSocket,
-    claims: &RouteClaims,
+    claims: &Route,
     gateway: &Gateway,
     id: &str,
     wire: &WireBudget,
@@ -1339,7 +1339,7 @@ async fn read_startup(
 /// Dials the writer the route was admitted on (or takes the dial that began with the admission)
 /// once the checked StartupMessage is there, while the table still admits it on that writer.
 async fn dial_started(
-    claims: &RouteClaims,
+    claims: &Route,
     session: &SessionLease,
     epoch: Epoch,
     stages: &mut Stages,
@@ -1385,7 +1385,7 @@ async fn dial_started(
 /// The StartupMessage, checked against the route, and the writer dialled for it.
 async fn startup(
     socket: &mut WebSocket,
-    claims: &RouteClaims,
+    claims: &Route,
     session: &SessionLease,
     epoch: Epoch,
     stages: &mut Stages,
@@ -1429,7 +1429,7 @@ impl Drop for EarlyDial {
     }
 }
 /// Starts the dial of the writer a route was admitted for, if it is still the writer.
-async fn early_dial(gateway: &Gateway, claims: &RouteClaims, bound: &Writer) -> Option<EarlyDial> {
+async fn early_dial(gateway: &Gateway, claims: &Route, bound: &Writer) -> Option<EarlyDial> {
     gateway.dialable(&claims.db, None, bound).await.ok()?;
     let writer = bound.clone();
     let wanted = writer.clone();

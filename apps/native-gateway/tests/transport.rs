@@ -44,6 +44,8 @@ use tokio_tungstenite::{
 type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const DATABASE: &str = "aaaaaaaaaaaaaaaaaaaa";
 const REGION: &str = "eu-test";
+/// The node the gateway serves, which every route names.
+const NODE: &str = "nod_aaaaaaaaaaaaaaaaaaaa";
 /// The unit's invocation ID, which the routes name.
 const INSTANCE: &str = "01234567-89ab-4def-8123-0123456789ab";
 const ROUTE_REVISION: u64 = 19;
@@ -67,33 +69,33 @@ fn token(prefix: &str, purpose: &str, claims: Value, key: &[u8]) -> String {
 fn route_token(id: usize) -> String {
     admitted(id, 1, INSTANCE, ROUTE_REVISION)
 }
-/// A v4 route: the generation, the unit and the route revision Cloudflare admitted.
+/// A v6 route: the generation, the unit and the route revision Cloudflare admitted, for this node.
 fn admitted(id: usize, generation: u64, instance: &str, route_revision: u64) -> String {
     let now = http::now() / 1000;
     token(
-        wire("admissionRouteTokenPrefix"),
-        wire("admissionRouteSignatureDomain"),
-        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"pod":instance,"route_revision":route_revision}),
+        wire("nodeRouteTokenPrefix"),
+        wire("nodeRouteSignatureDomain"),
+        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"route_revision":route_revision,"node":NODE,"inst":instance}),
         &[7; 32],
     )
 }
-/// A v3 route names no route revision.
-fn routed(id: usize, generation: u64, instance: &str) -> String {
+/// The route of the Kubernetes runtime, which named a Pod and was keyed per region: no route.
+fn pod_route(id: usize, generation: u64, instance: &str) -> String {
     let now = http::now() / 1000;
     token(
-        wire("routeTokenPrefix"),
-        wire("routeSignatureDomain"),
-        json!({"v":3,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"pod":instance}),
+        "v4",
+        "pgcf-route/v4\n",
+        json!({"v":4,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":generation,"pod":instance,"route_revision":ROUTE_REVISION}),
         &[7; 32],
     )
 }
-/// A v2 route names neither a generation nor a unit.
-fn legacy_route_token(id: usize) -> String {
+/// A v6 route made for another node, sealed with the key this gateway holds.
+fn other_node_route(id: usize) -> String {
     let now = http::now() / 1000;
     token(
-        wire("legacyRouteTokenPrefix"),
-        wire("legacyRouteSignatureDomain"),
-        json!({"v":2,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30}),
+        wire("nodeRouteTokenPrefix"),
+        wire("nodeRouteSignatureDomain"),
+        json!({"v":6,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":1,"route_revision":ROUTE_REVISION,"node":"nod_bbbbbbbbbbbbbbbbbbbb","inst":INSTANCE}),
         &[7; 32],
     )
 }
@@ -382,6 +384,7 @@ impl Fixture {
         let calls = Arc::new(AtomicUsize::new(0));
         let gateway = Gateway::new(Arc::new(Config {
             region: REGION.into(),
+            node: NODE.into(),
             keyring: Keyring {
                 active: "test".into(),
                 keys: HashMap::from([("test".into(), vec![7; 32])]),
@@ -906,11 +909,12 @@ async fn a_route_reaches_only_its_admitted_generation_unit_and_route_revision() 
         admitted(901, 2, INSTANCE, ROUTE_REVISION),
         admitted(902, 1, &cid(299), ROUTE_REVISION),
         admitted(903, 1, INSTANCE, ROUTE_REVISION + 1),
-        // Only an admission route names the route revision.
-        routed(904, 1, INSTANCE),
-        legacy_route_token(905),
     ] {
         assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
+    }
+    // A route of the Kubernetes runtime and a route made for another node are no routes here.
+    for route in [pod_route(904, 1, INSTANCE), other_node_route(905)] {
+        assert_eq!(fixture.upgrade(&route).await.err(), Some(401));
     }
     fixture.set(Mode::Running, 2, true).await;
     assert_eq!(fixture.upgrade(&route_token(906)).await.err(), Some(503));

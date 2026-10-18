@@ -7,6 +7,7 @@ import {
   AgentMessage,
   GatewayMessage,
   GatewayLocalActivityReport,
+  WAKE_AGAIN_REASON,
   WAKE_OUTCOMES,
   WAKE_REASONS,
   refusalFields,
@@ -175,6 +176,9 @@ describe("the agent's gateway channel", () => {
     ])
       expect(WAKE_REASONS).not.toContain(reason);
     expect(new Set(WAKE_REASONS).size).toBe(WAKE_REASONS.length);
+    // The one reason that is not an answer: the gateway asks again.
+    expect(WAKE_REASONS).toContain(WAKE_AGAIN_REASON);
+    expect(refusalFields(WAKE_AGAIN_REASON)).toEqual({});
   });
 
   it("sends the DETAIL of an admission refusal and the HINT of its retry hint with the 57P03", () => {

@@ -13,7 +13,7 @@ import {
 import { newNodeId } from "@pgcf/contracts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import { runNodeCapacityCron } from "../../src/domain/node-capacity.ts";
-import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
+import { recordNodeMemoryObservation } from "./memory-fixture.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();

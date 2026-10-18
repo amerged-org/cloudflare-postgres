@@ -8,8 +8,7 @@
     "DECOY_MAX_BYTES": 65536,
     "DECOY_MAX_FRAMES": 128,
     "DECOY_SCRAM_ITERATIONS": 4096,
-    "ROUTE_TOKEN_MAX_LENGTH": 512,
-    "ROUTE_TOKEN_ADMISSION_MAX_LENGTH": 1280,
+    "ROUTE_TOKEN_MAX_LENGTH": 1280,
     "ROUTE_TOKEN_MAX_LIFETIME_SECONDS": 30,
     "ROUTE_TOKEN_SKEW_SECONDS": 5,
     "ROUTE_KEY_MIN_BYTES": 32,
@@ -33,26 +32,21 @@
     "MAX_ACTIVITY_RECORDS": 2000
   },
   "wire": {
-    "routeKeyDomain": "pgcf-route-key/v1\n",
+    "routeKeyDomain": "pgcf-route-key/v2\n",
     "routeHeader": "X-PGCF-Route",
     "decoySaltDomain": "pgcf.edge.decoy-scram-salt/v1\n",
-    "routeTokenPrefix": "v3",
-    "routeSignatureDomain": "pgcf-route/v3\n",
-    "admissionRouteTokenPrefix": "v4",
-    "admissionRouteSignatureDomain": "pgcf-route/v4\n",
     "wakeRouteTokenPrefix": "v5",
     "wakeRouteSignatureDomain": "pgcf-route/v5\n",
     "nodeRouteTokenPrefix": "v6",
     "nodeRouteSignatureDomain": "pgcf-route/v6\n",
-    "nodeRouteKeyDomain": "pgcf-route-key/v2\n",
-    "legacyRouteTokenPrefix": "v2",
-    "legacyRouteSignatureDomain": "pgcf-route/v2\n"
+    "nodeRouteKeyDomain": "pgcf-route-key/v2\n"
   },
   "patterns": {
     "database": "^[a-z][a-z0-9]{19}$",
     "region": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$",
     "role": "^[a-z][a-z0-9_]{0,62}$",
     "operation": "^op_[a-z0-9]{20}$",
+    "node": "^nod_[a-z0-9]{20}$",
     "uuid": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
   },
   "reservedRoles": ["postgres", "streaming_replica"],
@@ -151,104 +145,6 @@
         "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
       },
       "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" }
-    }
-  },
-  "routeClaims": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "v": { "type": "number", "const": 3 },
-      "db": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "user": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
-      "cid": {
-        "type": "string",
-        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-      },
-      "rg": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$" },
-      "kid": {
-        "type": "string",
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
-      },
-      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "rev": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "pod": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      }
-    },
-    "required": [
-      "v",
-      "db",
-      "user",
-      "cid",
-      "rg",
-      "kid",
-      "iat",
-      "exp",
-      "rev",
-      "pod"
-    ],
-    "additionalProperties": false,
-    "$defs": {
-      "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
-    }
-  },
-  "admissionRouteClaims": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "v": { "type": "number", "const": 4 },
-      "db": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "user": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
-      "cid": {
-        "type": "string",
-        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-      },
-      "rg": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$" },
-      "kid": {
-        "type": "string",
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
-      },
-      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "rev": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      },
-      "pod": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "route_revision": {
-        "type": "integer",
-        "exclusiveMinimum": 0,
-        "maximum": 9007199254740991
-      }
-    },
-    "required": [
-      "v",
-      "db",
-      "user",
-      "cid",
-      "rg",
-      "kid",
-      "iat",
-      "exp",
-      "rev",
-      "pod",
-      "route_revision"
-    ],
-    "additionalProperties": false,
-    "$defs": {
-      "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
     }
   },
   "wakeRouteClaims": {
@@ -354,31 +250,6 @@
     "$defs": {
       "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
       "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" }
-    }
-  },
-  "legacyRouteClaims": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "v": { "type": "number", "const": 2 },
-      "db": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
-      "user": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
-      "cid": {
-        "type": "string",
-        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-      },
-      "rg": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$" },
-      "kid": {
-        "type": "string",
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
-      },
-      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
-    },
-    "required": ["v", "db", "user", "cid", "rg", "kid", "iat", "exp"],
-    "additionalProperties": false,
-    "$defs": {
-      "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
     }
   }
 }

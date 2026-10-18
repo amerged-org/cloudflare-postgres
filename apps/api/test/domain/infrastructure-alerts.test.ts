@@ -11,7 +11,7 @@ import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
-import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
+import { recordNodeMemoryObservation } from "./memory-fixture.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const capacity = 8 * 1024 ** 3;

@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
-import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
+import { recordNodeMemoryObservation } from "./memory-fixture.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);

@@ -1,7 +1,6 @@
 {
   "version": 1,
   "constants": {
-    "ID_ALPHABET": "abcdefghijklmnopqrstuvwxyz0123456789",
     "SLEEP_SQL": {
       "CLEAR": "SELECT pg_catalog.pg_stat_clear_snapshot()",
       "GUARD": "SELECT\n  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_stat_activity\n    WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid()\n      AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)) AS busy,\n  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_prepared_xacts) AS prepared",
@@ -19,7 +18,6 @@
       "switch_unknown",
       "archive_timeout",
       "aborted"
-    ],
-    "GATEWAY_RETIRE_HOLD_MS": 65000
+    ]
   }
 }

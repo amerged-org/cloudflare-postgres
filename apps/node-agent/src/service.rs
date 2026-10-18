@@ -249,17 +249,12 @@ impl<M: Machine> Service<M> {
             .spawn(task);
     }
 
-    /// What a boot does (plan 5.6 job 4, 4.3): the memory ceiling of all databases, the CPU quota
-    /// of every stopped unit lifted, the volumes of the page's databases mounted, and the socket
-    /// directory of every database the node has made, which `/run` lost.
+    /// What the first page of a boot does (plan 5.6 job 4, 4.3): the memory ceiling of all
+    /// databases and the volumes of the page's databases mounted, and again what the agent
+    /// restored when it started (`restore_runtime`), now that the mounts are there.
     async fn boot(&self, page: &Page) {
         let budget = self.core.policy().admission.admission.awake_budget_mib;
         let _ = self.machine.set_slice_memory(budget).await;
-        if let Ok(units) = self.machine.units().await {
-            for unit in units.iter().filter(|unit| !unit.active.awake()) {
-                let _ = self.machine.set_cpu_quota(&unit.database, None).await;
-            }
-        }
         let current: Vec<VolumeId> = page
             .databases
             .iter()
@@ -279,15 +274,7 @@ impl<M: Machine> Service<M> {
                 "event": "mount_failed", "class": crate::diagnostics::error_code(&error.into()),
             })),
         }
-        if let Ok(inventory) = self.machine.inventory().await {
-            for volume in inventory.volumes {
-                if let Some(account) = self.machine.account(volume.id.database()) {
-                    let _ = self
-                        .machine
-                        .prepare_socket_directory(volume.id.database(), &account);
-                }
-            }
-        }
+        crate::machine::restore_runtime(&*self.machine).await;
     }
 
     // ---- the link brings the page
@@ -348,10 +335,9 @@ impl<M: Machine> Service<M> {
             }
         };
         let revision = credentials["revision"].as_u64().unwrap_or(0);
-        let region = self.link.node().region_id.clone();
         match self
             .machine
-            .apply_credentials(&region, &credentials, applied.is_some())
+            .apply_credentials(self.link.node(), &credentials, applied.is_some())
             .await
         {
             Ok(()) => {
@@ -699,7 +685,12 @@ mod tests {
         );
         assert_eq!(
             machine.credentials_applied(),
-            [("eu-dev".to_string(), 3, false)]
+            [(
+                "eu-dev".to_string(),
+                crate::link::test_server::NODE_ID.to_string(),
+                3,
+                false
+            )]
         );
         assert_eq!(machine.slice_memory_mib(), Some(9913));
         // The database is served, and the meter says for how long.

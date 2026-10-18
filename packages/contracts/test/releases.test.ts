@@ -2,7 +2,6 @@
 import { expect, it } from "vitest";
 import { NodeRelease } from "../src/node-link.ts";
 import {
-  FleetNodeReleaseObservation,
   FleetNodeReleaseStatus,
   FleetRelease,
   FleetReleaseSpec,
@@ -128,13 +127,4 @@ it("a node is converged only on the release it reports, and a lost node says so"
     expect(FleetNodeReleaseStatus.safeParse({ ...status, state }).success).toBe(
       false,
     );
-});
-
-it("does not treat a release-id claim or partial duplicate inventory as component observations", () => {
-  expect(
-    FleetNodeReleaseObservation.safeParse({
-      release_id: "one",
-      node_uid: crypto.randomUUID(),
-    }).success,
-  ).toBe(false);
 });

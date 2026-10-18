@@ -49,7 +49,8 @@ export const WAKE_PHASES = [
 export type WakePhase = (typeof WAKE_PHASES)[number];
 /**
  * `started`: the agent started the database's unit, and its table entry releases the held
- * connections. `refused`: the held connections answer 57P03 and the result names the reason.
+ * connections. `refused`: the held connections answer 57P03 and the result names the reason,
+ * except for `WAKE_AGAIN_REASON`.
  */
 export const WAKE_OUTCOMES = ["started", "refused"] as const;
 export type WakeOutcome = (typeof WAKE_OUTCOMES)[number];
@@ -91,6 +92,12 @@ export const WAKE_REASONS = [
   "release_failed",
 ] as const;
 export type WakeReason = (typeof WAKE_REASONS)[number];
+/**
+ * The one reason that is not an answer: the agent already serves this wake (or has not yet looked
+ * at the database in this run), so the held connections keep waiting for the answer of the first
+ * delivery and the gateway delivers the ticket again after `WAKE_REDELIVER_MS`.
+ */
+export const WAKE_AGAIN_REASON = "wake_in_progress" satisfies WakeReason;
 
 /** The refusals of the admission loop (plan 4.6). */
 export const ADMISSION_REFUSALS = ["no_room", "no_headroom"] as const;

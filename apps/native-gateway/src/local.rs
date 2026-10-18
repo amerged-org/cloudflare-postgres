@@ -335,7 +335,7 @@ async fn apply(
                     .send(agent::encode(&FromGateway::Activity {
                         id,
                         database,
-                        report,
+                        report: Box::new(report),
                     }))
                     .await;
             }

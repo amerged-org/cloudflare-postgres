@@ -32,6 +32,11 @@ const https = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/[A-Za-z0-9._~%/?&=+-]*)?$/;
 const hex64 = /^[0-9a-f]{64}$/;
 const ipv4 = /^([0-9]{1,3}\.){3}[0-9]{1,3}$/;
 const token = /^[A-Za-z0-9._~-]{16,512}$/;
+// The seed the agent reads (`NodeEnrollmentSeed` of packages/contracts/src/node-link.ts) takes these
+// shapes and no others: the installer refuses what the agent would refuse after the disk is written.
+const nodeId = /^nod_[a-z0-9]{20}$/;
+const region = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
+const enrollmentToken = /^pgcf_et_[A-Za-z0-9_-]{43}$/;
 
 function count(value: number, name: string): string {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
@@ -69,10 +74,10 @@ export function installerParameters(p: InstallerParameters): string {
     ["PGCF_HOSTNAME", match(p.hostname, /^[a-z][a-z0-9-]{0,62}$/, "hostname")],
     ["PGCF_PROGRESS_URL", match(p.progressUrl, https, "progressUrl")],
     ["PGCF_PROGRESS_TOKEN", match(p.progressToken, token, "progressToken")],
-    ["PGCF_NODE_ID", match(p.nodeId, /^[A-Za-z0-9-]{1,64}$/, "nodeId")],
-    ["PGCF_REGION", match(p.region, /^[a-z][a-z0-9-]{0,31}$/, "region")],
+    ["PGCF_NODE_ID", match(p.nodeId, nodeId, "nodeId")],
+    ["PGCF_REGION", match(p.region, region, "region")],
     ["PGCF_API_URL", match(p.apiUrl, https, "apiUrl")],
-    ["PGCF_ENROLLMENT_TOKEN", match(p.enrollmentToken, token, "enrollmentToken")],
+    ["PGCF_ENROLLMENT_TOKEN", match(p.enrollmentToken, enrollmentToken, "enrollmentToken")],
   ];
   return values.map(([name, value]) => `${name}=${value}\n`).join("");
 }

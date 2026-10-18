@@ -109,20 +109,43 @@ pub struct GatewayRegion {
     pub gateway_url: String,
     pub gateway_binding: Option<String>,
 }
-/// The verified connection target an admission names: route revision and primary Pod UID.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct AdmittedTarget {
-    pub revision: u64,
-    pub pod_uid: String,
-    #[serde(default)]
-    pub route_revision: Option<u64>,
+/// What an admission lets the Edge sign: the route to the unit that serves an awake database
+/// (route v6), or the wake ticket of a sleeping one (route v5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signable {
+    Awake {
+        revision: u64,
+        route_revision: u64,
+        instance: String,
+    },
+    Wake {
+        operation: String,
+        generation: u64,
+        route_revision: u64,
+        role_revision_hash: String,
+    },
 }
-/// Parses the trusted DatabaseActor admission. Every field the Edge uses is required and
-/// validated; fields a newer API adds are ignored, as the TypeScript Edge does, so an API
-/// deploy never breaks this Edge, and they gain no authority because only known fields are
-/// signed. Temporary rollout compatibility (route-token.ts): the verified target may be
-/// absent; a present target must be complete and well formed.
-pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>), Failure> {
+/// A trusted DatabaseActor admission: the region's gateway, the node whose key signs the route,
+/// and what is signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    pub region: GatewayRegion,
+    pub node: String,
+    pub signable: Signable,
+}
+fn revision(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=9_007_199_254_740_991).contains(value))
+}
+fn text<'a>(object: &'a serde_json::Map<String, Value>, field: &str) -> Option<&'a str> {
+    object.get(field).and_then(Value::as_str)
+}
+/// Parses the trusted DatabaseActor admission (`DatabaseWakeAdmission`). Every field the Edge
+/// uses is required and validated; fields a newer API adds are ignored, as the TypeScript Edge
+/// does, so an API deploy never breaks this Edge, and they gain no authority because only known
+/// fields are signed. Exactly one of a target and a wake ticket is present.
+pub fn admission(value: &Value) -> Result<Admission, Failure> {
     let object = value.as_object().ok_or_else(Failure::gateway)?;
     match object.get("ok").and_then(Value::as_bool) {
         Some(false) => Err(actor_failure(
@@ -136,10 +159,10 @@ pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>
             if value.get("gateway_binding").is_none() {
                 return Err(Failure::gateway());
             }
-            let route: GatewayRegion =
+            let region: GatewayRegion =
                 serde_json::from_value(value.clone()).map_err(|_| Failure::gateway())?;
-            if !valid_pattern("region", &route.id)
-                || route.gateway_url.encode_utf16().count()
+            if !valid_pattern("region", &region.id)
+                || region.gateway_url.encode_utf16().count()
                     > pgcf_native_protocol::CONTRACT["gatewayRegion"]["properties"]["gateway_url"]
                         ["maxLength"]
                         .as_u64()
@@ -147,26 +170,44 @@ pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>
             {
                 return Err(Failure::gateway());
             }
-            let target = object
-                .get("target")
-                .map(|value| {
-                    let target: AdmittedTarget =
-                        serde_json::from_value(value.clone()).map_err(|_| Failure::gateway())?;
-                    if target.revision == 0
-                        || (value.get("route_revision").is_some()
-                            && target.route_revision.is_none())
-                        || target.revision > 9_007_199_254_740_991
-                        || target.route_revision.is_some_and(|revision| {
-                            revision == 0 || revision > 9_007_199_254_740_991
+            let node = text(object, "node")
+                .filter(|node| valid_pattern("node", node))
+                .ok_or_else(Failure::gateway)?;
+            let signable = match (object.get("target"), object.get("wake")) {
+                (Some(Value::Object(target)), None) => Signable::Awake {
+                    revision: revision(target.get("revision")).ok_or_else(Failure::gateway)?,
+                    route_revision: revision(target.get("route_revision"))
+                        .ok_or_else(Failure::gateway)?,
+                    instance: text(target, "instance")
+                        .filter(|instance| valid_pattern("uuid", instance))
+                        .ok_or_else(Failure::gateway)?
+                        .into(),
+                },
+                (None, Some(Value::Object(wake))) => Signable::Wake {
+                    operation: text(wake, "operation")
+                        .filter(|operation| valid_pattern("operation", operation))
+                        .ok_or_else(Failure::gateway)?
+                        .into(),
+                    generation: revision(wake.get("generation")).ok_or_else(Failure::gateway)?,
+                    route_revision: revision(wake.get("route_revision"))
+                        .ok_or_else(Failure::gateway)?,
+                    role_revision_hash: text(wake, "role_revision_hash")
+                        .filter(|hash| {
+                            hash.len() == 64
+                                && hash
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                         })
-                        || !valid_pattern("uuid", &target.pod_uid)
-                    {
-                        return Err(Failure::gateway());
-                    }
-                    Ok(target)
-                })
-                .transpose()?;
-            Ok((route, target))
+                        .ok_or_else(Failure::gateway)?
+                        .into(),
+                },
+                _ => return Err(Failure::gateway()),
+            };
+            Ok(Admission {
+                region,
+                node: node.into(),
+                signable,
+            })
         }
         _ => Err(Failure::gateway()),
     }

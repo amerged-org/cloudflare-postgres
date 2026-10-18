@@ -54,7 +54,6 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/costs": [400, 401, 403, 404, 500],
   "POST /v1/costs/node-facts": [400, 401, 403, 404, 409, 500],
 
-  "GET /v1/nodes/{id}/storage": [400, 401, 403, 404, 500],
   // setNodeDatabasePlacement's failed identity CAS is 409 even for a missing/lost node.
   "PUT /v1/nodes/{id}/database-placement": [400, 401, 403, 409, 500],
   "POST /v1/nodes/{id}/mark-lost": [400, 401, 403, 404, 409, 500],

@@ -2,7 +2,7 @@
 use pgcf_edge_rust::{
     decoy::{Decoy, derive_salt},
     policy::{
-        AdmittedTarget, Failure, GatewayRegion, actor_failure, admission, connection_rate_key,
+        Admission, Failure, GatewayRegion, Signable, actor_failure, admission, connection_rate_key,
         routing_hints,
     },
 };
@@ -42,24 +42,23 @@ fn authoritative_typescript_ip_and_signing_vectors() {
         };
         let connection = route::Connection {
             region: row["region"].as_str().unwrap(),
+            node: row["node"].as_str().unwrap(),
             database: row["db"].as_str().unwrap(),
             user: row["user"].as_str().unwrap(),
             cid: row["cid"].as_str().unwrap(),
             now_ms: row["now"].as_u64().unwrap(),
             ttl_seconds: row["ttlSeconds"].as_u64().unwrap(),
         };
-        let signed = match row.get("target") {
-            Some(target) => route::sign(
-                &ring,
-                &connection,
-                &route::RouteTarget {
-                    revision: target["revision"].as_u64().unwrap(),
-                    pod_uid: target["pod_uid"].as_str().unwrap(),
-                    route_revision: target["route_revision"].as_u64(),
-                },
-            ),
-            None => route::sign_legacy(&ring, &connection),
-        };
+        let target = &row["target"];
+        let signed = route::sign(
+            &ring,
+            &connection,
+            &route::NodeTarget {
+                revision: target["revision"].as_u64().unwrap(),
+                route_revision: target["route_revision"].as_u64().unwrap(),
+                instance: target["instance"].as_str().unwrap(),
+            },
+        );
         assert_eq!(signed.unwrap(), row["expected"].as_str().unwrap());
     }
     for row in edge["salts"].as_array().unwrap() {
@@ -109,28 +108,47 @@ fn hints_are_scoped_before_actor_or_gateway_and_duplicate_errors_take_precedence
 fn an_admission_validates_its_known_fields_and_ignores_additive_ones() {
     let region =
         json!({"id":"eu-test","gateway_url":"https://gateway.invalid/pg","gateway_binding":null});
-    let pod = "01234567-89ab-4def-8123-0123456789ad";
-    let verified = Some(AdmittedTarget {
+    let node = "nod_aaaaaaaaaaaaaaaaaaaa";
+    let unit = "01234567-89ab-4def-8123-0123456789ad";
+    let target = json!({"revision":7,"route_revision":19,"instance":unit});
+    let awake = Signable::Awake {
         revision: 7,
-        pod_uid: pod.into(),
-        route_revision: None,
-    });
-    let (route, target) =
-        admission(&json!({"ok":true,"region":region,"target":{"revision":7,"pod_uid":pod}}))
-            .unwrap();
-    assert_eq!(route.id, "eu-test");
-    assert_eq!(target, verified);
-    // Temporary rollout compatibility: an admission without a verified target.
+        route_revision: 19,
+        instance: unit.into(),
+    };
+    let Admission {
+        region: route,
+        node: named,
+        signable,
+    } = admission(&json!({"ok":true,"region":region,"node":node,"target":target})).unwrap();
+    assert_eq!((route.id.as_str(), named.as_str()), ("eu-test", node));
+    assert_eq!(signable, awake);
+    // A sleeping database's admission carries the wake ticket the Edge signs as route v5.
+    let wake = json!({"operation":format!("op_{}","c".repeat(20)),"generation":8,"route_revision":19,"role_revision_hash":"a".repeat(64)});
     assert_eq!(
-        admission(&json!({"ok":true,"region":region})).unwrap().1,
-        None
+        admission(&json!({"ok":true,"region":region,"node":node,"wake":wake}))
+            .unwrap()
+            .signable,
+        Signable::Wake {
+            operation: format!("op_{}", "c".repeat(20)),
+            generation: 8,
+            route_revision: 19,
+            role_revision_hash: "a".repeat(64),
+        }
     );
     // A newer API's additive fields never break an Edge that does not read them, as in the
     // TypeScript Edge; they carry no authority because only the known fields are signed.
     let mut wider = region.clone();
     wider["zone"] = json!("additive");
-    let (route, target) = admission(&json!({"ok":true,"region":wider,"extra":1,"target":{"revision":7,"pod_uid":pod,"additive":true}})).unwrap();
-    assert_eq!((route.id.as_str(), target), ("eu-test", verified));
+    let mut wide_target = target.clone();
+    wide_target["additive"] = json!(true);
+    let admitted =
+        admission(&json!({"ok":true,"region":wider,"node":node,"extra":1,"target":wide_target}))
+            .unwrap();
+    assert_eq!(
+        (admitted.region.id.as_str(), admitted.signable),
+        ("eu-test", awake)
+    );
     assert_eq!(
         admission(&json!({"ok":false,"sqlstate":"57P03","extra":1}))
             .unwrap_err()
@@ -138,16 +156,30 @@ fn an_admission_validates_its_known_fields_and_ignores_additive_ones() {
         "57P03"
     );
     for target in [
-        json!({"revision":0,"pod_uid":pod}),
-        json!({"revision":9_007_199_254_740_992_u64,"pod_uid":pod}),
-        json!({"revision":7,"pod_uid":"not-a-pod"}),
-        json!({"revision":7}),
-        json!({"revision":7,"pod_uid":pod,"route_revision":null}),
-        json!({"revision":7,"pod_uid":pod,"route_revision":0}),
+        json!({"revision":0,"route_revision":19,"instance":unit}),
+        json!({"revision":9_007_199_254_740_992_u64,"route_revision":19,"instance":unit}),
+        json!({"revision":7,"route_revision":0,"instance":unit}),
+        json!({"revision":7,"route_revision":null,"instance":unit}),
+        json!({"revision":7,"instance":unit}),
+        json!({"revision":7,"route_revision":19,"instance":"not-a-unit"}),
+        json!({"revision":7,"route_revision":19}),
+        // The Pod of the Kubernetes runtime is no unit.
+        json!({"revision":7,"route_revision":19,"pod_uid":unit}),
         json!(null),
     ] {
         assert_eq!(
-            admission(&json!({"ok":true,"region":region,"target":target})).unwrap_err(),
+            admission(&json!({"ok":true,"region":region,"node":node,"target":target})).unwrap_err(),
+            Failure::gateway()
+        );
+    }
+    for wake in [
+        json!({"operation":"op_short","generation":8,"route_revision":19,"role_revision_hash":"a".repeat(64)}),
+        json!({"operation":format!("op_{}","c".repeat(20)),"generation":0,"route_revision":19,"role_revision_hash":"a".repeat(64)}),
+        json!({"operation":format!("op_{}","c".repeat(20)),"generation":8,"route_revision":19,"role_revision_hash":"A".repeat(64)}),
+        json!({"operation":format!("op_{}","c".repeat(20)),"generation":8,"route_revision":19}),
+    ] {
+        assert_eq!(
+            admission(&json!({"ok":true,"region":region,"node":node,"wake":wake})).unwrap_err(),
             Failure::gateway()
         );
     }
@@ -156,8 +188,13 @@ fn an_admission_validates_its_known_fields_and_ignores_additive_ones() {
     let mut foreign = region.clone();
     foreign["id"] = json!("not a region");
     for invalid in [
-        json!({"ok":true,"region":unbound}),
-        json!({"ok":true,"region":foreign}),
+        json!({"ok":true,"region":unbound,"node":node,"target":target}),
+        json!({"ok":true,"region":foreign,"node":node,"target":target}),
+        json!({"ok":true,"region":region,"target":target}),
+        json!({"ok":true,"region":region,"node":"nod_short","target":target}),
+        // Exactly one of a target and a wake ticket.
+        json!({"ok":true,"region":region,"node":node}),
+        json!({"ok":true,"region":region,"node":node,"target":target,"wake":wake}),
         json!({"ok":true}),
         json!({"ok":false}),
         json!({"region":region}),

@@ -77,10 +77,11 @@ need PGCF_HOSTNAME '^[a-z][a-z0-9-]{0,62}$'
 need PGCF_PROGRESS_URL "$https"
 need PGCF_PROGRESS_TOKEN "$token"
 token_length PGCF_PROGRESS_TOKEN
-need PGCF_NODE_ID '^[A-Za-z0-9-]{1,64}$'
-need PGCF_REGION '^[a-z][a-z0-9-]{0,31}$'
+# The seed's identifiers are the contract's (NodeEnrollmentSeed): the agent refuses any other shape.
+need PGCF_NODE_ID '^nod_[a-z0-9]{20}$'
+need PGCF_REGION '^[a-z][a-z0-9-]{1,30}[a-z0-9]$'
 need PGCF_API_URL "$https"
-need PGCF_ENROLLMENT_TOKEN "$token"
+need PGCF_ENROLLMENT_TOKEN '^pgcf_et_[A-Za-z0-9_-]{43}$'
 token_length PGCF_ENROLLMENT_TOKEN
 if [ -n "${PGCF_IPV6}" ] && { [ -z "${PGCF_IPV6_PREFIX}" ] || [ -z "${PGCF_IPV6_GATEWAY}" ]; }; then
 	refuse "IPv6 needs an address, a prefix and a gateway"

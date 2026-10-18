@@ -5,10 +5,9 @@
 //! agent and what the agent answers with, over its channel (`agent`).
 use crate::{
     constant,
-    route::{Connection, Keyring, RouteClaims, decode, derive_region_key},
+    route::{Connection, Keyring, decode, seal},
     valid_pattern, valid_role,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,6 +55,9 @@ pub const REASONS: [&str; 22] = [
     "start_timeout",
     "release_failed",
 ];
+/// The one reason that is not an answer (`WAKE_AGAIN_REASON` of the contract): the agent already
+/// serves the wake, so the held connections keep waiting and the ticket is delivered again.
+pub const AGAIN_REASON: &str = "wake_in_progress";
 /// The one refusal that waiting can undo, and so the only one with a retry hint.
 pub const RETRY_REASON: &str = "no_headroom";
 /// The longest retry hint, in seconds.
@@ -76,7 +78,7 @@ pub fn refusal_hint(reason: &str, retry_after_seconds: Option<u32>) -> Option<St
         .flatten()
         .map(|seconds| format!("retry after {seconds} s"))
 }
-const MAX_SAFE: u64 = 9_007_199_254_740_991;
+pub(crate) const MAX_SAFE: u64 = 9_007_199_254_740_991;
 
 /// Route token v5 claims. `v: 5` is the wake flag: a v5 token exists only for a wake ticket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +118,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn uuid_text(value: &str) -> bool {
+pub(crate) fn lower_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
             if [8, 13, 18, 23].contains(&index) {
@@ -126,7 +128,7 @@ fn uuid_text(value: &str) -> bool {
             }
         })
 }
-fn kid(value: &str) -> bool {
+pub(crate) fn kid(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 32
@@ -135,14 +137,14 @@ fn kid(value: &str) -> bool {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
-fn positive(value: u64) -> bool {
+pub(crate) fn positive(value: u64) -> bool {
     (1..=MAX_SAFE).contains(&value)
 }
 pub fn claims_valid(claims: &WakeClaims) -> bool {
     claims.v == ROUTE_VERSION
         && valid_pattern("database", &claims.db)
         && valid_role(&claims.user)
-        && uuid_text(&claims.cid)
+        && lower_uuid(&claims.cid)
         && valid_pattern("region", &claims.rg)
         && kid(&claims.kid)
         && claims.iat <= MAX_SAFE
@@ -152,7 +154,7 @@ pub fn claims_valid(claims: &WakeClaims) -> bool {
         && positive(claims.route_revision)
         && lower_hex(&claims.rh, 64)
 }
-/// Signs a v5 route with the master keyring's active key, derived for the connection's region.
+/// Signs a v5 route with the master keyring's active key, derived for the connection's node.
 pub fn sign_wake(
     master: &Keyring,
     connection: &Connection,
@@ -180,25 +182,12 @@ pub fn sign_wake(
         route_revision: ticket.route_revision,
         rh: ticket.role_revision_hash.into(),
     };
-    if !claims_valid(&claims) {
+    if !claims_valid(&claims) || !valid_pattern("node", connection.node) {
         return Err("invalid claims");
     }
-    let key = master
-        .keys
-        .get(&master.active)
-        .ok_or("active key missing")?;
-    let derived = derive_region_key(key, connection.region)?;
-    let payload =
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).map_err(|_| "invalid claims")?);
-    let mut mac = Hmac::<Sha256>::new_from_slice(&derived).map_err(|_| "invalid key")?;
-    mac.update(ROUTE_DOMAIN.as_bytes());
-    mac.update(payload.as_bytes());
-    Ok(format!(
-        "{ROUTE_PREFIX}.{payload}.{}",
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    ))
+    seal(master, connection.node, &claims, ROUTE_PREFIX, ROUTE_DOMAIN)
 }
-/// Verifies a v5 route with the gateway's region-derived keys. Failure codes and their order are
+/// Verifies a v5 route with the gateway's node keys. Failure codes and their order are
 /// the TypeScript verifier's.
 pub fn verify_wake(
     token: Option<&str>,
@@ -207,7 +196,7 @@ pub fn verify_wake(
     now_ms: u64,
 ) -> Result<WakeClaims, &'static str> {
     let token = token.filter(|v| !v.is_empty()).ok_or("missing")?;
-    if token.len() > constant("ROUTE_TOKEN_ADMISSION_MAX_LENGTH") as usize {
+    if token.len() > constant("ROUTE_TOKEN_MAX_LENGTH") as usize {
         return Err("too_long");
     }
     let parts: Vec<&str> = token.split('.').collect();
@@ -253,26 +242,6 @@ pub fn verify_wake(
         return Err("expired");
     }
     Ok(claims)
-}
-impl WakeClaims {
-    /// The v4-shaped claims a released wake is routed under: the same connection, the claimed
-    /// generation as `rev`, the released unit's invocation ID and the route revision. `unit` is
-    /// `None` only for the replay check before release.
-    pub fn admitted(&self, unit: Option<&str>) -> RouteClaims {
-        RouteClaims {
-            v: 4,
-            db: self.db.clone(),
-            user: self.user.clone(),
-            cid: self.cid.clone(),
-            rg: self.rg.clone(),
-            kid: self.kid.clone(),
-            iat: self.iat,
-            exp: self.exp,
-            rev: Some(self.generation),
-            pod: unit.map(str::to_string),
-            route_revision: Some(self.route_revision),
-        }
-    }
 }
 /// SHA-256 (lowercase hex) of the sorted lines `"<name>\t<revision>\n"`, one per live role.
 pub fn role_revision_hash<'a>(roles: impl IntoIterator<Item = (&'a str, u64)>) -> String {
@@ -341,6 +310,10 @@ pub struct WakeResult {
     pub steps_ms: BTreeMap<String, u64>,
 }
 impl WakeResult {
+    /// The agent is still on the wake: the gateway keeps its connections held.
+    pub fn again(&self) -> bool {
+        self.outcome == Outcome::Refused && self.reason.as_deref() == Some(AGAIN_REASON)
+    }
     /// The DETAIL and HINT of the 57P03 that answers the connections held for this refused wake.
     pub fn refusal_fields(&self) -> (Option<&'static str>, Option<String>) {
         match self.reason.as_deref() {

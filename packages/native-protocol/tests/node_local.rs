@@ -41,6 +41,8 @@ fn the_constants_are_the_contracts() {
     );
     assert_eq!(constants["WAKE_REDELIVER_MS"], wake::REDELIVER_MS);
     assert_eq!(strings(&constants["WAKE_REASONS"]), wake::REASONS);
+    assert_eq!(constants["WAKE_AGAIN_REASON"], wake::AGAIN_REASON);
+    assert!(wake::REASONS.contains(&wake::AGAIN_REASON));
     assert_eq!(
         serde_json::to_value([wake::Outcome::Started, wake::Outcome::Refused]).unwrap(),
         constants["WAKE_OUTCOMES"]

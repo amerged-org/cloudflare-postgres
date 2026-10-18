@@ -6,10 +6,52 @@
 //! in for systemd and LVM only.
 use crate::{
     layout::Layout,
+    link::NodeIdentity,
     storage::{self, Inventory, NoRoom, PoolSample, Removal, VolumeId},
     units::{self, Started, UnitState, limits::Limits},
 };
 use std::{future::Future, io, num::NonZeroU32};
+
+/// What a boot loses, restored when the agent starts and before any page comes (plan 5.6 job 4,
+/// the image's `README.md`): the CPU quota of every stopped unit is lifted, because a quota can
+/// outlive a stop or an agent crash and would throttle the next start, and the socket directory of
+/// every database the node has a volume of is made again, because `/run` is empty after a boot and
+/// a start without it fails. What cannot be read now is left to the next time.
+pub async fn restore_runtime<M: Machine>(machine: &M) {
+    if let Ok(units) = machine.units().await {
+        for unit in units.iter().filter(|unit| !unit.active.awake()) {
+            let _ = machine.set_cpu_quota(&unit.database, None).await;
+        }
+    }
+    if let Ok(inventory) = machine.inventory().await {
+        for volume in inventory.volumes {
+            if let Some(account) = machine.account(volume.id.database()) {
+                let _ = machine.prepare_socket_directory(volume.id.database(), &account);
+            }
+        }
+    }
+}
+
+/// The gateway's environment file (`EnvironmentFile=` of `pgcf-gateway.service`): the node's
+/// region and ID, and the keyring derived for the node, which verifies only the routes made for
+/// it. The keyring is one line in single quotes, which an environment file takes literally.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn gateway_environment(
+    node: &NodeIdentity,
+    credentials: &serde_json::Value,
+) -> io::Result<String> {
+    let keyring = serde_json::to_string(&credentials["route_keyring"])?;
+    if keyring.contains(['\'', '\n'])
+        || !crate::valid_region(&node.region_id)
+        || !pgcf_native_protocol::valid_pattern("node", &node.id)
+    {
+        return Err(io::Error::other("credentials that cannot be written"));
+    }
+    Ok(format!(
+        "PGCF_REGION_ID={}\nPGCF_NODE_ID={}\nPGCF_ROUTE_KEY='{keyring}'\n",
+        node.region_id, node.id
+    ))
+}
 
 /// The Linux user and group of a database: a fixed uid from the agent's range, named
 /// `pgcf-<id>` (plan 5.5).
@@ -171,7 +213,7 @@ pub trait Machine: Send + Sync + 'static {
     /// systemd credential and never appears on a command line.
     fn apply_credentials(
         &self,
-        region: &str,
+        node: &NodeIdentity,
         credentials: &serde_json::Value,
         restart: bool,
     ) -> impl Future<Output = io::Result<()>> + Send;
@@ -200,4 +242,95 @@ pub struct CpuTimes {
     pub cores: u32,
     /// Clock ticks per second.
     pub ticks_per_second: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node() -> NodeIdentity {
+        NodeIdentity {
+            id: "nod_nnnnnnnnnnnnnnnnnnnn".into(),
+            uid: "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c".into(),
+            hostname: "eu1".into(),
+            region_id: "eu-dev".into(),
+        }
+    }
+
+    #[test]
+    fn the_gateways_environment_names_its_region_its_node_and_the_nodes_keyring() {
+        let keyring =
+            json!({"active": "k1", "keys": {"k1": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}});
+        let text = gateway_environment(&node(), &json!({"route_keyring": keyring})).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "PGCF_REGION_ID=eu-dev\nPGCF_NODE_ID=nod_nnnnnnnnnnnnnnnnnnnn\nPGCF_ROUTE_KEY='{keyring}'\n"
+            )
+        );
+        // What the gateway reads is what the file says: its three variables parse as it parses them.
+        let value = text.lines().last().unwrap();
+        let ring = value
+            .strip_prefix("PGCF_ROUTE_KEY='")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .unwrap();
+        assert!(pgcf_native_protocol::route::Keyring::parse(ring).is_ok());
+    }
+
+    /// A boot loses what lived in memory and in `/run`: the CPU quota of a unit that stopped, and
+    /// the socket directories of the databases. The agent restores both when it starts, before a
+    /// page comes (the image's boot test requires the directory of a database it made).
+    #[tokio::test]
+    async fn the_agent_restores_the_quotas_and_the_socket_directories_a_boot_lost() {
+        use crate::{agent::check::SCRATCH, machine::local::Local, storage::VolumeId};
+        use std::os::unix::fs::PermissionsExt;
+        let Some(machine) = Local::new("restore") else {
+            return;
+        };
+        let account = machine.ensure_account(SCRATCH).await.unwrap();
+        let volume = VolumeId::new(SCRATCH, 1).unwrap();
+        let policy = crate::storage::Policy {
+            reserve_bytes: 0,
+            metadata_no_room_percent: 100,
+            sample_max_age: std::time::Duration::from_secs(60),
+        };
+        machine
+            .create_volume(&volume, 1 << 30, &account, &policy)
+            .await
+            .unwrap();
+        // The unit stopped, and a quota outlived the stop; /run is empty.
+        machine.add_stopped_unit(SCRATCH);
+        machine
+            .set_cpu_quota(SCRATCH, std::num::NonZeroU32::new(250))
+            .await
+            .unwrap();
+        let directory = machine.layout().socket_directory(SCRATCH);
+        let _ = std::fs::remove_dir_all(&directory);
+        restore_runtime(&machine).await;
+        assert_eq!(machine.quota(SCRATCH), Some(None));
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
+    #[test]
+    fn credentials_that_could_break_out_of_the_line_are_not_written() {
+        let credentials = json!({"route_keyring": {"active": "it's"}});
+        assert!(gateway_environment(&node(), &credentials).is_err());
+        let credentials = json!({"route_keyring": {"active": "k1"}});
+        for broken in [
+            NodeIdentity {
+                id: "nod_short".into(),
+                ..node()
+            },
+            NodeIdentity {
+                region_id: "EU\nPGCF_X=1".into(),
+                ..node()
+            },
+        ] {
+            assert!(gateway_environment(&broken, &credentials).is_err());
+        }
+    }
 }

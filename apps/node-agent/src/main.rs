@@ -20,7 +20,7 @@ mod linux {
         diagnostics::error_code,
         layout::Layout,
         link::{Link, LinkConfig, LinkEvents, Paths, Timing as LinkTiming, Transport},
-        machine::Node,
+        machine::{Node, restore_runtime},
         notify::notify,
         release,
         service::{Intervals, Service, ServiceConfig, gateway_owner},
@@ -79,6 +79,8 @@ mod linux {
     pub async fn run() -> Result<(), Error> {
         let layout = Layout::default();
         let node = Arc::new(Node::connect(layout.clone(), storage::Config::default()).await?);
+        // What a boot lost is back before the agent is ready, link or no link.
+        restore_runtime(&*node).await;
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
         notify("READY=1")?;

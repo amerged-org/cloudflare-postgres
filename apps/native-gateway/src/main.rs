@@ -33,6 +33,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !valid_pattern("region", &region) {
         return Err("invalid gateway identity".into());
     }
+    let node = std::env::var("PGCF_NODE_ID")?;
+    if !valid_pattern("node", &node) {
+        return Err("invalid gateway identity".into());
+    }
     let keyring = Keyring::parse(&std::env::var("PGCF_ROUTE_KEY")?)?;
     let port: u16 = positive("PGCF_GATEWAY_PORT", 8080)?.try_into()?;
     let maximum_memory = positive(
@@ -48,6 +52,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let config = Arc::new(Config {
         region,
+        node,
         keyring,
         maximum_memory,
         database_memory,

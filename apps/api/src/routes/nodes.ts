@@ -7,7 +7,6 @@ import {
   RegionId,
   NodeId,
   listEnvelope,
-  NodeStorageSample,
 } from "@pgcf/contracts";
 import {
   NodeAddition,
@@ -32,7 +31,6 @@ import {
   markLostNode,
   NodeDatabasePlacement,
   setNodeDatabasePlacement,
-  getNodeStorage,
 } from "../platform/nodes.ts";
 
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
@@ -73,24 +71,6 @@ function register(
   app.openapi(createRoute(route), handler);
 }
 export function registerNodes(app: ApiApp): void {
-  register(
-    app,
-    {
-      method: "get",
-      path: "/v1/nodes/{id}/storage",
-      security,
-      tags: ["Nodes"],
-      request: { params: z.object({ id: NodeId }) },
-      responses: responses(
-        z.strictObject({
-          node_id: NodeId,
-          region_id: RegionId,
-          sample: NodeStorageSample.nullable(),
-        }),
-      ),
-    },
-    (c) => getNodeStorage(c, NodeId.parse(c.req.param("id"))),
-  );
   register(
     app,
     {

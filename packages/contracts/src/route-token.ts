@@ -1,87 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
-// Edge-to-gateway routing token. Pure WebCrypto so it runs in Workers and Node.
+// Edge-to-gateway routing tokens. Pure WebCrypto so they run in Workers and Node.
 //
-// Token:      v3.<payloadB64u>.<sigB64u>
-// Signature:  HMAC-SHA256(K, "pgcf-route/v3\n" + payloadB64u)
-// Region key: K = HMAC-SHA256(master[kid], "pgcf-route-key/v1\n" + regionId)
+// A route is signed for one node and verified only by that node's gateway:
+//   Token:      <prefix>.<payloadB64u>.<sigB64u>
+//   Signature:  HMAC-SHA256(K, "pgcf-route/<prefix>\n" + payloadB64u)
+//   Node key:   K = HMAC-SHA256(master[kid], "pgcf-route-key/v2\n" + nodeId)
+// The Edge holds the master keyring and signs; a gateway holds only the keyring derived for its
+// own node, so a compromised node cannot mint a token for any other node.
 //
-// A v3 token names the database generation and verified primary Pod that Cloudflare
-// admitted; v4 adds an independent route revision under a separate signature domain.
-// The edge holds the master keyring and signs; a gateway holds only the keyring
-// derived for its own region, so a compromised gateway cannot mint tokens for
-// any other region.
+// A v6 token is the route to an awake database (ULTRA plan 5.3, 5.8): it names the database
+// generation the node runs, the admission route revision, the node and the invocation ID of the
+// PostgreSQL unit that serves the database. The gateway admits it only on the unit its table shows.
 //
-// A v5 token is the Edge's wake ticket for a sleeping database (pool design 2026-10-16): it
-// carries the wake operation, the generation the wake claims in D1, the admission route revision
-// and a hash of the role revisions, and no Pod, because the Pod is not known when it is signed.
-// `v: 5` is the wake flag; v5 is issued only for a wake ticket. Rust: native-protocol wake.rs.
+// A v5 token is the Edge's wake ticket for a sleeping database: it carries the wake operation, the
+// generation the wake claims in D1, the admission route revision and a hash of the role revisions,
+// and no unit, because the unit does not exist when it is signed. `v: 5` is the wake flag; v5 is
+// issued only for a wake ticket. The gateway routes a released ticket as the v6 route of the unit
+// the agent started. Rust: packages/native-protocol (route.rs, wake.rs).
 //
-// A v6 token is the route to a node (ULTRA plan 5.3, 5.8): it names the database generation, the
-// admission route revision, the node and the systemd invocation ID of the PostgreSQL unit that
-// serves the database. Its key, and that of a v5 ticket signed for a node, is derived per node
-// (K = HMAC-SHA256(master[kid], "pgcf-route-key/v2\n" + nodeId)), so a node verifies only the
-// tokens made for it. The region-derived keys and v2-v4 stay until the Rust gateway
-// (packages/native-protocol) and the Rust Edge (apps/edge-rust) verify and sign v6; they are the
-// only readers of them, through the conformance vectors.
-//
-// Temporary rollout compatibility: v2 tokens (prefix "v2", domain "pgcf-route/v2\n")
-// carry no route revision or target. The Edge signs them only for an admission without
-// a target, which the Actor returns only outside a v3 region: one whose assigned release
-// declares route_token_version 3 and has converged (routeTokenV3Sql in the API). Gateways
-// still accept them. Remove v2 signing and verification and make the admission target
-// required once every region's release declares v3; a missing target is then refused.
+// The routes of the Kubernetes runtime (v2 to v4, keyed per region and naming a Pod) are deleted.
 import { z } from "zod";
-import {
-  CnpgDatabaseTarget,
-  type DatabaseWakeTicket,
-} from "./database-admission.ts";
+import { type DatabaseWakeTicket } from "./database-admission.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import {
-  DATABASE_ID_PATTERN,
   NODE_ID_PATTERN,
   NodeId,
   OperationId,
   REGION_ID_PATTERN,
+  DATABASE_ID_PATTERN,
   RoleName,
 } from "./ids.ts";
 
 export const ROUTE_TOKEN_HEADER = "X-PGCF-Route";
-export const ROUTE_TOKEN_MAX_LENGTH = 512;
-export const ROUTE_TOKEN_ADMISSION_MAX_LENGTH = 1280;
+export const ROUTE_TOKEN_MAX_LENGTH = 1280;
 export const ROUTE_TOKEN_SIGN_TTL_SECONDS = 30;
 export const ROUTE_TOKEN_MAX_LIFETIME_SECONDS = 30;
 export const ROUTE_TOKEN_SKEW_SECONDS = 5;
 export const ROUTE_KEY_MIN_BYTES = 32;
 
-const TOKEN_PREFIX = "v3";
-const SIGNATURE_DOMAIN = "pgcf-route/v3\n";
-const ADMISSION_TOKEN_PREFIX = "v4";
-const ADMISSION_SIGNATURE_DOMAIN = "pgcf-route/v4\n";
 const WAKE_TOKEN_PREFIX = "v5";
 const WAKE_SIGNATURE_DOMAIN = "pgcf-route/v5\n";
 const NODE_TOKEN_PREFIX = "v6";
 const NODE_SIGNATURE_DOMAIN = "pgcf-route/v6\n";
-const LEGACY_TOKEN_PREFIX = "v2";
-const LEGACY_SIGNATURE_DOMAIN = "pgcf-route/v2\n";
-const KEY_DOMAIN = "pgcf-route-key/v1\n";
 const NODE_KEY_DOMAIN = "pgcf-route-key/v2\n";
 const SIGNATURE_BYTES = 32;
 /** Authoritative wire constants for generated native consumers. */
-export const ROUTE_TOKEN_PREFIX = TOKEN_PREFIX;
-export const ROUTE_TOKEN_SIGNATURE_DOMAIN = SIGNATURE_DOMAIN;
-export const ROUTE_TOKEN_ADMISSION_PREFIX = ADMISSION_TOKEN_PREFIX;
-export const ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN =
-  ADMISSION_SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_WAKE_PREFIX = WAKE_TOKEN_PREFIX;
 export const ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN = WAKE_SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_NODE_PREFIX = NODE_TOKEN_PREFIX;
 export const ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN = NODE_SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_NODE_KEY_DOMAIN = NODE_KEY_DOMAIN;
-/** Temporary rollout compatibility; the module comment names the removal condition. */
-export const ROUTE_TOKEN_LEGACY_PREFIX = LEGACY_TOKEN_PREFIX;
-export const ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN = LEGACY_SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_SIGNATURE_BYTES = SIGNATURE_BYTES;
-export const ROUTE_TOKEN_KEY_DOMAIN = KEY_DOMAIN;
 
 const kidPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const cidPattern =
@@ -96,23 +65,6 @@ const connectionClaims = {
   iat: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   exp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 };
-export const routeTokenClaimsSchema = z.strictObject({
-  v: z.literal(3),
-  ...connectionClaims,
-  /** Existing database generation, unchanged for v3 and v4. */
-  rev: CnpgDatabaseTarget.shape.revision,
-  /** The verified primary Pod of that revision. */
-  pod: CnpgDatabaseTarget.shape.pod_uid,
-});
-export type RouteTokenClaims = z.infer<typeof routeTokenClaimsSchema>;
-export const cnpgAdmissionRouteTokenClaimsSchema =
-  routeTokenClaimsSchema.extend({
-    v: z.literal(4),
-    route_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  });
-export type AdmissionRouteTokenClaims = z.infer<
-  typeof cnpgAdmissionRouteTokenClaimsSchema
->;
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const RoleRevisionHash = z.string().regex(/^[a-f0-9]{64}$/);
 /**
@@ -140,15 +92,6 @@ export const wakeRouteTokenClaimsSchema = z.strictObject({
   rh: RoleRevisionHash,
 });
 export type WakeRouteTokenClaims = z.infer<typeof wakeRouteTokenClaimsSchema>;
-/** Temporary rollout compatibility: no route revision or target. */
-export const legacyRouteTokenClaimsSchema = z.strictObject({
-  v: z.literal(2),
-  ...connectionClaims,
-});
-export type LegacyRouteTokenClaims = z.infer<
-  typeof legacyRouteTokenClaimsSchema
->;
-
 /** Keys are raw bytes by kid; `active` names the key used for signing. */
 export interface RouteKeyring {
   readonly active: string;
@@ -162,7 +105,7 @@ const keyringJsonSchema = z.strictObject({
 
 /**
  * Parses a keyring secret `{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`.
- * The same shape holds master keys (edge) and derived region keys (gateway).
+ * The same shape holds master keys (edge) and derived node keys (gateway).
  * Throws on invalid configuration; the error never contains key material.
  */
 export function parseRouteKeyring(json: string): RouteKeyring {
@@ -194,29 +137,6 @@ export function serializeRouteKeyring(keyring: RouteKeyring): string {
   return JSON.stringify({ active: keyring.active, keys });
 }
 
-/** K = HMAC-SHA256(master, "pgcf-route-key/v1\n" + regionId), 32 raw bytes. */
-export async function deriveRegionKey(
-  master: Uint8Array,
-  regionId: string,
-): Promise<Uint8Array> {
-  if (!REGION_ID_PATTERN.test(regionId))
-    throw new RangeError("invalid region id");
-  if (master.length < ROUTE_KEY_MIN_BYTES)
-    throw new RangeError("master key too short");
-  return hmac(master, KEY_DOMAIN + regionId);
-}
-
-/** Derives the keyring a gateway of `regionId` verifies with. */
-export async function deriveRegionKeyring(
-  master: RouteKeyring,
-  regionId: string,
-): Promise<RouteKeyring> {
-  const keys = new Map<string, Uint8Array>();
-  for (const [kid, bytes] of master.keys)
-    keys.set(kid, await deriveRegionKey(bytes, regionId));
-  return { active: master.active, keys };
-}
-
 /** K = HMAC-SHA256(master, "pgcf-route-key/v2\n" + nodeId), 32 raw bytes. */
 export async function deriveNodeKey(
   master: Uint8Array,
@@ -239,56 +159,23 @@ export async function deriveNodeKeyring(
   return { active: master.active, keys };
 }
 
-export interface SignRouteTokenInput {
+/** What every route signs: the connection and the node whose key seals it. */
+export interface SignRouteInput {
   /** Master keyring; the active key signs. */
   readonly keyring: RouteKeyring;
   readonly region: string;
+  /** The node the database runs on; its key signs, and only its gateway verifies. */
+  readonly node: string;
   readonly db: string;
   readonly user: RoleName;
   readonly cid: string;
-  /** The admission's verified connection target. */
-  readonly target: CnpgDatabaseTarget;
   /** Milliseconds since the epoch. */
   readonly now?: number;
   readonly ttlSeconds?: number;
 }
 
-export async function signRouteToken(
-  input: SignRouteTokenInput,
-): Promise<string> {
-  if (input.target?.route_revision !== undefined)
-    return seal(
-      input,
-      cnpgAdmissionRouteTokenClaimsSchema.safeParse({
-        v: 4,
-        ...connection(input),
-        rev: input.target.revision,
-        pod: input.target.pod_uid,
-        route_revision: input.target.route_revision,
-      }),
-      ADMISSION_TOKEN_PREFIX,
-      ADMISSION_SIGNATURE_DOMAIN,
-    );
-  return seal(
-    input,
-    routeTokenClaimsSchema.safeParse({
-      v: 3,
-      ...connection(input),
-      rev: input.target?.revision,
-      pod: input.target?.pod_uid,
-    }),
-    TOKEN_PREFIX,
-    SIGNATURE_DOMAIN,
-  );
-}
-
-export interface SignWakeRouteTokenInput extends Omit<
-  SignRouteTokenInput,
-  "target"
-> {
+export interface SignWakeRouteTokenInput extends SignRouteInput {
   readonly wake: DatabaseWakeTicket;
-  /** The node the ticket is for; its key signs. Without it the region's key signs. */
-  readonly node?: string;
 }
 
 /** A v5 wake ticket for a sleeping database. */
@@ -307,15 +194,10 @@ export async function signWakeRouteToken(
     }),
     WAKE_TOKEN_PREFIX,
     WAKE_SIGNATURE_DOMAIN,
-    input.node,
   );
 }
 
-export interface SignNodeRouteTokenInput extends Omit<
-  SignRouteTokenInput,
-  "target"
-> {
-  readonly node: string;
+export interface SignNodeRouteTokenInput extends SignRouteInput {
   /** What the node's unit runs: its generation, the route revision and its invocation ID. */
   readonly target: {
     readonly revision: number;
@@ -340,7 +222,6 @@ export async function signNodeRouteToken(
     }),
     NODE_TOKEN_PREFIX,
     NODE_SIGNATURE_DOMAIN,
-    input.node,
   );
 }
 
@@ -359,19 +240,7 @@ export async function roleRevisionHash(
   );
 }
 
-/** Temporary rollout compatibility: a v2 token for an admission without a verified target. */
-export async function signLegacyRouteToken(
-  input: Omit<SignRouteTokenInput, "target">,
-): Promise<string> {
-  return seal(
-    input,
-    legacyRouteTokenClaimsSchema.safeParse({ v: 2, ...connection(input) }),
-    LEGACY_TOKEN_PREFIX,
-    LEGACY_SIGNATURE_DOMAIN,
-  );
-}
-
-function connection(input: Omit<SignRouteTokenInput, "target">) {
+function connection(input: SignRouteInput) {
   const ttl = input.ttlSeconds ?? ROUTE_TOKEN_SIGN_TTL_SECONDS;
   if (!Number.isInteger(ttl) || ttl < 1 || ttl > ROUTE_TOKEN_SIGN_TTL_SECONDS)
     throw new RangeError("ttlSeconds must be an integer in 1..30");
@@ -387,28 +256,18 @@ function connection(input: Omit<SignRouteTokenInput, "target">) {
   };
 }
 
-/** Signs with the key of `node` when given, else with the key of the region. */
+/** Signs with the key of the node. */
 async function seal(
-  input: Omit<SignRouteTokenInput, "target">,
-  claims: z.ZodSafeParseResult<
-    | RouteTokenClaims
-    | AdmissionRouteTokenClaims
-    | WakeRouteTokenClaims
-    | NodeRouteTokenClaims
-    | LegacyRouteTokenClaims
-  >,
+  input: SignRouteInput,
+  claims: z.ZodSafeParseResult<WakeRouteTokenClaims | NodeRouteTokenClaims>,
   prefix: string,
   domain: string,
-  node?: string,
 ): Promise<string> {
   const master = input.keyring.keys.get(input.keyring.active);
   if (master === undefined) throw new RangeError("active key missing");
   if (!claims.success) throw new RangeError("invalid route token claims");
   const payload = bytesToBase64url(encoder.encode(JSON.stringify(claims.data)));
-  const key =
-    node === undefined
-      ? await deriveRegionKey(master, input.region)
-      : await deriveNodeKey(master, node);
+  const key = await deriveNodeKey(master, input.node);
   const signature = await hmac(key, domain + payload);
   return `${prefix}.${payload}.${bytesToBase64url(signature)}`;
 }
@@ -430,17 +289,12 @@ export type RouteTokenFailure =
 export type RouteTokenResult =
   | {
       readonly ok: true;
-      readonly claims:
-        | RouteTokenClaims
-        | AdmissionRouteTokenClaims
-        | WakeRouteTokenClaims
-        | NodeRouteTokenClaims
-        | LegacyRouteTokenClaims;
+      readonly claims: WakeRouteTokenClaims | NodeRouteTokenClaims;
     }
   | { readonly ok: false; readonly reason: RouteTokenFailure };
 
 export interface VerifyRouteTokenInput {
-  /** The keys by kid (the gateway's derived keyring). */
+  /** The keys by kid (the gateway's node keyring). */
   readonly keys: ReadonlyMap<string, Uint8Array>;
   /** The region this verifier serves. */
   readonly region: string;
@@ -458,26 +312,11 @@ export async function verifyRouteToken(
   const time = input.now ?? Date.now();
   if (!Number.isFinite(time)) return fail("invalid_time");
   if (typeof token !== "string" || token.length === 0) return fail("missing");
-  if (
-    token.length >
-    (token.startsWith(`${ADMISSION_TOKEN_PREFIX}.`) ||
-    token.startsWith(`${WAKE_TOKEN_PREFIX}.`) ||
-    token.startsWith(`${NODE_TOKEN_PREFIX}.`)
-      ? ROUTE_TOKEN_ADMISSION_MAX_LENGTH
-      : ROUTE_TOKEN_MAX_LENGTH)
-  )
-    return fail("too_long");
+  if (token.length > ROUTE_TOKEN_MAX_LENGTH) return fail("too_long");
   const parts = token.split(".");
-  // Temporary rollout compatibility: v2 keeps its own prefix, domain and claims.
-  const legacy = parts[0] === LEGACY_TOKEN_PREFIX;
-  const admission = parts[0] === ADMISSION_TOKEN_PREFIX;
   const wake = parts[0] === WAKE_TOKEN_PREFIX;
   const node = parts[0] === NODE_TOKEN_PREFIX;
-  if (
-    parts.length !== 3 ||
-    (parts[0] !== TOKEN_PREFIX && !legacy && !admission && !wake && !node)
-  )
-    return fail("malformed");
+  if (parts.length !== 3 || (!wake && !node)) return fail("malformed");
   const payload = parts[1] as string;
   const payloadBytes = base64urlToBytes(payload);
   const signature = base64urlToBytes(parts[2] as string);
@@ -503,28 +342,12 @@ export async function verifyRouteToken(
     return fail("unknown_kid");
   const expected = await hmac(
     key,
-    (legacy
-      ? LEGACY_SIGNATURE_DOMAIN
-      : admission
-        ? ADMISSION_SIGNATURE_DOMAIN
-        : wake
-          ? WAKE_SIGNATURE_DOMAIN
-          : node
-            ? NODE_SIGNATURE_DOMAIN
-            : SIGNATURE_DOMAIN) + payload,
+    (wake ? WAKE_SIGNATURE_DOMAIN : NODE_SIGNATURE_DOMAIN) + payload,
   );
   if (!constantTimeEqual(expected, signature)) return fail("bad_signature");
 
   const claims = (
-    legacy
-      ? legacyRouteTokenClaimsSchema
-      : admission
-        ? cnpgAdmissionRouteTokenClaimsSchema
-        : wake
-          ? wakeRouteTokenClaimsSchema
-          : node
-            ? nodeRouteTokenClaimsSchema
-            : routeTokenClaimsSchema
+    wake ? wakeRouteTokenClaimsSchema : nodeRouteTokenClaimsSchema
   ).safeParse(decoded);
   if (!claims.success) return fail("invalid_claims");
   const { rg, iat, exp } = claims.data;

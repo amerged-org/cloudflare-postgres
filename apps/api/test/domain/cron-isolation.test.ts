@@ -10,7 +10,7 @@ import {
   cronErrorMessage,
 } from "../../src/domain/cron-health.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
-import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
+import { recordNodeMemoryObservation } from "./memory-fixture.ts";
 import { infrastructureAlertStatus } from "../../src/domain/infrastructure-alerts.ts";
 import { configureInfrastructureBackups } from "../../src/domain/infrastructure-backups.ts";
 import type { Env } from "../../src/env.ts";

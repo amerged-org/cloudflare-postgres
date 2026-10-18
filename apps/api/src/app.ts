@@ -70,7 +70,6 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/regions/:id/release",
   "/v1/nodes/:id/release",
   "/v1/nodes",
-  "/v1/nodes/:id/storage",
   "/v1/nodes/additions",
   "/v1/nodes/additions/:id",
   "/v1/nodes/additions/:id/approve",

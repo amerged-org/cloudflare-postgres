@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The node itself: `Storage` on LVM, `Units` over systemd's D-Bus, the users in `/etc/passwd`
 //! and `initdb` as the database's user.
-use super::{Account, CpuTimes, Machine, Memory, initdb_arguments};
+use super::{Account, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
 use crate::{
     layout::Layout,
+    link::NodeIdentity,
     storage::{
         self, Config, Inventory, NoRoom, PoolSample, Removal, Storage, SystemRunner, VolumeId,
     },
@@ -364,22 +365,16 @@ impl Machine for Node {
 
     async fn apply_credentials(
         &self,
-        region: &str,
+        node: &NodeIdentity,
         credentials: &serde_json::Value,
         restart: bool,
     ) -> io::Result<()> {
         use crate::link::file::{create_private_directory, sync_directory, write_private};
         let directory = self.layout.state.join("credentials");
         create_private_directory(&directory)?;
-        // The route keyring, as the gateway's environment reads it: one line in single quotes,
-        // which an environment file takes literally.
-        let keyring = serde_json::to_string(&credentials["route_keyring"])?;
-        if keyring.contains(['\'', '\n']) || !crate::valid_region(region) {
-            return Err(io::Error::other("credentials that cannot be written"));
-        }
         write_private(
             &directory.join("gateway.env"),
-            format!("PGCF_REGION_ID={region}\nPGCF_ROUTE_KEY='{keyring}'\n").as_bytes(),
+            gateway_environment(node, credentials)?.as_bytes(),
         )?;
         // The Tunnel token becomes an encrypted systemd credential: through a file, since a
         // command line is public to the node's users.

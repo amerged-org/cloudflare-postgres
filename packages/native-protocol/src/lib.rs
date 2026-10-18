@@ -44,21 +44,6 @@ static PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
         })
         .collect()
 });
-static CLAIM_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
-    let mut result = HashMap::new();
-    for name in ["routeClaims", "admissionRouteClaims", "legacyRouteClaims"] {
-        for (field, value) in CONTRACT[name]["properties"].as_object().unwrap() {
-            if let Some(pattern) = value["pattern"].as_str() {
-                result.insert(
-                    format!("{name}/{field}"),
-                    Regex::new(pattern).expect("generated regex"),
-                );
-            }
-        }
-    }
-    result
-});
-
 pub fn valid_pattern(name: &str, value: &str) -> bool {
     PATTERNS
         .get(name)
@@ -78,87 +63,4 @@ pub fn valid_role(value: &str) -> bool {
             .expect("generated prefixes")
             .iter()
             .any(|v| value.starts_with(v.as_str().expect("generated prefix")))
-}
-
-/// The generated route schema uses this bounded JSON Schema subset. Unknown keywords
-/// never influence authorization; the generator rejects unhandled structural changes.
-pub fn valid_claims(value: &Value) -> bool {
-    valid_schema("routeClaims", value) && value["user"].as_str().is_some_and(valid_role)
-}
-/// Temporary rollout compatibility: v2 claims without a route revision or target.
-pub fn valid_legacy_claims(value: &Value) -> bool {
-    valid_schema("legacyRouteClaims", value) && value["user"].as_str().is_some_and(valid_role)
-}
-pub fn valid_schema(name: &str, value: &Value) -> bool {
-    let schema = &CONTRACT[name];
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    let properties = schema["properties"]
-        .as_object()
-        .expect("generated properties");
-    if object.len() != properties.len() {
-        return false;
-    }
-    for (key, field) in properties {
-        let Some(value) = object.get(key) else {
-            return false;
-        };
-        if let Some(expected) = field.get("const")
-            && value != expected
-        {
-            return false;
-        }
-        match field["type"].as_str() {
-            Some("string") => {
-                let Some(text) = value.as_str() else {
-                    return false;
-                };
-                if let Some(pattern) = CLAIM_PATTERNS.get(&format!("{name}/{key}"))
-                    && !pattern.is_match(text)
-                {
-                    return false;
-                }
-                if field["minLength"]
-                    .as_u64()
-                    .is_some_and(|n| text.encode_utf16().count() < n as usize)
-                    || field["maxLength"]
-                        .as_u64()
-                        .is_some_and(|n| text.encode_utf16().count() > n as usize)
-                {
-                    return false;
-                }
-                if let Some(choices) = field["enum"].as_array()
-                    && !choices.contains(value)
-                {
-                    return false;
-                }
-            }
-            Some("integer") => {
-                let Some(number) = value.as_u64() else {
-                    return false;
-                };
-                if number < field["minimum"].as_u64().unwrap_or(0)
-                    || number > field["maximum"].as_u64().unwrap_or(u64::MAX)
-                    || field["exclusiveMinimum"]
-                        .as_u64()
-                        .is_some_and(|v| number <= v)
-                {
-                    return false;
-                }
-            }
-            Some("boolean") => {
-                if !value.is_boolean() {
-                    return false;
-                }
-            }
-            Some("number") => {
-                if value.as_u64().is_none() {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
 }

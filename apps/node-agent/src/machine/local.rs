@@ -6,6 +6,7 @@
 use super::{Account, CpuTimes, Machine, Memory, initdb_arguments};
 use crate::{
     layout::Layout,
+    link::NodeIdentity,
     storage::{
         self, FsUsage, Inventory, MountInfo, NoRoom, PoolMode, PoolSample, Removal, VolumeId,
         VolumeInfo,
@@ -62,8 +63,8 @@ struct State {
     archive_commands: HashMap<String, String>,
     /// Every database archives straight into its upload log.
     direct_archive: bool,
-    /// The credentials applied: region, revision, restart.
-    credentials: Vec<(String, u64, bool)>,
+    /// The credentials applied: region, node, revision, restart.
+    credentials: Vec<(String, String, u64, bool)>,
 }
 
 pub struct Local {
@@ -154,7 +155,7 @@ impl Local {
     pub fn quota(&self, database: &str) -> Option<Option<NonZeroU32>> {
         self.state().quotas.get(database).copied()
     }
-    pub fn credentials_applied(&self) -> Vec<(String, u64, bool)> {
+    pub fn credentials_applied(&self) -> Vec<(String, String, u64, bool)> {
         self.state().credentials.clone()
     }
     pub fn slice_memory_mib(&self) -> Option<u64> {
@@ -188,6 +189,18 @@ impl Local {
     }
     pub fn set_units_unreadable(&self, unreadable: bool) {
         self.state().units_unreadable = unreadable;
+    }
+    /// A unit that exists and is stopped, as one is after a stop or a boot.
+    pub fn add_stopped_unit(&self, database: &str) {
+        self.state().units.insert(
+            database.to_string(),
+            Unit {
+                child: None,
+                crashed: false,
+                invocations: 0,
+                invocation_id: None,
+            },
+        );
     }
     pub fn has_account(&self, database: &str) -> bool {
         self.state().accounts.iter().any(|a| a == database)
@@ -668,12 +681,13 @@ impl Machine for Local {
 
     async fn apply_credentials(
         &self,
-        region: &str,
+        node: &NodeIdentity,
         credentials: &serde_json::Value,
         restart: bool,
     ) -> io::Result<()> {
         self.state().credentials.push((
-            region.to_string(),
+            node.region_id.clone(),
+            node.id.clone(),
             credentials["revision"].as_u64().unwrap_or(0),
             restart,
         ));
