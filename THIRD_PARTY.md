@@ -94,7 +94,7 @@ read from the installed package manifests.
 | [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).                              |
 
 Direct root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescript-eslint`,
-`prettier` and `@types/node`) and the development type package `@types/ws` are not intentionally
+`prettier` and `@types/node`) and the development type packages `@types/pg` and `@types/ws` are not intentionally
 installed as runtime dependencies. Resolved dependency versions are recorded in `pnpm-lock.yaml`;
 build and test tooling is not relicensed as first-party code.
 
