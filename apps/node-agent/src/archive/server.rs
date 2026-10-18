@@ -225,7 +225,13 @@ impl Server {
             Err(Busy) => return Reply::Failed(Some("agent_busy")),
         };
         if !outcome.succeeded() {
-            log("archive_failed", registration, name, &outcome, &credential);
+            log_failed_job(
+                "archive_failed",
+                &registration.database.id,
+                name,
+                &outcome,
+                &credential,
+            );
             return entry.failed(if outcome.exit == Exit::TimedOut {
                 "upload_timeout"
             } else {
@@ -233,9 +239,9 @@ impl Server {
             });
         }
         if registration.upload_log.append(name).await.is_err() {
-            log(
+            log_failed_job(
                 "archive_log_failed",
-                registration,
+                &registration.database.id,
                 name,
                 &outcome,
                 &credential,
@@ -314,7 +320,13 @@ fn fetch_failed(
             Reply::Missing
         };
     }
-    log("fetch_failed", registration, name, outcome, credential);
+    log_failed_job(
+        "fetch_failed",
+        &registration.database.id,
+        name,
+        outcome,
+        credential,
+    );
     Reply::Failed(Some(if outcome.exit == Exit::TimedOut {
         "fetch_timeout"
     } else {
@@ -332,7 +344,7 @@ impl Entry {
     }
 }
 
-fn unix_seconds() -> u64 {
+pub(super) fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
@@ -367,9 +379,9 @@ async fn read_line(stream: &mut UnixStream) -> Option<Vec<u8>> {
 
 /// A line of the agent's log about a failed job. The command's stderr is cut short and holds no
 /// part of the credential.
-fn log(
+pub(super) fn log_failed_job(
     event: &str,
-    registration: &Registration,
+    database_id: &str,
     name: &str,
     outcome: &Outcome,
     credential: &Credential,
@@ -381,7 +393,7 @@ fn log(
         .unwrap_or(stderr.len());
     crate::timing::emit_event(json!({
         "event": event,
-        "database_id": registration.database.id,
+        "database_id": database_id,
         "file": name,
         "exit": format!("{:?}", outcome.exit),
         "elapsed_ms": outcome.elapsed.as_millis() as u64,

@@ -8,8 +8,8 @@ use super::{
     facts::{self, Backup},
     protocol::AGENT_BOUND,
     recovery::{self, Restored},
-    server::{Recovery, Registration},
-    test_support::{ARCHIVE, Node, database, store},
+    restore::{End, Failed, Host, Order, Restorer},
+    test_support::{ARCHIVE, CREDENTIAL_CHECK, Node, database, store},
     upload_log::UploadLog,
 };
 use crate::credentials::Access;
@@ -18,6 +18,7 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -129,6 +130,28 @@ impl Postgres {
                 "stop",
             ])
             .output();
+    }
+    /// The answer of `sql`, or `None` when the server does not answer.
+    fn try_sql(&self, sql: &str) -> Option<String> {
+        let output = Command::new(self.bin.join("psql"))
+            .args([
+                "-X",
+                "-At",
+                "-h",
+                self.socket().to_str().unwrap(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-c",
+                sql,
+            ])
+            .output()
+            .unwrap();
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().into())
     }
     fn sql(&self, sql: &str) -> String {
         run(
@@ -248,73 +271,120 @@ async fn postgresql_marks_a_segment_archived_only_after_the_agent_has_it_in_r2_a
     assert!(unfailing.iter().all(|file| file.name != segment));
 }
 
-/// Restores the base backup `base` into a new volume of the node and brings it up as the
-/// database that recovers from `ARCHIVE`: the agent's restore, with the barman copy done by the
-/// test. Returns the new cluster, or the log of its failed start.
-fn recover(
-    node: &Node,
-    bin: &Path,
-    fetch_client: &Path,
-    base: &Path,
-    name: &str,
-    target_time: Option<&str>,
-    required_through: Option<&str>,
-) -> (Postgres, Result<(), String>) {
+/// The database a restore builds, as the modules that own units and connections do for it, here
+/// with `pg_ctl` and `psql`.
+struct ClusterHost<'a> {
+    pg: &'a Postgres,
+    abandoned: AtomicBool,
+}
+impl Host for ClusterHost<'_> {
+    async fn start(&self) -> Result<(), Failed> {
+        // The configuration of the new database: no archiving here, and the recovery settings
+        // included from the file the agent writes and later removes.
+        fs::write(
+            self.pg.data().join("postgresql.conf"),
+            self.pg
+                .settings("include_if_exists = 'pgcf-recovery.conf'\n"),
+        )
+        .unwrap();
+        self.pg.start().map_err(|_| Failed)
+    }
+    async fn promoted(&self) -> Result<Restored, Failed> {
+        let started = Instant::now();
+        loop {
+            match self.pg.try_sql("SELECT pg_is_in_recovery()").as_deref() {
+                // The server is gone: the recovery died.
+                None => return Err(Failed),
+                Some("f") => break,
+                Some(_) if started.elapsed() > Duration::from_secs(60) => return Err(Failed),
+                Some(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        self.pg.sql("CHECKPOINT");
+        Ok(Restored {
+            in_recovery: false,
+            system_identifier: self
+                .pg
+                .sql("SELECT system_identifier FROM pg_control_system()"),
+            timeline: self
+                .pg
+                .sql("SELECT timeline_id FROM pg_control_checkpoint()")
+                .parse()
+                .unwrap(),
+        })
+    }
+    async fn abandon(&self) {
+        self.pg.stop();
+        self.abandoned.store(true, Ordering::SeqCst);
+    }
+}
+
+const BACKUP: &str = "20261017T225342";
+const OPERATION: &str = "op_dddddddddddddddddddd";
+
+/// A new database in the volume `name` of the node: nothing in it yet.
+fn new_database(node: &Node, bin: &Path, name: &str) -> Postgres {
     let volume = node.root.join(name);
     fs::create_dir_all(&volume).unwrap();
-    // A clone where the file system has them (APFS): copying the cluster is most of the time.
-    let clone = if cfg!(target_os = "macos") {
-        "-Rc"
-    } else {
-        "-R"
-    };
-    run(
-        Path::new("cp"),
-        &[
-            clone,
-            base.to_str().unwrap(),
-            volume.join("data").to_str().unwrap(),
-        ],
-    );
-    fs::set_permissions(volume.join("data"), fs::Permissions::from_mode(0o700)).unwrap();
-    let pg = Postgres {
+    // What barman leaves behind when it prefetches.
+    let spool = recovery::spool_directory(&volume, OPERATION);
+    fs::create_dir_all(&spool).unwrap();
+    fs::write(spool.join("000000010000000000000099"), b"prefetched").unwrap();
+    Postgres {
         bin: bin.into(),
-        volume: volume.clone(),
+        volume,
+    }
+}
+/// A restore of `BACKUP` of `ARCHIVE` into `pg` by the executor, with the database's own archive
+/// at generation `generation`; whether the database was abandoned comes with the result.
+async fn restore(
+    node: &Node,
+    pg: &Postgres,
+    fetch_client: &Path,
+    generation: u32,
+    target_time: Option<&str>,
+    end: Option<&End>,
+) -> (Result<Backup, &'static str>, bool) {
+    let own = store(
+        &format!("s3://pgcf-eu/eu-dev/zyxwvutsrqponmlkjihg/g{generation}-{OPERATION}"),
+        Access::ReadWrite,
+    );
+    node.credentials.hold(
+        own.scope.clone(),
+        crate::archive::test_support::credential(),
+    );
+    let source = store(ARCHIVE, Access::ReadOnly);
+    let log = UploadLog::new(pg.volume.join("uploads"));
+    let owner = fs::metadata(&pg.volume).unwrap();
+    let database = database(&pg.volume);
+    let order = Order {
+        database: &database,
+        uid: owner.uid(),
+        gid: owner.gid(),
+        source: &source,
+        backup_id: BACKUP,
+        target_time,
+        end,
+        store: &own,
+        upload_log: &log,
+        operation: OPERATION,
     };
-    // The configuration of the new database: no archiving here, and the recovery settings
-    // included from the file the agent writes and later removes.
-    fs::write(
-        pg.data().join("postgresql.conf"),
-        pg.settings("include_if_exists = 'pgcf-recovery.conf'\n"),
-    )
-    .unwrap();
-    let owner = fs::metadata(&volume).unwrap();
-    recovery::prepare(
-        &pg.data(),
-        &recovery::settings(fetch_client.to_str().unwrap(), target_time).unwrap(),
-        owner.uid(),
-        owner.gid(),
-    )
-    .unwrap();
-    let spool = recovery::spool_directory(&volume, "op_dddddddddddddddddddd");
-    node.table.set(Registration {
-        database: database(&volume),
-        uid: node.uid,
-        store: store(ARCHIVE, Access::ReadWrite),
-        recovery: Some(Recovery {
-            source: store(ARCHIVE, Access::ReadOnly),
-            spool,
-            required_through: required_through.map(Into::into),
-            segment_bytes: 1 << 20,
-        }),
-        upload_log: UploadLog::new(volume.join("uploads")),
-    });
-    let started = pg.start();
-    (pg, started)
+    let host = ClusterHost {
+        pg,
+        abandoned: AtomicBool::new(false),
+    };
+    let restorer = Restorer {
+        table: &node.table,
+        jobs: &node.jobs,
+        credentials: &node.credentials,
+        fetch_command: fetch_client.to_str().unwrap(),
+    };
+    let result = restorer.run(&order, &host).await;
+    (result, host.abandoned.load(Ordering::SeqCst))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_base_backup_of_a_real_cluster_recovers_through_the_socket_to_a_point_in_time_or_to_the_end()
+async fn a_restore_of_a_real_cluster_recovers_to_a_point_in_time_or_to_the_end_and_takes_its_first_backup()
  {
     let Some(bin) = bin_directory() else { return };
     let node = Node::start("pitr", AGENT_BOUND).await;
@@ -326,6 +396,7 @@ async fn a_base_backup_of_a_real_cluster_recovers_through_the_socket_to_a_point_
     let _ = fs::remove_dir_all(source.data());
     source.init(&archiving(&archive_client));
     source.start().unwrap();
+    source.sql("CREATE ROLE pgcf_backup LOGIN");
     source.sql("CREATE TABLE t(id int PRIMARY KEY, batch text)");
     // The base backup: files of the real cluster, with the WAL it needs left to the archive.
     let base = node.root.join("base");
@@ -345,7 +416,7 @@ async fn a_base_backup_of_a_real_cluster_recovers_through_the_socket_to_a_point_
         ],
     );
     let system_identifier = source.sql("SELECT system_identifier FROM pg_control_system()");
-    let timeline = source
+    let timeline: u32 = source
         .sql("SELECT timeline_id FROM pg_control_checkpoint()")
         .parse()
         .unwrap();
@@ -360,89 +431,136 @@ async fn a_base_backup_of_a_real_cluster_recovers_through_the_socket_to_a_point_
         node.log().contains(&last).unwrap()
     });
     source.stop();
-    let backup = Backup {
-        backup_id: "20261017T225342".into(),
-        status: "DONE".into(),
+    // The archive as barman lists it, with the base backup in it; and the barman that takes the
+    // first backup of a new timeline: it connects as the backup role to the socket it was given
+    // and lists what it saw there.
+    node.fixture.put_backup(
+        ARCHIVE,
+        BACKUP,
+        &format!(
+            r#"{{"backup_id":"{BACKUP}","status":"DONE","timeline":{timeline},"systemid":"{system_identifier}","end_wal":null,"end_time_iso":"2026-10-17T22:53:45+00:00","xlog_segment_size":1048576}}"#
+        ),
+        Some(&base),
+    );
+    node.fixture.install(
+        "barman-cloud-backup",
+        format!(
+            r#"#!/bin/sh
+STORE='{store}'
+{CREDENTIAL_CHECK}
+while [ $# -gt 0 ]; do case "$1" in --gzip|--immediate-checkpoint) ;; -J|--endpoint-url) shift ;; --host) host=$2; shift ;; -U) user=$2; shift ;; -d) db=$2; shift ;; *) break ;; esac; shift; done
+dest=$1; server=$2
+psql='{psql}'
+sys=$("$psql" -X -At -h "$host" -U "$user" -d "$db" -c 'SELECT system_identifier FROM pg_control_system()') || exit 3
+tl=$("$psql" -X -At -h "$host" -U "$user" -d "$db" -c 'SELECT timeline_id FROM pg_control_checkpoint()') || exit 3
+id=$(date -u +%Y%m%dT%H%M%S)
+dir="$STORE/objects/${{dest#s3://}}/$server/base/$id"
+mkdir -p "$dir"
+status=DONE; [ -f "$STORE/backup-failed" ] && status=FAILED
+printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal":null,"end_time_iso":"%s","xlog_segment_size":1048576}}' "$id" "$status" "$tl" "$sys" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" > "$dir/backup.json"
+"#,
+            store = node.fixture.store_directory().display(),
+            psql = bin.join("psql").display(),
+            CREDENTIAL_CHECK = CREDENTIAL_CHECK,
+        ),
+    );
+    let end = |last_segment: &str, system_identifier: &str| End {
+        system_identifier: system_identifier.into(),
         timeline,
-        system_identifier: system_identifier.clone(),
-        end_wal: None,
-        completed_at_ms: Some(1),
-        segment_bytes: Some(1 << 20),
+        last_segment: last_segment.into(),
     };
-    let rows = |pg: &Postgres| pg.sql("SELECT count(*) FROM t");
-    let promoted = |pg: &Postgres| {
-        wait_until("the recovery to end", || {
-            pg.sql("SELECT pg_is_in_recovery()") == "f"
-        });
-        pg.sql("CHECKPOINT");
-        Restored {
-            in_recovery: false,
-            system_identifier: pg.sql("SELECT system_identifier FROM pg_control_system()"),
-            timeline: pg
-                .sql("SELECT timeline_id FROM pg_control_checkpoint()")
-                .parse()
-                .unwrap(),
-        }
-    };
+    let spool = |pg: &Postgres| recovery::spool_directory(&pg.volume, OPERATION);
 
-    // A point in time: batch A only; the same database, promoted onto timeline 2.
-    let (pitr, started) = recover(&node, &bin, &fetch_client, &base, "r1", Some(&target), None);
-    started.unwrap();
-    let restored = promoted(&pitr);
-    assert_eq!(rows(&pitr), "1000");
+    // A point in time: batch A only; the same database, promoted onto timeline 2, and its first
+    // base backup on that timeline in its own archive.
+    let pitr = new_database(&node, &bin, "r1");
+    let (result, abandoned) = restore(&node, &pitr, &fetch_client, 2, Some(&target), None).await;
+    let backup = result.unwrap();
+    assert!(!abandoned);
+    assert_eq!(pitr.sql("SELECT count(*) FROM t"), "1000");
     assert_eq!(pitr.sql("SELECT count(*) FROM t WHERE batch = 'B'"), "0");
-    assert_eq!(recovery::verify_restored(&backup, None, &restored), Ok(()));
-    assert!(restored.timeline > timeline);
-    recovery::finish(
-        &pitr.data(),
-        &recovery::spool_directory(&pitr.volume, "op_dddddddddddddddddddd"),
-    )
-    .unwrap();
+    assert_eq!(
+        (
+            backup.status.as_str(),
+            backup.timeline,
+            &backup.system_identifier
+        ),
+        ("DONE", timeline + 1, &system_identifier)
+    );
+    // The recovery's files and spool are gone, and the database archives rather than recovers.
     assert!(!pitr.data().join(recovery::SETTINGS_FILE).exists());
+    assert!(!pitr.data().join(recovery::SIGNAL_FILE).exists());
+    assert!(!spool(&pitr).exists());
+    assert_eq!(
+        node.fetch("000000010000000000000001").await,
+        "failed not_recovering\n"
+    );
     pitr.stop();
 
     // To the end of the archive, as a move target that must reach the source's last segment: all
     // of batch B, and the archive's end is told to PostgreSQL only after that segment.
-    let (end, started) = recover(&node, &bin, &fetch_client, &base, "r2", None, Some(&last));
-    started.unwrap();
-    let restored = promoted(&end);
-    assert_eq!(rows(&end), "2000");
-    assert_eq!(
-        recovery::verify_restored(&backup, Some((&system_identifier, timeline)), &restored),
-        Ok(())
-    );
-    end.stop();
+    let moved = new_database(&node, &bin, "r2");
+    let (result, abandoned) = restore(
+        &node,
+        &moved,
+        &fetch_client,
+        3,
+        None,
+        Some(&end(&last, &system_identifier)),
+    )
+    .await;
+    let backup = result.unwrap();
+    assert!(!abandoned);
+    assert_eq!(moved.sql("SELECT count(*) FROM t"), "2000");
+    assert_eq!(backup.timeline, timeline + 1);
+    moved.stop();
 
     // A move target whose archive lacks a segment of the source's record is not promoted: the
-    // recovery fails instead of ending early, and the database never opens for writes.
+    // recovery fails instead of ending early, the database never opens for writes, and it is
+    // abandoned with its registration.
     let next = format!(
         "{}{:08X}",
         &last[..16],
         u32::from_str_radix(&last[16..], 16).unwrap() + 1
     );
-    let (short, _) = recover(&node, &bin, &fetch_client, &base, "r3", None, Some(&next));
-    wait_until("the recovery to fail", || short.sql_fails());
+    let short = new_database(&node, &bin, "r3");
+    let (result, abandoned) = restore(
+        &node,
+        &short,
+        &fetch_client,
+        4,
+        None,
+        Some(&end(&next, &system_identifier)),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "no_recovery_point");
+    assert!(abandoned);
     let log = short.log();
     assert!(log.contains("could not restore file"), "{log}");
     assert!(!log.contains("archive recovery complete"), "{log}");
-}
+    assert_eq!(
+        node.archive("000000010000000000000001").await,
+        "failed unknown_database\n"
+    );
 
-impl Postgres {
-    fn sql_fails(&self) -> bool {
-        Command::new(self.bin.join("psql"))
-            .args([
-                "-X",
-                "-At",
-                "-h",
-                self.socket().to_str().unwrap(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-c",
-                "SELECT 1",
-            ])
-            .output()
-            .map_or(true, |output| !output.status.success())
-    }
+    // A record of another database: this one recovered to the end of the archive, and is not it.
+    let other = new_database(&node, &bin, "r4");
+    let (result, abandoned) = restore(
+        &node,
+        &other,
+        &fetch_client,
+        5,
+        None,
+        Some(&end(&last, "7697773764701949975")),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "identity_mismatch");
+    assert!(abandoned);
+
+    // The first backup counts when the listing shows it DONE, whatever barman's exit status was.
+    node.fixture.set("backup-failed", "");
+    let unbacked = new_database(&node, &bin, "r5");
+    let (result, abandoned) = restore(&node, &unbacked, &fetch_client, 6, None, None).await;
+    assert_eq!(result.unwrap_err(), "build_failed");
+    assert!(abandoned);
 }

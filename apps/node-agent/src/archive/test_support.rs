@@ -31,7 +31,7 @@ fn script(path: &Path, text: String) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-const CREDENTIAL_CHECK: &str = r#"[ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ] && [ -n "$AWS_SESSION_TOKEN" ] && [ "$AWS_DEFAULT_REGION" = auto ] && [ "$TMPDIR" = /var/tmp ] || { echo 'no credential in the environment' >&2; exit 3; }
+pub const CREDENTIAL_CHECK: &str = r#"[ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ] && [ -n "$AWS_SESSION_TOKEN" ] && [ "$AWS_DEFAULT_REGION" = auto ] && [ "$TMPDIR" = /var/tmp ] || { echo 'no credential in the environment' >&2; exit 3; }
 echo "$AWS_ACCESS_KEY_ID" > "$STORE/key-id""#;
 
 /// A directory with the executables a job needs and the "bucket" they write to.
@@ -140,6 +140,43 @@ gunzip -c "$key" > "$target.part" && mv "$target.part" "$target"
 "#
             ),
         );
+        // barman-cloud-restore: the files of a backup of the "bucket" into the destination.
+        script(
+            &root.join("bin/barman-cloud-restore"),
+            format!(
+                r#"#!/bin/sh
+STORE='{store}'
+{CREDENTIAL_CHECK}
+while [ $# -gt 0 ]; do case "$1" in --endpoint-url) shift ;; *) break ;; esac; shift; done
+dest=$1; server=$2; id=$3; target=$4
+if [ -f "$STORE/restore-fail" ]; then echo 'simulated R2 outage' >&2; exit 4; fi
+src="$STORE/objects/${{dest#s3://}}/$server/base/$id/data"
+if [ ! -d "$src" ]; then echo "Backup $id for server $server does not exist" >&2; exit 1; fi
+if [ -n "$(ls -A "$target" 2>/dev/null)" ]; then echo "$target is not empty" >&2; exit 2; fi
+mkdir -p "$target" && cp -R "$src/." "$target/" && chmod 700 "$target"
+"#
+            ),
+        );
+        // barman-cloud-backup-list: the JSON of the backups of the "bucket", as barman prints it.
+        script(
+            &root.join("bin/barman-cloud-backup-list"),
+            format!(
+                r#"#!/bin/sh
+STORE='{store}'
+{CREDENTIAL_CHECK}
+while [ $# -gt 0 ]; do case "$1" in --format|--endpoint-url) shift ;; *) break ;; esac; shift; done
+dest=$1; server=$2
+if [ -f "$STORE/list-fail" ]; then echo 'simulated R2 outage' >&2; exit 4; fi
+printf '{{"backups_list": ['
+sep=
+for entry in "$STORE/objects/${{dest#s3://}}/$server"/base/*/backup.json; do
+  [ -f "$entry" ] || continue
+  printf '%s' "$sep"; cat "$entry"; sep=,
+done
+printf ']}}\n'
+"#
+            ),
+        );
         // The first start of a new executable can take a second or more on a laptop, which the
         // bounds of the tests do not allow for.
         for file in fs::read_dir(root.join("bin")).unwrap() {
@@ -178,6 +215,39 @@ gunzip -c "$key" > "$target.part" && mv "$target.part" "$target"
             "store/objects/{}/database/wals/{name}.gz",
             destination.strip_prefix("s3://").unwrap()
         ))
+    }
+    /// An executable of the jobs that a test brings itself.
+    pub fn install(&self, name: &str, text: String) {
+        script(&self.root.join("bin").join(name), text);
+    }
+    /// A backup in the "bucket": its entry in the listing barman prints, and the files a restore
+    /// copies, if the test has them.
+    pub fn put_backup(&self, destination: &str, id: &str, entry: &str, files: Option<&Path>) {
+        let backup = self.root.join(format!(
+            "store/objects/{}/database/base/{id}",
+            destination.strip_prefix("s3://").unwrap()
+        ));
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("backup.json"), entry).unwrap();
+        if let Some(files) = files {
+            // A clone where the file system has them (APFS): copying the cluster is most of the time.
+            let clone = if cfg!(target_os = "macos") {
+                "-Rc"
+            } else {
+                "-R"
+            };
+            let copied = Command::new("cp")
+                .arg(clone)
+                .arg(files)
+                .arg(backup.join("data"))
+                .status()
+                .unwrap();
+            assert!(copied.success());
+        }
+    }
+    /// The directory of the "bucket" and the switches of the commands.
+    pub fn store_directory(&self) -> PathBuf {
+        self.root.join("store")
     }
     pub fn put_object(&self, destination: &str, name: &str, bytes: &[u8]) {
         let object = self.object(destination, name);
@@ -284,6 +354,7 @@ pub struct Node {
     pub socket: PathBuf,
     pub table: Arc<Table>,
     pub credentials: Arc<Credentials>,
+    pub jobs: Arc<Jobs>,
     pub uid: u32,
     pub task: tokio::task::JoinHandle<std::convert::Infallible>,
 }
@@ -311,8 +382,9 @@ impl Node {
             Limits::default(),
         ));
         let socket = root.join("a.sock");
-        let server =
-            Arc::new(Server::new(table.clone(), jobs, credentials.clone()).with_bound(bound));
+        let server = Arc::new(
+            Server::new(table.clone(), jobs.clone(), credentials.clone()).with_bound(bound),
+        );
         let task = tokio::spawn(server.serve(bind(&socket).unwrap()));
         let node = Self {
             fixture,
@@ -320,6 +392,7 @@ impl Node {
             socket,
             table,
             credentials,
+            jobs,
             uid,
             task,
         };
