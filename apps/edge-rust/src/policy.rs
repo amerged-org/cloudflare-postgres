@@ -225,3 +225,163 @@ impl GatewayRegion {
         Ok(url)
     }
 }
+/// One rate limiter an admission consults: the binding, the key it counts under, and the message
+/// of the refusal when it denies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limit {
+    pub binding: &'static str,
+    pub key: String,
+    pub message: &'static str,
+}
+/// The limiters of one request, in the order their refusals take precedence. `network` is the
+/// caller's `connection_rate_key`; `scope` prefixes the keys, so that a kind of request (HTTP
+/// queries: `["sql"]`) counts in buckets of its own of the same limiters. A same-account Worker
+/// on a service binding has a budget of its own per database and role, and never drains, or is
+/// drained by, the public buckets.
+pub fn limits(network: &str, hints: &Hints, scope: &[&str]) -> Vec<Limit> {
+    let key = |tail: &[&str]| {
+        let parts: Vec<&str> = scope.iter().chain(tail).copied().collect();
+        serde_json::to_string(&parts).expect("strings serialize")
+    };
+    let identity = key(&[&hints.database, &hints.user, network]);
+    if network == "binding" {
+        return vec![Limit {
+            binding: "BINDING_CONNECTION_RATE_LIMITER",
+            key: identity,
+            message: "connection rate limit exceeded",
+        }];
+    }
+    vec![
+        Limit {
+            binding: "CONNECTION_RATE_LIMITER",
+            key: identity,
+            message: "connection rate limit exceeded",
+        },
+        Limit {
+            binding: "DATABASE_CONNECTION_RATE_LIMITER",
+            key: if scope.is_empty() {
+                hints.database.clone()
+            } else {
+                key(&[&hints.database])
+            },
+            message: "database connection rate limit exceeded",
+        },
+    ]
+}
+/// What the limiters decided, once all of them answered: a limiter that failed refuses the
+/// request as unavailable, ahead of one that denied it. `outcomes` is in the order of `limits`.
+pub fn limit_failure(limits: &[Limit], outcomes: &[Result<bool, ()>]) -> Option<Failure> {
+    if outcomes.iter().any(Result::is_err) {
+        return Some(Failure::unavailable());
+    }
+    limits
+        .iter()
+        .zip(outcomes)
+        .find(|(_, outcome)| matches!(outcome, Ok(false)))
+        .map(|(limit, _)| Failure::new("53300", limit.message))
+}
+/// The error code of a gateway's refusal, `{"error": "<snake_case>"}`; nothing else of its answer
+/// is kept, so no free text reaches a log. A body that is not exactly that has no code.
+/// `refusalCode` in packages/contracts/src/edge-policy.ts holds this to the same vectors.
+pub fn refusal_code(text: &str) -> Option<String> {
+    let answer: Value = serde_json::from_str(text).ok()?;
+    let code = answer.get("error")?.as_str()?;
+    (matches!(code.len(), 1..=64)
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+    .then(|| code.into())
+}
+/// What the Edge itself spent on a request: all of `duration` but the `waits` that were another's,
+/// the client's upload and the gateway's answer. Network transit and the node are not in it.
+pub fn edge_share(duration: u64, waits: &[Option<u64>]) -> u64 {
+    duration.saturating_sub(waits.iter().flatten().sum())
+}
+/// Milliseconds of each stage that ran, logged with the request; a stage that did not run is
+/// absent.
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct Timings {
+    /// The limiters, which run in parallel with the Actor's admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limiters_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admit_ms: Option<u64>,
+    /// The route token version signed: v6 for an awake database, v5 for a wake ticket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ms: Option<u64>,
+    /// The gateway's upgrade of a connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_connect_ms: Option<u64>,
+    /// Reading and understanding the body of an HTTP query: a client that uploads slowly shows
+    /// here, not in `edge_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_ms: Option<u64>,
+    /// The statements of an HTTP query, counted and never logged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statements: Option<usize>,
+    /// The gateway's answer to an HTTP query, from the send to its response head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_ms: Option<u64>,
+    /// The status of a gateway's answer to an HTTP query, or of its refusal of an upgrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_status: Option<u16>,
+    /// The error code of that refusal (`{"error": …}`), when it sent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_error: Option<String>,
+    /// When the gateway stage began, for the handler to read; never logged.
+    #[serde(skip)]
+    pub gateway_started: Option<u64>,
+}
+impl Timings {
+    /// An upgrade that the client or the deadline interrupted is still pending when the request
+    /// is logged: the wait so far is the gateway's, not the Edge's.
+    pub fn settle_gateway(&mut self, finished: u64) {
+        if let Some(started) = self.gateway_started {
+            self.gateway_connect_ms
+                .get_or_insert(finished.saturating_sub(started));
+        }
+    }
+}
+/// One request's line in the log: who asked, how long it took, where the time went, and how it
+/// ended. Never a password, a statement, a parameter or a token.
+pub struct Log<'a> {
+    /// `conn_admission` or `sql_admission`.
+    pub event: &'static str,
+    /// The connection ID the gateway receives in the route token.
+    pub cid: &'a str,
+    /// The Cloudflare location that admitted the request; none on a service binding.
+    pub colo: Option<&'a str>,
+    pub hints: Option<&'a Hints>,
+    pub region: Option<&'a str>,
+    /// From the request's arrival to its answer.
+    pub duration_ms: u64,
+    /// The part of it that was the Edge's own.
+    pub edge_ms: u64,
+    /// The database requests this isolate has taken, this one included; 1 is its first.
+    pub isolate_requests: u64,
+    pub outcome: &'a str,
+}
+impl Log<'_> {
+    pub fn line(&self, timings: &Timings) -> Value {
+        let mut line = serde_json::json!({
+            "event": self.event,
+            "cid": self.cid,
+            "colo": self.colo,
+            "database_id": self.hints.map(|hints| &hints.database),
+            "user": self.hints.map(|hints| &hints.user),
+            "region_id": self.region,
+            "duration_ms": self.duration_ms,
+            "edge_ms": self.edge_ms,
+            "isolate_requests": self.isolate_requests,
+            "outcome": self.outcome,
+        });
+        if let (Some(line), Ok(Value::Object(stages))) =
+            (line.as_object_mut(), serde_json::to_value(timings))
+        {
+            line.extend(stages);
+        }
+        line
+    }
+}

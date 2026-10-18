@@ -2,8 +2,8 @@
 use pgcf_edge_rust::{
     decoy::{Decoy, derive_salt},
     policy::{
-        Admission, Failure, GatewayRegion, Signable, actor_failure, admission, connection_rate_key,
-        routing_hints,
+        Admission, Failure, GatewayRegion, Log, Signable, Timings, actor_failure, admission,
+        connection_rate_key, edge_share, limit_failure, limits, refusal_code, routing_hints,
     },
 };
 use pgcf_native_protocol::{
@@ -406,4 +406,203 @@ fn unknown_route_salt_is_identity_scoped_and_missing_signing_material_never_auth
     assert_eq!(output.frames.len(), 1);
     assert_eq!(output.frames[0][0], b'E');
     assert_eq!(decoy.retained_bytes(), 0);
+}
+
+fn app_hints() -> pgcf_edge_rust::policy::Hints {
+    pgcf_edge_rust::policy::Hints {
+        database: "a".repeat(20),
+        user: "app".into(),
+    }
+}
+#[test]
+fn a_caller_on_the_internet_counts_in_the_public_buckets_and_a_service_binding_in_its_own() {
+    let hints = app_hints();
+    let db = &hints.database;
+    let public = limits("ipv4:192.0.2.1", &hints, &[]);
+    assert_eq!(
+        public
+            .iter()
+            .map(|limit| (limit.binding, limit.key.as_str(), limit.message))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "CONNECTION_RATE_LIMITER",
+                format!(r#"["{db}","app","ipv4:192.0.2.1"]"#).as_str(),
+                "connection rate limit exceeded"
+            ),
+            (
+                "DATABASE_CONNECTION_RATE_LIMITER",
+                db.as_str(),
+                "database connection rate limit exceeded"
+            ),
+        ]
+    );
+    // A same-account Worker has no CF-Connecting-IP: it never drains, or is drained by, them.
+    let binding = limits("binding", &hints, &[]);
+    assert_eq!(binding.len(), 1);
+    assert_eq!(binding[0].binding, "BINDING_CONNECTION_RATE_LIMITER");
+    assert_eq!(binding[0].key, format!(r#"["{db}","app","binding"]"#));
+    assert_eq!(binding[0].message, "connection rate limit exceeded");
+}
+#[test]
+fn http_queries_count_in_buckets_of_their_own_of_the_same_limiters() {
+    let hints = app_hints();
+    let db = &hints.database;
+    let sql = limits("ipv4:192.0.2.1", &hints, &["sql"]);
+    assert_eq!(sql[0].binding, "CONNECTION_RATE_LIMITER");
+    assert_eq!(
+        sql[0].key,
+        format!(r#"["sql","{db}","app","ipv4:192.0.2.1"]"#)
+    );
+    assert_eq!(sql[1].binding, "DATABASE_CONNECTION_RATE_LIMITER");
+    assert_eq!(sql[1].key, format!(r#"["sql","{db}"]"#));
+    assert_eq!(
+        limits("binding", &hints, &["sql"])[0].key,
+        format!(r#"["sql","{db}","app","binding"]"#)
+    );
+}
+#[test]
+fn a_limiter_that_failed_refuses_as_unavailable_before_one_that_denied() {
+    let public = limits("ipv4:192.0.2.1", &app_hints(), &[]);
+    assert_eq!(limit_failure(&public, &[Ok(true), Ok(true)]), None);
+    assert_eq!(
+        limit_failure(&public, &[Ok(false), Ok(true)]),
+        Some(Failure::new("53300", "connection rate limit exceeded"))
+    );
+    assert_eq!(
+        limit_failure(&public, &[Ok(true), Ok(false)]),
+        Some(Failure::new(
+            "53300",
+            "database connection rate limit exceeded"
+        ))
+    );
+    assert_eq!(
+        limit_failure(&public, &[Ok(false), Ok(false)]),
+        Some(Failure::new("53300", "connection rate limit exceeded"))
+    );
+    assert_eq!(
+        limit_failure(&public, &[Ok(false), Err(())]),
+        Some(Failure::unavailable())
+    );
+}
+#[test]
+fn the_edge_share_is_all_of_a_request_but_the_waits_that_were_anothers() {
+    assert_eq!(edge_share(120, &[Some(100)]), 20);
+    assert_eq!(edge_share(120, &[Some(30), Some(60)]), 30);
+    assert_eq!(edge_share(120, &[None, None]), 120);
+    assert_eq!(edge_share(10, &[Some(25)]), 0);
+}
+#[test]
+fn the_typescript_edge_reads_a_gateways_refusal_as_the_rust_edge_does() {
+    let refusals = vectors()["edge"]["refusals"].clone();
+    assert!(refusals.as_array().unwrap().len() > 30);
+    for row in refusals.as_array().unwrap() {
+        let code = refusal_code(row["text"].as_str().unwrap());
+        assert_eq!(
+            serde_json::to_value(code).unwrap(),
+            row["expected"],
+            "{row}"
+        );
+    }
+}
+#[test]
+fn an_interrupted_upgrade_counts_its_pending_wait_as_the_gateways() {
+    let mut pending = Timings {
+        gateway_started: Some(1_000),
+        ..Timings::default()
+    };
+    pending.settle_gateway(1_250);
+    assert_eq!(pending.gateway_connect_ms, Some(250));
+    // A wait the gateway already ended is not stretched, and a request that never reached the
+    // gateway has none.
+    pending.settle_gateway(9_000);
+    assert_eq!(pending.gateway_connect_ms, Some(250));
+    let mut refused = Timings::default();
+    refused.settle_gateway(9_000);
+    assert_eq!(refused.gateway_connect_ms, None);
+}
+#[test]
+fn the_log_line_names_the_request_and_every_stage_that_ran_and_no_secret() {
+    let hints = app_hints();
+    let timings = Timings {
+        limiters_ms: Some(3),
+        admit_ms: Some(5),
+        route: Some("v6"),
+        token_ms: Some(1),
+        gateway_connect_ms: Some(40),
+        gateway_started: Some(77),
+        ..Timings::default()
+    };
+    let line = Log {
+        event: "conn_admission",
+        cid: "01234567-89ab-4def-8123-0123456789ab",
+        colo: Some("FRA"),
+        hints: Some(&hints),
+        region: Some("eu-test"),
+        duration_ms: 60,
+        edge_ms: edge_share(60, &[timings.gateway_connect_ms]),
+        isolate_requests: 2,
+        outcome: "accepted",
+    }
+    .line(&timings);
+    assert_eq!(
+        line,
+        json!({
+            "event": "conn_admission",
+            "cid": "01234567-89ab-4def-8123-0123456789ab",
+            "colo": "FRA",
+            "database_id": hints.database,
+            "user": "app",
+            "region_id": "eu-test",
+            "duration_ms": 60,
+            "edge_ms": 20,
+            "isolate_requests": 2,
+            "limiters_ms": 3,
+            "admit_ms": 5,
+            "route": "v6",
+            "token_ms": 1,
+            "gateway_connect_ms": 40,
+            "outcome": "accepted",
+        })
+    );
+    // A gateway's refusal is named by its status and error code, and by nothing else of its answer.
+    let refusal = Timings {
+        gateway_connect_ms: Some(4),
+        gateway_status: Some(503),
+        gateway_error: Some("route_refused".into()),
+        ..Timings::default()
+    };
+    let line = Log {
+        event: "conn_admission",
+        cid: "01234567-89ab-4def-8123-0123456789ab",
+        colo: None,
+        hints: Some(&hints),
+        region: Some("eu-test"),
+        duration_ms: 6,
+        edge_ms: 2,
+        isolate_requests: 1,
+        outcome: "08006",
+    }
+    .line(&refusal);
+    assert_eq!(line["gateway_status"], 503);
+    assert_eq!(line["gateway_error"], "route_refused");
+    assert_eq!(line["outcome"], "08006");
+    // A request refused before it was routed names nothing it did not learn.
+    let refused = Log {
+        event: "sql_admission",
+        cid: "01234567-89ab-4def-8123-0123456789ab",
+        colo: None,
+        hints: None,
+        region: None,
+        duration_ms: 1,
+        edge_ms: 1,
+        isolate_requests: 1,
+        outcome: "08P01",
+    }
+    .line(&Timings::default());
+    assert_eq!(refused["colo"], Value::Null);
+    assert_eq!(refused["database_id"], Value::Null);
+    assert_eq!(refused["user"], Value::Null);
+    assert_eq!(refused["region_id"], Value::Null);
+    assert_eq!(refused.as_object().unwrap().len(), 10);
 }

@@ -43,7 +43,22 @@
         "period": 60,
       },
     },
+    {
+      "name": "BINDING_CONNECTION_RATE_LIMITER",
+      "namespace_id": "<BINDING_RATE_LIMIT_NAMESPACE_ID>",
+      // Per database + role for same-account Workers on a service binding (no CF-Connecting-IP).
+      // They use only this bucket; the Actor's per-minute allowance still bounds each database.
+      "simple": {
+        "limit": 1200,
+        "period": 60,
+      },
+    },
   ],
+  "vars": {
+    // Durable Object location hint for DatabaseActor objects. Use the API Worker's value: near the
+    // database regions and D1. It applies when an object is created; an existing one never moves.
+    "DATABASE_ACTOR_LOCATION_HINT": "weur",
+  },
   "secrets": {
     "required": ["ROUTE_MASTER_KEYS"],
   },
