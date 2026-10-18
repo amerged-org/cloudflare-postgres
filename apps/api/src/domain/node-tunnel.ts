@@ -4,11 +4,12 @@ import { cloudflareApi } from "../providers/cloudflare.ts";
 
 /**
  * The Tunnel of a node (ULTRA plan 5.8): one remotely managed Tunnel, named like the node's
- * addition, that carries the node's gateway and its operator shell, both on loopback. The Tunnel,
- * its ingress and the two DNS records that point at it are made by whoever first asks for them
- * and found again by every later call, so a read of the node's credentials that failed half way
- * is repeated whole. Fencing (`fence-actions.ts`) deletes the Tunnel by the same name, because
- * nothing else ties the Tunnel to the node.
+ * addition, that carries the node's gateway on loopback and, only while `shell` is on, its
+ * operator shell. The Tunnel, its ingress and the DNS records that point at it are made by whoever
+ * first asks for them and found again by every later call, so a read of the node's credentials
+ * that failed half way is repeated whole. While `shell` is off, the call also removes the shell's
+ * ingress rule and DNS record a node got before. Fencing (`fence-actions.ts`) deletes the Tunnel
+ * by the same name, because nothing else ties the Tunnel to the node.
  */
 export const nodeTunnelName = nodeAdditionHostname;
 
@@ -40,6 +41,11 @@ export interface NodeTunnelServices {
   zoneId: string;
   /** The domain the node's hostnames are made under. */
   domain: string;
+  /**
+   * Whether the node has a shell hostname. A shell hostname is reachable by whoever runs
+   * cloudflared, so it stays off until Cloudflare Access guards it (ULTRA plan 8).
+   */
+  shell: boolean;
   fetcher?: typeof fetch;
 }
 export interface NodeTunnel {
@@ -81,13 +87,26 @@ export async function ensureNodeTunnel(
     config: {
       ingress: [
         { hostname: gateway, service: GATEWAY_SERVICE },
-        { hostname: shell, service: SHELL_SERVICE },
+        ...(services.shell
+          ? [{ hostname: shell, service: SHELL_SERVICE }]
+          : []),
         // Anything else is refused.
         { service: "http_status:404" },
       ],
     },
   });
-  for (const hostname of [gateway, shell]) {
+  const dns = `/zones/${services.zoneId}/dns_records`;
+  const recordOf = async (hostname: string) => {
+    const records = await call(
+      "GET",
+      `${dns}?type=CNAME&name=${encodeURIComponent(hostname)}`,
+    );
+    if (!Array.isArray(records)) throw new Error("cloudflare_api_failed");
+    return (
+      records as { id?: unknown; content?: unknown; proxied?: unknown }[]
+    )[0];
+  };
+  for (const hostname of services.shell ? [gateway, shell] : [gateway]) {
     const wanted = {
       type: "CNAME",
       name: hostname,
@@ -95,27 +114,23 @@ export async function ensureNodeTunnel(
       proxied: true,
       ttl: 1,
     };
-    const records = await call(
-      "GET",
-      `/zones/${services.zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(hostname)}`,
-    );
-    if (!Array.isArray(records)) throw new Error("cloudflare_api_failed");
-    const have = (
-      records as { id?: unknown; content?: unknown; proxied?: unknown }[]
-    )[0];
-    if (have === undefined)
-      await call("POST", `/zones/${services.zoneId}/dns_records`, wanted);
+    const have = await recordOf(hostname);
+    if (have === undefined) await call("POST", dns, wanted);
     else if (have.content !== wanted.content || have.proxied !== true) {
       if (typeof have.id !== "string") throw new Error("cloudflare_api_failed");
-      await call(
-        "PUT",
-        `/zones/${services.zoneId}/dns_records/${have.id}`,
-        wanted,
-      );
+      await call("PUT", `${dns}/${have.id}`, wanted);
+    }
+  }
+  if (!services.shell) {
+    const have = await recordOf(shell);
+    if (have !== undefined) {
+      if (typeof have.id !== "string") throw new Error("cloudflare_api_failed");
+      await call("DELETE", `${dns}/${have.id}`);
     }
   }
   const token = await call("GET", `${base}/${id}/token`);
   if (typeof token !== "string" || !TUNNEL_TOKEN.test(token))
     throw new Error("cloudflare_api_failed");
-  return { gateway_url: `https://${gateway}`, token };
+  // The gateway accepts a WebSocket upgrade at /pg only; the region contract ends the URL there.
+  return { gateway_url: `https://${gateway}/pg`, token };
 }

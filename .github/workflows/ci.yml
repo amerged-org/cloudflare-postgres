@@ -306,6 +306,29 @@ jobs:
           node infra/node-image/boot-test.ts --image "$PGCF_NODE_IMAGE_WORK/out/pgcf-node.raw" --accel kvm
       - name: Show the image release
         run: cat "$PGCF_NODE_IMAGE_WORK/out/pgcf-node.json" "$PGCF_NODE_IMAGE_WORK/out/SHA256SUMS"
+      - name: Collect the files a release registration takes
+        run: |
+          release="$PGCF_NODE_IMAGE_WORK/release"
+          mkdir -p "$release"
+          cp "$PGCF_NODE_IMAGE_WORK/out/pgcf-node.raw.zst" "$PGCF_NODE_IMAGE_WORK/out/pgcf-node.json" \
+            infra/node-image/packages.lock.json "$release/"
+          for binary in pgcf-agent pgcf-native-gateway pgcf-archive pgcf-wal-fetch; do
+            cp "$PGCF_NODE_IMAGE_WORK/binaries/$binary" "$release/"
+          done
+          (cd "$release" && sha256sum * > SHA256SUMS)
+          # The registration script's own dry run: it refuses a file that is missing or is not the one the build describes.
+          node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" \
+            --lock "$release/packages.lock.json" --dry-run
+      - name: Keep the release files for the operator
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.fork
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pgcf-node-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pgcf-node-image/release/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
       - name: Keep the boot logs of a failed run
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

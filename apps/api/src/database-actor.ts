@@ -211,11 +211,14 @@ export class DatabaseActor extends DurableObject<Env> {
         "SELECT snapshot,barrier FROM database_snapshot WHERE singleton=1",
       )
       .toArray()[0];
+    // The snapshot is a cache of what D1 holds. One written by an earlier release that this release
+    // cannot read is no snapshot: the Actor falls back to D1 and the next publish replaces it.
+    const stored = row?.snapshot
+      ? DatabaseAdmissionSnapshot.safeParse(JSON.parse(row.snapshot))
+      : undefined;
     return {
       presence,
-      snapshot: row?.snapshot
-        ? DatabaseAdmissionSnapshot.parse(JSON.parse(row.snapshot))
-        : undefined,
+      snapshot: stored?.success ? stored.data : undefined,
       barrier: row?.barrier
         ? PersistedAdmissionMutationIntent.parse(JSON.parse(row.barrier))
         : undefined,

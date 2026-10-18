@@ -33,11 +33,15 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
 - `NODE_API_ORIGIN` is this Worker's `https` origin, which the installed node enrolls at, and
   `NODE_DNS_SERVERS` a JSON array of one to three resolvers the node is installed with.
 - `CLOUDFLARE_API_TOKEN` (a private secret with edit access to Tunnels and to the zone's DNS
-  records) makes the node's Tunnel when the node first reads its credentials. Its gateway and its
-  shell get the hostnames `<node>.<domain>` and `<node>-ssh.<domain>` under `NODE_GATEWAY_DOMAIN`,
-  a domain of the zone `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's
-  R2 endpoint. Without the token, the domain or the zone a node gets no credentials and stays
-  closed to placement.
+  records) makes the node's Tunnel when the node first reads its credentials. Its gateway gets the
+  hostname `<node>.<domain>` under `NODE_GATEWAY_DOMAIN`, a domain of the zone
+  `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2 endpoint. Without
+  the token, the domain or the zone a node gets no credentials and stays closed to placement.
+- `NODE_SHELL_HOSTNAME` is off unless it is the string `true`. The node's shell hostname
+  `<node>-ssh.<domain>`, its DNS record and its Tunnel ingress rule exist only while it is `true`,
+  and a node that has them loses them on its next credentials read when it is not. Leave it off
+  until Cloudflare Access guards the shell (plan 8): without Access the hostname is reachable by
+  anyone who can run cloudflared.
 - `CONTABO_ORDER_SSH_KEY_IDS` also names the keys the provider's rescue action wants beside the
   installer; the installer itself uses none.
 

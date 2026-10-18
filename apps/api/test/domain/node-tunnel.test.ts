@@ -15,20 +15,58 @@ import {
   cloudflare,
 } from "./cloudflare-double.ts";
 
-const services = (fetcher: typeof fetch) => ({
+const services = (fetcher: typeof fetch, shell = false) => ({
   token: TOKEN,
   accountId: ACCOUNT,
   zoneId: ZONE,
   domain: DOMAIN,
+  shell,
   fetcher,
 });
+const CNAME = (name: string) => ({
+  type: "CNAME",
+  name,
+  content: `${TUNNEL}.cfargotunnel.com`,
+  proxied: true,
+});
+const published = (api: ReturnType<typeof cloudflare>) =>
+  api.records.map(({ type, name, content, proxied }) => ({
+    type,
+    name,
+    content,
+    proxied,
+  }));
 
-it("creates the Tunnel of a node, sends its gateway and its shell to loopback and points two hostnames at it", async () => {
+it("creates the Tunnel of a node, sends its gateway to loopback and points one hostname at it, with no shell while the shell is off", async () => {
   const api = cloudflare();
   const tunnel = await ensureNodeTunnel(services(api.fetcher), NODE);
   expect(tunnel).toEqual({
     token: TUNNEL_TOKEN,
-    gateway_url: `https://${GATEWAY}`,
+    gateway_url: `https://${GATEWAY}/pg`,
+  });
+  expect(api.tunnels).toEqual([{ id: TUNNEL, name: NAME }]);
+  expect(
+    api.calls.find((c) => c.method === "POST" && c.url.endsWith("/cfd_tunnel"))
+      ?.body,
+  ).toEqual({ name: NAME, config_src: "cloudflare" });
+  // Anything but the gateway, which listens on 8080 on loopback, is refused: no ssh rule, no shell record.
+  expect(api.configurations.get(TUNNEL)).toEqual({
+    config: {
+      ingress: [
+        { hostname: GATEWAY, service: "http://127.0.0.1:8080" },
+        { service: "http_status:404" },
+      ],
+    },
+  });
+  expect(published(api)).toEqual([CNAME(GATEWAY)]);
+});
+
+it("sends the shell to loopback and points a second hostname at the Tunnel once the shell is on", async () => {
+  const api = cloudflare();
+  const tunnel = await ensureNodeTunnel(services(api.fetcher, true), NODE);
+  expect(tunnel).toEqual({
+    token: TUNNEL_TOKEN,
+    gateway_url: `https://${GATEWAY}/pg`,
   });
   expect(api.tunnels).toEqual([{ id: TUNNEL, name: NAME }]);
   expect(
@@ -45,27 +83,40 @@ it("creates the Tunnel of a node, sends its gateway and its shell to loopback an
       ],
     },
   });
+  expect(published(api)).toEqual([CNAME(GATEWAY), CNAME(SHELL)]);
+});
+
+it("removes the shell's ingress rule and DNS record of a node on the next call once the shell is off, and then changes nothing", async () => {
+  const api = cloudflare();
+  await ensureNodeTunnel(services(api.fetcher, true), NODE);
+  expect(published(api)).toEqual([CNAME(GATEWAY), CNAME(SHELL)]);
+  const tunnel = await ensureNodeTunnel(services(api.fetcher), NODE);
+  // The gateway is as before; only the shell is gone.
+  expect(tunnel).toEqual({
+    token: TUNNEL_TOKEN,
+    gateway_url: `https://${GATEWAY}/pg`,
+  });
+  expect(api.configurations.get(TUNNEL)).toEqual({
+    config: {
+      ingress: [
+        { hostname: GATEWAY, service: "http://127.0.0.1:8080" },
+        { service: "http_status:404" },
+      ],
+    },
+  });
+  expect(published(api)).toEqual([CNAME(GATEWAY)]);
+  // Once removed it stays removed: no creation, no deletion and no change of the gateway's record.
+  const calls = api.calls.length;
+  await ensureNodeTunnel(services(api.fetcher), NODE);
   expect(
-    api.records.map(({ type, name, content, proxied }) => ({
-      type,
-      name,
-      content,
-      proxied,
-    })),
-  ).toEqual([
-    {
-      type: "CNAME",
-      name: GATEWAY,
-      content: `${TUNNEL}.cfargotunnel.com`,
-      proxied: true,
-    },
-    {
-      type: "CNAME",
-      name: SHELL,
-      content: `${TUNNEL}.cfargotunnel.com`,
-      proxied: true,
-    },
-  ]);
+    api.calls
+      .slice(calls)
+      .filter((c) => c.method === "POST" || c.method === "DELETE"),
+  ).toEqual([]);
+  expect(
+    api.calls.slice(calls).filter((c) => c.url.includes("/dns_records/")),
+  ).toEqual([]);
+  expect(published(api)).toEqual([CNAME(GATEWAY)]);
 });
 
 it("finds the Tunnel it made before, creates nothing again and corrects a record that points elsewhere", async () => {
@@ -95,13 +146,13 @@ it("finds the Tunnel it made before, creates nothing again and corrects a record
       },
     ],
   });
-  const first = await ensureNodeTunnel(services(api.fetcher), NODE);
+  const first = await ensureNodeTunnel(services(api.fetcher, true), NODE);
   const calls = api.calls.length;
   expect(first.token).toBe(TUNNEL_TOKEN);
   expect(api.calls.some((c) => c.method === "POST")).toBe(false);
   expect(api.records[1]!.content).toBe(`${TUNNEL}.cfargotunnel.com`);
   // A second time changes nothing that exists: no creation, and no update of the record that was right.
-  await ensureNodeTunnel(services(api.fetcher), NODE);
+  await ensureNodeTunnel(services(api.fetcher, true), NODE);
   expect(api.calls.slice(calls).some((c) => c.method === "POST")).toBe(false);
   expect(
     api.calls.slice(calls).filter((c) => c.url.includes("/dns_records/")),

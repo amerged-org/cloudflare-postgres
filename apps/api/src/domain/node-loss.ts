@@ -32,11 +32,17 @@ export interface FenceTarget {
   providerInstanceId: string | null;
   /** The Cloudflare account that holds the Tunnel; null if the region's endpoint does not name it. */
   accountId: string | null;
+  /**
+   * Whether the node ever read its credentials, which makes its Tunnel under the name the node ID
+   * gives it. A node that did not has no Tunnel under any name.
+   */
+  tunnelMade: boolean;
 }
 export interface FenceActions {
   /**
    * Deletes the node's Tunnel and revokes its token. A Tunnel that is already deleted is a
-   * success; a node with no Tunnel under its name is `tunnel_unknown`, not a success.
+   * success; a node that made its Tunnel but has none under its name is `tunnel_unknown`, not a
+   * success; a node that never made one has nothing to delete.
    */
   deleteTunnel(target: FenceTarget): Promise<void>;
   /** Resolves once the provider accepted the order to power the instance off. */
@@ -207,6 +213,7 @@ interface FencingRow {
   region_id: string;
   provider_instance_id: string | null;
   backup_endpoint_url: string;
+  gateway_url: string | null;
   tunnel_deleted_at: string | null;
   power_off_requested_at: string | null;
 }
@@ -228,7 +235,7 @@ export async function runNodeFencing(
 ): Promise<string[]> {
   const rows = (
     await env.DB.prepare(
-      `SELECT l.node_id,l.region_id,n.provider_instance_id,r.backup_endpoint_url,l.tunnel_deleted_at,l.power_off_requested_at
+      `SELECT l.node_id,l.region_id,n.provider_instance_id,r.backup_endpoint_url,n.gateway_url,l.tunnel_deleted_at,l.power_off_requested_at
       FROM node_losses l JOIN nodes n ON n.id=l.node_id JOIN regions r ON r.id=l.region_id
       WHERE l.powered_off_at IS NULL ORDER BY l.declared_at,l.node_id LIMIT ?`,
     )
@@ -243,6 +250,7 @@ export async function runNodeFencing(
       regionId: row.region_id,
       providerInstanceId: row.provider_instance_id,
       accountId: accountOf(row.backup_endpoint_url),
+      tunnelMade: row.gateway_url !== null,
     };
     const fail = async (code: string) => {
       failures.push(code);

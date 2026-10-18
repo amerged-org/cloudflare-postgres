@@ -64,13 +64,37 @@ it("hands a node the route keyring derived for it, the token of its Tunnel and t
     expect(key).not.toBe(masterKeys[kid]);
   // The Tunnel's public hostname is the node's gateway from now on.
   expect(await gatewayOf(f.node)).toBe(
-    `https://${nodeAdditionHostname(f.node)}.${DOMAIN}`,
+    `https://${nodeAdditionHostname(f.node)}.${DOMAIN}/pg`,
   );
   await env.DB.prepare("UPDATE nodes SET credentials_revision=4 WHERE id=?")
     .bind(f.node)
     .run();
   const again = await nodeRequest(f, CREDENTIALS, { bindings: configured });
   expect(NodeCredentials.parse(await again.json()).revision).toBe(4);
+});
+
+it("makes the shell hostname of a node only while NODE_SHELL_HOSTNAME is exactly the string true, and removes it when it is not", async () => {
+  const f = await fixture(0);
+  await accountRegion(f.region);
+  const api = cloudflare();
+  vi.stubGlobal("fetch", api.fetcher);
+  const hostnames = () => api.records.map((record) => record.name);
+  const gateway = `${nodeAdditionHostname(f.node)}.${DOMAIN}`;
+  const shell = `${nodeAdditionHostname(f.node)}-ssh.${DOMAIN}`;
+  const ask = async (variable: string | undefined) => {
+    const response = await nodeRequest(f, CREDENTIALS, {
+      bindings: { ...configured, NODE_SHELL_HOSTNAME: variable },
+    });
+    expect(response.status).toBe(200);
+  };
+  await ask(undefined);
+  expect(hostnames()).toEqual([gateway]);
+  await ask("true");
+  expect(hostnames()).toEqual([gateway, shell]);
+  // Anything but the string true is off, and an existing shell hostname goes away.
+  await ask("yes");
+  expect(hostnames()).toEqual([gateway]);
+  expect(await gatewayOf(f.node)).toBe(`https://${gateway}/pg`);
 });
 
 it("answers a node whose Tunnel cannot be made with a failure, and writes no gateway", async () => {

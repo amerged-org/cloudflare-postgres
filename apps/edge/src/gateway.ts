@@ -8,6 +8,58 @@ export interface GatewayRegion {
   readonly gateway_binding: string | null;
 }
 
+/** The most of a gateway's refusal the Edge reads: its error code is short. */
+const REFUSAL_BYTES = 512;
+
+/**
+ * The error code of a gateway's refusal, `{"error": "<snake_case>"}`; nothing else of its answer
+ * is kept, so no free text reaches a log. A body that is not exactly that has no code.
+ */
+export function refusalCode(text: string): string | undefined {
+  try {
+    const answer: unknown = JSON.parse(text);
+    if (typeof answer !== "object" || answer === null) return undefined;
+    const code = (answer as { error?: unknown }).error;
+    return typeof code === "string" && /^[a-z0-9_]{1,64}$/.test(code)
+      ? code
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Reads the refusal's head, cancels the rest of its body and returns its error code, if any. */
+export async function readRefusal(
+  response: Response,
+): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (reader === undefined) return undefined;
+  const head: number[] = [];
+  try {
+    while (head.length < REFUSAL_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      head.push(...value.subarray(0, REFUSAL_BYTES - head.length));
+    }
+  } catch {
+    return undefined;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return refusalCode(new TextDecoder().decode(new Uint8Array(head)));
+}
+
+/** A gateway that answered the upgrade with a refusal: its status and error code, nothing else. */
+export class GatewayRefusal extends Error {
+  readonly status: number;
+  readonly code: string | undefined;
+  constructor(status: number, code: string | undefined) {
+    super("gateway upgrade failed");
+    this.status = status;
+    this.code = code;
+  }
+}
+
 /** The transport seam, selected by the live edge-to-region transport spike. */
 export async function connectGateway(
   region: GatewayRegion,
@@ -43,9 +95,7 @@ export async function connectGateway(
   } else {
     response = await fetch(request);
   }
-  if (response.status !== 101 || response.webSocket === null) {
-    await response.body?.cancel();
-    throw new Error("gateway upgrade failed");
-  }
+  if (response.status !== 101 || response.webSocket === null)
+    throw new GatewayRefusal(response.status, await readRefusal(response));
   return response.webSocket;
 }

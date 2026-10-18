@@ -60,8 +60,12 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
 
 The CI job `node-image` in [.github/workflows/ci.yml](../../.github/workflows/ci.yml) runs the unit
 tests, builds the four binaries with the pinned Rust toolchain, builds the image and runs the boot
-test with KVM. Compression and checksums are part of the build. The job holds no secret, so it
-uploads and registers nothing: that is the operator's step ([Registering a release](#registering-a-release)).
+test with KVM. Compression and checksums are part of the build. After the boot test it collects the
+files a registration takes and runs the registration script's `--dry-run` on them, so a missing file
+or a binary that is not the one in the image fails the job; on a push to `main` it then keeps them for
+7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`. The job holds no
+secret, so it uploads nothing to R2 and registers nothing: that is the operator's step
+([Registering a release](#registering-a-release)).
 
 ## Registering a release
 
@@ -70,6 +74,36 @@ is one image build with the four binaries it was built with and the package lock
 every node and every region. Its name is the `--release` of the build, which is also the image
 version of the nodes installed from it: lower-case letters, digits, `.`, `_` and `-`, at most 64
 characters (CI uses `sha-<12 hex digits of the commit>`).
+
+### From the CI artifact
+
+Every push to `main` of this repository (not of a fork) whose `node-image` job passed keeps the
+release files for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`: `pgcf-node.raw.zst`,
+`pgcf-node.json`, `packages.lock.json`, the four binaries and a `SHA256SUMS` of these seven files.
+The uncompressed image (about 1.7 GB) is not part of it, and no credential is. The release is named
+`sha-<first 12 hex digits of the commit>`. The artifact belongs to the commit that built it, so the
+package lock comes from the artifact, not from the checkout. Only the `push` run carries it: a
+manually dispatched run of the same commit (the external probe, for one) uploads nothing, which is why
+the lookup below filters on `--event push`.
+
+```sh
+git fetch origin main && sha=$(git rev-parse origin/main)   # or any commit on main whose CI run passed
+run=$(gh run list --workflow ci.yml --branch main --event push --commit "$sha" --status success --json databaseId --jq '.[0].databaseId')
+# --pattern extracts each artifact into a directory named after it; a re-run adds one per attempt.
+gh run download "$run" --pattern "pgcf-node-release-$sha-*" --dir .local/node-release
+release=$(ls -d .local/node-release/pgcf-node-release-"$sha"-* | tail -n 1)
+(cd "$release" && sha256sum --check SHA256SUMS)   # shasum -a 256 -c SHA256SUMS on macOS
+node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" --lock "$release/packages.lock.json"
+```
+
+The artifact expires after 7 days. Register within that time, or re-run all jobs of that CI run to
+get a new one. The attempts of one commit are separate builds, and a registered release is never
+overwritten, so register one attempt and keep using it.
+
+### Or build it locally
+
+When there is no artifact (it expired, or the release comes from a commit that is not on `main`),
+build the release yourself with the local Docker builder:
 
 ```sh
 # 1. The four binaries, built for linux/amd64 with the pinned Rust toolchain (CI does this too):
@@ -83,7 +117,11 @@ node scripts/operations/register-node-image.ts --image-dir .local/node-image/out
 ```
 
 Step 1 builds on Linux; on another host build in a linux/amd64 container with the same toolchain.
-The third step reads these variables, in memory only, and never prints their values:
+
+### The registration
+
+Both paths run `register-node-image.ts`. It reads these variables, in memory only, and never prints
+their values:
 
 | Variable | Holds |
 | --- | --- |
@@ -239,7 +277,9 @@ restart never stops a database, because the databases are independent units.
 
 `cloudflared tunnel --no-autoupdate --protocol quic --metrics 127.0.0.1:20241 run --token-file
 %d/tunnel-token`, with the token from `LoadCredentialEncrypted=` (`--token-file` exists since
-2025.4.0). Ingress goes to the gateway and to `ssh://localhost:22`, both behind Cloudflare Access.
+2025.4.0). Ingress goes to the gateway and, once the shell hostname is on, to `ssh://localhost:22`,
+both behind Cloudflare Access. The shell hostname is off until Access exists: the API makes it only
+while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
 
 ## What the image expects from the agent
 

@@ -557,6 +557,14 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     });
     const lost = await post(admitting(awake("reject")), { query: "insert" });
     expect(await refusal(lost)).toBe("08007");
+    // The outcome is unknown to the client, but the log names what the gateway answered.
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log).toMatchObject({
+      outcome: "08007",
+      gateway_status: 503,
+      gateway_error: "route_refused",
+    });
+    expect(JSON.stringify(log)).not.toContain("free text");
     // Each request reached the gateway exactly once: nothing is retried.
     expect(await forwarded()).toHaveLength(2);
   });

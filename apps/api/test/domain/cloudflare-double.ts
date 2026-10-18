@@ -36,6 +36,8 @@ export function cloudflare(
     records = [...(initial.records ?? [])],
     configurations = new Map<string, unknown>(),
     calls: { method: string; url: string; body: unknown }[] = [];
+  // A record's id is never reused after the record is deleted.
+  let nextRecord = records.length;
   const fetcher: typeof fetch = async (input, init) => {
     const url = new URL(String(input)),
       method = init?.method ?? "GET",
@@ -76,7 +78,7 @@ export function cloudflare(
         ),
       );
     if (path === `/zones/${ZONE}/dns_records` && method === "POST") {
-      const record = { id: `rec${records.length}`, ...body } as DnsRecord;
+      const record = { id: `rec${nextRecord++}`, ...body } as DnsRecord;
       records.push(record);
       return ok(record);
     }
@@ -85,6 +87,13 @@ export function cloudflare(
       const record = records.find((r) => r.id === update[1])!;
       Object.assign(record, body);
       return ok(record);
+    }
+    if (update && method === "DELETE") {
+      const at = records.findIndex((r) => r.id === update[1]);
+      if (at < 0)
+        return Response.json({ success: false, result: null }, { status: 404 });
+      records.splice(at, 1);
+      return ok({ id: update[1] });
     }
     return Response.json({ success: false, result: null }, { status: 404 });
   };

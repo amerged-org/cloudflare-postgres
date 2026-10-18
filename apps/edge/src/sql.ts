@@ -34,7 +34,7 @@ import {
   type AdmissionTimings,
 } from "./admission.ts";
 import type { Env } from "./env.ts";
-import type { GatewayRegion } from "./gateway.ts";
+import { readRefusal, refusalCode, type GatewayRegion } from "./gateway.ts";
 
 /** Milliseconds of each stage that ran, logged with the request. */
 interface Timings extends AdmissionTimings {
@@ -45,6 +45,8 @@ interface Timings extends AdmissionTimings {
   /** The gateway's answer, from the send to its response head. */
   gateway_ms?: number;
   gateway_status?: number;
+  /** The error code of a gateway's refusal (`{"error": …}`), when it sent one. */
+  gateway_error?: string;
 }
 
 function json(body: unknown, status: number): Response {
@@ -166,8 +168,9 @@ async function forward(
           "Cache-Control": "no-store",
         },
       });
+    timings.gateway_error = refusalCode(text);
   } else {
-    await response.body?.cancel();
+    timings.gateway_error = await readRefusal(response);
   }
   throw unknownOutcome();
 }

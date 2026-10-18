@@ -18,9 +18,16 @@ export type Env = Cloudflare.Env & {
   /** The API's origin, which a node's installer enrolls at, and the resolvers it configures (a JSON array). */
   NODE_API_ORIGIN?: string;
   NODE_DNS_SERVERS?: string;
-  /** The DNS zone that holds the hostnames of the nodes' gateways and shells, and its domain. */
+  /** The DNS zone that holds the hostnames of the nodes' gateways (and of their shells, see NODE_SHELL_HOSTNAME), and its domain. */
   NODE_GATEWAY_ZONE_ID?: string;
   NODE_GATEWAY_DOMAIN?: string;
+  /**
+   * "true" gives every node a shell hostname (`<node>-ssh.<domain>`, with its DNS record and Tunnel
+   * ingress rule); any other value, or none, gives none and removes the one a node has. Leave it
+   * off until Cloudflare Access guards the shell (ULTRA plan 8): without Access the hostname is
+   * reachable by anyone who can run cloudflared.
+   */
+  NODE_SHELL_HOSTNAME?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;

@@ -27,13 +27,15 @@ function tunnelServices(env: Env, endpoint: string): NodeTunnelServices | null {
         accountId,
         zoneId: env.NODE_GATEWAY_ZONE_ID,
         domain: env.NODE_GATEWAY_DOMAIN,
+        shell: env.NODE_SHELL_HOSTNAME === "true",
       };
 }
 
 /**
  * `GET /node/v1/credentials` (plan 5.3, 5.8, 8): what the node's gateway and its Tunnel need. The
  * route keyring is derived for the node and holds no key that signs for another; the Tunnel is
- * made if it is not there, and its public hostname becomes the node's gateway for the Edge.
+ * made if it is not there, and its public hostname becomes the node's gateway for the Edge. The
+ * Tunnel carries a shell hostname only while NODE_SHELL_HOSTNAME is "true".
  */
 export async function nodeCredentials(
   c: ApiContext,
