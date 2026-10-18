@@ -1,159 +1,135 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it } from "vitest";
+import { NodeRelease } from "../src/node-link.ts";
 import {
-  FleetReleaseSpec,
   FleetNodeReleaseObservation,
+  FleetNodeReleaseStatus,
+  FleetRelease,
+  FleetReleaseSpec,
 } from "../src/releases.ts";
 
-const names = [
-  "api",
-  "edge",
-  "node-bootstrap",
-  "regional",
-  "postgres",
-  "barman",
-  "cloudflared",
-  "cilium",
-  "flux-source",
-  "flux-kustomize",
-  "flux-helm",
-  "flux-notification",
-  "cert-manager",
-  "cloudnative-pg",
-  "openebs-lvm",
-];
+const pinned = (name: string, size = 4096) => ({
+  url: `https://releases.example/${name}`,
+  sha256: name.length.toString(16).padStart(2, "0").repeat(32),
+  size_bytes: size,
+});
 function spec() {
-  const role = {
-    talos_version: "1.14.1",
-    talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
-    talos_schematic_sha256: "b".repeat(64),
-    talos_extensions: [] as string[],
-    kubernetes_version: "1.36.5",
-    components: names.slice(3),
-  };
   return {
-    version: 1,
-    versions_lock_sha256: "c".repeat(64),
-    configuration_schema_revision: 1,
-    components: names.map((name) => ({
-      name,
-      kind: name === "api" || name === "edge" ? "worker_bundle" : "image",
-      version: "1.0.0",
-      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
-      sha256: "d".repeat(64),
-    })),
-    roles: { control_relay: role, customer: structuredClone(role) },
+    version: 2,
+    image: {
+      url: "https://releases.example/pgcf-node-1.2.0.raw.zst",
+      sha256: "a".repeat(64),
+      format: "raw.zst",
+      size_bytes: 1_500_000_000,
+      raw_sha256: "b".repeat(64),
+      raw_bytes: 8_589_934_592,
+    },
+    binaries: {
+      "pgcf-agent": pinned("pgcf-agent"),
+      "pgcf-native-gateway": pinned("pgcf-native-gateway"),
+      "pgcf-archive": pinned("pgcf-archive"),
+      "pgcf-wal-fetch": pinned("pgcf-wal-fetch"),
+    },
+    os: {
+      image_version: "1.2.0",
+      debian_snapshot: "20261015T000000Z",
+      package_lock: pinned("packages.lock.json"),
+    },
   };
 }
-it("requires explicit digests, complete product layers and closed role references", () => {
+
+it("one release is one node image, four binaries and the package lock, nothing else", () => {
   expect(FleetReleaseSpec.safeParse(spec()).success).toBe(true);
-  const missing = spec();
-  missing.components.pop();
-  expect(FleetReleaseSpec.safeParse(missing).success).toBe(false);
-  const unknown = spec();
-  unknown.roles.customer.components.push("unknown");
-  expect(FleetReleaseSpec.safeParse(unknown).success).toBe(false);
-  const unpinned = spec();
-  unpinned.components[0]!.sha256 = "latest";
-  expect(FleetReleaseSpec.safeParse(unpinned).success).toBe(false);
-  const duplicate = spec();
-  duplicate.components.push(duplicate.components[0]!);
-  expect(FleetReleaseSpec.safeParse(duplicate).success).toBe(false);
+  for (const change of [
+    (value: ReturnType<typeof spec>) => ({ ...value, version: 1 }),
+    (value: ReturnType<typeof spec>) => ({ ...value, roles: {} }),
+    (value: ReturnType<typeof spec>) => ({ ...value, components: [] }),
+    (value: ReturnType<typeof spec>) => ({ ...value, route_token_version: 6 }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      binaries: { ...value.binaries, "pgcf-agent": undefined },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      binaries: { ...value.binaries, extra: pinned("extra") },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      os: { ...value.os, debian_snapshot: "latest" },
+    }),
+    (value: ReturnType<typeof spec>) => ({
+      ...value,
+      os: { ...value.os, package_lock: { ...pinned("lock"), sha256: "x" } },
+    }),
+  ])
+    expect(FleetReleaseSpec.safeParse(change(spec())).success).toBe(false);
 });
-it("only a release whose every role runs the native gateway and controller declares route token v3", () => {
-  const native = spec();
-  for (const name of ["native-gateway", "native-controller"])
-    native.components.push({
-      name,
-      kind: "image",
-      version: "1.0.0",
-      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
-      sha256: "d".repeat(64),
-    });
-  for (const role of Object.values(native.roles))
-    role.components.push("native-gateway", "native-controller");
-  expect(FleetReleaseSpec.safeParse(native).success).toBe(true);
-  const declared = { ...native, route_token_version: 3 };
-  expect(FleetReleaseSpec.parse(declared).route_token_version).toBe(3);
-  expect(
-    FleetReleaseSpec.safeParse({ ...native, route_token_version: 2 }).success,
-  ).toBe(false);
-  // The TypeScript gateway verifies only v2 and the TypeScript controller publishes no target.
-  expect(
-    FleetReleaseSpec.safeParse({ ...spec(), route_token_version: 3 }).success,
-  ).toBe(false);
-  for (const name of ["native-gateway", "native-controller"]) {
-    const partial = structuredClone(declared);
-    partial.roles.control_relay.components =
-      partial.roles.control_relay.components.filter((n) => n !== name);
-    expect(FleetReleaseSpec.safeParse(partial).success).toBe(false);
-  }
+
+it("pins every download by an https URL, a digest and a size", () => {
+  const insecure = spec();
+  insecure.binaries["pgcf-agent"].url = "http://releases.example/pgcf-agent";
+  expect(FleetReleaseSpec.safeParse(insecure).success).toBe(false);
+  const unsized = spec();
+  unsized.binaries["pgcf-archive"].size_bytes = 0;
+  expect(FleetReleaseSpec.safeParse(unsized).success).toBe(false);
+  const credentials = spec();
+  credentials.image.url = "https://user:secret@releases.example/image.raw.zst";
+  expect(FleetReleaseSpec.safeParse(credentials).success).toBe(false);
+  const query = spec();
+  query.image.url = "https://releases.example/image.raw.zst?token=x";
+  expect(FleetReleaseSpec.safeParse(query).success).toBe(false);
 });
-it("declares thin sampling only with a native controller on every role", () => {
-  const native = spec();
-  native.components.push({
-    name: "native-controller",
-    kind: "image",
-    version: "1.0.0",
-    reference: `registry.example/native-controller@sha256:${"d".repeat(64)}`,
-    sha256: "d".repeat(64),
+
+it("an uncompressed image pins identical transport and raw bytes, and a raw disk is whole sectors", () => {
+  const raw = spec();
+  raw.image.format = "raw";
+  expect(FleetReleaseSpec.safeParse(raw).success).toBe(false);
+  raw.image.sha256 = raw.image.raw_sha256;
+  raw.image.size_bytes = raw.image.raw_bytes;
+  expect(FleetReleaseSpec.safeParse(raw).success).toBe(true);
+  const odd = spec();
+  odd.image.raw_bytes += 1;
+  expect(FleetReleaseSpec.safeParse(odd).success).toBe(false);
+});
+
+it("the page's release is the spec's binaries and operating system under the release id", () => {
+  const release = FleetRelease.parse({
+    id: "release-1-2-0",
+    spec: spec(),
+    spec_sha256: "c".repeat(64),
+    approved_at: "2026-10-18T10:00:00.000Z",
   });
-  for (const role of Object.values(native.roles))
-    role.components.push("native-controller");
   expect(
-    FleetReleaseSpec.parse({ ...native, thin_storage_sampling_version: 1 })
-      .thin_storage_sampling_version,
-  ).toBe(1);
-  expect(
-    FleetReleaseSpec.safeParse({ ...native, thin_storage_sampling_version: 2 })
-      .success,
-  ).toBe(false);
-  expect(
-    FleetReleaseSpec.safeParse({ ...spec(), thin_storage_sampling_version: 1 })
-      .success,
-  ).toBe(false);
-  native.roles.control_relay.components =
-    native.roles.control_relay.components.filter(
-      (n) => n !== "native-controller",
-    );
-  expect(
-    FleetReleaseSpec.safeParse({ ...native, thin_storage_sampling_version: 1 })
-      .success,
-  ).toBe(false);
-});
-it("declares admission snapshots only with v4 routing and v2 proofs on every native role", () => {
-  const native = spec();
-  for (const name of ["native-gateway", "native-controller"]) {
-    native.components.push({
-      name,
-      kind: "image",
-      version: "1.0.0",
-      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
-      sha256: "d".repeat(64),
-    });
-    for (const role of Object.values(native.roles)) role.components.push(name);
-  }
-  const capable = {
-    ...native,
-    route_token_version: 4,
-    runtime_attestation_version: 2,
-    admission_snapshot_version: 1,
-  };
-  expect(FleetReleaseSpec.safeParse(capable).success).toBe(true);
-  expect(
-    FleetReleaseSpec.safeParse({ ...capable, route_token_version: 3 }).success,
-  ).toBe(false);
-  expect(
-    FleetReleaseSpec.safeParse({
-      ...capable,
-      runtime_attestation_version: undefined,
+    NodeRelease.safeParse({
+      id: release.id,
+      binaries: release.spec.binaries,
+      os: release.spec.os,
     }).success,
-  ).toBe(false);
-  native.roles.customer.components = native.roles.customer.components.filter(
-    (name) => name !== "native-controller",
-  );
-  expect(FleetReleaseSpec.safeParse(capable).success).toBe(false);
+  ).toBe(true);
 });
+
+it("a node is converged only on the release it reports, and a lost node says so", () => {
+  const status = {
+    node_id: `nod_${"a".repeat(20)}`,
+    region_id: "eu-1",
+    node_uid: crypto.randomUUID(),
+    desired_release_id: "release-1-2-0",
+    desired_spec_sha256: "c".repeat(64),
+    observed_release_id: "release-1-2-0",
+    observed_at: "2026-10-18T10:00:00.000Z",
+    state: "converged",
+  };
+  expect(FleetNodeReleaseStatus.safeParse(status).success).toBe(true);
+  for (const state of ["unassigned", "pending", "stale", "fenced"])
+    expect(FleetNodeReleaseStatus.safeParse({ ...status, state }).success).toBe(
+      true,
+    );
+  for (const state of ["drifted", "identity_changed"])
+    expect(FleetNodeReleaseStatus.safeParse({ ...status, state }).success).toBe(
+      false,
+    );
+});
+
 it("does not treat a release-id claim or partial duplicate inventory as component observations", () => {
   expect(
     FleetNodeReleaseObservation.safeParse({
@@ -161,33 +137,4 @@ it("does not treat a release-id claim or partial duplicate inventory as componen
       node_uid: crypto.randomUUID(),
     }).success,
   ).toBe(false);
-});
-it("forbids a different shared runtime version and contradictory image digest in one release", () => {
-  const different = structuredClone(spec());
-  different.roles.customer.kubernetes_version = "1.36.3";
-  expect(FleetReleaseSpec.safeParse(different).success).toBe(false);
-  const wrong = spec();
-  wrong.components[3]!.reference = `registry.example/regional@sha256:${"e".repeat(64)}`;
-  expect(FleetReleaseSpec.safeParse(wrong).success).toBe(false);
-});
-it("keeps the pinned cert-manager installation hook qualified without requiring a permanent running Job on every node", () => {
-  const value = spec();
-  value.components.push({
-    name: "image/cert-manager/cert-manager-startupapicheck",
-    kind: "image",
-    version: "1.21.2",
-    reference:
-      "quay.io/jetstack/cert-manager-startupapicheck:v1.21.2@sha256:" +
-      "e".repeat(64),
-    sha256: "e".repeat(64),
-  });
-  expect(FleetReleaseSpec.safeParse(value).success).toBe(true);
-  value.components.push({
-    name: "image/cert-manager/unqualified-hook",
-    kind: "image",
-    version: "1.21.2",
-    reference: "quay.io/jetstack/unqualified:v1.21.2@sha256:" + "e".repeat(64),
-    sha256: "e".repeat(64),
-  });
-  expect(FleetReleaseSpec.safeParse(value).success).toBe(false);
 });

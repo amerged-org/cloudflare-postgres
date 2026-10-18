@@ -31,6 +31,7 @@ import {
 } from "../domain/cancel-provider-addition.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
 import { readNodeStorageObservation } from "../domain/node-storage.ts";
+import { nodeActor } from "../domain/node-hints.ts";
 
 export async function getNodeStorage(
   c: ApiContext,
@@ -178,16 +179,22 @@ export async function markLostNode(
     .bind(id)
     .first<{ node_uid: string | null; lost_at: string | null }>();
   if (!row) throw new ApiError("not_found", "Node not found");
-  if (row.lost_at !== null)
-    return c.json(await markNodeLost(c.env.DB, id, raw));
-  return c.json(
-    await withAdmissionMutation(
-      c.env,
-      [],
-      (mutation) => markNodeLost(c.env.DB, id, raw, mutation),
-      { kind: "node", id },
-    ),
+  const loss =
+    row.lost_at !== null
+      ? await markNodeLost(c.env.DB, id, raw)
+      : await withAdmissionMutation(
+          c.env,
+          [],
+          (mutation) => markNodeLost(c.env.DB, id, raw, mutation),
+          { kind: "node", id },
+        );
+  // The node's key now reaches only its fenced scope; the agent is told to pull the fence.
+  c.executionCtx.waitUntil(
+    nodeActor(c.env, id)
+      .fence()
+      .catch(() => undefined),
   );
+  return c.json(loss);
 }
 export async function listNodeAdditions(c: ApiContext): Promise<Response> {
   await requireScope(c, "admin");

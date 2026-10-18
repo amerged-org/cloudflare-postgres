@@ -13,7 +13,6 @@ import {
   newRolePassword,
   OWNER_ROLE_NAME,
   SIDECAR,
-  type DesiredPostgres,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
@@ -49,10 +48,6 @@ import {
   databaseCpuChargeSql,
 } from "./startup-admission.ts";
 import {
-  generateMaintenanceCredential,
-  maintenanceCreationStatement,
-} from "./maintenance.ts";
-import {
   databaseForRequest,
   databaseView,
   effectiveSleepAfterSql,
@@ -70,10 +65,10 @@ import {
   selectedStorageProfileSql,
   storageResizeAllowedSql,
 } from "./storage-capacity.ts";
-export function hint(c: ApiContext, regionId: string, ids: string[]): void {
-  const stub = c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(regionId));
-  // Hints are best effort; the periodic full desired-state pull remains authoritative.
-  c.executionCtx.waitUntil(stub.notify(ids).catch(() => undefined));
+import { hintDatabases } from "./node-hints.ts";
+export function hint(c: ApiContext, ids: string[]): void {
+  // Hints are best effort; the node's own pull of its desired page remains authoritative.
+  c.executionCtx.waitUntil(hintDatabases(c.env, ids).catch(() => 0));
 }
 export async function databaseOperationResponse(
   c: ApiContext,
@@ -103,24 +98,11 @@ export function databaseInsertStatement(
   db: D1Database,
   snapshot: DatabaseInsertSnapshot,
 ): D1PreparedStatement {
-  const postgresColumns =
-    "desired_postgres_release_id,desired_postgres_image,desired_postgres_version,desired_postgres_schema_revision";
-  const postgresSelection = [
-    "f.release_id",
-    "json_extract(c.value,'$.reference')",
-    "json_extract(c.value,'$.version')",
-    "json_extract(release.spec_json,'$.configuration_schema_revision')",
-  ]
-    .map(
-      (column) =>
-        `(SELECT ${column} FROM fleet_region_releases f JOIN fleet_releases release ON release.id=f.release_id,json_each(release.spec_json,'$.components') c WHERE f.region_id=r.id AND json_extract(c.value,'$.name')='postgres')`,
-    )
-    .join(",");
   if (snapshot.nodeId === null) {
     return db
       .prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,${postgresColumns})
-      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,${postgresSelection}
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at)
+      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?
       FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
       AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
@@ -151,8 +133,8 @@ export function databaseInsertStatement(
   }
   return db
     .prepare(
-      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,storage_profile_json,${postgresColumns})
-            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,${selectedStorageProfileSql()},${postgresSelection} FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
+      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,storage_profile_json)
+            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,${selectedStorageProfileSql()} FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
             WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
@@ -209,7 +191,7 @@ export async function createDatabase(
         .bind(body.size_class_id)
         .first<SizeRow>();
       const region = await c.env.DB.prepare(
-        "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
+        "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
       )
         .bind(body.region_id)
         .first<RegionRow>();
@@ -237,10 +219,6 @@ export async function createDatabase(
         id,
         OWNER_ROLE_NAME,
         newRolePassword(),
-      );
-      const maintenance = await generateMaintenanceCredential(
-        c.env.CREDENTIAL_KEYS,
-        id,
       );
       for (let attempt = 0; attempt < 3; attempt++) {
         const node =
@@ -274,16 +252,6 @@ export async function createDatabase(
               archivePath: archive,
               now,
             }),
-            maintenanceCreationStatement(
-              c.env.DB,
-              {
-                databaseId: id,
-                projectId: body.project_id,
-                createdAt: now,
-                creationGeneration: 1,
-              },
-              maintenance,
-            ),
             c.env.DB.prepare(
               `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at)
             SELECT id,?,1,?,?,?,1,?,? FROM databases WHERE id=? AND project_id=?`,
@@ -346,7 +314,7 @@ export async function createDatabase(
           throw error;
         }
         if (result[0]!.meta.changes === 1) {
-          if (node !== null) hint(c, region.id, [id]);
+          if (node !== null) hint(c, [id]);
           else c.executionCtx.waitUntil(runNodeCapacity(c.env, region.id));
           return databaseOperationResponse(c, op);
         }
@@ -417,33 +385,19 @@ export function databaseResizeStatement(
   size: SizeRow,
   now: string,
   authority?: DatabaseInsertSnapshot["authority"],
-  postgres?: DesiredPostgres,
   admission?: AdmissionSqlGuard,
 ): D1PreparedStatement {
-  const imageUpdate = postgres
-    ? "desired_postgres_release_id=?,desired_postgres_image=?,desired_postgres_version=?,desired_postgres_schema_revision=?,"
-    : "";
-  const imageBindings = postgres
-    ? [
-        postgres.release_id,
-        postgres.image,
-        postgres.version,
-        postgres.configuration_schema_revision,
-      ]
-    : [];
-  const sameClassImagePatch =
-    postgres !== undefined && size.id === row.size_class_id;
   if (row.desired_state === "suspended")
     return db
       .prepare(
-        `UPDATE databases SET ${imageUpdate}size_class_id=?,generation=generation+1,observed_generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
+        `UPDATE databases SET size_class_id=?,generation=generation+1,observed_generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
        WHERE (id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND node_id IS ?
          AND desired_state='suspended' AND observed_state='provisioning' AND observed_generation=generation
          AND observed_power='hibernated' AND power_operation IS ? AND suspension_reason IS ? AND deleted_at IS NULL)
          AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
          AND EXISTS(SELECT 1 FROM size_classes old WHERE old.id=databases.size_class_id
            AND ${databaseCpuChargeSql("databases", "old")}=0)
-         AND EXISTS(SELECT 1 FROM size_classes target WHERE target.id=? AND ${sameClassImagePatch ? "1=1" : "target.enabled=1"}
+         AND EXISTS(SELECT 1 FROM size_classes target WHERE target.id=? AND target.enabled=1
            AND ${storageResizeAllowedSql("databases", "target")}
            AND target.memory_mib=? AND target.cpu_millicores=? AND COALESCE(target.cpu_request_millicores,target.cpu_millicores)=?
            AND target.storage_gib=? AND target.max_connections=? AND target.sleep_after_seconds IS ?
@@ -455,7 +409,6 @@ export function databaseResizeStatement(
          AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
-        ...imageBindings,
         size.id,
         now,
         row.id,
@@ -480,11 +433,11 @@ export function databaseResizeStatement(
       );
   return db
     .prepare(
-      `UPDATE databases SET ${imageUpdate}size_class_id=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
+      `UPDATE databases SET size_class_id=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
     WHERE ((id=? AND project_id=? AND node_id IS ? AND generation=? AND size_class_id=? AND updated_at=?)
       AND (desired_state='running' AND observed_state='ready' AND observed_generation=generation AND deleted_at IS NULL))
       AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
-      AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND ${sameClassImagePatch ? "1=1" : "s.enabled=1"}
+      AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
         WHERE (n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1)
           AND ((${nodePlacementGuard("n")}) AND ${nodeDatabaseCapacityGuard("n")}
           AND ${startupHeadroomSql()}
@@ -498,7 +451,6 @@ export function databaseResizeStatement(
       AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
     )
     .bind(
-      ...imageBindings,
       size.id,
       now,
       row.id,
@@ -532,7 +484,6 @@ export async function scheduleDatabaseResize(
   now: string,
   lease?: IdempotencyLease,
   authority?: DatabaseInsertSnapshot["authority"],
-  postgres?: DesiredPostgres,
 ): Promise<string> {
   const db = env.DB;
   if (
@@ -576,7 +527,7 @@ export async function scheduleDatabaseResize(
     );
   const sleeping = row.desired_state === "suspended";
   const op = newOperationId();
-  if (target.id === previous.id && !postgres) {
+  if (target.id === previous.id) {
     await db
       .prepare(
         `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
@@ -675,7 +626,7 @@ export async function scheduleDatabaseResize(
     const guard = mutation.guard(row.id),
       generation = row.generation + 1;
     const statements = [
-      databaseResizeStatement(db, row, target, now, authority, postgres, guard),
+      databaseResizeStatement(db, row, target, now, authority, guard),
       db
         .prepare(
           `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
@@ -784,7 +735,7 @@ export async function resizeDatabase(
         new Date().toISOString(),
         lease,
       );
-      hint(c, row.region_id, [id]);
+      hint(c, [id]);
       return databaseOperationResponse(c, op);
     },
   });
@@ -938,7 +889,7 @@ export async function deleteDatabase(
         throw new ApiError("conflict", "Database changed; retry the request", {
           reason: "generation_changed",
         });
-      hint(c, row.region_id, [id]);
+      hint(c, [id]);
       return databaseOperationResponse(c, op);
     },
   });

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation, DesiredResponse } from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observation,
-  observedBody,
+  report,
   request,
 } from "./fixtures.ts";
 
@@ -130,12 +130,10 @@ it("rejects active assigned cohorts while allowing pending unplaced demand to en
 
 it("preserves an assigned cohort while changing RAM policy only after every manual suspension is confirmed", async () => {
   const f = await fixture(4096, 40);
-  const uid = crypto.randomUUID();
+  const uid = f.nodeUid;
   const provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
-  await env.DB.prepare(
-    "UPDATE nodes SET node_uid=?,provider_instance_id=? WHERE id=?",
-  )
-    .bind(uid, provider, f.node)
+  await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
+    .bind(provider, f.node)
     .run();
   const ids: string[] = [];
   for (const name of ["retained-first", "retained-second"]) {
@@ -144,16 +142,8 @@ it("preserves an assigned cohort while changing RAM policy only after every manu
     );
     ids.push(created.database.id);
     expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([
-            observation(created.database.id, created.database.generation),
-          ]),
-        )
-      ).status,
+      (await report(f, created.database.id, created.database.generation))
+        .status,
     ).toBe(200);
   }
   const readCohort = async () => ({
@@ -187,24 +177,11 @@ it("preserves an assigned cohort while changing RAM policy only after every manu
   const confirm = async (stopped: DatabaseWithOperation) => {
     expect(
       (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([
-            {
-              ...observation(
-                stopped.database.id,
-                stopped.database.generation,
-                "hibernated",
-              ),
-              power: {
-                operation: stopped.operation.id,
-                revision: stopped.database.generation,
-                state: "hibernated",
-              },
-            },
-          ]),
+        await report(
+          f,
+          stopped.database.id,
+          stopped.database.generation,
+          "asleep",
         )
       ).status,
     ).toBe(200);
@@ -316,12 +293,11 @@ it("preserves an assigned cohort while changing RAM policy only after every manu
     ).json(),
   );
   expect(resumed.database.id).toBe(ids[0]);
-  const desired = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  expect(
-    desired.databases.find((d) => d.id === ids[0])?.size.memory_request_mib,
-  ).toBe(128);
+  const desired = await desiredPage(f);
+  expect(desired.databases.find((d) => d.id === ids[0])).toMatchObject({
+    desired_state: "running",
+    generation: resumed.database.generation,
+  });
   expect(desired.databases.find((d) => d.id === ids[1])?.desired_state).toBe(
     "suspended",
   );

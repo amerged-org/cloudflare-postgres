@@ -2,18 +2,21 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import {
+  DatabaseRuntime,
   DatabaseWithOperation,
   newDatabaseId,
   newOperationId,
 } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { readDatabasePresence } from "../../src/domain/database-actor-sync.ts";
+import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
 import {
   cleanupFixtures,
   fixture,
+  desiredPage,
   request,
-  observation,
-  observedBody,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 
 afterEach(async () => {
@@ -26,12 +29,7 @@ async function ready() {
   const f = await fixture();
   const result = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = result.database.id;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(id, 1)]),
-  );
+  await report(f, id, 1);
   await actor(id).seed((await readDatabasePresence(env.DB, id))!);
   return { ...f, id };
 }
@@ -57,21 +55,7 @@ async function idle(f: Awaited<ReturnType<typeof ready>>) {
   )
     .bind(f.id)
     .first<{ generation: number; power_operation: string }>();
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, row!.generation, "hibernated"),
-        power: {
-          operation: row!.power_operation,
-          revision: row!.generation,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  expect((await report(f, f.id, row!.generation, "asleep")).status).toBe(200);
 }
 async function untilWake(id: string, generation = 3) {
   for (let i = 0; i < 100; i++) {
@@ -171,18 +155,31 @@ async function pollReads(id: string, hold = false) {
     },
   };
 }
-function awake(f: Awaited<ReturnType<typeof ready>>, operation: string) {
-  return request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+function awake(f: Awaited<ReturnType<typeof ready>>, generation = 3) {
+  return report(f, f.id, generation);
+}
+
+/**
+ * What the node's report of the woken generation commits in D1, without the push and the publish
+ * that follow it: isolates the wake loop from the report's own release of the waiters.
+ */
+async function commitReady(
+  f: Awaited<ReturnType<typeof ready>>,
+  generation = 3,
+) {
+  const runtime = DatabaseRuntime.parse({
+    database_id: f.id,
+    node_id: f.node,
+    generation,
+    storage_generation: 1,
+    instance: crypto.randomUUID(),
+    observed_at: Date.now(),
+  });
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_attestation_json=? WHERE id=?",
+  )
+    .bind(JSON.stringify(runtime), f.id)
+    .run();
 }
 
 /**
@@ -226,7 +223,7 @@ it("a committed ready observation releases a waiting wake at once, without its f
   const row = await untilWake(f.id);
   await registered(f.id, waiterId);
   await parkPolling(f.id);
-  await awake(f, row.power_operation);
+  await awake(f, row.generation);
   expect(await pending).toMatchObject({ ok: true });
 });
 
@@ -265,7 +262,7 @@ it("only the waiting wake's push reads D1 at once, and a push ahead of the commi
       Reflect.get(instance, "waiters").has(waiterId),
     ),
   ).toBe(true);
-  await awake(f, row.power_operation);
+  await awake(f, row.generation);
   expect(await pending).toMatchObject({ ok: true });
   expect(reads()).toBe(2);
 });
@@ -286,11 +283,7 @@ it("a push during the loop's not-ready read makes it read again without sleeping
   expect(await push()).toBe(true);
   await poll.executed(1);
   // Readiness commits and its push arrives while the first read still holds the older row.
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation WHERE id=?",
-  )
-    .bind(f.id)
-    .run();
+  await commitReady(f);
   expect(await push()).toBe(true);
   await poll.release();
   const timer = () =>
@@ -302,10 +295,12 @@ it("a push during the loop's not-ready read makes it read again without sleeping
   expect(poll.reads()).toBe(2);
   expect(await timer()).toBeUndefined();
   await poll.release();
+  // The connection needs the published snapshot too: the publish releases it.
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   expect(await pending).toMatchObject({ ok: true });
 });
 
-it("the bounded fallback read still releases a waiter whose push was lost", async () => {
+it("the publish still releases a waiter whose push was lost", async () => {
   const f = await ready();
   await idle(f);
   const waiterId = crypto.randomUUID();
@@ -315,15 +310,12 @@ it("the bounded fallback read still releases a waiter whose push was lost", asyn
   });
   await untilWake(f.id);
   await registered(f.id, waiterId);
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation WHERE id=?",
-  )
-    .bind(f.id)
-    .run();
+  await commitReady(f);
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   expect(await pending).toMatchObject({ ok: true });
 });
 
-it("admits an already-ready route with one fresh authoritative read", async () => {
+it("admits an already-ready route from its snapshot without reading D1", async () => {
   const f = await ready();
   const prepare = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
   expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
@@ -333,8 +325,14 @@ it("admits an already-ready route with one fresh authoritative read", async () =
       gateway_url: `https://${["gateway", "invalid"].join(".")}`,
       gateway_binding: null,
     },
+    node: f.node,
+    target: {
+      revision: 1,
+      route_revision: 1,
+      instance: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    },
   });
-  expect(prepare).toHaveBeenCalledTimes(1);
+  expect(prepare).not.toHaveBeenCalled();
 });
 
 it("does not wake for a role revoked after the authorization read", async () => {
@@ -408,7 +406,7 @@ it("rejects a duplicate waiter without cancelling its original connection", asyn
     waiterId,
     deadline: Date.now() + 4000,
   });
-  const row = await untilWake(f.id);
+  await untilWake(f.id);
   for (let i = 0; i < 100; i++) {
     if (
       await runInDurableObject(actor(f.id), (instance) =>
@@ -429,17 +427,7 @@ it("rejects a duplicate waiter without cancelling its original connection", asyn
       deadline: Date.now() + 4000,
     }),
   ).toEqual({ ok: false, sqlstate: "57P03" });
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect((await first).ok).toBe(true);
 });
 
@@ -447,35 +435,21 @@ it("coalesces ten idle wake waiters into one durable operation and hint, releasi
   const f = await ready();
   await idle(f);
   const notify = await runInDurableObject(
-    env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region)),
+    env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(f.node)),
     (instance) => vi.spyOn(Object.getPrototypeOf(instance), "notify"),
   );
   const waits = Array.from({ length: 10 }, () =>
     actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 4000 }),
   );
   const row = await untilWake(f.id);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(f.id, 3)]),
-  );
+  // A report of the generation before the wake releases nothing.
+  expect(await verdicts(await report(f, f.id, 2))).toEqual(["stale"]);
   expect(
     await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
       .bind(f.id)
       .first("observed_state"),
   ).toBe("provisioning");
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect((await Promise.all(waits)).every((value) => value.ok)).toBe(true);
   expect(notify).toHaveBeenCalledTimes(1);
   expect(
@@ -533,24 +507,14 @@ it("recovers the persisted wake after eviction without duplicating the operation
     deadline: Date.now() + 3000,
     waiterId,
   });
-  const row = await untilWake(f.id);
+  await untilWake(f.id);
   await actor(f.id).cancelWakeWaiter(f.id, waiterId);
   expect(await priming).toEqual({ ok: false, sqlstate: "57P03" });
   await evictDurableObject(actor(f.id));
   const pending = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 3000,
   });
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect((await pending).ok).toBe(true);
   expect(
     await env.DB.prepare(
@@ -564,7 +528,17 @@ it("recovers the persisted wake after eviction without duplicating the operation
 it("logs every refused admission with the actor's state, so a refusal says why", async () => {
   // Live, a wake was refused in 24 ms and nothing said which of a dozen paths refused it.
   const f = await ready();
-  await idle(f);
+  expect(
+    (
+      await request(
+        `/v1/databases/${f.id}/suspend`,
+        f.integrator,
+        "POST",
+        undefined,
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(202);
   const log = vi.spyOn(console, "log");
   expect(
     await actor(f.id).admitWake(f.id, "app", { deadline: Date.now() - 1 }),
@@ -698,23 +672,13 @@ it("current role revocation rejects a waiting caller even after an exact ready o
   const pending = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 3000,
   });
-  const row = await untilWake(f.id);
+  await untilWake(f.id);
   await env.DB.prepare(
     "UPDATE roles SET deleted_at=? WHERE database_id=? AND name='app'",
   )
     .bind(new Date().toISOString(), f.id)
     .run();
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect(await pending).toEqual({ ok: false, sqlstate: "28P01" });
 });
 
@@ -730,17 +694,7 @@ it("a superseding configuration generation cannot release an old wake", async ()
   )
     .bind(f.id)
     .run();
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect(await pending).toEqual({ ok: false, sqlstate: "57P03" });
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
@@ -770,22 +724,12 @@ it("reconciles a committed wake after its D1 response is lost without repeating 
       batch.mockRestore();
     }
   });
-  const row = await untilWake(f.id);
+  await untilWake(f.id);
   await evictDurableObject(actor(f.id));
   const pending = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 3000,
   });
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect((await pending).ok).toBe(true);
   expect(
     await env.DB.prepare(
@@ -798,6 +742,7 @@ it("reconciles a committed wake after its D1 response is lost without repeating 
 
 it("a deadline bounds even a stalled authoritative read without manufacturing readiness", async () => {
   const f = await ready();
+  await idle(f);
   await runInDurableObject(actor(f.id), async (instance) => {
     const db = (instance as unknown as { env: { DB: D1Database } }).env.DB;
     const original = db.prepare.bind(db);
@@ -851,23 +796,13 @@ it("an idle connect supersedes an unknown pending shutdown without claiming it a
   const pending = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 3000,
   });
-  const row = await untilWake(f.id);
+  await untilWake(f.id);
   expect(
     await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
       .bind(f.id)
       .first("observed_state"),
   ).toBe("provisioning");
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: row.power_operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  await report(f, f.id, 3);
   expect((await pending).ok).toBe(true);
 });
 
@@ -911,18 +846,8 @@ it("a current password revision on an idle sleeper advances configuration withou
   const pending = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 3000,
   });
-  const row = await untilWake(f.id, 4);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 4),
-        power: { operation: row.power_operation, revision: 4, state: "awake" },
-      },
-    ]),
-  );
+  await untilWake(f.id, 4);
+  await report(f, f.id, 4);
   expect((await pending).ok).toBe(true);
 });
 
@@ -934,7 +859,7 @@ it("a wake claim that lost its row to an observation write reads it again and cl
     deadline: Date.now() + 3000,
   });
   const row = await untilWake(f.id);
-  await awake(f, row.power_operation);
+  await awake(f, row.generation);
   expect(await pending).toMatchObject({ ok: true });
   expect(seen.writes).toBe(1);
   // The lost commit made no operation: the one wake is the second attempt's.
@@ -1005,9 +930,9 @@ it("wake_timing_events_name_the_database_and_the_wake_operation", async () => {
   });
   const row = await untilWake(f.id);
   await registered(f.id, waiterId);
-  await awake(f, row.power_operation);
+  await awake(f, row.generation);
   expect(await pending).toMatchObject({ ok: true });
-  expect((await request("/agent/v1/desired", f.agent)).status).toBe(200);
+  await desiredPage(f);
   const events = log.mock.calls.flatMap(([value]) => {
     try {
       return typeof value === "string"
@@ -1046,15 +971,15 @@ it("wake_timing_events_name_the_database_and_the_wake_operation", async () => {
       ...key,
       at_ms: expect.any(Number),
       waited_ms: expect.any(Number),
-      via: expect.stringMatching(/^(push|poll)$/),
+      via: expect.stringMatching(/^(push|poll|publish)$/),
     }),
   ]);
-  expect(named("desired_page").at(-1)).toMatchObject({
+  expect(named("node_desired_page").at(-1)).toMatchObject({
     at_ms: expect.any(Number),
     elapsedMs: expect.any(Number),
     databases: expect.any(Number),
   });
   // The events never carry credentials or tokens.
   const serialized = JSON.stringify(events);
-  expect(serialized).not.toContain(f.agent);
+  expect(serialized).not.toContain("Bearer");
 });

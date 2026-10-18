@@ -2,6 +2,7 @@
 import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
 import type { CronWatchdog } from "./cron-watchdog.ts";
+import type { NodeCaller } from "./domain/node-auth.ts";
 
 export type Env = Cloudflare.Env & {
   CF_VERSION_METADATA: WorkerVersionMetadata;
@@ -28,6 +29,10 @@ export interface ApiVariables {
   /** The class of an unexpected failure, set by the error handler for the request's one failure line. */
   failureCause?: string;
   auth?: AuthPrincipal;
+  /** The node of a call signed with its key. */
+  node?: NodeCaller;
+  /** The bytes of the request body as they arrived; a node's signature covers them. */
+  body?: Uint8Array;
 }
 
 export interface ApiEnv {

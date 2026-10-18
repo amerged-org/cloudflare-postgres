@@ -209,10 +209,6 @@ it("requires administrator scope for reads and writes and prevents protected-fie
       .status,
   ).toBe(403);
   expect(
-    (await request(path(state.region), state.agent, "PUT", update(before)))
-      .status,
-  ).toBe(401);
-  expect(
     (
       await request(path(state.region), state.admin, "PUT", {
         ...update(before),
@@ -224,12 +220,12 @@ it("requires administrator scope for reads and writes and prevents protected-fie
   expect(await row(state.region)).toEqual(original);
 });
 
-it("keeps heartbeat activity outside the configuration CAS and fences agent credential changes", async () => {
+it("keeps the activity of the region's nodes outside the configuration CAS", async () => {
   const state = await fixture();
   const before = await configuration(state.region, state.admin);
   const heartbeat = new Date(Date.now() + 1000).toISOString();
-  await env.DB.prepare("UPDATE regions SET agent_last_seen_at=? WHERE id=?")
-    .bind(heartbeat, state.region)
+  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+    .bind(heartbeat, state.node)
     .run();
   expect(
     (await configuration(state.region, state.admin)).configuration_sha256,
@@ -238,23 +234,11 @@ it("keeps heartbeat activity outside the configuration CAS and fences agent cred
     (await request(path(state.region), state.admin, "PUT", update(before)))
       .status,
   ).toBe(200);
-  expect((await row(state.region))!.agent_last_seen_at).toBe(heartbeat);
-  const next = await configuration(state.region, state.admin);
-  await env.DB.prepare("UPDATE regions SET agent_key_hash=? WHERE id=?")
-    .bind("e".repeat(64), state.region)
-    .run();
-  const changed = await row(state.region);
   expect(
-    (
-      await request(
-        path(state.region),
-        state.admin,
-        "PUT",
-        update(next, "blocked"),
-      )
-    ).status,
-  ).toBe(409);
-  expect(await row(state.region)).toEqual(changed);
+    await env.DB.prepare("SELECT last_observed_at FROM nodes WHERE id=?")
+      .bind(state.node)
+      .first("last_observed_at"),
+  ).toBe(heartbeat);
 });
 
 it("validates the exact upgrade endpoint and permits HTTP only for an explicit service binding", async () => {

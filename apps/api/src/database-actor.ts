@@ -6,23 +6,19 @@ import {
   DatabaseRegionRoute as RegionRoute,
   type DatabaseAdmission,
   type DatabaseWakeAdmission,
-  CnpgDatabaseTarget,
+  DatabaseRuntime,
+  type NodeDatabaseTarget,
   RoleName,
   Timestamp,
   newOperationId,
   roleExpiryInstant,
 } from "@pgcf/contracts";
 import { z } from "zod";
-import { DatabaseRuntimeAttestation } from "@pgcf/contracts/reclaim";
 import { roleRevisionHash } from "@pgcf/contracts/route-token";
-import {
-  routeTokenV3Sql,
-  admissionSnapshotSql,
-} from "./domain/fleet-releases.ts";
 
 import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
-import { wakeHintPage } from "./domain/desired.ts";
+import { hintDatabases } from "./domain/node-hints.ts";
 import { effectiveSleepAfterSql, type DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 import {
@@ -108,18 +104,15 @@ function roleAdmitted(
 }
 export type { DatabaseAdmission } from "@pgcf/contracts";
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,
-  CASE WHEN ${admissionSnapshotSql("g")} THEN 1 ELSE 0 END admission_snapshot_capable,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
-  CASE WHEN EXISTS(SELECT 1 FROM roles changed WHERE changed.database_id=d.id AND changed.owner=0 AND changed.deleted_at IS NULL
-    AND changed.name<>r.name AND changed.updated_at=d.updated_at) THEN 1 ELSE 0 END unrelated_role_configuration,
+  d.runtime_attestation_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
+  LEFT JOIN database_admission_epochs e ON e.database_id=d.id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL
     AND (r.valid_until IS NULL OR substr(r.valid_until,1,19)>strftime('%Y-%m-%dT%H:%M:%S','now')) WHERE d.id=? LIMIT 1`;
 interface AdmissionRow {
-  unrelated_role_configuration: number;
-  admission_snapshot_capable: number;
+  route_revision: number;
   generation: number;
   observed_generation: number;
   observed_power: string;
@@ -130,7 +123,6 @@ interface AdmissionRow {
   database_deleted_at: string | null;
   project_deleted_at: string | null;
   runtime_attestation_json: string | null;
-  route_token_v3: number;
   role_name: string | null;
   id: string;
   gateway_url: string;
@@ -150,32 +142,31 @@ function admittedRoute(
     gateway_binding: row.gateway_binding,
   });
   if (!region.success) return { ok: false, sqlstate: "08006" };
-  // Temporary rollout compatibility (route-token.ts): a region whose gateways may still verify
-  // only v2 gets an untargeted route.
-  if (row.route_token_v3 !== 1) return { ok: true, region: region.data };
+  // Without the unit the node reported for the observed generation the database is not ready for
+  // a connection yet.
   const target = verifiedTarget(row, databaseId);
-  // A v3 region never falls back to an untargeted route: without the verified Pod of the observed
-  // revision the database is not ready for a connection yet.
-  return target
-    ? { ok: true, region: region.data, target }
+  return target && row.node_id !== null
+    ? { ok: true, region: region.data, node: row.node_id, target }
     : { ok: false, sqlstate: "57P03" };
 }
 
-/** The controller's runtime attestation of the observed revision names its verified Pod. */
+/** The node's report of the observed generation names the unit that serves it. */
 function verifiedTarget(
   row: AdmissionRow,
   databaseId: string,
-): z.infer<typeof CnpgDatabaseTarget> | undefined {
+): NodeDatabaseTarget | undefined {
   if (row.runtime_attestation_json === null) return undefined;
-  const attestation = DatabaseRuntimeAttestation.safeParse(
+  const runtime = DatabaseRuntime.safeParse(
     JSON.parse(row.runtime_attestation_json),
   );
-  return attestation.success &&
-    attestation.data.database_id === databaseId &&
-    attestation.data.generation === row.observed_generation
+  return runtime.success &&
+    runtime.data.database_id === databaseId &&
+    runtime.data.node_id === row.node_id &&
+    runtime.data.generation === row.observed_generation
     ? {
-        revision: attestation.data.generation,
-        pod_uid: attestation.data.pod_uid,
+        revision: runtime.data.generation,
+        route_revision: row.route_revision,
+        instance: runtime.data.instance,
       }
     : undefined;
 }
@@ -374,12 +365,8 @@ export class DatabaseActor extends DurableObject<Env> {
     ) {
       // The snapshot was read from the committed state after readiness and no barrier stands now:
       // it is the condition the readiness loop applies, so it releases the waiters itself without
-      // another read. A cached runtime proof must still be current.
-      if (
-        !snapshot.cache_capable ||
-        (snapshot.runtime &&
-          snapshot.runtime.observation.expires_at > Date.now())
-      ) {
+      // another read.
+      if (snapshot.runtime) {
         console.log(
           JSON.stringify({
             event: "actor_release",
@@ -421,24 +408,32 @@ export class DatabaseActor extends DurableObject<Env> {
   ): DatabaseAdmission | undefined {
     if (state?.barrier) return { ok: false, sqlstate: "57P03" };
     const snapshot = state?.snapshot;
-    if (!snapshot?.cache_capable) return undefined;
+    if (!snapshot) return undefined;
     if (snapshot.deleted) return { ok: false, sqlstate: "3D000" };
-    if (!snapshot.roles.some((role) => role.name === user))
+    // A credential PostgreSQL would refuse never admits, whatever else the snapshot says.
+    const now = Date.now();
+    if (
+      !snapshot.roles.some(
+        (role) =>
+          role.name === user &&
+          (role.valid_until === null ||
+            roleExpiryInstant(role.valid_until) > now),
+      )
+    )
       return { ok: false, sqlstate: "28P01" };
     const runtime = snapshot.runtime;
-    if (
-      !snapshot.admissible ||
-      !runtime ||
-      runtime.observation.expires_at <= Date.now() ||
-      runtime.observed_at > Date.now() + 1000
-    )
+    if (!snapshot.admissible || !runtime)
       return { ok: false, sqlstate: "57P03" };
-    const target = {
-      revision: snapshot.generation,
-      pod_uid: runtime.pod_uid,
-      route_revision: snapshot.route_revision,
+    return {
+      ok: true,
+      region: snapshot.region,
+      node: runtime.node_id,
+      target: {
+        revision: snapshot.generation,
+        route_revision: snapshot.route_revision,
+        instance: runtime.instance,
+      },
     };
-    return { ok: true, region: snapshot.region, target };
   }
   private initializeSchema(): void {
     if (this.hasSchema) return;
@@ -487,26 +482,11 @@ export class DatabaseActor extends DurableObject<Env> {
   }
   /** Management RPC only: incoming hints never invoke seeding or authoritative repair. */
   async seed(value: unknown): Promise<void> {
-    return this.seedPresence(value, false);
-  }
-  /** A trusted current legacy Fleet page may only remove cached admission, never enable it. */
-  async seedLegacyPresence(value: unknown): Promise<boolean> {
-    await this.seedPresence(value, true);
-    return this.admissionState()?.barrier !== undefined;
-  }
-  private async seedPresence(
-    value: unknown,
-    clearAdmissionSnapshot: boolean,
-  ): Promise<void> {
     const parsed = DatabasePresence.safeParse(value);
     if (!parsed.success) throw new Error("invalid_actor_snapshot");
     this.identity(parsed.data.database_id);
     await this.gate("seedPresence", async () => {
       this.initializeSchema();
-      if (clearAdmissionSnapshot) {
-        const state = this.admissionState();
-        if (state) this.saveAdmissionState(undefined, state.barrier);
-      }
       let next = parsed.data;
       const previous = this.presence();
       if (previous?.deleted) return;
@@ -632,7 +612,6 @@ export class DatabaseActor extends DurableObject<Env> {
           deleted: snapshot?.deleted ?? null,
           admissible: snapshot?.admissible ?? null,
           wakeable: snapshot?.wakeable ?? null,
-          cache_capable: snapshot?.cache_capable ?? null,
           barrier: read.barrier !== undefined,
           ticket: this.storedTicket()?.state ?? null,
           wake: this.wake?.operation ?? null,
@@ -665,7 +644,7 @@ export class DatabaseActor extends DurableObject<Env> {
     try {
       const read = this.admissionState();
       const snapshot = read?.snapshot;
-      if (!snapshot?.cache_capable || snapshot.wakeable === undefined)
+      if (snapshot?.wakeable === undefined)
         return await this.ensureAwake(id.data, role.data, options);
       const failure = this.earlyAdmission(id.data, role.data, read!.presence);
       if (failure) return failure;
@@ -716,9 +695,11 @@ export class DatabaseActor extends DurableObject<Env> {
           at_ms: Date.now(),
         }),
       );
+      if (current.node === null) return { ok: false, sqlstate: "57P03" };
       return {
         ok: true,
         region: current.region,
+        node: current.node,
         wake: {
           operation: ticket!.operation,
           generation: ticket!.generation,
@@ -834,7 +815,6 @@ export class DatabaseActor extends DurableObject<Env> {
             if (transition[0]!.meta.changes === 1)
               await this.hintWake(
                 id,
-                row.region_id,
                 ticket.operation,
                 ticket.generation,
                 started,
@@ -885,33 +865,9 @@ export class DatabaseActor extends DurableObject<Env> {
       }),
     );
   }
-  /** Tells the region a ticket was refused, with the database's current page when it is a wake. */
+  /** Tells the node a ticket was refused, so it pulls the page that refutes it. */
   private async refuteTicket(id: string): Promise<void> {
-    try {
-      const row = await this.env.DB.prepare(
-        "SELECT region_id,power_operation,generation FROM databases WHERE id=?",
-      )
-        .bind(id)
-        .first<{
-          region_id: string;
-          power_operation: string | null;
-          generation: number;
-        }>();
-      if (!row) return;
-      const page = row.power_operation
-        ? await wakeHintPage(this.env, row.region_id, id, {
-            operation: row.power_operation,
-            revision: row.generation,
-          }).catch(() => undefined)
-        : undefined;
-      await this.env.REGION_LINK.get(
-        this.env.REGION_LINK.idFromName(row.region_id),
-      )
-        .notify([id], page)
-        .catch(() => undefined);
-    } catch {
-      /* The region's periodic pull finds the refusal; the ticket lease refutes it meanwhile. */
-    }
+    await hintDatabases(this.env, [id]).catch(() => 0);
   }
   /** The local admission actor of a ticket claim: its barrier is the Actor's own ticket mutation. */
   private ticketAdmissionActor(databaseId: string): LocalAdmissionActor {
@@ -936,20 +892,8 @@ export class DatabaseActor extends DurableObject<Env> {
     };
   }
   private readyRevision(row: AdmissionRow): boolean {
-    if (row.observed_generation === row.generation) return true;
-    // Legacy role configuration advances desired metadata without restarting
-    // the live server. Create/reset atomically stamp the changed non-owner role
-    // and database; a raw generation bump or this role's own change is no proof.
-    // This D1 path still revalidates the role and all admission
-    // fences. V3 still verifies the observed Pod/revision in admittedRoute;
-    // snapshot-capable routing requires the exact current generation.
-    return (
-      row.observed_generation > 0 &&
-      row.observed_generation < row.generation &&
-      row.unrelated_role_configuration === 1 &&
-      row.admission_snapshot_capable === 0 &&
-      !this.admissionState()?.snapshot?.cache_capable
-    );
+    // A role change advances the generation too: the node applies it and reports the new one.
+    return row.observed_generation === row.generation;
   }
   private async known(
     id: string,
@@ -1019,7 +963,6 @@ export class DatabaseActor extends DurableObject<Env> {
    */
   private async hintWake(
     id: string,
-    regionId: string,
     operation: string,
     revision: number,
     started: number,
@@ -1050,20 +993,14 @@ export class DatabaseActor extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         "UPDATE database_wake SET hint_claimed=1 WHERE singleton=1",
       );
-      // Already claimed, so nothing replays it: the claim does not wait for its delivery. The hint
-      // carries the page the region's targeted pull would read now; without it the region pulls.
+      // Already claimed, so nothing replays it: the claim does not wait for its delivery. The node
+      // pulls the page that holds the claimed generation.
       const hinted = Date.now();
       this.ctx.waitUntil(
-        wakeHintPage(this.env, regionId, id, { operation, revision })
-          .catch(() => undefined)
-          .then(async (page) => {
-            const read = Date.now();
-            await this.env.REGION_LINK.get(
-              this.env.REGION_LINK.idFromName(regionId),
-            )
-              .notify([id], page)
-              .catch(() => undefined);
-            // The wake split's first stage on this side: the claim itself and the region hint.
+        hintDatabases(this.env, [id])
+          .catch(() => 0)
+          .then(() =>
+            // The wake split's first stage on this side: the claim itself and the node hint.
             console.log(
               JSON.stringify({
                 event: "actor_claim",
@@ -1075,12 +1012,10 @@ export class DatabaseActor extends DurableObject<Env> {
                 requested_at_ms: requested,
                 gate_ms: started - requested,
                 claim_ms: hinted - started,
-                page: page !== undefined,
-                page_ms: read - hinted,
-                hint_ms: Date.now() - read,
+                hint_ms: Date.now() - hinted,
               }),
-            );
-          }),
+            ),
+          ),
       );
     }
     return true;
@@ -1148,7 +1083,6 @@ export class DatabaseActor extends DurableObject<Env> {
                 if (transition[0]!.meta.changes === 1)
                   hinted = await this.hintWake(
                     id,
-                    previous.region_id,
                     operation,
                     revision,
                     started,
@@ -1192,7 +1126,6 @@ export class DatabaseActor extends DurableObject<Env> {
           if (
             !(await this.hintWake(
               id,
-              row.region_id,
               operation.id,
               row.generation,
               started,
@@ -1302,10 +1235,12 @@ export class DatabaseActor extends DurableObject<Env> {
         current.observed_state === "ready" &&
         current.observed_power === "awake" &&
         this.readyRevision(current)
-      )
-        return (
-          this.snapshotAdmission(role.data) ?? admittedRoute(current, id.data)
-        );
+      ) {
+        // D1 holds the readiness; a snapshot that does not show it yet is the publish still on its
+        // way, and the verified unit of the row routes meanwhile.
+        const cached = this.snapshotAdmission(role.data);
+        return cached?.ok ? cached : admittedRoute(current, id.data);
+      }
       if (
         current.desired_state === "suspended" &&
         current.suspension_reason !== "idle"
@@ -1423,11 +1358,9 @@ export class DatabaseActor extends DurableObject<Env> {
               snapshot = state?.snapshot;
             if (
               !state?.barrier &&
-              (!snapshot?.cache_capable ||
-                (snapshot.admissible &&
-                  snapshot.generation === this.wake.revision &&
-                  snapshot.runtime &&
-                  snapshot.runtime.observation.expires_at > Date.now()))
+              snapshot?.admissible &&
+              snapshot.generation === this.wake.revision &&
+              snapshot.runtime
             ) {
               console.log(
                 JSON.stringify({
@@ -1491,6 +1424,35 @@ export class DatabaseActor extends DurableObject<Env> {
     waiter.resolve(false);
     this.interruptPoll?.();
     return true;
+  }
+  /**
+   * The wake ticket whose claim D1 has not committed yet. The node releases a wake before that
+   * commit, so its first report may name this generation while D1 still names the previous one
+   * (`observationVerdict`).
+   */
+  async pendingTicket(): Promise<{
+    generation: number;
+    operation: string;
+  } | null> {
+    const ticket = this.presence() ? this.storedTicket() : undefined;
+    return ticket?.state === "pending"
+      ? { generation: ticket.generation, operation: ticket.operation }
+      : null;
+  }
+  /** Waits, for at most `milliseconds`, for the claim of a ticket in flight to finish. */
+  async awaitTicketClaim(
+    operation: string,
+    milliseconds: number,
+  ): Promise<void> {
+    const claim = this.claim;
+    if (claim?.operation !== operation) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      claim.done,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, milliseconds);
+      }),
+    ]).finally(() => clearTimeout(timer));
   }
   /** Trusted gateway activity RPC; absence of authenticated measurements never starts an idle intent. */
   async recordActivity(databaseId: string, value: unknown): Promise<boolean> {
@@ -1668,11 +1630,7 @@ export class DatabaseActor extends DurableObject<Env> {
       );
       if (result[0]!.meta.changes !== 1)
         return { ok: false, reason: "changed" };
-      await this.env.REGION_LINK.get(
-        this.env.REGION_LINK.idFromName(row.region_id),
-      )
-        .notify([databaseId])
-        .catch(() => undefined);
+      await hintDatabases(this.env, [databaseId]).catch(() => 0);
       return { ok: true, operation, revision: revision + 1 };
     });
   }

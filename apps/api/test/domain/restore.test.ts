@@ -4,10 +4,13 @@ import { afterEach, expect, it } from "vitest";
 import {
   fixture,
   cleanupFixtures,
+  desiredPage,
+  grantCredential,
+  nodeKeyPair,
   refusal,
   request,
-  observedBody,
-  observation,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 import { createApp } from "../../src/app.ts";
 import {
@@ -237,6 +240,8 @@ it("holds startup RAM for a placed restore and admits an unplaced restore later 
 it("restores a source catalog into a separate target region without changing source placement or credentials", async () => {
   const f = await archived(),
     targetNode = newNodeId(),
+    targetKey = await nodeKeyPair(),
+    targetUid = crypto.randomUUID(),
     now = new Date().toISOString(),
     bucket = "pgcf-api-us-test";
   await env.DB.batch([
@@ -244,7 +249,7 @@ it("restores a source catalog into a separate target region without changing sou
       "UPDATE regions SET backup_bucket=?,backup_endpoint_url=? WHERE id=?",
     ).bind(bucket, "https://target.r2.cloudflarestorage.com", f.foreign),
     env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?)",
+      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?,?,?)",
     ).bind(
       targetNode,
       f.foreign,
@@ -252,7 +257,9 @@ it("restores a source catalog into a separate target region without changing sou
       now,
       now,
       now,
-      crypto.randomUUID(),
+      targetUid,
+      targetKey.publicKey,
+      now,
     ),
   ]);
   const mapping = {
@@ -324,38 +331,33 @@ it("restores a source catalog into a separate target region without changing sou
       )
     ).status,
   ).toBe(409);
-  const desired = await overridden(
-    "/agent/v1/desired",
-    f.foreignAgent,
-    undefined,
-    mapping,
-    "unused",
-    "GET",
-  );
-  const page = await desired.json<{
-    databases: { id: string; recovery: { source_archive: unknown } }[];
-  }>();
-  expect(
-    page.databases.find((d) => d.id === result.target_database.id)?.recovery
-      .source_archive,
-  ).toEqual({
-    region_id: f.region,
-    bucket: env.ARCHIVE_BUCKET_NAME,
-    endpoint_url: "https://archive.invalid",
-    region: "auto",
+  // The node of the target region reads the restore from the source's archive.
+  await grantCredential(result.target_database.id, {
+    path: (source as { archive_path: string }).archive_path,
+    access: "read_only",
   });
-  const originalDesired = await overridden(
-    "/agent/v1/desired",
-    f.agent,
-    undefined,
-    mapping,
-    "unused",
-    "GET",
-  );
+  const targetPage = await desiredPage({
+    region: f.foreign,
+    admin: f.admin,
+    node: targetNode,
+    nodeUid: targetUid,
+    nodeKey: targetKey.privateKey,
+  });
   expect(
-    (
-      await originalDesired.json<{ databases: { id: string }[] }>()
-    ).databases.some((d) => d.id === result.target_database.id),
+    targetPage.databases.find((d) => d.id === result.target_database.id)
+      ?.origin,
+  ).toMatchObject({
+    kind: "restore",
+    source: {
+      database_id: f.id,
+      path: (source as { archive_path: string }).archive_path,
+    },
+  });
+  // The source's own node never sees the target.
+  expect(
+    (await desiredPage(f)).databases.some(
+      (d) => d.id === result.target_database.id,
+    ),
   ).toBe(false);
   expect(
     (
@@ -425,47 +427,21 @@ it("restores into one separate target on replay with credentials encrypted for i
     });
   expect(await decrypt(target!)).toBe(await decrypt(source!));
   expect(target!.password_ciphertext).not.toBe(source!.password_ciphertext);
-  const desired = await request("/agent/v1/desired", f.agent);
-  const page = (await desired.json()) as {
-    databases: { id: string; recovery?: { source_database_id: string } }[];
-  };
+  await grantCredential(result.target_database.id, {
+    path: (await env.DB.prepare("SELECT archive_path FROM databases WHERE id=?")
+      .bind(f.id)
+      .first<string>("archive_path"))!,
+    access: "read_only",
+  });
   expect(
-    page.databases.find((d) => d.id === result.target_database.id)?.recovery
-      ?.source_database_id,
-  ).toBe(f.id);
-  const ack = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(result.target_database.id, 1)]),
+    (await desiredPage(f)).databases.find(
+      (d) => d.id === result.target_database.id,
+    )?.origin,
+  ).toMatchObject({ kind: "restore", source: { database_id: f.id } });
+  // The node restored the database and reports it ready; that ends the restore.
+  expect(await verdicts(await report(f, result.target_database.id, 1))).toEqual(
+    ["accept"],
   );
-  expect(await ack.json()).toEqual({ accepted: 0 });
-  const proof = {
-    operation_id: result.operation.id,
-    storage_generation: 2,
-    verified: true,
-  };
-  const wrong = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(result.target_database.id, 1),
-        recovery: { ...proof, storage_generation: 1 },
-      },
-    ]),
-  );
-  expect(await wrong.json()).toEqual({ accepted: 0 });
-  const verified = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      { ...observation(result.target_database.id, 1), recovery: proof },
-    ]),
-  );
-  expect(await verified.json()).toEqual({ accepted: 1 });
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(result.operation.id)
@@ -669,12 +645,9 @@ it("expiry cleanup deletes only the owned prefix and releases retained credentia
   expect(
     (await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")).status,
   ).toBe(202);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(f.id, 2, "deleted")]),
-  );
+  expect(await verdicts(await report(f, f.id, 2, "deleted"))).toEqual([
+    "accept",
+  ]);
   const retention = await env.DB.prepare(
     "SELECT expires_at FROM retained_archives WHERE source_database_id=?",
   )

@@ -12,26 +12,23 @@ import {
   withAdmissionMutation,
 } from "../../src/domain/admission-mutations.ts";
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
-import { fixture, cleanupFixtures, request } from "./fixtures.ts";
-import { admissionFixtureReleases } from "./admission-snapshot-fixture.ts";
+import {
+  fixture,
+  cleanupFixtures,
+  nodeKeyPair,
+  report,
+  request,
+} from "./fixtures.ts";
 afterEach(async () => {
   await env.DB.prepare("DELETE FROM region_archive_sources").run();
   await cleanupFixtures();
-  for (const id of admissionFixtureReleases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
-async function legacyReady() {
+async function ready() {
   const f = await fixture(),
     created = DatabaseWithOperation.parse(await (await f.create()).json());
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_generation=generation WHERE id=?",
-  )
-    .bind(created.database.id)
-    .run();
+  expect((await report(f, created.database.id, 1)).status).toBe(200);
   await publishDatabaseAdmission(env, created.database.id);
   return { ...f, id: created.database.id };
 }
@@ -53,17 +50,25 @@ async function trigger(sql: string) {
 }
 
 it("archive-source custody rotation fences only established referencing restore targets", async () => {
-  const f = await legacyReady(),
+  const f = await ready(),
     at = new Date().toISOString(),
-    node = newNodeId();
+    node = newNodeId(),
+    key = await nodeKeyPair(),
+    foreignNode = {
+      node,
+      nodeUid: crypto.randomUUID(),
+      nodeKey: key.privateKey,
+    };
   await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,1,4096,2000,30,128,100,?,?,?)",
+    "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,public_key,enrolled_at,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,?,1,4096,2000,30,128,100,?,?,?)",
   )
     .bind(
       node,
       f.foreign,
       `archive-target-${node.slice(4)}`,
-      crypto.randomUUID(),
+      foreignNode.nodeUid,
+      key.publicKey,
+      at,
       at,
       at,
       at,
@@ -108,10 +113,8 @@ it("archive-source custody rotation fences only established referencing restore 
       at,
       at,
     ),
-    env.DB.prepare(
-      "UPDATE databases SET observed_state='ready',observed_generation=generation WHERE id=?",
-    ).bind(other),
   ]);
+  expect((await report(foreignNode, other, 1)).status).toBe(200);
   await publishDatabaseAdmission(env, target);
   await publishDatabaseAdmission(env, other);
   const before = (await epoch(target))!,
@@ -157,16 +160,12 @@ it("archive-source custody rotation fences only established referencing restore 
   }
 });
 
-it("selective region membership closes only affected Actors while unrelated legacy admission stays open", async () => {
-  const f = await legacyReady(),
+it("selective region membership closes only affected Actors while unrelated admission stays open", async () => {
+  const f = await ready(),
     other = DatabaseWithOperation.parse(
       await (await f.create("unrelated")).json(),
     ).database.id;
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_generation=generation WHERE id=?",
-  )
-    .bind(other)
-    .run();
+  expect((await report(f, other, 1)).status).toBe(200);
   await publishDatabaseAdmission(env, other);
   await withAdmissionMutation(
     env,
@@ -194,7 +193,7 @@ it("selective region membership closes only affected Actors while unrelated lega
 });
 
 it("project removal requires terminal databases and a project membership fence before tombstoning", async () => {
-  const f = await legacyReady();
+  const f = await ready();
   await env.DB.prepare(
     "UPDATE databases SET observed_state='deleted' WHERE id=?",
   )
@@ -244,7 +243,7 @@ it("project removal requires terminal databases and a project membership fence b
 });
 
 it("a real project ABORT fences its delayed original SQL authority without replaying deletion", async () => {
-  const f = await legacyReady();
+  const f = await ready();
   await env.DB.prepare(
     "UPDATE databases SET desired_state='deleted',observed_state='deleted',observed_generation=generation,deleted_at=? WHERE id=?",
   )
@@ -307,7 +306,7 @@ it("a real project ABORT fences its delayed original SQL authority without repla
   ).toBeNull();
 });
 it("actual project deletion and a racing new database cannot both commit", async () => {
-  const f = await legacyReady();
+  const f = await ready();
   await env.DB.prepare(
     "UPDATE databases SET desired_state='deleted',observed_state='deleted',observed_generation=generation,deleted_at=? WHERE id=?",
   )

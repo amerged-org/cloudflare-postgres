@@ -5,9 +5,9 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { neon, neonConfig } from "@neondatabase/serverless";
-import { newDatabaseId, newOperationId } from "@pgcf/contracts";
+import { newDatabaseId, newNodeId, newOperationId } from "@pgcf/contracts";
 import {
-  deriveRegionKeyring,
+  deriveNodeKeyring,
   parseRouteKeyring,
   verifyRouteToken,
 } from "@pgcf/contracts/route-token";
@@ -21,6 +21,8 @@ const origin = `https://${["edge", "invalid"].join(".")}`;
 const gatewayOrigin = `https://${["gateway", "invalid"].join(".")}`;
 const region = "eu-test";
 const password = "pass word:/@ü";
+/** The node the admitted databases run on; the Actor here is a stand-in that names it. */
+const node = newNodeId();
 let logs: ReturnType<typeof vi.spyOn>;
 let database: string;
 
@@ -67,7 +69,8 @@ function awake(mode?: string): DatabaseWakeAdmission & { ok: true } {
       gateway_url: `${gatewayOrigin}/pg${mode ? `?mode=${mode}` : ""}`,
       gateway_binding: "GATEWAY",
     },
-    target: { revision: 2, pod_uid: crypto.randomUUID(), route_revision: 5 },
+    node,
+    target: { revision: 2, route_revision: 5, instance: crypto.randomUUID() },
   };
 }
 
@@ -145,18 +148,22 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     }
     const requests = await forwarded();
     expect(requests).toHaveLength(2);
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      node,
     );
     for (const request of requests) {
       expect(request.path).toBe("/sql");
       expect(request.method).toBe("POST");
       expect(
-        await verifyRouteToken(request.token, { region, keys: keyring.keys }),
+        await verifyRouteToken(request.token, {
+          region,
+          node,
+          keys: keyring.keys,
+        }),
       ).toMatchObject({
         ok: true,
-        claims: { v: 4, db: database, user: "app" },
+        claims: { v: 6, db: database, user: "app", node },
       });
       // The password travels only in the body, never in a header or the URL.
       expect(JSON.stringify(request.headers)).not.toContain("pass");
@@ -188,7 +195,7 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     expect(log).toMatchObject({
       event: "sql_admission",
       database_id: database,
-      route: "v4",
+      route: "v6",
       outcome: "accepted",
       gateway_status: 200,
     });
@@ -225,17 +232,21 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
       role_revision_hash: "a".repeat(64),
     };
     const response = await post(
-      admitting({ ok: true, region: awake().region, wake }),
+      admitting({ ok: true, region: awake().region, node, wake }),
       { query: "select 1", params: [] },
     );
     expect(response.status).toBe(200);
     const [request] = await forwarded();
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      node,
     );
     expect(
-      await verifyRouteToken(request!.token, { region, keys: keyring.keys }),
+      await verifyRouteToken(request!.token, {
+        region,
+        node,
+        keys: keyring.keys,
+      }),
     ).toMatchObject({ ok: true, claims: { v: 5, db: database, gen: 3 } });
   });
 

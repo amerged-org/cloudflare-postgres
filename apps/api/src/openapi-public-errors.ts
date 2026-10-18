@@ -71,20 +71,10 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   // Immutable global history lists do not check existence/current assignment or refuse empty pages.
   "GET /v1/fleet/releases": [400, 401, 403, 500],
   "PUT /v1/regions/{id}/release": [400, 401, 403, 404, 409, 500],
+  "GET /v1/regions/{id}/node-policy": [400, 401, 403, 404, 500],
+  "PUT /v1/regions/{id}/node-policy": [400, 401, 403, 404, 500],
   "GET /v1/regions/{id}/release": [400, 401, 403, 404, 500],
-  "PUT /v1/nodes/{id}/release": [400, 401, 403, 404, 409, 500],
   "GET /v1/nodes/{id}/release": [400, 401, 403, 404, 500],
-  "GET /v1/fleet/update-policy": [400, 401, 403, 500],
-  "PUT /v1/fleet/update-policy": [400, 401, 403, 404, 409, 500],
-  "GET /v1/fleet/update-candidates": [400, 401, 403, 500],
-  "GET /v1/fleet/update-candidates/{id}": [400, 401, 403, 404, 500],
-  "POST /v1/fleet/update-candidates/{id}/reject": [
-    400, 401, 403, 404, 409, 500,
-  ],
-  "POST /v1/fleet/update-candidates/{id}/resume": [
-    400, 401, 403, 404, 409, 500,
-  ],
-
   "GET /v1/resource-profiles/{id}/rollout": [400, 401, 403, 404, 500],
   "PUT /v1/resource-profiles/{id}/rollout": [400, 401, 403, 404, 409, 500],
   "GET /v1/resource-profiles/{id}": [400, 401, 404, 500],
@@ -135,10 +125,6 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/regions/{id}/configuration",
   "PUT /v1/fleet/releases/{id}",
   "PUT /v1/regions/{id}/release",
-  "PUT /v1/nodes/{id}/release",
-  "PUT /v1/fleet/update-policy",
-  "POST /v1/fleet/update-candidates/{id}/reject",
-  "POST /v1/fleet/update-candidates/{id}/resume",
   "PUT /v1/resource-profiles/{id}/rollout",
   "PUT /v1/resource-profiles/{id}",
   "PUT /v1/databases/{id}/resource-profile",
@@ -177,7 +163,7 @@ export const locationResponses: Readonly<
   },
   "POST /v1/regions": {
     "201":
-      "Created region resource path; one-time regional credentials cannot be replayed.",
+      "Created region resource path, also returned on a completed idempotency replay.",
   },
   "POST /v1/databases": {
     "202": "Database operation resource path.",

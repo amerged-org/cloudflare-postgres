@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation, DesiredResponse } from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import { placePendingDatabases } from "../../src/domain/node-capacity.ts";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observedBody,
-  observation,
-  request,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -122,21 +122,10 @@ describe("pending capacity on real D1", () => {
         .bind(created.database.id)
         .first("node_id"),
     ).toBeNull();
-    expect(
-      DesiredResponse.parse(
-        await (await request("/agent/v1/desired", f.agent)).json(),
-      ).databases,
-    ).toEqual([]);
-    expect(
-      await (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(created.database.id, 1)]),
-        )
-      ).json(),
-    ).toEqual({ accepted: 0 });
+    expect((await desiredPage(f)).databases).toEqual([]);
+    expect(await verdicts(await report(f, created.database.id, 1))).toEqual([
+      "stale",
+    ]);
     await env.DB.prepare(
       "UPDATE nodes SET allocatable_memory_mib=4096,storage_gib_total=30 WHERE id=?",
     )
@@ -150,13 +139,10 @@ describe("pending capacity on real D1", () => {
         .bind(created.database.id)
         .first(),
     ).toEqual(before);
-    const desired = DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    );
+    const desired = await desiredPage(f);
     expect(desired.databases[0]?.id).toBe(created.database.id);
-    expect(desired.databases[0]?.creation?.operation_id).toBe(
-      created.operation.id,
-    );
+    expect(desired.databases[0]?.operation).toBe(created.operation.id);
+    expect(desired.databases[0]?.origin).toEqual({ kind: "create" });
     expect(await placePendingDatabases(env.DB, f.region)).toEqual([]);
   });
   it("rechecks headroom atomically when pending placements compete", async () => {

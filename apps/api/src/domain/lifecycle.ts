@@ -253,7 +253,7 @@ export async function changePower(
           reason: "generation_changed",
         });
       }
-      hint(c, row.region_id, [id]);
+      hint(c, [id]);
       return databaseOperationResponse(c, op);
     },
   });
@@ -265,7 +265,11 @@ export async function recoverQuiescence(
   expected: { databaseId: string; operation: string; revision: number },
   reason: "busy" | "archive" | "unknown" | "timeout",
   now = new Date().toISOString(),
-): Promise<{ operation: string; revision: number; regionId: string } | null> {
+): Promise<{
+  operation: string;
+  revision: number;
+  nodeId: string | null;
+} | null> {
   const db = env.DB;
   DatabaseId.parse(expected.databaseId);
   OperationId.parse(expected.operation);
@@ -357,7 +361,7 @@ export async function recoverQuiescence(
       );
     const result = await mutation.batch(statements);
     return result[0]!.meta.changes === 1
-      ? { operation, revision: row.generation + 1, regionId: row.region_id }
+      ? { operation, revision: row.generation + 1, nodeId: row.node_id }
       : null;
   });
 }

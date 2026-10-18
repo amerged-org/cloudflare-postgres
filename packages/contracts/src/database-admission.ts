@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { OperationId, RegionId } from "./ids.ts";
+import { DatabaseId, NodeId, OperationId, RegionId } from "./ids.ts";
 
 /** The existing DatabaseActor RPC response; Rust Edge consumes its generated schema. */
 export const DatabaseRegionRoute = z.strictObject({
@@ -14,6 +14,7 @@ export const DatabaseRegionRoute = z.strictObject({
 /**
  * The verified database generation and primary Pod, with a separate admission route revision.
  * The Edge signs these identities; the gateway compares them with its persisted running fence.
+ * Read only by the Rust gateway and the Rust Edge until they sign and verify route v6.
  */
 export const CnpgDatabaseTarget = z.strictObject({
   revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -28,6 +29,32 @@ export const CnpgDatabaseTarget = z.strictObject({
 });
 export type CnpgDatabaseTarget = z.infer<typeof CnpgDatabaseTarget>;
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+/**
+ * What an awake database runs on its node: the generation the node reported, the admission route
+ * revision and the invocation ID of the PostgreSQL unit. The Edge signs it into route v6, and the
+ * gateway compares it with its table (`UnitWriter.instance`).
+ */
+export const NodeDatabaseTarget = z.strictObject({
+  revision: Revision,
+  route_revision: Revision,
+  instance: z.uuid(),
+});
+export type NodeDatabaseTarget = z.infer<typeof NodeDatabaseTarget>;
+/**
+ * What a node reported of the unit that serves a database, stored beside the database and carried
+ * in its admission snapshot. It is valid exactly while the database's observed generation and
+ * storage generation are these.
+ */
+export const DatabaseRuntime = z.strictObject({
+  database_id: DatabaseId,
+  node_id: NodeId,
+  generation: Revision,
+  storage_generation: Revision,
+  instance: z.uuid(),
+  /** Milliseconds since the epoch when the API accepted the report. */
+  observed_at: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+export type DatabaseRuntime = z.infer<typeof DatabaseRuntime>;
 export const DatabaseAdmissionIntent = z.strictObject({
   v: z.literal(1),
   route_revision: Revision,
@@ -56,8 +83,9 @@ export const DatabaseAdmission = z.discriminatedUnion("ok", [
   z.strictObject({
     ok: z.literal(true),
     region: DatabaseRegionRoute,
-    /** Temporary rollout compatibility (route-token.ts): absent only outside a v3 region. */
-    target: CnpgDatabaseTarget.optional(),
+    /** The node of the database; its key signs the route. */
+    node: NodeId,
+    target: NodeDatabaseTarget,
   }),
   z.strictObject({
     ok: z.literal(false),
@@ -79,12 +107,13 @@ export const DatabaseWakeAdmission = z.union([
   z.strictObject({
     ok: z.literal(true),
     region: DatabaseRegionRoute,
-    /** Absent only on the ensureAwake fallback outside a v3 region (route-token.ts). */
-    target: CnpgDatabaseTarget.optional(),
+    node: NodeId,
+    target: NodeDatabaseTarget,
   }),
   z.strictObject({
     ok: z.literal(true),
     region: DatabaseRegionRoute,
+    node: NodeId,
     wake: DatabaseWakeTicket,
   }),
   z.strictObject({

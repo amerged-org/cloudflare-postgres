@@ -2,8 +2,8 @@
 import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
-  DesiredResponse,
   ConnectionUri,
+  TEXT_MAX_LENGTH,
   archiveDestinationPath,
   newDatabaseId,
   newOperationId,
@@ -13,15 +13,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import { runCron } from "../../src/cron.ts";
 import { choosePlacement } from "../../src/domain/placement.ts";
-import { truncateAgentText } from "../../src/domain/observations.ts";
 import { databaseInsertStatement } from "../../src/domain/databases.ts";
 import type { RoleRow, SizeRow, RegionRow } from "../../src/domain/rows.ts";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observation,
-  observedBody,
+  nodeRequest,
+  observationOf,
+  report,
+  reportBody,
   request,
+  verdicts,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -35,19 +38,6 @@ async function created(
   return DatabaseWithOperation.parse(await response.json());
 }
 describe("database domain on real Workers D1", () => {
-  it("keeps generation-one desired state compatible with the deployed legacy agent", async () => {
-    const f = await fixture();
-    const result = await created(f);
-    const response = await request("/agent/v1/desired", f.agent);
-    expect(response.status).toBe(200);
-    const body = await response.json<{
-      databases: Record<string, unknown>[];
-    }>();
-    const database = body.databases.find((d) => d.id === result.database.id);
-    expect(database).toBeDefined();
-    expect(database).not.toHaveProperty("storage_generation");
-    expect(database).not.toHaveProperty("recovery");
-  });
   it("places by free memory, includes sidecar and rejects unknown storage", () => {
     const base = {
       last_observed_at: new Date().toISOString(),
@@ -258,19 +248,10 @@ describe("database domain on real Workers D1", () => {
         )
       ).status,
     ).toBe(202);
-    const pageOne = DesiredResponse.parse(
-      await (await request("/agent/v1/desired?limit=1", f.agent)).json(),
-    );
+    const pageOne = await desiredPage(f, "?limit=1");
     expect(pageOne.databases).toHaveLength(1);
     expect(pageOne.next).not.toBeNull();
-    const pageTwo = DesiredResponse.parse(
-      await (
-        await request(
-          `/agent/v1/desired?limit=1&after=${pageOne.next}`,
-          f.agent,
-        )
-      ).json(),
-    );
+    const pageTwo = await desiredPage(f, `?limit=1&after=${pageOne.next}`);
     expect(pageTwo.next).toBeNull();
     expect(
       [...pageOne.databases, ...pageTwo.databases].map((db) => db.id).sort(),
@@ -281,7 +262,7 @@ describe("database domain on real Workers D1", () => {
       )?.desired_state,
     ).toBe("deleted");
   });
-  it("keeps credentials encrypted and exposes passwords only in integrator URIs and desired", async () => {
+  it("keeps credentials encrypted and exposes passwords only in integrator URIs and the node page", async () => {
     const f = await fixture(),
       body = await created(f),
       id = body.database.id;
@@ -323,9 +304,7 @@ describe("database domain on real Workers D1", () => {
     );
     expect(integrator.includes_password).toBe(true);
     expect(integrator.uri).toContain(password);
-    const desired = DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    );
+    const desired = await desiredPage(f);
     expect(
       presentRoles(desired.databases.find((d) => d.id === id)!)[0]?.password,
     ).toBe(password);
@@ -380,15 +359,12 @@ describe("database domain on real Workers D1", () => {
       next_cursor: null,
     });
   });
-  it("ignores stale and foreign observations, retries errors and retains deletion tombstones", async () => {
+  it("ignores stale and foreign observations, ends an operation on a node error for good and retains deletion tombstones", async () => {
     const f = await fixture(),
+      foreign = await fixture(),
       body = await created(f),
       id = body.database.id;
-    const post = (key: string, obs: unknown[]) =>
-      request("/agent/v1/observations", key, "POST", observedBody(obs));
-    expect(
-      await (await post(f.foreignAgent, [observation(id, 1)])).json(),
-    ).toEqual({ accepted: 0 });
+    expect(await verdicts(await report(foreign, id, 1))).toEqual(["stale"]);
     expect(
       (
         await request(
@@ -402,33 +378,28 @@ describe("database domain on real Workers D1", () => {
         )
       ).status,
     ).toBe(201);
-    expect(await (await post(f.agent, [observation(id, 1)])).json()).toEqual({
-      accepted: 0,
-    });
+    expect(await verdicts(await report(f, id, 1))).toEqual(["stale"]);
     expect(
-      await (
-        await post(f.agent, [observation(id, 2, "error", "transient")])
-      ).json(),
-    ).toEqual({ accepted: 1 });
-    expect(await (await post(f.agent, [observation(id, 2)])).json()).toEqual({
-      accepted: 1,
-    });
+      await verdicts(
+        await report(f, id, 2, "error", {
+          error: "start_failed",
+          message: "transient",
+        }),
+      ),
+    ).toEqual(["accept"]);
+    expect(await verdicts(await report(f, id, 2))).toEqual(["accept"]);
     const ready = await env.DB.prepare(
       "SELECT observed_state,observed_generation FROM databases WHERE id=?",
     )
       .bind(id)
       .first();
     expect(ready).toEqual({ observed_state: "ready", observed_generation: 2 });
+    // The node's error ended the create; the database that became ready later does not revive it.
     expect(
-      (
-        await (
-          await request(`/v1/operations/${body.operation.id}`, f.integrator)
-        ).json<{ status: string }>()
-      ).status,
-    ).toBe("succeeded");
-    expect(
-      await (await post(f.agent, [observation(id, 2, "provisioning")])).json(),
-    ).toEqual({ accepted: 0 });
+      await (
+        await request(`/v1/operations/${body.operation.id}`, f.integrator)
+      ).json<{ status: string; error: { code: string } }>(),
+    ).toMatchObject({ status: "failed", error: { code: "start_failed" } });
     const deleted = await request(
       `/v1/databases/${id}`,
       f.integrator,
@@ -436,16 +407,14 @@ describe("database domain on real Workers D1", () => {
     );
     expect(deleted.status).toBe(202);
     const deletion = DatabaseWithOperation.parse(await deleted.json());
-    const desired = DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    );
+    const desired = await desiredPage(f);
     expect(desired.databases.find((d) => d.id === id)).toMatchObject({
       desired_state: "deleted",
       roles: [],
     });
-    expect(
-      await (await post(f.agent, [observation(id, 3, "deleted")])).json(),
-    ).toEqual({ accepted: 1 });
+    expect(await verdicts(await report(f, id, 3, "deleted"))).toEqual([
+      "accept",
+    ]);
     expect(
       (
         await (
@@ -453,11 +422,9 @@ describe("database domain on real Workers D1", () => {
         ).json<{ status: string }>()
       ).status,
     ).toBe("succeeded");
-    expect(
-      DesiredResponse.parse(
-        await (await request("/agent/v1/desired", f.agent)).json(),
-      ).databases.some((d) => d.id === id),
-    ).toBe(false);
+    expect((await desiredPage(f)).databases.some((d) => d.id === id)).toBe(
+      false,
+    );
     expect(
       (
         await request(
@@ -471,19 +438,15 @@ describe("database domain on real Workers D1", () => {
     const f = await fixture(),
       body = await created(f),
       id = body.database.id;
-    const obs = observation(id, 1);
-    const raw = {
-      ...obs,
-      archive: { continuous: true, ready_wal_files: null },
-    };
     expect(
       (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([raw]),
-        )
+        await report(f, id, 1, "ready", {
+          archive: {
+            last_segment: null,
+            ready_files: null,
+            failing_since: null,
+          },
+        })
       ).status,
     ).toBe(200);
     const database = await (
@@ -499,43 +462,31 @@ describe("database domain on real Workers D1", () => {
       ).status,
     ).toBe("succeeded");
   });
-  it("authenticates region agents and truncates messages to 4096 UTF-8 bytes", async () => {
+  it("shows only its own databases to a node and bounds the message of an observation", async () => {
     const f = await fixture(),
+      foreign = await fixture(),
       body = await created(f),
       id = body.database.id;
-    expect((await request("/agent/v1/desired", f.integrator)).status).toBe(401);
+    expect((await desiredPage(f)).databases.map((d) => d.id)).toEqual([id]);
+    expect((await desiredPage(foreign)).databases).toEqual([]);
+    const send = async (message: string) =>
+      nodeRequest(f, "/node/v1/observations", {
+        method: "POST",
+        body: reportBody([
+          await observationOf(id, 1, "error", {
+            error: "start_failed",
+            message,
+          }),
+        ]),
+      });
+    expect((await send("é".repeat(TEXT_MAX_LENGTH + 1))).status).toBe(400);
+    const bounded = "é".repeat(TEXT_MAX_LENGTH);
+    expect((await send(bounded)).status).toBe(200);
     expect(
-      (
-        await request(
-          "/agent/v1/desired",
-          f.agent.slice(0, -1) + (f.agent.endsWith("a") ? "b" : "a"),
-        )
-      ).status,
-    ).toBe(401);
-    const foreign = DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.foreignAgent)).json(),
-    );
-    expect(foreign.databases).toEqual([]);
-    const message = "é".repeat(3000);
-    expect(new TextEncoder().encode(truncateAgentText(message)).length).toBe(
-      4096,
-    );
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(id, 1, "error", message)]),
-        )
-      ).status,
-    ).toBe(200);
-    const stored = await env.DB.prepare(
-      "SELECT status_message FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first<string>("status_message");
-    expect(new TextEncoder().encode(stored!).length).toBe(4096);
+      await env.DB.prepare("SELECT status_message FROM databases WHERE id=?")
+        .bind(id)
+        .first<string>("status_message"),
+    ).toBe(Array.from(`start_failed: ${bounded}`).slice(0, 4096).join(""));
   });
   it("lists real R2 backup catalogs and WAL and rejects a mismatched region binding", async () => {
     const f = await fixture(),

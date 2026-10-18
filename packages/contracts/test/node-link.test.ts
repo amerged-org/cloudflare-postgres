@@ -46,6 +46,7 @@ const node = {
   },
   id = `d${"b".repeat(19)}`,
   operation = `op_${"c".repeat(20)}`,
+  instance = "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
   now = "2026-10-17T12:00:00.000Z";
 const credential = {
   id: `crd_${"k".repeat(20)}`,
@@ -545,7 +546,7 @@ describe("what a node reports", () => {
     ).toBe(true);
     for (const broken of [
       { proven_sleep: null },
-      { state: "ready", proven_sleep: proof },
+      { state: "ready", instance, proven_sleep: proof },
       { state: "asleep", refusal: "power_busy" },
       { proven_sleep: { ...proof, checkpoint_lsn: "0/3000028/1" } },
     ])
@@ -563,6 +564,7 @@ describe("what a node reports", () => {
           {
             ...observation,
             state: "ready",
+            instance,
             proven_sleep: null,
             refusal: "power_archive",
           },
@@ -587,6 +589,34 @@ describe("what a node reports", () => {
           orders: [{ operation: `op_${"s".repeat(20)}`, ...result }],
         }).success,
       ).toBe(valid);
+  });
+
+  it("names the unit's instance exactly while the database is ready", () => {
+    const ready = {
+      ...observation,
+      state: "ready",
+      proven_sleep: null,
+      instance,
+    };
+    const accepted = (change: object) =>
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [{ ...ready, ...change }],
+        orders: [],
+      }).success;
+    expect(accepted({})).toBe(true);
+    expect(accepted({ instance: undefined })).toBe(false);
+    expect(accepted({ instance: "not-a-uuid" })).toBe(false);
+    for (const state of ["building", "unproven", "deleted"])
+      expect(accepted({ state })).toBe(false);
+    expect(accepted({ state: "building", instance: undefined })).toBe(true);
+    expect(
+      accepted({
+        state: "error",
+        error: "start_failed",
+        instance: undefined,
+      }),
+    ).toBe(true);
   });
 
   it("samples memory, CPU, the pool, the volumes and the archive within their bounds", () => {
@@ -824,7 +854,7 @@ describe("what a node reports", () => {
     ];
     expect(NodeEventReport.safeParse({ events }).success).toBe(true);
     for (const broken of [
-      events.map(({ id: _, ...event }) => event),
+      events.map((event) => ({ ...event, id: undefined })),
       events.map((event) => ({ ...event, id: "not-a-uuid" })),
       [events[0], { ...events[1], id: events[0]!.id }],
       [events[0], events[0]],
@@ -1015,6 +1045,7 @@ describe("the order of generations", () => {
         ...suspend,
         storage_generation: 1,
         state: "ready",
+        instance,
         proven_sleep: null,
         refusal: "power_busy",
         backup: null,

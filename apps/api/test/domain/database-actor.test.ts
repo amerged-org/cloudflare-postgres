@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import {
-  DatabaseWithOperation,
-  newDatabaseId,
-  newNodeId,
-} from "@pgcf/contracts";
+import { DatabaseWithOperation, newDatabaseId } from "@pgcf/contracts";
 import { Hono } from "hono";
 import { afterEach, expect, it, vi } from "vitest";
 import type { ApiEnv } from "../../src/env.ts";
@@ -15,17 +11,11 @@ import {
   readDatabasePresence,
   syncDatabaseActor,
 } from "../../src/domain/database-actor-sync.ts";
-import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { cleanupFixtures, fixture, report } from "./fixtures.ts";
 
-const releases: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
-  // Fixture cleanup removes assignments and patch receipts through their node/region FKs.
   await cleanupFixtures();
-  for (const id of releases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
@@ -37,112 +27,8 @@ async function ready() {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = created.database.id;
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_generation=generation WHERE id=?",
-  )
-    .bind(id)
-    .run();
+  expect((await report(f, id, 1)).status).toBe(200);
   return { ...f, id };
-}
-/** An approved native release; only a declared one claims that its gateways verify route token v3. */
-async function nativeRelease(admin: string, declared: boolean) {
-  const id = `release-${crypto.randomUUID()}`;
-  releases.push(id);
-  const names = [
-    "api",
-    "edge",
-    "node-bootstrap",
-    "postgres",
-    "barman",
-    "cloudflared",
-    "cilium",
-    "flux-source",
-    "flux-kustomize",
-    "flux-helm",
-    "flux-notification",
-    "cert-manager",
-    "cloudnative-pg",
-    "openebs-lvm",
-    "native-gateway",
-    "native-controller",
-  ];
-  const role = {
-    talos_version: "1.14.1",
-    talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
-    talos_schematic_sha256: "b".repeat(64),
-    talos_extensions: [],
-    kubernetes_version: "1.36.5",
-    components: names.slice(3),
-  };
-  const approved = await request(`/v1/fleet/releases/${id}`, admin, "PUT", {
-    version: 1,
-    versions_lock_sha256: "c".repeat(64),
-    configuration_schema_revision: 1,
-    ...(declared ? { route_token_version: 3 } : {}),
-    components: names.map((name) => ({
-      name,
-      kind: name === "api" || name === "edge" ? "worker_bundle" : "image",
-      version: "1.0.0",
-      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
-      sha256: "d".repeat(64),
-    })),
-    roles: { control_relay: role, customer: structuredClone(role) },
-  });
-  expect(approved.status).toBe(200);
-  const { spec_sha256 } = (await approved.json()) as { spec_sha256: string };
-  return { id, sha: spec_sha256 };
-}
-async function assignRegion(admin: string, region: string, release: string) {
-  const current = (await (
-    await request(`/v1/regions/${region}/release`, admin)
-  ).json()) as { revision: number };
-  const assigned = await request(
-    `/v1/regions/${region}/release`,
-    admin,
-    "PUT",
-    {
-      expected_revision: current.revision,
-      release_id: release,
-    },
-  );
-  expect(assigned.status).toBe(200);
-}
-async function assignNode(admin: string, node: string, release: string) {
-  const current = await env.DB.prepare(
-    "SELECT n.node_uid,a.revision FROM nodes n LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id=?",
-  )
-    .bind(node)
-    .first<{ node_uid: string; revision: number | null }>();
-  const assigned = await request(`/v1/nodes/${node}/release`, admin, "PUT", {
-    expected_revision: current!.revision ?? 0,
-    release_id: release,
-    node_uid: current!.node_uid,
-    role: "customer",
-  });
-  expect(assigned.status).toBe(200);
-}
-function attestation(database: string, generation: number, pod: string) {
-  return JSON.stringify({
-    v: 1,
-    database_id: database,
-    generation,
-    storage_generation: 1,
-    node_uid: crypto.randomUUID(),
-    boot_id: crypto.randomUUID(),
-    cluster_uid: crypto.randomUUID(),
-    namespace_uid: crypto.randomUUID(),
-    cnpg_cluster_uid: crypto.randomUUID(),
-    storage_uid: crypto.randomUUID(),
-    pvc_uid: crypto.randomUUID(),
-    pv_uid: crypto.randomUUID(),
-    pod_uid: pod,
-    container_id: "3".repeat(64),
-    postgres_image_sha256: "4".repeat(64),
-    memory_request_bytes: 1,
-    memory_limit_bytes: 2,
-    observed_at: Date.now(),
-    configuration_fingerprint: "5".repeat(64),
-  });
 }
 async function sync(id: string) {
   const app = new Hono<ApiEnv>();
@@ -239,31 +125,6 @@ it("gets every DatabaseActor with the configured location hint, and none without
   expect(get.mock.calls.map((call) => call[1])).toEqual([undefined]);
 });
 
-it("a fresh authoritative node loss overrides a warm seeded route without waking it", async () => {
-  const f = await ready();
-  expect((await actor(f.id).ensureAwake(f.id, "app")).ok).toBe(true);
-  await env.DB.prepare(
-    "UPDATE nodes SET lost_at=?,lost_reason='confirmed loss',ready=0,schedulable=0 WHERE id=?",
-  )
-    .bind(new Date().toISOString(), f.node)
-    .run();
-  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
-    ok: false,
-    sqlstate: "57P03",
-  });
-  expect(await actor(f.id).admit(f.id, "app")).toEqual({
-    ok: false,
-    sqlstate: "57P03",
-  });
-  expect(
-    await env.DB.prepare(
-      "SELECT count(*) count FROM operations WHERE database_id=? AND kind='database.wake'",
-    )
-      .bind(f.id)
-      .first("count"),
-  ).toBe(0);
-});
-
 it("atomically bounds a configured aggregate across valid roles and refuses invalid policy", async () => {
   const f = await ready();
   vi.spyOn(Date, "now").mockReturnValue(Date.now());
@@ -273,7 +134,7 @@ it("atomically bounds a configured aggregate across valid roles and refuses inva
   )
     .bind(f.id)
     .run();
-  await actor(f.id).seed(await readDatabasePresence(env.DB, f.id));
+  await sync(f.id);
   await runInDurableObject(actor(f.id), (instance) => {
     Reflect.get(instance, "env").DATABASE_CONNECTION_LIMIT_PER_MINUTE = "2";
   });
@@ -380,7 +241,7 @@ it("one thousand distinct unseeded hints make zero authoritative admission queri
   expect(count()).toBe(0);
 }, 30_000);
 
-it("a seeded unknown role makes no D1 admission query and a valid role reads real authoritative D1", async () => {
+it("a seeded unknown role and a valid role are both answered from the snapshot without a D1 admission query", async () => {
   const f = await ready();
   expect(await sync(f.id)).toBe(true);
   const count = admissionQueries();
@@ -389,125 +250,17 @@ it("a seeded unknown role makes no D1 admission query and a valid role reads rea
     sqlstate: "28P01",
   });
   expect(count()).toBe(0);
-  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+  expect(await actor(f.id).admit(f.id, "app")).toMatchObject({
     ok: true,
     region: {
       id: f.region,
       gateway_url: `https://${["gateway", "invalid"].join(".")}`,
       gateway_binding: null,
     },
+    node: f.node,
+    target: { revision: 1, route_revision: 1 },
   });
-  expect(count()).toBe(1);
-});
-
-it("a v3 region admits only the controller-verified target of the observed revision", async () => {
-  const f = await ready();
-  await sync(f.id);
-  const release = await nativeRelease(f.admin, true);
-  await assignRegion(f.admin, f.region, release.id);
-  await assignNode(f.admin, f.node, release.id);
-  const pod = crypto.randomUUID();
-  const store = (value: string | null) =>
-    env.DB.prepare("UPDATE databases SET runtime_attestation_json=? WHERE id=?")
-      .bind(value, f.id)
-      .run();
-  await store(attestation(f.id, 1, pod));
-  const region = {
-    id: f.region,
-    gateway_url: `https://${["gateway", "invalid"].join(".")}`,
-    gateway_binding: null,
-  };
-  expect(await actor(f.id).admit(f.id, "app")).toEqual({
-    ok: true,
-    region,
-    target: { revision: 1, pod_uid: pod },
-  });
-  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
-    ok: true,
-    region,
-    target: { revision: 1, pod_uid: pod },
-  });
-  // A v3 region never falls back to an untargeted v2 route: without the verified Pod of the
-  // observed revision the database is not ready for a connection yet.
-  for (const value of [
-    attestation(f.id, 2, pod),
-    attestation(newDatabaseId(), 1, pod),
-    JSON.stringify({ pod_uid: pod }),
-    null,
-  ]) {
-    await store(value);
-    expect(await actor(f.id).admit(f.id, "app")).toEqual({
-      ok: false,
-      sqlstate: "57P03",
-    });
-    expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
-      ok: false,
-      sqlstate: "57P03",
-    });
-  }
-});
-
-it("route token v3 follows the region's declaring release once every current member is assigned to it", async () => {
-  const f = await ready();
-  await sync(f.id);
-  const pod = crypto.randomUUID();
-  const store = (value: string | null) =>
-    env.DB.prepare("UPDATE databases SET runtime_attestation_json=? WHERE id=?")
-      .bind(value, f.id)
-      .run();
-  await store(attestation(f.id, 1, pod));
-  const region = {
-    id: f.region,
-    gateway_url: `https://${["gateway", "invalid"].join(".")}`,
-    gateway_binding: null,
-  };
-  const legacy = { ok: true, region },
-    targeted = { ok: true, region, target: { revision: 1, pod_uid: pod } };
-  const admission = () => actor(f.id).admit(f.id, "app");
-  // A region without an assigned release keeps the v2 route even with an attestation.
-  expect(await admission()).toEqual(legacy);
-  const declared = await nativeRelease(f.admin, true);
-  await assignRegion(f.admin, f.region, declared.id);
-  // The region declares v3 while its member is not yet assigned to that release.
-  expect(await admission()).toEqual(legacy);
-  await assignNode(f.admin, f.node, declared.id);
-  expect(await admission()).toEqual(targeted);
-  // A further current member without the declaring release keeps the whole region on v2.
-  const member = newNodeId(),
-    at = new Date().toISOString();
-  await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES (?,?,?,1,4096,2000,30,128,100,?,?,?,?)",
-  )
-    .bind(
-      member,
-      f.region,
-      `member-${member.slice(4)}`,
-      at,
-      at,
-      at,
-      crypto.randomUUID(),
-    )
-    .run();
-  expect(await admission()).toEqual(legacy);
-  await assignNode(f.admin, member, declared.id);
-  expect(await admission()).toEqual(targeted);
-  // Rollback: assigning a release without the declaration stops v3 at once, also once every member
-  // runs it, and never refuses an untargeted ready database.
-  const older = await nativeRelease(f.admin, false);
-  await assignRegion(f.admin, f.region, older.id);
-  expect(await admission()).toEqual(legacy);
-  for (const node of [f.node, member])
-    await assignNode(f.admin, node, older.id);
-  expect(await admission()).toEqual(legacy);
-  await store(null);
-  expect(await admission()).toEqual(legacy);
-  // Rolling forward again needs every member on the declaring release.
-  await store(attestation(f.id, 1, pod));
-  await assignRegion(f.admin, f.region, declared.id);
-  expect(await admission()).toEqual(legacy);
-  for (const node of [f.node, member])
-    await assignNode(f.admin, node, declared.id);
-  expect(await admission()).toEqual(targeted);
+  expect(count()).toBe(0);
 });
 
 it("stale positive snapshots never authorize deleted roles, databases or projects", async () => {
@@ -517,6 +270,7 @@ it("stale positive snapshots never authorize deleted roles, databases or project
   await env.DB.prepare("UPDATE roles SET deleted_at=? WHERE database_id=?")
     .bind(time, f.id)
     .run();
+  await sync(f.id);
   expect((await actor(f.id).admit(f.id, "app")).ok).toBe(false);
   await env.DB.prepare("UPDATE roles SET deleted_at=NULL WHERE database_id=?")
     .bind(f.id)
@@ -524,6 +278,7 @@ it("stale positive snapshots never authorize deleted roles, databases or project
   await env.DB.prepare("UPDATE projects SET deleted_at=? WHERE id=?")
     .bind(time, f.project)
     .run();
+  await sync(f.id);
   expect((await actor(f.id).admit(f.id, "app")).ok).toBe(false);
   await env.DB.prepare("UPDATE projects SET deleted_at=NULL WHERE id=?")
     .bind(f.project)
@@ -533,6 +288,7 @@ it("stale positive snapshots never authorize deleted roles, databases or project
   )
     .bind(time, f.id)
     .run();
+  await sync(f.id);
   expect((await actor(f.id).admit(f.id, "app")).ok).toBe(false);
 });
 
@@ -665,7 +421,7 @@ it("keyset pages converge legacy databases and subsequent role/deletion snapshot
   });
 });
 
-it("known roles make independent authoritative requests and unavailable D1 never admits", async () => {
+it("known roles are admitted from their snapshots with no D1 query, whether or not D1 is available", async () => {
   const f = await ready();
   await sync(f.id);
   const other = await ready();
@@ -678,17 +434,14 @@ it("known roles make independent authoritative requests and unavailable D1 never
     }),
   );
   expect(replies.every((reply) => reply.ok)).toBe(true);
-  expect(count()).toBe(8);
+  expect(count()).toBe(0);
   await runInDurableObject(actor(f.id), async (instance) => {
     const db = (instance as unknown as { env: { DB: D1Database } }).env.DB;
     const prepare = vi.spyOn(db, "prepare").mockImplementation(() => {
       throw new Error("unavailable");
     });
     try {
-      expect(await instance.admit(f.id, "app")).toEqual({
-        ok: false,
-        sqlstate: "08006",
-      });
+      expect((await instance.admit(f.id, "app")).ok).toBe(true);
     } finally {
       prepare.mockRestore();
     }
@@ -727,11 +480,8 @@ it("older revisions and timestamps cannot reintroduce roles while fresh sync rep
     ok: false,
     sqlstate: "57P03",
   });
-  await env.DB.prepare(
-    "UPDATE databases SET observed_generation=generation WHERE id=?",
-  )
-    .bind(f.id)
-    .run();
+  // The node applies the new generation and reports it ready.
+  expect((await report(f, f.id, newer.revision)).status).toBe(200);
   expect((await actor(f.id).admit(f.id, "app")).ok).toBe(true);
 });
 
@@ -741,6 +491,7 @@ it("seeded running roles still require a currently ready database and live regio
   await env.DB.prepare("UPDATE databases SET observed_state='error' WHERE id=?")
     .bind(f.id)
     .run();
+  await sync(f.id);
   expect(await actor(f.id).admit(f.id, "app")).toEqual({
     ok: false,
     sqlstate: "57P03",
@@ -750,6 +501,7 @@ it("seeded running roles still require a currently ready database and live regio
   )
     .bind(f.id)
     .run();
+  await sync(f.id);
   expect(await actor(f.id).admit(f.id, "app")).toEqual({
     ok: false,
     sqlstate: "57P03",

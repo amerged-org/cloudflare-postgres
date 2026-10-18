@@ -3,7 +3,6 @@ import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import {
   DatabaseWithOperation,
-  DesiredResponse,
   NodeThinStorageAuthority,
   ThinStorageProfile,
   newOperationId,
@@ -12,13 +11,7 @@ import {
 import { afterEach, expect, it } from "vitest";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { thinPoolRoomSql } from "../../src/domain/storage-capacity.ts";
-import {
-  cleanupFixtures,
-  fixture,
-  request,
-  observation,
-  observedBody,
-} from "./fixtures.ts";
+import { cleanupFixtures, fixture, request, report } from "./fixtures.ts";
 import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
 import type { DatabaseRow } from "../../src/domain/rows.ts";
 const mib = 1024 ** 2,
@@ -381,28 +374,6 @@ it("refuses a thin wake claim without room, but never the ticket claim a pool hi
   expect(await wake(true)).toBe(1);
 });
 
-it("serves each storage node's room as its write_allowed, in a page the deployed controller still parses", async () => {
-  const f = await thinFixture();
-  const node = async () =>
-    DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    ).region.storage_nodes?.find((entry) => entry.node_id === f.node);
-  await physicalSample(f, { dataFree: gib });
-  expect(await node()).toMatchObject({ write_allowed: true });
-  // The controller schema allows no other field in a storage node entry.
-  expect(await node()).not.toHaveProperty("room");
-  await physicalSample(f, { dataFree: 256 * mib });
-  expect(await node()).toMatchObject({ write_allowed: false });
-  // A node closed to new databases still has room for the databases it holds.
-  await physicalSample(f, { dataFree: gib });
-  await env.DB.prepare(
-    "UPDATE node_thin_storage SET allow_new_databases=0 WHERE node_id=?",
-  )
-    .bind(f.node)
-    .run();
-  expect(await node()).toMatchObject({ write_allowed: true });
-});
-
 it("places logical quotas against fresh physical thin headroom instead of the old GiB reservation", async () => {
   const f = await thinFixture();
   const first = DatabaseWithOperation.parse(
@@ -482,22 +453,6 @@ it("the metadata reserve and the explicit logical quota maximum constrain a new 
     .run();
   expect(await fits(f)).toBe(0);
 });
-it("desired state replicates the immutable storage profile and the real startup hold without inventing an IO token", async () => {
-  const f = await thinFixture(),
-    created = DatabaseWithOperation.parse(await (await f.create()).json());
-  const response = await request("/agent/v1/desired", f.agent);
-  expect(response.status).toBe(200);
-  const desired = DesiredResponse.parse(await response.json()),
-    database = desired.databases.find(
-      (value) => value.id === created.database.id,
-    )!;
-  expect(desired.region.storage_nodes).toHaveLength(1);
-  expect(database.storage).toMatchObject({
-    profile_sha256: sha,
-    pool_uuid: pool,
-    node_uid: f.nodeUid,
-  });
-});
 it("the existing hold-ledger migration preserves uncertain and acknowledged RAM rows while zero RAM is stop-only", async () => {
   const f = await thinFixture();
   const first = DatabaseWithOperation.parse(
@@ -506,12 +461,7 @@ it("the existing hold-ledger migration preserves uncertain and acknowledged RAM 
     second = DatabaseWithOperation.parse(
       await (await f.create("migration-ready")).json(),
     );
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(second.database.id, 1)]),
-  );
+  await report(f, second.database.id, 1);
   const migrations = (env as typeof env & { TEST_MIGRATIONS: D1Migration[] })
     .TEST_MIGRATIONS;
   const legacy = migrations.find((m) => m.name.startsWith("0019"))!,

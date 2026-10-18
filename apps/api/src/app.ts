@@ -14,14 +14,13 @@ import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
 import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
-import { registerAgentMetrics } from "./routes/agent-metrics.ts";
 import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
 import { registerRegionConfiguration } from "./routes/region-configuration.ts";
 import { registerFleetReleases } from "./routes/fleet-releases.ts";
-import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
+import { registerNodeLink } from "./routes/node-link.ts";
 import { registerNodes } from "./routes/nodes.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
 import { NodeStateError } from "./domain/node-state.ts";
@@ -30,6 +29,8 @@ export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
 export const DIAGNOSTIC_ID_HEADER = "X-PGCF-Diagnostic-Id";
 export const JSON_BODY_MAX_BYTES = 64 * 1024;
+/** A node's volume report names up to 10,000 volumes. */
+export const NODE_JSON_BODY_MAX_BYTES = 4 * 1024 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/;
 const DIAGNOSTIC_METHODS = new Set([
   "GET",
@@ -63,7 +64,6 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/fleet/releases/:id",
   "/v1/regions/:id/release",
   "/v1/nodes/:id/release",
-  "/agent/v1/fleet-observations",
   "/v1/nodes",
   "/v1/nodes/:id/storage",
   "/v1/nodes/additions",
@@ -87,11 +87,15 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/usage",
   "/v1/databases/:id/archive",
   "/v1/databases/:id/backups",
-  "/agent/v1/desired",
-  "/agent/v1/observations",
-  "/agent/v1/activity",
-  "/agent/v1/usage",
-  "/agent/v1/link",
+  "/v1/regions/:id/node-policy",
+  "/node/v1/enroll",
+  "/node/v1/installer/progress",
+  "/node/v1/link",
+  "/node/v1/desired",
+  "/node/v1/observations",
+  "/node/v1/volumes",
+  "/node/v1/events",
+  "/node/v1/usage",
 ]);
 
 export class ApiError extends Error {
@@ -122,11 +126,13 @@ export function apiError(
 
 async function readJsonBody(
   request: Request,
-): Promise<{ text: string; byteLength: number }> {
-  const maximum = JSON_BODY_MAX_BYTES;
+  maximum: number,
+): Promise<{ text: string; bytes: Uint8Array }> {
   const reader = request.body!.getReader();
-  const bytes = new Uint8Array(maximum);
+  const chunks: Uint8Array[] = [];
   let length = 0;
+  const tooLarge = () =>
+    new ApiError("invalid_request", `JSON body exceeds ${maximum / 1024} KiB`);
   try {
     const declared = request.headers.get("Content-Length");
     if (
@@ -135,29 +141,29 @@ async function readJsonBody(
       Number(declared) > maximum
     ) {
       await reader.cancel();
-      throw new ApiError(
-        "invalid_request",
-        `JSON body exceeds ${maximum / 1024} KiB`,
-      );
+      throw tooLarge();
     }
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
       if (chunk.value.byteLength > maximum - length) {
         await reader.cancel();
-        throw new ApiError(
-          "invalid_request",
-          `JSON body exceeds ${maximum / 1024} KiB`,
-        );
+        throw tooLarge();
       }
-      bytes.set(chunk.value, length);
+      chunks.push(chunk.value);
       length += chunk.value.byteLength;
+    }
+    const bytes = new Uint8Array(length);
+    let at = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, at);
+      at += chunk.byteLength;
     }
     return {
       text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
-        bytes.subarray(0, length),
+        bytes,
       ),
-      byteLength: length,
+      bytes,
     };
   } catch (error) {
     if (error instanceof ApiError) throw error;
@@ -280,9 +286,16 @@ export function createApp(): ApiApp {
 
   app.use("*", async (c, next) => {
     if (c.req.raw.body !== null) {
-      const { text, byteLength } = await readJsonBody(c.req.raw);
+      const { text, bytes } = await readJsonBody(
+        c.req.raw,
+        c.req.path.startsWith("/node/v1/")
+          ? NODE_JSON_BODY_MAX_BYTES
+          : JSON_BODY_MAX_BYTES,
+      );
+      // The bytes a node signed are the bytes it sent, not what parsing leaves of them.
+      c.set("body", bytes);
       // A bodyless HTTP request can arrive as a non-null zero-byte stream.
-      if (byteLength !== 0) {
+      if (bytes.byteLength !== 0) {
         const mediaType = c.req.header("Content-Type")?.split(";")[0]?.trim();
         if (
           mediaType === undefined ||
@@ -325,14 +338,13 @@ export function createApp(): ApiApp {
   registerPlatform(app);
   registerDomain(app);
   registerUsage(app);
-  registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
+  registerNodeLink(app);
   registerInfrastructureBackups(app);
   registerOperationalHealth(app);
   registerRegionConfiguration(app);
   registerFleetReleases(app);
-  registerFleetUpdates(app);
   registerResourceProfiles(app);
   registerRegionArchiveSources(app);
   registerApiDocuments(app);

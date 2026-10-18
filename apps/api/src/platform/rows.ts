@@ -64,34 +64,12 @@ export function nodeInventoryRow(
   row: Row,
   fleet: {
     status: FleetNodeReleaseStatus;
-    role: "control_relay" | "customer" | null;
-    observationState: "current" | "stale" | "unobserved";
+    observation: NodeInventory["observation"];
   },
 ): NodeInventory {
-  const facts =
-    fleet.observationState === "unobserved"
-      ? null
-      : fleet.status.observed_facts;
-  const agent = facts?.components.find(
-      (component) => component.name === "native-controller",
-    ),
-    runtime = agent?.runtime_image_sha256 ?? null;
-  const release = NodeInventory.shape.release.strip().parse(fleet.status);
   return NodeInventory.parse({
     ...nodeRow(row),
-    role: fleet.role,
-    release,
-    observation: {
-      state: fleet.observationState,
-      observed_at: facts ? fleet.status.observed_at : null,
-      talos_version: facts?.talos_version ?? null,
-      kubernetes_version: facts?.kubernetes_version ?? null,
-      kubelet_version: facts?.kubelet_version ?? null,
-      agent_version:
-        runtime !== null && agent?.sha256 === runtime
-          ? (agent.version ?? null)
-          : null,
-      agent_image_sha256: runtime,
-    },
+    release: NodeInventory.shape.release.strip().parse(fleet.status),
+    observation: fleet.observation,
   });
 }

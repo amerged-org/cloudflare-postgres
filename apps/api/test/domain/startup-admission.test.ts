@@ -13,13 +13,7 @@ import {
   recordStartupObservationStatement,
   releaseCoveredStartupReservationsStatement,
 } from "../../src/domain/startup-admission.ts";
-import {
-  cleanupFixtures,
-  fixture,
-  observation,
-  observedBody,
-  request,
-} from "./fixtures.ts";
+import { cleanupFixtures, fixture, request, report } from "./fixtures.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -28,10 +22,7 @@ afterEach(async () => {
 const mib = 1024 * 1024;
 async function coldDatabases(count = 2) {
   const f = await fixture(4096, 40);
-  const uid = crypto.randomUUID();
-  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
-    .bind(uid, f.node)
-    .run();
+  const uid = f.nodeUid;
   await configureNodeRegionPolicy(env.DB, {
     region_id: f.region,
     max_nodes: 2,
@@ -56,32 +47,15 @@ async function coldDatabases(count = 2) {
     )
       .bind(f.node, id)
       .run();
-    await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      observedBody([observation(id, 1)]),
-    );
+    await report(f, id, 1);
     const suspended = DatabaseWithOperation.parse(
       await (
         await request(`/v1/databases/${id}/suspend`, f.integrator, "POST")
       ).json(),
     );
-    await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      observedBody([
-        {
-          ...observation(id, suspended.database.generation, "hibernated"),
-          power: {
-            operation: suspended.operation.id,
-            revision: suspended.database.generation,
-            state: "hibernated",
-          },
-        },
-      ]),
-    );
+    expect(
+      (await report(f, id, suspended.database.generation, "asleep")).status,
+    ).toBe(200);
   }
   await env.DB.prepare(
     "UPDATE nodes SET database_placement_closed_at=?,memory_window_valid=0 WHERE id=?",
@@ -308,22 +282,7 @@ it("coalesces ten eligible cold connections to one startup lease without reopeni
           .first("generation"),
     )
     .toBe(3);
-  const operation = (await env.DB.prepare(
-    "SELECT power_operation FROM databases WHERE id=?",
-  )
-    .bind(id)
-    .first("power_operation")) as string;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, 3),
-        power: { operation, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  expect((await report(f, id, 3)).status).toBe(200);
   expect((await Promise.all(connections)).every((result) => result.ok)).toBe(
     true,
   );
@@ -362,17 +321,7 @@ it("retains failed uncertain starts despite fresh memory and only releases a bou
   await sample(f, 1024 * mib, Date.now() + 1);
   expect((await release()).meta.changes).toBe(0);
   expect((await resume(f, f.databases[1]!)).status).toBe(409);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(resumed.database.id, 3),
-        power: { operation: resumed.operation.id, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  expect((await report(f, resumed.database.id, 3)).status).toBe(200);
   const readyAt = (await env.DB.prepare(
     "SELECT updated_at FROM databases WHERE id=?",
   )
@@ -427,14 +376,16 @@ it("settles delete-before-ready only from accepted deletion and a later physical
       }).run()
     ).meta.changes,
   ).toBe(0);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      observation(resumed.database.id, deleted.database.generation, "deleted"),
-    ]),
-  );
+  expect(
+    (
+      await report(
+        f,
+        resumed.database.id,
+        deleted.database.generation,
+        "deleted",
+      )
+    ).status,
+  ).toBe(200);
   const stoppedAt = (await env.DB.prepare(
     "SELECT updated_at FROM databases WHERE id=?",
   )
@@ -495,7 +446,7 @@ it("keeps busy compensation on the existing awake path but refuses an unknown re
       { databaseId: busyId, operation: busy, revision: 2 },
       "busy",
     ),
-  ).toMatchObject({ revision: 3, regionId: f.region });
+  ).toMatchObject({ revision: 3, nodeId: f.node });
   expect(
     await env.DB.prepare(
       "SELECT COUNT(*) count FROM database_start_admissions",

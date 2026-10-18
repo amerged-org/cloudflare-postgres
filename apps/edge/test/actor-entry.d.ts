@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-export function seedKnownDatabase(
-  db: D1Database,
-  namespace: object,
-  id: string,
-): Promise<void>;
+export function seedKnownDatabase(env: object, id: string): Promise<void>;
 
 export function createUnrelatedRole(
   env: object,
@@ -14,6 +10,7 @@ export function createUnrelatedRole(
 export function publishPowerObservation(
   env: object,
   ctx: ExecutionContext,
+  node: { id: string; uid: string; key: CryptoKey },
   database: string,
   revision: number,
   operation: string,

@@ -4,7 +4,7 @@ import {
   ApiKeyCreated,
   ErrorBody,
   Project,
-  RegionCreated,
+  Region,
   RolePassword,
   bytesToBase64url,
   hashApiKey,
@@ -16,11 +16,6 @@ import {
   type ApiKeyCreate,
   type Project as ProjectView,
 } from "@pgcf/contracts";
-import {
-  deriveRegionKeyring,
-  parseRouteKeyring,
-  serializeRouteKeyring,
-} from "@pgcf/contracts/route-token";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../../src/app.ts";
 import { nodeRow } from "../../src/platform/rows.ts";
@@ -549,30 +544,18 @@ describe("API platform on real Workers D1", () => {
       env,
     );
     expect(regionResponse.status).toBe(201);
-    const region = RegionCreated.parse(await regionResponse.json());
-    const expected = JSON.parse(
-      serializeRouteKeyring(
-        await deriveRegionKeyring(
-          parseRouteKeyring(env.ROUTE_MASTER_KEYS),
-          body.id,
-        ),
-      ),
-    );
-    expect(region.route_keyring).toEqual(expected);
+    const region = Region.parse(await regionResponse.json());
+    expect(region.id).toBe(body.id);
+    // A region holds no secret: the same request again returns the same region.
     const replay = await worker.fetch(
       request("/v1/regions", admin.key, "POST", body, regionIdempotency),
       env,
     );
-    expect(replay.status).toBe(409);
-    expect(await errorCode(replay)).toBe("idempotency_conflict");
+    expect(replay.status).toBe(201);
+    expect(Region.parse(await replay.json())).toEqual(region);
     const regions = await worker.fetch(request("/v1/regions", admin.key), env);
     const listed = JSON.stringify(await regions.json());
-    for (const hidden of [
-      region.agent_key,
-      "agent_key_hash",
-      "route_keyring",
-      ...Object.values(region.route_keyring.keys),
-    ])
+    for (const hidden of ["agent_key", "agent_key_hash", "route_keyring"])
       expect(listed).not.toContain(hidden);
     expect(
       await env.DB.prepare("SELECT COUNT(*) AS count FROM regions").first(

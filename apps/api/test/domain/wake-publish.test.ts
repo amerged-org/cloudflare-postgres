@@ -6,19 +6,20 @@ import {
   createExecutionContext,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { newOperationId } from "@pgcf/contracts";
+import { DatabaseRuntime, newOperationId } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
-import { createApp } from "../../src/app.ts";
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
+import { admissionSnapshotFixture } from "./admission-snapshot-fixture.ts";
 import {
-  admissionFixtureReleases,
-  admissionSnapshotFixture,
-} from "./admission-snapshot-fixture.ts";
-import { cleanupFixtures, request } from "./fixtures.ts";
+  cleanupFixtures,
+  nodeRequest,
+  observationOf,
+  report,
+  reportBody,
+} from "./fixtures.ts";
 import {
   actor,
   parkPolling,
-  readyBody,
   registered,
   sleep,
   sleeping,
@@ -28,32 +29,18 @@ import {
 afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
-  for (const id of admissionFixtureReleases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
-/** Posts an observation without waiting for the work it leaves in the execution context. */
+/** The node reports a database ready, without waiting for the work it leaves in the context. */
 async function observe(
-  agent: string,
-  body: unknown,
+  f: Parameters<typeof nodeRequest>[0] & { id: string },
+  generation: number,
   context: ExecutionContext,
 ): Promise<Response> {
-  return createApp().fetch(
-    new Request(
-      `https://${["api", "invalid"].join(".")}/agent/v1/observations`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${agent}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      },
-    ),
-    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join(".") },
+  return nodeRequest(f, "/node/v1/observations", {
+    method: "POST",
+    body: reportBody([await observationOf(f.id, generation)]),
     context,
-  );
+  });
 }
 
 /**
@@ -141,46 +128,8 @@ it("a transient read failure in the wake loop does not fail the waiting connecti
     ]),
   ).toBe("waiting");
   expect(failed).toBe(1);
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        readyBody(f, row.power_operation),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, f.id, row.generation)).status).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
-}, 30_000);
-
-it("the push releases a waiting connection while the admission publish is still running", async () => {
-  const f = await sleeping();
-  const waiterId = crypto.randomUUID();
-  const waiting = actor(f.id).ensureAwake(f.id, "app", {
-    waiterId,
-    deadline: Date.now() + 15_000,
-  });
-  const row = await untilWake(f.id);
-  await registered(f.id, waiterId);
-  await parkPolling(f.id);
-  const hold = holdSnapshotReads();
-  hold.arm();
-  const context = createExecutionContext();
-  const response = observe(f.agent, readyBody(f, row.power_operation), context);
-  // The ready state is committed and the snapshot read is held: the Actor's readiness read alone
-  // (this region has no snapshot cache) releases the connection, and it needs only the push.
-  const released = await Promise.race([
-    waiting.then((value) => value),
-    sleep(2500).then(() => "held"),
-  ]);
-  // The publish reaches its held read right after the connection has been released.
-  for (let i = 0; i < 400 && hold.held() === 0; i++) await sleep(5);
-  expect(hold.held()).toBeGreaterThan(0);
-  hold.release();
-  await response;
-  await waitOnExecutionContext(context);
-  expect(released).toMatchObject({ ok: true });
 }, 30_000);
 
 it("a ready observation is answered while its admission publish is still running", async () => {
@@ -195,7 +144,7 @@ it("a ready observation is answered while its admission publish is still running
   const hold = holdSnapshotReads();
   hold.arm();
   const context = createExecutionContext();
-  const response = observe(f.agent, readyBody(f, row.power_operation), context);
+  const response = observe(f, row.generation, context);
   const answered = await Promise.race([
     response.then((value) => value.status),
     sleep(3000).then(() => "stalled"),
@@ -210,9 +159,9 @@ it("a ready observation is answered while its admission publish is still running
 it("a published snapshot of the wake's revision releases the waiting connection without another read", async () => {
   const f = await admissionSnapshotFixture();
   const sleepOperation = newOperationId(),
-    sleepGeneration = f.proof.generation + 1,
+    sleepGeneration = f.generation + 1,
     at = new Date().toISOString();
-  // Controlled committed regional sleep metadata, followed by the real Actor wake writer.
+  // Controlled committed sleep metadata, followed by the real Actor wake writer.
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,?,?,?,?)",
@@ -268,31 +217,16 @@ it("a published snapshot of the wake's revision releases the waiting connection 
   )
     .bind(f.id)
     .first<{ generation: number; power_operation: string }>())!;
-  const epoch = (await env.DB.prepare(
-    "SELECT admission_revision,route_revision FROM database_admission_epochs WHERE database_id=?",
-  )
-    .bind(f.id)
-    .first<{ admission_revision: number; route_revision: number }>())!;
-  const observedAt = Date.now();
-  const proof = {
-    ...f.proof,
+  const runtime = DatabaseRuntime.parse({
+    ...f.runtime,
     generation: row.generation,
-    admission_epoch: epoch.admission_revision,
-    route_revision: epoch.route_revision,
-    pod_uid: crypto.randomUUID(),
-    container_id: "b".repeat(64),
-    observed_at: observedAt,
-    observation: {
-      ...f.proof.observation,
-      verified_at: observedAt,
-      expires_at: observedAt + 60000,
-      watch_epoch: f.proof.observation.watch_epoch + 1,
-    },
-  };
+    instance: crypto.randomUUID(),
+    observed_at: Date.now(),
+  });
   await env.DB.prepare(
     "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation,runtime_attestation_json=? WHERE id=?",
   )
-    .bind(JSON.stringify(proof), f.id)
+    .bind(JSON.stringify(runtime), f.id)
     .run();
   expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   const released = await Promise.race([
@@ -301,7 +235,8 @@ it("a published snapshot of the wake's revision releases the waiting connection 
   ]);
   expect(released).toMatchObject({
     ok: true,
-    target: { revision: row.generation, pod_uid: proof.pod_uid },
+    node: f.node,
+    target: { revision: row.generation, instance: runtime.instance },
   });
 }, 30_000);
 
@@ -328,12 +263,7 @@ it("a gate held for a second names its callback in the log", async () => {
   await victim;
   expect(Date.now() - waitStarted).toBeGreaterThanOrEqual(1000);
   const row = await untilWake(f.id);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    readyBody(f, row.power_operation),
-  );
+  expect((await report(f, f.id, row.generation)).status).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
   const events = warnings
     .map((line) => {
@@ -430,16 +360,7 @@ it("an idle probe that finds the database busy does not hold the gate across its
     deadline: Date.now() + 15_000,
   });
   const woken = await untilWake(f.id);
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        readyBody(f, woken.power_operation),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, f.id, woken.generation)).status).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
   const at = new Date().toISOString();
   expect(

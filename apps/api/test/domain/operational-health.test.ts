@@ -162,9 +162,13 @@ it("exposes bounded administrator health from real D1 samples and preserves miss
   expect(nodes.data[0]!.observation.status).toBe("ok");
   const regions = await (
     await healthRequest("/v1/operational-health?scope=regions", f.admin)
-  ).json<{ data: { agent: { status: string } }[] }>();
-  expect(regions.data.every((row) => row.agent.status === "unknown")).toBe(
-    true,
+  ).json<{ data: { id: string; agent: { status: string } }[] }>();
+  // The region of the node that just spoke is ok; a region without a node has no report.
+  expect(regions.data.find((row) => row.id === f.region)!.agent.status).toBe(
+    "ok",
+  );
+  expect(regions.data.find((row) => row.id === f.foreign)!.agent.status).toBe(
+    "unknown",
   );
   const second = DatabaseWithOperation.parse(
     await (await f.create("second")).json(),

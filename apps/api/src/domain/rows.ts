@@ -28,10 +28,6 @@ export interface DatabaseRow extends DatabaseHealthSource {
   /** Read with effectiveSleepAfterSql. */
   effective_sleep_after_seconds?: number | null;
   pg_major: 18;
-  desired_postgres_release_id?: string | null;
-  desired_postgres_image?: string | null;
-  desired_postgres_version?: string | null;
-  desired_postgres_schema_revision?: number | null;
   observed_postgres_image?: string | null;
   observed_postgres_image_id?: string | null;
   desired_state: DesiredState;
@@ -91,7 +87,6 @@ export interface RegionRow {
   id: string;
   backup_bucket: string;
   backup_endpoint_url: string;
-  agent_key_hash: string;
 }
 export interface SizeRow extends Omit<SizeClass, "enabled"> {
   enabled: number;

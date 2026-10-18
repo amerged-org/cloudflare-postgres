@@ -280,37 +280,3 @@ export function coveredStorageHoldSql(admissionAlias = "a"): string {
                 AND json_extract(v.value,'$.io[0].write_iops_per_second')<=json_extract(storage_db.storage_profile_json,'$.write_iops_per_second')))))
   ))`;
 }
-
-/** Only a fresh Native negative physical read may complete deletion of a known thin volume. */
-export function thinStorageDeletionConfirmedSql(
-  databaseAlias = "databases",
-): string {
-  const database = identifier(databaseAlias),
-    lv = `json_extract(${database}.storage_volume_json,'$.lv_uuid')`;
-  return `(${database}.storage_profile_json IS NULL OR EXISTS(
-    SELECT 1 FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
-    WHERE t.node_id=${database}.node_id AND n.region_id=${database}.region_id AND n.lost_at IS NULL
-      AND ${database}.storage_volume_json IS NOT NULL
-      AND typeof(${lv})='text' AND length(${lv})=38 AND length(replace(${lv},'-',''))=32
-      AND replace(${lv},'-','') NOT GLOB '*[^A-Za-z0-9]*'
-      AND substr(${lv},7,1)='-' AND substr(${lv},12,1)='-' AND substr(${lv},17,1)='-'
-      AND substr(${lv},22,1)='-' AND substr(${lv},27,1)='-' AND substr(${lv},32,1)='-'
-      AND json_extract(${database}.storage_volume_json,'$.storage_generation')=${database}.storage_generation
-      AND json_extract(${database}.storage_profile_json,'$.node_uid')=t.node_uid
-      AND json_extract(${database}.storage_volume_json,'$.node_uid')=t.node_uid
-      AND json_extract(${database}.storage_volume_json,'$.volume_group_uuid')=t.volume_group_uuid
-      AND json_extract(${database}.storage_profile_json,'$.profile_sha256')=t.profile_sha256
-      AND json_extract(t.authority_json,'$.revision')=t.authority_revision
-      AND julianday(t.authority_received_at)>=julianday('now','-120 seconds')
-      AND julianday(t.authority_received_at)<=julianday('now','+5 seconds')
-      AND json_extract(t.authority_json,'$.node_uid')=t.node_uid
-      AND json_extract(t.authority_json,'$.volume_group_uuid')=t.volume_group_uuid
-      AND json_extract(t.authority_json,'$.profile_sha256')=t.profile_sha256
-      AND json_extract(t.authority_json,'$.data_accounting_complete')=1
-      AND julianday(${inventoryObservedSql()})>julianday(${database}.updated_at)
-      AND julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds')
-      AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
-      AND julianday(${inventoryExpiresSql()})>julianday('now')
-      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.physical_lvs') physical_lv WHERE json_extract(physical_lv.value,'$.lv_uuid')=${lv})
-      AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.active_lv_uuids') active_lv WHERE active_lv.value=${lv})))`;
-}

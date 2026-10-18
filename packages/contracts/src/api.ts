@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { MAINTENANCE_ROLE } from "./maintenance.ts";
-import {
-  ApiKeyScope,
-  ApiKeyString,
-  AgentKeyString,
-  RegionRouteKeyring,
-} from "./auth.ts";
+import { ApiKeyScope, ApiKeyString } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import {
   ApiKeyId,
@@ -250,7 +245,7 @@ const RegionFields = {
   backup_endpoint_url: HttpsUrl,
 };
 
-/** Admin view; the agent key hash is never returned. */
+/** Admin view. `agent_last_seen_at` is the newest link message of any node of the region. */
 export const Region = z
   .strictObject({
     id: RegionId,
@@ -285,16 +280,6 @@ export const PlacementRegion = z
     examples: [{ id: "eu-1", provider_region: "EU" }],
   });
 export type PlacementRegion = z.infer<typeof PlacementRegion>;
-
-/** The agent key and derived routing keyring are returned exactly once, at creation. */
-export const RegionCreated = z
-  .strictObject({
-    region: Region,
-    agent_key: AgentKeyString,
-    route_keyring: RegionRouteKeyring,
-  })
-  .meta({ id: "RegionCreated" });
-export type RegionCreated = z.infer<typeof RegionCreated>;
 
 // ---------- Nodes ----------
 

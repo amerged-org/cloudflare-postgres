@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { choosePlacement, placementNodes } from "../../src/domain/placement.ts";
 import { databaseInsertStatement } from "../../src/domain/databases.ts";
 import type { RegionRow, SizeRow } from "../../src/domain/rows.ts";
-import { cleanupFixtures, fixture, request, observedBody } from "./fixtures.ts";
+import { cleanupFixtures, fixture } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
 describe("measured CPU admission on real Workers D1", () => {
@@ -233,7 +233,7 @@ describe("measured CPU admission on real Workers D1", () => {
     ).toBe("most-memory");
   });
 
-  it("refuses legacy unknown CPU in both placement and direct SQL until an actual measured observation arrives", async () => {
+  it("refuses unknown platform CPU in both placement and direct SQL", async () => {
     const f = await fixture();
     await env.DB.prepare(
       "UPDATE nodes SET platform_reserved_cpu_millicores=NULL WHERE id=?",
@@ -278,54 +278,6 @@ describe("measured CPU admission on real Workers D1", () => {
       now: new Date().toISOString(),
     }).run();
     expect(insert.meta.changes).toBe(0);
-    const node = {
-      name: f.nodeName,
-      ready: true,
-      allocatable_memory_mib: 4096,
-      allocatable_cpu_millicores: 2000,
-      storage_gib_total: 30,
-      platform_reserved_memory_mib: 128,
-      platform_reserved_cpu_millicores: 0,
-    };
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([], [node]),
-        )
-      ).status,
-    ).toBe(200);
-    expect((await f.create("measured")).status).toBe(202);
-    const legacy = { ...node };
-    delete (legacy as { platform_reserved_cpu_millicores?: number })
-      .platform_reserved_cpu_millicores;
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([], [legacy]),
-        )
-      ).status,
-    ).toBe(200);
-    expect(
-      await env.DB.prepare(
-        "SELECT platform_reserved_cpu_millicores FROM nodes WHERE id=?",
-      )
-        .bind(f.node)
-        .first("platform_reserved_cpu_millicores"),
-    ).toBeNull();
-    expect((await f.create("legacy-again")).status).toBe(202);
-    expect(
-      await env.DB.prepare(
-        "SELECT node_id FROM databases WHERE project_id=? AND name=?",
-      )
-        .bind(f.project, "legacy-again")
-        .first("node_id"),
-    ).toBeNull();
   });
 
   it("counts PostgreSQL plus sidecar CPU until a database is observed deleted", async () => {
@@ -363,51 +315,5 @@ describe("measured CPU admission on real Workers D1", () => {
       (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
     ).toBe(0);
     expect((await f.create("released")).status).toBe(202);
-  });
-
-  it("does not overwrite CPU from a newer server receipt or a foreign region", async () => {
-    const f = await fixture();
-    const newer = new Date(Date.now() + 60_000).toISOString();
-    await env.DB.prepare(
-      "UPDATE nodes SET updated_at=?,platform_reserved_cpu_millicores=1000 WHERE id=?",
-    )
-      .bind(newer, f.node)
-      .run();
-    const node = {
-      name: f.nodeName,
-      ready: true,
-      allocatable_memory_mib: 4096,
-      allocatable_cpu_millicores: 2000,
-      storage_gib_total: 30,
-      platform_reserved_memory_mib: 128,
-      platform_reserved_cpu_millicores: 0,
-    };
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([], [node]),
-        )
-      ).status,
-    ).toBe(200);
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.foreignAgent,
-          "POST",
-          observedBody([], [node]),
-        )
-      ).status,
-    ).toBe(200);
-    expect(
-      await env.DB.prepare(
-        "SELECT platform_reserved_cpu_millicores FROM nodes WHERE id=?",
-      )
-        .bind(f.node)
-        .first("platform_reserved_cpu_millicores"),
-    ).toBe(1000);
   });
 });

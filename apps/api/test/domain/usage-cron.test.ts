@@ -48,7 +48,7 @@ afterEach(async () => {
 async function cohort(count = 1) {
   const f = await fixture(),
     ids = Array.from({ length: count }, () => newDatabaseId()).sort();
-  const inserts = ids.map((id) =>
+  const inserts = ids.flatMap((id) => [
     env.DB.prepare(
       `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,created_at,updated_at)
     VALUES(?,?,?,?,?,?,'running','ready',1,1,?,?,?)`,
@@ -63,7 +63,10 @@ async function cohort(count = 1) {
       iso(start),
       iso(start),
     ),
-  );
+    env.DB.prepare(
+      "INSERT INTO database_admission_epochs(database_id) VALUES(?)",
+    ).bind(id),
+  ]);
   for (let offset = 0; offset < inserts.length; offset += 100)
     await env.DB.batch(inserts.slice(offset, offset + 100));
   const event = (
