@@ -390,6 +390,38 @@ mod tests {
     }
 
     #[test]
+    fn the_room_rule_neither_overflows_nor_trusts_a_pool_without_metadata() {
+        let t0 = Instant::now();
+        let huge = PoolSample {
+            data_total_bytes: u64::MAX,
+            data_used_bytes: 0,
+            metadata_total_bytes: u64::MAX,
+            metadata_used_bytes: u64::MAX / 2,
+            ..sample(t0)
+        };
+        assert_eq!(room(Some(&huge), t0, &policy()), Ok(()));
+        let used_up = PoolSample {
+            data_used_bytes: u64::MAX,
+            ..huge.clone()
+        };
+        assert_eq!(room(Some(&used_up), t0, &policy()), Err(NoRoom::Reserve));
+        // A used count above the total reads as no free data, not as a wrap.
+        let over = PoolSample {
+            data_total_bytes: 1,
+            data_used_bytes: u64::MAX,
+            ..sample(t0)
+        };
+        assert_eq!(room(Some(&over), t0, &policy()), Err(NoRoom::Reserve));
+        // A pool that reports no metadata size is unknown, not empty.
+        let unknown = PoolSample {
+            metadata_total_bytes: 0,
+            metadata_used_bytes: 0,
+            ..sample(t0)
+        };
+        assert_eq!(room(Some(&unknown), t0, &policy()), Err(NoRoom::Metadata));
+    }
+
+    #[test]
     fn a_pool_that_takes_no_writes_has_no_room_even_with_no_reserve() {
         let t0 = Instant::now();
         let no_reserve = Policy {
@@ -419,6 +451,26 @@ mod tests {
                 &json!({"reserve_bytes": 1, "metadata_no_room_percent": 300, "sample_max_age_seconds": 10})
             ),
             None
+        );
+    }
+
+    #[test]
+    fn the_policy_is_what_the_contracts_example_page_carries() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../../packages/contracts/native/node-vectors.generated.json"
+        ))
+        .unwrap();
+        let page = vectors["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                v["schema"] == "NodeDesiredPage" && v["name"] == "full-page" && v["valid"] == true
+            })
+            .expect("the valid full desired page");
+        assert_eq!(
+            Policy::from_json(&page["value"]["policy"]["storage"]),
+            Some(policy())
         );
     }
 

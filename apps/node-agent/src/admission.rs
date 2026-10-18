@@ -7,8 +7,9 @@
 //! reads the facts when it decides.
 //!
 //! For a start of a database of `m` MiB three rules apply, in the order the plan gives them:
-//! 1. The room rule: the pool sample is fresh and the pool has room (`StoragePolicy::room`).
-//!    Otherwise the start is refused at once (`Refusal::NoRoom`); waiting does not make room.
+//! 1. The room rule: the pool has room (`Facts::room`, which the storage module decides from its
+//!    fresh pool sample). Otherwise the start is refused at once (`Refusal::NoRoom`); waiting
+//!    does not make room.
 //! 2. The memory rule of policy: `measured` (decision D3 (a), the plan default) needs `MemAvailable`
 //!    minus the full size of every start still in flight minus the floor to be at least `m`;
 //!    `reserved` (D3 (b)) needs the reservations of the awake and starting databases plus `m` and
@@ -69,48 +70,11 @@ pub struct EarlySleepPolicy {
     pub min_idle_seconds: u64,
 }
 
-/// The contract's `policy.storage`.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StoragePolicy {
-    pub reserve_bytes: u64,
-    pub metadata_no_room_percent: u64,
-    pub sample_max_age_seconds: u64,
-}
-
 /// The parts of the contract's `NodePolicy` that admission reads. Other parts are ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Policy {
     pub admission: AdmissionPolicy,
     pub early_sleep: EarlySleepPolicy,
-    pub storage: StoragePolicy,
-}
-
-/// The thin pool as the storage side last sampled it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PoolSample {
-    /// How long ago the sample was taken.
-    pub age: Duration,
-    pub data_total_bytes: u64,
-    pub data_used_bytes: u64,
-    pub metadata_total_bytes: u64,
-    pub metadata_used_bytes: u64,
-}
-
-impl StoragePolicy {
-    /// The room rule (plan 4.3 and 4.6): a pool sample that is not too old, free data at least the
-    /// reserve and metadata below the "no room" percentage. A pool that was not sampled has no
-    /// room that anyone can prove.
-    pub fn room(&self, pool: Option<&PoolSample>) -> bool {
-        let Some(pool) = pool else {
-            return false;
-        };
-        let free = pool.data_total_bytes.saturating_sub(pool.data_used_bytes);
-        pool.age <= Duration::from_secs(self.sample_max_age_seconds)
-            && free >= self.reserve_bytes
-            && u128::from(pool.metadata_used_bytes) * 100
-                < u128::from(pool.metadata_total_bytes) * u128::from(self.metadata_no_room_percent)
-    }
 }
 
 /// What the node knows when it decides.
@@ -118,7 +82,8 @@ impl StoragePolicy {
 pub struct Facts {
     /// `MemAvailable` of `/proc/meminfo`, read now.
     pub mem_available_bytes: u64,
-    pub pool: Option<PoolSample>,
+    /// The pool has room (plan 4.3 and 4.6): `storage::Storage::room` holds now.
+    pub room: bool,
 }
 
 /// `MemAvailable` in bytes from the text of `/proc/meminfo`.
@@ -432,7 +397,7 @@ impl Admitter {
         {
             return Decision::Duplicate;
         }
-        if !self.policy.storage.room(facts.pool.as_ref()) {
+        if !facts.room {
             return Decision::Done(Err(self.refusal(Refusal::NoRoom, Duration::ZERO)));
         }
         if self.queue.is_empty() && self.fits(facts, request.memory_mib) {
@@ -462,7 +427,7 @@ impl Admitter {
     /// the starts asked.
     pub fn poll(&mut self, now: Instant, facts: &Facts) -> Vec<(Ticket, Outcome)> {
         let mut outcomes = Vec::new();
-        if !self.policy.storage.room(facts.pool.as_ref()) {
+        if !facts.room {
             // Waiting does not make room: nobody who waits can begin.
             for waiter in std::mem::take(&mut self.queue) {
                 let waited = now.saturating_duration_since(waiter.enqueued);
@@ -923,11 +888,6 @@ mod tests {
                 enabled: true,
                 min_idle_seconds: 30,
             },
-            storage: StoragePolicy {
-                reserve_bytes: 6 * 1024 * MIB_U64,
-                metadata_no_room_percent: 75,
-                sample_max_age_seconds: 10,
-            },
         }
     }
     fn reserved() -> Policy {
@@ -935,20 +895,11 @@ mod tests {
         policy.admission.memory_rule = MemoryRule::Reserved;
         policy
     }
-    fn pool() -> PoolSample {
-        PoolSample {
-            age: Duration::from_secs(1),
-            data_total_bytes: 100 * 1024 * MIB_U64,
-            data_used_bytes: 10 * 1024 * MIB_U64,
-            metadata_total_bytes: 1024 * MIB_U64,
-            metadata_used_bytes: 20 * MIB_U64,
-        }
-    }
     /// Facts with `mib` of memory available and a roomy pool.
     fn facts(mib: u64) -> Facts {
         Facts {
             mem_available_bytes: mib * MIB_U64,
-            pool: Some(pool()),
+            room: true,
         }
     }
     fn request(database: &str, memory_mib: u64) -> Request {
@@ -995,77 +946,15 @@ mod tests {
     // ---------- the room rule ----------
 
     #[test]
-    fn the_room_rule_needs_a_fresh_sample_free_data_and_metadata_below_the_percentage() {
-        let storage = policy().storage;
-        let reserve = storage.reserve_bytes;
-        assert!(storage.room(Some(&pool())));
-        assert!(
-            !storage.room(None),
-            "an unsampled pool has no provable room"
-        );
-        // The sample may be exactly as old as the policy allows, not older.
-        let aged = |age| PoolSample { age, ..pool() };
-        assert!(storage.room(Some(&aged(secs(10)))));
-        assert!(!storage.room(Some(&aged(secs(10) + Duration::from_nanos(1)))));
-        // Free data at least the reserve: equal is room, one byte less is not.
-        let data = |free: u64| PoolSample {
-            data_total_bytes: 100 * 1024 * MIB_U64,
-            data_used_bytes: 100 * 1024 * MIB_U64 - free,
-            ..pool()
-        };
-        assert!(storage.room(Some(&data(reserve))));
-        assert!(!storage.room(Some(&data(reserve - 1))));
-        // Metadata below 75 %: "at 75 %" is no room (plan 4.3 "≥ 75 %").
-        let metadata = |used: u64| PoolSample {
-            metadata_total_bytes: 1000,
-            metadata_used_bytes: used,
-            ..pool()
-        };
-        assert!(storage.room(Some(&metadata(749))));
-        assert!(!storage.room(Some(&metadata(750))));
-        assert!(!storage.room(Some(&metadata(1000))));
-        let empty_metadata = PoolSample {
-            metadata_total_bytes: 0,
-            metadata_used_bytes: 0,
-            ..pool()
-        };
-        assert!(
-            !storage.room(Some(&empty_metadata)),
-            "a pool without metadata size is unknown"
-        );
-        // Sizes near the top of u64 do not overflow.
-        let huge = PoolSample {
-            age: Duration::ZERO,
-            data_total_bytes: u64::MAX,
-            data_used_bytes: 0,
-            metadata_total_bytes: u64::MAX,
-            metadata_used_bytes: u64::MAX / 2,
-        };
-        assert!(storage.room(Some(&huge)));
-        let used_up = PoolSample {
-            data_used_bytes: u64::MAX,
-            ..huge
-        };
-        assert!(!storage.room(Some(&used_up)));
-        // A used count above the total reads as no free data, not as a wrap.
-        let over = PoolSample {
-            data_used_bytes: u64::MAX,
-            data_total_bytes: 1,
-            ..pool()
-        };
-        assert!(!storage.room(Some(&over)));
-    }
-
-    #[test]
     fn a_start_without_room_is_refused_at_once_and_never_queued() {
         let t0 = Instant::now();
-        let no_pool = Facts {
-            pool: None,
+        let no_room = Facts {
+            room: false,
             ..facts(10_000)
         };
         let mut admitter = Admitter::new(policy());
         assert_eq!(
-            admitter.request(t0, &no_pool, request("a", 256)),
+            admitter.request(t0, &no_room, request("a", 256)),
             Decision::Done(Err(Refused {
                 reason: Refusal::NoRoom,
                 retry_after_seconds: None,
@@ -1080,7 +969,7 @@ mod tests {
             Decision::Queued(_)
         ));
         assert!(matches!(
-            admitter.request(t0, &no_pool, request("c", 256)),
+            admitter.request(t0, &no_room, request("c", 256)),
             Decision::Done(Err(Refused {
                 reason: Refusal::NoRoom,
                 ..
@@ -1096,7 +985,7 @@ mod tests {
         let a = queue(&mut admitter, t0, &facts(100), request("a", 256));
         let b = queue(&mut admitter, t0 + secs(1), &facts(100), request("b", 256));
         let lost = Facts {
-            pool: None,
+            room: false,
             ..facts(10_000)
         };
         let refusal = |waited| {
@@ -2044,7 +1933,7 @@ mod tests {
             let node = self.clone();
             Admission::spawn(admitter, move || Facts {
                 mem_available_bytes: node.memory_mib.load(Ordering::SeqCst) * MIB_U64,
-                pool: node.room.load(Ordering::SeqCst).then(pool),
+                room: node.room.load(Ordering::SeqCst),
             })
         }
     }
