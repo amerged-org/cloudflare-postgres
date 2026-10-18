@@ -206,7 +206,6 @@ pub fn credential() -> Credential {
         "fixturekeyid",
         "fixturesecret",
         "fixturetoken",
-        1,
         u64::MAX / 2,
     )
     .unwrap()
@@ -240,7 +239,7 @@ impl Node {
         std::fs::write(volume.join("data/pg_wal").join(SEGMENT), vec![9u8; 2048]).unwrap();
         let uid = std::fs::metadata(&volume).unwrap().uid();
         let table = Arc::new(Table::default());
-        let credentials = Arc::new(Credentials::delivered());
+        let credentials = Arc::new(Credentials::default());
         for access in [Access::ReadWrite, Access::ReadOnly] {
             for path in [ARCHIVE, SOURCE] {
                 credentials.hold(store(path, access).scope, credential());

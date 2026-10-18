@@ -66,6 +66,10 @@ pub struct Registration {
 
 struct Entry {
     registration: Registration,
+    /// Held for the length of a call: a database has one at a time (plan 7.5 step 6). PostgreSQL's
+    /// archiver and recovery ask one after the other, so a second call is a client that gave up
+    /// on the first, or a process of the database's uid that wants the node's slots.
+    serial: tokio::sync::Mutex<()>,
     /// When the current run of failed archive calls began (Unix milliseconds).
     failing_since_ms: Mutex<Option<i64>>,
 }
@@ -79,6 +83,7 @@ impl Table {
     pub fn set(&self, registration: Registration) {
         let entry = Arc::new(Entry {
             registration,
+            serial: tokio::sync::Mutex::new(()),
             failing_since_ms: Mutex::new(None),
         });
         self.entries
@@ -176,12 +181,19 @@ impl Server {
         let Some(entry) = self.table.get(uid) else {
             return Reply::Failed(Some("unknown_database"));
         };
-        match Request::decode(line) {
-            Ok(Request::Archive { name }) => self.archive(&entry, &name, deadline).await,
-            Ok(Request::Fetch { name, destination }) => {
+        let Ok(request) = Request::decode(line) else {
+            return Reply::Failed(Some("bad_request"));
+        };
+        // Not waited for: a waiting call would hold a connection for as long, and PostgreSQL asks
+        // again.
+        let Ok(_call) = entry.serial.try_lock() else {
+            return Reply::Failed(Some("agent_busy"));
+        };
+        match request {
+            Request::Archive { name } => self.archive(&entry, &name, deadline).await,
+            Request::Fetch { name, destination } => {
                 self.fetch(&entry, &name, &destination, deadline).await
             }
-            Err(_) => Reply::Failed(Some("bad_request")),
         }
     }
     /// `ok` once barman has exited 0, which is after R2 holds the object, and the upload log holds
@@ -412,10 +424,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn more_uploads_than_slots_that_cannot_finish_in_time_are_all_failed_and_none_logged() {
+    async fn calls_that_cannot_finish_in_time_are_all_failed_and_none_logged() {
         let node = Node::start("busy", Duration::from_millis(300)).await;
         node.fixture.set("delay", "0.8");
-        // Two uploads fill the WAL slots and run out of time; the third waits and does too.
+        // One call runs out of time; the database's other calls are refused while it runs.
         let calls = futures_util::future::join_all((0..3).map(|_| node.archive(SEGMENT))).await;
         for answer in &calls {
             assert!(
@@ -426,6 +438,82 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(node.log().entries().unwrap().is_empty());
         assert!(!node.fixture.object(ARCHIVE, SEGMENT).exists());
+    }
+
+    #[tokio::test]
+    async fn a_database_has_one_call_at_a_time_and_cannot_take_the_slots_of_the_others() {
+        use crate::archive::job::{Database, Jobs, Limits};
+        let node = Node::start("serial", AGENT_BOUND).await;
+        // A second database of the node, with its own user, volume and archive.
+        let neighbour_archive =
+            "s3://pgcf-eu/eu-dev/zyxwvutsrqponmlkjihg/g1-op_eeeeeeeeeeeeeeeeeeee";
+        let neighbour_volume = directory("neighbour");
+        std::fs::create_dir_all(neighbour_volume.join("data/pg_wal")).unwrap();
+        std::fs::write(
+            neighbour_volume.join("data/pg_wal").join(SEGMENT),
+            vec![5u8; 2048],
+        )
+        .unwrap();
+        let neighbour_store = store(neighbour_archive, Access::ReadWrite);
+        node.credentials
+            .hold(neighbour_store.scope.clone(), credential());
+        let neighbour_uid = node.uid + 1;
+        node.table.set(Registration {
+            database: Database {
+                id: "zyxwvutsrqponmlkjihg".into(),
+                user: "pgcf-zyxwvutsrqponmlkjihg".into(),
+                volume: neighbour_volume.clone(),
+                socket_directory: neighbour_volume.join("socket"),
+            },
+            uid: neighbour_uid,
+            store: neighbour_store,
+            recovery: None,
+            upload_log: UploadLog::new(neighbour_volume.join("uploads")),
+        });
+        std::fs::write(
+            node.volume().join("data/pg_wal/000000010000000000000002"),
+            vec![6u8; 2048],
+        )
+        .unwrap();
+        let jobs = Arc::new(Jobs::new(
+            node.fixture.runner().with_grace(Duration::ZERO),
+            Limits::default(),
+        ));
+        let server = Server::new(node.table.clone(), jobs, node.credentials.clone());
+        node.fixture.set("delay", "1");
+        let archive = async |uid: u32, name: String| {
+            server
+                .answer(uid, format!("pgcf-archive/1 archive {name}").as_bytes())
+                .await
+        };
+        let first = archive(node.uid, SEGMENT.into());
+        let others = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            // More calls of the same database, from any connection, are refused at once ...
+            let again = futures_util::future::join_all(
+                (2..5).map(|n| archive(node.uid, format!("00000001000000000000000{n}"))),
+            )
+            .await;
+            let refused_in = started.elapsed();
+            // ... and take no slot from the database next to it.
+            let neighbour = archive(neighbour_uid, SEGMENT.into()).await;
+            (again, refused_in, neighbour)
+        };
+        let (first, (again, refused_in, neighbour)) = tokio::join!(first, others);
+        assert_eq!(first, Reply::Ok);
+        assert_eq!(again, [Reply::Failed(Some("agent_busy")); 3]);
+        assert!(refused_in < Duration::from_millis(150), "{refused_in:?}");
+        assert_eq!(neighbour, Reply::Ok);
+        // Two uploads ran, side by side: the first and the neighbour's. Nothing else ran.
+        let seen = node.fixture.concurrency();
+        assert_eq!((seen.len(), seen.into_iter().max()), (2, Some(2)));
+        assert_eq!(node.log().entries().unwrap(), [SEGMENT]);
+        // Once the call is over the database can ask again.
+        assert_eq!(
+            archive(node.uid, "000000010000000000000002".into()).await,
+            Reply::Ok
+        );
     }
 
     #[tokio::test]
@@ -451,7 +539,7 @@ mod tests {
     async fn an_expired_credential_fails_at_once_and_starts_no_job() {
         let node = Node::start("expired", AGENT_BOUND).await;
         let expired =
-            Credential::delivered("fixturekeyid", "fixturesecret", "fixturetoken", 1, 2).unwrap();
+            Credential::delivered("fixturekeyid", "fixturesecret", "fixturetoken", 2).unwrap();
         node.credentials
             .hold(store(ARCHIVE, Access::ReadWrite).scope, expired);
         assert_eq!(node.archive(SEGMENT).await, "failed credential_expired\n");

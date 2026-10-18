@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn the_credential_travels_in_the_environment_file_and_never_in_an_argument() {
         let credential =
-            Credential::delivered("keyid", "secret/value+1=", "token.part-2_~", 1, 9).unwrap();
+            Credential::delivered("keyid", "secret/value+1=", "token.part-2_~", 9).unwrap();
         assert_eq!(
             environment_file(&credential),
             "AWS_ACCESS_KEY_ID=keyid\nAWS_SECRET_ACCESS_KEY=secret/value+1=\nAWS_SESSION_TOKEN=token.part-2_~\nAWS_DEFAULT_REGION=auto\nTMPDIR=/var/tmp\n"
@@ -904,8 +904,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         fn credential() -> Credential {
-            Credential::delivered("fixturekeyid", "fixturesecret", "fixturetoken", 1, 1 << 40)
-                .unwrap()
+            Credential::delivered("fixturekeyid", "fixturesecret", "fixturetoken", 1 << 40).unwrap()
         }
         fn wal_job(volume: &Path, timeout: Duration) -> (Database, Job) {
             let db = database_in(volume);
