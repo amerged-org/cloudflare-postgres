@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_is_logged_once_with_its_outcome_every_step_and_its_total() {
+    fn a_wake_line_carries_its_outcome_every_step_and_its_total() {
         let mut result = WakeResult {
             database: "abcdefghijklmnopqrst".into(),
             operation: format!("op_{}", "w".repeat(20)),

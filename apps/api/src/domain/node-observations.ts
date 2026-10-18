@@ -823,7 +823,9 @@ export async function nodeObservations(
   // The results of the other orders, the moves they unlock and the recovery points of the databases.
   orders += await applyLifecycleObservations(c.env, node.id, report);
   // The node's own log lines (plan 9.9): one line of Workers Logs each, kept nowhere else. A log
-  // key is never replaced by a field of the same name.
+  // key is never replaced by a field of the same name. A report the API applied but whose answer the
+  // node never got is sent again, so a line can appear twice: a query that counts events counts
+  // identical lines once.
   for (const { event, at, database_id, fields } of report.events ?? [])
     console.log(
       JSON.stringify({

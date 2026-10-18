@@ -1111,9 +1111,11 @@ export type NodeOrderResult = z.infer<typeof NodeOrderResult>;
 export const NODE_REPORT_EVENTS_MAX = 64;
 export const NODE_REPORT_EVENT_FIELDS_MAX = 16;
 /**
- * One line of the agent's own log (plan 9.9), reduced to what cannot carry an address, a path, a
- * role or free text: an event's name, and fields that are numbers or short tokens. The API logs
- * it as a `node_event` line of Workers Logs and keeps nothing.
+ * One line of the agent's own log (plan 9.9): an event's name, and fields that are numbers or
+ * short tokens. The shape rules out whitespace, path separators, non-ASCII, nested values and
+ * long text. It does not rule out a token that is an address, a host name or a secret: the agent
+ * refuses the address forms it knows and its call sites emit only class codes and IDs. The API
+ * logs each event as a `node_event` line of Workers Logs and keeps nothing.
  */
 export const NodeReportEvent = z.strictObject({
   at: Timestamp,

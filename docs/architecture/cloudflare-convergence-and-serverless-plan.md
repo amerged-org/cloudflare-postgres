@@ -1353,7 +1353,7 @@ OpenAPI must document email, thresholds and alert status.
 - **Wake timing events per phase**, so every p95 can be broken down, including capacity waits. The phases: Edge admission, Tunnel, agent admission and wait, mount, start, release, login, and each statement.
 - **Usage metrics** as in section 3.4. Sleeping databases emit no samples.
 - **Node rollups** (section 4.9) and infrastructure cost per node.
-- **Logs** are sampled. Sanitized journal excerpts are available through the agent link and the operator shell: the agent's log lines travel in the observation report as events (at most 64 a report, each a name, a database and fields that are numbers or short tokens, never error text, a path or an address), and the API writes each as a `node_event` line to Workers Logs and stores nothing. Error codes are never swallowed.
+- **Logs** are sampled. Sanitized journal excerpts are available through the agent link and the operator shell: the agent's log lines travel in the observation report as events (at most 64 a report, each a name, a database and fields that are numbers or short tokens, never error text, a path or an address), and the API writes each as a `node_event` line to Workers Logs and stores nothing. Delivery is at least once: a report whose answer was lost is sent again, so a query that counts events (the p95 of a wake) counts identical lines once. Error codes are never swallowed.
 
 ### 9.10 Infrastructure backup
 

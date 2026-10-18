@@ -2,8 +2,10 @@
 //! The agent's log lines that travel to Cloudflare (`NodeReportEvent`, ULTRA plan 9.9). A node has
 //! no shell and no journal over the link, so `timing::emit_event` also keeps each line in a bounded
 //! ring, reduced to what the contract allows: the event's name, its database, and fields that are
-//! numbers or short tokens. Error text, paths, addresses and anything else is dropped. The next
-//! observation report carries the ring, and a report that was not accepted gives its events back.
+//! numbers or short tokens. Error text, paths, dotted-quad and colon address forms and anything
+//! else the contract refuses is dropped; what the contract accepts is the call sites' to keep
+//! clean (class codes, IDs, numbers). The next observation report carries the ring, and a report
+//! that was not accepted gives its events back.
 use crate::{archive::facts, node_link::constant};
 use serde_json::{Map, Value, json};
 use std::{
