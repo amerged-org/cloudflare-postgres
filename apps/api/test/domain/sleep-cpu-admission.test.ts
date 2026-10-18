@@ -7,10 +7,10 @@ import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
   cleanupFixtures,
   fixture,
-  observation,
-  observedBody,
   refusal,
   request,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -22,16 +22,7 @@ async function readyDatabase(
   const created = DatabaseWithOperation.parse(
     await (await f.create(name)).json(),
   );
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(created.database.id, 1)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, created.database.id, 1)).status).toBe(200);
   return created.database.id;
 }
 async function stop(f: Awaited<ReturnType<typeof fixture>>, id: string) {
@@ -40,22 +31,11 @@ async function stop(f: Awaited<ReturnType<typeof fixture>>, id: string) {
       await request(`/v1/databases/${id}/suspend`, f.integrator, "POST")
     ).json(),
   );
-  const response = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, suspended.database.generation, "hibernated"),
-        power: {
-          operation: suspended.operation.id,
-          revision: suspended.database.generation,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
-  expect(await response.json()).toEqual({ accepted: 1 });
+  expect(
+    await verdicts(
+      await report(f, id, suspended.database.generation, "asleep"),
+    ),
+  ).toEqual(["accept"]);
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(suspended.operation.id)
@@ -65,10 +45,7 @@ async function stop(f: Awaited<ReturnType<typeof fixture>>, id: string) {
 }
 async function coldCohort() {
   const f = await fixture(8192, 60),
-    uid = crypto.randomUUID();
-  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
-    .bind(uid, f.node)
-    .run();
+    uid = f.nodeUid;
   const first = await readyDatabase(f, "first"),
     second = await readyDatabase(f, "second");
   await stop(f, first);
@@ -108,21 +85,7 @@ it("releases CPU only after an accepted owned stop, while retaining storage and 
   expect(
     (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
   ).toBe(600);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, 2, "hibernated"),
-        power: {
-          operation: suspended.operation.id,
-          revision: 2,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  expect(await verdicts(await report(f, id, 2, "asleep"))).toEqual(["accept"]);
   const node = (await placementNodes(env.DB, f.region))[0]!;
   expect(node.reserved_cpu_millicores).toBe(0);
   expect(node.reserved_storage_gib).toBe(5);
@@ -254,43 +217,19 @@ it("refuses CPU reacquisition with stale or missing physical identity even in re
 it("keeps a degraded stopped observation charged until the current owned no-Pod acknowledgement is restored", async () => {
   const f = await fixture(8192, 60);
   const id = await readyDatabase(f, "degraded-stop");
-  const suspended = await stop(f, id);
+  await stop(f, id);
   expect(
     (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
   ).toBe(0);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, 2, "error"),
-        power: {
-          operation: suspended.operation.id,
-          revision: 2,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  expect(
+    await verdicts(
+      await report(f, id, 2, "error", { error: "volume_missing" }),
+    ),
+  ).toEqual(["accept"]);
   expect(
     (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
   ).toBe(600);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, 2, "hibernated"),
-        power: {
-          operation: suspended.operation.id,
-          revision: 2,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  expect(await verdicts(await report(f, id, 2, "asleep"))).toEqual(["accept"]);
   expect(
     (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
   ).toBe(0);
@@ -319,50 +258,6 @@ it("retains a missing startup result's CPU charge even when its operation times 
   ).toEqual({ generation: 2, desired_state: "suspended" });
 });
 
-it("cannot refresh an identity-bound CPU admission with a UID-less node report", async () => {
-  const f = await coldCohort();
-  const stale = new Date(Date.now() - 181_000).toISOString();
-  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
-    .bind(stale, f.node)
-    .run();
-  const before = await env.DB.prepare(
-    "SELECT node_uid,last_observed_at,allocatable_cpu_millicores,platform_reserved_cpu_millicores FROM nodes WHERE id=?",
-  )
-    .bind(f.node)
-    .first();
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody(
-          [],
-          [
-            {
-              name: f.nodeName,
-              ready: true,
-              allocatable_memory_mib: 8192,
-              allocatable_cpu_millicores: 12000,
-              storage_gib_total: 60,
-              platform_reserved_memory_mib: 128,
-              platform_reserved_cpu_millicores: 0,
-            },
-          ],
-        ),
-      )
-    ).status,
-  ).toBe(200);
-  expect(
-    await env.DB.prepare(
-      "SELECT node_uid,last_observed_at,allocatable_cpu_millicores,platform_reserved_cpu_millicores FROM nodes WHERE id=?",
-    )
-      .bind(f.node)
-      .first(),
-  ).toEqual(before);
-  expect((await resume(f, f.first)).status).toBe(409);
-});
-
 it("records scheduling CPU requests consistently across create, sleep and wake lifecycle facts", async () => {
   const f = await fixture(8192, 60);
   await env.DB.prepare(
@@ -375,21 +270,9 @@ it("records scheduling CPU requests consistently across create, sleep and wake l
   const resumed = DatabaseWithOperation.parse(
     await (await resume(f, id)).json(),
   );
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, resumed.database.generation),
-        power: {
-          operation: resumed.operation.id,
-          revision: resumed.database.generation,
-          state: "awake",
-        },
-      },
-    ]),
-  );
+  expect(
+    await verdicts(await report(f, id, resumed.database.generation)),
+  ).toEqual(["accept"]);
   const events = await env.DB.prepare(
     "SELECT kind,resource_snapshot FROM lifecycle_events WHERE database_id=? ORDER BY id",
   )
@@ -406,8 +289,8 @@ it("records scheduling CPU requests consistently across create, sleep and wake l
 
 it("requires a current stop acknowledgement after a suspended database's role revision changes", async () => {
   const f = await fixture(8192, 60);
-  const id = await readyDatabase(f, "revised-stop"),
-    suspended = await stop(f, id);
+  const id = await readyDatabase(f, "revised-stop");
+  await stop(f, id);
   expect(
     (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
   ).toBe(0);
@@ -433,25 +316,9 @@ it("requires a current stop acknowledgement after a suspended database's role re
     .bind(id)
     .first<number>("generation");
   expect(generation).toBe(3);
-  expect(
-    await (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([
-          {
-            ...observation(id, generation!, "hibernated"),
-            power: {
-              operation: suspended.operation.id,
-              revision: generation,
-              state: "hibernated",
-            },
-          },
-        ]),
-      )
-    ).json(),
-  ).toEqual({ accepted: 1 });
+  expect(await verdicts(await report(f, id, generation!, "asleep"))).toEqual([
+    "accept",
+  ]);
   expect(
     (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
   ).toBe(0);
@@ -478,23 +345,13 @@ it("completes the owned stop after an intervening role revision and keeps CPU fa
       )
     ).status,
   ).toBe(201);
-  const response = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(id, 3, "hibernated"),
-        archive: { continuous: true, ready_wal_files: 1 },
-        power: {
-          operation: suspended.operation.id,
-          revision: 3,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
-  expect(await response.json()).toEqual({ accepted: 1 });
+  expect(
+    await verdicts(
+      await report(f, id, 3, "asleep", {
+        archive: { last_segment: null, ready_files: 1, failing_since: null },
+      }),
+    ),
+  ).toEqual(["accept"]);
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(suspended.operation.id)

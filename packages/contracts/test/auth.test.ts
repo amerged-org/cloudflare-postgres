@@ -3,11 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   formatApiKey,
   hashApiKey,
-  newAgentKey,
   newApiKey,
   newRolePassword,
   newSecret,
-  parseAgentKey,
   parseApiKey,
   timingSafeEqual,
 } from "../src/index.ts";
@@ -34,14 +32,6 @@ describe("API keys", () => {
     expect(parseApiKey(`pgcf_sk_abcdefghijkl_${secret}x`)).toBeNull();
     expect(parseApiKey(`pgcf_sk_ABCDEFGHIJKL_${secret}`)).toBeNull();
     expect(() => formatApiKey("short", secret)).toThrow();
-  });
-
-  it("round-trips agent keys and binds them to a region", () => {
-    const key = newAgentKey("eu-1");
-    expect(key.startsWith("pgcf_ak_eu-1_")).toBe(true);
-    expect(parseAgentKey(key)?.regionId).toBe("eu-1");
-    expect(parseAgentKey(key.replace("eu-1", "eu_1"))).toBeNull();
-    expect(parseApiKey(key)).toBeNull();
   });
 
   it("hashes deterministically with the pepper", async () => {

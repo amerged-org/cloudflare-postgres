@@ -7,7 +7,6 @@ This view is an explicitly selected subset of the source model.
 ```mermaid
 erDiagram
     n_62201d615e26["regions"] {
-        TEXT agent_key_hash UK
         TEXT id PK
     }
     n_1f9b9d5b8614["roles"] {
@@ -127,5 +126,6 @@ erDiagram
 - [apps/api/migrations/0060_drop_storage_protection.sql:1](../../../apps/api/migrations/0060_drop_storage_protection.sql#L1)
 - [apps/api/migrations/0061_database_sleep_after.sql:1](../../../apps/api/migrations/0061_database_sleep_after.sql#L1)
 - [apps/api/migrations/0062_drop_kubernetes_runtime.sql:1](../../../apps/api/migrations/0062_drop_kubernetes_runtime.sql#L1)
+- [apps/api/migrations/0063_node_link.sql:1](../../../apps/api/migrations/0063_node_link.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

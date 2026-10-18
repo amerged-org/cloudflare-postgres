@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import {
-  DatabaseWithOperation,
-  DesiredResponse,
-  newNodeId,
-} from "@pgcf/contracts";
+import { DatabaseWithOperation, newNodeId } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
-import { runInDurableObject } from "cloudflare:test";
 import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
@@ -131,19 +126,6 @@ it("expands proactively at 76 percent while keeping old placement available unde
       .bind(f.node)
       .first("memory_expansion_triggered_at"),
   ).toBe(expanding?.memory_expansion_triggered_at);
-  const desired = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  expect(desired.databases.map((d) => d.id)).toContain(first.database.id);
-  expect(desired.region.scheduling).toEqual({
-    placement_mode: "actual_ram",
-    maximum_database_memory_mib: 4096,
-    postgres_memory_request_mib: 128,
-  });
-  expect(
-    desired.databases.find((d) => d.id === first.database.id)?.size
-      .memory_request_mib,
-  ).toBe(128);
 });
 
 it("admits a freshly Ready node from measured startup headroom without waiting ten minutes or inventing an average", async () => {
@@ -242,28 +224,6 @@ it("binds samples to physical UID, keeps control nodes Ready, and rejects oversi
     { expected_node_uid: f.uid, database_placement_enabled: false },
   );
   expect(control.status).toBe(200);
-  const nodeReport = {
-    name: f.nodeName,
-    node_id: f.node,
-    node_uid: f.uid,
-    provider_instance_id: f.provider,
-    ready: true,
-    allocatable_memory_mib: 128,
-    allocatable_cpu_millicores: 12000,
-    storage_gib_total: 40,
-    platform_reserved_memory_mib: 128,
-    platform_reserved_cpu_millicores: 100,
-  };
-  expect(
-    (
-      await request("/agent/v1/observations", f.agent, "POST", {
-        observed_at: new Date().toISOString(),
-        nodes: [nodeReport],
-        databases: [],
-        orphans: [],
-      })
-    ).status,
-  ).toBe(200);
   expect(
     await env.DB.prepare(
       "SELECT ready,schedulable,database_placement_enabled FROM nodes WHERE id=?",
@@ -319,50 +279,6 @@ it("rejects a legacy 300 MiB class before creating actual-RAM database state, ac
       .first("node_id"),
   ).toBe(legacyFixture.node);
 });
-it("accepts a samples-only report without replacing node or orphan inventory", async () => {
-  const f = await setup();
-  const stub = env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region)),
-    at = new Date().toISOString(),
-    orphans = [{ namespace: "owned-orphan", database_id: null }];
-  await stub.reportOrphans(at, orphans);
-  const observed_at = new Date(Date.now() + 1000).toISOString();
-  const result = await request("/agent/v1/observations", f.agent, "POST", {
-    observed_at,
-    nodes: [],
-    databases: [],
-    orphans: [],
-    node_memory_samples: [
-      {
-        node_id: f.node,
-        provider_instance_id: f.provider,
-        node_uid: f.uid,
-        memory: {
-          node_uid: f.uid,
-          observed_at,
-          working_set_bytes: Math.ceil(physicalCapacity * 0.2),
-          capacity_memory_bytes: physicalCapacity,
-          available_bytes: physicalCapacity - Math.ceil(physicalCapacity * 0.2),
-          memory_pressure: false,
-        },
-      },
-    ],
-  });
-  expect(result.status).toBe(200);
-  expect(
-    await env.DB.prepare("SELECT ready,schedulable FROM nodes WHERE id=?")
-      .bind(f.node)
-      .first(),
-  ).toEqual({ ready: 1, schedulable: 1 });
-  const rows = await runInDurableObject(stub, (_instance, state) =>
-    state.storage.sql
-      .exec<{ observed_at: string; orphans: string }>(
-        "SELECT observed_at,orphans FROM orphan_reports",
-      )
-      .toArray(),
-  );
-  expect(rows).toEqual([{ observed_at: at, orphans: JSON.stringify(orphans) }]);
-});
-
 it("regional pressure expands only when all aligned customer-node windows together reach 76 percent, with one exclusive addition", async () => {
   const f = await setup();
   const sampleAt = Math.floor(Date.now() / 60_000) * 60_000;

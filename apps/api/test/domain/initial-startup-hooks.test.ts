@@ -11,9 +11,9 @@ import {
 import {
   cleanupFixtures,
   fixture,
-  observation,
-  observedBody,
   request,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 
 const mib = 1024 * 1024,
@@ -26,12 +26,12 @@ afterEach(async () => {
 });
 async function physical() {
   const f = await fixture(capacity / mib, 40),
-    uid = crypto.randomUUID(),
+    uid = f.nodeUid,
     provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
   await env.DB.prepare(
-    "UPDATE nodes SET node_uid=?,provider_instance_id=?,allocatable_cpu_millicores=12000 WHERE id=?",
+    "UPDATE nodes SET provider_instance_id=?,allocatable_cpu_millicores=12000 WHERE id=?",
   )
-    .bind(uid, provider, f.node)
+    .bind(provider, f.node)
     .run();
   return { ...f, uid, provider };
 }
@@ -123,13 +123,7 @@ it("admits one concurrent placed create with one full startup hold and leaves th
   )
     .bind(f.project)
     .first<{ id: string }>();
-  const ready = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(placed!.id, 1)]),
-  );
-  expect(await ready.json()).toEqual({ accepted: 1 });
+  expect(await verdicts(await report(f, placed!.id, 1))).toEqual(["accept"]);
   expect(
     await env.DB.prepare(
       "SELECT count(*) FROM lifecycle_events WHERE database_id=? AND kind='ready'",
@@ -181,12 +175,7 @@ it("refuses a running resize without target peak RAM, then reserves its new oper
     .bind(f.node)
     .run();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(created.database.id, 1)]),
-  );
+  await report(f, created.database.id, 1);
   await baseline(f, 1024 * mib);
   const target = "target-" + crypto.randomUUID().slice(0, 12);
   extraClasses.push(target);
@@ -238,13 +227,9 @@ it("refuses a running resize without target peak RAM, then reserves its new oper
     budget_bytes: (1024 + SIDECAR.limitMemoryMib) * mib,
     ready_at: null,
   });
-  const confirmed = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(created.database.id, 2)]),
-  );
-  expect(await confirmed.json()).toEqual({ accepted: 1 });
+  expect(await verdicts(await report(f, created.database.id, 2))).toEqual([
+    "accept",
+  ]);
   expect(
     await env.DB.prepare(
       "SELECT ready_at FROM database_start_admissions WHERE operation_id=?",

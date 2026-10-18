@@ -10,6 +10,7 @@ import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
+import { hintDatabases } from "./node-hints.ts";
 import {
   decryptCustodyDocument,
   encryptCustodyDocument,
@@ -180,17 +181,13 @@ export async function updateRegionArchiveSource(
         },
       );
       if (affected.length)
-        c.executionCtx.waitUntil(
-          c.env.REGION_LINK.get(c.env.REGION_LINK.idFromName(target))
-            .notify(affected)
-            .catch(() => undefined),
-        );
+        c.executionCtx.waitUntil(hintDatabases(c.env, affected).catch(() => 0));
       return getRegionArchiveSource(c, target, source);
     },
   });
 }
-/** Only the authenticated target agent receives its explicitly assigned source-read keys. */
-export async function desiredRegionArchiveSources(
+/** The source-read keys assigned to a target region, decrypted for the credential issuer only. */
+export async function regionArchiveSourceCredentials(
   env: Env,
   target: string,
 ): Promise<RecoverySourceCredentialsMap | undefined> {

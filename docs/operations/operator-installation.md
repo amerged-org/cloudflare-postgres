@@ -12,7 +12,7 @@ real expansion uses the configured threshold/purchase policy.
 Use a source commit that passed the common CI checks.
 
 Keep the private API configuration outside Git. It supplies D1, region-specific R2 bindings,
-RegionLink/DatabaseActor/CronWatchdog Durable Objects and the AddNode and InfrastructureBackup
+NodeActor/DatabaseActor/CronWatchdog Durable Objects and the AddNode and InfrastructureBackup
 Workflows. Start from `apps/api/wrangler.example.jsonc`; replace every placeholder. Import secret
 values from private custody and preserve the existing four root secrets. Export D1 before applying
 additive migrations and rehearse them against the export.

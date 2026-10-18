@@ -4,6 +4,7 @@ import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import type { AdmissionMutationIntent } from "./admission-state.ts";
 import { databaseActor, readDatabasePresence } from "./database-actor-sync.ts";
+import { hintDatabases } from "./node-hints.ts";
 
 export interface AdmissionSqlGuard {
   sql: string;
@@ -295,21 +296,9 @@ async function publishMutation(
   }
 }
 
-/** Epoch changes require a fresh regional proof. Publication alone never hints healthy renewals. */
+/** A changed epoch tells the node of each database to pull its page. */
 export async function notifyAdmissionRevisions(env: Env, ids: string[]) {
-  const regions = new Map<string, string[]>();
-  for (const id of ids) {
-    const region = await env.DB.prepare(
-      "SELECT region_id FROM databases WHERE id=?",
-    )
-      .bind(id)
-      .first<string>("region_id");
-    if (region) regions.set(region, [...(regions.get(region) ?? []), id]);
-  }
-  for (const [region, databases] of regions)
-    await env.REGION_LINK.get(env.REGION_LINK.idFromName(region))
-      .notify(databases)
-      .catch(() => undefined);
+  await hintDatabases(env, ids).catch(() => 0);
 }
 
 /** Positive fence, not a timeout-based unfreeze: old tokens can no longer write after this CAS. */

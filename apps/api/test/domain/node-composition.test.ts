@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { newNodeId, randomString } from "@pgcf/contracts";
+import { randomString } from "@pgcf/contracts";
 import { NodeAddition } from "@pgcf/contracts/nodes";
 import { ContaboClient } from "../../src/providers/contabo.ts";
 import {
   approveNodePurchase,
   configureNodeRegionPolicy,
   readNodeAddition,
-  recordNodeAudit,
-  recordNodeReceipt,
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
 import {
@@ -17,7 +15,7 @@ import {
   reconcileNodeProvider,
 } from "../../src/workflows/add-node.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
-import { cleanupFixtures, fixture, observedBody, request } from "./fixtures.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 const workflows: string[] = [];
 afterEach(async () => {
   for (const id of workflows.splice(0))
@@ -112,130 +110,6 @@ describe("node composition with actual Workers/D1", () => {
         )
       ).status,
     ).toBe(409);
-  });
-  it("quarantines every newly observed unknown node and refuses a forged reserved identity", async () => {
-    const f = await configured(),
-      instance = providerId();
-    let addition = await reserveNodeAddition(env.DB, {
-      request_key: crypto.randomUUID(),
-      request: {
-        region_id: f.region,
-        mode: "adopt",
-        provider_instance_id: instance,
-      },
-    });
-    addition = await recordNodeReceipt(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-      {
-        provider_instance_id: instance,
-        request_id: null,
-        reference: crypto.randomUUID(),
-        received_at: new Date().toISOString(),
-      },
-    );
-    addition = await recordNodeAudit(
-      env.DB,
-      addition.intent.operation_id,
-      addition.revision,
-      {
-        provider_instance_id: instance,
-        provider_region: "EU",
-        product_id: crypto.randomUUID(),
-        image_id: crypto.randomUUID(),
-        reference: crypto.randomUUID(),
-        observed_at: new Date().toISOString(),
-      },
-    );
-    const observed = {
-      name: addition.intent.requested_hostname,
-      ready: true,
-      allocatable_memory_mib: 4096,
-      allocatable_cpu_millicores: 2000,
-      storage_gib_total: 30,
-      platform_reserved_memory_mib: 128,
-      platform_reserved_cpu_millicores: 100,
-    };
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody(
-            [],
-            [
-              {
-                ...observed,
-                node_id: newNodeId(),
-                provider_instance_id: instance,
-                node_uid: crypto.randomUUID(),
-              },
-            ],
-          ),
-        )
-      ).status,
-    ).toBe(200);
-    expect(
-      await env.DB.prepare(
-        "SELECT ready,schedulable,provider_instance_id FROM nodes WHERE id=?",
-      )
-        .bind(addition.intent.node_id)
-        .first(),
-    ).toEqual({ ready: 0, schedulable: 0, provider_instance_id: null });
-    const uid = crypto.randomUUID();
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody(
-            [],
-            [
-              {
-                ...observed,
-                node_id: addition.intent.node_id,
-                provider_instance_id: instance,
-                node_uid: uid,
-              },
-            ],
-          ),
-        )
-      ).status,
-    ).toBe(200);
-    expect(
-      await env.DB.prepare(
-        "SELECT ready,schedulable,provider_instance_id,node_uid FROM nodes WHERE id=?",
-      )
-        .bind(addition.intent.node_id)
-        .first(),
-    ).toEqual({
-      ready: 1,
-      schedulable: 0,
-      provider_instance_id: instance,
-      node_uid: uid,
-    });
-    const unknown = "node-" + crypto.randomUUID();
-    await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      observedBody([], [{ ...observed, name: unknown }]),
-    );
-    expect(
-      await env.DB.prepare(
-        "SELECT schedulable FROM nodes WHERE region_id=? AND k8s_node_name=?",
-      )
-        .bind(f.region, unknown)
-        .first("schedulable"),
-    ).toBe(0);
-    expect(
-      await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
-        .bind(f.node)
-        .first("schedulable"),
-    ).toBe(1);
   });
   it("keeps a lost dispatch unknown across restart without a second provider POST or speculative release", async () => {
     const f = await configured();

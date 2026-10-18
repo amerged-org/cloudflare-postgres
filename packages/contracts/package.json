@@ -25,7 +25,6 @@
     "./database-storage": "./src/database-storage.ts",
     "./client": "./src/client.ts",
     "./reclaim": "./src/reclaim.ts",
-    "./fleet-updates": "./src/fleet-updates.ts",
     "./infrastructure-backups": "./src/infrastructure-backups.ts"
   },
   "scripts": {

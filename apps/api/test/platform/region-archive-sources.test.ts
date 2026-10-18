@@ -2,18 +2,19 @@
 import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
-  DesiredResponse,
   bytesToBase64url,
   newNodeId,
 } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
+  nodeKeyPair,
+  report,
   request,
-  observation,
-  observedBody,
 } from "../domain/fixtures.ts";
+import { regionArchiveSourceCredentials } from "../../src/domain/region-archive-sources.ts";
 import {
   encryptCustodyDocument,
   decryptCustodyDocument,
@@ -47,7 +48,7 @@ async function setup() {
   };
 }
 
-it("publishes encrypted source-read custody only to its authorized target region and never admin responses", async () => {
+it("keeps encrypted source-read custody for its target region only and never in admin responses", async () => {
   const f = await setup(),
     idem = crypto.randomUUID();
   const response = await request(f.path, f.admin, "PUT", f.input, idem);
@@ -87,25 +88,18 @@ it("publishes encrypted source-read custody only to its authorized target region
       .bind(f.foreign)
       .first(),
   ).toEqual(stored);
-  const target = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.foreignAgent)).json(),
-  );
-  expect(target.region.recovery_sources).toEqual({
+  expect(await regionArchiveSourceCredentials(env, f.foreign)).toEqual({
     [f.region]: {
       bucket: f.input.bucket,
       endpoint_url: f.input.endpoint_url,
       ...f.input.credentials,
     },
   });
-  const source = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  expect(source.region.recovery_sources).toBeUndefined();
+  expect(await regionArchiveSourceCredentials(env, f.region)).toBeUndefined();
   expect((await request(f.path, f.integrator)).status).toBe(403);
   expect((await request(f.path, f.integrator, "PUT", f.input)).status).toBe(
     403,
   );
-  expect((await request(f.path, f.foreignAgent)).status).toBe(401);
 });
 
 it("fences concurrent revision changes, invalid source bindings and self-relations without partial custody", async () => {
@@ -167,7 +161,7 @@ it("fences concurrent revision changes, invalid source bindings and self-relatio
   ).toBe(1);
 });
 
-it("exposes source drift and sends an explicit empty authority instead of enabling a stale local fallback", async () => {
+it("exposes source drift and hands out an explicit empty authority instead of a stale key", async () => {
   const f = await setup();
   expect((await request(f.path, f.admin, "PUT", f.input)).status).toBe(200);
   await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
@@ -176,10 +170,7 @@ it("exposes source drift and sends an explicit empty authority instead of enabli
   expect(await (await request(f.path, f.admin)).json()).toMatchObject({
     source_matches_configuration: false,
   });
-  const target = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.foreignAgent)).json(),
-  );
-  expect(target.region.recovery_sources).toEqual({});
+  expect(await regionArchiveSourceCredentials(env, f.foreign)).toEqual({});
 });
 
 it("rotates established restore configuration once and preserves source data, archive identity and in-progress initial authority", async () => {
@@ -212,17 +203,27 @@ it("rotates established restore configuration once and preserves source data, ar
     await env.ARCHIVE.put(key!, value!);
   }
   const now = new Date().toISOString();
+  const key = await nodeKeyPair(),
+    foreignNode = {
+      node: newNodeId(),
+      nodeUid: crypto.randomUUID(),
+      nodeKey: key.privateKey,
+      region: f.foreign,
+      admin: f.admin,
+    };
   await env.DB.prepare(
-    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?)",
+    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?,?,?,?)",
   )
     .bind(
-      newNodeId(),
+      foreignNode.node,
       f.foreign,
       "restore-target",
       now,
       now,
       now,
-      crypto.randomUUID(),
+      foreignNode.nodeUid,
+      key.publicKey,
+      now,
     )
     .run();
   const restored = await request(
@@ -254,21 +255,7 @@ it("rotates established restore configuration once and preserves source data, ar
       .bind(targetId)
       .first(),
   ).toEqual(original);
-  const ready = await request(
-    "/agent/v1/observations",
-    f.foreignAgent,
-    "POST",
-    observedBody([
-      {
-        ...observation(targetId, 1),
-        recovery: {
-          operation_id: target.operation.id,
-          storage_generation: 2,
-          verified: true,
-        },
-      },
-    ]),
-  );
+  const ready = await report(foreignNode, targetId, 1);
   expect(ready.status).toBe(200);
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
@@ -302,13 +289,13 @@ it("rotates established restore configuration once and preserves source data, ar
       .bind(source.database.id)
       .first(),
   ).toEqual(sourceRow);
-  const desired = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.foreignAgent)).json(),
-  );
-  expect(desired.databases.find((d) => d.id === targetId)?.generation).toBe(2);
-  expect(desired.region.recovery_sources?.[f.region]).toMatchObject(
-    rotation.credentials,
-  );
+  expect(
+    (await desiredPage(foreignNode)).databases.find((d) => d.id === targetId)
+      ?.generation,
+  ).toBe(2);
+  expect(
+    (await regionArchiveSourceCredentials(env, f.foreign))?.[f.region],
+  ).toMatchObject(rotation.credentials);
 });
 
 it("binds encrypted custody to both regions and revision while allowing credential-key rotation", async () => {

@@ -12,11 +12,11 @@
   "durable_objects": {
     "bindings": [
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
-      { "name": "REGION_LINK", "class_name": "RegionLink" },
+      { "name": "NODE_ACTOR", "class_name": "NodeActor" },
     ],
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["DatabaseActor", "RegionLink"] },
+    { "tag": "v1", "new_sqlite_classes": ["DatabaseActor", "NodeActor"] },
   ],
   "ratelimits": [
     {

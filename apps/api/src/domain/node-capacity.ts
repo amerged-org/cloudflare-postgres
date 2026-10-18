@@ -43,6 +43,7 @@ import {
   selectedStorageProfileSql,
 } from "./storage-capacity.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
+import { hintDatabases } from "./node-hints.ts";
 /** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
 export async function startupPlacementNodes(
   db: D1Database,
@@ -197,11 +198,7 @@ export async function runNodeCapacity(
       placement_mode: "reserved" | "actual_ram";
     }>();
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
-  if (placed.length) {
-    await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify(
-      placed,
-    );
-  }
+  if (placed.length) await hintDatabases(env, placed);
   const result = {
     region_id: regionId,
     dry_run: dryRun,

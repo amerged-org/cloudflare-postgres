@@ -22,13 +22,7 @@ import {
   computeUsageHour,
   rollupUsageHour,
 } from "../../src/domain/usage-rollup.ts";
-import {
-  cleanupFixtures,
-  fixture,
-  observedBody,
-  observation,
-  request,
-} from "./fixtures.ts";
+import { cleanupFixtures, fixture, report } from "./fixtures.ts";
 
 const epoch = Date.parse("2026-01-01T00:00:00.000Z"),
   iso = (value: number) => new Date(value).toISOString();
@@ -160,12 +154,7 @@ describe("hourly usage", () => {
     );
     const id = created.database.id;
     databaseIds.push(id);
-    const response = await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      observedBody([observation(id, 1)]),
-    );
+    const response = await report(f, id, 1);
     expect(response.status).toBe(200);
     const measuredAt = Date.now() + 2_000;
     const hour = Math.floor(measuredAt / USAGE_HOUR_MS) * USAGE_HOUR_MS;

@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import {
-  ARCHIVE_SERVER_NAME,
-  DatabaseId,
-  DesiredDatabaseStorage,
-  DatabaseStorageVolumeReceipt,
-} from "@pgcf/contracts";
-import {
-  DatabaseRuntimeAttestationV2,
-  reclaimConfigurationFingerprint,
-} from "@pgcf/contracts/reclaim";
+import { DatabaseId, DatabaseRuntime } from "@pgcf/contracts";
 import type { Env } from "../env.ts";
 import { databaseActor } from "./database-actor-sync.ts";
 import { DatabaseAdmissionSnapshot } from "./admission-state.ts";
-import { admissionSnapshotSql } from "./fleet-releases.ts";
 import { DatabasePresence } from "../database-actor.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { notifyAdmissionRevisions } from "./admission-mutations.ts";
@@ -21,7 +11,6 @@ interface SnapshotRow extends DatabaseRow {
   epoch_database_id: string | null;
   presence_updated_at: string;
   project_deleted_at: string | null;
-  node_uid: string | null;
   node_ready: number | null;
   lost_at: string | null;
   gateway_url: string;
@@ -30,38 +19,19 @@ interface SnapshotRow extends DatabaseRow {
   route_revision: number;
   mutation_id: string | null;
   completed_mutation_id: string | null;
-  cache_capable: number;
   roles_json: string;
-  memory_mib: number;
-  memory_request_mib: number | null;
-  cpu_millicores: number;
-  cpu_request_millicores: number | null;
-  storage_gib: number;
-  max_connections: number;
-  archive_timeout_seconds: number;
-  backup_retention_days: number;
-  maintenance_revision: number | null;
 }
-/** Trusted publication reads all authoritative nonsecret admission/configuration inputs together. */
-export async function readDatabaseAdmissionSnapshot(
-  env: Env,
-  id: string,
-  now = Date.now(),
-) {
+/** Trusted publication reads all authoritative nonsecret admission inputs together. */
+export async function readDatabaseAdmissionSnapshot(env: Env, id: string) {
   DatabaseId.parse(id);
   const readRow = () =>
     env.DB.prepare(
-      `SELECT d.*,p.deleted_at project_deleted_at,n.node_uid,n.ready node_ready,n.lost_at,r.gateway_url,r.gateway_binding,
+      `SELECT d.*,p.deleted_at project_deleted_at,n.ready node_ready,n.lost_at,r.gateway_url,r.gateway_binding,
     ae.database_id epoch_database_id,CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END presence_updated_at,
     ae.admission_revision,ae.route_revision,ae.mutation_id,ae.completed_mutation_id,
-    CASE WHEN ${admissionSnapshotSql("r")} THEN 1 ELSE 0 END cache_capable,
-    s.memory_mib,CASE WHEN policy.placement_mode='actual_ram' AND d.desired_state='running' THEN policy.postgres_memory_request_mib ELSE NULL END memory_request_mib,
-    s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
-    (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json,
-    m.password_revision maintenance_revision
-    FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions r ON r.id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
-    LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
-    LEFT JOIN node_region_policies policy ON policy.region_id=d.region_id LEFT JOIN maintenance_credentials m ON m.database_id=d.id WHERE d.id=?`,
+    (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json
+    FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions r ON r.id=d.region_id
+    LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id WHERE d.id=?`,
     )
       .bind(id)
       .first<SnapshotRow>();
@@ -91,96 +61,24 @@ export async function readDatabaseAdmissionSnapshot(
     row.deleted_at !== null ||
     row.desired_state === "deleted" ||
     row.project_deleted_at !== null;
+  // What the node reported of the unit counts only for the generation and storage it names now.
   let runtime: DatabaseAdmissionSnapshot["runtime"] = null;
   try {
-    const raw = row.runtime_attestation_json
-      ? JSON.parse(row.runtime_attestation_json)
-      : null;
-    const parsed = DatabaseRuntimeAttestationV2.safeParse(raw);
-    if (parsed.success) runtime = parsed.data;
-  } catch {
-    /* A malformed/stale proof closes admission; it cannot repair desired state. */
-  }
-  const expectedImage = row.desired_postgres_image;
-  if (runtime && expectedImage) {
-    const fingerprint = await reclaimConfigurationFingerprint(
-      {
-        pg_major: row.pg_major,
-        postgres: { image: expectedImage },
-        size: {
-          memory_mib: row.memory_mib,
-          ...(row.memory_request_mib === null
-            ? {}
-            : { memory_request_mib: row.memory_request_mib }),
-          cpu_millicores: row.cpu_millicores,
-          ...(row.cpu_request_millicores === null
-            ? {}
-            : { cpu_request_millicores: row.cpu_request_millicores }),
-          storage_gib: row.storage_gib,
-          max_connections: row.max_connections,
-          archive_timeout_seconds: row.archive_timeout_seconds,
-          backup_retention_days: row.backup_retention_days,
-        },
-        roles: roles.map((role) => ({ ...role, owner: role.owner === 1 })),
-        ...(row.maintenance_revision === null
-          ? {}
-          : { maintenance: { revision: row.maintenance_revision } }),
-        storage_generation: row.storage_generation ?? 1,
-        ...(row.storage_profile_json
-          ? {
-              storage: DesiredDatabaseStorage.parse(
-                JSON.parse(row.storage_profile_json),
-              ),
-            }
-          : {}),
-        archive: {
-          destination_path: row.archive_path,
-          server_name: ARCHIVE_SERVER_NAME,
-        },
-      },
-      expectedImage,
+    const parsed = DatabaseRuntime.safeParse(
+      row.runtime_attestation_json
+        ? JSON.parse(row.runtime_attestation_json)
+        : null,
     );
     if (
-      runtime.database_id !== id ||
-      runtime.region_id !== row.region_id ||
-      runtime.generation !== row.generation ||
-      runtime.storage_generation !== (row.storage_generation ?? 1) ||
-      runtime.node_uid !== row.node_uid ||
-      runtime.configuration_fingerprint !== fingerprint ||
-      runtime.postgres_image_sha256 !== expectedImage.split("@sha256:")[1] ||
-      runtime.memory_limit_bytes !== row.memory_mib * 1024 ** 2 ||
-      runtime.memory_request_bytes !==
-        (row.memory_request_mib ?? row.memory_mib) * 1024 ** 2 ||
-      runtime.tls_server_name !== `database-rw.pgcf-db-${id}.svc` ||
-      runtime.route_revision !== row.route_revision ||
-      runtime.admission_epoch !== row.admission_revision ||
-      JSON.stringify([...runtime.applied_role_revisions].sort(roleOrder)) !==
-        JSON.stringify(
-          roles.map(({ name, revision }) => ({ name, revision })),
-        ) ||
-      runtime.observation.expires_at <= now ||
-      runtime.observed_at > now + 1000
+      parsed.success &&
+      parsed.data.database_id === id &&
+      parsed.data.node_id === row.node_id &&
+      parsed.data.generation === row.generation &&
+      parsed.data.storage_generation === (row.storage_generation ?? 1)
     )
-      runtime = null;
-  } else runtime = null;
-  if (runtime && (row.storage_profile_json || row.storage_volume_json)) {
-    try {
-      const volume = DatabaseStorageVolumeReceipt.parse(
-        row.storage_volume_json ? JSON.parse(row.storage_volume_json) : null,
-      );
-      if (
-        volume.storage_generation !== runtime.storage_generation ||
-        volume.node_uid !== runtime.node_uid ||
-        volume.cluster_uid !== runtime.cnpg_cluster_uid ||
-        volume.namespace_uid !== runtime.namespace_uid ||
-        volume.storage_uid !== runtime.storage_uid ||
-        volume.pvc_uid !== runtime.pvc_uid ||
-        volume.pv_uid !== runtime.pv_uid
-      )
-        runtime = null;
-    } catch {
-      runtime = null;
-    }
+      runtime = parsed.data;
+  } catch {
+    /* A malformed report closes admission; it cannot repair desired state. */
   }
   const admissible =
     !deleted &&
@@ -192,7 +90,7 @@ export async function readDatabaseAdmissionSnapshot(
     row.observed_state === "ready" &&
     row.observed_power === "awake" &&
     row.observed_generation === row.generation &&
-    (row.cache_capable === 0 || runtime !== null);
+    runtime !== null;
   const wakeable =
     !deleted &&
     row.mutation_id === null &&
@@ -220,9 +118,12 @@ export async function readDatabaseAdmissionSnapshot(
       updated_at: row.updated_at,
       roles: deleted
         ? []
-        : roles.map(({ name, revision }) => ({ name, revision })),
+        : roles.map(({ name, revision, valid_until }) => ({
+            name,
+            revision,
+            valid_until,
+          })),
       deleted,
-      cache_capable: row.cache_capable === 1,
       admissible,
       wakeable,
       region: {
@@ -230,6 +131,7 @@ export async function readDatabaseAdmissionSnapshot(
         gateway_url: row.gateway_url,
         gateway_binding: row.gateway_binding,
       },
+      node: row.node_id,
       runtime,
     }),
     mutation_id: row.mutation_id,

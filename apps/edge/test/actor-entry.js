@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-/* global crypto, Request, URL, btoa */
-export { RegionLink } from "../../api/src/region-link.ts";
+/* global crypto, Request, URL, btoa, TextEncoder */
+export { NodeActor } from "../../api/src/node-actor.ts";
 export { DatabaseActor } from "../../api/src/database-actor.ts";
 export { default } from "../src/index.ts";
-import { readDatabasePresence } from "../../api/src/domain/database-actor-sync.ts";
+import { publishDatabaseAdmission } from "../../api/src/domain/database-admission-snapshot.ts";
 
-// Trusted fixture setup only; the Edge request entry never seeds actors.
-export async function seedKnownDatabase(db, namespace, id) {
-  const snapshot = await readDatabasePresence(db, id);
-  if (!snapshot) throw new Error("database_fixture_missing");
-  await namespace.get(namespace.idFromName(id)).seed(snapshot);
+// Trusted fixture setup only; the Edge request entry never seeds actors. The API's own publisher
+// seeds the Actor's presence and its admission snapshot from D1.
+export async function seedKnownDatabase(env, id) {
+  if (!(await publishDatabaseAdmission(env, id)))
+    throw new Error("database_fixture_missing");
 }
 
 // Test-only management call uses the actual authenticated role writer and Actor publisher.
@@ -73,54 +73,77 @@ export async function createUnrelatedRole(env, ctx, database) {
   }
 }
 
-// Test-only regional publisher sends the controller's partial database update to the actual API handler.
+// Test-only node report: the node signs its observation with its own key, and the actual API
+// handler takes it. `node` is `{ id, uid, key }` of an enrolled node.
 export async function publishPowerObservation(
   env,
   ctx,
+  node,
   database,
   revision,
   operation,
   state,
 ) {
   const { createApp } = await import("../../api/src/app.ts");
-  const { hashApiKey, newAgentKey } = await import("@pgcf/contracts");
-  const row = await env.DB.prepare("SELECT region_id FROM databases WHERE id=?")
-    .bind(database)
-    .first();
-  if (!row) throw new Error("database_fixture_missing");
-  const key = newAgentKey(row.region_id);
-  const pepper = crypto.randomUUID();
-  await env.DB.prepare("UPDATE regions SET agent_key_hash=? WHERE id=?")
-    .bind(await hashApiKey(pepper, key), row.region_id)
-    .run();
-  return createApp().fetch(
-    new Request(
-      new URL(
-        "/agent/v1/observations",
-        `https://${["api", "invalid"].join(".")}`,
-      ),
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
+  const { signNodeRequest, nodeRequestClaims } =
+    await import("@pgcf/contracts");
+  const path = "/node/v1/observations";
+  const body = new TextEncoder().encode(
+    JSON.stringify({
+      observed_at: new Date().toISOString(),
+      databases: [
+        {
+          id: database,
+          generation: revision,
+          operation,
+          storage_generation: 1,
+          state: state === "awake" ? "ready" : "asleep",
+          ...(state === "awake" ? { instance: crypto.randomUUID() } : {}),
+          proven_sleep:
+            state === "awake"
+              ? null
+              : {
+                  system_identifier: "7428512345678901234",
+                  timeline: 1,
+                  checkpoint_lsn: "0/3000028",
+                  last_archived_segment: "000000010000000000000002",
+                  proven_at: new Date().toISOString(),
+                },
+          // A ready database has the DONE base backup of its storage generation.
+          backup:
+            state === "awake"
+              ? {
+                  backup_id: "20261017T110000",
+                  timeline: 1,
+                  completed_at: new Date().toISOString(),
+                }
+              : null,
+          archive: { last_segment: null, ready_files: 0, failing_since: null },
         },
-        body: JSON.stringify({
-          coverage: "databases",
-          observed_at: new Date().toISOString(),
-          databases: [
-            {
-              id: database,
-              generation: revision,
-              state: state === "awake" ? "ready" : "hibernated",
-              power: { operation, revision, state },
-              archive: { continuous: true, ready_wal_files: 0 },
-            },
-          ],
-        }),
+      ],
+      orders: [],
+    }),
+  );
+  const token = await signNodeRequest(
+    node.key,
+    await nodeRequestClaims({
+      node: node.id,
+      uid: node.uid,
+      method: "POST",
+      path,
+      body,
+    }),
+  );
+  return createApp().fetch(
+    new Request(new URL(path, `https://${["api", "invalid"].join(".")}`), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
       },
-    ),
-    { ...env, API_KEY_PEPPER: pepper },
+      body,
+    }),
+    env,
     ctx,
   );
 }

@@ -208,6 +208,7 @@ same event ID while it stays active; a cleared episode sends nothing.
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed | Check R2 reachability and archive credentials; WAL accumulates on the volume meanwhile |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time | fixed | Check its scheduled backup and R2 access; `backup.status` in `GET /v1/operational-health?scope=databases` |
 | `thin_storage_blocked` | a node's fresh physical sample shows the thin pool without data or metadata room, or a pool that holds thin volumes has no fresh sample | fixed | With `thin_pool_no_room`, free space by deleting databases on the node; with `thin_pool_unobserved`, fix the node's storage sample |
+| `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed; the episode lists the nodes in `node_ids` | If you did not retry the install, treat the token as leaked: read the `node_enrollment_refused` log and reinstall the node, which issues new tokens |
 | `control_cron_stalled` | no run of the minute cron completed for 300 s | fixed | Check the Worker's cron trigger and logs; see the cron heartbeat below |
 | `control_cron_step_failing` | a cron step failed in each of its last 5 completed runs | fixed | Read the Worker logs for `cron_step_failed` with the step named in `cron.failing_steps` |
 
@@ -248,8 +249,8 @@ Rules of the database and Thin storage kinds:
 The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
 `infrastructure_backup_dispatch`, then `admission_recovery`,
 `resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `role_deletion_timeouts`,
-`idempotency_purge`, `region_hints`, `database_actors`, `usage`, `node_capacity`,
-`retained_archives` and `fleet_updates`. Alerting needs only D1 and a bounded send, so it
+`idempotency_purge`, `node_hints`, `database_actors`, `usage`, `node_capacity`,
+and `retained_archives`. Alerting needs only D1 and a bounded send, so it
 leads, and the daily backup dispatch follows ahead of the steps that call out to other
 systems: a step that fails, is slow or exhausts the invocation's D1 statement budget cannot
 starve them. A step that hangs still holds back the steps after it in that run; the stall

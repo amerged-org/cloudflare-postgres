@@ -23,6 +23,7 @@ import {
   assertNodeRecoveryAuthority,
 } from "../domain/node-state.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
+import { hintDatabases } from "../domain/node-hints.ts";
 
 function orderInput(
   env: Env,
@@ -225,13 +226,7 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
             this.env.DB,
             addition.intent.request.region_id,
           );
-          if (ids.length) {
-            await this.env.REGION_LINK.get(
-              this.env.REGION_LINK.idFromName(
-                addition.intent.request.region_id,
-              ),
-            ).notify(ids);
-          }
+          if (ids.length) await hintDatabases(this.env, ids);
           return { placed: ids.length };
         });
         return { operation_id: id, status: "ready" };

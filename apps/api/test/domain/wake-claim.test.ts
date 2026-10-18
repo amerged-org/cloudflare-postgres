@@ -6,11 +6,11 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
-import { cleanupFixtures, request } from "./fixtures.ts";
+import { cleanupFixtures } from "./fixtures.ts";
 import {
   actor,
-  readyBody,
   registered,
+  reportReady,
   sleep,
   sleeping,
   untilWake,
@@ -40,11 +40,11 @@ type Gate = {
   open: () => void;
 };
 /**
- * Records every D1 execution (start and end) and every region hint in one ordered list. A gate
+ * Records every D1 execution (start and end) and every node hint in one ordered list. A gate
  * holds the n-th execution of a statement until it is opened, to prove that another one is issued
  * meanwhile.
  */
-async function record(region: string, gates: Gate[] = []) {
+async function record(node: string, gates: Gate[] = []) {
   const events: string[] = [];
   const seen = new Map<string, number>();
   const prototype = Object.getPrototypeOf(env.DB) as D1Database;
@@ -90,7 +90,7 @@ async function record(region: string, gates: Gate[] = []) {
     return wrap(original.call(this, sql));
   });
   await runInDurableObject(
-    env.REGION_LINK.get(env.REGION_LINK.idFromName(region)),
+    env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(node)),
     (instance) => {
       const proto = Object.getPrototypeOf(instance) as {
         notify: (ids?: string[]) => Promise<number>;
@@ -122,7 +122,7 @@ const indexOf = (events: string[], needle: string, from = 0) =>
 /** Runs the claim of one wake up to its registered waiter and returns what the Actor did. */
 async function claim(gates: Gate[] = []) {
   const f = await sleeping();
-  const events = await record(f.region, gates);
+  const events = await record(f.node, gates);
   const waiterId = crypto.randomUUID();
   const waiting = actor(f.id).ensureAwake(f.id, "app", {
     waiterId,
@@ -132,12 +132,7 @@ async function claim(gates: Gate[] = []) {
   await registered(f.id, waiterId);
   const finish = async () => {
     for (const g of gates) g.open();
-    await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      readyBody(f, row.power_operation),
-    );
+    expect((await reportReady(f, f.id, row.generation)).status).toBe(200);
     expect(await waiting).toMatchObject({ ok: true });
   };
   return { f, events, row, finish };
@@ -161,7 +156,7 @@ it("the claim reads the database row together with its admission read", async ()
   // The claim's own admission read is the second one: the first is the wait's.
   const admission = gate(ADMISSION, 2);
   const f = await sleeping();
-  const events = await record(f.region, [admission]);
+  const events = await record(f.node, [admission]);
   const waiting = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 20_000,
   });
@@ -175,12 +170,7 @@ it("the claim reads the database row together with its admission read", async ()
   expect(starts(events, ROW)).toHaveLength(1);
   admission.open();
   const row = await untilWake(f.id);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    readyBody(f, row.power_operation),
-  );
+  expect((await reportReady(f, f.id, row.generation)).status).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
 }, 30_000);
 
@@ -210,7 +200,7 @@ it("the claim does not wait for the hint's delivery", async () => {
   });
   let notified = 0;
   await runInDurableObject(
-    env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region)),
+    env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(f.node)),
     (instance) => {
       const proto = Object.getPrototypeOf(instance) as {
         notify: (ids?: string[]) => Promise<number>;
@@ -231,17 +221,12 @@ it("the claim does not wait for the hint's delivery", async () => {
     waiterId,
     deadline: Date.now() + 20_000,
   });
-  // The wake is claimed and its waiter registered while the region's hint is still on its way: the
-  // hint's RPC may reach the region's object after the registration, so its arrival is awaited.
+  // The wake is claimed and its waiter registered while the node's hint is still on its way: the
+  // hint's RPC may reach the node's object after the registration, so its arrival is awaited.
   await registered(f.id, waiterId);
   await vi.waitFor(() => expect(notified).toBe(1), { timeout: 10_000 });
   open();
   const row = await untilWake(f.id);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    readyBody(f, row.power_operation),
-  );
+  expect((await reportReady(f, f.id, row.generation)).status).toBe(200);
   expect(await waiting).toMatchObject({ ok: true });
 }, 30_000);

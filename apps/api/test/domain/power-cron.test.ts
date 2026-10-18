@@ -3,13 +3,7 @@ import { env } from "cloudflare:workers";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
-import {
-  cleanupFixtures,
-  fixture,
-  request,
-  observation,
-  observedBody,
-} from "./fixtures.ts";
+import { cleanupFixtures, fixture, request, report } from "./fixtures.ts";
 
 afterEach(async () => {
   await env.DB.prepare("DELETE FROM reconciliation_cursors").run();
@@ -21,12 +15,7 @@ async function suspended() {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = created.database.id;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(id, 1)]),
-  );
+  await report(f, id, 1);
   const result = DatabaseWithOperation.parse(
     await (
       await request(`/v1/databases/${id}/suspend`, f.integrator, "POST")

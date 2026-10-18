@@ -1,31 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
-  hashApiKey,
-  newAgentKey,
   PlacementRegion,
   type RegionCreate,
-  type RegionRouteKeyring,
   bytesToHex,
   RegionGatewayConfiguration,
   type RegionConfigurationUpdate,
 } from "@pgcf/contracts";
-import {
-  deriveRegionKeyring,
-  parseRouteKeyring,
-  serializeRouteKeyring,
-} from "@pgcf/contracts/route-token";
 import { ApiError } from "../app.ts";
 import { withAdmissionMutation } from "../domain/admission-mutations.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth, requireScope } from "../middleware/auth.ts";
 import { regionAcceptsPlacementSql } from "../domain/placement.ts";
-import {
-  refuseCredentialReplay,
-  withIdempotency,
-} from "../middleware/idempotency.ts";
+import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
 import { nodeInventoryRow, regionRow, type Row } from "./rows.ts";
 import { readFleetNodeReleaseInventories } from "../domain/fleet-releases.ts";
+
+/** A region as the API shows it: the newest link message of its nodes is the agent's last sighting. */
+const regionSelect = `SELECT r.*,(SELECT MAX(n.last_observed_at) FROM nodes n WHERE n.region_id=r.id) agent_last_seen_at FROM regions r WHERE r.id=?`;
 
 export async function createRegion(
   c: ApiContext,
@@ -43,24 +35,20 @@ export async function createRegion(
       "Gateway URL must use /pg without credentials, query or fragment; public gateways require HTTPS",
     );
   return withIdempotency(c, {
-    replay: async () => refuseCredentialReplay(),
+    replay: async (id) => {
+      const row = await c.env.DB.prepare(regionSelect).bind(id).first<Row>();
+      if (!row) throw new ApiError("not_found", "Region not found");
+      c.header("Location", `/v1/regions/${id}`);
+      return c.json(regionRow(row), 201);
+    },
     execute: async (lease) => {
-      const agentKey = newAgentKey(body.id);
-      const routeKeyring = JSON.parse(
-        serializeRouteKeyring(
-          await deriveRegionKeyring(
-            parseRouteKeyring(c.env.ROUTE_MASTER_KEYS),
-            body.id,
-          ),
-        ),
-      ) as RegionRouteKeyring;
       const now = new Date().toISOString();
       try {
         await c.env.DB.batch([
           c.env.DB.prepare(
             `INSERT INTO regions
             (id, provider, provider_region, gateway_url, gateway_binding, backup_bucket, backup_endpoint_url,
-             agent_key_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).bind(
             body.id,
             body.provider,
@@ -69,7 +57,6 @@ export async function createRegion(
             body.gateway_binding ?? null,
             body.backup_bucket,
             body.backup_endpoint_url,
-            await hashApiKey(c.env.API_KEY_PEPPER, agentKey),
             now,
             now,
           ),
@@ -85,17 +72,13 @@ export async function createRegion(
       }
       c.header("Location", `/v1/regions/${body.id}`);
       return c.json(
-        {
-          region: {
-            ...body,
-            gateway_binding: body.gateway_binding ?? null,
-            agent_last_seen_at: null,
-            created_at: now,
-            updated_at: now,
-          },
-          agent_key: agentKey,
-          route_keyring: routeKeyring,
-        },
+        regionRow({
+          ...body,
+          gateway_binding: body.gateway_binding ?? null,
+          agent_last_seen_at: null,
+          created_at: now,
+          updated_at: now,
+        }),
         201,
       );
     },
@@ -130,7 +113,8 @@ export async function listRegions(c: ApiContext): Promise<Response> {
     );
   }
   const rows = await c.env.DB.prepare(
-    `SELECT * FROM regions WHERE ${cursor.sql} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    `SELECT r.*,(SELECT MAX(n.last_observed_at) FROM nodes n WHERE n.region_id=r.id) agent_last_seen_at
+     FROM regions r WHERE ${cursor.sql} ORDER BY created_at DESC, id DESC LIMIT ?`,
   )
     .bind(...cursor.bindings, pagination.limit + 1)
     .all<Row>();
@@ -178,15 +162,12 @@ export async function getNode(c: ApiContext, id: string) {
 
 export async function getRegion(c: ApiContext, id: string) {
   await requireScope(c, "admin");
-  const row = await c.env.DB.prepare("SELECT * FROM regions WHERE id=?")
-    .bind(id)
-    .first<Row>();
+  const row = await c.env.DB.prepare(regionSelect).bind(id).first<Row>();
   if (!row) throw new ApiError("not_found", "Region not found");
   return c.json(regionRow(row), 200);
 }
 
-// The heartbeat is deliberately excluded. Credential changes, even those made outside this
-// endpoint, fence routing updates without disclosing custody in the response.
+// The newest link message of the region's nodes is deliberately excluded.
 const configurationFields = [
   "id",
   "provider",
@@ -195,15 +176,12 @@ const configurationFields = [
   "gateway_binding",
   "backup_bucket",
   "backup_endpoint_url",
-  "agent_key_hash",
   "created_at",
   "updated_at",
 ] as const;
 
 async function regionConfigurationRow(c: ApiContext, id: string): Promise<Row> {
-  const row = await c.env.DB.prepare("SELECT * FROM regions WHERE id=?")
-    .bind(id)
-    .first<Row>();
+  const row = await c.env.DB.prepare(regionSelect).bind(id).first<Row>();
   if (!row) throw new ApiError("not_found", "Region not found");
   return row;
 }

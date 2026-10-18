@@ -31,7 +31,12 @@ import {
   RoleName,
 } from "./ids.ts";
 import { MAINTENANCE_ROLE } from "./maintenance.ts";
-import { FleetReleaseId } from "./releases.ts";
+import {
+  FleetReleaseBinaries,
+  FleetReleaseId,
+  FleetReleaseOs,
+  ImageVersion,
+} from "./releases.ts";
 import { USAGE_HOUR_MS } from "./usage.ts";
 import {
   ADMISSION_REFUSALS,
@@ -121,8 +126,6 @@ export const ENROLLMENT_TOKEN_PATTERN = /^pgcf_et_[A-Za-z0-9_-]{43}$/;
  */
 export const ENROLLMENT_TOKEN_LIFETIME_SECONDS = 1800;
 export const EnrollmentToken = z.string().regex(ENROLLMENT_TOKEN_PATTERN);
-export const IMAGE_VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
-export const ImageVersion = z.string().regex(IMAGE_VERSION_PATTERN);
 
 /** `/var/lib/pgcf/enrollment/seed.json`, written by the installer and deleted after enrollment. */
 export const NODE_ENROLLMENT_SEED_PATH = "/var/lib/pgcf/enrollment/seed.json";
@@ -607,11 +610,6 @@ export const NodeDesiredQuery = z
   });
 export type NodeDesiredQuery = z.infer<typeof NodeDesiredQuery>;
 
-const PinnedFile = z.strictObject({
-  url: Https,
-  sha256: Sha256,
-  size_bytes: Positive,
-});
 /**
  * What the node runs. The agent downloads the four binaries, each under its own file name, into
  * the release's directory `/var/lib/pgcf/bin/<id>/`, checks their sha256, switches the `current`
@@ -620,18 +618,8 @@ const PinnedFile = z.strictObject({
  */
 export const NodeRelease = z.strictObject({
   id: FleetReleaseId,
-  binaries: z.strictObject({
-    "pgcf-agent": PinnedFile,
-    "pgcf-native-gateway": PinnedFile,
-    "pgcf-archive": PinnedFile,
-    "pgcf-wal-fetch": PinnedFile,
-  }),
-  os: z.strictObject({
-    image_version: ImageVersion,
-    debian_snapshot: z.string().regex(/^[0-9]{8}T[0-9]{6}Z$/),
-    /** Every package with its version and sha256, installed exactly in the maintenance cycle. */
-    package_lock: PinnedFile,
-  }),
+  binaries: FleetReleaseBinaries,
+  os: FleetReleaseOs,
 });
 export type NodeRelease = z.infer<typeof NodeRelease>;
 
@@ -969,6 +957,13 @@ export const NodeDatabaseObservation = z
     operation: OperationId,
     storage_generation: Positive,
     state: z.enum(NODE_DATABASE_STATES),
+    /**
+     * The invocation ID of the PostgreSQL unit while the database is `ready`. The route names
+     * it (`UnitWriter.instance`, route token v6), so Cloudflare must learn it from the node.
+     * Required exactly while ready, and with the `backup` a ready database names, a breaking
+     * change for an agent built before them: its whole report is refused until it sends both.
+     */
+    instance: z.uuid().optional(),
     error: z.enum(NODE_DATABASE_ERRORS).optional(),
     proven_sleep: ProvenSleepRecord.nullable(),
     /**
@@ -977,7 +972,10 @@ export const NodeDatabaseObservation = z
      * suspends only when a new generation asks again.
      */
     refusal: z.enum(["power_busy", "power_archive"]).optional(),
-    /** The newest DONE base backup of this storage generation. */
+    /**
+     * The newest DONE base backup of this storage generation. A ready database has one: the
+     * agent reports ready only when its first base backup is DONE (plan 5.10, 7.8).
+     */
     backup: z
       .strictObject({
         backup_id: z.string().regex(BACKUP_ID),
@@ -1001,6 +999,20 @@ export const NodeDatabaseObservation = z
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
   })
   .superRefine((db, ctx) => {
+    if ((db.state === "ready") !== (db.instance !== undefined))
+      ctx.addIssue({
+        code: "custom",
+        path: ["instance"],
+        message:
+          "A ready database names the unit's instance, and no other does",
+      });
+    if (db.state === "ready" && db.backup === null)
+      ctx.addIssue({
+        code: "custom",
+        path: ["backup"],
+        message:
+          "A ready database has a DONE base backup of its storage generation",
+      });
     if ((db.state === "asleep") !== (db.proven_sleep !== null))
       ctx.addIssue({
         code: "custom",

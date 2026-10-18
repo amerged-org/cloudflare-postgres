@@ -203,6 +203,7 @@ const withDatabase = (change: object) => ({
   orders: [],
   databases: [{ ...database, ...change }],
 });
+const instance = "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c";
 const observation = {
   id,
   generation: 4,
@@ -825,6 +826,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         ...observations({
           ...observation,
           state: "ready",
+          instance,
           proven_sleep: null,
           refusal: "power_archive",
           roles: { removed: ["report"], blocked: [] },
@@ -868,7 +870,31 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ],
     [
       "ready-with-proof",
-      observations({ ...observation, state: "ready" }),
+      observations({ ...observation, state: "ready", instance }),
+      false,
+      true,
+    ],
+    [
+      "ready-without-instance",
+      observations({ ...observation, state: "ready", proven_sleep: null }),
+      false,
+      true,
+    ],
+    [
+      "ready-without-backup",
+      observations({
+        ...observation,
+        state: "ready",
+        instance,
+        proven_sleep: null,
+        backup: null,
+      }),
+      false,
+      true,
+    ],
+    [
+      "asleep-with-instance",
+      observations({ ...observation, instance }),
       false,
       true,
     ],

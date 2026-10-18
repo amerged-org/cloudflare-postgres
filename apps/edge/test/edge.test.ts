@@ -12,6 +12,8 @@ import {
   newOperationId,
   isDatabaseId,
   isRoleName,
+  nodePublicKey,
+  type NodeKey,
 } from "@pgcf/contracts";
 import {
   encodeStartup,
@@ -19,7 +21,7 @@ import {
   encodeErrorResponse,
 } from "@pgcf/contracts/pg-wire";
 import {
-  deriveRegionKeyring,
+  deriveNodeKeyring,
   parseRouteKeyring,
   verifyRouteToken,
 } from "@pgcf/contracts/route-token";
@@ -44,6 +46,8 @@ const region = "eu-test";
 const live: { socket: WebSocket; ctx: ExecutionContext }[] = [];
 let logs: ReturnType<typeof vi.spyOn>;
 let database: string;
+/** The node the fixture database runs on, with the key it signs its reports with. */
+let enrolled: { id: string; uid: string; key: NodeKey };
 
 interface GatewayObservation {
   token: string;
@@ -306,10 +310,24 @@ function idleUpgradeDiagnostics(
   };
 }
 
-async function setGatewayMode(mode: string): Promise<void> {
-  await testEnv.DB.prepare("UPDATE regions SET gateway_url = ? WHERE id = ?")
-    .bind(`${gatewayOrigin}/pg?mode=${mode}`, region)
+/** The operation a node names for a generation: the newest one at or before it. */
+async function operationOf(generation: number): Promise<string> {
+  return (await testEnv.DB.prepare(
+    "SELECT id FROM operations WHERE database_id=? AND generation<=? ORDER BY generation DESC,created_at DESC,id DESC LIMIT 1",
+  )
+    .bind(database, generation)
+    .first<string>("id"))!;
+}
+/** The admission snapshot carries the region's route: a changed route is published again. */
+async function updateRegion(set: string, ...values: string[]): Promise<void> {
+  await testEnv.DB.prepare(`UPDATE regions SET ${set} WHERE id = ?`)
+    .bind(...values, region)
     .run();
+  await seedKnownDatabase(testEnv, database);
+}
+const setGatewayUrl = (url: string) => updateRegion("gateway_url = ?", url);
+async function setGatewayMode(mode: string): Promise<void> {
+  await setGatewayUrl(`${gatewayOrigin}/pg?mode=${mode}`);
 }
 
 beforeEach(async () => {
@@ -330,10 +348,15 @@ beforeEach(async () => {
   const project = newProjectId();
   const node = newNodeId();
   const now = new Date().toISOString();
-  const randomHash = Array.from(
-    crypto.getRandomValues(new Uint8Array(32)),
-    (value) => value.toString(16).padStart(2, "0"),
-  ).join("");
+  const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  enrolled = {
+    id: node,
+    uid: crypto.randomUUID(),
+    key: pair.privateKey as NodeKey,
+  };
   const password = crypto.randomUUID();
   const iv = btoa(
     String.fromCharCode(...crypto.getRandomValues(new Uint8Array(12))),
@@ -349,26 +372,36 @@ beforeEach(async () => {
     ).bind(now, now),
     testEnv.DB.prepare(
       `INSERT INTO regions (id, provider, provider_region, gateway_url,
-      gateway_binding, backup_bucket, backup_endpoint_url, agent_key_hash, created_at, updated_at)
-      VALUES (?, 'test-provider', 'test-region', ?, 'GATEWAY', 'test-backups', ?, ?, ?, ?)`,
+      gateway_binding, backup_bucket, backup_endpoint_url, created_at, updated_at)
+      VALUES (?, 'test-provider', 'test-region', ?, 'GATEWAY', 'test-backups', ?, ?, ?)`,
     ).bind(
       region,
       `${gatewayOrigin}/pg`,
       `https://${["backup", "invalid"].join(".")}`,
-      randomHash,
       now,
       now,
     ),
     testEnv.DB.prepare(
       `INSERT INTO nodes (id, region_id, k8s_node_name, ready, schedulable,
        allocatable_memory_mib, allocatable_cpu_millicores, platform_reserved_memory_mib,
-       storage_gib_total, created_at, updated_at, node_uid, last_observed_at, platform_reserved_cpu_millicores)
-       VALUES (?, ?, 'edge-fixture-node', 1, 1, 4096, 2000, 128, 20, ?, ?, ?, ?, 100)`,
-    ).bind(node, region, now, now, crypto.randomUUID(), now),
+       storage_gib_total, created_at, updated_at, node_uid, last_observed_at, platform_reserved_cpu_millicores,
+       public_key, enrolled_at)
+       VALUES (?, ?, 'edge-fixture-node', 1, 1, 4096, 2000, 128, 20, ?, ?, ?, ?, 100, ?, ?)`,
+    ).bind(
+      node,
+      region,
+      now,
+      now,
+      enrolled.uid,
+      now,
+      await nodePublicKey(pair.publicKey as NodeKey),
+      now,
+    ),
     testEnv.DB.prepare(
       `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
-      desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'edge-test', 'small', 'running', 'ready', 2, 2, ?, ?, ?)`,
+      desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at,
+      runtime_attestation_json)
+      VALUES (?, ?, ?, ?, 'edge-test', 'small', 'running', 'ready', 2, 2, ?, ?, ?, ?)`,
     ).bind(
       database,
       project,
@@ -377,13 +410,25 @@ beforeEach(async () => {
       `s3://test-backups/${region}/${database}/g1-${newOperationId()}`,
       now,
       now,
+      JSON.stringify({
+        database_id: database,
+        node_id: node,
+        generation: 2,
+        storage_generation: 1,
+        instance: crypto.randomUUID(),
+        observed_at: Date.now(),
+      }),
     ),
+    testEnv.DB.prepare(
+      `INSERT INTO operations (id, kind, status, project_id, database_id, generation,
+      created_at, updated_at, completed_at) VALUES (?, 'database.create', 'succeeded', ?, ?, 1, ?, ?, ?)`,
+    ).bind(newOperationId(), project, database, now, now, now),
     testEnv.DB.prepare(
       `INSERT INTO roles (database_id, name, owner, password_ciphertext,
       password_iv, password_kid, created_at, updated_at) VALUES (?, 'app', 1, ?, ?, 'v1', ?, ?)`,
     ).bind(database, password, iv, now, now),
   ]);
-  await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+  await seedKnownDatabase(testEnv, database);
 });
 
 afterEach(async () => {
@@ -482,12 +527,12 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   });
 
-  it("uses the actual actor's authoritative D1 read without a data-plane D1 binding", async () => {
+  it("admits from the actual actor's snapshot without a data-plane D1 binding or a D1 read", async () => {
     const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
     const bindings = { ...testEnv };
     delete (bindings as { DB?: D1Database }).DB;
     const connection = await open({ bindings });
-    expect(queries).toHaveBeenCalledTimes(1);
+    expect(queries).not.toHaveBeenCalled();
     const startup = encodeStartup({ user: "app", database });
     connection.socket.send(startup);
     await expect
@@ -506,17 +551,25 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   });
 
-  it("a current project deletion overrides a stale positive actor snapshot", async () => {
+  it("a published project deletion overrides a positive actor snapshot", async () => {
     await testEnv.DB.prepare(
       "UPDATE projects SET deleted_at=? WHERE id=(SELECT project_id FROM databases WHERE id=?)",
     )
       .bind(new Date().toISOString(), database)
       .run();
+    await seedKnownDatabase(testEnv, database);
     expect(await errorCode(await open())).toBe("28P01");
     expect(await stats()).toHaveLength(0);
   });
 
   it("actual actor D1 failure returns a generic error without contacting Gateway", async () => {
+    // A database that is not ready takes the authoritative read, which is the one that fails.
+    await testEnv.DB.prepare(
+      "UPDATE databases SET observed_state='error' WHERE id=?",
+    )
+      .bind(database)
+      .run();
+    await seedKnownDatabase(testEnv, database);
     const canary = crypto.randomUUID();
     const queries = vi
       .spyOn(Object.getPrototypeOf(testEnv.DB), "prepare")
@@ -674,6 +727,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(new Date().toISOString(), database)
       .run();
+    await seedKnownDatabase(testEnv, database);
     const deletedRole = await open();
     expect(await errorCode(deletedRole)).toBe("28P01");
     expect(await stats()).toHaveLength(0);
@@ -692,6 +746,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       )
         .bind(state.desired, state.observed, state.observedGeneration, database)
         .run();
+      await seedKnownDatabase(testEnv, database);
       const connection = await open();
       expect(await errorCode(connection)).toBe("57P03");
     }
@@ -700,12 +755,13 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(new Date().toISOString(), database)
       .run();
+    await seedKnownDatabase(testEnv, database);
     const deleted = await open();
     expect(await errorCode(deleted)).toBe("28P01");
     expect(await stats()).toHaveLength(0);
   });
 
-  it("keeps ready routing available across an unrelated role configuration revision", async () => {
+  it("refuses routing while an unrelated role revision awaits the node, and routes again once the node reports it", async () => {
     const ctx = createExecutionContext();
     expect((await createUnrelatedRole(testEnv, ctx, database)).status).toBe(
       201,
@@ -723,6 +779,24 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       observed_state: "ready",
       observed_power: "awake",
     });
+    expect(await errorCode(await open())).toBe("57P03");
+    expect(await stats()).toHaveLength(0);
+    const operation = await operationOf(3);
+    const reported = createExecutionContext();
+    expect(
+      (
+        await publishPowerObservation(
+          testEnv,
+          reported,
+          enrolled,
+          database,
+          3,
+          operation,
+          "awake",
+        )
+      ).status,
+    ).toBe(200);
+    await waitOnExecutionContext(reported);
     const connection = await open();
     expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
       "accepted",
@@ -1004,11 +1078,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   });
 
   it("replaces caller route headers and excludes authorization and cookies from a public gateway upgrade", async () => {
-    await testEnv.DB.prepare(
-      "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
-    )
-      .bind(region)
-      .run();
+    await updateRegion("gateway_binding = NULL");
     const callerRoute = crypto.randomUUID();
     const connection = await open({
       headers: {
@@ -1026,9 +1096,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(observation.headers.authorization).toBeUndefined();
     expect(observation.headers.cookie).toBeUndefined();
     expect(observation.token).not.toBe(callerRoute);
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
     const verified = await verifyRouteToken(observation.token, {
       region,
@@ -1036,7 +1106,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     });
     expect(verified.ok).toBe(true);
     if (!verified.ok) throw new Error("edge must mint the gateway token");
-    expect(verified.claims.v).toBe(2);
+    expect(verified.claims.v).toBe(6);
     expect(verified.claims.user).toBe("app");
     expect(verified.claims.db).toBe(database);
   });
@@ -1114,18 +1184,20 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await testEnv.DB.batch([
       testEnv.DB.prepare(
         `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
-        desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
+        desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at,
+        runtime_attestation_json)
         SELECT ?, project_id, region_id, node_id, 'second', size_class_id, desired_state, observed_state,
-        generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at
+        generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at,
+        json_set(runtime_attestation_json, '$.database_id', ?)
         FROM databases WHERE id = ?`,
-      ).bind(other, other, database),
+      ).bind(other, other, other, database),
       testEnv.DB.prepare(
         `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
         password_kid, created_at, updated_at) SELECT ?, name, owner, password_ciphertext, password_iv,
         password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
       ).bind(other, database),
     ]);
-    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, other);
+    await seedKnownDatabase(testEnv, other);
     const ip = [0x2001, 0xdb8, 0xa, 0xb, 0, 0, 0, 1]
       .map((part) => part.toString(16))
       .join(":");
@@ -1160,7 +1232,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(otherRole, database)
       .run();
-    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+    await seedKnownDatabase(testEnv, database);
     const window = { epoch: Math.floor(Date.now() / 60_000) };
     const first = await open({ bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
@@ -1265,7 +1337,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(otherRole, database)
       .run();
-    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+    await seedKnownDatabase(testEnv, database);
     rollover += await assertRealRateDenied(
       { bindings },
       { bindings, user: otherRole },
@@ -1275,18 +1347,20 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await testEnv.DB.batch([
       testEnv.DB.prepare(
         `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
-        desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
+        desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at,
+        runtime_attestation_json)
         SELECT ?, project_id, region_id, node_id, 'second', size_class_id, desired_state, observed_state,
-        generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at
+        generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at,
+        json_set(runtime_attestation_json, '$.database_id', ?)
         FROM databases WHERE id = ?`,
-      ).bind(other, other, database),
+      ).bind(other, other, other, database),
       testEnv.DB.prepare(
         `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
         password_kid, created_at, updated_at) SELECT ?, name, owner, password_ciphertext, password_iv,
         password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
       ).bind(other, database),
     ]);
-    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, other);
+    await seedKnownDatabase(testEnv, other);
     const independent = await open({ bindings, database: other });
     independent.socket.send(encodeStartup({ user: "app", database: other }));
     await expect.poll(async () => (await stats()).length).toBe(2 + rollover);
@@ -1320,9 +1394,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .poll(async () => (await stats())[0]?.bytes)
       .toEqual([...packet]);
     const observation = (await stats())[0]!;
-    const keys = await deriveRegionKeyring(
+    const keys = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
     const verified = await verifyRouteToken(observation.token, {
       region,
@@ -1343,9 +1417,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       connection.socket.send(encodeStartup({ user: "app", database }));
       await expect.poll(async () => (await stats()).length).toBe(index + 1);
     }
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
     const observations = await stats();
     const first = await verifyRouteToken(observations[0]!.token, {
@@ -1359,7 +1433,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
     if (!first.ok || !second.ok) throw new Error("route token must verify");
-    expect(first.claims.v).toBe(2);
+    expect(first.claims.v).toBe(6);
     expect(first.claims.user).toBe("app");
     expect(first.claims.db).toBe(database);
     expect(first.claims.rg).toBe(region);
@@ -1367,94 +1441,101 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(first.claims.cid).not.toBe(second.claims.cid);
   });
 
-  it("signs the admission's verified target into a v3 route", async () => {
-    const pod = crypto.randomUUID(),
-      release = `release-${crypto.randomUUID()}`,
-      at = new Date().toISOString();
-    // The region's assigned release declares v3 and its only member is assigned to that release.
-    // Only the declaration is read on this path, so the fixture release carries nothing else.
-    await testEnv.DB.batch([
-      testEnv.DB.prepare(
-        "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
-      ).bind(
-        release,
-        JSON.stringify({ route_token_version: 3 }),
-        "e".repeat(64),
-        at,
-      ),
-      testEnv.DB.prepare(
-        "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
-      ).bind(region, release, at),
-      testEnv.DB.prepare(
-        "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT id,node_uid,?,'customer',1,? FROM nodes WHERE region_id=?",
-      ).bind(release, at, region),
-    ]);
+  it("signs the admission's verified target into a v6 route to its node", async () => {
+    const instance = crypto.randomUUID();
     await testEnv.DB.prepare(
       "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
     )
       .bind(
         JSON.stringify({
-          v: 1,
           database_id: database,
+          node_id: enrolled.id,
           generation: 2,
           storage_generation: 1,
-          node_uid: crypto.randomUUID(),
-          boot_id: crypto.randomUUID(),
-          cluster_uid: crypto.randomUUID(),
-          namespace_uid: crypto.randomUUID(),
-          cnpg_cluster_uid: crypto.randomUUID(),
-          storage_uid: crypto.randomUUID(),
-          pvc_uid: crypto.randomUUID(),
-          pv_uid: crypto.randomUUID(),
-          pod_uid: pod,
-          container_id: "3".repeat(64),
-          postgres_image_sha256: "4".repeat(64),
-          memory_request_bytes: 1,
-          memory_limit_bytes: 2,
+          instance,
           observed_at: Date.now(),
-          configuration_fingerprint: "5".repeat(64),
         }),
         database,
       )
       .run();
+    await seedKnownDatabase(testEnv, database);
     const connection = await open();
     connection.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
+    const claims = {
+      v: 6,
+      db: database,
+      user: "app",
+      rg: region,
+      node: enrolled.id,
+      rev: 2,
+      inst: instance,
+    };
     expect(
       await verifyRouteToken((await stats())[0]!.token, {
         region,
+        node: enrolled.id,
         keys: keyring.keys,
       }),
-    ).toMatchObject({
-      ok: true,
-      claims: { v: 3, db: database, user: "app", rg: region, rev: 2, pod },
-    });
+    ).toMatchObject({ ok: true, claims });
+    // Another node's gateway does not take the route.
+    expect(
+      await verifyRouteToken((await stats())[0]!.token, {
+        region,
+        node: newNodeId(),
+        keys: keyring.keys,
+      }),
+    ).toMatchObject({ ok: false, reason: "wrong_node" });
     const ctx = createExecutionContext();
     expect((await createUnrelatedRole(testEnv, ctx, database)).status).toBe(
       201,
     );
     await waitOnExecutionContext(ctx);
-    const unchanged = await open();
+    // The role advanced the generation; the node applies it and reports the unit ready again.
+    const generation = (await testEnv.DB.prepare(
+      "SELECT generation FROM databases WHERE id=?",
+    )
+      .bind(database)
+      .first<number>("generation"))!;
+    expect(generation).toBe(3);
+    const operation = await operationOf(3);
+    const reported = createExecutionContext();
+    expect(
+      (
+        await publishPowerObservation(
+          testEnv,
+          reported,
+          enrolled,
+          database,
+          generation,
+          operation,
+          "awake",
+        )
+      ).status,
+    ).toBe(200);
+    await waitOnExecutionContext(reported);
+    const next = await open();
     expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
       "accepted",
     );
     const startup = encodeStartup({ user: "app", database });
-    unchanged.socket.send(startup);
+    next.socket.send(startup);
     await expect
       .poll(async () => (await stats())[1]?.bytes)
       .toEqual([...startup]);
     expect(
       await verifyRouteToken((await stats())[1]!.token, {
         region,
+        node: enrolled.id,
         keys: keyring.keys,
       }),
     ).toMatchObject({
       ok: true,
-      claims: { v: 3, db: database, user: "app", rg: region, rev: 2, pod },
+      claims: { v: 6, db: database, rg: region, rev: 3, node: enrolled.id },
     });
   });
 
@@ -1514,9 +1595,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await open({ cf: { colo: "FRA" } });
     const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
     expect(log).toMatchObject({ event: "conn_admission", colo: "FRA" });
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
     await expect.poll(async () => (await stats()).length).toBe(1);
     expect(
@@ -1600,6 +1681,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
         gateway_url: `${gatewayOrigin}/pg`,
         gateway_binding: "GATEWAY",
       },
+      node: enrolled.id,
       wake,
     }));
     const connection = await open({
@@ -1617,9 +1699,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .poll(async () => (await stats())[0]?.bytes)
       .toEqual([...startup]);
     expect(await stats()).toHaveLength(1);
-    const keyring = await deriveRegionKeyring(
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
     const token = (await stats())[0]!.token;
     expect(token.startsWith("v5.")).toBe(true);
@@ -1642,54 +1724,54 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(admitWake).toHaveBeenCalledTimes(1);
   });
 
-  it("an awake admission is signed v4 and a legacy one v2", async () => {
-    const pod = crypto.randomUUID();
-    const keyring = await deriveRegionKeyring(
+  it("an awake admission is signed v6 with the unit the node reported", async () => {
+    const instance = crypto.randomUUID();
+    const keyring = await deriveNodeKeyring(
       parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
-      region,
+      enrolled.id,
     );
-    const routeRegion = {
-      id: region,
-      gateway_url: `${gatewayOrigin}/pg`,
-      gateway_binding: "GATEWAY",
-    };
-    for (const [index, admission, claims, route] of [
-      [
-        0,
-        {
-          ok: true,
-          region: routeRegion,
-          target: { revision: 2, pod_uid: pod, route_revision: 5 },
+    const admission = {
+      ok: true,
+      region: {
+        id: region,
+        gateway_url: `${gatewayOrigin}/pg`,
+        gateway_binding: "GATEWAY",
+      },
+      node: enrolled.id,
+      target: { revision: 2, route_revision: 5, instance },
+    } as const;
+    const connection = await open({
+      bindings: {
+        ...testEnv,
+        DATABASE_ACTOR: {
+          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+          get: () => ({
+            admitWake: async () => admission,
+            cancelWakeWaiter: async () => false,
+          }),
         },
-        { v: 4, rev: 2, pod, route_revision: 5 },
-        "v4",
-      ],
-      [1, { ok: true, region: routeRegion }, { v: 2 }, "v2"],
-    ] as const) {
-      const connection = await open({
-        bindings: {
-          ...testEnv,
-          DATABASE_ACTOR: {
-            idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
-            get: () => ({
-              admitWake: async () => admission,
-              cancelWakeWaiter: async () => false,
-            }),
-          },
-        },
-      });
-      connection.socket.send(encodeStartup({ user: "app", database }));
-      await expect.poll(async () => (await stats()).length).toBe(index + 1);
-      expect(
-        await verifyRouteToken((await stats())[index]!.token, {
-          region,
-          keys: keyring.keys,
-        }),
-      ).toMatchObject({ ok: true, claims: { ...claims, db: database } });
-      expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).route).toBe(
-        route,
-      );
-    }
+      },
+    });
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    expect(
+      await verifyRouteToken((await stats())[0]!.token, {
+        region,
+        node: enrolled.id,
+        keys: keyring.keys,
+      }),
+    ).toMatchObject({
+      ok: true,
+      claims: {
+        v: 6,
+        db: database,
+        node: enrolled.id,
+        rev: 2,
+        route_revision: 5,
+        inst: instance,
+      },
+    });
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).route).toBe("v6");
   });
 
   it("a refused limiter answers 53300 even when the actor admitted", async () => {
@@ -1730,20 +1812,17 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   });
 
   it("refuses public HTTP fallback before sending a routing token or database bytes", async () => {
-    await testEnv.DB.prepare(
-      "UPDATE regions SET gateway_binding = NULL, gateway_url = ? WHERE id = ?",
-    )
-      .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region)
-      .run();
+    await updateRegion(
+      "gateway_binding = NULL, gateway_url = ?",
+      `${gatewayOrigin.replace("https:", "http:")}/pg`,
+    );
     const connection = await open();
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
   });
 
   it("allows HTTP only through an explicitly configured trusted service binding", async () => {
-    await testEnv.DB.prepare("UPDATE regions SET gateway_url = ? WHERE id = ?")
-      .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region)
-      .run();
+    await setGatewayUrl(`${gatewayOrigin.replace("https:", "http:")}/pg`);
     const connection = await open();
     const startup = encodeStartup({ user: "app", database });
     connection.socket.send(startup);
@@ -1757,11 +1836,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
 
   it("refuses gateway redirects without leaking a token to the redirect target", async () => {
     await setGatewayMode("redirect");
-    await testEnv.DB.prepare(
-      "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
-    )
-      .bind(region)
-      .run();
+    await updateRegion("gateway_binding = NULL");
     const connection = await open();
     expect(await errorCode(connection)).toBe("08006");
     const observations = await stats();
@@ -1806,11 +1881,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   });
 
   it("routes the global fetch fallback to a real test gateway Worker", async () => {
-    await testEnv.DB.prepare(
-      "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
-    )
-      .bind(region)
-      .run();
+    await updateRegion("gateway_binding = NULL");
     const connection = await open();
     const startup = encodeStartup({ user: "app", database });
     connection.socket.send(startup);
@@ -1823,11 +1894,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   });
 
   it("rejects a missing configured service binding instead of falling back to fetch", async () => {
-    await testEnv.DB.prepare(
-      "UPDATE regions SET gateway_binding = 'UNCONFIGURED' WHERE id = ?",
-    )
-      .bind(region)
-      .run();
+    await updateRegion("gateway_binding = 'UNCONFIGURED'");
     const connection = await open();
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
@@ -1862,7 +1929,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       "gateway_connect_ms",
     ])
       expect(log[stage]).toBeGreaterThanOrEqual(0);
-    expect(log.route).toBe("v2");
+    expect(log.route).toBe("v6");
     expect(Object.keys(log)).not.toContain("password");
     expect(Object.keys(log)).not.toContain("ingress_bytes");
     expect(Object.keys(log)).not.toContain("egress_bytes");
@@ -1927,6 +1994,7 @@ async function sleeping(reason: "manual" | "idle") {
   const response = await publishPowerObservation(
     testEnv,
     ctx,
+    enrolled,
     database,
     3,
     operation,
@@ -1934,13 +2002,15 @@ async function sleeping(reason: "manual" | "idle") {
   );
   expect(response.status).toBe(200);
   await waitOnExecutionContext(ctx);
-  await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+  await seedKnownDatabase(testEnv, database);
 }
 
-it("wakes an idle database with the real actor, contacts no gateway before exact observed readiness, and uses the fresh authoritative route", async () => {
+it("wakes an idle database with the real actor: the gateway is dialed at once under a v5 ticket, the claim commits, and the node's ready report lets the request through", async () => {
   await sleeping("idle");
-  await setGatewayMode("reject");
+  await setGatewayMode("held");
   const pending = open();
+  // The gateway holds the request while the node starts the database.
+  await expect.poll(async () => (await stats())[0]?.waiting).toBe(true);
   await expect
     .poll(async () =>
       testEnv.DB.prepare("SELECT desired_state FROM databases WHERE id=?")
@@ -1948,20 +2018,31 @@ it("wakes an idle database with the real actor, contacts no gateway before exact
         .first("desired_state"),
     )
     .toBe("running");
-  expect(await stats()).toHaveLength(0);
   const row = await testEnv.DB.prepare(
     "SELECT generation,power_operation FROM databases WHERE id=?",
   )
     .bind(database)
     .first<{ generation: number; power_operation: string }>();
   expect(row!.generation).toBe(4);
-  await testEnv.DB.prepare("UPDATE regions SET gateway_url=? WHERE id=?")
-    .bind(`${gatewayOrigin}/fresh?mode=count`, region)
-    .run();
+  const keyring = await deriveNodeKeyring(
+    parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+    enrolled.id,
+  );
+  expect(
+    await verifyRouteToken((await stats())[0]!.token, {
+      region,
+      node: enrolled.id,
+      keys: keyring.keys,
+    }),
+  ).toMatchObject({
+    ok: true,
+    claims: { v: 5, db: database, gen: 4, op: row!.power_operation },
+  });
   const ctx = createExecutionContext();
   const response = await publishPowerObservation(
     testEnv,
     ctx,
+    enrolled,
     database,
     4,
     row!.power_operation,
@@ -1969,8 +2050,8 @@ it("wakes an idle database with the real actor, contacts no gateway before exact
   );
   expect(response.status).toBe(200);
   await waitOnExecutionContext(ctx);
+  await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
   const connection = await pending;
-  expect((await stats())[0]!.path).toBe("/fresh");
   const startup = encodeStartup({ user: "app", database });
   connection.socket.send(startup);
   await expect
@@ -2064,6 +2145,12 @@ it("a wake timeout cancels the waiter once, never forwards late success and keep
         gateway_url: `${gatewayOrigin}/pg`,
         gateway_binding: "GATEWAY",
       },
+      node: enrolled.id,
+      target: {
+        revision: 2,
+        route_revision: 1,
+        instance: crypto.randomUUID(),
+      },
     };
   });
   const cancel = vi.fn(async () => true);
@@ -2084,37 +2171,5 @@ it("a wake timeout cancels the waiter once, never forwards late success and keep
   expect(ensure).toHaveBeenCalledTimes(1);
   release();
   await waitOnExecutionContext(connection.ctx);
-  expect(await stats()).toHaveLength(0);
-});
-
-it("aborting an idle wake removes the actual durable actor waiter and never opens gateway", async () => {
-  await sleeping("idle");
-  const stub = testEnv.DATABASE_ACTOR.get(
-    testEnv.DATABASE_ACTOR.idFromName(database),
-  ) as unknown as DurableObjectStub;
-  const controller = new AbortController();
-  const pending = open({ signal: controller.signal });
-  await expect
-    .poll(() =>
-      runInDurableObject(
-        stub,
-        (instance) =>
-          (instance as unknown as { waiters: Map<string, unknown> }).waiters
-            .size,
-      ),
-    )
-    .toBe(1);
-  expect(await stats()).toHaveLength(0);
-  controller.abort();
-  const connection = await pending;
-  expect(await errorCode(connection)).toBe("08006");
-  await waitOnExecutionContext(connection.ctx);
-  expect(
-    await runInDurableObject(
-      stub,
-      (instance) =>
-        (instance as unknown as { waiters: Map<string, unknown> }).waiters.size,
-    ),
-  ).toBe(0);
   expect(await stats()).toHaveLength(0);
 });

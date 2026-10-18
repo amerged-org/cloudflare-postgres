@@ -25,7 +25,7 @@ it(
     const now = new Date().toISOString();
     const ids = Array.from({ length: 202 }, () => newDatabaseId()).sort();
     await env.DB.batch(
-      ids.map((id) =>
+      ids.flatMap((id) => [
         env.DB.prepare(
           "INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,created_at,updated_at) VALUES(?,?,?,?,?,?,'running','ready',1,1,?,?,?)",
         ).bind(
@@ -45,13 +45,17 @@ it(
           now,
           now,
         ),
-      ),
+        env.DB.prepare(
+          "INSERT INTO database_admission_epochs(database_id) VALUES(?)",
+        ).bind(id),
+      ]),
     );
     const spy = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
     await runCron(env);
     const reads = spy.mock.calls.filter(
       ([sql]) =>
-        typeof sql === "string" && sql.includes("SELECT d.id database_id"),
+        typeof sql === "string" &&
+        sql.includes("p.deleted_at project_deleted_at"),
     );
     expect(reads).toHaveLength(200);
     expect(
@@ -64,7 +68,8 @@ it(
     expect(
       spy.mock.calls.filter(
         ([sql]) =>
-          typeof sql === "string" && sql.includes("SELECT d.id database_id"),
+          typeof sql === "string" &&
+          sql.includes("p.deleted_at project_deleted_at"),
       ),
     ).toHaveLength(2);
     expect(

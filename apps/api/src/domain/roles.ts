@@ -196,7 +196,7 @@ export async function createRole(
           reason: "generation_changed",
         });
       }
-      hint(c, db.region_id, [id]);
+      hint(c, [id]);
       return roleResponse(c, id, body.name, 201);
     },
   });
@@ -262,7 +262,7 @@ export async function resetPassword(
           "Database or role changed; retry the request",
           { reason: "generation_changed" },
         );
-      hint(c, db.region_id, [id]);
+      hint(c, [id]);
       return roleResponse(c, id, name);
     },
   });
@@ -395,7 +395,7 @@ export async function deleteRole(
           "Database or role changed; retry the request",
           { reason: "generation_changed" },
         );
-      hint(c, db.region_id, [id]);
+      hint(c, [id]);
       return databaseOperationResponse(c, operation);
     },
   });

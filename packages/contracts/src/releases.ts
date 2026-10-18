@@ -1,46 +1,128 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
+import { HttpsUrl } from "./api.ts";
 import { NodeId, RegionId } from "./ids.ts";
 
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
-const Version = z.string().regex(/^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/);
+const Positive = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 export const FleetReleaseId = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,95}$/);
+/** The pattern carries the scheme into the JSON Schema, which drops the URL check. */
+const Https = HttpsUrl.regex(/^https:\/\//);
+
+export const IMAGE_VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
+/** The version of a node image; the installer's seed binds an enrollment to it. */
+export const ImageVersion = z.string().regex(IMAGE_VERSION_PATTERN);
+
+/** A file the node downloads: where, its digest and its size. */
+export const FleetPinnedFile = z.strictObject({
+  url: Https,
+  sha256: Sha256,
+  size_bytes: Positive,
+});
+export type FleetPinnedFile = z.infer<typeof FleetPinnedFile>;
+/**
+ * The four binaries the agent downloads, each under its own file name, into the release's
+ * directory `/var/lib/pgcf/bin/<id>/` (plan 9.3).
+ */
+export const FleetReleaseBinaries = z.strictObject({
+  "pgcf-agent": FleetPinnedFile,
+  "pgcf-native-gateway": FleetPinnedFile,
+  "pgcf-archive": FleetPinnedFile,
+  "pgcf-wal-fetch": FleetPinnedFile,
+});
+/** The operating system of the image; a maintenance cycle installs exactly this lock. */
+export const FleetReleaseOs = z.strictObject({
+  image_version: ImageVersion,
+  debian_snapshot: z.string().regex(/^[0-9]{8}T[0-9]{6}Z$/),
+  /** Every package with its version and sha256. */
+  package_lock: FleetPinnedFile,
+});
+
+/** The disk a new node is installed from (plan 9.2); the pull installer downloads it. */
+export const FleetNodeImage = z
+  .strictObject({
+    url: HttpsUrl.refine((value) => {
+      const url = new URL(value);
+      return !url.username && !url.password && !url.search && !url.hash;
+    }),
+    sha256: Sha256,
+    format: z.enum(["raw.zst", "raw"]),
+    size_bytes: Positive,
+    raw_sha256: Sha256,
+    raw_bytes: Positive.refine((value) => value % 512 === 0),
+  })
+  .superRefine((image, context) => {
+    if (
+      image.format === "raw" &&
+      (image.sha256 !== image.raw_sha256 ||
+        image.size_bytes !== image.raw_bytes)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "An uncompressed disk must pin identical transport and raw bytes",
+      });
+  });
+export type FleetNodeImage = z.infer<typeof FleetNodeImage>;
+
+/**
+ * One release is one node image with its binaries: every node of every region runs the same one
+ * (plan 9.6), and the package lock changes only in a maintenance cycle. The page's `NodeRelease`
+ * is the release id with `binaries` and `os`; `image` serves AddNode and no node.
+ */
+export const FleetReleaseSpec = z.strictObject({
+  version: z.literal(2),
+  image: FleetNodeImage,
+  binaries: FleetReleaseBinaries,
+  os: FleetReleaseOs,
+});
+export type FleetReleaseSpec = z.infer<typeof FleetReleaseSpec>;
+
+export const FleetRelease = z.strictObject({
+  id: FleetReleaseId,
+  spec: FleetReleaseSpec,
+  spec_sha256: Sha256,
+  approved_at: z.iso.datetime(),
+});
+export type FleetRelease = z.infer<typeof FleetRelease>;
+export const FleetRegionReleaseUpdate = z.strictObject({
+  expected_revision: z.number().int().min(0).max(2147483646),
+  release_id: FleetReleaseId,
+});
+export type FleetRegionReleaseUpdate = z.infer<typeof FleetRegionReleaseUpdate>;
+export const FleetRegionReleaseStatus = z.strictObject({
+  region_id: RegionId,
+  revision: z.number().int().min(0),
+  desired_release_id: FleetReleaseId.nullable(),
+  updated_at: z.iso.datetime().nullable(),
+});
+/**
+ * Where a node stands against its region's release: `converged` when its last hello named the
+ * release and its link is fresh, `stale` when the link has been silent too long, `pending` when
+ * it has not yet reported the release, `fenced` when it was declared lost.
+ */
+export const FleetNodeReleaseStatus = z.strictObject({
+  node_id: NodeId,
+  region_id: RegionId,
+  node_uid: z.uuid().nullable(),
+  desired_release_id: FleetReleaseId.nullable(),
+  desired_spec_sha256: Sha256.nullable(),
+  observed_release_id: FleetReleaseId.nullable(),
+  observed_at: z.iso.datetime().nullable(),
+  state: z.enum(["unassigned", "pending", "stale", "fenced", "converged"]),
+});
+export type FleetNodeReleaseStatus = z.infer<typeof FleetNodeReleaseStatus>;
+
+// ---------- Read only by the old per-region node client (apps/node-agent api.rs) ----------
+// The controller generator (native/generate-controller.ts) still emits these for it. They go with
+// that client when the node link replaces it.
+
+const Version = z.string().regex(/^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/);
 export const FleetNodeRole = z.enum(["control_relay", "customer"]);
 export const FleetComponentName = z
   .string()
   .regex(/^[a-z0-9][a-z0-9._/-]{0,127}$/);
-export const FleetReleaseComponent = z.strictObject({
-  name: FleetComponentName,
-  kind: z.enum(["image", "chart", "worker_bundle"]),
-  version: z.string().min(1).max(128),
-  reference: z
-    .string()
-    .min(1)
-    .max(512)
-    .regex(/^[^\s\p{C}]+$/u),
-  sha256: Sha256,
-  workload: z
-    .strictObject({
-      namespace: z
-        .string()
-        .regex(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/)
-        .max(63),
-      selector: z
-        .record(z.string().min(1).max(253), z.string().max(63))
-        .refine((value) => Object.keys(value).length > 0),
-      scope: z.enum(["node", "cluster"]).optional(),
-    })
-    .optional(),
-});
-export type FleetReleaseComponent = z.infer<typeof FleetReleaseComponent>;
-export const FleetKubernetesImages = z.strictObject({
-  kubelet: z.string().regex(/^[^\s@]+:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/),
-  apiServer: z.string().regex(/^[^\s@]+:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/),
-  controllerManager: z
-    .string()
-    .regex(/^[^\s@]+:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/),
-  scheduler: z.string().regex(/^[^\s@]+:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/),
-});
+
 export const FleetKubernetesImageFacts = z.strictObject({
   kubelet: z.strictObject({
     configuration: z.string().max(512),
@@ -65,343 +147,6 @@ export const FleetKubernetesImageFacts = z.strictObject({
     })
     .optional(),
 });
-const Role = z.strictObject({
-  host_configuration_required: z.boolean().optional(),
-  kubernetes_images: FleetKubernetesImages.optional(),
-  talos_version: Version,
-  talos_installer: z
-    .string()
-    .max(512)
-    .regex(/^[^\s@]+@sha256:[0-9a-f]{64}$/),
-  talos_schematic_sha256: Sha256,
-  talos_extensions: z.array(FleetComponentName).max(32),
-  kubernetes_version: Version,
-  components: z.array(FleetComponentName).min(1).max(128),
-});
-/** Root records actual backend acceptance once for this complete finite profile and software. */
-export const ThinStorageQualification = z.strictObject({
-  /** Full canonical ThinStorageProfile hash; the PVC class uses a separate volume-settings hash. */
-  profile_sha256: Sha256,
-  driver_image: z
-    .string()
-    .max(512)
-    .regex(/^[^\s@]+@sha256:[0-9a-f]{64}$/),
-  host_extension_image: z
-    .string()
-    .max(512)
-    .regex(/^[^\s@]+@sha256:[0-9a-f]{64}$/),
-  kernel_version: z
-    .string()
-    .max(128)
-    .regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/),
-  receipt_sha256: Sha256,
-  qualified_at: z.iso.datetime(),
-  gates: z.strictObject({
-    data_full: z.literal(true),
-    metadata_full: z.literal(true),
-    noflush_quiescence: z.literal(true),
-    resume_marker: z.literal(true),
-    startup_bound: z.literal(true),
-    trim_delete_recreate: z.literal(true),
-    retained_thick_preservation: z.literal(true),
-  }),
-});
-export type ThinStorageQualification = z.infer<typeof ThinStorageQualification>;
-/** Immutable initial disk bytes; this is an install artifact, never a running component inventory item. */
-export const FleetTalosRawImage = z
-  .strictObject({
-    url: z
-      .url({ protocol: /^https$/ })
-      .max(2048)
-      .refine((value) => {
-        const url = new URL(value);
-        return !url.username && !url.password && !url.search && !url.hash;
-      }),
-    sha256: Sha256,
-    format: z.enum(["raw.xz", "raw"]),
-    bytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-    raw_sha256: Sha256,
-    raw_bytes: z
-      .number()
-      .int()
-      .positive()
-      .max(Number.MAX_SAFE_INTEGER)
-      .refine((value) => value % 512 === 0),
-  })
-  .superRefine((image, context) => {
-    if (
-      image.format === "raw" &&
-      (image.sha256 !== image.raw_sha256 || image.bytes !== image.raw_bytes)
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "An uncompressed disk must pin identical transport and raw bytes",
-      });
-  });
-export type FleetTalosRawImage = z.infer<typeof FleetTalosRawImage>;
-export const FleetReleaseSpec = z
-  .strictObject({
-    version: z.literal(1),
-    versions_lock_sha256: Sha256,
-    configuration_schema_revision: z.number().int().min(1).max(2147483647),
-    platform_source_commit: z
-      .string()
-      .regex(/^[0-9a-f]{40}$/)
-      .optional(),
-    storage_authority_keys_sha256: Sha256.optional(),
-    thin_storage_qualification: ThinStorageQualification.optional(),
-    talos_raw_image: FleetTalosRawImage.optional(),
-    /**
-     * Declares that this release's native gateway verifies route token v3 and its native
-     * controller publishes verified targets. Omitted: the region keeps v2 routes (route-token.ts).
-     * Cloudflare-side only; regional agents never receive it.
-     */
-    route_token_version: z.union([z.literal(3), z.literal(4)]).optional(),
-    /** Cloudflare-only identity-bound runtime proof capability. */
-    runtime_attestation_version: z.literal(2).optional(),
-    /** Cloudflare-only snapshot capability; requires independent route and proof versions. */
-    admission_snapshot_version: z.literal(1).optional(),
-    /** Cloudflare-only declaration of the nonce-bound native controller sampling protocol. */
-    thin_storage_sampling_version: z.literal(1).optional(),
-    components: z.array(FleetReleaseComponent).min(1).max(128),
-    roles: z.strictObject({ control_relay: Role, customer: Role }),
-  })
-  .superRefine((spec, context) => {
-    if (
-      spec.admission_snapshot_version !== undefined &&
-      (spec.route_token_version !== 4 || spec.runtime_attestation_version !== 2)
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "Admission snapshots require route token v4 and runtime attestation v2",
-      });
-    if (
-      spec.runtime_attestation_version !== undefined &&
-      !Object.values(spec.roles).every((role) =>
-        role.components.includes("native-controller"),
-      )
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "Runtime attestation v2 requires the native controller on every role",
-      });
-    if (
-      spec.thin_storage_sampling_version !== undefined &&
-      (!spec.components.some(
-        (c) => c.name === "native-controller" && c.kind === "image",
-      ) ||
-        Object.values(spec.roles).some(
-          (role) => !role.components.includes("native-controller"),
-        ))
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Thin sampling requires the native controller on every role",
-      });
-    if (
-      spec.roles.control_relay.talos_version.replace(/^v/, "") !==
-        spec.roles.customer.talos_version.replace(/^v/, "") ||
-      spec.roles.control_relay.kubernetes_version.replace(/^v/, "") !==
-        spec.roles.customer.kubernetes_version.replace(/^v/, "")
-    )
-      context.addIssue({
-        code: "custom",
-        message: "Shared runtime versions must match across roles",
-      });
-    for (const component of spec.components) {
-      if (
-        component.kind === "image" &&
-        !component.reference.endsWith(`@sha256:${component.sha256}`)
-      )
-        context.addIssue({
-          code: "custom",
-          message: "Image reference must pin its declared digest",
-        });
-    }
-    if (spec.thin_storage_qualification) {
-      if (!thinStorageReleaseGuardPinned(spec))
-        context.addIssue({
-          code: "custom",
-          message:
-            "Thin storage requires the pinned verifier, native gateway and native controller on every role",
-        });
-      const q = spec.thin_storage_qualification;
-      for (const [name, reference] of [
-        ["openebs-lvm", q.driver_image],
-        ["pgcf-sandbox-controller", q.host_extension_image],
-      ]) {
-        const component = spec.components.find((value) => value.name === name);
-        if (
-          !component ||
-          component.kind !== "image" ||
-          component.reference !== reference ||
-          !reference.endsWith("@sha256:" + component.sha256)
-        )
-          context.addIssue({
-            code: "custom",
-            message:
-              "Physical storage qualification must bind the same release images",
-          });
-      }
-      if (
-        Object.values(spec.roles).some(
-          (role) =>
-            !role.host_configuration_required ||
-            !role.talos_extensions.includes("pgcf-sandbox-controller") ||
-            !role.components.includes("openebs-lvm"),
-        )
-      )
-        context.addIssue({
-          code: "custom",
-          message:
-            "Qualified physical storage requires the pinned host guard on every role",
-        });
-    }
-    if (
-      spec.route_token_version !== undefined &&
-      !["native-gateway", "native-controller"].every(
-        (name) =>
-          spec.components.some(
-            (component) =>
-              component.name === name && component.kind === "image",
-          ) &&
-          Object.values(spec.roles).every((role) =>
-            role.components.includes(name),
-          ),
-      )
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "Route tokens require the native gateway and native controller on every role",
-      });
-    const names = new Set(spec.components.map((component) => component.name));
-    if (names.size !== spec.components.length)
-      context.addIssue({
-        code: "custom",
-        message: "Duplicate release component",
-      });
-    for (const role of Object.values(spec.roles)) {
-      if (
-        role.kubernetes_images &&
-        Object.values(role.kubernetes_images).some(
-          (reference) =>
-            /:v([0-9]+\.[0-9]+\.[0-9]+)@sha256:/.exec(reference)?.[1] !==
-            role.kubernetes_version.replace(/^v/, ""),
-        )
-      )
-        context.addIssue({
-          code: "custom",
-          message:
-            "Kubernetes image pins must match the declared runtime version",
-        });
-      if (
-        new Set(role.components).size !== role.components.length ||
-        new Set(role.talos_extensions).size !== role.talos_extensions.length
-      )
-        context.addIssue({
-          code: "custom",
-          message: "Duplicate role component",
-        });
-      for (const name of [...role.components, ...role.talos_extensions])
-        if (!names.has(name))
-          context.addIssue({
-            code: "custom",
-            message: "Unknown role component",
-          });
-    }
-    // A release must describe each product layer, not just a matching Regional tag.
-    for (const required of [
-      "api",
-      "edge",
-      "node-bootstrap",
-      ...(names.has("native-controller") && names.has("native-gateway")
-        ? []
-        : ["regional"]),
-      "postgres",
-      "barman",
-      "cloudflared",
-      "cilium",
-      "flux-source",
-      "flux-kustomize",
-      "flux-helm",
-      "flux-notification",
-      "cert-manager",
-      "cloudnative-pg",
-      "openebs-lvm",
-    ])
-      if (!names.has(required))
-        context.addIssue({
-          code: "custom",
-          message: `Missing release component: ${required}`,
-        });
-    const used = new Set(
-      Object.values(spec.roles).flatMap((role) => [
-        ...role.components,
-        ...role.talos_extensions,
-      ]),
-    );
-    for (const name of names)
-      if (
-        !used.has(name) &&
-        ![
-          "api",
-          "edge",
-          "node-bootstrap",
-          "postgres",
-          "barman",
-          "sandbox-controller",
-          "image/cert-manager/cert-manager-startupapicheck",
-        ].includes(name)
-      )
-        context.addIssue({
-          code: "custom",
-          message: "Unassigned release component",
-        });
-  });
-export type FleetReleaseSpec = z.infer<typeof FleetReleaseSpec>;
-/** Thin qualification and retained requalification share the same mandatory runtime boundary.
- * Only the native controller writes the gateway's write-authority ledger, protection marker and reclamation proof. */
-export function thinStorageReleaseGuardPinned(spec: FleetReleaseSpec): boolean {
-  const runtime = ["native-gateway", "native-controller", "openebs-lvm"];
-  return Boolean(
-    spec.storage_authority_keys_sha256 &&
-    [...runtime, "pgcf-sandbox-controller"].every((name) =>
-      spec.components.some(
-        (c) =>
-          c.name === name &&
-          c.kind === "image" &&
-          c.reference.endsWith("@sha256:" + c.sha256),
-      ),
-    ) &&
-    Object.values(spec.roles).every(
-      (role) =>
-        role.host_configuration_required &&
-        role.talos_extensions.includes("pgcf-sandbox-controller") &&
-        runtime.every((name) => role.components.includes(name)),
-    ),
-  );
-}
-export const FleetRelease = z.strictObject({
-  id: FleetReleaseId,
-  spec: FleetReleaseSpec,
-  spec_sha256: Sha256,
-  approved_at: z.iso.datetime(),
-});
-export type FleetRelease = z.infer<typeof FleetRelease>;
-export const FleetRegionReleaseUpdate = z.strictObject({
-  expected_revision: z.number().int().min(0).max(2147483646),
-  release_id: FleetReleaseId,
-});
-export type FleetRegionReleaseUpdate = z.infer<typeof FleetRegionReleaseUpdate>;
-export const FleetNodeReleaseUpdate = FleetRegionReleaseUpdate.extend({
-  node_uid: z.uuid(),
-  role: FleetNodeRole,
-});
-export type FleetNodeReleaseUpdate = z.infer<typeof FleetNodeReleaseUpdate>;
 export const FleetReleaseFacts = z
   .strictObject({
     boot_id: z.uuid().optional(),
@@ -500,33 +245,6 @@ export const FleetNodeReleaseObservation = z.strictObject({
 export type FleetNodeReleaseObservation = z.infer<
   typeof FleetNodeReleaseObservation
 >;
-export const FleetRegionReleaseStatus = z.strictObject({
-  region_id: RegionId,
-  revision: z.number().int().min(0),
-  desired_release_id: FleetReleaseId.nullable(),
-  updated_at: z.iso.datetime().nullable(),
-});
-export const FleetNodeReleaseStatus = z.strictObject({
-  node_id: NodeId,
-  region_id: RegionId,
-  node_uid: z.uuid().nullable(),
-  revision: z.number().int().min(0),
-  role: FleetNodeRole.nullable(),
-  desired_release_id: FleetReleaseId.nullable(),
-  desired_spec_sha256: Sha256.nullable(),
-  state: z.enum([
-    "unassigned",
-    "pending",
-    "stale",
-    "identity_changed",
-    "drifted",
-    "converged",
-  ]),
-  observed_at: z.iso.datetime().nullable(),
-  observed_facts: FleetReleaseFacts.nullable(),
-  mismatches: z.array(z.string().max(256)),
-});
-export type FleetNodeReleaseStatus = z.infer<typeof FleetNodeReleaseStatus>;
 
 export const FleetDesiredRelease = z.strictObject({
   region_id: RegionId,

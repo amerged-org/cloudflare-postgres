@@ -1,7 +1,7 @@
 flowchart TD
     n_98d16e133cfc["Read current node addition from D1"]
     n_05cae6515ea2["Cancelled: return"]
-    n_f6c7e8a30e85["Ready: place pending databases and<br/>notify RegionLink"]
+    n_f6c7e8a30e85["Ready: place pending databases and<br/>hint their nodes"]
     n_a67701fc2401["As eligible: claim order dispatch<br/>and resolve provider identity"]
     n_d893dc3cbbc2["Audited or bootstrapping: return<br/>until the node installer exists"]
     n_8092c49190cf["Wait; re-read D1 next cycle (never<br/>trust cached outputs as authority)"]

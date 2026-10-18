@@ -3,19 +3,15 @@
 import { env } from "cloudflare:workers";
 import {
   archiveDestinationPath,
+  DatabaseRuntime,
   newDatabaseId,
   newOperationId,
 } from "@pgcf/contracts";
-import { reclaimConfigurationFingerprint } from "@pgcf/contracts/reclaim";
 import { USAGE_HOUR_MS } from "@pgcf/contracts/usage";
 import { afterEach, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
-import { admissionSnapshotCapable } from "../../src/domain/fleet-releases.ts";
 import { USAGE_CRON_STATEMENT_LIMIT } from "../../src/domain/usage-cron.ts";
-import {
-  admissionFixtureReleases,
-  admissionSnapshotFixture,
-} from "./admission-snapshot-fixture.ts";
+import { admissionSnapshotFixture } from "./admission-snapshot-fixture.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 
 afterEach(async () => {
@@ -26,10 +22,6 @@ afterEach(async () => {
     env.DB.prepare("DELETE FROM power_timeout_cursor"),
   ]);
   await cleanupFixtures();
-  for (const id of admissionFixtureReleases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
 
 /** Count executed statements while forwarding every result to the real local D1 binding. */
@@ -89,7 +81,7 @@ function countStatements(input: D1Database) {
 }
 
 it(
-  "bounds a fully confirmed admission-capable 1000-database cron cohort and advances both 200-row pages fairly",
+  "bounds a 1000-database cron cohort and advances both 200-row pages fairly",
   { timeout: 30000 },
   async () => {
     const f = await admissionSnapshotFixture(),
@@ -99,7 +91,6 @@ it(
         f.id,
         ...Array.from({ length: 999 }, () => newDatabaseId()),
       ].sort();
-    expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(true);
     await env.DB.prepare(
       "UPDATE databases SET observed_generation=generation-1,created_at=? WHERE id=?",
     )
@@ -107,43 +98,27 @@ it(
       .run();
     const statements: D1PreparedStatement[] = [];
     for (const id of ids.filter((id) => id !== f.id)) {
-      const archive = {
-          ...f.desired.archive,
-          destination_path: archiveDestinationPath(
-            "fixture-archive",
-            f.region,
-            id,
-            1,
-            newOperationId(),
-          ),
-        },
-        proof = {
-          ...f.proof,
+      const archivePath = archiveDestinationPath(
+          "fixture-archive",
+          f.region,
+          id,
+          1,
+          newOperationId(),
+        ),
+        runtime = DatabaseRuntime.parse({
+          ...f.runtime,
           database_id: id,
-          admission_epoch: 1,
-          route_revision: 1,
-          applied_role_revisions: [],
-          tls_server_name: `database-rw.pgcf-db-${id}.svc`,
-          configuration_fingerprint: await reclaimConfigurationFingerprint(
-            {
-              ...f.desired,
-              roles: [],
-              maintenance: undefined,
-              archive,
-            },
-            f.desired.postgres!.image,
-          ),
-        };
+          instance: crypto.randomUUID(),
+        });
       statements.push(
         env.DB.prepare(
-          `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,pg_major,desired_state,observed_state,observed_power,generation,observed_generation,storage_generation,archive_path,desired_postgres_release_id,desired_postgres_image,desired_postgres_version,desired_postgres_schema_revision,runtime_attestation_json,storage_volume_json,created_at,updated_at)
-        SELECT ?,project_id,region_id,node_id,?,size_class_id,pg_major,'running','ready','awake',generation,generation-1,storage_generation,?,desired_postgres_release_id,desired_postgres_image,desired_postgres_version,desired_postgres_schema_revision,?,?,?,? FROM databases WHERE id=?`,
+          `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,pg_major,desired_state,observed_state,observed_power,generation,observed_generation,storage_generation,archive_path,runtime_attestation_json,created_at,updated_at)
+        SELECT ?,project_id,region_id,node_id,?,size_class_id,pg_major,'running','ready','awake',generation,generation-1,storage_generation,?,?,?,? FROM databases WHERE id=?`,
         ).bind(
           id,
           id,
-          archive.destination_path,
-          JSON.stringify(proof),
-          JSON.stringify(f.volume),
+          archivePath,
+          JSON.stringify(runtime),
           createdAt,
           createdAt,
           f.id,
@@ -175,7 +150,7 @@ it(
       second = await runCron({ ...env, DB: secondCount.db }, now);
     console.log(
       JSON.stringify({
-        event: "capable_whole_cron_bound",
+        event: "whole_cron_bound",
         cohort: ids.length,
         first_statements: firstCount.count(),
         second_statements: secondCount.count(),

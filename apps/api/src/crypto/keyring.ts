@@ -131,12 +131,3 @@ export function keyring(secret: string): CredentialKeyring {
     },
   };
 }
-
-export function encryptPassword(
-  secret: string,
-  databaseId: string,
-  role: string,
-  password: string,
-): Promise<EncryptedPassword> {
-  return keyring(secret).encrypt(databaseId, role, password);
-}

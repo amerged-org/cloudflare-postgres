@@ -148,7 +148,7 @@ it("raises a failing step only after five consecutive failed runs and names it",
   expect(
     (await episodes(f.region)).get("control_cron_step_failing"),
   ).toBeUndefined();
-  await heartbeat(now, 30_000, { usage: 5, fleet_updates: 1 });
+  await heartbeat(now, 30_000, { usage: 5, retained_archives: 1 });
   await runCronWatchdog(hook.env, now + 1000, hook.fetcher);
   const mine = hook.events.filter(
     (value) => value.event.region_id === f.region,
@@ -165,7 +165,7 @@ it("raises a failing step only after five consecutive failed runs and names it",
       error_code: "usage_cron_statement_budget",
     },
     {
-      step: "fleet_updates",
+      step: "retained_archives",
       consecutive_failures: 1,
       error_code: "usage_cron_statement_budget",
     },

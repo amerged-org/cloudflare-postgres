@@ -57,16 +57,26 @@ async function preLifecycle() {
   ).results;
   for (const table of tables) {
     const source = table.name.slice(prefix.length);
-    const columns = (
-      await env.DB.prepare(`PRAGMA table_info(${table.name})`).all<{
-        name: string;
-      }>()
-    ).results
-      .map((row) => row.name)
-      .join(",");
+    const names = async (name: string) =>
+      (
+        await env.DB.prepare(`PRAGMA table_info(${name})`).all<{
+          name: string;
+        }>()
+      ).results.map((row) => row.name);
+    const current = new Set(await names(source));
+    // A table that today's schema no longer has keeps its empty history.
+    if (current.size === 0) continue;
+    // Today's tables lost columns that the genuine pre-0008 schema requires: the regional agent
+    // key goes with the node link, so the history gets a placeholder in its place.
+    const columns = (await names(table.name)).filter(
+      (name) => current.has(name) || name === "agent_key_hash",
+    );
+    const values = columns.map((name) =>
+      current.has(name) ? name : "lower(hex(randomblob(32)))",
+    );
     // Lifecycle/sample inserts may already have created their revision row.
     await env.DB.prepare(
-      `INSERT OR REPLACE INTO ${table.name}(${columns}) SELECT ${columns} FROM ${source}`,
+      `INSERT OR REPLACE INTO ${table.name}(${columns.join(",")}) SELECT ${values.join(",")} FROM ${source}`,
     ).run();
   }
 }
@@ -102,7 +112,6 @@ it("the actual D1 lifecycle migration preserves every parent, ciphertext, operat
   const tables = [
     "databases",
     "roles",
-    "maintenance_credentials",
     "operations",
     "lifecycle_events",
     "usage_samples",
@@ -168,7 +177,6 @@ it("the actual D1 lifecycle migration preserves every parent, ciphertext, operat
     history.prepare("DELETE FROM databases WHERE id=?").bind(id),
   ]);
   for (const table of [
-    "maintenance_credentials",
     "usage_samples",
     "usage_hourly",
     "usage_revisions",

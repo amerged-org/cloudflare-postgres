@@ -6,8 +6,8 @@ import {
   cleanupFixtures,
   fixture,
   request,
-  observation,
-  observedBody,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 import type { D1Migration } from "cloudflare:test";
 import { databaseResizeStatement } from "../../src/domain/databases.ts";
@@ -36,16 +36,7 @@ async function ready() {
   const first = await f.create();
   expect(first.status).toBe(202);
   const created = DatabaseWithOperation.parse(await first.json());
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(created.database.id, 1)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, created.database.id, 1)).status).toBe(200);
   return { ...f, id: created.database.id, createOp: created.operation.id };
 }
 async function size(
@@ -380,7 +371,7 @@ describe("manual in-place resize on real Workers D1", () => {
     ).toBe(0);
   });
 
-  it("requires the current configuration proof after a concurrent role revision", async () => {
+  it("requires the current generation after a concurrent role revision", async () => {
     const f = await ready();
     const target = await size(f);
     const resized = DatabaseWithOperation.parse(
@@ -399,31 +390,13 @@ describe("manual in-place resize on real Workers D1", () => {
         )
       ).status,
     ).toBe(201);
-    expect(
-      await (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(f.id, 2)]),
-        )
-      ).json(),
-    ).toEqual({ accepted: 0 });
+    expect(await verdicts(await report(f, f.id, 2))).toEqual(["stale"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(resized.operation.id)
         .first("status"),
     ).toBe("pending");
-    expect(
-      await (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(f.id, 3)]),
-        )
-      ).json(),
-    ).toEqual({ accepted: 1 });
+    expect(await verdicts(await report(f, f.id, 3))).toEqual(["accept"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(resized.operation.id)
@@ -485,24 +458,17 @@ describe("manual in-place resize on real Workers D1", () => {
     const changed = DatabaseWithOperation.parse(
       await (await resize(f, target)).json(),
     );
-    const report = (generation: number, state = "ready") =>
-      request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(f.id, generation, state)]),
-      );
-    expect(await (await report(1)).json()).toEqual({ accepted: 0 });
-    expect(await (await report(3)).json()).toEqual({ accepted: 0 });
-    expect(await (await report(2, "provisioning")).json()).toEqual({
-      accepted: 1,
-    });
+    const send = async (generation: number, state = "ready") =>
+      verdicts(await report(f, f.id, generation, state));
+    expect(await send(1)).toEqual(["stale"]);
+    expect(await send(3)).toEqual(["conflict"]);
+    expect(await send(2, "building")).toEqual(["accept"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(changed.operation.id)
         .first("status"),
     ).toBe("running");
-    expect(await (await report(2)).json()).toEqual({ accepted: 1 });
+    expect(await send(2)).toEqual(["accept"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(changed.operation.id)
@@ -523,7 +489,7 @@ describe("manual in-place resize on real Workers D1", () => {
       reserved_cpu_millicores: 850,
       storage_allocated_bytes: 5 * 2 ** 30,
     });
-    await report(2);
+    await send(2);
     expect(
       (
         await env.DB.prepare(

@@ -15,6 +15,7 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
 import { databaseCpuChargeSql } from "./startup-admission.ts";
 import { resizeDatabase, scheduleDatabaseResize } from "./databases.ts";
+import { hintDatabases } from "./node-hints.ts";
 
 interface ProfileRow {
   profile_id: string;
@@ -297,9 +298,7 @@ export async function runResourceProfileRollouts(
           bindings: [row.profile_id, row.selected_revision],
         },
       );
-      await env.REGION_LINK.get(
-        env.REGION_LINK.idFromName(row.region_id),
-      ).notify([row.id]);
+      await hintDatabases(env, [row.id]);
       changed++;
     } catch (error) {
       if (

@@ -18,8 +18,7 @@ import {
   ListQuery,
   Node,
   Region,
-  RegionCreated,
-  newAgentKey,
+  RegionRouteKeyring,
   newSecret,
   bytesToBase64url,
   decodeCursor,
@@ -363,7 +362,7 @@ describe("errors", () => {
 });
 
 describe("request bodies", () => {
-  it("returns a complete routing keyring only at region creation", () => {
+  it("never returns a key with a region, and a gateway's routing keyring is canonical and complete", () => {
     const region = {
       id: "eu-1",
       provider: "contabo",
@@ -376,69 +375,27 @@ describe("request bodies", () => {
       created_at: "2026-10-02T10:46:00.000Z",
       updated_at: "2026-10-02T10:46:00.000Z",
     };
-    const created = {
-      region,
-      agent_key: newAgentKey(region.id),
-      route_keyring: {
-        active: "k1",
-        keys: { k1: newSecret(), k0: newSecret() },
-      },
+    const keyring = {
+      active: "k1",
+      keys: { k1: newSecret(), k0: newSecret() },
     };
-    expect(RegionCreated.safeParse(created).success).toBe(true);
-    expect(
-      RegionCreated.safeParse({ region, agent_key: created.agent_key }).success,
-    ).toBe(false);
     expect(Region.safeParse(region).success).toBe(true);
-    expect(
-      Region.safeParse({ ...region, route_keyring: created.route_keyring })
-        .success,
-    ).toBe(false);
-    expect(
-      RegionCreated.safeParse({
-        ...created,
-        route_keyring: { active: "absent", keys: created.route_keyring.keys },
-      }).success,
-    ).toBe(false);
-    expect(
-      RegionCreated.safeParse({
-        ...created,
-        route_keyring: {
-          active: "k1",
-          keys: { k1: created.route_keyring.keys.k1 + "=" },
-        },
-      }).success,
-    ).toBe(false);
-    const nonCanonical = created.route_keyring.keys.k1.slice(0, -1) + "B";
-    expect(
-      RegionCreated.safeParse({
-        ...created,
-        route_keyring: { active: "k1", keys: { k1: nonCanonical } },
-      }).success,
-    ).toBe(false);
-    expect(
-      RegionCreated.safeParse({
-        ...created,
-        route_keyring: {
-          active: "k1",
-          keys: { k1: bytesToBase64url(new Uint8Array(31)) },
-        },
-      }).success,
-    ).toBe(false);
-    expect(
-      RegionCreated.safeParse({
-        ...created,
-        route_keyring: {
-          active: "k1",
-          keys: { k1: bytesToBase64url(new Uint8Array(33)) },
-        },
-      }).success,
-    ).toBe(false);
-    expect(
-      RegionCreated.safeParse({
-        ...created,
-        route_keyring: { active: ".bad", keys: { ".bad": newSecret() } },
-      }).success,
-    ).toBe(false);
+    for (const extra of [
+      { route_keyring: keyring },
+      { agent_key: `pgcf_ak_eu-1_${newSecret()}` },
+    ])
+      expect(Region.safeParse({ ...region, ...extra }).success).toBe(false);
+    expect(RegionRouteKeyring.safeParse(keyring).success).toBe(true);
+    const nonCanonical = keyring.keys.k1.slice(0, -1) + "B";
+    for (const broken of [
+      { active: "absent", keys: keyring.keys },
+      { active: "k1", keys: { k1: keyring.keys.k1 + "=" } },
+      { active: "k1", keys: { k1: nonCanonical } },
+      { active: "k1", keys: { k1: bytesToBase64url(new Uint8Array(31)) } },
+      { active: "k1", keys: { k1: bytesToBase64url(new Uint8Array(33)) } },
+      { active: ".bad", keys: { ".bad": newSecret() } },
+    ])
+      expect(RegionRouteKeyring.safeParse(broken).success).toBe(false);
   });
 
   it("binds integrator keys to a project and admin keys to none", () => {

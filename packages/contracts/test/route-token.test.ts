@@ -5,17 +5,23 @@ import {
   ReplayCache,
   ROUTE_TOKEN_HEADER,
   ROUTE_TOKEN_MAX_LENGTH,
+  deriveNodeKey,
+  deriveNodeKeyring,
   deriveRegionKey,
   deriveRegionKeyring,
   parseRouteKeyring,
   serializeRouteKeyring,
   signLegacyRouteToken,
+  signNodeRouteToken,
   signRouteToken,
   signWakeRouteToken,
   roleRevisionHash,
   ROUTE_TOKEN_WAKE_PREFIX,
   ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
   ROUTE_TOKEN_ADMISSION_MAX_LENGTH,
+  ROUTE_TOKEN_NODE_KEY_DOMAIN,
+  ROUTE_TOKEN_NODE_PREFIX,
+  ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN,
   verifyRouteToken,
   type RouteKeyring,
   type SignRouteTokenInput,
@@ -973,6 +979,208 @@ describe("wake route token v5", () => {
     expect(vectors.length).toBeGreaterThan(1);
     for (const vector of vectors)
       expect(await roleRevisionHash(vector.roles)).toBe(vector.hash);
+  });
+});
+
+describe("node route token v6", () => {
+  const node = "nod_" + "a1b2c3d4e5f6g7h8i9j0";
+  const other = "nod_" + "z9y8x7w6v5u4t3s2r1q0";
+  const instance = "7d1f4a52-9b0e-4c6d-8a3f-5e2b1c0d9f8e";
+  const target = { revision: 7, route_revision: 19, instance };
+  const input = { keyring: master, region, node, db, user, cid, target, now };
+  const nodeKeys = async (id = node) =>
+    (await deriveNodeKeyring(master, id)).keys;
+
+  it("derives a node key like an independent HMAC and keeps nodes apart", async () => {
+    expect(ROUTE_TOKEN_NODE_KEY_DOMAIN).toBe("pgcf-route-key/v2\n");
+    const expected = createHmac("sha256", keyBytes(2))
+      .update("pgcf-route-key/v2\n" + node)
+      .digest();
+    expect(Buffer.from(await deriveNodeKey(keyBytes(2), node))).toEqual(
+      expected,
+    );
+    expect(await deriveNodeKey(keyBytes(2), other)).not.toEqual(
+      await deriveNodeKey(keyBytes(2), node),
+    );
+    // Neither a region key nor another kid's key is a node key.
+    expect(await deriveNodeKey(keyBytes(2), node)).not.toEqual(
+      await deriveRegionKey(keyBytes(2), region),
+    );
+    const ring = await deriveNodeKeyring(master, node);
+    expect(ring.active).toBe("k2");
+    expect([...ring.keys.keys()]).toEqual(["k1", "k2"]);
+    await expect(deriveNodeKey(keyBytes(2), "nod_short")).rejects.toThrow(
+      RangeError,
+    );
+    await expect(deriveNodeKey(new Uint8Array(31), node)).rejects.toThrow(
+      RangeError,
+    );
+  });
+
+  it("a v6 route names the generation, the route revision, the node and the unit's instance", async () => {
+    expect(ROUTE_TOKEN_NODE_PREFIX).toBe("v6");
+    expect(ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN).toBe("pgcf-route/v6\n");
+    const token = await signNodeRouteToken(input);
+    const [prefix, payload, signature] = token.split(".") as [
+      string,
+      string,
+      string,
+    ];
+    expect(prefix).toBe("v6");
+    expect(
+      createHmac("sha256", (await nodeKeys()).get("k2")!)
+        .update("pgcf-route/v6\n" + payload)
+        .digest("base64url"),
+    ).toBe(signature);
+    const claims = {
+      v: 6,
+      db,
+      user,
+      cid,
+      rg: region,
+      kid: "k2",
+      iat: nowSec,
+      exp: nowSec + 30,
+      rev: 7,
+      route_revision: 19,
+      node,
+      inst: instance,
+    };
+    expect(JSON.parse(Buffer.from(payload, "base64url").toString())).toEqual(
+      claims,
+    );
+    expect(token.length).toBeLessThanOrEqual(ROUTE_TOKEN_ADMISSION_MAX_LENGTH);
+    expect(
+      await verifyRouteToken(token, { keys: await nodeKeys(), region, now }),
+    ).toEqual({ ok: true, claims });
+    expect(
+      await verifyRouteToken(token, {
+        keys: await nodeKeys(),
+        region,
+        node,
+        now,
+      }),
+    ).toEqual({ ok: true, claims });
+  });
+
+  it("a node verifies only its own tokens", async () => {
+    const token = await signNodeRouteToken(input);
+    expect(
+      await verifyRouteToken(token, {
+        keys: await nodeKeys(other),
+        region,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "bad_signature" });
+    // Not even the region's key verifies a node route.
+    expect(
+      await verifyRouteToken(token, { keys: await regionKeys(), region, now }),
+    ).toEqual({ ok: false, reason: "bad_signature" });
+    // A verifier that knows its node refuses a route signed with its key for another node.
+    const key = (await nodeKeys()).get("k2")!;
+    const claims = JSON.parse(
+      Buffer.from(token.split(".")[1]!, "base64url").toString(),
+    );
+    const forged = signPayload(
+      JSON.stringify({ ...claims, node: other }),
+      key,
+      "v6",
+    );
+    expect(
+      await verifyRouteToken(forged, {
+        keys: await nodeKeys(),
+        region,
+        node,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "wrong_node" });
+  });
+
+  it("v6 refuses a missing or malformed claim, the v4 domain and a tampered payload", async () => {
+    const keys = await nodeKeys();
+    const key = keys.get("k2")!;
+    const token = await signNodeRouteToken(input);
+    const claims = JSON.parse(
+      Buffer.from(token.split(".")[1]!, "base64url").toString(),
+    );
+    const verify = (value: string) =>
+      verifyRouteToken(value, { keys, region, now });
+    const sign = (value: object) =>
+      signPayload(JSON.stringify(value), key, "v6");
+    for (const changed of [
+      { inst: undefined },
+      { inst: "not-a-uuid" },
+      { inst: instance.toUpperCase() },
+      { node: undefined },
+      { node: "nod_short" },
+      { route_revision: undefined },
+      { route_revision: 0 },
+      { rev: undefined },
+      { rev: 0 },
+      { rev: 7.5 },
+      { pod: instance },
+      { v: 5 },
+    ])
+      expect(await verify(sign({ ...claims, ...changed }))).toEqual({
+        ok: false,
+        reason: "invalid_claims",
+      });
+    // v6 claims sealed under the v4 domain, and v4 claims under v6.
+    expect(
+      await verify(
+        `v6.${signPayload(JSON.stringify(claims), key, "v4").slice(3)}`,
+      ),
+    ).toEqual({ ok: false, reason: "bad_signature" });
+    const [, , signature] = token.split(".");
+    const changed = b64u(Buffer.from(JSON.stringify({ ...claims, rev: 8 })));
+    expect(await verify(`v6.${changed}.${signature}`)).toEqual({
+      ok: false,
+      reason: "bad_signature",
+    });
+    expect(
+      await verify(`v6.${"A".repeat(ROUTE_TOKEN_ADMISSION_MAX_LENGTH)}.x`),
+    ).toEqual({ ok: false, reason: "too_long" });
+    await expect(
+      signNodeRouteToken({
+        ...input,
+        target: { ...target, instance: "not-a-uuid" },
+      }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      signNodeRouteToken({ ...input, node: "nod_short" }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it("signs a wake ticket with the node's key when it names the node", async () => {
+    const wake = {
+      operation: `op_${"c".repeat(20)}`,
+      generation: 8,
+      route_revision: 19,
+      role_revision_hash: "a".repeat(64),
+    };
+    const token = await signWakeRouteToken({
+      keyring: master,
+      region,
+      node,
+      db,
+      user,
+      cid,
+      wake,
+      now,
+    });
+    expect(
+      await verifyRouteToken(token, { keys: await nodeKeys(), region, now }),
+    ).toMatchObject({ ok: true });
+    expect(
+      await verifyRouteToken(token, { keys: await regionKeys(), region, now }),
+    ).toEqual({ ok: false, reason: "bad_signature" });
+    expect(
+      await verifyRouteToken(token, {
+        keys: await nodeKeys(other),
+        region,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "bad_signature" });
   });
 });
 

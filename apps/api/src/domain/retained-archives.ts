@@ -99,9 +99,6 @@ export async function cleanupRetainedArchives(
       env.DB.prepare(
         "DELETE FROM roles WHERE database_id=? AND changes()=1 AND EXISTS(SELECT 1 FROM databases d WHERE d.id=roles.database_id AND d.desired_state='deleted' AND d.observed_state='deleted')",
       ).bind(row.source_database_id),
-      env.DB.prepare(
-        "DELETE FROM maintenance_credentials WHERE database_id=? AND NOT EXISTS(SELECT 1 FROM retained_archives a WHERE a.source_database_id=maintenance_credentials.database_id) AND EXISTS(SELECT 1 FROM databases d WHERE d.id=maintenance_credentials.database_id AND d.desired_state='deleted' AND d.observed_state='deleted' AND d.deleted_at=? AND d.archive_path=?)",
-      ).bind(row.source_database_id, row.deleted_at, row.archive_path),
     ]);
     purged += result[0]!.meta.changes;
   }

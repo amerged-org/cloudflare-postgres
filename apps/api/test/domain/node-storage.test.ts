@@ -6,7 +6,7 @@ import {
   recordNodeStorageObservation,
   readNodeStorageObservation,
 } from "../../src/domain/node-storage.ts";
-import { cleanupFixtures, fixture, observedBody, request } from "./fixtures.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
 async function subject() {
@@ -142,16 +142,18 @@ it("stale, future and replaced node identities never become fresh physical capac
   ).toBeNull();
 });
 
-it("round-trips physical observations through authenticated HTTP and exposes only fresh current-node facts", async () => {
+it("serves the recorded physical facts of a node to administrators only", async () => {
   const { f, node, sample } = await subject();
   const path = `/v1/nodes/${f.node}/storage`;
-  const posted = await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([], [{ ...node, storage: sample }]),
-  );
-  expect(posted.status).toBe(200);
+  expect(
+    await recordNodeStorageObservation(
+      env.DB,
+      f.region,
+      node,
+      sample,
+      Date.now(),
+    ),
+  ).toBe(true);
   const readback = await request(path, f.admin);
   expect(readback.status).toBe(200);
   expect(await readback.json()).toEqual({
@@ -160,76 +162,12 @@ it("round-trips physical observations through authenticated HTTP and exposes onl
     sample,
   });
   expect((await request(path, f.integrator)).status).toBe(403);
-  const envelopeTime = Date.now();
-  const aheadOfEnvelope = {
-    ...sample,
-    observed_at: new Date(envelopeTime + 3000).toISOString(),
-    physical: null,
-  };
-  expect(
-    (
-      await request("/agent/v1/observations", f.agent, "POST", {
-        ...observedBody([], [{ ...node, storage: aheadOfEnvelope }]),
-        observed_at: new Date(envelopeTime).toISOString(),
-      })
-    ).status,
-  ).toBe(200);
-  expect(
-    ((await (await request(path, f.admin)).json()) as { sample: unknown })
-      .sample,
-  ).toEqual(sample);
-  const stale = {
-    ...sample,
-    observed_at: new Date(Date.now() - 180_000).toISOString(),
-    physical: null,
-  };
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([], [{ ...node, storage: stale }]),
-      )
-    ).status,
-  ).toBe(200);
-  expect(
-    ((await (await request(path, f.admin)).json()) as { sample: unknown })
-      .sample,
-  ).toEqual(sample);
-  const otherUid = crypto.randomUUID();
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody(
-          [],
-          [
-            {
-              ...node,
-              node_uid: otherUid,
-              storage: {
-                ...sample,
-                node_uid: otherUid,
-                observed_at: new Date().toISOString(),
-              },
-            },
-          ],
-        ),
-      )
-    ).status,
-  ).toBe(200);
+  // A report of another install of the node is not this node's: the sample is withheld.
+  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
+    .bind(crypto.randomUUID(), f.node)
+    .run();
   expect(
     ((await (await request(path, f.admin)).json()) as { sample: unknown })
       .sample,
   ).toBeNull();
-  expect(
-    await env.DB.prepare(
-      "SELECT node_uid FROM node_storage_observations WHERE node_id=?",
-    )
-      .bind(f.node)
-      .first("node_uid"),
-  ).toBe(sample.node_uid);
 });

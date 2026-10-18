@@ -59,22 +59,22 @@ describe("actual generated API references in the Workers runtime", () => {
   it("publishes complete disjoint scopes with explicit unique operation metadata", async () => {
     const app = createApp();
     const publicDoc = await document("/v1/openapi.json");
-    const agentDoc = await document("/agent/v1/openapi.json");
-    const docs = [publicDoc, agentDoc];
+    const nodeDoc = await document("/node/v1/openapi.json");
+    const docs = [publicDoc, nodeDoc];
     expect(
       Object.keys(publicDoc.paths).every(
         (path) => path.startsWith("/v1/") || path === "/healthz",
       ),
     ).toBe(true);
     expect(
-      Object.keys(agentDoc.paths).every((path) => path.startsWith("/agent/")),
+      Object.keys(nodeDoc.paths).every((path) => path.startsWith("/node/")),
     ).toBe(true);
     const actual = new Set(
       app.routes
         .filter((route) => methods.has(route.method.toLowerCase()))
         .filter(
           (route) =>
-            /^(?:\/v1\/|\/agent\/)/.test(route.path) ||
+            /^(?:\/v1\/|\/node\/)/.test(route.path) ||
             route.path === "/healthz",
         )
         .map(
@@ -122,7 +122,7 @@ describe("actual generated API references in the Workers runtime", () => {
       "CF_VERSION_METADATA",
     ) as WorkerVersionMetadata;
     expect(metadata?.id).toBeTruthy();
-    for (const path of ["/v1/openapi.json", "/agent/v1/openapi.json"]) {
+    for (const path of ["/v1/openapi.json", "/node/v1/openapi.json"]) {
       const doc = await document(path);
       // A Worker release changes the Worker version; only the contract changes this one.
       expect(doc.info.version, path).toBe(API_CONTRACT_VERSION);
@@ -145,7 +145,7 @@ describe("actual generated API references in the Workers runtime", () => {
 
   it("preserves actual JSON headers, scoped auth and WebSocket response semantics", async () => {
     const publicDoc = await document("/v1/openapi.json");
-    const agents = await document("/agent/v1/openapi.json");
+    const nodes = await document("/node/v1/openapi.json");
     const listed = operation(publicDoc, "/v1/databases", "get");
     expect(listed.parameters).toContainEqual(
       expect.objectContaining({
@@ -166,7 +166,7 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(
       operation(publicDoc, "/v1/databases", "post").responses["202"]!.headers,
     ).toHaveProperty("Location");
-    const link = operation(agents, "/agent/v1/link", "get");
+    const link = operation(nodes, "/node/v1/link", "get");
     expect(link.parameters).toContainEqual(
       expect.objectContaining({
         name: "Upgrade",
@@ -175,13 +175,13 @@ describe("actual generated API references in the Workers runtime", () => {
       }),
     );
     expect(link.responses["101"]!.content).toBeUndefined();
-    expect(operation(agents, "/agent/v1/desired", "get").security).toEqual([
-      { AgentBearer: [] },
+    expect(operation(nodes, "/node/v1/desired", "get").security).toEqual([
+      { NodeBearer: [] },
     ]);
   });
 
   it("keeps every local component reference resolvable after scope separation", async () => {
-    for (const path of ["/v1/openapi.json", "/agent/v1/openapi.json"]) {
+    for (const path of ["/v1/openapi.json", "/node/v1/openapi.json"]) {
       const doc = await document(path);
       const visit = (value: unknown): void => {
         if (value === null || typeof value !== "object") return;
@@ -205,7 +205,7 @@ describe("actual generated API references in the Workers runtime", () => {
 
   it("documents supported replay headers", async () => {
     const management = await document("/v1/openapi.json");
-    const agent = await document("/agent/v1/openapi.json");
+    const node = await document("/node/v1/openapi.json");
     // Creating a database is idempotent by contract and refuses a request without its key.
     const create = operation(management, "/v1/databases", "post");
     expect(create.parameters).toContainEqual(
@@ -252,7 +252,7 @@ describe("actual generated API references in the Workers runtime", () => {
         .responses,
     ).toHaveProperty("409");
     expect(
-      operation(agent, "/agent/v1/link", "get").responses["426"]!.content,
+      operation(node, "/node/v1/link", "get").responses["426"]!.content,
     ).toHaveProperty("text/plain");
     const keys = operation(management, "/v1/api-keys", "post");
     expect(keys.description).toContain("first administrator key");
@@ -260,14 +260,9 @@ describe("actual generated API references in the Workers runtime", () => {
       keys.parameters?.find((parameter) => parameter.name === "Idempotency-Key")
         ?.description,
     ).toContain("409");
-    expect(
-      operation(management, "/v1/regions", "post").parameters?.find(
-        (parameter) => parameter.name === "Idempotency-Key",
-      )?.description,
-    ).toContain("409");
     console.info(
       "generated reference measurements",
-      [management, agent].map((doc) => ({
+      [management, node].map((doc) => ({
         operations: operations(doc).length,
         schemas: Object.keys(doc.components?.schemas ?? {}).length,
         bytes: new TextEncoder().encode(JSON.stringify(doc)).length,
@@ -438,7 +433,7 @@ describe("actual generated API references in the Workers runtime", () => {
     };
     const nullable = (schema: Schema | undefined) =>
       Array.isArray(schema?.type) && schema!.type.includes("null");
-    for (const path of ["/v1/openapi.json", "/agent/v1/openapi.json"]) {
+    for (const path of ["/v1/openapi.json", "/node/v1/openapi.json"]) {
       const doc = await document(path);
       const schemas = (doc.components?.schemas ?? {}) as Record<string, Schema>;
       // A component that is nullable makes every use of it nullable; nullability belongs to the use.

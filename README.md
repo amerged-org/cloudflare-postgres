@@ -30,7 +30,7 @@ states what runs where; it does not repeat measurements.
 
 | Part                                             | State                                                                                                                    |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| API Worker, DatabaseActor, RegionLink, Workflows | TypeScript on Cloudflare, deployed; they remain TypeScript                                                               |
+| API Worker, DatabaseActor, NodeActor, Workflows  | TypeScript on Cloudflare; the node link (NodeActor, `/node/v1`) is built in Stage 3 and not deployed; the rest remains TypeScript |
 | Edge Worker                                      | TypeScript (`apps/edge`) is deployed; the Rust/Wasm target (`apps/edge-rust`) is built by CI and not deployed            |
 | Regional gateway                                 | Rust (`apps/native-gateway`); its Kubernetes routing stays until local mode replaces it in Stage 3; not deployed         |
 | Node runtime                                     | Not running: the Kubernetes runtime was retired on 2026-10-17; the node agent and the node image are built in Stage 3    |
@@ -154,7 +154,7 @@ Further nodes and regions use the same node image; see the
 Public-release installation polish follows separately; see [not in v1](docs/architecture/cloudflare-convergence-and-serverless-plan.md#111-not-in-v1) in the ULTRA plan.
 
 The management API reference is generated at `/v1/openapi.json` from the shared contracts.
-Agent operations are published at `/agent/v1/openapi.json`. Each document contains only its
+Node operations are published at `/node/v1/openapi.json`. Each document contains only its
 interface and referenced schemas.
 Their `info.version` is the request-serving Worker's version ID; `info.x-worker-version` also
 includes its tag and timestamp. Configure the `CF_VERSION_METADATA` version metadata binding

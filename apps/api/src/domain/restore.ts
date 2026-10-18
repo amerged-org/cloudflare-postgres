@@ -12,10 +12,6 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { keyring } from "../crypto/keyring.ts";
 import { databaseInsertStatement, hint } from "./databases.ts";
 import { startupReservationStatement } from "./startup-admission.ts";
-import {
-  generateMaintenanceCredential,
-  maintenanceCreationStatement,
-} from "./maintenance.ts";
 import { choosePlacement, databaseMemoryPolicyAllows } from "./placement.ts";
 import { startupPlacementNodes } from "./node-capacity.ts";
 import {
@@ -125,12 +121,12 @@ export async function restoreDatabase(
       const targetRegionId = body.region_id ?? source.region_id;
       const [sourceRegion, region, size] = await Promise.all([
         c.env.DB.prepare(
-          "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
+          "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
         )
           .bind(source.region_id)
           .first<RegionRow>(),
         c.env.DB.prepare(
-          "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
+          "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
         )
           .bind(targetRegionId)
           .first<RegionRow>(),
@@ -201,10 +197,6 @@ export async function restoreDatabase(
           ),
         })),
       );
-      const maintenance = await generateMaintenanceCredential(
-        c.env.CREDENTIAL_KEYS,
-        targetId,
-      );
       const node = choosePlacement(
         await startupPlacementNodes(c.env.DB, targetRegionId, size.id),
         targetRegionId,
@@ -265,16 +257,6 @@ export async function restoreDatabase(
           now,
           authority,
         }),
-        maintenanceCreationStatement(
-          c.env.DB,
-          {
-            databaseId: targetId,
-            projectId: source.project_id,
-            createdAt: now,
-            creationGeneration: 1,
-          },
-          maintenance,
-        ),
         c.env.DB.prepare(
           "UPDATE databases SET storage_generation=? WHERE id=? AND project_id=? AND created_at=?",
         ).bind(storageGeneration, targetId, source.project_id, now),
@@ -349,7 +331,7 @@ export async function restoreDatabase(
           "Source credentials, retention or placement changed; retry the request",
           { reason: "generation_changed" },
         );
-      if (node) hint(c, targetRegionId, [targetId]);
+      if (node) hint(c, [targetId]);
       return response(c, op);
     },
   });

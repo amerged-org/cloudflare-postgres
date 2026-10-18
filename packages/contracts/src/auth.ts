@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { base64urlToBytes, bytesToHex, newSecret } from "./encoding.ts";
-import { ID_ALPHABET, REGION_ID_PATTERN, randomString } from "./ids.ts";
-import type { RegionId } from "./ids.ts";
+import { ID_ALPHABET, randomString } from "./ids.ts";
 
 export const API_KEY_SCOPES = ["admin", "integrator"] as const;
 export const ApiKeyScope = z.enum(API_KEY_SCOPES).meta({ id: "ApiKeyScope" });
@@ -12,14 +11,9 @@ export const API_KEY_LOOKUP_ID_LENGTH = 12;
 export const SECRET_LENGTH = 43;
 
 export const API_KEY_PATTERN = /^pgcf_sk_([a-z0-9]{12})_([A-Za-z0-9_-]{43})$/;
-// Region IDs contain no underscore, so the first underscore after the prefix ends the region ID.
-export const AGENT_KEY_PATTERN = new RegExp(
-  `^pgcf_ak_(${REGION_ID_PATTERN.source.slice(1, -1)})_([A-Za-z0-9_-]{43})$`,
-);
 export const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 export const ApiKeyString = z.string().regex(API_KEY_PATTERN);
-export const AgentKeyString = z.string().regex(AGENT_KEY_PATTERN);
 
 export const ROUTE_KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 export const RouteKeyId = z.string().regex(ROUTE_KEY_ID_PATTERN);
@@ -29,10 +23,10 @@ const RegionRouteKey = z
   .string()
   .length(43)
   .refine((value) => base64urlToBytes(value)?.length === 32, {
-    message: "region routing keys must be canonical base64url of 32 bytes",
+    message: "routing keys must be canonical base64url of 32 bytes",
   });
 
-/** Derived region keys for gateway configuration; never the master keyring. */
+/** The keys derived for one node's gateway; never the master keyring. */
 export const RegionRouteKeyring = z
   .strictObject({
     active: RouteKeyId,
@@ -49,11 +43,6 @@ export interface ParsedApiKey {
   secret: string;
 }
 
-export interface ParsedAgentKey {
-  regionId: RegionId;
-  secret: string;
-}
-
 export function formatApiKey(lookupId: string, secret: string): string {
   const key = `pgcf_sk_${lookupId}_${secret}`;
   if (!API_KEY_PATTERN.test(key)) throw new TypeError("invalid API key parts");
@@ -66,27 +55,10 @@ export function parseApiKey(key: string): ParsedApiKey | null {
   return { lookupId: match[1]!, secret: match[2]! };
 }
 
-export function formatAgentKey(regionId: RegionId, secret: string): string {
-  const key = `pgcf_ak_${regionId}_${secret}`;
-  if (!AGENT_KEY_PATTERN.test(key))
-    throw new TypeError("invalid agent key parts");
-  return key;
-}
-
-export function parseAgentKey(key: string): ParsedAgentKey | null {
-  const match = AGENT_KEY_PATTERN.exec(key);
-  if (!match) return null;
-  return { regionId: match[1]!, secret: match[2]! };
-}
-
 /** A fresh API key; only its hash is stored. */
 export function newApiKey(): { lookupId: string; key: string } {
   const lookupId = randomString(ID_ALPHABET, API_KEY_LOOKUP_ID_LENGTH);
   return { lookupId, key: formatApiKey(lookupId, newSecret()) };
-}
-
-export function newAgentKey(regionId: RegionId): string {
-  return formatAgentKey(regionId, newSecret());
 }
 
 /** Database role passwords: 32 random bytes, base64url, safe in URIs without escaping. */
@@ -117,7 +89,7 @@ export async function hmacSha256Hex(
   return bytesToHex(new Uint8Array(signature));
 }
 
-/** Stored form of API and agent keys: hex(HMAC-SHA256(pepper, fullKey)). */
+/** Stored form of API keys and enrollment tokens: hex(HMAC-SHA256(pepper, fullKey)). */
 export async function hashApiKey(pepper: string, key: string): Promise<string> {
   if (pepper.length === 0) throw new TypeError("pepper must not be empty");
   return hmacSha256Hex(pepper, key);
