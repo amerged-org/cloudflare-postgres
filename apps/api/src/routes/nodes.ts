@@ -11,6 +11,8 @@ import {
 import {
   NodeAddition,
   NodeAdditionRequest,
+  NodeMaintenance,
+  NodeMaintenanceRequest,
   NodeMarkLost,
   NodeLoss,
 } from "@pgcf/contracts/nodes";
@@ -22,11 +24,13 @@ import {
   cancelNodeAddition,
   getCapacityPolicy,
   getNodeAddition,
+  getNodeMaintenance,
   listNodeAdditions,
   NodeCapacityPolicy,
   NodePurchaseApproval,
   NodeRevision,
   requestNodeAddition,
+  requestNodeMaintenance,
   setCapacityPolicy,
   markLostNode,
   NodeDatabasePlacement,
@@ -108,6 +112,50 @@ export function registerNodes(app: ApiApp): void {
         c,
         NodeId.parse(c.req.param("id")),
         NodeMarkLost.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/nodes/{id}/maintenance",
+      security,
+      tags: ["Nodes"],
+      summary: "Run the maintenance cycle on one node",
+      description:
+        "Closes placement on the node (unless it is closed already) and orders its maintenance cycle (ULTRA plan 9.3): the node holds new wakes with 57P03 and puts every awake database to sleep with the proof, installs exactly the packages that the release of its region pins, reboots if the kernel or core libraries changed, runs its check and reports. A cycle that is done reopens placement if this cycle closed it; a placement an operator closed stays closed, and so does placement after a failed cycle until the next cycle that is done or an operator opens it. Answers 202 with the operation; read it with GET /v1/nodes/{id}/maintenance/{operation}. While a cycle is open, every request answers that cycle. 409: expected_node_uid is not the node's physical identity, the node is lost or fenced, or the node does not run the release of its region yet (assign the release and wait until GET /v1/nodes/{id}/release says converged).",
+      request: {
+        headers,
+        params: z.object({ id: NodeId }),
+        body: body(NodeMaintenanceRequest),
+      },
+      responses: responses(NodeMaintenance, 202, "Maintenance cycle"),
+    },
+    async (c) =>
+      requestNodeMaintenance(
+        c,
+        NodeId.parse(c.req.param("id")),
+        NodeMaintenanceRequest.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/{id}/maintenance/{operation}",
+      security,
+      tags: ["Nodes"],
+      summary: "Read a maintenance cycle of a node",
+      description:
+        "open until the node answers its order, then done or failed with the class of the failure in result_reason, and the times the cycle closed placement, started and ended.",
+      request: { params: z.object({ id: NodeId, operation: OperationId }) },
+      responses: responses(NodeMaintenance, 200, "Maintenance cycle"),
+    },
+    async (c) =>
+      getNodeMaintenance(
+        c,
+        NodeId.parse(c.req.param("id")),
+        OperationId.parse(c.req.param("operation")),
       ),
   );
   register(

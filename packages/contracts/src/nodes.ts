@@ -28,6 +28,33 @@ export const NodeLoss = z.strictObject({
   reason: z.string().min(1).max(500),
 });
 export type NodeLoss = z.infer<typeof NodeLoss>;
+export const NodeMaintenanceRequest = z.strictObject({
+  expected_node_uid: z.uuid(),
+});
+export type NodeMaintenanceRequest = z.infer<typeof NodeMaintenanceRequest>;
+export const NodeMaintenance = z
+  .strictObject({
+    operation: OperationId,
+    node_id: NodeId,
+    status: z
+      .enum(["open", "done", "failed"])
+      .describe(
+        "open: the node has not answered its order yet. done: the node installed the release's packages, rebooted if needed and passed its check; placement is open again unless someone else closed it. failed: see result_reason; placement stays closed.",
+      ),
+    result_reason: z
+      .string()
+      .nullable()
+      .describe("The class of the failure the node reported, such as boot."),
+    placement_closed_at: Timestamp.nullable().describe(
+      "When this cycle closed placement on the node; null if placement was already closed, which the cycle then leaves as it is. A cycle that is done reopens placement only if the node's database_placement_closed_at still has this value.",
+    ),
+    created_at: Timestamp,
+    closed_at: Timestamp.nullable().describe(
+      "When the node answered; a done cycle reopens placement at the same time.",
+    ),
+  })
+  .meta({ id: "NodeMaintenance" });
+export type NodeMaintenance = z.infer<typeof NodeMaintenance>;
 const Selector = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Reference = z.string().min(1).max(512);

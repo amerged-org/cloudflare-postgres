@@ -2,6 +2,7 @@
 import { OperationId, RegionId } from "@pgcf/contracts";
 import {
   NodeAdditionRequest,
+  NodeMaintenanceRequest,
   NodeRegionPolicy,
   ProviderInstanceId,
   CostedNodeApproval,
@@ -31,6 +32,10 @@ import {
 import { runNodeCapacity } from "../domain/node-capacity.ts";
 import { declareNodeLost, runNodeFencingCron } from "../domain/node-loss.ts";
 import { nodeActor } from "../domain/node-hints.ts";
+import {
+  readNodeMaintenance,
+  startNodeMaintenance,
+} from "../domain/lifecycle-orders.ts";
 
 export const NodeCapacityPolicy = NodeRegionPolicy.safeExtend({
   autoscale_enabled: z
@@ -166,6 +171,51 @@ export async function markLostNode(
     ]),
   );
   return c.json(loss);
+}
+export async function maintenanceResponse(
+  c: ApiContext,
+  nodeId: string,
+  operation: string,
+): Promise<Response> {
+  const maintenance = await readNodeMaintenance(c.env.DB, nodeId, operation);
+  if (!maintenance)
+    throw new ApiError("not_found", "Maintenance operation not found");
+  c.header("Location", `/v1/nodes/${nodeId}/maintenance/${operation}`);
+  return c.json(maintenance, 202);
+}
+export async function requestNodeMaintenance(
+  c: ApiContext,
+  id: string,
+  raw: NodeMaintenanceRequest,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  const body = NodeMaintenanceRequest.parse(raw);
+  return withIdempotency(c, {
+    replay: (operation) => maintenanceResponse(c, id, operation),
+    execute: async (lease) => {
+      const maintenance = await startNodeMaintenance(
+        c.env,
+        { nodeId: id, nodeUid: body.expected_node_uid },
+        (operation) =>
+          lease.completeStatement(operation, 202, {
+            sql: "EXISTS(SELECT 1 FROM lifecycle_orders WHERE operation=? AND node_id=?)",
+            bindings: [operation, id],
+          }),
+      );
+      return maintenanceResponse(c, id, maintenance.operation);
+    },
+  });
+}
+export async function getNodeMaintenance(
+  c: ApiContext,
+  id: string,
+  operation: string,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  const maintenance = await readNodeMaintenance(c.env.DB, id, operation);
+  if (!maintenance)
+    throw new ApiError("not_found", "Maintenance operation not found");
+  return c.json(maintenance);
 }
 export async function listNodeAdditions(c: ApiContext): Promise<Response> {
   await requireScope(c, "admin");
