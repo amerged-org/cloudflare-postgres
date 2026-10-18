@@ -217,7 +217,10 @@ impl Restorer<'_> {
 mod tests {
     use super::*;
     use crate::{
-        archive::test_support::{Node, SEGMENT_BYTES, SOURCE, directory, store},
+        archive::{
+            protocol::AGENT_BOUND,
+            test_support::{Node, SEGMENT_BYTES, SOURCE, credential, database, directory, store},
+        },
         credentials::Access,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -265,13 +268,10 @@ mod tests {
         let volume = node.root.join(name);
         // The user and group the agent hands the recovery files to: the test's own.
         let owner = std::fs::metadata(&node.root).unwrap();
-        let database = crate::archive::test_support::database(&volume);
+        let database = database(&volume);
         let new_archive = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g2-op_dddddddddddddddddddd";
         let new_store = store(new_archive, Access::ReadWrite);
-        node.credentials.hold(
-            new_store.scope.clone(),
-            crate::archive::test_support::credential(),
-        );
+        node.credentials.hold(new_store.scope.clone(), credential());
         let source = store(SOURCE, Access::ReadOnly);
         let log = UploadLog::new(volume.join("uploads"));
         let order = Order {
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_backup_the_source_does_not_offer_fails_the_operation_before_anything_is_written() {
-        let node = Node::start("restore-unusable", crate::archive::protocol::AGENT_BOUND).await;
+        let node = Node::start("restore-unusable", AGENT_BOUND).await;
         let segment = Some(SEGMENT_BYTES);
         node.fixture
             .put_backup(SOURCE, "20261017T225300", &entry("FAILED", segment), None);
@@ -343,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_that_does_not_start_is_abandoned_with_its_files_prepared() {
-        let node = Node::start("restore-start", crate::archive::protocol::AGENT_BOUND).await;
+        let node = Node::start("restore-start", AGENT_BOUND).await;
         let files = directory("restore-start-files");
         std::fs::write(files.join("PG_VERSION"), "18\n").unwrap();
         node.fixture.put_backup(
@@ -372,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_target_time_that_is_no_contract_timestamp_fails_before_the_restore_runs() {
-        let node = Node::start("restore-time", crate::archive::protocol::AGENT_BOUND).await;
+        let node = Node::start("restore-time", AGENT_BOUND).await;
         let files = directory("restore-files");
         std::fs::write(files.join("PG_VERSION"), "18\n").unwrap();
         node.fixture.put_backup(

@@ -68,16 +68,16 @@ done
 [ -n "$quiet" ] || echo "Running as unit: fixture.service; invocation ID: 0" >&2
 if [ -n "$env_file" ]; then set -a; . "$env_file"; set +a; fi
 ended="$env_file.ended"
-# The unit's processes are one group, as in a cgroup that is killed whole.
-set -m
-"$@" &
+# The unit's processes are one group, as in a cgroup that is killed whole (perl: `set -m` needs a
+# terminal, which dash does not have here).
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' "$@" &
 command=$!
 if [ -n "$runtime" ]; then
   # The unit's own timer: it outlives this client if the client is killed.
   (
     left=$((runtime * 10))
     while [ $left -gt 0 ] && kill -0 $command 2>/dev/null; do sleep 0.1; left=$((left - 1)); done
-    if kill -0 $command 2>/dev/null; then touch "$ended" 2>/dev/null; kill -TERM -- -$command 2>/dev/null; fi
+    if kill -0 $command 2>/dev/null; then touch "$ended" 2>/dev/null; perl -e 'kill "TERM", -$ARGV[0]' $command 2>/dev/null; fi
   ) &
 fi
 wait $command

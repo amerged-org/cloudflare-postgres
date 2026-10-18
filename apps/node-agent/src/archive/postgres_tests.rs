@@ -9,7 +9,7 @@ use super::{
     protocol::AGENT_BOUND,
     recovery::{self, Restored},
     restore::{End, Failed, Host, Order, Restorer},
-    test_support::{ARCHIVE, CREDENTIAL_CHECK, Node, database, store},
+    test_support::{ARCHIVE, CREDENTIAL_CHECK, Node, credential, database, store},
     upload_log::UploadLog,
 };
 use crate::credentials::Access;
@@ -349,10 +349,7 @@ async fn restore(
         &format!("s3://pgcf-eu/eu-dev/zyxwvutsrqponmlkjihg/g{generation}-{OPERATION}"),
         Access::ReadWrite,
     );
-    node.credentials.hold(
-        own.scope.clone(),
-        crate::archive::test_support::credential(),
-    );
+    node.credentials.hold(own.scope.clone(), credential());
     let source = store(ARCHIVE, Access::ReadOnly);
     let log = UploadLog::new(pg.volume.join("uploads"));
     let owner = fs::metadata(&pg.volume).unwrap();
