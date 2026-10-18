@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import test from "node:test";
 
 const image = new URL("mkosi.extra/", import.meta.url);
@@ -94,4 +94,17 @@ test("the database directory is traversable but not listable: tmpfiles resets it
   const directory = tmpfiles.find((fields) => fields[1] === "/var/lib/pgcf/db");
   // The agent creates it 0711 (store.rs); a tenant must reach its own directory but not list the IDs.
   assert.deepEqual(directory?.slice(0, 5), ["d", "/var/lib/pgcf/db", "0711", "root", "root"]);
+});
+
+test("systemd's ssh generator is masked and off on the kernel command line: no sshd socket for a database's user", () => {
+  // With sshd installed, systemd 257 binds it to /run/ssh-unix-local/socket (mode 0666) and to vsock.
+  const mask = new URL("etc/systemd/system-generators/systemd-ssh-generator", image);
+  assert.equal(lstatSync(mask).isSymbolicLink(), true);
+  assert.equal(readlinkSync(mask), "/dev/null");
+  const kernels = readFileSync(new URL("efi/grub/grub.cfg", image), "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("linux "));
+  assert.equal(kernels.length, 2, "the current and the previous kernel");
+  for (const line of kernels) assert.ok(line.split(/\s+/).includes("systemd.ssh_auto=no"), line);
 });

@@ -196,7 +196,7 @@ so apt kernel updates need nothing from mkosi. The static [grub.cfg](mkosi.extra
 boots `/vmlinuz` and `/initrd.img`, which Debian's kernel packages point at the newest kernel, and
 offers the previous kernel through the `.old` links. A one-shot boot of the previous kernel:
 `grub-editenv /efi/grub/grubenv set next_entry=previous`, then reboot. The kernel console is on
-`tty0` (Contabo VNC) and `ttyS0`.
+`tty0` (Contabo VNC) and `ttyS0`. Both entries carry `systemd.ssh_auto=no`.
 
 ## Units
 
@@ -337,6 +337,10 @@ while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
 - **No inbound surface.** [nftables.conf](mkosi.extra/etc/nftables.conf) drops all inbound traffic
   except replies to the node's own flows and IPv6 neighbour discovery (hop limit 255). sshd, the
   gateway and cloudflared's metrics listen on loopback only; PostgreSQL listens on no address.
+- **No ssh socket.** With sshd installed, systemd 257's `systemd-ssh-generator` binds it to the Unix
+  socket `/run/ssh-unix-local/socket` (mode 0666, which a database's user reaches, because its unit
+  allows `AF_UNIX`) and to vsock. The image masks the generator (a link to `/dev/null` in
+  `/etc/systemd/system-generators`) and both kernel lines of grub.cfg carry `systemd.ssh_auto=no`.
 - **Kernel.** [90-pgcf.conf](mkosi.extra/usr/lib/sysctl.d/90-pgcf.conf) turns off unprivileged user
   namespaces and BPF, turns off io_uring (`kernel.io_uring_disabled = 2`: nothing on the node uses
   it, and PostgreSQL runs `io_method=worker`) and the autoload of terminal line disciplines,
@@ -408,5 +412,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
-| Second | no failed unit; loopback only; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
+| First | no failed unit; nothing listens outside loopback; no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
+| Second | no failed unit; loopback only; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |

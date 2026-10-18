@@ -56,6 +56,23 @@ loopback_only() {
 	}
 }
 
+# Plan 8: with sshd installed, systemd 257's ssh generator binds it to /run/ssh-unix-local/socket
+# (mode 0666, so a database's user could reach it) and to vsock. The image masks the generator and
+# the kernel command line turns it off, so no ssh socket exists. The journal socket proves that the
+# listings worked.
+no_ssh_socket() {
+	local sockets units pattern='ssh-unix-local|sshd-unix-local|sshd-vsock'
+	sockets=$(ss --listening --unix --numeric --no-header) || return 1
+	units=$(systemctl list-sockets --all --no-legend --plain) || return 1
+	grep -q 'systemd-journald\.socket' <<<"$units" || {
+		echo "no socket listing"
+		return 1
+	}
+	if grep -E "$pattern" <<<"$sockets" || grep -E "$pattern" <<<"$units"; then
+		false
+	fi
+}
+
 inbound_dropped() {
 	nft list chain inet pgcf input | grep -q 'policy drop;'
 }
@@ -213,6 +230,7 @@ backup_slice_top_level() {
 
 check no_failed_units no_failed_units
 check loopback_only loopback_only
+check no_ssh_socket no_ssh_socket
 check inbound_dropped inbound_dropped
 check binaries binaries
 check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
