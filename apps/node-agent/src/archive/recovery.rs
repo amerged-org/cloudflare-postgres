@@ -54,30 +54,43 @@ pub fn settings(fetch_command: &str, target_time: Option<&str>) -> Option<String
 pub fn spool_directory(volume: &Path, operation: &str) -> PathBuf {
     volume.join(format!("spool-{operation}"))
 }
+/// An entry that is not there is as good as removed.
+fn absent_is_done(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
 /// Writes the settings and the signal file into the restored data directory, readable by the
 /// database's user alone.
+///
+/// The directory is the source database's, and its user can leave anything under either name,
+/// while the agent runs as root. An entry that is there is unlinked, which follows nothing and
+/// does not wait on a pipe. The file is then created exclusively, which fails on a link that
+/// appears in between instead of following it, and is handed over by its descriptor.
 pub fn prepare(data_directory: &Path, settings: &str, uid: u32, gid: u32) -> io::Result<()> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    if !std::fs::symlink_metadata(data_directory)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the restored data directory is no directory",
+        ));
+    }
     for (file, content) in [(SETTINGS_FILE, settings), (SIGNAL_FILE, "")] {
-        let path = data_directory.join(file);
+        absent_is_done(std::fs::remove_file(data_directory.join(file)))?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(&path)?;
+            .open(data_directory.join(file))?;
         file.write_all(content.as_bytes())?;
-        std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
         file.sync_all()?;
     }
     std::fs::File::open(data_directory)?.sync_all()
 }
 /// Removes the settings, the signal file and the operation's spool.
 pub fn finish(data_directory: &Path, spool: &Path) -> io::Result<()> {
-    let absent_is_done = |result: io::Result<()>| match result {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
-    };
     absent_is_done(std::fs::remove_file(data_directory.join(SETTINGS_FILE)))?;
     absent_is_done(std::fs::remove_file(data_directory.join(SIGNAL_FILE)))?;
     absent_is_done(std::fs::remove_dir_all(spool))
@@ -189,6 +202,87 @@ mod tests {
         assert!(!spool.exists());
         // Finishing twice, or after PostgreSQL removed its signal file, is not an error.
         finish(&data, &spool).unwrap();
+    }
+
+    /// Runs `prepare` where a pipe could block it, and gives it five seconds.
+    fn prepare_within_five_seconds(data: &Path, text: &str) -> io::Result<()> {
+        let owner = std::fs::metadata(data).unwrap();
+        let (data, text) = (data.to_path_buf(), text.to_string());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(prepare(&data, &text, owner.uid(), owner.gid()));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("prepare blocked on an entry of the restored directory")
+    }
+
+    /// The restored directory is the source database's: its user can leave a link or a pipe under
+    /// either name for the agent, which prepares the directory as root.
+    #[test]
+    fn prepare_replaces_a_link_or_a_pipe_of_the_restored_directory_and_follows_none() {
+        let volume = crate::archive::test_support::directory("planted");
+        let data = volume.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let state = volume.join("agent-state");
+        std::fs::write(&state, "fence").unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let created = volume.join("created-by-a-link");
+        // One link to a file of the node, one to a file that does not exist.
+        std::os::unix::fs::symlink("../agent-state", data.join(SETTINGS_FILE)).unwrap();
+        std::os::unix::fs::symlink(&created, data.join(SIGNAL_FILE)).unwrap();
+        prepare_within_five_seconds(&data, "restore_command = 'x %f %p'\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "fence");
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!created.exists());
+        for file in [SETTINGS_FILE, SIGNAL_FILE] {
+            let metadata = std::fs::symlink_metadata(data.join(file)).unwrap();
+            assert!(metadata.file_type().is_file(), "{file}");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600, "{file}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(data.join(SETTINGS_FILE)).unwrap(),
+            "restore_command = 'x %f %p'\n"
+        );
+
+        // A pipe would block an agent that opens it.
+        let piped = volume.join("piped");
+        std::fs::create_dir_all(&piped).unwrap();
+        for file in [SETTINGS_FILE, SIGNAL_FILE] {
+            let made = std::process::Command::new("mkfifo")
+                .arg(piped.join(file))
+                .status()
+                .unwrap();
+            assert!(made.success());
+        }
+        prepare_within_five_seconds(&piped, "a = 1\n").unwrap();
+        for file in [SETTINGS_FILE, SIGNAL_FILE] {
+            let metadata = std::fs::symlink_metadata(piped.join(file)).unwrap();
+            assert!(metadata.file_type().is_file(), "{file}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(piped.join(SETTINGS_FILE)).unwrap(),
+            "a = 1\n"
+        );
+    }
+
+    #[test]
+    fn prepare_refuses_a_data_directory_that_is_a_link_and_a_directory_in_place_of_a_file() {
+        let volume = crate::archive::test_support::directory("planted-directory");
+        let elsewhere = volume.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, volume.join("data")).unwrap();
+        assert!(prepare_within_five_seconds(&volume.join("data"), "a = 1\n").is_err());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+
+        let data = volume.join("real");
+        std::fs::create_dir_all(data.join(SETTINGS_FILE)).unwrap();
+        std::fs::write(data.join(SETTINGS_FILE).join("kept"), "x").unwrap();
+        assert!(prepare_within_five_seconds(&data, "a = 1\n").is_err());
+        assert!(data.join(SETTINGS_FILE).join("kept").exists());
     }
 
     fn backup() -> Backup {
