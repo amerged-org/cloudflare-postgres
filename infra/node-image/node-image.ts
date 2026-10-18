@@ -3,6 +3,7 @@
 //   node infra/node-image/node-image.ts resolve [--work DIR]
 //   node infra/node-image/node-image.ts fetch   [--work DIR]
 //   node infra/node-image/node-image.ts build   --binaries DIR [--work DIR] [--release NAME]
+//   node infra/node-image/node-image.ts advisories [--work DIR]
 // The work directory defaults to .local/node-image; with Docker in a VM it must be a path the VM
 // shares (Colima and Docker Desktop share the home directory).
 import { spawnSync } from "node:child_process";
@@ -15,10 +16,12 @@ import { pipeline } from "node:stream/promises";
 import { digestBinaries } from "./binaries.ts";
 import {
   aptListName,
+  behindLock,
   compareInstalled,
   debFileName,
   debianRepositories,
   installedFromManifest,
+  liveRepositories,
   lockPackages,
   parsePackagesIndex,
   snapshotEpoch,
@@ -130,14 +133,16 @@ function buildBuilder(lock: PackageLock): string {
 function runBuilder(
   tag: string,
   lock: PackageLock,
-  mode: "resolve" | "build",
-  mounts: { debs: string; out: string; binaries?: string },
+  mode: "resolve" | "build" | "advisories",
+  mounts: { debs?: string; out: string; binaries?: string },
   release: string,
 ): void {
   run("docker", [
-    "run", "--rm", "--privileged",
+    "run", "--rm",
+    // mkosi's sandbox needs it; the advisories only run apt.
+    ...(mode === "advisories" ? [] : ["--privileged"]),
     "--volume", `${here}:/src:ro`,
-    "--volume", `${mounts.debs}:/debs:ro`,
+    ...(mounts.debs ? ["--volume", `${mounts.debs}:/debs:ro`] : []),
     ...(mounts.binaries ? ["--volume", `${mounts.binaries}:/binaries:ro`] : []),
     "--volume", `${mounts.out}:/out`,
     "--env", `PGCF_DEBIAN_SNAPSHOT=${lock.debian.snapshot}`,
@@ -145,6 +150,7 @@ function runBuilder(
     "--env", `PGCF_RELEASE=${release}`,
     "--env", `PGCF_PGDG_URL=${lock.pgdg.url}`,
     "--env", `PGCF_PGDG_SUITE=${lock.pgdg.suite}`,
+    "--env", `PGCF_PGDG_FINGERPRINT=${lock.pgdg.key.fingerprint}`,
     tag, mode,
   ]);
 }
@@ -184,6 +190,34 @@ async function resolveLock(work: string): Promise<void> {
   validateLock(updated);
   await writeFile(lockPath, `${JSON.stringify(updated, null, 2)}\n`);
   console.log(`locked ${packages.length} packages at snapshot ${lock.debian.snapshot}`);
+}
+
+// The locked packages that today's trixie-security, trixie-updates and PGDG indexes list at a newer
+// version, one "name locked available suite" line each. The run fails if there is any.
+async function checkAdvisories(work: string): Promise<void> {
+  const lock = await readLock();
+  const out = join(work, "advisories");
+  await rm(out, { recursive: true, force: true });
+  await mkdir(out, { recursive: true });
+  runBuilder(buildBuilder(lock), lock, "advisories", { out }, "advisories");
+
+  const locked = new Map([...lock.extra, ...lock.packages].map((entry) => [entry.name, entry.version]));
+  const behind: string[] = [];
+  for (const repository of liveRepositories()) {
+    const name = aptListName(repository);
+    if (!existsSync(join(out, "lists", name))) throw new Error(`missing signed index ${name}`);
+    const records = parsePackagesIndex(await readFile(join(out, "lists", name), "utf8"));
+    for (const record of behindLock(lock, records)) {
+      behind.push(`${record.name} ${locked.get(record.name)} ${record.version} ${repository.suite}`);
+    }
+  }
+  if (behind.length > 0) {
+    console.log(behind.join("\n"));
+    console.error(`${behind.length} locked packages have a newer version; resolve a newer snapshot`);
+    process.exitCode = 1;
+  } else {
+    console.log("the lock is current");
+  }
 }
 
 async function fetchLocked(work: string): Promise<PackageLock> {
@@ -243,6 +277,9 @@ switch (command) {
   case "fetch":
     await fetchLocked(work);
     break;
+  case "advisories":
+    await checkAdvisories(work);
+    break;
   case "build": {
     const binaries = option("binaries");
     if (!binaries) throw new Error("--binaries DIR is required: the image bakes in the four binaries a release pins");
@@ -250,6 +287,6 @@ switch (command) {
     break;
   }
   default:
-    console.error("usage: node-image.ts resolve|fetch [--work DIR] | build --binaries DIR [--work DIR] [--release NAME]");
+    console.error("usage: node-image.ts resolve|fetch|advisories [--work DIR] | build --binaries DIR [--work DIR] [--release NAME]");
     process.exit(2);
 }

@@ -33,6 +33,7 @@ From the repository root, with Docker:
 
 ```sh
 node infra/node-image/node-image.ts resolve   # only when changing the snapshot or the package set
+node infra/node-image/node-image.ts advisories # does the lock lag Debian security, updates or PGDG?
 node infra/node-image/node-image.ts build --binaries DIR --release NAME
 node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw --accel kvm
 ```
@@ -44,6 +45,16 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
   highest version, and the PGDG archive also holds the release candidates of the next major version
   (it once handed the image `19~rc1`). `validateLock` refuses every locked version that contains
   `~alpha`, `~beta` or `~rc`.
+- **advisories** asks whether the lock lags the archives it was resolved from. In the builder it
+  runs `apt-get update` against the live `trixie-security` and `trixie-updates` suites of
+  `deb.debian.org` and `trixie-pgdg` of `apt.postgresql.org`, verified with the container's
+  `debian-archive-keyring` and with `keys/pgdg.asc` for the locked fingerprint. It prints
+  `name locked available suite` for every locked package (the `.deb` list and `extra`) that one of
+  these suites lists at a newer Debian version, and exits 1 if there is any. Nothing is installed or
+  written to the lock; the remedy is `resolve` with a newer snapshot (the first
+  [snapshot.debian.org](https://snapshot.debian.org/archive/debian-security/) timestamp whose
+  `trixie-security` index lists the new versions), then a new image release. The check holds no
+  secret.
 - **build** downloads every locked `.deb` (size and sha256 checked, three attempts each), serves
   them as the only repository (mkosi `LocalMirror=`) and builds offline. The build fails if the
   installed set differs from the lock in any package or version. It writes `pgcf-node.raw`,
@@ -69,6 +80,10 @@ or a binary that is not the one in the image fails the job; on a push to `main` 
 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`. The job holds no
 secret, so it uploads nothing to R2 and registers nothing: that is the operator's step
 ([Registering a release](#registering-a-release)).
+
+The CI job `advisories` runs `advisories` every day at 05:23 UTC (the workflow's `schedule`) and on a
+manual dispatch with the input `advisories`; the other jobs skip on both. A red run means that a
+Debian security update, a `trixie-updates` change or a PGDG release is waiting for a new lock.
 
 ## Registering a release
 

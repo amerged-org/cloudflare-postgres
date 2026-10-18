@@ -69,6 +69,15 @@ export function debianRepositories(lock: PackageLock): Repository[] {
   ];
 }
 
+// The suites an image update draws from, as they are today rather than at the snapshot.
+export function liveRepositories(): Repository[] {
+  return [
+    { base: "https://deb.debian.org/debian-security", suite: "trixie-security" },
+    { base: "https://deb.debian.org/debian", suite: "trixie-updates" },
+    { base: "https://apt.postgresql.org/pub/repos/apt", suite: "trixie-pgdg" },
+  ];
+}
+
 // apt's URItoFileName: drop the scheme, quote reserved characters, turn "/" into "_".
 export function aptListName(repository: Repository): string {
   const uri = `${repository.base}/dists/${repository.suite}/main/binary-amd64/Packages`;
@@ -115,6 +124,69 @@ export function parsePackagesIndex(text: string): IndexRecord[] {
     });
   }
   return records;
+}
+
+// dpkg's comparison of one upstream or revision string (Debian Policy 5.6.12): runs of non-digits
+// compare character by character ("~" before everything, even the end; letters before other
+// characters), runs of digits compare as numbers.
+function compareVersionPart(a: string, b: string): number {
+  const isDigit = (character: string | undefined) => character !== undefined && character >= "0" && character <= "9";
+  const order = (character: string | undefined) => {
+    if (character === undefined || isDigit(character)) return 0;
+    if (character === "~") return -1;
+    const code = character.charCodeAt(0);
+    return /[A-Za-z]/.test(character) ? code : code + 256;
+  };
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    while ((i < a.length && !isDigit(a[i])) || (j < b.length && !isDigit(b[j]))) {
+      const difference = order(a[i]) - order(b[j]);
+      if (difference !== 0) return Math.sign(difference);
+      i++;
+      j++;
+    }
+    const startA = i;
+    const startB = j;
+    while (isDigit(a[i])) i++;
+    while (isDigit(b[j])) j++;
+    const digitsA = a.slice(startA, i).replace(/^0+/, "");
+    const digitsB = b.slice(startB, j).replace(/^0+/, "");
+    if (digitsA.length !== digitsB.length) return digitsA.length < digitsB.length ? -1 : 1;
+    if (digitsA !== digitsB) return digitsA < digitsB ? -1 : 1;
+  }
+  return 0;
+}
+
+function splitVersion(version: string): { epoch: number; upstream: string; revision: string } {
+  const colon = version.indexOf(":");
+  const rest = colon === -1 ? version : version.slice(colon + 1);
+  const hyphen = rest.lastIndexOf("-");
+  return {
+    epoch: colon === -1 ? 0 : Number(version.slice(0, colon)),
+    upstream: hyphen === -1 ? rest : rest.slice(0, hyphen),
+    revision: hyphen === -1 ? "" : rest.slice(hyphen + 1),
+  };
+}
+
+// -1, 0 or 1 as `a` sorts before, with or after `b` in dpkg's version order.
+export function compareDebianVersions(a: string, b: string): number {
+  const left = splitVersion(a);
+  const right = splitVersion(b);
+  return (
+    Math.sign(left.epoch - right.epoch) ||
+    compareVersionPart(left.upstream, right.upstream) ||
+    compareVersionPart(left.revision, right.revision)
+  );
+}
+
+// The records of an index that carry a locked package's name at a newer version.
+export function behindLock(lock: PackageLock, records: IndexRecord[]): IndexRecord[] {
+  const locked = new Map([...lock.extra, ...lock.packages].map((entry) => [entry.name, entry.version]));
+  return records.filter((record) => {
+    const version = locked.get(record.name);
+    return version !== undefined && compareDebianVersions(record.version, version) > 0;
+  });
 }
 
 export function key(item: InstalledPackage): string {
