@@ -743,8 +743,11 @@ const subjectObservation = (
       ? { state: "retain" }
       : { state: "resolved" };
 
+/** A refused enrollment keeps its episode this long after the last refusal (plan 8). */
+const ENROLLMENT_REFUSAL_ALERT_MS = 24 * 3_600_000;
 const HEALTH_KINDS = [
   "regional_node_stale",
+  "node_enrollment_refused",
   "infrastructure_backup_failed",
   "infrastructure_backup_stale",
   "database_archive_failing",
@@ -789,6 +792,13 @@ async function regionHealthAlerts(
       ),
     )
     .slice(0, 64);
+  // The nodes whose enrollment token was presented in vain, newest first.
+  const refused = await env.DB.prepare(
+    `SELECT i.node_id FROM node_installs i JOIN node_additions a ON a.node_id=i.node_id
+     WHERE a.region_id=? AND i.refused_at>=? ORDER BY i.refused_at DESC,i.node_id LIMIT 64`,
+  )
+    .bind(regionId, new Date(now - ENROLLMENT_REFUSAL_ALERT_MS).toISOString())
+    .all<{ node_id: string }>();
   const backups = (health ?? []).filter(
       (value) => value.region_id === regionId,
     ),
@@ -838,6 +848,16 @@ async function regionHealthAlerts(
             state: "active",
             detail: { node_ids: failedNodes.map((node) => node.id) },
             subjects: failedNodes.map((node) => node.id),
+          }
+        : { state: "resolved" },
+    ],
+    [
+      "node_enrollment_refused",
+      refused.results.length
+        ? {
+            state: "active",
+            detail: { node_ids: refused.results.map((node) => node.node_id) },
+            subjects: refused.results.map((node) => node.node_id),
           }
         : { state: "resolved" },
     ],

@@ -109,7 +109,15 @@ export async function publishPowerObservation(
                   last_archived_segment: "000000010000000000000002",
                   proven_at: new Date().toISOString(),
                 },
-          backup: null,
+          // A ready database has the DONE base backup of its storage generation.
+          backup:
+            state === "awake"
+              ? {
+                  backup_id: "20261017T110000",
+                  timeline: 1,
+                  completed_at: new Date().toISOString(),
+                }
+              : null,
           archive: { last_segment: null, ready_files: 0, failing_since: null },
         },
       ],

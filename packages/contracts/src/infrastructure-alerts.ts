@@ -18,11 +18,12 @@ export const InfraAlertKind = z
     "thin_storage_blocked",
     "control_cron_stalled",
     "control_cron_step_failing",
+    "node_enrollment_refused",
   ])
   .describe(
     "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: the daily D1 backup stored in the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm. Thresholds come from the region's capacity policy. " +
       "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's fresh physical sample shows the thin pool without data or metadata room (thin_pool_no_room: no database starts or attaches there), or a pool that holds thin volumes has no physical sample of at most 120 s (thin_pool_unobserved); thin_storage lists each node with its thin_pool_* error_code. " +
-      "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
+      "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). node_enrollment_refused: a node's enrollment token was presented again with another key or after it expired during the last 24 h (node_ids, at most 64); the refused token never enrolls a node. The database, Thin storage, enrollment and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
   );
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
 
@@ -54,6 +55,8 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
     "The minute cron has not completed a run for over 5 minutes. Check the Worker's cron trigger and logs (cron_step_failed, cron_completed) and redeploy the Worker if its trigger is missing.",
   control_cron_step_failing:
     "A cron step failed in each of its last runs. Read the Worker logs for cron_step_failed with the step named in cron.failing_steps and fix its cause; later steps keep running.",
+  node_enrollment_refused:
+    "A node's enrollment token was used again with another key, or after it expired. If you did not retry the install, treat the token as leaked: read the node_enrollment_refused log for the node and reinstall it, which issues new tokens.",
 };
 
 const Ppm = z.number().int().min(0).max(1_000_000);

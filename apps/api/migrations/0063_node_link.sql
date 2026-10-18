@@ -58,6 +58,19 @@ INSERT INTO regions(id,provider,provider_region,gateway_url,gateway_binding,back
   backup_endpoint_url,created_at,updated_at)
 SELECT id,provider,provider_region,gateway_url,gateway_binding,backup_bucket,backup_endpoint_url,
   created_at,updated_at FROM node_link_keep_regions;
+-- Alert episodes gain the refused enrollment. SQLite cannot widen a CHECK in place, so the table is
+-- rebuilt as 0053 did and the episodes copied before `regions` went are put back unchanged.
+DROP TABLE infrastructure_alerts;
+CREATE TABLE infrastructure_alerts (
+  region_id TEXT NOT NULL REFERENCES regions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN('regional_ram_warning','regional_node_cap_reached','regional_node_stale','infrastructure_backup_failed','infrastructure_backup_stale','regional_node_ram_warning','regional_node_cpu_warning','regional_node_storage_warning','database_archive_failing','database_base_backup_stale','thin_storage_blocked','database_storage_protected','control_cron_stalled','control_cron_step_failing','node_enrollment_refused')),
+  active INTEGER NOT NULL CHECK(active IN(0,1)),
+  event_id TEXT NOT NULL UNIQUE,
+  payload TEXT NOT NULL CHECK(json_valid(payload) AND length(payload)<=4096),
+  delivered_at TEXT,
+  last_attempt_at TEXT,
+  PRIMARY KEY(region_id,kind)
+) STRICT;
 INSERT INTO admission_scope_fences SELECT * FROM node_link_keep_scope_fences;
 INSERT INTO infrastructure_alerts SELECT * FROM node_link_keep_alerts;
 DROP TABLE node_link_keep_regions;
@@ -99,7 +112,13 @@ CREATE TABLE node_installs (
   enrolled_at TEXT,
   enrolled_public_key TEXT,
   enrolled_node_uid TEXT,
-  CHECK((enrolled_at IS NULL)=(enrolled_public_key IS NULL) AND (enrolled_at IS NULL)=(enrolled_node_uid IS NULL))
+  -- The last time the right token was presented in vain: after the node enrolled with another key,
+  -- or after the token expired. It raises an alert; a new install of a node that did not enroll
+  -- starts clean.
+  refused_at TEXT,
+  refusal TEXT CHECK(refusal IS NULL OR refusal IN('repeat','expired')),
+  CHECK((enrolled_at IS NULL)=(enrolled_public_key IS NULL) AND (enrolled_at IS NULL)=(enrolled_node_uid IS NULL)),
+  CHECK((refused_at IS NULL)=(refusal IS NULL))
 ) STRICT;
 
 -- One row per node and minute (plan 4.8, 4.9): what placement reads. Sums and counts keep the

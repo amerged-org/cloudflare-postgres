@@ -77,7 +77,7 @@ export async function issueNodeInstall(
      VALUES(?,?,?,?,?,?,?)
      ON CONFLICT(node_id) DO UPDATE SET image_version=excluded.image_version,token_hash=excluded.token_hash,
        progress_hash=excluded.progress_hash,allowed_sources_json=excluded.allowed_sources_json,checkpoints_json='[]',
-       progress_closed_at=NULL,issued_at=excluded.issued_at,expires_at=excluded.expires_at
+       progress_closed_at=NULL,issued_at=excluded.issued_at,expires_at=excluded.expires_at,refused_at=NULL,refusal=NULL
      WHERE node_installs.enrolled_at IS NULL`,
   )
     .bind(
@@ -234,13 +234,27 @@ export async function enrollNode(
   if (!row || !timingSafeEqual(row.token_hash, hash))
     throw refuse("token", "unauthorized");
   const now = new Date().toISOString();
+  // The right token presented in vain, by another key or too late, raises an alert (plan 8): the
+  // refusal is recorded for the minute cron to judge.
+  const refuseInVain = async (
+    reason: "repeat" | "expired",
+    code: "unauthorized" | "conflict",
+  ) => {
+    await c.env.DB.prepare(
+      "UPDATE node_installs SET refused_at=?,refusal=? WHERE node_id=?",
+    )
+      .bind(now, reason, request.node_id)
+      .run();
+    return refuse(reason, code);
+  };
   if (row.enrolled_at !== null) {
     if (row.enrolled_public_key !== request.public_key || row.expires_at <= now)
-      throw refuse("repeat", "conflict");
+      throw await refuseInVain("repeat", "conflict");
     const same = await identityOf(c.env, request.node_id);
     if (same !== null) return c.json(same);
   }
-  if (row.expires_at <= now) throw refuse("expired", "unauthorized");
+  if (row.expires_at <= now)
+    throw await refuseInVain("expired", "unauthorized");
   if (request.image_version !== row.image_version)
     throw refuse("image", "conflict");
   if (

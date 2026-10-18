@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
-import { INSTALLER_CHECKPOINTS, NodeEnrollmentResponse } from "@pgcf/contracts";
+import {
+  INFRA_ALERT_ACTIONS,
+  INSTALLER_CHECKPOINTS,
+  InfraAlert,
+  NodeEnrollmentResponse,
+} from "@pgcf/contracts";
+import {
+  infrastructureAlertStatus,
+  runInfrastructureHealthAlerts,
+} from "../../src/domain/infrastructure-alerts.ts";
 import {
   installSources,
   issueNodeInstall,
@@ -350,5 +359,101 @@ describe("enrolling a node", () => {
       .bind(i.id)
       .run();
     expect((await enroll(i.request)).status).toBe(409);
+  });
+});
+
+describe("an enrollment that raises an alert", () => {
+  const refusal = (node: string) =>
+    env.DB.prepare(
+      "SELECT refusal,refused_at FROM node_installs WHERE node_id=?",
+    )
+      .bind(node)
+      .first<{ refusal: string | null; refused_at: string | null }>();
+  const episode = (region: string) =>
+    infrastructureAlertStatus(env.DB, region).then((all) =>
+      all.find((alert) => alert.kind === "node_enrollment_refused"),
+    );
+  async function evaluate(now: number) {
+    const events: InfraAlert[] = [];
+    await runInfrastructureHealthAlerts(
+      {
+        ...env,
+        INFRASTRUCTURE_ALERT_WEBHOOK_URL: "https://receiver.invalid/events",
+        INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN: "test-alert-receiver-token",
+      },
+      now,
+      async (_url, init) => {
+        events.push(InfraAlert.parse(JSON.parse(init!.body as string)));
+        return new Response(null, { status: 204 });
+      },
+    );
+    // A day on, the fixture's node is stale as well; only the enrollment kind is judged here.
+    return events.filter((event) => event.kind === "node_enrollment_refused");
+  }
+
+  it("is raised by a second enrollment with another key, names the node and ends after a day", async () => {
+    const i = await installed();
+    expect((await enroll(i.request)).status).toBe(200);
+    expect(await refusal(i.id)).toEqual({ refusal: null, refused_at: null });
+    // The same key is the lost answer coming again; another key is the token in other hands.
+    expect((await enroll(i.request)).status).toBe(200);
+    expect(await episode(i.f.region)).toBeUndefined();
+    const other = await newKey();
+    expect(
+      (await enroll({ ...i.request, public_key: other.publicKey })).status,
+    ).toBe(409);
+    expect(await refusal(i.id)).toMatchObject({ refusal: "repeat" });
+    const now = Date.now();
+    const events = await evaluate(now);
+    expect(events).toMatchObject([
+      {
+        kind: "node_enrollment_refused",
+        region_id: i.f.region,
+        node_ids: [i.id],
+      },
+    ]);
+    expect(events[0]!.action).toBe(INFRA_ALERT_ACTIONS.node_enrollment_refused);
+    expect(await episode(i.f.region)).toMatchObject({ active: true });
+    // The episode is sent once while it stands, and a day after the refusal it ends.
+    expect(await evaluate(now + 60_000)).toEqual([]);
+    expect(await evaluate(now + 25 * 3_600_000)).toEqual([]);
+    expect(await episode(i.f.region)).toMatchObject({ active: false });
+  });
+
+  it("is raised by an expired token, and not by a token nobody holds or a wrong address", async () => {
+    const i = await installed();
+    expect(
+      (
+        await enroll({
+          ...i.request,
+          enrollment_token: `pgcf_et_${"b".repeat(43)}`,
+        })
+      ).status,
+    ).toBe(401);
+    expect((await enroll(i.request, "192.0.2.99")).status).toBe(403);
+    expect(await refusal(i.id)).toEqual({ refusal: null, refused_at: null });
+    await env.DB.prepare(
+      "UPDATE node_installs SET expires_at=?,issued_at=? WHERE node_id=?",
+    )
+      .bind(
+        new Date(Date.now() - 1000).toISOString(),
+        new Date(Date.now() - 2000).toISOString(),
+        i.id,
+      )
+      .run();
+    expect((await enroll(i.request)).status).toBe(401);
+    expect(await refusal(i.id)).toMatchObject({ refusal: "expired" });
+    expect(await evaluate(Date.now())).toMatchObject([
+      { kind: "node_enrollment_refused", node_ids: [i.id] },
+    ]);
+    // A new install of a node that did not enroll starts clean.
+    await issueNodeInstall(env, {
+      node_id: i.id,
+      image_version: "1.2.0",
+      sources,
+    });
+    expect(await refusal(i.id)).toEqual({ refusal: null, refused_at: null });
+    await evaluate(Date.now());
+    expect(await episode(i.f.region)).toMatchObject({ active: false });
   });
 });

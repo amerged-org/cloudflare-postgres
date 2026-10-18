@@ -903,6 +903,7 @@ measurement is fresh and below the threshold.
 | `database_archive_failing` | a running, awake database reports `health.archiving: failing` | fixed (from the release with migration `0052`) |
 | `database_base_backup_stale` | an awake database has no completed base backup within 36 h of awake time; hibernated ones are excluded and a wake restarts the count | fixed (same release) |
 | `thin_storage_blocked` | a node's thin pool has no data or metadata room, or a pool that holds thin volumes has no fresh sample (`thin_pool_*`) | fixed (same release) |
+| `node_enrollment_refused` | a node's enrollment token was presented again with another key, or after it expired, within the last 24 h | fixed |
 | `control_cron_stalled`, `control_cron_step_failing` | no minute-cron run completed for 300 s, or a step failed in each of its last 5 runs | fixed (same release) |
 
 Thresholds are integer parts per million (1,000,000 = 100 %, valid 1 to 1,000,000, `null`

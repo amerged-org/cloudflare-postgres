@@ -137,6 +137,35 @@ it("drops the releases of the Talos spec and the per-node release tables", () =>
     "node_orders",
   ])
     expect(tables).toContain(kept);
+  // A release is a node image: nothing may still demand a PostgreSQL image in a region's release,
+  // or no database could be created once a region has one.
+  expect(
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='database_postgres_release_supported'",
+      )
+      .all(),
+  ).toEqual([]);
+});
+
+it("widens the alert kinds with the refused enrollment and keeps the episodes", () => {
+  populate();
+  apply("0063_node_link.sql");
+  const alert = (kind: string) =>
+    run(
+      `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
+       VALUES('eu-test',?,1,?,'{}')`,
+      kind,
+      crypto.randomUUID(),
+    );
+  alert("node_enrollment_refused");
+  expect(() => alert("regional_node_disk_warning")).toThrow(/CHECK/);
+  expect(
+    db.prepare("SELECT kind FROM infrastructure_alerts ORDER BY kind").all(),
+  ).toEqual([
+    { kind: "node_enrollment_refused" },
+    { kind: "regional_node_stale" },
+  ]);
 });
 
 it("keeps one row per node and minute, one volume per storage generation and one order per operation", () => {
