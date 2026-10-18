@@ -22,3 +22,6 @@ worker-configuration.d.ts
 
 # Local agent harness state
 .claude/
+
+# The Edge benchmark extracts a base ref here while it runs
+apps/edge/bench/.base-src/

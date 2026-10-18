@@ -6,6 +6,7 @@
   "include": [
     "src/**/*.ts",
     "test/**/*.ts",
+    "bench/**/*.ts",
     "*.ts",
     "worker-configuration.d.ts"
   ]
