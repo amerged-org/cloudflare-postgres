@@ -58,6 +58,10 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   // setNodeDatabasePlacement's failed identity CAS is 409 even for a missing/lost node.
   "PUT /v1/nodes/{id}/database-placement": [400, 401, 403, 409, 500],
   "POST /v1/nodes/{id}/mark-lost": [400, 401, 403, 404, 409, 500],
+  "GET /v1/nodes/{id}/loss": [400, 401, 403, 404, 500],
+  "POST /v1/nodes/{id}/reinstall-override": [400, 401, 403, 404, 409, 500],
+  "POST /v1/databases/{id}/move": [400, 401, 403, 404, 409, 500],
+  "GET /v1/databases/{id}/moves": [400, 401, 403, 404, 500],
   // reserveNodeAddition's slot refusal is NodeStateError.capacity_unavailable -> 503.
   "POST /v1/nodes/additions": [400, 401, 403, 404, 409, 500, 503],
   // This list reads each stored addition through readNodeAddition and its intent-integrity guard.

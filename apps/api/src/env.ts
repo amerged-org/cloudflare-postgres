@@ -10,6 +10,11 @@ export type Env = Cloudflare.Env & {
   CRON_WATCHDOG?: DurableObjectNamespace<CronWatchdog>;
   INFRASTRUCTURE_BACKUP_CF_TOKEN?: string;
   RESEND_API_KEY?: string;
+  /** The parent R2 key that signs the temporary credentials of the nodes (ULTRA plan 7.3). */
+  R2_PARENT_ACCESS_KEY_ID?: string;
+  R2_PARENT_SECRET_ACCESS_KEY?: string;
+  /** Deletes the Tunnel of a node declared lost (ULTRA plan 9.4). */
+  CLOUDFLARE_API_TOKEN?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;

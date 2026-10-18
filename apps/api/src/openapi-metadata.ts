@@ -188,7 +188,27 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /v1/nodes/{id}/mark-lost": route(
     "markNodeLost",
-    "Mark a physical node lost with its current identity fence",
+    "Declare a physical node lost and fence it",
+    "admin",
+  ),
+  "GET /v1/nodes/{id}/loss": route(
+    "getNodeLoss",
+    "Read the fencing and the recovery points of a lost node",
+    "admin",
+  ),
+  "POST /v1/nodes/{id}/reinstall-override": route(
+    "overrideNodeReinstallGuard",
+    "Acknowledge that reinstalling a lost node may overwrite unarchived WAL",
+    "admin",
+  ),
+  "POST /v1/databases/{id}/move": route(
+    "moveDatabase",
+    "Move a database to another node under the same ID",
+    "admin",
+  ),
+  "GET /v1/databases/{id}/moves": route(
+    "listDatabaseMoves",
+    "List the moves of a database",
     "admin",
   ),
   "POST /v1/nodes/additions": route(

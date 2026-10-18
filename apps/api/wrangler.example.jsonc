@@ -72,7 +72,9 @@
     { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
   ],
   "triggers": { "crons": ["* * * * *"] },
-  // Optional private secrets: INFRASTRUCTURE_BACKUP_CF_TOKEN (D1 export), RESEND_API_KEY (email).
+  // Optional private secrets: INFRASTRUCTURE_BACKUP_CF_TOKEN (D1 export), RESEND_API_KEY (email),
+  // R2_PARENT_ACCESS_KEY_ID and R2_PARENT_SECRET_ACCESS_KEY (the parent key that signs the nodes' temporary
+  // R2 credentials) and CLOUDFLARE_API_TOKEN (deletes the Tunnel of a node declared lost).
   // Enable backups and select actual D1 identity/R2 region through the management API.
   "secrets": {
     "required": [

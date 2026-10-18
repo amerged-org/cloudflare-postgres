@@ -128,5 +128,6 @@ erDiagram
 - [apps/api/migrations/0062_drop_kubernetes_runtime.sql:1](../../../apps/api/migrations/0062_drop_kubernetes_runtime.sql#L1)
 - [apps/api/migrations/0063_node_link.sql:1](../../../apps/api/migrations/0063_node_link.sql#L1)
 - [apps/api/migrations/0064_placement_resources.sql:1](../../../apps/api/migrations/0064_placement_resources.sql#L1)
+- [apps/api/migrations/0065_lifecycle.sql:1](../../../apps/api/migrations/0065_lifecycle.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

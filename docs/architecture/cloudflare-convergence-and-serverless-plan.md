@@ -1271,12 +1271,12 @@ There is no control server, so there is no control-loss procedure.
 ### 9.5 Moves
 
 A move is one operation, triggered through the API (admin) or by the operator. One database moves by R2 restore and **keeps its ID**:
-1. Proven sleep on the source.
-2. D1 bumps the generation, with a new archive path.
-3. The target restores from the source's last backup plus WAL, through admission. The move order carries the source's proven-sleep record (`end`). The target lets recovery end only after every segment through the record's last archived segment was fetched and replayed, and reports `ready` only after it promoted a database with the record's `system_identifier` on a later timeline. Otherwise it reports `no_recovery_point` and the source's volume stays.
+1. Proven sleep on the source. The source holds its wakes until the move ends.
+2. D1 checks that R2 holds the backup and the WAL through the proof, and that the target is still eligible (section 4.8). It then stages the next generation with a new archive path. The database stays what D1 says it is, served by the source.
+3. The target restores from the source's last backup plus WAL, through admission. The move order carries the source's proven-sleep record (`end`). The target lets recovery end only after every segment through the record's last archived segment was fetched and replayed, and reports `ready` only after it promoted a database with the record's `system_identifier` on a later timeline. Otherwise it reports an error such as `no_recovery_point`, the move fails and the source serves again; a target on another node is told to remove what it staged.
 4. The target takes its first base backup.
-5. D1 switches the route (mutation barrier).
-6. The source deletes its volume.
+5. D1 switches the database to the target with the staged generation (mutation barrier).
+6. The source retires its generation and deletes its volume.
 
 A connect during the move is held, or answered with `57P03`. Stage 5.7 tests a move from one volume to another on EU1 and measures its duration.
 

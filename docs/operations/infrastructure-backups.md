@@ -251,10 +251,10 @@ Rules of the database and Thin storage kinds:
 ## Minute cron heartbeat and watchdog
 
 The minute cron runs these steps in order: `health_alerts`, `capacity_alerts`,
-`infrastructure_backup_dispatch`, then `admission_recovery`,
+`infrastructure_backup_dispatch`, then `admission_recovery`, `node_fencing`,
 `resource_profile_rollouts`, `power_timeouts`, `operation_timeouts`, `role_deletion_timeouts`,
 `idempotency_purge`, `node_hints`, `database_actors`, `usage`, `node_capacity`,
-and `retained_archives`. Alerting needs only D1 and a bounded send, so it
+`retained_archives` and `backup_retention`. Alerting needs only D1 and a bounded send, so it
 leads, and the daily backup dispatch follows ahead of the steps that call out to other
 systems: a step that fails, is slow or exhausts the invocation's D1 statement budget cannot
 starve them. A step that hangs still holds back the steps after it in that run; the stall
