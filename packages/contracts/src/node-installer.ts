@@ -35,7 +35,9 @@ export interface InstallerParameters {
 // Contabo accepts at most 32 KiB of userData.
 export const userDataLimit = 32 * 1024;
 
-const https = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/[A-Za-z0-9._~%/?&=+-]*)?$/;
+// A URL of the installer has no query: the image is read with the install's token, so no presigned
+// URL, key or signature ever travels in the userData.
+const https = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/[A-Za-z0-9._~%/+-]*)?$/;
 const hex64 = /^[0-9a-f]{64}$/;
 const ipv4 = /^([0-9]{1,3}\.){3}[0-9]{1,3}$/;
 const token = /^[A-Za-z0-9._~-]{16,512}$/;

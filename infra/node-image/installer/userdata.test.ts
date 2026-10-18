@@ -37,9 +37,10 @@ const rescueTools = new Set(
   "awk blkid blockdev curl dd ip lsblk mount mountpoint passwd sgdisk sha256sum stat udevadm umount zstd".split(" "),
 );
 
-// The longest values the API can pass: presigned URLs and tokens at their limits.
+// The longest values the API can pass: the delivery route of a version of the longest name, and
+// tokens at their limits.
 const longest: InstallerParameters = {
-  imageUrl: `https://example.r2.cloudflarestorage.com/node-images/${"a".repeat(40)}/pgcf-node.raw.zst?${"X-Amz-Signature=0123456789abcdef&".repeat(30)}x=1`,
+  imageUrl: `https://api.example.org:8443/node/v1/releases/${"a".repeat(64)}/pgcf-node.raw.zst`,
   imageZstSha256: "1".repeat(64),
   imageZstBytes: 400 * 1024 ** 2,
   imageRawSha256: "2".repeat(64),
@@ -158,6 +159,7 @@ test("a refused parameters file is removed and its directory is made 0700, excep
     const refusals: Record<string, string> = {
       "an unknown name": `${valid}PGCF_EXTRA=1\n`,
       "an invalid value": valid.replace(/^PGCF_IMAGE_URL=https:/m, "PGCF_IMAGE_URL=http:"),
+      "a presigned image URL": valid.replace(/^PGCF_IMAGE_URL=.*$/m, "PGCF_IMAGE_URL=https://example.r2.cloudflarestorage.com/image.raw.zst?X-Amz-Expires=60"),
       "a short token": valid.replace(/^PGCF_ENROLLMENT_TOKEN=.*$/m, "PGCF_ENROLLMENT_TOKEN=short"),
       "an incomplete IPv6 address": valid.replace(/^PGCF_IPV6_GATEWAY=.*$/m, "PGCF_IPV6_GATEWAY="),
     };
@@ -189,6 +191,30 @@ test("a refused parameters file is removed and its directory is made 0700, excep
   }
 });
 
+// The statement of install.sh that has `file` as its curl output, continuation lines joined.
+function curlOutputting(file: string): string {
+  const lines = script.split("\n");
+  const last = lines.findIndex((line) => line.includes(`--output "${file}"`));
+  assert.notEqual(last, -1, `install.sh downloads ${file}`);
+  let first = last;
+  while (lines[first - 1]?.endsWith("\\")) first--;
+  return lines
+    .slice(first, last + 1)
+    .join(" ")
+    .replace(/\\\s+/g, " ");
+}
+
+test("the image is read from the Worker with the install's token and followed nowhere else", () => {
+  const download = curlOutputting("$ram/image.raw.zst");
+  // The progress token is the credential of the image route; it comes from the 0600 header file
+  // and never from a command line or a URL.
+  assert.match(download, / --header @"\$work\/progress\.header" /);
+  assert.doesNotMatch(download, /--location|--proto-redir|-L /, "the Worker streams the bytes itself");
+  assert.match(download, / --proto '=https' /);
+  assert.match(download, / "\$\{PGCF_IMAGE_URL\}"$/, "the URL is the parameter, and nothing is appended to it");
+  assert.doesNotMatch(download, /PGCF_PROGRESS_TOKEN/);
+});
+
 test("install.sh needs only tools the Contabo rescue system carries", () => {
   const tools = /^for tool in ([a-z0-9 ]+); do$/m.exec(script)?.[1]?.split(" ");
   assert.ok(tools, "install.sh checks its tools before it starts");
@@ -206,6 +232,12 @@ test("values that could break out of a KEY=value line or a file are refused", ()
   assert.throws(() => installerParameters({ ...longest, hostname: "eu1\nPGCF_DISK_BYTES=1" }), /invalid hostname/);
   assert.throws(() => installerParameters({ ...longest, apiUrl: 'https://api.example.org/"x' }), /invalid apiUrl/);
   assert.throws(() => installerParameters({ ...longest, imageUrl: "http://example.org/image" }), /invalid imageUrl/);
+  // The image is read with the install's token; a URL that carries a signature or a key is refused.
+  assert.throws(
+    () => installerParameters({ ...longest, imageUrl: "https://example.org/image.raw.zst?X-Amz-Expires=60" }),
+    /invalid imageUrl/,
+  );
+  assert.throws(() => installerParameters({ ...longest, progressUrl: "https://example.org/progress?a=b" }), /invalid progressUrl/);
   assert.throws(() => installerParameters({ ...longest, imageRawBytes: longest.diskBytes }), /does not fit/);
   assert.throws(() => installerParameters({ ...longest, enrollmentToken: "short" }), /invalid enrollmentToken/);
 });

@@ -57,7 +57,7 @@ hex64='^[0-9a-f]{64}$'
 count='^[1-9][0-9]{0,15}$'
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 token='^[A-Za-z0-9._~-]+$'
-https='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/?&=+-]*)?$'
+https='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/+-]*)?$'
 # The seed's API URL is an origin (NodeEnrollmentSeed): the agent refuses a path or a query.
 origin='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$'
 need PGCF_IMAGE_URL "$https"
@@ -145,7 +145,9 @@ report hardware_ok
 step=download
 mkdir -p "$ram"
 mountpoint -q "$ram" || mount -t tmpfs -o "mode=0700,size=$((${PGCF_IMAGE_ZST_BYTES} + ${PGCF_IMAGE_RAW_BYTES} + 67108864))" tmpfs "$ram"
-curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+# The Worker streams the image itself: the install's progress token authorizes the read, so no
+# redirect is followed and no presigned URL or bucket key is ever in the parameters.
+curl --fail --silent --show-error --proto '=https' --tlsv1.2 --header @"$work/progress.header" \
 	--retry 3 --connect-timeout 30 --max-time 1800 --output "$ram/image.raw.zst" "${PGCF_IMAGE_URL}"
 [ "$(stat -c %s "$ram/image.raw.zst")" = "${PGCF_IMAGE_ZST_BYTES}" ]
 [ "$(sha256sum <"$ram/image.raw.zst" | awk '{ print $1 }')" = "${PGCF_IMAGE_ZST_SHA256}" ]
