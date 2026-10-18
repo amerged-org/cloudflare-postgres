@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The node agent's reusable parts, moved from the native controller without their Kubernetes
 //! surroundings. The agent binary is built in Stage 3.
+pub mod admission;
 pub mod api;
 pub mod contracts;
 pub mod diagnostics;
@@ -25,5 +26,6 @@ mod test_postgres;
 #[cfg(test)]
 mod test_sql;
 pub mod timing;
+pub mod units;
 pub mod volume;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

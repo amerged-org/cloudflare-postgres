@@ -26,10 +26,12 @@ tokio-postgres-rustls = { version = "=0.14.0", features = ["ring"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = "=0.30.0"
 sha2 = "=0.11.0"
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 time = { version = "=0.3.55", features = ["formatting", "parsing"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.190"
 
 [dev-dependencies]
+tokio = { version = "=1.53.2", features = ["test-util"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
