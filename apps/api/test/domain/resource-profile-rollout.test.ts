@@ -2,7 +2,6 @@
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
-import { placementNodes } from "../../src/domain/placement.ts";
 import { runResourceProfileRollouts } from "../../src/domain/resource-profiles.ts";
 import {
   cleanupFixtures,
@@ -91,21 +90,11 @@ it("accepts a future profile for a confirmed sleeping database without starting 
   const result = DatabaseWithOperation.parse(await assigned.json());
   expect(result.database.desired_state).toBe("suspended");
   expect(result.database.generation).toBe(generation + 1);
-  expect(
-    (await placementNodes(env.DB, f.region))[0]!.reserved_cpu_millicores,
-  ).toBe(0);
   const desired = await desiredPage(f);
   expect(desired.databases.find((d) => d.id === f.id)).toMatchObject({
     desired_state: "suspended",
     resources: { memory_mib: 512 },
   });
-  expect(
-    await env.DB.prepare(
-      "SELECT count(*) n FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(f.id)
-      .first("n"),
-  ).toBe(0);
   expect(await (await request(f.assignment, f.admin)).json()).toMatchObject({
     profile_revision: 2,
     applied: false,

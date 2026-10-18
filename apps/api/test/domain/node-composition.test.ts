@@ -16,6 +16,7 @@ import {
 } from "../../src/workflows/add-node.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { patchSample } from "./node-samples.ts";
 const workflows: string[] = [];
 afterEach(async () => {
   for (const id of workflows.splice(0))
@@ -218,11 +219,8 @@ describe("node composition with actual Workers/D1", () => {
   });
   it("makes an autoscale dry run from real headroom without creating a reservation", async () => {
     const f = await configured();
-    await env.DB.prepare(
-      "UPDATE nodes SET allocatable_memory_mib=128 WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
+    // The node's memory is all in use: no node can take the smallest size class.
+    await patchSample(f.node, { availableBytes: 0 });
     await env.DB.prepare(
       "UPDATE node_region_policies SET autoscale_enabled=1,adopt_instance_ids=? WHERE region_id=?",
     )

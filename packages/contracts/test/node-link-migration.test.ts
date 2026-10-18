@@ -63,6 +63,17 @@ function populate() {
   run(
     "INSERT INTO admission_scope_fences(kind,scope_id,region_id,revision) VALUES('region','eu-test','eu-test',7)",
   );
+  // The fences of projects and nodes do not cascade from a region and stay as they are.
+  run(
+    "INSERT INTO admission_scope_fences(kind,scope_id,project_id,revision) VALUES('project',?,?,3)",
+    project,
+    project,
+  );
+  run(
+    "INSERT INTO admission_scope_fences(kind,scope_id,node_id,revision) VALUES('node',?,?,5)",
+    node,
+    node,
+  );
   run(
     `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
      VALUES('eu-test','regional_node_stale',1,?,'{}')`,
@@ -83,8 +94,16 @@ it("rebuilds regions without the agent key and keeps what cascades from them", (
     { id: "eu-test", gateway_url: gateway },
   ]);
   expect(
-    db.prepare("SELECT region_id,revision FROM admission_scope_fences").all(),
-  ).toContainEqual({ region_id: "eu-test", revision: 7 });
+    db
+      .prepare(
+        "SELECT kind,scope_id,revision FROM admission_scope_fences ORDER BY kind",
+      )
+      .all(),
+  ).toEqual([
+    { kind: "node", scope_id: node, revision: 5 },
+    { kind: "project", scope_id: project, revision: 3 },
+    { kind: "region", scope_id: "eu-test", revision: 7 },
+  ]);
   expect(
     db.prepare("SELECT region_id,kind,active FROM infrastructure_alerts").all(),
   ).toEqual([{ region_id: "eu-test", kind: "regional_node_stale", active: 1 }]);

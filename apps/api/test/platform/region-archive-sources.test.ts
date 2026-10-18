@@ -15,6 +15,7 @@ import {
   request,
 } from "../domain/fixtures.ts";
 import { regionArchiveSourceCredentials } from "../../src/domain/region-archive-sources.ts";
+import { reports } from "../domain/node-samples.ts";
 import {
   encryptCustodyDocument,
   decryptCustodyDocument,
@@ -226,6 +227,7 @@ it("rotates established restore configuration once and preserves source data, ar
       now,
     )
     .run();
+  await reports(foreignNode.node);
   const restored = await request(
     `/v1/databases/${source.database.id}/restore`,
     f.integrator,

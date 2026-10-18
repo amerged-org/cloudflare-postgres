@@ -231,7 +231,7 @@ export async function nodeDesiredPage(
   const result = await env.DB.prepare(
     `SELECT * FROM (
        SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,
-         COALESCE(ae.route_revision,1) route_revision,s.memory_mib,s.cpu_millicores,s.storage_gib,s.max_connections,
+         COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_gib,s.max_connections,
          s.archive_timeout_seconds,${effectiveSleepAfterSql("d")} sleep_after_seconds,
          (SELECT o.id FROM operations o WHERE o.database_id=d.id AND o.generation<=d.generation
             ORDER BY o.generation DESC,o.created_at DESC,o.id DESC LIMIT 1) operation,
@@ -246,7 +246,7 @@ export async function nodeDesiredPage(
          x.verified_at restore_verified_at,
          (SELECT c.id||'|'||c.expires_at FROM database_archive_credentials c WHERE c.database_id=d.id AND c.archive_path=x.source_archive_path
             AND c.access='read_only' AND c.expires_at>? ORDER BY c.expires_at DESC LIMIT 1) source_credential
-       FROM databases d JOIN size_classes s ON s.id=d.size_class_id
+       FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN database_resources dr ON dr.database_id=d.id
        LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id
        LEFT JOIN database_restores x ON x.target_database_id=d.id
        WHERE d.node_id=? AND d.region_id=? AND d.desired_state IN('running','suspended','deleted')
@@ -296,6 +296,7 @@ export async function nodeDesiredPage(
       route_revision: row.route_revision,
       storage_generation: row.storage_generation,
       pg_major: row.pg_major,
+      // The database's effective values: its own, else its size class's.
       resources: {
         memory_mib: row.memory_mib,
         cpu_millicores: row.cpu_millicores,

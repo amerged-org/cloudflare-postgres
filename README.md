@@ -195,12 +195,10 @@ from `1` to `1000000` parts per million (`900000` means 90%). `null` disables a 
 a field keeps its stored value. A warning fires when any single node reaches its threshold,
 including a control node closed to database placement:
 
-- RAM uses the node's own fresh, complete ten-minute working-set window.
-- CPU averages reported CPU usage over the same ten consecutive minutes against the node's CPU
-  capacity. Only reporters that send the optional CPU fields with their node memory samples
-  supply it (the node agent, Stage 3); without them CPU stays unknown and never warns.
-- Storage uses the node's fresh LVM sample: the fuller of thin-pool data and metadata when a thin
-  pool exists, otherwise volume-group allocation.
+- RAM is the 30-minute average of the node's active RAM, (MemTotal - MemAvailable) / MemTotal,
+  over its samples, and CPU the 30-minute average of its CPU load, busy time over all its cores;
+  both need samples that span at least ten minutes and the newest at most 180 s old.
+- Storage is the fuller of the thin pool's data and metadata in the node's newest sample.
 
 Each region keeps one episode per kind (`regional_node_ram_warning`, `regional_node_cpu_warning`,
 `regional_node_storage_warning`). Its event lists up to 64 exceeding nodes, highest first, with
@@ -213,7 +211,10 @@ Fixed-rule alarms need no threshold and are evaluated for every region: a stale 
 failing or stale daily infrastructure backup, a running database whose WAL archive is failing
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
 awake time (`database_base_backup_stale`; hibernated databases are excluded), and a thin pool
-without room or without a fresh sample (`thin_storage_blocked`). Each
+without room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
+capacity (`regional_node_capacity_refusals`), a thin pool that placement has closed
+(`regional_node_pool_closed`: data at 80 %, metadata at 50 % or the logical cap) and a database volume at 80 % or 90 % of its space or
+inodes (`database_volume_warning`, `database_volume_critical`). Each
 minute-cron step runs in its own failure boundary, and the `CronWatchdog` Durable Object (binding
 `CRON_WATCHDOG`) judges the cron's heartbeat from its own alarm, independently of the cron trigger,
 raising `control_cron_stalled` and `control_cron_step_failing`. Every event carries a short runbook `action`; the

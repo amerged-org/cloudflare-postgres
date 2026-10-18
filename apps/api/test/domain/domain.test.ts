@@ -12,7 +12,6 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import { runCron } from "../../src/cron.ts";
-import { choosePlacement } from "../../src/domain/placement.ts";
 import { databaseInsertStatement } from "../../src/domain/databases.ts";
 import type { RoleRow, SizeRow, RegionRow } from "../../src/domain/rows.ts";
 import {
@@ -38,55 +37,8 @@ async function created(
   return DatabaseWithOperation.parse(await response.json());
 }
 describe("database domain on real Workers D1", () => {
-  it("places by free memory, includes sidecar and rejects unknown storage", () => {
-    const base = {
-      last_observed_at: new Date().toISOString(),
-      region_id: "eu-1",
-      ready: true,
-      schedulable: true,
-      allocatable_memory_mib: 1024,
-      platform_reserved_memory_mib: 128,
-      allocatable_cpu_millicores: 2000,
-      platform_reserved_cpu_millicores: 100,
-      reserved_cpu_millicores: 0,
-      storage_gib_total: 10,
-      reserved_memory_mib: 0,
-      reserved_storage_gib: 0,
-    };
-    const nodes = [
-      { ...base, id: "one", reserved_memory_mib: 300 },
-      { ...base, id: "two" },
-      {
-        ...base,
-        id: "unknown",
-        allocatable_memory_mib: 9999,
-        storage_gib_total: null,
-      },
-    ];
-    expect(
-      choosePlacement(nodes, "eu-1", {
-        memory_mib: 512,
-        cpu_millicores: 500,
-        storage_gib: 5,
-      })?.id,
-    ).toBe("two");
-    expect(
-      choosePlacement(nodes, "eu-1", {
-        memory_mib: 800,
-        cpu_millicores: 500,
-        storage_gib: 5,
-      }),
-    ).toBeNull();
-    expect(
-      choosePlacement(nodes, "us-1", {
-        memory_mib: 512,
-        cpu_millicores: 500,
-        storage_gib: 5,
-      }),
-    ).toBeNull();
-  });
   it("guards concurrent placement and retains complete pending creates", async () => {
-    const f = await fixture(1408, 10); // 128 platform + exactly two (512 + 128) reservations.
+    const f = await fixture(1536, 10); // Two 512 MiB databases are 67 % of the node, three would be 100 %.
     const results = await Promise.all([
       f.create("one"),
       f.create("two"),

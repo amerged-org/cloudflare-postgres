@@ -11,6 +11,7 @@ import {
   report,
   request,
 } from "./fixtures.ts";
+import { patchSample, reports } from "./node-samples.ts";
 
 afterEach(cleanupFixtures);
 const actual = (region: string) => ({
@@ -130,7 +131,6 @@ it("rejects active assigned cohorts while allowing pending unplaced demand to en
 
 it("preserves an assigned cohort while changing RAM policy only after every manual suspension is confirmed", async () => {
   const f = await fixture(4096, 40);
-  const uid = f.nodeUid;
   const provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
   await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
     .bind(provider, f.node)
@@ -263,30 +263,16 @@ it("preserves an assigned cohort while changing RAM policy only after every manu
     postgres_memory_request_mib: 128,
     maximum_database_memory_mib: 4096,
   });
+  // A node that has not reported for three minutes cannot take the start.
+  await patchSample(f.node, {
+    observedAt: new Date(Date.now() - 181_000).toISOString(),
+  });
   expect(
     (await request(`/v1/databases/${ids[0]}/resume`, f.integrator, "POST"))
       .status,
   ).toBe(409);
   expect(await readCohort()).toEqual(before);
-  const observedAt = new Date().toISOString();
-  await recordNodeMemoryObservation(
-    env.DB,
-    f.region,
-    {
-      node_id: f.node,
-      provider_instance_id: provider,
-      node_uid: uid,
-      memory: {
-        node_uid: uid,
-        observed_at: observedAt,
-        working_set_bytes: 1024 ** 3,
-        capacity_memory_bytes: 4 * 1024 ** 3,
-        available_bytes: 3 * 1024 ** 3,
-        memory_pressure: false,
-      },
-    },
-    observedAt,
-  );
+  await reports(f.node);
   const resumed = DatabaseWithOperation.parse(
     await (
       await request(`/v1/databases/${ids[0]}/resume`, f.integrator, "POST")
@@ -301,11 +287,4 @@ it("preserves an assigned cohort while changing RAM policy only after every manu
   expect(desired.databases.find((d) => d.id === ids[1])?.desired_state).toBe(
     "suspended",
   );
-  expect(
-    await env.DB.prepare(
-      "SELECT budget_bytes FROM database_start_admissions WHERE operation_id=?",
-    )
-      .bind(resumed.operation.id)
-      .first("budget_bytes"),
-  ).toBe(1024 * 1024 ** 2);
 });

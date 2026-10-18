@@ -9,6 +9,7 @@ export * from "./encoding.ts";
 export * from "./errors.ts";
 export * from "./ids.ts";
 export * from "./sizing.ts";
+export * from "./database-resources.ts";
 export * from "./gateway-control.ts";
 export * from "./maintenance.ts";
 export * from "./gateway-activity.ts";

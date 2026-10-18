@@ -556,7 +556,7 @@ describe("actual generated API references in the Workers runtime", () => {
         (doc.components!.schemas as Record<string, unknown>).Database,
       ),
     ).toMatch(
-      /effective_sleep_after_seconds.*null when the database is always warm.*\/v1\/databases\/\{id\}\/warm-reclaim/,
+      /effective_sleep_after_seconds.*null when the database is always warm/,
     );
     expect(
       operation(doc, "/v1/databases/{id}/archive", "get").summary,

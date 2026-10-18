@@ -5,14 +5,10 @@ import {
   DatabaseListQuery,
   type DatabaseIdleTime,
   type DatabaseResize,
-  databaseMemoryReservationMib,
-  databaseCpuReservationMillicores,
-  postgresCpuRequestMillicores,
   newDatabaseId,
   newOperationId,
   newRolePassword,
   OWNER_ROLE_NAME,
-  SIDECAR,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
@@ -31,22 +27,27 @@ import { latestAgentSampleSql } from "./operational-health.ts";
 import { keyring } from "../crypto/keyring.ts";
 import {
   choosePlacement,
+  growthFits,
+  nodeLoadGuard,
+  placementGuard,
   placementNodes,
-  nodePlacementGuard,
-  nodePlacementBindings,
-  nodeDatabasePlacementGuard,
-  nodeDatabaseCapacityGuard,
-  nodeMemoryReservationGuard,
-  databaseMemoryPolicyAllows,
 } from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
-import { runNodeCapacity, startupPlacementNodes } from "./node-capacity.ts";
+import { runNodeCapacity } from "./node-capacity.ts";
+import { stoppedSleeperSql } from "./startup-admission.ts";
 import {
-  startupHeadroomSql,
-  startupReservationStatement,
-  nodeCpuHeadroomSql,
-  databaseCpuChargeSql,
-} from "./startup-admission.ts";
+  assertResourcesAllowed,
+  effectiveResources,
+  effectiveResourcesColumnsSql,
+  NO_OVERRIDES,
+  overridesOfCreate,
+  ownResources,
+  regionBounds,
+  sameOverrides,
+  sameResources,
+  usageSnapshot,
+  type ResourceOverrides,
+} from "./resources.ts";
 import {
   databaseForRequest,
   databaseView,
@@ -60,11 +61,6 @@ import {
   type SizeRow,
 } from "./rows.ts";
 
-import {
-  nodeStoragePlacementSql,
-  selectedStorageProfileSql,
-  storageResizeAllowedSql,
-} from "./storage-capacity.ts";
 import { hintDatabases } from "./node-hints.ts";
 export function hint(c: ApiContext, ids: string[]): void {
   // Hints are best effort; the node's own pull of its desired page remains authoritative.
@@ -88,7 +84,14 @@ export interface DatabaseInsertSnapshot {
   body: DatabaseCreate;
   size: SizeRow;
   region: RegionRow;
+  /** The database's own resources; omitted takes the size class's. */
+  resources?: ResourceOverrides;
+  /** The node the database is placed on; null waits for verified regional capacity. */
   nodeId: string | null;
+  /** The memory and storage pending on that node when `placementNodes` read it, and the instant of that read. */
+  pendingMemoryMib?: number;
+  pendingStorageGib?: number;
+  decidedAt?: number;
   id: string;
   archivePath: string;
   now: string;
@@ -98,16 +101,26 @@ export function databaseInsertStatement(
   db: D1Database,
   snapshot: DatabaseInsertSnapshot,
 ): D1PreparedStatement {
+  const own = snapshot.resources ?? NO_OVERRIDES,
+    ownValues = [own.memory_mib, own.cpu_millicores, own.storage_gib],
+    sizeValues = [
+      snapshot.size.memory_mib,
+      snapshot.size.storage_gib,
+      snapshot.size.cpu_millicores,
+      snapshot.size.max_connections,
+      snapshot.size.sleep_after_seconds,
+      snapshot.size.archive_timeout_seconds,
+      snapshot.size.backup_retention_days,
+    ];
   if (snapshot.nodeId === null) {
     return db
       .prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at)
-      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,own_memory_mib,own_cpu_millicores,own_storage_gib)
+      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,?,?,?
       FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
       AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
       AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?
-      AND (COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')='reserved' OR (s.memory_mib%256=0 AND (SELECT maximum_database_memory_mib FROM node_region_policies WHERE region_id=r.id)>=s.memory_mib AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id)<=s.memory_mib))
       AND (${snapshot.authority?.sql ?? "1=1"})`,
       )
       .bind(
@@ -117,33 +130,29 @@ export function databaseInsertStatement(
         snapshot.archivePath,
         snapshot.now,
         snapshot.now,
+        ...ownValues,
         snapshot.body.region_id,
         snapshot.region.backup_bucket,
         snapshot.body.size_class_id,
         snapshot.body.project_id,
-        snapshot.size.memory_mib,
-        snapshot.size.storage_gib,
-        snapshot.size.cpu_millicores,
-        snapshot.size.max_connections,
-        snapshot.size.sleep_after_seconds,
-        snapshot.size.archive_timeout_seconds,
-        snapshot.size.backup_retention_days,
+        ...sizeValues,
         ...(snapshot.authority?.bindings ?? []),
       );
   }
+  const guard = placementGuard("n", {
+    nodeId: snapshot.nodeId,
+    pendingMemoryMib: snapshot.pendingMemoryMib ?? 0,
+    pendingStorageGib: snapshot.pendingStorageGib ?? 0,
+    now: snapshot.decidedAt ?? Date.parse(snapshot.now),
+  });
   return db
     .prepare(
-      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,storage_profile_json)
-            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,${selectedStorageProfileSql()} FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
+      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib,own_cpu_millicores,own_storage_gib)
+            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,?,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
-            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
+            WHERE n.region_id=? AND ${guard.sql}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
-            AND ${startupHeadroomSql()}
-            AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?`)}
-            AND n.platform_reserved_cpu_millicores IS NOT NULL
-            AND ${nodeCpuHeadroomSql()}
-            AND ${nodeStoragePlacementSql()}
-            AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.max_connections=?
+            AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
             AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=? AND (${snapshot.authority?.sql ?? "1=1"})`,
     )
     .bind(
@@ -153,22 +162,14 @@ export function databaseInsertStatement(
       snapshot.archivePath,
       snapshot.now,
       snapshot.now,
+      snapshot.now,
+      ...ownValues,
       snapshot.body.project_id,
       snapshot.body.size_class_id,
       snapshot.region.backup_bucket,
-      snapshot.nodeId,
       snapshot.body.region_id,
-      ...nodePlacementBindings(Date.parse(snapshot.now)),
-      SIDECAR.requestMemoryMib,
-      SIDECAR.requestMemoryMib,
-      snapshot.size.memory_mib,
-      snapshot.size.storage_gib,
-      snapshot.size.cpu_millicores,
-      postgresCpuRequestMillicores(snapshot.size),
-      snapshot.size.max_connections,
-      snapshot.size.sleep_after_seconds,
-      snapshot.size.archive_timeout_seconds,
-      snapshot.size.backup_retention_days,
+      ...guard.bindings,
+      ...sizeValues,
       ...(snapshot.authority?.bindings ?? []),
     );
 }
@@ -176,7 +177,12 @@ export async function createDatabase(
   c: ApiContext,
   body: DatabaseCreate,
 ): Promise<Response> {
-  await assertProjectAccess(c, body.project_id);
+  const auth = await assertProjectAccess(c, body.project_id);
+  if (body.resources !== undefined && auth.scope !== "admin")
+    throw new ApiError(
+      "forbidden",
+      "Only an admin key sets a database's own resources",
+    );
   return withIdempotency(c, {
     replay: (id, status) => databaseOperationResponse(c, id, status),
     execute: async (lease) => {
@@ -201,17 +207,13 @@ export async function createDatabase(
           "invalid_request",
           "Size class or region unavailable",
         );
-      if (
-        !(await databaseMemoryPolicyAllows(
-          c.env.DB,
-          region.id,
-          size.memory_mib,
-        ))
-      )
-        throw new ApiError(
-          "invalid_request",
-          "Size class exceeds the configured per-database memory maximum",
-        );
+      const own = overridesOfCreate(body.resources),
+        effective = effectiveResources(size, own);
+      assertResourcesAllowed(
+        effective,
+        own,
+        await regionBounds(c.env.DB, region.id),
+      );
       const id = newDatabaseId(),
         op = newOperationId(),
         now = new Date().toISOString();
@@ -221,14 +223,15 @@ export async function createDatabase(
         newRolePassword(),
       );
       for (let attempt = 0; attempt < 3; attempt++) {
-        const node =
-          attempt === 2
-            ? null
-            : choosePlacement(
-                await startupPlacementNodes(c.env.DB, body.region_id, size.id),
-                body.region_id,
-                size,
-              );
+        const decidedAt = Date.now(),
+          node =
+            attempt === 2
+              ? null
+              : choosePlacement(
+                  await placementNodes(c.env.DB, body.region_id, decidedAt),
+                  effective,
+                  decidedAt,
+                );
         const archive = archiveDestinationPath(
           region.backup_bucket,
           region.id,
@@ -247,7 +250,11 @@ export async function createDatabase(
               body,
               size,
               region,
+              resources: own,
               nodeId: node?.id ?? null,
+              pendingMemoryMib: node?.pending_memory_mib,
+              pendingStorageGib: node?.pending_storage_gib,
+              decidedAt,
               id,
               archivePath: archive,
               now,
@@ -269,36 +276,12 @@ export async function createDatabase(
               `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
             SELECT ?,'database.create','pending',project_id,id,generation,?,? FROM databases WHERE id=? AND project_id=?`,
             ).bind(op, now, now, id, body.project_id),
-            ...(node
-              ? [
-                  startupReservationStatement(c.env.DB, {
-                    databaseId: id,
-                    operationId: op,
-                    generation: 1,
-                    nodeId: node.id,
-                    now,
-                  }),
-                ]
-              : []),
             c.env.DB.prepare(
               `INSERT INTO lifecycle_events (database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-            SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?,'$.reserved_memory_mib',?) FROM databases WHERE id=? AND project_id=? AND node_id IS NOT NULL`,
+            SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases WHERE id=? AND project_id=? AND node_id IS NOT NULL`,
             ).bind(
               now,
-              node === null
-                ? null
-                : JSON.stringify({
-                    memory_mib: size.memory_mib,
-                    cpu_millicores: size.cpu_millicores,
-                    reserved_memory_mib:
-                      size.memory_mib + SIDECAR.requestMemoryMib,
-                    reserved_cpu_millicores:
-                      databaseCpuReservationMillicores(size),
-                    storage_allocated_bytes: size.storage_gib * 2 ** 30,
-                  }),
-              size.storage_gib * 2 ** 30,
-              databaseCpuReservationMillicores(size),
-              size.memory_mib + SIDECAR.requestMemoryMib,
+              JSON.stringify(usageSnapshot(effective)),
               id,
               body.project_id,
             ),
@@ -369,7 +352,7 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     bindings.push(query.observed_state);
   }
   const result = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
   )
     .bind(...bindings, ...cursor.bindings, pagination.limit + 1)
     .all<DatabaseRow>();
@@ -379,6 +362,17 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
   );
 }
 
+/**
+ * What the resize of a database asks of its node, decided from `placementNodes` at `decidedAt`:
+ * the memory and storage pending there then, and whether the memory grows (a growing database
+ * counts at its full memory until its average catches up).
+ */
+export interface ResizeCapacity {
+  pendingMemoryMib: number;
+  pendingStorageGib: number;
+  decidedAt: number;
+  grows: boolean;
+}
 export function databaseResizeStatement(
   db: D1Database,
   row: DatabaseRow,
@@ -386,30 +380,58 @@ export function databaseResizeStatement(
   now: string,
   authority?: DatabaseInsertSnapshot["authority"],
   admission?: AdmissionSqlGuard,
+  /** The database's own resources after the resize; omitted keeps its present ones. */
+  resources: ResourceOverrides = ownResources(row),
+  capacity?: ResizeCapacity,
 ): D1PreparedStatement {
+  const current = ownResources(row),
+    own = [
+      resources.memory_mib,
+      resources.cpu_millicores,
+      resources.storage_gib,
+    ],
+    wasOwn = [current.memory_mib, current.cpu_millicores, current.storage_gib],
+    ownSet =
+      "size_class_id=?,own_memory_mib=?,own_cpu_millicores=?,own_storage_gib=?",
+    ownRead =
+      "own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_gib IS ?",
+    classRead = `s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=? AND s.max_connections=?
+      AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
+    classValues = [
+      size.memory_mib,
+      size.cpu_millicores,
+      size.storage_gib,
+      size.max_connections,
+      size.sleep_after_seconds,
+      size.archive_timeout_seconds,
+      size.backup_retention_days,
+    ];
+  const guard =
+    capacity === undefined
+      ? null
+      : nodeLoadGuard("n", {
+          pendingMemoryMib: capacity.pendingMemoryMib,
+          pendingStorageGib: capacity.pendingStorageGib,
+          now: capacity.decidedAt,
+        });
   if (row.desired_state === "suspended")
     return db
       .prepare(
-        `UPDATE databases SET size_class_id=?,generation=generation+1,observed_generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
+        `UPDATE databases SET ${ownSet},generation=generation+1,observed_generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
        WHERE (id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND node_id IS ?
+         AND ${ownRead}
          AND desired_state='suspended' AND observed_state='provisioning' AND observed_generation=generation
          AND observed_power='hibernated' AND power_operation IS ? AND suspension_reason IS ? AND deleted_at IS NULL)
          AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
-         AND EXISTS(SELECT 1 FROM size_classes old WHERE old.id=databases.size_class_id
-           AND ${databaseCpuChargeSql("databases", "old")}=0)
-         AND EXISTS(SELECT 1 FROM size_classes target WHERE target.id=? AND target.enabled=1
-           AND ${storageResizeAllowedSql("databases", "target")}
-           AND target.memory_mib=? AND target.cpu_millicores=? AND COALESCE(target.cpu_request_millicores,target.cpu_millicores)=?
-           AND target.storage_gib=? AND target.max_connections=? AND target.sleep_after_seconds IS ?
-           AND target.archive_timeout_seconds=? AND target.backup_retention_days=?
-           AND (COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=databases.region_id),'reserved')='reserved'
-             OR EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=databases.region_id
-               AND target.memory_mib BETWEEN 256 AND p.maximum_database_memory_mib AND target.memory_mib%256=0
-               AND p.postgres_memory_request_mib BETWEEN 1 AND target.memory_mib)))
+         AND ${stoppedSleeperSql("databases", false)}
+         AND EXISTS(SELECT 1 FROM size_classes s WHERE s.id=? AND s.enabled=1
+           AND ${classRead})
+         ${guard === null ? "" : `AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND ${guard.sql})`}
          AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
         size.id,
+        ...own,
         now,
         row.id,
         row.project_id,
@@ -417,41 +439,32 @@ export function databaseResizeStatement(
         row.size_class_id,
         row.updated_at,
         row.node_id,
+        ...wasOwn,
         row.power_operation ?? null,
         row.suspension_reason ?? null,
         size.id,
-        size.memory_mib,
-        size.cpu_millicores,
-        postgresCpuRequestMillicores(size),
-        size.storage_gib,
-        size.max_connections,
-        size.sleep_after_seconds,
-        size.archive_timeout_seconds,
-        size.backup_retention_days,
+        ...classValues,
+        ...(guard?.bindings ?? []),
         ...(authority?.bindings ?? []),
         ...(admission?.bindings ?? []),
       );
   return db
     .prepare(
-      `UPDATE databases SET size_class_id=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
-    WHERE ((id=? AND project_id=? AND node_id IS ? AND generation=? AND size_class_id=? AND updated_at=?)
+      `UPDATE databases SET ${ownSet},placed_at=CASE WHEN ?=1 THEN ? ELSE placed_at END,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
+    WHERE ((id=? AND project_id=? AND node_id IS ? AND generation=? AND size_class_id=? AND updated_at=? AND ${ownRead})
       AND (desired_state='running' AND observed_state='ready' AND observed_generation=generation AND deleted_at IS NULL))
       AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
       AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-        WHERE (n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1)
-          AND ((${nodePlacementGuard("n")}) AND ${nodeDatabaseCapacityGuard("n")}
-          AND ${startupHeadroomSql()}
-          AND n.platform_reserved_cpu_millicores IS NOT NULL)
-          AND (${storageResizeAllowedSql()}
-          AND ${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?`)}
-          AND ${nodeCpuHeadroomSql("n", "s", "databases")})
-          AND ${nodeStoragePlacementSql("n", "s", "databases")}
-          AND ((s.memory_mib=? AND s.cpu_millicores=? AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=? AND s.max_connections=?)
-          AND (s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?)))
+        WHERE n.id=databases.node_id AND n.region_id=databases.region_id
+          ${guard === null ? "" : `AND ${guard.sql}`}
+          AND ${classRead})
       AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
     )
     .bind(
       size.id,
+      ...own,
+      Number(capacity?.grows ?? false),
+      now,
       now,
       row.id,
       row.project_id,
@@ -459,24 +472,20 @@ export function databaseResizeStatement(
       row.generation,
       row.size_class_id,
       row.updated_at,
+      ...wasOwn,
       size.id,
-      ...nodePlacementBindings(Date.parse(now)),
-      SIDECAR.requestMemoryMib,
-      SIDECAR.requestMemoryMib,
-      size.memory_mib,
-      size.cpu_millicores,
-      postgresCpuRequestMillicores(size),
-      size.storage_gib,
-      size.max_connections,
-      size.sleep_after_seconds,
-      size.archive_timeout_seconds,
-      size.backup_retention_days,
+      ...(guard?.bindings ?? []),
+      ...classValues,
       ...(authority?.bindings ?? []),
       ...(admission?.bindings ?? []),
     );
 }
 
-/** The API and central profile rollout share the same atomic resize and startup admission. */
+/**
+ * The API and central profile rollout share the same atomic resize. `own` is the database's own
+ * resources after it; omitted keeps its present ones. A change that leaves the effective resources
+ * as they are only stores them.
+ */
 export async function scheduleDatabaseResize(
   env: Env,
   row: DatabaseRow,
@@ -484,6 +493,7 @@ export async function scheduleDatabaseResize(
   now: string,
   lease?: IdempotencyLease,
   authority?: DatabaseInsertSnapshot["authority"],
+  own?: ResourceOverrides,
 ): Promise<string> {
   const db = env.DB;
   if (
@@ -509,25 +519,47 @@ export async function scheduleDatabaseResize(
     (target.id !== previous.id && target.enabled !== 1)
   )
     throw new ApiError("invalid_request", "Size class unavailable");
-  if (!(await databaseMemoryPolicyAllows(db, row.region_id, target.memory_mib)))
-    throw new ApiError(
-      "invalid_request",
-      "Size class exceeds the configured per-database memory maximum",
-    );
-  if (
-    target.storage_gib < previous.storage_gib ||
-    (target.storage_gib !== previous.storage_gib &&
-      row.storage_profile_json == null)
-  )
-    throw new ApiError(
-      "invalid_request",
-      target.storage_gib < previous.storage_gib
-        ? "Storage shrink is not supported"
-        : "Storage-changing resize is not supported",
-    );
+  const current = ownResources(row),
+    resources = own ?? current,
+    before = effectiveResources(previous, current),
+    after = effectiveResources(target, resources);
+  assertResourcesAllowed(
+    after,
+    resources,
+    await regionBounds(db, row.region_id),
+  );
+  if (after.storage_gib < before.storage_gib)
+    throw new ApiError("invalid_request", "Storage shrink is not supported");
   const sleeping = row.desired_state === "suspended";
   const op = newOperationId();
-  if (target.id === previous.id) {
+  if (target.id === previous.id && sameResources(before, after)) {
+    // The database keeps what it runs with; its own values are only recorded.
+    if (!sameOverrides(current, resources)) {
+      const stored = await db
+        .prepare(
+          `UPDATE databases SET own_memory_mib=?,own_cpu_millicores=?,own_storage_gib=?
+         WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
+           AND own_memory_mib IS ? AND own_cpu_millicores IS ? AND own_storage_gib IS ?`,
+        )
+        .bind(
+          resources.memory_mib,
+          resources.cpu_millicores,
+          resources.storage_gib,
+          row.id,
+          row.project_id,
+          row.generation,
+          row.size_class_id,
+          row.updated_at,
+          current.memory_mib,
+          current.cpu_millicores,
+          current.storage_gib,
+        )
+        .run();
+      if (stored.meta.changes !== 1)
+        throw new ApiError("conflict", "Database changed; retry the request", {
+          reason: "generation_changed",
+        });
+    }
     await db
       .prepare(
         `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
@@ -590,43 +622,50 @@ export async function scheduleDatabaseResize(
     throw new ApiError("conflict", "Database configuration is not ready", {
       reason: "not_ready",
     });
-  if (!sleeping) {
-    const node = (await placementNodes(db, row.region_id, row.id)).find(
-      (value) => value.id === row.node_id,
-    );
-    if (
-      !node ||
-      !choosePlacement(
-        [
-          {
-            ...node,
-            reserved_memory_mib:
-              node.reserved_memory_mib - databaseMemoryReservationMib(previous),
-            reserved_cpu_millicores:
-              node.reserved_cpu_millicores -
-              databaseCpuReservationMillicores(previous),
-            reserved_storage_gib:
-              node.reserved_storage_gib - previous.storage_gib,
-          },
-        ],
-        row.region_id,
-        target,
-        Date.parse(now),
-        row.node_id,
-      )
-    )
+  let capacity: ResizeCapacity | undefined;
+  // A sleeping database takes its memory and CPU at its next wake, where its node admits them;
+  // its storage is sold from now on, so it counts against the logical cap like an awake one's.
+  const growth = {
+    memory_mib: sleeping
+      ? 0
+      : Math.max(0, after.memory_mib - before.memory_mib),
+    storage_gib: Math.max(0, after.storage_gib - before.storage_gib),
+    cpu_millicores: sleeping ? 0 : after.cpu_millicores,
+  };
+  if (!sleeping || growth.storage_gib > 0) {
+    const decidedAt = Date.parse(now),
+      node = (await placementNodes(db, row.region_id, decidedAt)).find(
+        (value) => value.id === row.node_id,
+      );
+    if (!node || !growthFits(node, growth, decidedAt))
       throw new ApiError(
         "capacity_exhausted",
         "Current node has insufficient memory, CPU or storage",
         { reason: "node_capacity" },
       );
+    // Growth is written only while the node still reports and nothing else was placed on it.
+    if (growth.memory_mib > 0 || growth.storage_gib > 0)
+      capacity = {
+        pendingMemoryMib: node.pending_memory_mib,
+        pendingStorageGib: node.pending_storage_gib,
+        decidedAt,
+        grows: growth.memory_mib > 0,
+      };
   }
-  const nodeId = row.node_id;
   return withAdmissionMutation(env, [row.id], async (mutation) => {
     const guard = mutation.guard(row.id),
       generation = row.generation + 1;
     const statements = [
-      databaseResizeStatement(db, row, target, now, authority, guard),
+      databaseResizeStatement(
+        db,
+        row,
+        target,
+        now,
+        authority,
+        guard,
+        resources,
+        capacity,
+      ),
       db
         .prepare(
           `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
@@ -644,16 +683,6 @@ export async function scheduleDatabaseResize(
           ...guard.bindings,
         ),
     ];
-    if (!sleeping)
-      statements.push(
-        startupReservationStatement(db, {
-          databaseId: row.id,
-          operationId: op,
-          generation,
-          nodeId,
-          now,
-        }),
-      );
     statements.push(
       db
         .prepare(
@@ -685,17 +714,18 @@ export async function scheduleDatabaseResize(
       );
     const result = await mutation.batch(statements);
     if (result[0]!.meta.changes !== 1) {
-      const current = await db
+      const changed = await db
         .prepare("SELECT * FROM databases WHERE id=?")
         .bind(row.id)
         .first<DatabaseRow>();
       if (
-        !current ||
-        current.generation !== row.generation ||
-        current.desired_state !== row.desired_state ||
-        current.size_class_id !== row.size_class_id ||
-        current.updated_at !== row.updated_at ||
-        sleeping
+        !changed ||
+        changed.generation !== row.generation ||
+        changed.desired_state !== row.desired_state ||
+        changed.size_class_id !== row.size_class_id ||
+        changed.updated_at !== row.updated_at ||
+        !sameOverrides(ownResources(changed), current) ||
+        (sleeping && capacity === undefined)
       )
         throw new ApiError("conflict", "Database changed; retry the request", {
           reason: "generation_changed",

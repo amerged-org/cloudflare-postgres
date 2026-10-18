@@ -228,7 +228,7 @@ const minutes = (node: string) =>
 
 describe("the events of a node", () => {
   it("count its decisions in the minute they happened", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const at = Math.floor(Date.now() / 60_000) * 60_000 - 5 * 60_000 + 1000;
     const events = [
       admission("a", {}, at),
@@ -322,7 +322,7 @@ describe("the events of a node", () => {
   });
 
   it("log a wake with its phases and count nothing", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const lines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((line: unknown) => {
       lines.push(String(line));

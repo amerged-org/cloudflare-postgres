@@ -32,6 +32,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "PATCH /v1/databases/{id}": [400, 401, 404, 409, 500, 503],
   // 409: the database is deleted.
   "PUT /v1/databases/{id}/idle-time": [400, 401, 404, 409, 500],
+  // 403: not an admin key; 503: the node cannot take the growth.
+  "PUT /v1/databases/{id}/resources": [400, 401, 403, 404, 409, 500, 503],
   "DELETE /v1/databases/{id}": [400, 401, 404, 409, 500],
   "POST /v1/databases/{id}/restore": [400, 401, 404, 409, 500],
   "POST /v1/databases/{id}/suspend": [400, 401, 404, 409, 500],
@@ -113,6 +115,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",
+  "PUT /v1/databases/{id}/resources",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
   "POST /v1/databases/{id}/suspend",
@@ -140,6 +143,7 @@ export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",
+  "PUT /v1/databases/{id}/resources",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
   "POST /v1/databases/{id}/suspend",
@@ -186,6 +190,9 @@ export const locationResponses: Readonly<
   "PUT /v1/databases/{id}/resource-profile": {
     "202":
       "Database resize operation resource path for the selected resource profile.",
+  },
+  "PUT /v1/databases/{id}/resources": {
+    "202": "Database resize operation resource path for the new resources.",
   },
   "DELETE /v1/databases/{id}/roles/{name}": {
     "202": "Role deletion operation resource path.",

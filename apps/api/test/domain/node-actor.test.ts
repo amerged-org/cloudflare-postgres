@@ -67,7 +67,7 @@ const until = async (check: () => Promise<boolean>) => {
 
 describe("the link of a node", () => {
   it("answers a hello with a welcome and records the agent and the release it runs", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f, false);
     const welcome = next(socket);
     socket.send(hello("release-1-2-0"));
@@ -83,7 +83,7 @@ describe("the link of a node", () => {
   });
 
   it("closes a link on anything but a hello and then samples", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     for (const [message, greeted] of [
       [sampleMessage(Date.now()), false],
       [hello(), true],
@@ -121,7 +121,7 @@ describe("the link of a node", () => {
   });
 
   it("sends hints to the connected agent, also after hibernation, and replaces the older socket", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const stub = actor(f.node),
       id = newDatabaseId();
     const first = await connect(f);
@@ -142,15 +142,15 @@ describe("the link of a node", () => {
   });
 
   it("reaches no agent that has not said hello", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f, false);
     expect(await actor(f.node).notify([newDatabaseId()])).toBe(0);
     socket.close(1000);
   });
 
   it("refuses a link that does not come from the Worker for its own node", async () => {
-    const f = await fixture();
-    const other = await fixture();
+    const f = await fixture(0);
+    const other = await fixture(0);
     const attempt = (headers: Record<string, string>) =>
       actor(f.node).fetch(
         new Request(`https://${["link", "invalid"].join(".")}/node/v1/link`, {
@@ -176,7 +176,7 @@ describe("the link of a node", () => {
   });
 
   it("is opened by the node's signed request", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const response = await nodeRequest(f, "/node/v1/link", {
       headers: { Upgrade: "websocket" },
     });
@@ -192,7 +192,7 @@ describe("the link of a node", () => {
   });
 
   it("is told to pull the fence and closed when the node is declared lost", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f);
     const hint = next(socket),
       end = closed(socket);
@@ -204,7 +204,7 @@ describe("the link of a node", () => {
 
 describe("the samples of a node", () => {
   it("folds a minute into one row, the first sample written at once and the rest with the minute", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f);
     const start = Math.floor((Date.now() - 5 * MINUTE) / MINUTE) * MINUTE;
     const send = async (message: string) => {
@@ -258,7 +258,7 @@ describe("the samples of a node", () => {
   });
 
   it("writes the last minute when its alarm rings, and not twice", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f);
     // Samples of the minute that is running, so that its alarm is still to come.
     if (Date.now() % MINUTE > MINUTE - 20_000)
@@ -281,7 +281,7 @@ describe("the samples of a node", () => {
     // The alarm of a minute rings 5 s after it ends, so a first sample sooner than that moves the
     // alarm on before it rings. The node's vitals must follow the sample all the same.
     async function rollOver(forceAlarm: boolean) {
-      const f = await fixture();
+      const f = await fixture(0);
       const socket = await connect(f);
       const minute = Math.floor(Date.now() / MINUTE) * MINUTE;
       const send = async (message: string) => {
@@ -391,7 +391,7 @@ describe("the samples of a node", () => {
   });
 
   it("ignores a sample from the future and one older than the newest", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f);
     const now = Date.now();
     socket.send(sampleMessage(now - 20_000));
@@ -409,7 +409,7 @@ describe("the samples of a node", () => {
   });
 
   it("reports no sample before the first and no link after it closed", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     expect(await actor(f.node).latest()).toEqual({
       connected: false,
       received_at: null,
@@ -444,7 +444,7 @@ describe("folding samples", () => {
 
 describe("a node's reading in the actor", () => {
   it("is kept in the actor's own storage across evictions", async () => {
-    const f = await fixture();
+    const f = await fixture(0);
     const socket = await connect(f);
     socket.send(sampleMessage(Date.now() - 1000));
     await until(async () => (await actor(f.node).latest()).sample !== null);

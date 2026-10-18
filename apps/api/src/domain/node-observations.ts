@@ -4,7 +4,6 @@ import {
   NodeObservationReport,
   newOperationId,
   observationVerdict,
-  SIDECAR,
   type NodeDatabaseObservation,
   type NodeOrderResult,
   type ObservationVerdict,
@@ -14,10 +13,7 @@ import type { ApiContext, Env } from "../env.ts";
 import { databaseActor } from "./database-actor-sync.ts";
 import { recoverQuiescence, powerTransitionStatements } from "./lifecycle.ts";
 import { hintDatabases } from "./node-hints.ts";
-import {
-  databaseCpuChargeSql,
-  recordStartupObservationStatement,
-} from "./startup-admission.ts";
+import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 import {
   withAdmissionMutation,
   type AdmissionMutation,
@@ -97,18 +93,14 @@ class Statements {
       this.db
         .prepare(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-           SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,
-             json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
-               'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)},
-               'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib*1073741824 ELSE NULL END)
-           FROM databases d JOIN size_classes s ON s.id=d.size_class_id
+           SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
+           FROM databases d JOIN database_resources r ON r.database_id=d.id
            WHERE d.id=? AND d.generation=? AND ${applied.sql} ${asked}
              AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind=? AND generation=d.generation)`,
         )
         .bind(
           kind,
           this.at,
-          SIDECAR.requestMemoryMib,
           this.row.id,
           this.generation,
           ...applied.bindings,
@@ -256,16 +248,6 @@ class Statements {
           `UPDATE database_restores SET verified_at=COALESCE(verified_at,?) WHERE target_database_id=? AND operation_id=? AND ${applied.sql}`,
         )
         .bind(this.now, this.row.id, operation, ...applied.bindings),
-    );
-  }
-  startup(state: "ready" | "hibernated" | "deleted"): void {
-    this.list.push(
-      recordStartupObservationStatement(this.db, {
-        databaseId: this.row.id,
-        generation: this.generation,
-        observedAt: this.now,
-        state,
-      }),
     );
   }
 }
@@ -486,7 +468,6 @@ async function applyObservation(
           observation.roles?.removed ?? [],
           observation.roles?.blocked ?? [],
         );
-        statements.startup("ready");
         break;
       case "asleep":
         // A running database the node reports asleep has its wake pending: the sleep stands, and
@@ -501,13 +482,11 @@ async function applyObservation(
           );
           statements.succeed(["database.resize"], null);
           statements.sleepEndsRoleRemovals();
-          statements.startup("hibernated");
         }
         break;
       case "deleted":
         statements.event("deleted");
         statements.succeed(["database.delete"], null);
-        statements.startup("deleted");
         break;
       case "error":
         statements.fail(
@@ -684,7 +663,6 @@ async function idleSleep(
       statements.event("hibernated");
       statements.succeed(["database.hibernate"], operation);
       statements.sleepEndsRoleRemovals();
-      statements.startup("hibernated");
       return mutation.batch([...transition, ...statements.list]);
     },
   );

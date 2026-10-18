@@ -71,7 +71,8 @@ CREATE TABLE infrastructure_alerts (
   last_attempt_at TEXT,
   PRIMARY KEY(region_id,kind)
 ) STRICT;
-INSERT INTO admission_scope_fences SELECT * FROM node_link_keep_scope_fences;
+-- Only the region fences went with `regions`; those of projects and nodes are still there.
+INSERT OR IGNORE INTO admission_scope_fences SELECT * FROM node_link_keep_scope_fences;
 INSERT INTO infrastructure_alerts SELECT * FROM node_link_keep_alerts;
 DROP TABLE node_link_keep_regions;
 DROP TABLE node_link_keep_scope_fences;

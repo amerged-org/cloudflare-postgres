@@ -12,6 +12,7 @@ import { routePath } from "hono/route";
 import { registerApiDocuments } from "./openapi.ts";
 import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
+import { registerDatabaseResources } from "./routes/database-resources.ts";
 import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
 import { registerCosts } from "./routes/costs.ts";
@@ -76,6 +77,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases",
   "/v1/databases/:id",
   "/v1/databases/:id/idle-time",
+  "/v1/databases/:id/resources",
   "/v1/databases/:id/suspend",
   "/v1/databases/:id/restore",
   "/v1/databases/:id/resume",
@@ -340,6 +342,7 @@ export function createApp(): ApiApp {
 
   registerPlatform(app);
   registerDomain(app);
+  registerDatabaseResources(app);
   registerUsage(app);
   registerCosts(app);
   registerNodes(app);

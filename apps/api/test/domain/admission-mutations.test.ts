@@ -10,6 +10,7 @@ import {
   request,
   verdicts,
 } from "./fixtures.ts";
+import { reports } from "./node-samples.ts";
 import {
   withAdmissionMutation,
   type AdmissionSqlGuard,
@@ -289,11 +290,7 @@ it("pending placement cannot join a node or region while its scope is closed", a
     await (await f.create()).json(),
   ).database;
   expect(created.node_id).toBeNull();
-  await env.DB.prepare(
-    "UPDATE nodes SET allocatable_memory_mib=4096 WHERE id=?",
-  )
-    .bind(f.node)
-    .run();
+  await reports(f.node);
   await withAdmissionMutation(
     env,
     [],
