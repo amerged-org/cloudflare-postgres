@@ -198,8 +198,13 @@ fn root_socket(root: &Path) -> PathBuf {
 
 impl Rig {
     pub(crate) async fn new(label: &str) -> Option<Self> {
+        Self::with_timing(label, timing()).await
+    }
+
+    /// A node whose agent waits as `timing` says.
+    pub(crate) async fn with_timing(label: &str, timing: Timing) -> Option<Self> {
         let (machine, fixture, root) = site(label, &root_socket)?;
-        Some(Self::boot(machine, fixture, root, Vec::new()).await)
+        Some(Self::boot(machine, fixture, root, Vec::new(), timing).await)
     }
 
     /// The agent process on a machine: its sockets, its tables and its core. A restart is another
@@ -209,6 +214,7 @@ impl Rig {
         fixture: Arc<Fixture>,
         root: PathBuf,
         running: Vec<Running>,
+        timing: Timing,
     ) -> Self {
         let archive_socket = root.join("a.sock");
         let table = Arc::new(Table::default());
@@ -236,7 +242,7 @@ impl Rig {
                 gateway: gateway.clone(),
                 fences,
                 policy: policy(),
-                timing: timing(),
+                timing,
             },
             running,
         );
@@ -269,10 +275,11 @@ impl Rig {
             self.fixture.clone(),
             self.root.clone(),
         );
+        let timing = self.core.timing.clone();
         drop(self);
         // The old sockets close with the old tasks.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        Self::boot(machine, fixture, root, running).await
+        Self::boot(machine, fixture, root, running, timing).await
     }
 
     /// A page entry for a new database with the roles `app` and `reader`; the archive credential
@@ -353,7 +360,13 @@ impl Rig {
 
     /// A gateway connected to the agent's channel.
     pub(crate) async fn connect_gateway(&self) -> FakeGateway {
-        FakeGateway::connect(&self.root.join("g.sock")).await
+        let gateway = FakeGateway::connect(&self.root.join("g.sock")).await;
+        // From here on every change of the table reaches it as a message of its own.
+        eventually(5, "the feed to serve the gateway", || {
+            self.gateway.connected()
+        })
+        .await;
+        gateway
     }
 
     /// The observation the core queued last for a database.

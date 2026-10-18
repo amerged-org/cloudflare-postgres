@@ -77,6 +77,8 @@ impl Node {
             let storage = storage.clone();
             tokio::task::spawn_blocking(move || storage.open()).await??;
         }
+        // What the agent keeps of its own, below a directory only root reads.
+        crate::link::file::create_private_directory(&layout.agent())?;
         let users = Users::load(layout.uids())?;
         Ok(Self {
             layout,
@@ -441,5 +443,224 @@ impl Machine for Node {
     fn cpu(&self) -> Option<CpuTimes> {
         let text = std::fs::read_to_string("/proc/stat").ok()?;
         crate::sample::cpu_times(&text, USER_HZ)
+    }
+}
+
+#[cfg(test)]
+mod lab {
+    //! The node's machine against a real systemd as PID 1, LVM on a loop device and PostgreSQL 18.
+    //! It runs as root in the lab with the node image's units (`pgcf-pg@.service`, `pgcf.slice`) and a
+    //! group `pgcf-gateway`, with `--ignored`; anywhere else it is skipped. It makes users, a volume
+    //! group and a database, and removes them again.
+    use super::*;
+    use crate::{
+        machine::Machine,
+        postgres, settings,
+        storage::{Policy, Removal, VolumeId},
+        units::limits::{Io, Limits},
+    };
+    use std::{path::PathBuf, process::Command, time::Duration};
+
+    const ID: &str = "labnode0000000000001";
+
+    fn sh(program: &str, args: &[&str]) -> String {
+        let output = Command::new(program).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{program} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+    /// A property of a unit, as `systemctl show` spells it.
+    fn show(unit: &str, property: &str) -> String {
+        sh("systemctl", &["show", "-p", property, "--value", unit])
+    }
+
+    /// The loop device, the volume group and the users, removed again however the test ends.
+    struct Lab {
+        disk: PathBuf,
+        loop_device: String,
+        group: String,
+    }
+    impl Drop for Lab {
+        fn drop(&mut self) {
+            let run = |program: &str, args: &[&str]| {
+                let _ = Command::new(program).args(args).output();
+            };
+            run("systemctl", &["stop", &format!("pgcf-pg@{ID}.service")]);
+            run("umount", &[&format!("/var/lib/pgcf/db/{ID}")]);
+            run("vgremove", &["-f", &self.group]);
+            run("losetup", &["-d", &self.loop_device]);
+            run("userdel", &[&format!("pgcf-{ID}")]);
+            run("groupdel", &[&format!("pgcf-{ID}")]);
+            let _ = std::fs::remove_dir_all(format!("/run/pgcf/{ID}"));
+            let _ = std::fs::remove_file(&self.disk);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs systemd as PID 1, root, LVM and the node image's units (lab)"]
+    async fn a_database_lives_on_the_real_stack_from_its_account_to_its_removal() {
+        if !Path::new("/run/systemd/system").is_dir() || unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs systemd as PID 1 and root");
+            return;
+        }
+        let group = format!("pgcflab{}", std::process::id());
+        let disk = std::env::temp_dir().join(format!("{group}.img"));
+        std::fs::File::create(&disk)
+            .unwrap()
+            .set_len(4 << 30)
+            .unwrap();
+        let loop_device = sh("losetup", &["-f", "--show", disk.to_str().unwrap()]);
+        let _lab = Lab {
+            disk,
+            loop_device: loop_device.clone(),
+            group: group.clone(),
+        };
+        let layout = Layout::default();
+        let node = Node::connect(
+            layout.clone(),
+            storage::Config {
+                device: loop_device.into(),
+                group,
+                ..storage::Config::default()
+            },
+        )
+        .await
+        .unwrap();
+        let policy = Policy {
+            reserve_bytes: 0,
+            metadata_no_room_percent: 100,
+            sample_max_age: Duration::from_secs(60),
+        };
+        let volume = VolumeId::new(ID, 1).unwrap();
+
+        // The database's user has the uid the agent handed it, and a second call finds it.
+        let account = node.ensure_account(ID).await.unwrap();
+        assert_eq!(node.account(ID), Some(account.clone()));
+        assert_eq!(node.ensure_account(ID).await.unwrap(), account);
+        assert_eq!(account.name, format!("pgcf-{ID}"));
+
+        // Its volume is made, formatted and mounted for it; its socket directory is the gateway's
+        // to read; initdb runs as the database's user.
+        node.poll_pool().await.unwrap();
+        node.create_volume(&volume, 1 << 30, &account, &policy)
+            .await
+            .unwrap();
+        assert!(node.has_volume(&volume).await.unwrap());
+        let owner = |path: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.uid(), metadata.mode() & 0o777)
+        };
+        assert_eq!(owner(&layout.volume(ID)), (account.uid, 0o700));
+        node.prepare_socket_directory(ID, &account).unwrap();
+        assert_eq!(owner(&layout.socket_directory(ID)), (account.uid, 0o750));
+        let data = layout.data(ID);
+        node.initdb(&account, &data).await.unwrap();
+        assert_eq!(owner(&data.join("PG_VERSION")).0, account.uid);
+
+        // The agent's configuration, written for the database's user, and the unit's limits.
+        let socket = layout.socket_directory(ID);
+        let conf = settings::postgresql_conf(&settings::Settings {
+            socket_directory: &socket,
+            memory_mib: 512,
+            volume_bytes: 1 << 30,
+            max_connections: 20,
+            archive_timeout_seconds: 60,
+            archive_command: None,
+        })
+        .unwrap();
+        let ident = settings::pg_ident(&node.agent_user(), &account.name).unwrap();
+        for (name, content) in [
+            ("postgresql.conf", conf.as_str()),
+            ("pg_hba.conf", settings::PG_HBA),
+            ("pg_ident.conf", ident.as_str()),
+        ] {
+            std::fs::write(data.join(name), content).unwrap();
+            chown(data.join(name), Some(account.uid), Some(account.gid)).unwrap();
+        }
+        let unit = format!("pgcf-pg@{ID}.service");
+        node.set_limits(
+            ID,
+            &Limits {
+                memory_mib: 512,
+                cpu_millicores: 500,
+                tasks_max: 64,
+                io: Some(Io::scaled(node.device(&volume), 20 << 20, 500, 512)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(show(&unit, "MemoryMax"), (512u64 << 20).to_string());
+        assert_eq!(show(&unit, "CPUWeight"), "50");
+
+        // It starts as its user, answers the agent over the socket, takes a CPU quota that its
+        // stop lifts again.
+        let started = node.start(ID).await.unwrap();
+        assert_eq!(started.uid, account.uid);
+        node.set_cpu_quota(ID, NonZeroU32::new(250)).await.unwrap();
+        assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "250ms");
+        let session = postgres::agent(&socket).await.unwrap();
+        assert_eq!(
+            session
+                .query("SELECT 1::int4", &[])
+                .await
+                .unwrap()
+                .first()
+                .map(|row| row.get::<_, i32>(0)),
+            Some(1)
+        );
+        drop(session);
+        node.stop(ID).await.unwrap();
+        assert_eq!(show(&unit, "CPUQuotaPerSecUSec"), "infinity");
+        assert!(!node.unit(ID).await.unwrap().active.awake());
+
+        // The volume grows online, is trimmed, unmounted and mounted again as after a boot.
+        node.grow_volume(&volume, 2 << 30).await.unwrap();
+        node.trim_volume(&volume).await.unwrap();
+        let listed = |inventory: Inventory| {
+            inventory
+                .volumes
+                .into_iter()
+                .find(|info| info.id == volume)
+                .map(|info| (info.size_bytes, info.mounted()))
+        };
+        assert_eq!(
+            listed(node.inventory().await.unwrap()),
+            Some((2 << 30, true))
+        );
+        node.unmount_volume(&volume).await.unwrap();
+        assert_eq!(
+            listed(node.inventory().await.unwrap()),
+            Some((2 << 30, false))
+        );
+        assert!(
+            node.mount_volumes(std::slice::from_ref(&volume))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(data.join("PG_VERSION").exists());
+
+        // The memory all databases may hold together, and what the kernel reports.
+        node.set_slice_memory(300).await.unwrap();
+        assert_eq!(show("pgcf.slice", "MemoryMax"), (300u64 << 20).to_string());
+        assert!(node.memory().is_some_and(|memory| memory.total_bytes > 0));
+        assert!(node.cpu().is_some_and(|cpu| cpu.cores > 0));
+
+        // A deleted database takes its volume and its user with it, and the uid is free again.
+        node.remove_volume(
+            &volume,
+            Removal::DatabaseDeleted {
+                storage_generation: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!node.has_volume(&volume).await.unwrap());
+        node.remove_account(ID).await.unwrap();
+        assert_eq!(node.account(ID), None);
     }
 }

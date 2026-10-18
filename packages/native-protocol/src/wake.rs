@@ -42,7 +42,43 @@ pub const TICKET_LEASE_MS: u64 = 10_000;
 pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
 pub const SLOT_NAMESPACE_PREFIX: &str = "pgcf-slot-";
-/// Every reason a wake result may name (`WAKE_REASONS` of `packages/contracts/src/node-local.ts`).
+/// Every reason the pool of the Kubernetes runtime names; the node agent never does.
+pub const POOL_REASONS: [&str; 32] = [
+    "no_desired_row",
+    "not_sleeping",
+    "wake_in_progress",
+    "desired_stale",
+    "no_room",
+    "thick_storage",
+    "volume_identity_missing",
+    "no_power_record",
+    "no_sleep_record",
+    "image_changed",
+    "configuration_changed",
+    "no_free_slot",
+    "no_headroom",
+    "gateways_not_ready",
+    "agent_unavailable",
+    "holder_busy",
+    "volume_open",
+    "volume_suspended",
+    "volume_missing",
+    "uuid_mismatch",
+    "unclean",
+    "control_version",
+    "identity_mismatch",
+    "container_missing",
+    "mount_failed",
+    "audit_failed",
+    "bind_failed",
+    "start_timeout",
+    "sql_identity_mismatch",
+    "release_failed",
+    "deleted",
+    "not_in_region",
+];
+/// Every reason the node agent's wake result may name (`WAKE_REASONS` of
+/// `packages/contracts/src/node-local.ts`).
 pub const REASONS: [&str; 22] = [
     "no_room",
     "no_headroom",
@@ -425,22 +461,10 @@ pub struct WakeResult {
     pub steps_ms: BTreeMap<String, u64>,
 }
 impl WakeResult {
-    pub fn valid(&self) -> bool {
+    fn well_formed(&self) -> bool {
         valid_pattern("database", &self.database)
             && valid_pattern("operation", &self.operation)
             && positive(self.generation)
-            && match (&self.outcome, &self.reason) {
-                (Outcome::Started, None) => true,
-                (Outcome::Refused, Some(reason)) => REASONS.contains(&reason.as_str()),
-                _ => false,
-            }
-            && match (&self.reason, self.retry_after_seconds) {
-                (Some(reason), Some(seconds)) => {
-                    reason == RETRY_REASON && (1..=RETRY_AFTER_MAX_SECONDS).contains(&seconds)
-                }
-                (reason, None) => reason.as_deref() != Some(RETRY_REASON),
-                (None, Some(_)) => false,
-            }
             && self.steps_ms.len() <= 16
             && self.steps_ms.iter().all(|(key, value)| {
                 !key.is_empty()
@@ -448,6 +472,32 @@ impl WakeResult {
                     && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
                     && *value <= 600_000
             })
+    }
+    /// The result as the pool of the Kubernetes runtime posts it: `hit`, or `miss` and `refused`
+    /// with a reason of `POOL_REASONS`.
+    pub fn valid(&self) -> bool {
+        self.well_formed()
+            && self.retry_after_seconds.is_none()
+            && match (&self.outcome, &self.reason) {
+                (Outcome::Hit, None) => true,
+                (Outcome::Miss | Outcome::Refused, Some(reason)) => {
+                    POOL_REASONS.contains(&reason.as_str())
+                }
+                _ => false,
+            }
+    }
+    /// The result as the node agent sends it on its channel: `started`, or `refused` with a reason
+    /// of `REASONS`. Exactly the refusal that waiting can undo carries the retry hint.
+    pub fn valid_from_agent(&self) -> bool {
+        self.well_formed()
+            && match (&self.outcome, &self.reason, self.retry_after_seconds) {
+                (Outcome::Started, None, None) => true,
+                (Outcome::Refused, Some(reason), seconds) if REASONS.contains(&reason.as_str()) => {
+                    (reason == RETRY_REASON) == seconds.is_some()
+                        && seconds.is_none_or(|s| (1..=RETRY_AFTER_MAX_SECONDS).contains(&s))
+                }
+                _ => false,
+            }
     }
 }
 /// Whether `value` is a slot namespace: `pgcf-slot-` and 8 lowercase hex digits.
@@ -464,4 +514,70 @@ pub fn slot_tls_name(namespace: &str) -> String {
 pub fn slot_namespace_of_tls_name(name: &str) -> Option<&str> {
     let namespace = name.strip_prefix("database-rw.")?.strip_suffix(".svc")?;
     is_slot_namespace(namespace).then_some(namespace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(outcome: Outcome, reason: Option<&str>, hint: Option<u32>) -> WakeResult {
+        WakeResult {
+            database: "a".repeat(20),
+            operation: format!("op_{}", "b".repeat(20)),
+            generation: 3,
+            outcome,
+            reason: reason.map(String::from),
+            retry_after_seconds: hint,
+            steps_ms: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn the_agents_answers_are_started_or_refused_and_only_no_headroom_carries_the_hint() {
+        let valid = |r: WakeResult| r.valid_from_agent();
+        assert!(valid(result(Outcome::Started, None, None)));
+        assert!(!valid(result(Outcome::Started, Some("no_room"), None)));
+        assert!(!valid(result(Outcome::Started, None, Some(5))));
+        for reason in REASONS {
+            let hint = (reason == RETRY_REASON).then_some(5);
+            assert!(
+                valid(result(Outcome::Refused, Some(reason), hint)),
+                "{reason}"
+            );
+        }
+        assert!(!valid(result(Outcome::Refused, Some("no_headroom"), None)));
+        assert!(!valid(result(Outcome::Refused, Some("no_room"), Some(5))));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("no_headroom"),
+            Some(0)
+        )));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("no_headroom"),
+            Some(RETRY_AFTER_MAX_SECONDS + 1)
+        )));
+        assert!(!valid(result(
+            Outcome::Refused,
+            Some("a_reason_nobody_named"),
+            None
+        )));
+        assert!(!valid(result(Outcome::Refused, None, None)));
+        // The pool's answers and reasons are no agent's.
+        assert!(!valid(result(Outcome::Hit, None, None)));
+        assert!(!valid(result(Outcome::Miss, Some("no_free_slot"), None)));
+        assert!(!valid(result(Outcome::Refused, Some("no_free_slot"), None)));
+    }
+
+    #[test]
+    fn the_pool_of_the_kubernetes_runtime_keeps_its_own_answers_and_never_a_hint() {
+        assert!(result(Outcome::Hit, None, None).valid());
+        assert!(result(Outcome::Miss, Some("no_free_slot"), None).valid());
+        assert!(result(Outcome::Refused, Some("deleted"), None).valid());
+        assert!(!result(Outcome::Hit, None, Some(5)).valid());
+        assert!(!result(Outcome::Miss, Some("no_free_slot"), Some(5)).valid());
+        // The agent's answers are no pool's.
+        assert!(!result(Outcome::Started, None, None).valid());
+        assert!(!result(Outcome::Refused, Some("fenced"), None).valid());
+    }
 }

@@ -143,7 +143,7 @@ impl<M: Machine> Service<M> {
             .collect();
         let table = Arc::new(Table::default());
         let credentials = Arc::new(Credentials::default());
-        std::fs::create_dir_all(layout.jobs())?;
+        crate::link::file::create_private_directory(&layout.jobs())?;
         let jobs = Arc::new(Jobs::new(
             Runner::new(&layout.systemd_run, &layout.barman_bin, layout.jobs()),
             policy.backup.clone(),

@@ -530,7 +530,14 @@ printf '{{"backup_id":"%s","status":"%s","timeline":%s,"systemid":"%s","end_wal"
         Some(&end(&next, &system_identifier)),
     )
     .await;
-    assert_eq!(result.unwrap_err(), "no_recovery_point");
+    // PostgreSQL is consistent early in the recovery and dies at the missing segment: whether it
+    // dies before or after `pg_ctl` saw it accept connections decides which step reports it, and
+    // either way the recovery point was not reached.
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, "no_recovery_point" | "start_failed"),
+        "{error}"
+    );
     assert!(abandoned);
     let log = short.log();
     assert!(log.contains("could not restore file"), "{log}");

@@ -1066,6 +1066,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wake_that_outlasts_its_deadline_is_refused_and_its_late_start_still_applies_the_roles()
+     {
+        let timing = crate::agent::Timing {
+            wake_start: std::time::Duration::from_millis(300),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("late-roles", timing).await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+
+        // While it sleeps the page changes a password.
+        next(&mut db, 6);
+        db["roles"] = json!([
+            {"name": "app", "owner": true, "password": testpg::password(5), "revision": 5},
+            {"name": "reader", "owner": false, "password": testpg::password(2), "revision": 2}
+        ]);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(10, "the entry", || {
+            handle
+                .view()
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.generation == 6)
+        })
+        .await;
+
+        // The start takes longer than the wake may: the gateway is told to ask again.
+        rig.machine
+            .delay_next_start(std::time::Duration::from_millis(1500));
+        let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&db))).await;
+        assert_eq!(
+            (result.outcome, result.reason.as_deref()),
+            (Outcome::Refused, Some("start_timeout"))
+        );
+        // The start goes on, and the database is released only with the page's roles.
+        eventually(30, "the late start to release the database", || {
+            handle.phase() == Phase::Ready
+        })
+        .await;
+        login(&rig, &id, "app", &testpg::password(5)).await.unwrap();
+        assert!(login(&rig, &id, "app", &testpg::password(1)).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_orders_move_maintenance_fence_and_superseded_do_what_they_say_and_no_more() {
         let Some(rig) = Rig::new("orders").await else {
             return;

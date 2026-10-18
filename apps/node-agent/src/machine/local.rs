@@ -53,6 +53,8 @@ struct State {
     volume_error: Option<storage::Error>,
     /// `start` fails once.
     start_fails: bool,
+    /// How long the next start takes before the postmaster begins.
+    start_delay: Option<Duration>,
     /// The `archive_command` of a database, where it is not the layout's.
     archive_commands: HashMap<String, String>,
     /// Every database archives straight into its upload log.
@@ -171,6 +173,9 @@ impl Local {
     /// Every database archives straight into its upload log, as `archive_with` does for one.
     pub fn direct_archive(&self) {
         self.state().direct_archive = true;
+    }
+    pub fn delay_next_start(&self, delay: Duration) {
+        self.state().start_delay = Some(delay);
     }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
@@ -561,6 +566,12 @@ impl Machine for Local {
             unit.child = Some(child);
             unit.invocation_id = Some(format!("00000000-0000-4000-8000-{:012x}", unit.invocations));
         }
+        // A start that takes long, as a recovery does, goes on in systemd whether or not the caller
+        // still waits for it.
+        let delay = self.state().start_delay.take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let started = Instant::now();
         loop {
             if ready::ready_socket(&volume, pid).is_ok() {
@@ -584,7 +595,15 @@ impl Machine for Local {
         }
     }
     async fn wait_started(&self, database: &str) -> Result<Started, units::Error> {
-        self.started(database)
+        let waited = Instant::now();
+        loop {
+            match self.started(database) {
+                Err(units::Error::NotReady(_))
+                    if self.running(database) && waited.elapsed() < Duration::from_secs(60) => {}
+                other => return other,
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
     async fn stop(&self, database: &str) -> Result<(), units::Error> {
         let child = {

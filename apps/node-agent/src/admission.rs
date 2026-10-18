@@ -528,7 +528,6 @@ impl Admitter {
         }
     }
 
-    /// The database's class gained or lost its idle time.
     /// A resize changed the memory of an awake database: it counts at its new size from now on.
     pub fn resized(&mut self, database: &str, memory_mib: u64) {
         if let Some(awake) = self.awake.get_mut(database) {
@@ -536,6 +535,7 @@ impl Admitter {
         }
     }
 
+    /// The database's class gained or lost its idle time.
     pub fn set_always_warm(&mut self, database: &str, always_warm: bool) {
         if let Some(awake) = self.awake.get_mut(database) {
             awake.always_warm = always_warm;
@@ -2306,5 +2306,39 @@ mod tests {
             None,
             "the loop ended and closed its channel"
         );
+    }
+    #[test]
+    fn a_resized_awake_database_counts_at_its_new_size_and_a_sleeping_one_is_not_added() {
+        let t0 = Instant::now();
+        let mut admitter = Admitter::rebuild(
+            reserved(),
+            [Running {
+                database: "a".into(),
+                memory_mib: 256,
+                starting: false,
+                always_warm: false,
+            }],
+            t0,
+        );
+        // Before the resize the awake budget has room for 1,000 MiB more.
+        assert_eq!(
+            admitter.request(t0, &facts(8000), request("b", 1000)),
+            admitted(Duration::ZERO)
+        );
+        finish(&mut admitter, "b", true, t0);
+        admitter.stopped("b");
+        admitter.resized("a", 9000);
+        admitter.resized("asleep", 512);
+        assert_eq!(
+            admitter.snapshot(),
+            Snapshot {
+                awake: vec!["a".into()],
+                awake_memory_mib: 9000,
+                starting: 0,
+                queued: 0,
+            }
+        );
+        // The same start now waits for memory.
+        queue(&mut admitter, t0, &facts(8000), request("b", 1000));
     }
 }

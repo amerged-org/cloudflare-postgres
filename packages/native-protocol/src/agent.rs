@@ -144,7 +144,7 @@ impl ToGateway {
             }
             Self::Database { database } => database.valid(),
             Self::Removed { database } => valid_pattern("database", database),
-            Self::WakeResult { result } => result.valid(),
+            Self::WakeResult { result } => result.valid_from_agent(),
             Self::Control {
                 id,
                 database,

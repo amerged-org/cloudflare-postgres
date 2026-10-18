@@ -199,6 +199,17 @@ impl<M: Machine> Core<M> {
         if db.phase() != Phase::Starting {
             return;
         }
+        // The roles are the page's before anyone logs in, as at a wake that did not outlast its
+        // deadline.
+        let entry = db.view().entry.clone();
+        if let Some(entry) = entry
+            && self.refresh_roles(db, &entry).await.is_err()
+        {
+            let _ = self.machine.stop(&db.id).await;
+            self.admission.stopped(&db.id);
+            self.go_unproven(db);
+            return;
+        }
         if let Some(writer) = writer_of(&started) {
             self.set(db, |view| {
                 view.phase = Phase::Ready;
@@ -1228,15 +1239,6 @@ mod tests {
         rig.core.watch_pass().await;
         assert_eq!(db.phase(), Phase::Unproven);
         assert_eq!(rig.gateway.get(&entry.id).unwrap().mode, Mode::Sleeping);
-        assert!(
-            rig.core
-                .admission
-                .snapshot()
-                .await
-                .unwrap()
-                .awake
-                .is_empty()
-        );
         // While recovery is pending a wake is refused as unproven.
         let first = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(
@@ -1250,6 +1252,23 @@ mod tests {
         })
         .await;
         assert!(!rig.machine.running(&entry.id));
+        // The crashed unit's memory and the recovery's own were given back.
+        let waited = std::time::Instant::now();
+        while !rig
+            .core
+            .admission
+            .snapshot()
+            .await
+            .unwrap()
+            .awake
+            .is_empty()
+        {
+            assert!(
+                waited.elapsed() < Duration::from_secs(5),
+                "timed out: the memory to be given back"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(rig.observation(&entry.id)["state"], "asleep");
         let events = rig.core.take_events();
         assert!(events.iter().any(|e| e["type"] == "admission"
