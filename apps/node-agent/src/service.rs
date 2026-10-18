@@ -1185,6 +1185,7 @@ mod tests {
             ("postgresql-18", "18.6-1"),
             ("cloudflared", "2026.10.0"),
         ]);
+        let before = crate::update::packages_digest(&machine.installed_packages().await.unwrap());
         let cloud = Cloud::start().await;
         let deb = b"cloudflared 2026.10.1".to_vec();
         let url = cloud.serve_file("/files/cloudflared.deb", deb.clone());
@@ -1230,21 +1231,25 @@ mod tests {
             "{calls:?}"
         );
         assert!(at("reboot").is_none(), "{calls:?}");
-        // The packages changed and the node did not boot again: the link says hello again, with
-        // the digest of what is installed now, and the boot of before.
+        // The packages changed and the node did not boot again: the hello says the digest of what
+        // is installed now, on the link that was up or on a new one, and no hello says another boot.
+        let after = crate::update::packages_digest(&machine.installed_packages().await.unwrap());
+        assert_ne!(after, before);
         eventually(30, "the new packages to be said", || {
-            cloud.with(|inner| inner.hellos.len()) == 2
+            cloud.with(|inner| {
+                inner
+                    .hellos
+                    .iter()
+                    .any(|hello| hello["os"]["packages_sha256"] == after.as_str())
+            })
         })
         .await;
         let hellos = cloud.with(|inner| inner.hellos.clone());
-        assert_eq!(hellos[1]["os"]["boot_id"], hellos[0]["os"]["boot_id"]);
-        assert_ne!(
-            hellos[1]["os"]["packages_sha256"],
-            hellos[0]["os"]["packages_sha256"]
-        );
-        assert_eq!(
-            hellos[1]["os"]["packages_sha256"],
-            crate::update::packages_digest(&machine.installed_packages().await.unwrap())
+        assert!(
+            hellos
+                .iter()
+                .all(|hello| hello["os"]["boot_id"] == hellos[0]["os"]["boot_id"]),
+            "{hellos:?}"
         );
         service.stop();
     }
@@ -1307,6 +1312,7 @@ mod tests {
         };
         runs(&machine, "r1", &same(b"bin"));
         machine.set_packages(&[("bash", "5.2")]);
+        let booted = machine.boot().unwrap().id;
         let cloud = Cloud::start().await;
         let lock = json!({
             "packages": [
@@ -1351,14 +1357,18 @@ mod tests {
         assert_eq!(answer(), Some(json!("done")));
         // The agent that started after the boot says another boot, the kernel the lock named and
         // the lock's packages: what the API compares with the release.
-        let hellos = cloud.with(|inner| inner.hellos.clone());
-        let (before, after) = (&hellos[0]["os"], &hellos.last().unwrap()["os"]);
-        assert_ne!(before["boot_id"], after["boot_id"]);
-        assert_eq!(after["kernel_release"], "6.12.99-amd64");
-        assert_eq!(
-            after["packages_sha256"],
-            crate::update::packages_digest(&machine.installed_packages().await.unwrap())
-        );
+        let digest = crate::update::packages_digest(&machine.installed_packages().await.unwrap());
+        eventually(30, "the new boot to be said", || {
+            cloud.with(|inner| {
+                inner.hellos.iter().any(|hello| {
+                    let os = &hello["os"];
+                    os["boot_id"] != booted.as_str()
+                        && os["kernel_release"] == "6.12.99-amd64"
+                        && os["packages_sha256"] == digest.as_str()
+                })
+            })
+        })
+        .await;
         let calls = machine.calls();
         assert!(calls.contains(&"health_check".to_string()), "{calls:?}");
         assert!(
