@@ -11,7 +11,7 @@ use std::{
 /// Creates `directory` and its parents, readable by its owner only. A `directory` that exists
 /// keeps the mode it was created with, so it is made private as well, whatever mode the installer
 /// gave it: other users must not list the node's files.
-pub(super) fn create_private_directory(directory: &Path) -> Result<()> {
+pub(crate) fn create_private_directory(directory: &Path) -> Result<()> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -20,14 +20,14 @@ pub(super) fn create_private_directory(directory: &Path) -> Result<()> {
 }
 
 /// Makes the rename and removal of an entry of `directory` durable.
-pub(super) fn sync_directory(directory: &Path) -> Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)?.sync_all()
 }
 
 /// Replaces `path` with `bytes` in one step that survives a crash: a 0600 file beside it is
 /// written and fsynced, renamed over `path`, and the directory is fsynced. A reader sees the old
 /// content or the new, never a part.
-pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let directory = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
     let mut partial = name.to_os_string();

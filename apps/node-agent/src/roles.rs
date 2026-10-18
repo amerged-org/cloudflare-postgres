@@ -91,7 +91,7 @@ pub fn parse(roles: &[Value]) -> Option<Vec<Wanted>> {
 }
 
 /// A contract timestamp, `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-fn timestamp(text: &str) -> bool {
+pub(crate) fn timestamp(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() == 24
         && bytes.iter().enumerate().all(|(index, b)| match index {

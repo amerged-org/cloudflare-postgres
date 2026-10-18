@@ -10,7 +10,7 @@
 mod backoff;
 mod desired;
 mod events;
-mod file;
+pub(crate) mod file;
 mod identity;
 mod outbox;
 mod request;

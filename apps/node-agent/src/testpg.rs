@@ -66,6 +66,25 @@ pub fn password(seed: u8) -> String {
         .collect()
 }
 
+/// An `archive_command` for a test: it appends the name of the segment to `log` and exits 0, or
+/// exits 1 while the file `fail` exists. The agent's own archive socket and its upload log are
+/// tested with their own; the proof only needs a log that fills when archiving works.
+pub fn archive_script(directory: &Path, log: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = directory.join("archive.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n[ -f '{fail}' ] && exit 1\nbasename \"$1\" >> '{log}'\n",
+            fail = directory.join("fail").display(),
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
 /// A database ID for a test: 20 characters.
 pub fn database_id() -> String {
     format!("t{:019}", SEQUENCE.fetch_add(1, Ordering::Relaxed))

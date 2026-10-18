@@ -9,6 +9,7 @@ pub mod credentials;
 pub mod diagnostics;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dm;
+pub mod fence;
 pub mod gateway;
 pub mod health;
 pub mod holder;
@@ -20,11 +21,13 @@ pub mod mount;
 pub mod node_link;
 pub mod pg_control;
 pub mod postgres;
+pub mod proof;
 pub mod roles;
 pub mod scram;
 pub mod settings;
 pub mod sleep;
 pub mod sleep_record;
+pub mod state;
 pub mod storage;
 #[cfg(test)]
 mod test_api;
