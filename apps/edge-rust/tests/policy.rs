@@ -2,13 +2,15 @@
 use pgcf_edge_rust::{
     decoy::{Decoy, derive_salt},
     policy::{
-        Admission, Failure, GatewayRegion, Log, Signable, Timings, actor_failure, admission,
-        connection_rate_key, edge_share, limit_failure, limits, refusal_code, routing_hints,
+        Access, Admission, Failure, GatewayRegion, Log, Signable, Timings, access, actor_failure,
+        admission, connection_rate_key, edge_share, limit_failure, limits, refusal_code,
+        routing_hints,
     },
 };
 use pgcf_native_protocol::{
     constant,
     route::{self, Keyring},
+    wire,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -504,6 +506,49 @@ fn the_typescript_edge_reads_a_gateways_refusal_as_the_rust_edge_does() {
             "{row}"
         );
     }
+}
+#[test]
+fn the_typescript_edge_decides_the_access_token_as_the_rust_edge_does() {
+    let rows = vectors()["edge"]["access"].clone();
+    assert!(rows.as_array().unwrap().len() >= 8);
+    for row in rows.as_array().unwrap() {
+        let (id, secret) = (row["id"].as_str(), row["secret"].as_str());
+        let decided = match access(id, secret) {
+            Access::Send {
+                id: sent,
+                secret: kept,
+            } => {
+                assert_eq!((Some(sent), Some(kept)), (id, secret), "{row}");
+                "send"
+            }
+            Access::Absent => "none",
+            Access::Incomplete => "incomplete",
+        };
+        assert_eq!(decided, row["expected"], "{row}");
+    }
+    assert_eq!(wire("accessClientIdHeader"), "CF-Access-Client-Id");
+    assert_eq!(wire("accessClientSecretHeader"), "CF-Access-Client-Secret");
+}
+#[test]
+fn a_configuration_error_is_logged_by_name_and_never_by_value() {
+    let line = Log {
+        event: "conn_admission",
+        cid: "01234567-89ab-4def-8123-0123456789ab",
+        colo: None,
+        hints: None,
+        region: Some("eu-test"),
+        duration_ms: 2,
+        edge_ms: 2,
+        isolate_requests: 1,
+        outcome: "08006",
+    }
+    .line(&Timings {
+        config_error: Some(wire("accessSecretsIncomplete")),
+        ..Timings::default()
+    });
+    assert_eq!(line["config_error"], "access_secrets_incomplete");
+    assert_eq!(line["outcome"], "08006");
+    assert!(line.get("gateway_status").is_none());
 }
 #[test]
 fn an_interrupted_upgrade_counts_its_pending_wait_as_the_gateways() {

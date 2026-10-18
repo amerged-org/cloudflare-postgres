@@ -26,6 +26,7 @@ import {
 import type { DatabaseWakeTicket } from "@pgcf/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
+import { connectGateway, GatewayConfigError } from "../src/gateway.ts";
 import {
   connectionRateKey,
   ADMISSION_DEADLINE_MS,
@@ -42,6 +43,14 @@ const testEnv = env as unknown as Env & { DB: D1Database; GATEWAY: Fetcher };
 const origin = `https://${["edge", "invalid"].join(".")}`;
 const gatewayOrigin = `https://${["gateway", "invalid"].join(".")}`;
 const region = "eu-test";
+// Sentinels for the Access service token: they must reach the gateway and nothing else.
+const accessId = `sentinel-id-${crypto.randomUUID()}.access`;
+const accessSecret = `sentinel-secret-${crypto.randomUUID()}`;
+const withAccess = {
+  ...testEnv,
+  ACCESS_CLIENT_ID: accessId,
+  ACCESS_CLIENT_SECRET: accessSecret,
+} as Env;
 const live: { socket: WebSocket; ctx: ExecutionContext }[] = [];
 let logs: ReturnType<typeof vi.spyOn>;
 let database: string;
@@ -1871,6 +1880,184 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(observations[0]!.path).toBe("/pg");
     expect(observations[0]!.token).toBeTruthy();
     expect(observations[0]!.bytes).toHaveLength(0);
+  });
+
+  describe("Cloudflare Access service token", () => {
+    let elsewhere: ReturnType<typeof vi.spyOn>[];
+    beforeEach(() => {
+      elsewhere = (["error", "warn"] as const).map((level) =>
+        vi.spyOn(console, level).mockImplementation(() => {}),
+      );
+    });
+    /** Everything the Edge wrote anywhere, as one string. */
+    const written = () =>
+      JSON.stringify([
+        ...logs.mock.calls,
+        ...elsewhere.flatMap((spy) => spy.mock.calls),
+      ]);
+    const expectNoValue = (text: string) => {
+      expect(text).not.toContain(accessId);
+      expect(text).not.toContain(accessSecret);
+    };
+    const callerHeaders = {
+      "CF-Access-Client-Id": "caller-id",
+      "CF-Access-Client-Secret": "caller-secret",
+    };
+    const lastLog = () => JSON.parse(logs.mock.calls.at(-1)![0] as string);
+
+    it("presents the service token to a public gateway, never what the caller sends", async () => {
+      await updateRegion("gateway_binding = NULL");
+      const connection = await open({
+        bindings: withAccess,
+        headers: callerHeaders,
+      });
+      const startup = encodeStartup({ user: "app", database });
+      connection.socket.send(startup);
+      await expect
+        .poll(async () => (await stats())[0]?.bytes)
+        .toEqual([...startup]);
+      const { headers } = (await stats())[0]!;
+      expect(headers["cf-access-client-id"]).toBe(accessId);
+      expect(headers["cf-access-client-secret"]).toBe(accessSecret);
+      // The route and the upgrade are the Edge's own as before.
+      expect(headers["x-pgcf-route"]).toBeTruthy();
+      expectNoValue(written());
+    });
+
+    it("presents nothing without the secrets, whatever the caller sends", async () => {
+      await updateRegion("gateway_binding = NULL");
+      const connection = await open({ headers: callerHeaders });
+      const startup = encodeStartup({ user: "app", database });
+      connection.socket.send(startup);
+      await expect
+        .poll(async () => (await stats())[0]?.bytes)
+        .toEqual([...startup]);
+      const { headers } = (await stats())[0]!;
+      expect(
+        Object.keys(headers).filter((h) => h.startsWith("cf-access")),
+      ).toEqual([]);
+      expect(lastLog().config_error).toBeUndefined();
+    });
+
+    it("presents nothing over a service binding, which does not go through Access", async () => {
+      const connection = await open({ bindings: withAccess });
+      const startup = encodeStartup({ user: "app", database });
+      connection.socket.send(startup);
+      await expect
+        .poll(async () => (await stats())[0]?.bytes)
+        .toEqual([...startup]);
+      const { headers } = (await stats())[0]!;
+      expect(
+        Object.keys(headers).filter((h) => h.startsWith("cf-access")),
+      ).toEqual([]);
+    });
+
+    it("refuses before sending anything when only one of the two secrets is set", async () => {
+      await updateRegion("gateway_binding = NULL");
+      for (const one of [
+        { ACCESS_CLIENT_ID: accessId },
+        { ACCESS_CLIENT_SECRET: accessSecret },
+        { ACCESS_CLIENT_ID: accessId, ACCESS_CLIENT_SECRET: "" },
+      ]) {
+        const connection = await open({ bindings: { ...testEnv, ...one } });
+        expect(await errorCode(connection)).toBe("08006");
+        expect(await stats()).toHaveLength(0);
+        await waitOnExecutionContext(connection.ctx);
+        const log = lastLog();
+        expect(log).toMatchObject({
+          event: "conn_admission",
+          outcome: "08006",
+          config_error: "access_secrets_incomplete",
+        });
+        // Nothing was sent, so there is no gateway answer to name.
+        expect(log.gateway_status).toBeUndefined();
+        expectNoValue(written());
+      }
+    });
+
+    it("lets a service binding connect although only one secret is set", async () => {
+      const connection = await open({
+        bindings: { ...testEnv, ACCESS_CLIENT_ID: accessId },
+      });
+      const startup = encodeStartup({ user: "app", database });
+      connection.socket.send(startup);
+      await expect
+        .poll(async () => (await stats())[0]?.bytes)
+        .toEqual([...startup]);
+    });
+
+    it("logs the status of an Access refusal, and a redirect to its login as a failed upgrade", async () => {
+      await updateRegion("gateway_binding = NULL");
+      for (const [mode, status] of [
+        ["status-401", 401],
+        ["status-403", 403],
+        ["status-530", 530],
+        ["access-login", 302],
+      ] as const) {
+        await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
+        await setGatewayMode(mode);
+        const connection = await open({ bindings: withAccess });
+        expect(await errorCode(connection)).toBe("08006");
+        await waitOnExecutionContext(connection.ctx);
+        const log = lastLog();
+        expect(log).toMatchObject({ outcome: "08006", gateway_status: status });
+        // The answer has no error code, and its free text is not kept.
+        expect(log.gateway_error).toBeUndefined();
+        expect(log.config_error).toBeUndefined();
+        expect(JSON.stringify(log)).not.toContain("free text");
+        // One request: the redirect to the login page was not followed.
+        const observations = await stats();
+        expect(observations).toHaveLength(1);
+        expect(observations[0]!.bytes).toHaveLength(0);
+        expectNoValue(written());
+      }
+    });
+
+    it("keeps the values out of an error, whether the secrets are incomplete or not a header value", async () => {
+      const gateway = {
+        id: region,
+        gateway_url: `${gatewayOrigin}/pg`,
+        gateway_binding: null,
+      };
+      const token = "route-token";
+      const refused = async (bindings: Partial<Env>) => {
+        const error = await connectGateway(
+          gateway,
+          token,
+          { ...testEnv, ...bindings },
+          new AbortController().signal,
+        ).then(
+          () => {
+            throw new Error("connected");
+          },
+          (reason: unknown) => reason as Error,
+        );
+        expectNoValue(`${error.message}${String(error)}${error.stack ?? ""}`);
+        return error;
+      };
+      const incomplete = await refused({ ACCESS_CLIENT_SECRET: accessSecret });
+      expect(incomplete).toBeInstanceOf(GatewayConfigError);
+      expect(incomplete.message).toBe("invalid gateway configuration");
+      // A value that cannot be a header makes no request at all.
+      expect(
+        await refused({
+          ACCESS_CLIENT_ID: accessId,
+          ACCESS_CLIENT_SECRET: `${accessSecret}\nbroken`,
+        }),
+      ).not.toBeInstanceOf(GatewayConfigError);
+      expect(await stats()).toHaveLength(0);
+      await updateRegion("gateway_binding = NULL");
+      const connection = await open({
+        bindings: {
+          ...testEnv,
+          ACCESS_CLIENT_ID: accessId,
+          ACCESS_CLIENT_SECRET: `${accessSecret}\nbroken`,
+        },
+      });
+      expect(await errorCode(connection)).toBe("08006");
+      expect(await stats()).toHaveLength(0);
+      expectNoValue(written());
+    });
   });
 
   it("does not reconnect when an upgrade request aborts during gateway connection", async () => {

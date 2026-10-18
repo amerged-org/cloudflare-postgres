@@ -31,6 +31,9 @@ function encodeCancelRequest(pid: number, secret: number) {
 }
 import { ADMISSION_DEADLINE_MS } from "../../edge/src/session-policy.ts";
 
+// Sentinels for the Access service token: they must reach the gateway and nothing else.
+const accessId = `sentinel-id-${randomUUID()}.access`;
+const accessSecret = `sentinel-secret-${randomUUID()}`;
 const origin = "https://edge.invalid";
 const gatewayOrigin = "https://gateway.invalid";
 const region = "eu-test";
@@ -137,6 +140,31 @@ test(
             ),
           },
         },
+        // An Edge that fetches its gateway over the public network, with the Access token or part
+        // of it.
+        ...(
+          [
+            [
+              "access-edge",
+              "11",
+              {
+                ACCESS_CLIENT_ID: accessId,
+                ACCESS_CLIENT_SECRET: accessSecret,
+              },
+            ],
+            ["half-access-edge", "12", { ACCESS_CLIENT_ID: accessId }],
+            ["plain-public-edge", "13", {}],
+          ] as const
+        ).map(([name, namespace, access]) => {
+          const config = edgeConfig(name, namespace, 12000);
+          return {
+            config: {
+              ...config,
+              main: resolve(import.meta.dirname, "public-gateway.ts"),
+              vars: { ...config.vars, ...access },
+            },
+          };
+        }),
         { config: edgeConfig("no-actor-edge", "4", 12000, false) },
         {
           config: edgeConfig(
@@ -1161,6 +1189,141 @@ test(
           assert.equal(line.gateway_status, 503);
           assert.equal(line.gateway_error, "route_refused");
           assert.equal(JSON.stringify(line).includes("free text"), false);
+        },
+      );
+      await t.test(
+        "the Access service token goes to a gateway on the public network and to no other",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          // What a caller sends in these headers is not what the gateway gets.
+          const caller = {
+            "CF-Access-Client-Id": "caller-id",
+            "CF-Access-Client-Secret": "caller-secret",
+          };
+          const token = {
+            "cf-access-client-id": accessId,
+            "cf-access-client-secret": accessSecret,
+          };
+          const presented = async () => {
+            const rows = await stats();
+            assert.equal(rows.length, 1);
+            return Object.fromEntries(
+              Object.entries(rows[0]!.headers).filter(([name]) =>
+                name.startsWith("cf-access"),
+              ),
+            );
+          };
+          const select = (worker: string) =>
+            query({ query: "SELECT 1" }, { database, worker, headers: caller });
+          await route(database, "gateway_binding=NULL");
+          await open(database, { worker: "access-edge", headers: caller });
+          assert.deepEqual(await presented(), token);
+          // An HTTP query presents it as well.
+          await gateway.fetch("/reset");
+          assert.equal((await select("access-edge")).status, 200);
+          assert.deepEqual(await presented(), token);
+          // Without the secrets nothing is presented, whatever the caller sends.
+          await gateway.fetch("/reset");
+          await open(database, {
+            worker: "plain-public-edge",
+            headers: caller,
+          });
+          assert.deepEqual(await presented(), {});
+          await gateway.fetch("/reset");
+          await select("plain-public-edge");
+          assert.deepEqual(await presented(), {});
+          // A gateway on a service binding is not behind Access: it gets nothing, with the
+          // secrets set or not.
+          await route(database, "gateway_binding='GATEWAY'");
+          for (const worker of ["access-edge", "half-access-edge"]) {
+            await gateway.fetch("/reset");
+            await select(worker);
+            assert.deepEqual(await presented(), {});
+          }
+          const text = JSON.stringify(server.getLogs());
+          for (const secret of [accessId, accessSecret])
+            assert.equal(text.includes(secret), false);
+        },
+      );
+      await t.test(
+        "one Access secret alone refuses before anything is sent and is logged by name only",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          await route(database, "gateway_binding=NULL");
+          server.clearLogs();
+          assert.equal(
+            await sqlstate(
+              await open(database, { worker: "half-access-edge" }),
+            ),
+            "08006",
+          );
+          let line = await logged("conn_admission");
+          assert.equal(line.outcome, "08006");
+          assert.equal(line.config_error, "access_secrets_incomplete");
+          assert.equal("gateway_status" in line, false);
+          server.clearLogs();
+          // Not an unknown outcome (08007): the query was never sent.
+          const refused = await query(
+            { query: "INSERT INTO t VALUES (1)" },
+            { database, worker: "half-access-edge" },
+          );
+          assert.deepEqual(
+            refused.json,
+            failure("08006", "gateway connection failed"),
+          );
+          line = await logged("sql_admission");
+          assert.equal(line.outcome, "08006");
+          assert.equal(line.config_error, "access_secrets_incomplete");
+          assert.equal((await stats()).length, 0);
+          for (const secret of [accessId, accessSecret])
+            assert.equal(
+              JSON.stringify(server.getLogs()).includes(secret),
+              false,
+            );
+        },
+      );
+      await t.test(
+        "an Access refusal is logged by status, and a redirect to its login is a failed upgrade",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          await route(database, "gateway_binding=NULL");
+          for (const [refusal, status] of [
+            ["status-401", 401],
+            ["status-403", 403],
+            ["status-530", 530],
+            ["access-login", 302],
+          ] as const) {
+            await gateway.fetch("/reset");
+            await mode(database, refusal);
+            server.clearLogs();
+            assert.equal(
+              await sqlstate(await open(database, { worker: "access-edge" })),
+              "08006",
+            );
+            let line = await logged("conn_admission");
+            assert.equal(line.outcome, "08006");
+            assert.equal(line.gateway_status, status);
+            assert.equal("gateway_error" in line, false);
+            assert.equal("config_error" in line, false);
+            // The redirect to the login page was not followed.
+            assert.equal((await stats()).length, 1);
+            server.clearLogs();
+            const lost = await query(
+              { query: "INSERT INTO t VALUES (1)" },
+              { database, worker: "access-edge" },
+            );
+            assert.equal(lost.json.code, "08007");
+            line = await logged("sql_admission");
+            assert.equal(line.outcome, "08007");
+            assert.equal(line.gateway_status, status);
+            assert.equal((await stats()).length, 2);
+            const text = JSON.stringify(server.getLogs());
+            for (const secret of [accessId, accessSecret, "free text"])
+              assert.equal(text.includes(secret), false, secret);
+          }
         },
       );
       await t.test(

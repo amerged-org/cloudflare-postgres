@@ -37,6 +37,9 @@
   "wire": {
     "routeKeyDomain": "pgcf-route-key/v2\n",
     "routeHeader": "X-PGCF-Route",
+    "accessClientIdHeader": "CF-Access-Client-Id",
+    "accessClientSecretHeader": "CF-Access-Client-Secret",
+    "accessSecretsIncomplete": "access_secrets_incomplete",
     "decoySaltDomain": "pgcf.edge.decoy-scram-salt/v1\n",
     "wakeRouteTokenPrefix": "v5",
     "wakeRouteSignatureDomain": "pgcf-route/v5\n",
