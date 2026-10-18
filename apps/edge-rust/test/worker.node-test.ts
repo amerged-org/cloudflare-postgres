@@ -170,6 +170,15 @@ test(
       )
         .bind(region, gatewayOrigin + "/pg", now, now)
         .run();
+      // The API publishes the admission snapshot of a database whenever D1 changes it; a test
+      // that writes D1 directly publishes the same way, or the Actor admits on the old snapshot.
+      async function publish(database: string) {
+        assert.equal(
+          (await actor.fetch(`/seed?database=${database}`, { method: "POST" }))
+            .status,
+          204,
+        );
+      }
       async function seed() {
         const database = id("d"),
           project = "prj_" + randomUUID().replaceAll("-", "").slice(0, 20),
@@ -220,11 +229,7 @@ test(
             now,
           ),
         ]);
-        assert.equal(
-          (await actor.fetch(`/seed?database=${database}`, { method: "POST" }))
-            .status,
-          204,
-        );
+        await publish(database);
         return { database, project, node, instance };
       }
       const stats = async () =>
@@ -271,11 +276,7 @@ test(
             "UPDATE databases SET desired_state='suspended',suspension_reason='idle',power_operation=?,generation=3,observed_generation=3,observed_state='provisioning',observed_power='hibernated' WHERE id=?",
           ).bind(operation, database),
         ]);
-        assert.equal(
-          (await actor.fetch(`/seed?database=${database}`, { method: "POST" }))
-            .status,
-          204,
-        );
+        await publish(database);
       }
       const reset = async () => {
         await gateway.fetch("/reset");
@@ -285,11 +286,19 @@ test(
           .bind(gatewayOrigin + "/pg", region)
           .run();
       };
-      const mode = async (value: string) => {
-        await DB.prepare("UPDATE regions SET gateway_url=? WHERE id=?")
-          .bind(gatewayOrigin + "/pg?mode=" + value, region)
+      // The route is part of the snapshot: a changed route is published again.
+      const route = async (
+        database: string,
+        set: string,
+        ...values: string[]
+      ) => {
+        await DB.prepare(`UPDATE regions SET ${set} WHERE id=?`)
+          .bind(...values, region)
           .run();
+        await publish(database);
       };
+      const mode = (database: string, value: string) =>
+        route(database, "gateway_url=?", gatewayOrigin + "/pg?mode=" + value);
       async function open(
         database: string,
         options: {
@@ -540,6 +549,7 @@ test(
           await DB.prepare("UPDATE projects SET deleted_at=? WHERE id=?")
             .bind(now, project)
             .run();
+          await publish(database);
           const c = await open(database);
           c.socket.send(encodeStartup({ database, user: "app" }));
           await until(() => c.messages.length === 1);
@@ -551,6 +561,7 @@ test(
           )
             .bind(suspended.database)
             .run();
+          await publish(suspended.database);
           assert.equal(await sqlstate(await open(suspended.database)), "57P03");
           assert.equal((await stats()).length, 0);
         },
@@ -560,25 +571,17 @@ test(
         async () => {
           await reset();
           const { database } = await seed();
-          await DB.prepare(
-            "UPDATE regions SET gateway_binding='MISSING' WHERE id=?",
-          )
-            .bind(region)
-            .run();
+          await route(database, "gateway_binding='MISSING'");
           assert.equal(await sqlstate(await open(database)), "08006");
           assert.equal((await stats()).length, 0);
-          await DB.prepare(
-            "UPDATE regions SET gateway_binding=NULL,gateway_url='http://gateway.invalid/pg' WHERE id=?",
-          )
-            .bind(region)
-            .run();
+          await route(
+            database,
+            "gateway_binding=NULL,gateway_url=?",
+            "http://gateway.invalid/pg",
+          );
           assert.equal(await sqlstate(await open(database)), "08006");
           assert.equal((await stats()).length, 0);
-          await DB.prepare(
-            "UPDATE regions SET gateway_binding='GATEWAY' WHERE id=?",
-          )
-            .bind(region)
-            .run();
+          await route(database, "gateway_binding='GATEWAY'");
           await open(database);
           assert.equal((await stats()).length, 1);
         },
@@ -588,13 +591,13 @@ test(
         async () => {
           await reset();
           const { database } = await seed();
-          await mode("redirect");
+          await mode(database, "redirect");
           assert.equal(await sqlstate(await open(database)), "08006");
           let rows = await stats();
           assert.equal(rows.length, 1);
           assert.equal(rows[0]!.path, "/pg");
           await reset();
-          await mode("reject");
+          await mode(database, "reject");
           assert.equal(await sqlstate(await open(database)), "08006");
           rows = await stats();
           assert.equal(rows.length, 1);
@@ -605,7 +608,7 @@ test(
         async () => {
           await reset();
           const { database } = await seed();
-          await mode("stalled-cancel");
+          await mode(database, "stalled-cancel");
           const began = Date.now();
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
@@ -717,7 +720,7 @@ test(
         async () => {
           await reset();
           const { database } = await seed();
-          await mode("held");
+          await mode(database, "held");
           const c = await open(database, { worker: "abort-edge" });
           assert.equal(await sqlstate(c), "08006");
           assert.equal((await stats()).length, 1);
@@ -748,7 +751,7 @@ test(
         async () => {
           await reset();
           const { database } = await seed();
-          await mode("close");
+          await mode(database, "close");
           const c = await open(database);
           c.socket.send(new Uint8Array([1]));
           await until(() => c.close() !== null);
