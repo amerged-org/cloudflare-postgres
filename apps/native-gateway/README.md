@@ -92,7 +92,8 @@ when it ends, as the message `conn_stages` (`FromGateway::ConnStages`): the data
 `outcome`, `held_outcome` and `wake_reason` tokens and the milliseconds it reached, without
 `agent_ms` (the agent has its own steps in its `wake` event). The agent logs them as the event
 `conn_stages`, which reaches Cloudflare in an observation report. The marks wait in a queue of 64
-and are dropped when it, or the channel, is full; no connection ever waits for them. HTTP SQL
+of their own and are dropped when it is full; no connection ever waits for them. The channel's
+writer takes a mark only when no wake or answer waits, so the marks delay neither. HTTP SQL
 requests send none.
 
 ## HTTP SQL

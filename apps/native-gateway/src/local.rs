@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedReadHalf},
     sync::{Mutex, Notify, RwLock, mpsc, watch},
     task::JoinSet,
@@ -44,8 +44,8 @@ const STAGE_QUEUE: usize = 64;
 
 /// The stage marks of the connections that were held for a wake, on their way to the agent. A
 /// connection that ends sends its marks with `try_send` and never waits: a mark that finds the
-/// queue full is lost, and so is one that finds the agent's channel full, so the marks never
-/// delay a wake or an answer.
+/// queue full is lost. The marks do not enter the channel's queue of wakes and answers: `write`
+/// takes one only when none of those waits, so the marks delay neither.
 pub struct StageQueue {
     sender: mpsc::Sender<ConnStages>,
     receiver: Mutex<mpsc::Receiver<ConnStages>>,
@@ -64,11 +64,25 @@ impl StageQueue {
     pub fn sender(&self) -> mpsc::Sender<ConnStages> {
         self.sender.clone()
     }
-    /// Forwards the queued marks to the agent's channel for as long as it is served.
-    pub async fn forward(&self, outgoing: &mpsc::Sender<Vec<u8>>) {
+    /// Writes the channel's lines to the agent for as long as it is served, each wake and answer
+    /// before any mark, and returns when `queue` is closed or a write fails.
+    async fn write(&self, mut agent: impl AsyncWrite + Unpin, mut queue: mpsc::Receiver<Vec<u8>>) {
         let mut marks = self.receiver.lock().await;
-        while let Some(stages) = marks.recv().await {
-            let _ = outgoing.try_send(agent::encode(&FromGateway::ConnStages(stages)));
+        loop {
+            let line = tokio::select! {
+                biased;
+                line = queue.recv() => match line {
+                    Some(line) => line,
+                    None => return,
+                },
+                Some(stages) = marks.recv() => agent::encode(&FromGateway::ConnStages(stages)),
+            };
+            if !matches!(
+                timeout(WRITE_BOUND, agent.write_all(&line)).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
         }
     }
 }
@@ -254,20 +268,14 @@ async fn serve(
     stream: UnixStream,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), Failure> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let (outgoing, mut queue) = mpsc::channel::<Vec<u8>>(256);
+    let (outgoing, queue) = mpsc::channel::<Vec<u8>>(256);
     let mut tasks = JoinSet::new();
-    tasks.spawn(async move {
-        while let Some(line) = queue.recv().await {
-            if !matches!(
-                timeout(WRITE_BOUND, writer.write_all(&line)).await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-        }
-    });
+    {
+        let gateway = gateway.clone();
+        tasks.spawn(async move { gateway.stage_marks.write(writer, queue).await });
+    }
     {
         let (gateway, outgoing) = (gateway.clone(), outgoing.clone());
         tasks.spawn(async move {
@@ -287,10 +295,6 @@ async fn serve(
                 }
             }
         });
-    }
-    {
-        let (gateway, outgoing) = (gateway.clone(), outgoing.clone());
-        tasks.spawn(async move { gateway.stage_marks.forward(&outgoing).await });
     }
     let mut line = Vec::new();
     loop {
@@ -484,6 +488,7 @@ fn activity(gateway: &Gateway, database: &str) -> Option<ActivityReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     fn writer(pid: u32) -> Writer {
         Writer {
             socket: "/run/pgcf/aaaaaaaaaaaaaaaaaaaa/.s.PGSQL.5432".into(),
@@ -503,7 +508,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn a_flood_of_stage_marks_is_dropped_never_queued_without_bound_or_waited_for() {
+    async fn a_flood_of_stage_marks_is_dropped_and_what_is_kept_follows_every_wake_and_answer() {
         let queue = StageQueue::default();
         let sender = queue.sender();
         let marks = || ConnStages {
@@ -518,26 +523,40 @@ mod tests {
             .filter(|_| sender.try_send(marks()).is_ok())
             .count();
         assert_eq!(accepted, STAGE_QUEUE);
-        // The agent's channel is full and nobody reads it: the forwarder drops what does not fit,
-        // empties its queue and waits for more, instead of waiting for the channel.
-        let (outgoing, mut channel) = mpsc::channel(4);
+        // The marks take no room in the channel for wakes and answers, although it holds four.
+        let (outgoing, channel) = mpsc::channel::<Vec<u8>>(4);
+        for line in ["wake\n", "answer\n"] {
+            timeout(
+                Duration::from_millis(200),
+                outgoing.send(line.as_bytes().to_vec()),
+            )
+            .await
+            .expect("a wake or an answer finds room behind the marks")
+            .unwrap();
+        }
+        // The writer is idle once everything is written: the wake and the answer first, then
+        // every mark that was kept, as the protocol's lines.
+        let (agent, mut written) = tokio::io::duplex(1 << 20);
         assert!(
-            timeout(Duration::from_millis(200), queue.forward(&outgoing))
+            timeout(Duration::from_millis(200), queue.write(agent, channel))
                 .await
                 .is_err()
         );
-        assert_eq!(sender.capacity(), STAGE_QUEUE);
-        let mut lines = Vec::new();
-        while let Ok(line) = channel.try_recv() {
-            lines.push(line);
+        let mut text = Vec::new();
+        written.read_to_end(&mut text).await.unwrap();
+        let head = b"wake\nanswer\n";
+        assert!(text.starts_with(head), "{}", String::from_utf8_lossy(&text));
+        let lines: Vec<&str> = std::str::from_utf8(&text[head.len()..])
+            .unwrap()
+            .lines()
+            .collect();
+        assert_eq!(lines.len(), STAGE_QUEUE);
+        for line in lines {
+            assert_eq!(
+                agent::decode_from_gateway(line.as_bytes()),
+                Ok(FromGateway::ConnStages(marks()))
+            );
         }
-        assert_eq!(lines.len(), 4);
-        // What reaches the agent is the protocol's line.
-        let line = &lines[0][..lines[0].len() - 1];
-        assert_eq!(
-            agent::decode_from_gateway(line),
-            Ok(FromGateway::ConnStages(marks()))
-        );
     }
 
     #[test]
