@@ -73,10 +73,7 @@ export async function cancelAlreadyCancelledProviderAddition(
       return refuse(
         "Fresh allocated provider inventory must match the audited adoption",
       );
-    return cancelAuditedNodeAdoption(env.DB, addition, expectedRevision, {
-      tenant_id: actual.tenantId,
-      customer_id: actual.customerId,
-    });
+    return cancelAuditedNodeAdoption(env.DB, addition, expectedRevision);
   }
   if (
     !Number.isSafeInteger(expectedRevision) ||

@@ -15,7 +15,11 @@ import {
   type InstallProvider,
 } from "../../src/domain/node-installer.ts";
 import { readNodeAddition } from "../../src/domain/node-state.ts";
-import type { Instance } from "../../src/providers/contabo.ts";
+import {
+  ContaboError,
+  type ContaboFirewall,
+  type Instance,
+} from "../../src/providers/contabo.ts";
 import {
   API_ORIGIN,
   assignRelease,
@@ -44,11 +48,13 @@ afterEach(async () => {
 
 const MIB = 1024 ** 2;
 const API = API_ORIGIN;
+const FIREWALL_ID = "0c1d7ef0-5a52-4b6a-9a1e-6b3f2d1c9e10";
 const settings = {
   ...env,
   NODE_API_ORIGIN: API,
   NODE_DNS_SERVERS: JSON.stringify(["192.0.2.53", "2001:db8::53"]),
   CONTABO_ORDER_SSH_KEY_IDS: JSON.stringify(["4711"]),
+  CONTABO_NODE_FIREWALL_ID: FIREWALL_ID,
 };
 const hex = (letter: string) => letter.repeat(64);
 const spec = (id: string) => ({
@@ -130,9 +136,57 @@ const instance = (id: string): Instance => ({
   status: "running",
   addOns: [],
 });
+type InboundRule = ContaboFirewall["rules"]["inbound"][number];
+const rule = (action: "accept" | "drop", ...ports: string[]): InboundRule => ({
+  protocol: ports.length > 0 ? "tcp" : "",
+  destPorts: ports,
+  srcCidr: { ipv4: [], ipv6: [] },
+  action,
+  status: "active",
+  displayName: action === "accept" ? "ssh" : "final deny",
+});
+/** The firewall as Contabo reports it, holding the instances in `held` and applying `inbound`. */
+const contaboFirewall = (
+  held: Instance[],
+  inbound: InboundRule[] = [],
+): ContaboFirewall => ({
+  tenantId: "DE",
+  customerId: "1",
+  firewallId: FIREWALL_ID,
+  name: "pgcf-nodes",
+  description: "deny-all inbound for the nodes",
+  status: "active",
+  instanceStatus: held.map((held) => ({
+    instanceId: held.id,
+    status: "ok" as const,
+  })),
+  instances: held.map((held) => ({
+    instanceId: held.id,
+    displayName: held.displayName,
+    name: held.name ?? "vps",
+    productId: held.productId,
+    ipConfig: { v4: held.ipConfig!.v4, v6: held.ipConfig!.v6! },
+    regionSlug: held.region,
+    regionName: held.regionName!,
+    dataCenterSlug: "eu1",
+    dataCenterName: held.dataCenter!,
+  })),
+  rules: { inbound },
+  createdDate: "2026-10-18T09:00:00.000Z",
+  updatedDate: "2026-10-18T09:00:00.000Z",
+});
 function provider(
   providerInstance: string,
   answer: "accepted" | "rejected" | "unknown" = "accepted",
+  /**
+   * The operator's firewall: by default it already holds the instance and applies no rule. An
+   * assignment is listed at once, or only after `settle()` when Contabo applies it later.
+   */
+  node: {
+    held?: boolean;
+    inbound?: InboundRule[];
+    applies?: "at once" | "later";
+  } = {},
 ) {
   const rescue = vi.fn(async (_id: string, _input, request) => ({
     kind: answer,
@@ -157,12 +211,50 @@ function provider(
     dispatched: true,
     value: { instanceId: providerInstance, action: "restart" },
   }));
+  const firewall = contaboFirewall(
+    node.held === false ? [] : [instance(providerInstance)],
+    node.inbound,
+  );
+  const list = (id: string) => {
+    const listed = contaboFirewall([instance(id)]);
+    firewall.instances.push(...listed.instances);
+    firewall.instanceStatus.push(...listed.instanceStatus);
+  };
+  const queued: string[] = [];
+  const getFirewall = vi.fn(async (id: string) => {
+    if (id !== FIREWALL_ID) throw new ContaboError("unexpected_status", 404);
+    return structuredClone(firewall);
+  });
+  const assignFirewall = vi.fn(
+    async (id: string, instanceId: string, request) => {
+      if (node.applies === "later") queued.push(instanceId);
+      else list(instanceId);
+      return {
+        kind: "accepted",
+        code: "accepted",
+        status: 201,
+        requestId: request.requestId,
+        dispatched: true,
+        value: { firewallId: id, instanceId },
+      };
+    },
+  );
   const double = {
     getInstance: vi.fn(async () => instance(providerInstance)),
+    getFirewall,
+    assignFirewall,
     rescue,
     restart,
   };
-  return { rescue, restart, provider: double as unknown as InstallProvider };
+  return {
+    rescue,
+    restart,
+    getFirewall,
+    assignFirewall,
+    firewall,
+    settle: () => queued.splice(0).forEach(list),
+    provider: double as unknown as InstallProvider,
+  };
 }
 const parameters = (userData: string) => {
   const content = (path: string) =>
@@ -316,6 +408,111 @@ describe("the install of an audited node", () => {
       p.provider,
     );
     expect(p.rescue).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the node firewall before the rescue", () => {
+  const started = async (
+    ...options: [
+      Parameters<typeof provider>[1]?,
+      Parameters<typeof provider>[2]?,
+    ]
+  ) => {
+    const a = await auditedAddition();
+    await release(a.f.region);
+    const p = provider(a.instance, ...options);
+    const operation = a.addition.intent.operation_id;
+    return {
+      a,
+      p,
+      operation,
+      drive: () => driveNodeInstall(settings, operation, p.provider),
+      addition: () => readNodeAddition(env.DB, operation),
+      accounting: {
+        accounting: { operation_id: operation, stage: "firewall" },
+      },
+    };
+  };
+  const tokens = (nodeId: string) =>
+    env.DB.prepare("SELECT 1 AS issued FROM node_installs WHERE node_id=?")
+      .bind(nodeId)
+      .first();
+
+  it("sends no rescue while the firewall has an inbound rule that accepts, records it, and goes on when the rule is gone", async () => {
+    const s = await started("accepted", { inbound: [rule("accept", "22")] });
+    await s.drive();
+    expect(s.p.getFirewall).toHaveBeenCalledWith(
+      FIREWALL_ID,
+      expect.objectContaining(s.accounting),
+    );
+    expect(s.p.rescue).not.toHaveBeenCalled();
+    expect(await s.addition()).toMatchObject({
+      status: "audited",
+      install_blocker: "node_firewall_unconfirmed",
+    });
+    // The tokens' lifetime starts with the rescue, not with a firewall that is still open.
+    expect(await tokens(s.a.id)).toBeNull();
+    s.p.firewall.rules.inbound = [];
+    await s.drive();
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+    expect(await s.addition()).toMatchObject({
+      status: "bootstrapping",
+      install_blocker: null,
+    });
+  });
+
+  it("assigns an instance the firewall does not hold, then rescues it", async () => {
+    const s = await started("accepted", { held: false });
+    await s.drive();
+    expect(s.p.assignFirewall).toHaveBeenCalledTimes(1);
+    const [firewall, instance, request] = s.p.assignFirewall.mock.calls[0]!;
+    expect([firewall, instance]).toEqual([FIREWALL_ID, s.a.instance]);
+    expect(request).toMatchObject(s.accounting);
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+    expect(s.p.assignFirewall.mock.invocationCallOrder[0]).toBeLessThan(
+      s.p.rescue.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("sends no rescue while the read after the assignment lacks the instance, and goes on once Contabo lists it", async () => {
+    const s = await started("accepted", { held: false, applies: "later" });
+    await s.drive();
+    expect(s.p.assignFirewall).toHaveBeenCalledTimes(1);
+    expect(s.p.rescue).not.toHaveBeenCalled();
+    expect(await s.addition()).toMatchObject({
+      status: "audited",
+      install_blocker: "node_firewall_unconfirmed",
+    });
+    s.p.settle();
+    await s.drive();
+    expect(s.p.assignFirewall).toHaveBeenCalledTimes(1);
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not assign an instance the firewall already holds", async () => {
+    const s = await started();
+    await s.drive();
+    expect(s.p.getFirewall).toHaveBeenCalledTimes(1);
+    expect(s.p.assignFirewall).not.toHaveBeenCalled();
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes a rule that only drops traffic for Contabo's final deny", async () => {
+    const s = await started("accepted", { inbound: [rule("drop")] });
+    await s.drive();
+    expect(s.p.getFirewall).toHaveBeenCalledTimes(1);
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a firewall it cannot read as unconfirmed, without failing the cycle", async () => {
+    const s = await started();
+    s.p.getFirewall.mockRejectedValue(new ContaboError("timeout"));
+    await s.drive();
+    expect(s.p.rescue).not.toHaveBeenCalled();
+    expect(await s.addition()).toMatchObject({
+      status: "audited",
+      install_blocker: "node_firewall_unconfirmed",
+    });
   });
 });
 
