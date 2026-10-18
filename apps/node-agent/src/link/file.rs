@@ -8,12 +8,15 @@ use std::{
     path::Path,
 };
 
-/// Creates `directory` and its parents, readable by its owner only.
+/// Creates `directory` and its parents, readable by its owner only. A `directory` that exists
+/// keeps the mode it was created with, so it is made private as well, whatever mode the installer
+/// gave it: other users must not list the node's files.
 pub(super) fn create_private_directory(directory: &Path) -> Result<()> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(directory)
+        .create(directory)?;
+    std::fs::set_permissions(directory, Permissions::from_mode(0o700))
 }
 
 /// Makes the rename and removal of an entry of `directory` durable.
@@ -71,6 +74,25 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"third");
         assert_eq!(mode(&path), 0o600);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_directory_that_exists_with_a_wider_mode_becomes_private_with_its_files_untouched() {
+        let base = tempdir();
+        let directory = base.join("credentials");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, Permissions::from_mode(0o755)).unwrap();
+        let path = directory.join("node.json");
+        write_private(&path, b"identity").unwrap();
+        create_private_directory(&directory).unwrap();
+        assert_eq!(mode(&directory), 0o700);
+        assert_eq!(std::fs::read(&path).unwrap(), b"identity");
+        // Parents that did not exist are private as well.
+        let nested = base.join("a/b");
+        create_private_directory(&nested).unwrap();
+        assert_eq!(
+            (mode(&nested), mode(nested.parent().unwrap())),
+            (0o700, 0o700)
+        );
     }
 }

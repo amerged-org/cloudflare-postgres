@@ -10,12 +10,18 @@ use crate::{
 use reqwest::{Client, Method, Url, header::CONTENT_TYPE};
 use rustls::RootCertStore;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+    time::Duration,
+};
 
 /// The largest request body: a volume report of 10,000 volumes is about 2.3 MB.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-/// The largest answer: a page of 200 databases with their roles.
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// The largest answer: the desired page the contract allows, 200 databases of 100 roles with every
+/// attribute (78 KB each) and 1,000 open orders, which is 15.8 MB. Origins and the release add
+/// less than 1 MB. A page the contract accepts is never refused for its size.
+const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cloudflare refused the node's key with 403 `node_fenced`: the node was declared lost (plan
@@ -33,6 +39,11 @@ impl std::error::Error for Fenced {}
 #[derive(Clone)]
 pub struct Transport {
     pub(super) client: Client,
+    /// The client of the enrollment. The Worker accepts the enrollment only from the instance's
+    /// own public IPv4 (plan 8), so it connects over IPv4 alone: a node with an IPv6 route would
+    /// otherwise reach a dual-stack Cloudflare address over IPv6, be refused for good, and never
+    /// enroll.
+    pub(super) enrollment: Client,
     pub(super) tls: Arc<rustls::ClientConfig>,
 }
 impl Transport {
@@ -43,16 +54,20 @@ impl Transport {
                 .with_root_certificates(roots.clone())
                 .with_no_client_auth()
         };
-        let client = Client::builder()
-            .use_preconfigured_tls(config())
-            .https_only(true)
-            .no_proxy()
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
+        let client = |local_address: Option<IpAddr>| {
+            Client::builder()
+                .use_preconfigured_tls(config())
+                .https_only(true)
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(REQUEST_TIMEOUT)
+                .local_address(local_address)
+                .build()
+        };
         Ok(Self {
-            client,
+            client: client(None)?,
+            enrollment: client(Some(Ipv4Addr::UNSPECIFIED.into()))?,
             tls: Arc::new(config()),
         })
     }
@@ -161,7 +176,8 @@ pub(super) mod tests {
     use super::*;
     use crate::link::test_server::{Cloud, Failure, tempdir};
 
-    /// An enrolled node of `cloud`: the pieces a test needs to make requests as the node.
+    /// An enrolled node of `cloud`: the pieces a test needs to make requests as the node. Its
+    /// files are removed on return: the identity and the key live in the returned `Api`.
     pub(crate) async fn enrolled(cloud: &Cloud) -> (Api, Arc<Events>) {
         let base = tempdir();
         cloud.seed(&base);
@@ -197,8 +213,6 @@ pub(super) mod tests {
         assert!(seen[1..].iter().all(|s| s.signed == Some(Ok(()))));
         assert_eq!(seen[2].body, body);
         // The double does refuse a request that the key did not sign.
-        let other = tempdir();
-        cloud.seed(&other);
         cloud.with(|inner| inner.public_key = Some(vec![1; 32]));
         let error = api.get("/node/v1/desired").await.unwrap_err();
         assert_eq!(error.downcast_ref::<Refusal>().unwrap().status, 401);

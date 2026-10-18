@@ -377,6 +377,15 @@ mod tests {
         assert_eq!((attempts, link.cloud.with(|inner| inner.upgrades)), (1, 0));
     }
 
+    #[tokio::test]
+    async fn an_upgrade_that_is_refused_is_logged_by_its_status() {
+        let cloud = Cloud::start().await;
+        let (api, _) = enrolled(&cloud).await;
+        cloud.with(|inner| inner.public_key = Some(vec![1; 32]));
+        let error = open(&api).await.err().unwrap();
+        assert_eq!(super::super::line("link_down", &error)["class"], "http_401");
+    }
+
     #[test]
     fn a_good_connection_restarts_the_backoff_and_a_short_one_does_not() {
         let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));

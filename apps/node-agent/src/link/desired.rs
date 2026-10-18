@@ -261,6 +261,42 @@ mod tests {
         );
     }
 
+    /// The largest database entry the contract allows: 100 roles with every attribute, each a
+    /// member of 8 others, with names of the longest length.
+    fn maxed(id: &str) -> Value {
+        let name = |i: usize| format!("r{i:062}");
+        let mut roles =
+            vec![json!({"name":"app","owner":true,"password":"p".repeat(43),"revision":1})];
+        for i in 0..99 {
+            let member_of: Vec<String> = (1..=8).map(|n| name((i + n) % 99)).collect();
+            roles.push(json!({"name":name(i),"owner":false,"password":"q".repeat(43),"revision":i + 1,
+                "valid_until":"2031-01-02T03:04:05.678Z","connection_limit":10000,"member_of":member_of,"bypass_rls":true}));
+        }
+        let mut db = database(id);
+        db["roles"] = roles.into();
+        db
+    }
+
+    #[tokio::test]
+    async fn a_page_of_the_most_the_contract_allows_is_pulled() {
+        let cloud = Cloud::start().await;
+        let (api, _) = enrolled(&cloud).await;
+        // The largest page the contract allows: 200 databases of 100 roles and 1,000 open orders.
+        let orders: Vec<Value> = (0..1000)
+            .map(|i| json!({"type":"wake","operation":format!("op_{i:020}"),"database":database_id(i % 200),"generation":6}))
+            .collect();
+        cloud.with(|inner| {
+            inner.databases = (0..200).map(|i| maxed(&database_id(i))).collect();
+            inner.orders = orders;
+        });
+        let size = serde_json::to_vec(&maxed(&database_id(0))).unwrap().len();
+        assert!(size * 200 > 15_000_000, "{size}");
+        let desired = pull(&api, None).await.unwrap();
+        assert!(desired.complete);
+        assert_eq!(desired.databases.len(), 200);
+        assert_eq!(desired.orders.len(), 1000);
+    }
+
     #[tokio::test]
     async fn a_pull_of_named_databases_is_one_request_and_many_names_become_a_full_pull() {
         let cloud = Cloud::start().await;

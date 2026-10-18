@@ -26,6 +26,7 @@ pub use request::{Fenced, Transport};
 
 use crate::{
     Error,
+    api::Refusal,
     node_link::{constant, schema_valid},
 };
 use events::Events;
@@ -33,6 +34,7 @@ use request::Api;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::{sync::watch, task::JoinHandle};
+use tokio_tungstenite::tungstenite;
 
 use std::time::Duration;
 
@@ -75,11 +77,27 @@ impl Default for Timing {
 }
 
 /// One line on the agent's log: the class of a failure, never its text, which can carry an address.
-fn log(event: &str, error: &crate::Error) {
-    crate::timing::emit(serde_json::json!({
-        "event": event,
-        "class": crate::diagnostics::error_code(error),
-    }));
+fn log(event: &str, error: &Error) {
+    crate::timing::emit(line(event, error));
+}
+/// The line of `log`. Cloudflare's refusal, of a request or of the upgrade, is named by its HTTP
+/// status, which tells a rejected signature (401) from a limit (429) and an outage (503), and
+/// by its error code when that is a plain word of the API's own.
+fn line(event: &str, error: &Error) -> Value {
+    let mut line = json!({"event": event, "class": crate::diagnostics::error_code(error)});
+    if let Some(refusal) = error.downcast_ref::<Refusal>() {
+        line["class"] = format!("http_{}", refusal.status).into();
+        if let Some(code) = refusal.code.as_deref().filter(|code| plain(code)) {
+            line["code"] = code.into();
+        }
+    } else if let Some(tungstenite::Error::Http(response)) = error.downcast_ref() {
+        line["class"] = format!("http_{}", response.status().as_u16()).into();
+    }
+    line
+}
+/// A code the API names itself, like `unauthorized`; anything else is a server's own text.
+fn plain(code: &str) -> bool {
+    (1..=40).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 /// What the link needs to know about its node.
@@ -326,6 +344,9 @@ mod tests {
             .await
             .expect("no event came")
     }
+    fn class(error: &Error) -> Value {
+        line("outbox_flush_failed", error)["class"].clone()
+    }
     fn usage() -> Vec<Value> {
         vector("NodeUsageReport", "usage")["rows"]
             .as_array()
@@ -403,7 +424,45 @@ mod tests {
         assert!(link.post_samples(&json!({"memory":1})).await.is_err());
         assert!(link.archive_credential("../credentials").await.is_err());
         assert_eq!(cloud.requests().len(), before);
-        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_logged_by_its_status_and_a_plain_code_never_by_its_text() {
+        let cloud = Cloud::start().await;
+        let (api, _) = request::tests::enrolled(&cloud).await;
+        // A rejected signature, rate limiting and an outage are three different classes.
+        let key = cloud.with(|inner| inner.public_key.take());
+        let rejected = api.get("/node/v1/desired").await.unwrap_err();
+        cloud.with(|inner| inner.public_key = key);
+        cloud.fail_next([Failure::Status(429), Failure::Status(503)]);
+        let limited = api.post("/node/v1/volumes", &json!({})).await.unwrap_err();
+        let unavailable = api.post("/node/v1/volumes", &json!({})).await.unwrap_err();
+        assert_eq!(
+            line("outbox_flush_failed", &rejected),
+            json!({"event":"outbox_flush_failed","class":"http_401","code":"unauthorized"})
+        );
+        assert_eq!(class(&limited), "http_429");
+        assert_eq!(class(&unavailable), "http_503");
+        // A code that is no plain word of the API's is not logged: it is the server's text.
+        for code in [
+            "10.0.0.7 refused",
+            "Bearer abc",
+            "x".repeat(200).as_str(),
+            "",
+        ] {
+            let refusal = Refusal {
+                status: 502,
+                code: Some(code.into()),
+            };
+            assert_eq!(
+                line("link_down", &refusal.into()),
+                json!({"event":"link_down","class":"http_502"}),
+                "{code}"
+            );
+        }
+        // A fence and a failure of the agent's own keep the names they had.
+        assert_eq!(class(&Fenced.into()), "node_fenced");
+        assert_eq!(class(&"link silent".into()), "link_silent");
     }
 
     #[tokio::test]
@@ -419,8 +478,9 @@ mod tests {
         eventually(|| !cloud.posted("/node/v1/usage").is_empty()).await;
         assert!(cloud.acknowledged("/node/v1/usage").is_empty());
         drop(link);
-        // With every clone dropped, the events end.
-        assert_eq!(next(&mut events).await, None);
+        // With every clone dropped, the events end, after the pulls that were pending: a link
+        // that was starved for three intervals came back with a pull of its own.
+        while next(&mut events).await.is_some() {}
         cloud.with(|inner| inner.failures.clear());
         let (restarted, mut events) = start(&cloud, &base).await;
         assert_eq!(restarted.node().id, test_server::NODE_ID);
@@ -435,7 +495,6 @@ mod tests {
             cloud.acknowledged("/node/v1/usage")[0]["rows"],
             json!(usage())
         );
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
@@ -465,6 +524,5 @@ mod tests {
                 .is::<Fenced>()
         );
         assert_eq!(next(&mut events).await, None, "the link does not come back");
-        std::fs::remove_dir_all(base).unwrap();
     }
 }

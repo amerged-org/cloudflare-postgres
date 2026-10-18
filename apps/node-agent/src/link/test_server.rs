@@ -77,6 +77,8 @@ pub fn database_id(index: usize) -> String {
 /// What the double does with the next POSTs (the enrollment included), after it recorded them.
 #[derive(Clone, Copy, Debug)]
 pub enum Failure {
+    /// Answers as usual: the failures queued behind it fall on later POSTs.
+    Pass,
     /// Answers with this status instead of success.
     Status(u16),
     /// Closes the connection without an answer: the node cannot tell whether it was applied.
@@ -138,7 +140,12 @@ impl Drop for Cloud {
 }
 
 impl Cloud {
+    /// A double on the IPv4 loopback.
     pub async fn start() -> Self {
+        Self::start_on("127.0.0.1:0").await
+    }
+    /// A double that listens on `address` alone, the IPv4 or the IPv6 loopback.
+    pub async fn start_on(address: &str) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -147,7 +154,10 @@ impl Cloud {
                 .unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
         let mut leaf = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        leaf.subject_alt_names = vec![rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap())];
+        leaf.subject_alt_names = vec![
+            rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()),
+            rcgen::SanType::IpAddress("::1".parse().unwrap()),
+        ];
         let leaf = leaf.signed_by(&key, &authority).unwrap();
         let tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -157,7 +167,9 @@ impl Cloud {
             )
             .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(tls));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind(address)
+            .await
+            .unwrap_or_else(|error| panic!("the double cannot listen on {address}: {error}"));
         let address = listener.local_addr().unwrap();
         let inner = Arc::new(Mutex::new(Inner {
             public_key: None,
@@ -553,7 +565,7 @@ async fn serve(
             respond(&mut stream, &self::answer(status, error("unavailable"))).await;
             return Ok(());
         }
-        None => {}
+        Some(Failure::Pass) | None => {}
     }
     if answer.status == 101 {
         let key = request.header("sec-websocket-key").unwrap_or_default();
@@ -646,8 +658,26 @@ async fn session<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     }
 }
 
-/// A new empty directory under the system's temporary directory.
-pub fn tempdir() -> std::path::PathBuf {
+/// A new empty directory under the system's temporary directory, removed with everything in it
+/// when the test is done with it, however the test ended.
+pub struct TempDir(std::path::PathBuf);
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl AsRef<std::ffi::OsStr> for TempDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+pub fn tempdir() -> TempDir {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
@@ -656,5 +686,20 @@ pub fn tempdir() -> std::path::PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&path).unwrap();
-    path
+    TempDir(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_temporary_directory_is_removed_with_its_contents_when_dropped() {
+        let directory = tempdir();
+        let path = directory.to_path_buf();
+        std::fs::create_dir_all(path.join("credentials")).unwrap();
+        std::fs::write(path.join("credentials/node-key.pk8"), b"key").unwrap();
+        drop(directory);
+        assert!(!path.exists());
+    }
 }

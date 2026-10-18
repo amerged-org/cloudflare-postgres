@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What the node reports to Cloudflare over HTTP and keeps until Cloudflare answered it: usage rows
 //! and events. Rows are persisted before they are sent and kept unchanged until acknowledged, so
-//! that a retried post counts once (the API keeps the row it already holds). Bodies are cut by the
+//! that a retried post counts once (the API keeps the row it already holds). The file drops the
+//! rows a pass answered once per pass, not per batch: draining a full queue would otherwise
+//! rewrite and fsync it hundreds of times on the disk the databases share. Bodies are cut by the
 //! arithmetic of `measurements.rs`. A metric the node cannot know stays `null` in its row, never a
 //! manufactured zero.
 use super::{file, request::Api};
@@ -71,6 +73,8 @@ fn event_valid(event: &Value) -> bool {
 struct UsageQueue {
     path: PathBuf,
     rows: Vec<Value>,
+    /// Rows left the queue since the file was written: it still holds rows that were answered.
+    unsaved: bool,
 }
 fn identity(row: &Value) -> (&str, &str, &str) {
     let text = |key: &str| row[key].as_str().unwrap_or_default();
@@ -101,6 +105,7 @@ impl UsageQueue {
                 vec![]
             }),
             path,
+            unsaved: false,
         }
     }
     fn persist(&self, rows: &[Value]) -> Result<(), Error> {
@@ -133,6 +138,7 @@ impl UsageQueue {
         queued.extend(fresh.into_iter().cloned());
         self.persist(&queued)?;
         self.rows = queued;
+        self.unsaved = false;
         Ok(())
     }
     /// The next rows to post: a bounded prefix of the queue.
@@ -140,11 +146,18 @@ impl UsageQueue {
         let prefix = self.rows.iter().take(BATCH_WINDOW).cloned().collect();
         Ok(batches("rows", prefix)?.into_iter().next())
     }
-    /// Cloudflare answered the first `count` rows, or refused them for good.
-    fn done(&mut self, count: usize) -> Result<(), Error> {
-        let remaining = self.rows[count..].to_vec();
-        self.persist(&remaining)?;
-        self.rows = remaining;
+    /// Cloudflare answered the first `count` rows, or refused them for good. The file keeps them
+    /// until `save`: a restart before it posts them again, and the API ignores a repeat.
+    fn done(&mut self, count: usize) {
+        self.rows.drain(..count);
+        self.unsaved = true;
+    }
+    /// Writes the queue as it is now, if rows left it since the file was written.
+    fn save(&mut self) -> Result<(), Error> {
+        if self.unsaved {
+            self.persist(&self.rows)?;
+            self.unsaved = false;
+        }
         Ok(())
     }
 }
@@ -206,10 +219,6 @@ impl EventQueue {
     }
 }
 
-struct State {
-    usage: UsageQueue,
-    events: EventQueue,
-}
 /// What one flush delivered.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Flushed {
@@ -220,13 +229,18 @@ pub struct Flushed {
     pub refused: usize,
 }
 
-/// The usage rows and events of one node, on their way to Cloudflare.
+/// The usage rows and events of one node, on their way to Cloudflare. The usage queue is written
+/// to its file under its own lock, which the events never wait for.
 pub(super) struct Outbox {
     api: Arc<Api>,
-    state: Mutex<State>,
+    usage: Arc<Mutex<UsageQueue>>,
+    events: Mutex<EventQueue>,
     /// One flush at a time, so that the front of a queue is what the answer is for.
     gate: Gate<()>,
     work: Notify,
+}
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 /// A body Cloudflare refuses as it is will be refused again: drop it. Anything else, a fence, a
 /// credential, a limit, an outage, is retried.
@@ -239,29 +253,24 @@ impl Outbox {
     pub fn new(api: Arc<Api>, usage_file: PathBuf) -> Self {
         Self {
             api,
-            state: Mutex::new(State {
-                usage: UsageQueue::load(usage_file),
-                events: EventQueue {
-                    waiting: VecDeque::new(),
-                    posted: None,
-                },
+            usage: Arc::new(Mutex::new(UsageQueue::load(usage_file))),
+            events: Mutex::new(EventQueue {
+                waiting: VecDeque::new(),
+                posted: None,
             }),
             gate: Gate::new(()),
             work: Notify::new(),
         }
     }
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
     /// Persists `rows` (`NodeUsageRow`) to be sent; none of them are taken when this fails.
     pub fn queue_usage(&self, rows: &[Value]) -> Result<(), Error> {
-        self.state().usage.queue(rows)?;
+        lock(&self.usage).queue(rows)?;
         self.work.notify_one();
         Ok(())
     }
     /// Queues `events` (`NodeEvent`) to be sent.
     pub fn queue_events(&self, events: &[Value]) -> Result<(), Error> {
-        let dropped = self.state().events.queue(events)?;
+        let dropped = lock(&self.events).queue(events)?;
         if dropped > 0 {
             super::log("events_dropped", &"event queue full".into());
         }
@@ -282,9 +291,17 @@ impl Outbox {
         usage.and(events).map(|()| flushed)
     }
     async fn flush_usage(&self, flushed: &mut Flushed) -> Result<(), Error> {
+        let posted = self.post_usage(flushed).await;
+        // The file is written once for the pass, however it ended, and not on a worker of the
+        // runtime: an fsync on the shared disk can take long, and admission and wakes need the
+        // workers.
+        let saved = self.save_usage().await;
+        posted.and(saved)
+    }
+    async fn post_usage(&self, flushed: &mut Flushed) -> Result<(), Error> {
         loop {
             // The lock is not held while the batch is posted.
-            let batch = self.state().usage.batch()?;
+            let batch = lock(&self.usage).batch()?;
             let Some(batch) = batch else {
                 return Ok(());
             };
@@ -300,12 +317,19 @@ impl Outbox {
                 }
                 Err(error) => return Err(error),
             }
-            self.state().usage.done(batch.len())?;
+            lock(&self.usage).done(batch.len());
         }
+    }
+    async fn save_usage(&self) -> Result<(), Error> {
+        if !lock(&self.usage).unsaved {
+            return Ok(());
+        }
+        let usage = self.usage.clone();
+        tokio::task::spawn_blocking(move || lock(&usage).save()).await?
     }
     async fn flush_events(&self, flushed: &mut Flushed) -> Result<(), Error> {
         loop {
-            let batch = self.state().events.batch(Instant::now())?;
+            let batch = lock(&self.events).batch(Instant::now())?;
             let Some(batch) = batch else {
                 return Ok(());
             };
@@ -321,7 +345,7 @@ impl Outbox {
                 }
                 Err(error) => return Err(error),
             }
-            self.state().events.done();
+            lock(&self.events).done();
         }
     }
 }
@@ -331,7 +355,7 @@ mod tests {
     use super::*;
     use crate::link::{
         request::{Fenced, tests::enrolled},
-        test_server::{Cloud, Failure, database_id, tempdir, vector, vectors},
+        test_server::{Cloud, Failure, TempDir, database_id, tempdir, vector, vectors},
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -383,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_rows_wait_in_a_private_file_until_they_are_done() {
+    fn usage_rows_wait_in_a_private_file_until_the_pass_that_answered_them_is_saved() {
         let base = tempdir();
         let path = base.join("link/usage-outbox.json");
         let mut queue = UsageQueue::load(path.clone());
@@ -395,13 +419,17 @@ mod tests {
         // The same intervals again are the same rows: a restart computes them twice.
         queue.queue(&rows(3..8)).unwrap();
         assert_eq!(queue.rows, rows(0..8));
-        // A restart finds them, and what was done stays done.
         assert_eq!(UsageQueue::load(path.clone()).rows, rows(0..8));
-        queue.done(3).unwrap();
+        // Answered rows leave the queue at once and the file with the save of the pass, not with
+        // every batch: a restart before it posts rows again that the API holds and ignores.
+        queue.done(3);
+        assert_eq!(queue.rows, rows(3..8));
+        assert_eq!(UsageQueue::load(path.clone()).rows, rows(0..8));
+        queue.save().unwrap();
         assert_eq!(UsageQueue::load(path.clone()).rows, rows(3..8));
-        queue.done(5).unwrap();
+        queue.done(5);
+        queue.save().unwrap();
         assert!(UsageQueue::load(path).rows.is_empty());
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -423,7 +451,6 @@ mod tests {
         );
         assert_eq!(queue.rows, rows(0..2));
         assert_eq!(UsageQueue::load(path).rows, rows(0..2));
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -438,7 +465,6 @@ mod tests {
             std::fs::write(&path, damaged).unwrap();
             assert!(UsageQueue::load(path.clone()).rows.is_empty(), "{damaged}");
         }
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -494,16 +520,21 @@ mod tests {
         assert_eq!(queue.waiting.len(), EVENTS_MAX);
     }
 
-    async fn outbox(cloud: &Cloud) -> (Outbox, PathBuf) {
+    /// An outbox of an enrolled node, and the directory that holds its file.
+    async fn outbox(cloud: &Cloud) -> (Outbox, TempDir) {
         let (api, _) = enrolled(cloud).await;
-        let path = tempdir().join("usage-outbox.json");
-        (Outbox::new(Arc::new(api), path.clone()), path)
+        let directory = tempdir();
+        (
+            Outbox::new(Arc::new(api), directory.join("usage-outbox.json")),
+            directory,
+        )
     }
 
     #[tokio::test]
     async fn usage_is_posted_in_bounded_batches_oldest_first_and_forgotten_once_answered() {
         let cloud = Cloud::start().await;
-        let (outbox, path) = outbox(&cloud).await;
+        let (outbox, directory) = outbox(&cloud).await;
+        let path = directory.join("usage-outbox.json");
         outbox.queue_usage(&rows(0..60)).unwrap();
         let flushed = outbox.flush().await.unwrap();
         assert_eq!(
@@ -535,7 +566,8 @@ mod tests {
     #[tokio::test]
     async fn a_post_that_fails_or_whose_answer_is_lost_is_repeated_with_the_same_rows() {
         let cloud = Cloud::start().await;
-        let (outbox, path) = outbox(&cloud).await;
+        let (outbox, directory) = outbox(&cloud).await;
+        let path = directory.join("usage-outbox.json");
         outbox.queue_usage(&rows(0..30)).unwrap();
         // The API is unavailable; then it applies a batch and the answer is lost.
         cloud.fail_next([Failure::Status(503)]);
@@ -555,9 +587,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rows_answered_before_a_failure_are_not_posted_again_after_a_restart() {
+        let cloud = Cloud::start().await;
+        let (outbox, directory) = outbox(&cloud).await;
+        outbox.queue_usage(&rows(0..60)).unwrap();
+        // Two batches are answered, then the API is unavailable.
+        cloud.fail_next([Failure::Pass, Failure::Pass, Failure::Status(503)]);
+        assert!(outbox.flush().await.is_err());
+        assert_eq!(
+            UsageQueue::load(directory.join("usage-outbox.json")).rows,
+            rows(50..60)
+        );
+    }
+
+    #[tokio::test]
     async fn a_batch_cloudflare_refuses_is_dropped_so_the_queue_drains_past_it() {
         let cloud = Cloud::start().await;
-        let (outbox, _) = outbox(&cloud).await;
+        let (outbox, _directory) = outbox(&cloud).await;
         outbox.queue_usage(&rows(0..30)).unwrap();
         cloud.fail_next([Failure::Status(400)]);
         let flushed = outbox.flush().await.unwrap();
@@ -573,25 +619,22 @@ mod tests {
     #[tokio::test]
     async fn a_fenced_node_keeps_what_it_could_not_report() {
         let cloud = Cloud::start().await;
-        let (outbox, path) = outbox(&cloud).await;
+        let (outbox, directory) = outbox(&cloud).await;
+        let path = directory.join("usage-outbox.json");
         outbox.queue_usage(&rows(0..3)).unwrap();
         outbox.queue_events(&events()).unwrap();
         cloud.with(|inner| inner.fenced = true);
         assert!(outbox.flush().await.unwrap_err().is::<Fenced>());
         assert_eq!(UsageQueue::load(path).rows, rows(0..3));
-        let state = outbox.state();
-        let posted = state
-            .events
-            .posted
-            .as_ref()
-            .map_or(0, |(batch, _)| batch.len());
-        assert_eq!(state.events.waiting.len() + posted, events().len());
+        let held = lock(&outbox.events);
+        let posted = held.posted.as_ref().map_or(0, |(batch, _)| batch.len());
+        assert_eq!(held.waiting.len() + posted, events().len());
     }
 
     #[tokio::test]
     async fn events_are_posted_and_a_lost_answer_repeats_the_same_batch() {
         let cloud = Cloud::start().await;
-        let (outbox, _) = outbox(&cloud).await;
+        let (outbox, _directory) = outbox(&cloud).await;
         outbox.queue_events(&events()).unwrap();
         cloud.fail_next([Failure::Drop]);
         // The usage queue is empty: the failure is the events'.

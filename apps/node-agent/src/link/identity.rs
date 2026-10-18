@@ -226,6 +226,7 @@ pub async fn establish(
         match enrollment(transport, &url, &request).await {
             Ok(node) => break node,
             Err(error) if transient(&error) && Instant::now() < deadline => {
+                super::log("enrollment_retry", &error);
                 tokio::time::sleep(backoff.wait()).await;
             }
             Err(error) => return Err(error),
@@ -251,7 +252,7 @@ async fn enrollment(
     request: &Value,
 ) -> Result<NodeIdentity, Error> {
     let response = transport
-        .client
+        .enrollment
         .post(url.clone())
         .json(request)
         .send()
@@ -333,7 +334,6 @@ mod tests {
         let again = establish(&paths, &transport, "25", &quick()).await.unwrap();
         assert_eq!(again.node, expected());
         assert_eq!(cloud.requests().len(), 1);
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
@@ -349,7 +349,6 @@ mod tests {
             !paths.key().exists(),
             "a key Cloudflare does not know would only be refused"
         );
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -383,7 +382,6 @@ mod tests {
         establish(&paths, &transport, "25", &quick()).await.unwrap();
         let last = cloud.posted("/node/v1/enroll").pop().unwrap();
         assert_eq!(last["public_key"], keys[0]);
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
@@ -416,7 +414,27 @@ mod tests {
         assert_eq!(error.downcast_ref::<Refusal>().unwrap().status, 503);
         assert!(cloud.requests().len() > 3);
         assert!(!paths.identity().exists());
-        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_enrollment_goes_out_over_ipv4_and_never_reaches_an_api_over_ipv6() {
+        // The Worker accepts the enrollment from the instance's own public IPv4, and a node with
+        // an IPv6 route would otherwise reach Cloudflare from an address it refuses for good.
+        let cloud = Cloud::start_on("[::1]:0").await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (paths, transport) = (Paths::new(&base), Transport::new(cloud.roots()).unwrap());
+        let window = Timing {
+            enrollment_window: Duration::from_millis(100),
+            ..quick()
+        };
+        let error = establish(&paths, &transport, "25", &window)
+            .await
+            .err()
+            .expect("the enrollment reached the API over IPv6");
+        assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_connect());
+        assert!(cloud.requests().is_empty());
+        assert!(!paths.identity().exists());
     }
 
     #[tokio::test]
@@ -441,8 +459,6 @@ mod tests {
         }
         assert!(cloud.requests().is_empty());
         // The API answers for another node than the seed names.
-        let seed = std::fs::read_to_string(paths.seed()).unwrap();
-        let _ = seed;
         cloud.seed(&base);
         let mut seed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(paths.seed()).unwrap()).unwrap();
@@ -450,6 +466,5 @@ mod tests {
         std::fs::write(paths.seed(), seed.to_string()).unwrap();
         assert!(establish(&paths, &transport, "25", &quick()).await.is_err());
         assert!(!paths.identity().exists());
-        std::fs::remove_dir_all(base).unwrap();
     }
 }
