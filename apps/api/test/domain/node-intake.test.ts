@@ -12,6 +12,7 @@ import {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   await cleanupFixtures();
 });
 
@@ -490,6 +491,9 @@ describe("the usage of a node", () => {
   it("acknowledges a row it cannot record, so the node's outbox drains", async () => {
     const f = await fixture();
     const id = await database(f);
+    // The last half minute of a UTC hour: a future row a fixed hour ahead would cross into the next one.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(hour + 2 * 3_600_000 - 30_000);
     const nothing = row(id, 0, {
       ingress_bytes: null,
       egress_bytes: null,
@@ -497,9 +501,11 @@ describe("the usage of a node", () => {
       connection_ms: null,
     });
     const strangers = row(newDatabaseId(), 60_000);
+    const ahead =
+      Math.floor(Date.now() / 3_600_000) * 3_600_000 + 2 * 3_600_000;
     const future = row(id, 120_000, {
-      interval_start: new Date(Date.now() + 3600_000).toISOString(),
-      interval_end: new Date(Date.now() + 3600_000 + 60_000).toISOString(),
+      interval_start: new Date(ahead).toISOString(),
+      interval_end: new Date(ahead + 60_000).toISOString(),
     });
     const response = await post(f, "/node/v1/usage", {
       rows: [nothing, strangers, future, row(id, 180_000)],
