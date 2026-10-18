@@ -10,8 +10,8 @@
 use crate::{sessions::Action, transport::Gateway};
 use pgcf_native_protocol::{
     agent::{
-        self, ControlAction, Database, FromGateway, MAX_LINE_BYTES, Mode, SessionStatus, ToGateway,
-        Writer,
+        self, ActivityReport, ControlAction, Database, FromGateway, MAX_LINE_BYTES, Mode,
+        SessionStatus, ToGateway, Writer,
     },
     wake::POLL_HOLD_MS,
 };
@@ -330,14 +330,15 @@ async fn apply(
             Vec::new()
         }
         ToGateway::Activity { id, database } => {
-            let report = activity(gateway, &database);
-            let _ = outgoing
-                .send(agent::encode(&FromGateway::Activity {
-                    id,
-                    database,
-                    report,
-                }))
-                .await;
+            if let Some(report) = activity(gateway, &database) {
+                let _ = outgoing
+                    .send(agent::encode(&FromGateway::Activity {
+                        id,
+                        database,
+                        report,
+                    }))
+                    .await;
+            }
             Vec::new()
         }
     };
@@ -421,8 +422,10 @@ async fn control(
     answer(status, gateway, database)
 }
 
-/// The gateway's measurements of a database, for the agent's idle decision.
-fn activity(gateway: &Gateway, database: &str) -> serde_json::Value {
+/// The gateway's measurements of a database, for the agent's idle decision. A report that breaks
+/// the contract's rules is no answer: the agent then knows nothing of the database's use and
+/// never sleeps it for idleness.
+fn activity(gateway: &Gateway, database: &str) -> Option<ActivityReport> {
     let counts = gateway.sessions.lock().unwrap().counts(database);
     let mut report = gateway.measurements.lock().unwrap().read(database);
     let output = report.as_object_mut().expect("measurement object");
@@ -434,7 +437,9 @@ fn activity(gateway: &Gateway, database: &str) -> serde_json::Value {
     ] {
         output.insert(key.into(), value);
     }
-    report
+    serde_json::from_value::<ActivityReport>(report)
+        .ok()
+        .filter(ActivityReport::valid)
 }
 
 #[cfg(test)]

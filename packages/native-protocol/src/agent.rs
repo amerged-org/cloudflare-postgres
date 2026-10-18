@@ -15,7 +15,7 @@ use crate::{
     valid_pattern,
     wake::{WakeRequest, WakeResult},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Where the agent serves the channel.
 pub const GATEWAY_SOCKET: &str = "/run/pgcf/agent/gateway.sock";
@@ -176,6 +176,130 @@ pub enum SessionStatus {
     Busy,
 }
 
+/// How much of its counters' history the gateway can vouch for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum History {
+    /// Counted from the start of the counter run.
+    Complete,
+    /// Counted from `counters_since` only.
+    Partial,
+    /// This process has seen no activity of the database since it counted: all zero.
+    CurrentProcessAbsence,
+    /// The gateway cannot say; it has no counters.
+    Unavailable,
+}
+
+/// A field that must be present, and may be `null`.
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::deserialize(deserializer)
+}
+
+/// The counters and session counts of one database as the gateway reports them
+/// (`GatewayLocalActivityReport` of the contract): cumulative since `countersSince` within one
+/// counter run, which `processEpoch` and `epoch` name. A counter the gateway cannot know is null,
+/// never zero.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivityReport {
+    pub process_epoch: String,
+    pub epoch: String,
+    pub started_at: String,
+    pub counter_started_at: String,
+    pub observed_at: String,
+    pub history: History,
+    #[serde(deserialize_with = "nullable")]
+    pub counters_since: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub ingress_bytes: Option<u64>,
+    #[serde(deserialize_with = "nullable")]
+    pub egress_bytes: Option<u64>,
+    #[serde(deserialize_with = "nullable")]
+    pub total_connections: Option<u64>,
+    #[serde(deserialize_with = "nullable")]
+    pub connection_milliseconds: Option<u64>,
+    pub connections: u64,
+    pub authenticated_connections: u64,
+    pub busy_connections: u64,
+    pub pending_dials: u64,
+    #[serde(deserialize_with = "nullable")]
+    pub last_activity_at: Option<String>,
+}
+/// A contract timestamp (`Date#toISOString`: `2026-10-17T12:00:00.000Z`) as Unix milliseconds.
+pub fn timestamp_ms(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 24 || bytes[10] != b'T' || bytes[19] != b'.' || bytes[23] != b'Z' {
+        return None;
+    }
+    let at =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()?;
+    i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
+}
+impl ActivityReport {
+    /// The rules that no JSON Schema states (`refineGatewayActivity` of the contract).
+    pub fn valid(&self) -> bool {
+        let count = |value: u64| value <= MAX_SAFE;
+        let optional = |value: Option<u64>| value.is_none_or(count);
+        let (Some(started), Some(counter), Some(observed)) = (
+            timestamp_ms(&self.started_at),
+            timestamp_ms(&self.counter_started_at),
+            timestamp_ms(&self.observed_at),
+        ) else {
+            return false;
+        };
+        let since = self.counters_since.as_deref().map(timestamp_ms);
+        let activity = self.last_activity_at.as_deref().map(timestamp_ms);
+        let metrics = [
+            self.ingress_bytes,
+            self.egress_bytes,
+            self.total_connections,
+            self.connection_milliseconds,
+        ];
+        let within = |at: Option<Option<i64>>| match at {
+            None => true,
+            Some(None) => false,
+            Some(Some(at)) => (counter..=observed).contains(&at),
+        };
+        valid_pattern("uuid", &self.process_epoch)
+            && valid_pattern("uuid", &self.epoch)
+            && counter >= started
+            && observed >= counter
+            && within(since)
+            && within(activity)
+            && metrics.into_iter().all(optional)
+            && [
+                self.connections,
+                self.authenticated_connections,
+                self.busy_connections,
+                self.pending_dials,
+            ]
+            .into_iter()
+            .all(count)
+            && self.authenticated_connections <= self.connections
+            && self.busy_connections <= self.authenticated_connections
+            && self.pending_dials <= self.connections
+            // Unknown history is distinct from measured counters.
+            && if self.history == History::Unavailable {
+                self.counters_since.is_none() && metrics.iter().all(Option::is_none)
+            } else {
+                self.counters_since.is_some() && metrics.iter().all(Option::is_some)
+            }
+            // Complete history begins at the actual counter initialization.
+            && (!matches!(
+                self.history,
+                History::Complete | History::CurrentProcessAbsence
+            ) || self.counters_since.as_deref() == Some(self.counter_started_at.as_str()))
+            // A process that saw nothing cannot conceal activity.
+            && (self.history != History::CurrentProcessAbsence
+                || (self.last_activity_at.is_none()
+                    && metrics.iter().all(|value| *value == Some(0))
+                    && self.authenticated_connections == 0
+                    && self.busy_connections == 0))
+    }
+}
+
 /// From the gateway to the agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -194,7 +318,7 @@ pub enum FromGateway {
     Activity {
         id: u64,
         database: String,
-        report: serde_json::Value,
+        report: ActivityReport,
     },
 }
 
@@ -224,9 +348,14 @@ pub fn decode_from_gateway(line: &[u8]) -> Result<FromGateway, &'static str> {
         serde_json::from_slice(line).map_err(|_| "invalid gateway message")?;
     let valid = match &message {
         FromGateway::Wake { wake } => wake.valid(),
-        FromGateway::Status { database, .. } | FromGateway::Activity { database, .. } => {
-            valid_pattern("database", database)
+        FromGateway::Status { id, database, .. } => {
+            *id <= MAX_SAFE && valid_pattern("database", database)
         }
+        FromGateway::Activity {
+            id,
+            database,
+            report,
+        } => *id <= MAX_SAFE && valid_pattern("database", database) && report.valid(),
     };
     if !valid {
         return Err("invalid gateway message");

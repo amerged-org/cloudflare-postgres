@@ -760,8 +760,10 @@ async fn sessions_outlive_the_agent_channel_and_new_routes_wait_for_its_table() 
     else {
         unreachable!()
     };
-    assert_eq!(report["connections"], 1);
-    assert_eq!(report["authenticatedConnections"], 1);
+    assert_eq!(
+        (report.connections, report.authenticated_connections),
+        (1, 1)
+    );
 
     // The agent restarts: the gateway admits nothing new, and the session keeps its unit.
     let _ = node.commands.send(Command::Disconnect);

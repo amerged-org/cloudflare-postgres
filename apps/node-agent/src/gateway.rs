@@ -11,12 +11,11 @@
 use crate::Error;
 use pgcf_native_protocol::{
     agent::{
-        ControlAction, Database, FromGateway, MAX_LINE_BYTES, SessionStatus, ToGateway,
-        decode_from_gateway, encode,
+        ActivityReport, ControlAction, Database, FromGateway, MAX_LINE_BYTES, SessionStatus,
+        ToGateway, decode_from_gateway, encode, timestamp_ms,
     },
     wake::{WakeRequest, WakeResult},
 };
-use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -66,45 +65,29 @@ pub struct Activity {
     pub history: String,
 }
 impl Activity {
-    /// From the `report` of `FromGateway::Activity`, read field by field; `None` for a report
-    /// that is not one.
-    pub fn of(report: &Value) -> Option<Self> {
-        let count = |key: &str| report.get(key)?.as_u64();
-        let optional = |key: &str| match report.get(key)? {
-            Value::Null => Some(None),
-            value => value.as_u64().map(Some),
-        };
-        let last = match report.get("lastActivityAt")? {
-            Value::Null => None,
-            text => Some(unix_ms(text.as_str()?)?),
+    /// From the `report` of `FromGateway::Activity`.
+    pub fn of(report: &ActivityReport) -> Option<Self> {
+        let last = match report.last_activity_at.as_deref() {
+            None => None,
+            Some(text) => Some(timestamp_ms(text)?),
         };
         Some(Self {
             last_activity_ms: last,
-            connections: count("connections")?,
-            busy_connections: count("busyConnections")?,
-            pending_dials: count("pendingDials")?,
-            ingress_bytes: optional("ingressBytes")?,
-            egress_bytes: optional("egressBytes")?,
-            total_connections: optional("totalConnections")?,
-            connection_milliseconds: optional("connectionMilliseconds")?,
-            epoch: format!(
-                "{}/{}",
-                report.get("processEpoch")?.as_str()?,
-                report.get("epoch")?.as_str()?
-            ),
-            counters_since: report
-                .get("countersSince")
-                .and_then(Value::as_str)
-                .map(String::from),
-            history: report.get("history")?.as_str()?.to_string(),
+            connections: report.connections,
+            busy_connections: report.busy_connections,
+            pending_dials: report.pending_dials,
+            ingress_bytes: report.ingress_bytes,
+            egress_bytes: report.egress_bytes,
+            total_connections: report.total_connections,
+            connection_milliseconds: report.connection_milliseconds,
+            epoch: format!("{}/{}", report.process_epoch, report.epoch),
+            counters_since: report.counters_since.clone(),
+            history: serde_json::to_value(report.history)
+                .ok()?
+                .as_str()?
+                .to_string(),
         })
     }
-}
-/// A contract timestamp as Unix milliseconds.
-fn unix_ms(text: &str) -> Option<i64> {
-    let at =
-        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()?;
-    i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
 }
 
 /// The table of writers and the channel that carries it.
@@ -387,6 +370,7 @@ mod tests {
     use crate::testpg;
     use pgcf_native_protocol::agent::{Mode, Writer, decode_to_gateway};
     use pgcf_native_protocol::wake::Outcome;
+    use serde_json::Value;
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
@@ -398,8 +382,8 @@ mod tests {
     }
 
     /// The contract's lines hold for the protocol crate the agent speaks: every valid line of the
-    /// agent's side decodes, every invalid one is refused, and the same for the gateway's side.
-    /// (The gateway's `report` is the activity report, which the agent reads field by field.)
+    /// agent's side decodes, every invalid one is refused, and the same for the gateway's side,
+    /// the activity report included.
     #[test]
     fn the_contracts_vectors_hold_for_the_protocol_the_agent_speaks() {
         let vectors = vectors();
@@ -412,15 +396,9 @@ mod tests {
             }
         }
         for vector in channel["gateway"].as_array().unwrap() {
-            let name = vector["name"].as_str().unwrap();
-            // The report's own rules are the gateway's. An id beyond 2^53 decodes but answers no
-            // request: the agent numbers its requests itself and matches the answers by number.
-            if name.starts_with("activity-") || name.ends_with("-id-above-2-53") {
-                continue;
-            }
             let line = vector["line"].as_str().unwrap().as_bytes();
             if decode_from_gateway(line).is_ok() != (vector["valid"] == true) {
-                wrong.push(format!("gateway {name}"));
+                wrong.push(format!("gateway {}", vector["name"]));
             }
         }
         assert_eq!(wrong, Vec::<String>::new());

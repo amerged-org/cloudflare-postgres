@@ -447,7 +447,7 @@ impl FakeGateway {
                         Some(FromGateway::Activity {
                             id,
                             database,
-                            report: json!({
+                            report: serde_json::from_value(json!({
                                 "processEpoch": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
                                 "epoch": "1f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
                                 "startedAt": at(now - 100_000), "counterStartedAt": at(now - 100_000),
@@ -458,7 +458,8 @@ impl FakeGateway {
                                 "authenticatedConnections": seen.connections,
                                 "busyConnections": seen.busy_connections, "pendingDials": 0,
                                 "lastActivityAt": seen.last_activity_ms.map(at),
-                            }),
+                            }))
+                            .unwrap(),
                         })
                     }
                     _ => None,

@@ -60,6 +60,22 @@ pub const REASONS: [&str; 22] = [
 pub const RETRY_REASON: &str = "no_headroom";
 /// The longest retry hint, in seconds.
 pub const RETRY_AFTER_MAX_SECONDS: u32 = 300;
+/// The DETAIL of the 57P03 that answers a refused wake (`ADMISSION_REFUSAL_DETAILS` of the
+/// contract): the admission refusals have one, every other reason answers the 57P03 alone.
+pub fn refusal_detail(reason: &str) -> Option<&'static str> {
+    match reason {
+        "no_room" => Some("storage"),
+        "no_headroom" => Some("node at awake capacity"),
+        _ => None,
+    }
+}
+/// The HINT of that 57P03: `retry after <n> s` for the refusal that carries a retry hint.
+pub fn refusal_hint(reason: &str, retry_after_seconds: Option<u32>) -> Option<String> {
+    (reason == RETRY_REASON)
+        .then_some(retry_after_seconds)
+        .flatten()
+        .map(|seconds| format!("retry after {seconds} s"))
+}
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 
 /// Route token v5 claims. `v: 5` is the wake flag: a v5 token exists only for a wake ticket.
