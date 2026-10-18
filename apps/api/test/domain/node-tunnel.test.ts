@@ -42,7 +42,7 @@ it("creates the Tunnel of a node, sends its gateway to loopback and points one h
   const tunnel = await ensureNodeTunnel(services(api.fetcher), NODE);
   expect(tunnel).toEqual({
     token: TUNNEL_TOKEN,
-    gateway_url: `https://${GATEWAY}`,
+    gateway_url: `https://${GATEWAY}/pg`,
   });
   expect(api.tunnels).toEqual([{ id: TUNNEL, name: NAME }]);
   expect(
@@ -66,7 +66,7 @@ it("sends the shell to loopback and points a second hostname at the Tunnel once 
   const tunnel = await ensureNodeTunnel(services(api.fetcher, true), NODE);
   expect(tunnel).toEqual({
     token: TUNNEL_TOKEN,
-    gateway_url: `https://${GATEWAY}`,
+    gateway_url: `https://${GATEWAY}/pg`,
   });
   expect(api.tunnels).toEqual([{ id: TUNNEL, name: NAME }]);
   expect(
@@ -94,7 +94,7 @@ it("removes the shell's ingress rule and DNS record of a node on the next call o
   // The gateway is as before; only the shell is gone.
   expect(tunnel).toEqual({
     token: TUNNEL_TOKEN,
-    gateway_url: `https://${GATEWAY}`,
+    gateway_url: `https://${GATEWAY}/pg`,
   });
   expect(api.configurations.get(TUNNEL)).toEqual({
     config: {

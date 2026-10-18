@@ -64,7 +64,7 @@ it("hands a node the route keyring derived for it, the token of its Tunnel and t
     expect(key).not.toBe(masterKeys[kid]);
   // The Tunnel's public hostname is the node's gateway from now on.
   expect(await gatewayOf(f.node)).toBe(
-    `https://${nodeAdditionHostname(f.node)}.${DOMAIN}`,
+    `https://${nodeAdditionHostname(f.node)}.${DOMAIN}/pg`,
   );
   await env.DB.prepare("UPDATE nodes SET credentials_revision=4 WHERE id=?")
     .bind(f.node)
@@ -94,7 +94,7 @@ it("makes the shell hostname of a node only while NODE_SHELL_HOSTNAME is exactly
   // Anything but the string true is off, and an existing shell hostname goes away.
   await ask("yes");
   expect(hostnames()).toEqual([gateway]);
-  expect(await gatewayOf(f.node)).toBe(`https://${gateway}`);
+  expect(await gatewayOf(f.node)).toBe(`https://${gateway}/pg`);
 });
 
 it("answers a node whose Tunnel cannot be made with a failure, and writes no gateway", async () => {

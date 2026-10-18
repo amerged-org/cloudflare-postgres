@@ -131,5 +131,6 @@ export async function ensureNodeTunnel(
   const token = await call("GET", `${base}/${id}/token`);
   if (typeof token !== "string" || !TUNNEL_TOKEN.test(token))
     throw new Error("cloudflare_api_failed");
-  return { gateway_url: `https://${gateway}`, token };
+  // The gateway accepts a WebSocket upgrade at /pg only; the region contract ends the URL there.
+  return { gateway_url: `https://${gateway}/pg`, token };
 }
