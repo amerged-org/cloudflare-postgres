@@ -324,6 +324,39 @@ const hello = {
   },
 };
 
+const journalEntry = {
+  at: now,
+  unit: "pgcf-agent.service",
+  identifier: "pgcf-agent",
+  transport: "stdout",
+  priority: 6,
+  message: '{"event":"agent_started","uptime_s":12}',
+};
+const bootReport = {
+  boot_id: hello.os.boot_id,
+  previous_boot_id: "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+  kernel_release: hello.os.kernel_release,
+  entries: [
+    journalEntry,
+    {
+      at: now,
+      unit: null,
+      identifier: null,
+      transport: "kernel",
+      priority: 3,
+      message: "Out of memory: Killed process 4242 (postgres)",
+    },
+    {
+      at: now,
+      unit: "init.scope",
+      identifier: "systemd",
+      transport: "journal",
+      priority: 6,
+      message: "Stopping pgcf-agent.service - PGCF node agent...",
+    },
+  ],
+};
+
 type Case = [name: string, value: unknown, valid: boolean, refinement?: true];
 /** The schemas the node agent reads or writes, by the name the JSON Schemas carry. */
 export const nodeSchemas = {
@@ -338,6 +371,7 @@ export const nodeSchemas = {
   NodeSample: link.NodeSample,
   NodeVolumeReport: link.NodeVolumeReport,
   NodeEventReport: link.NodeEventReport,
+  NodeBootReport: link.NodeBootReport,
   NodeUsageReport: link.NodeUsageReport,
   NodeFencedResponse: link.NodeFencedResponse,
   AgentLinkMessage: link.AgentLinkMessage,
@@ -1249,6 +1283,52 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     ["pool-hit", { events: [{ ...wake, outcome: "hit" }] }, false],
+  ],
+  NodeBootReport: [
+    ["report", bootReport, true],
+    [
+      "no-earlier-boot-and-no-journal",
+      { ...bootReport, previous_boot_id: null, entries: [] },
+      true,
+    ],
+    [
+      "message-of-2048-bytes",
+      {
+        ...bootReport,
+        entries: [{ ...journalEntry, message: "\u00e9".repeat(1024) }],
+      },
+      true,
+    ],
+    [
+      "message-of-2050-bytes",
+      {
+        ...bootReport,
+        entries: [{ ...journalEntry, message: "\u00e9".repeat(1025) }],
+      },
+      false,
+      true,
+    ],
+    [
+      "priority-above-debug",
+      { ...bootReport, entries: [{ ...journalEntry, priority: 8 }] },
+      false,
+    ],
+    [
+      "unit-not-a-name",
+      { ...bootReport, entries: [{ ...journalEntry, unit: "" }] },
+      false,
+    ],
+    [
+      "entry-with-a-field-of-the-journal",
+      { ...bootReport, entries: [{ ...journalEntry, _PID: "104" }] },
+      false,
+    ],
+    ["boot-id-not-a-uuid", { ...bootReport, boot_id: "boot" }, false],
+    [
+      "no-previous-boot-id",
+      { ...bootReport, previous_boot_id: undefined },
+      false,
+    ],
   ],
   NodeUsageReport: [
     ["usage", { rows: [usageRow] }, true],

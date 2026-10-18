@@ -262,6 +262,10 @@ pub trait Machine: Send + Sync + 'static {
     // ---- the kernel's facts
     /// This boot and the running kernel.
     fn boot(&self) -> Option<Boot>;
+    /// The journal of the boot before this one as `journalctl` prints it with `--output=json`, one
+    /// object a line (`diagnostics::boot_report::JOURNAL_ARGUMENTS`), or `None` when the journal
+    /// holds no earlier boot.
+    fn previous_boot_journal(&self) -> impl Future<Output = io::Result<Option<String>>> + Send;
     /// `MemTotal` and `MemAvailable` now.
     fn memory(&self) -> Option<Memory>;
     /// The CPU times since boot, summed over the cores.

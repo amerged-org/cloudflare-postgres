@@ -4,6 +4,8 @@
 //! where one exists, a status code, never by its message.
 use crate::Error;
 
+pub mod boot_report;
+
 /// The class of `error` as a short snake-case code: its kind (`postgres_28p01`, `http_connect`,
 /// `io_connection_refused`, `deadline_exceeded`), or a fixed phrase the agent wrote itself
 /// (`cluster_uid_changed`), or `other`.

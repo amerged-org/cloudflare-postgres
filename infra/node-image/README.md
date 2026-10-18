@@ -385,6 +385,10 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
 - **Journal.** [journald](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf.conf) keeps at most
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
   every five minutes, so that the minutes before a freeze are in the journal after the reboot.
+  After every reboot the agent posts the last 1,000 lines of the previous boot from `pgcf-agent`,
+  `pgcf-gateway`, `pgcf-cloudflared`, `systemd-networkd`, PID 1 and the kernel (`journalctl
+  --boot=-1`, never the units of the databases or of the backup jobs), which the API keeps for 30
+  days and an administrator reads at `GET /v1/nodes/{id}/diagnostics`.
 
 ## Installing a node
 

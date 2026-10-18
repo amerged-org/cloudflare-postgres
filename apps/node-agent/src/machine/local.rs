@@ -787,6 +787,13 @@ impl Machine for Local {
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
+    /// What `journalctl` printed on a node that rebooted, captured from a real one; a node that has
+    /// not rebooted has no earlier boot.
+    async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
+        Ok((self.state().boots > 0)
+            .then(|| include_str!("../diagnostics/previous-boot.jsonl").to_string()))
+    }
+
     fn boot(&self) -> Option<Boot> {
         let state = self.state();
         Some(Boot {

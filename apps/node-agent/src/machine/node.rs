@@ -507,6 +507,17 @@ impl Machine for Node {
         }
     }
 
+    async fn previous_boot_journal(&self) -> io::Result<Option<String>> {
+        let output = tokio::process::Command::new("journalctl")
+            .args(crate::diagnostics::boot_report::JOURNAL_ARGUMENTS)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        crate::diagnostics::boot_report::previous_boot(&output)
+    }
+
     fn boot(&self) -> Option<Boot> {
         let read = |path| std::fs::read_to_string(path).ok();
         Boot::parse(

@@ -5,11 +5,13 @@ import {
   ArchiveCredential,
   NODE_API_PATHS,
   NODE_AWAKE_LIMIT,
+  NODE_BOOT_REPORT_MAX_BYTES,
   NODE_DESIRED_PAGE_LIMIT_MAX,
   NODE_FENCED_PATHS,
   NODE_LINK_MESSAGE_MAX_BYTES,
   NODE_REQUEST_MAX_LIFETIME_SECONDS,
   NODE_USAGE_BATCH_MAX,
+  NodeBootReport,
   NodeCredentials,
   NodeDatabaseObservation,
   NodeDesiredPage,
@@ -1250,5 +1252,56 @@ describe("credentials and the node's policy", () => {
       { io: { ...page.policy.io, write_bytes_per_second: 0 } },
     ])
       expect(NodeDesiredPage.safeParse(withPolicy(broken)).success).toBe(false);
+  });
+});
+
+describe("the report of the previous boot", () => {
+  const entry = {
+    at: now,
+    unit: "pgcf-agent.service",
+    identifier: "pgcf-agent",
+    transport: "stdout",
+    priority: 6,
+    message: "agent started",
+  };
+  const report = (entries: object[]) => ({
+    boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+    previous_boot_id: null,
+    kernel_release: "6.12.111+deb13-amd64",
+    entries,
+  });
+
+  it("takes at most 1,000 entries and names its path", () => {
+    expect(NODE_API_PATHS.diagnostics).toBe("/node/v1/diagnostics");
+    const thousand = Array.from({ length: 1000 }, () => entry);
+    expect(NodeBootReport.safeParse(report(thousand)).success).toBe(true);
+    expect(NodeBootReport.safeParse(report([...thousand, entry])).success).toBe(
+      false,
+    );
+  });
+
+  it("counts a message in bytes, not in characters", () => {
+    const message = (text: string) =>
+      NodeBootReport.safeParse(report([{ ...entry, message: text }])).success;
+    expect(message("a".repeat(2048))).toBe(true);
+    expect(message("\u00e9".repeat(1024))).toBe(true);
+    expect(message("\u00e9".repeat(1025))).toBe(false);
+    expect(message("a".repeat(2049))).toBe(false);
+  });
+
+  it("is refused beyond 1 MiB of JSON, which 1,000 full messages are", () => {
+    const full = { ...entry, message: "a".repeat(2048) };
+    const fits = Math.floor(
+      NODE_BOOT_REPORT_MAX_BYTES / JSON.stringify(full).length,
+    );
+    expect(
+      NodeBootReport.safeParse(
+        report(Array.from({ length: fits - 1 }, () => full)),
+      ).success,
+    ).toBe(true);
+    expect(
+      NodeBootReport.safeParse(report(Array.from({ length: 1000 }, () => full)))
+        .success,
+    ).toBe(false);
   });
 });

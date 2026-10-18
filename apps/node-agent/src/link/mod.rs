@@ -274,6 +274,11 @@ impl Link {
             .await
     }
 
+    /// Posts the journal of the previous boot (`NodeBootReport`), once after a reboot.
+    pub async fn post_diagnostics(&self, report: &Value) -> Result<(), Error> {
+        self.post("diagnostics", "NodeBootReport", report).await
+    }
+
     /// Posts every thin volume of the node (`NodeVolumeReport`), sampled every 60 s.
     pub async fn post_volumes(&self, report: &Value) -> Result<(), Error> {
         self.post("volumes", "NodeVolumeReport", report).await

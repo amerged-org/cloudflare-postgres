@@ -7,6 +7,7 @@ import {
   InstallerProgress,
   NODE_API_PATHS,
   INSTALLER_PROGRESS_PATH,
+  NodeBootReport,
   NodeCredentials,
   NodeDesiredPage,
   NodeDesiredQuery,
@@ -26,6 +27,7 @@ import { archiveCredentialResponse } from "../domain/archive-credentials.ts";
 import { callingNode, nodeAuthentication } from "../domain/node-auth.ts";
 import { nodeCredentials } from "../domain/node-credentials.ts";
 import { desiredResponse } from "../domain/node-desired.ts";
+import { nodeBootReport } from "../domain/node-diagnostics.ts";
 import { enrollNode, recordInstallerProgress } from "../domain/node-install.ts";
 import { nodeEvents, nodeUsage, nodeVolumes } from "../domain/node-intake.ts";
 import { nodeObservations } from "../domain/node-observations.ts";
@@ -241,6 +243,25 @@ export function registerNodeLink(app: ApiApp): void {
       ),
     },
     async (c) => nodeUsage(c, callingNode(c), await c.req.json()),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: NODE_API_PATHS.diagnostics,
+      tags,
+      security: node,
+      description:
+        "The tail of the previous boot's journal, sent once after a reboot. It carries at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, and is at most 1 MiB. expected_reboot is true when a maintenance order of the node was open when its last sample of the previous boot arrived, or closed after it; when it is false the minute cron raises node_unexpected_reboot; it is null when the agent knew no earlier boot.",
+      request: { body: body(NodeBootReport) },
+      responses: nodeResponses(
+        z.strictObject({
+          id: z.uuid(),
+          expected_reboot: z.boolean().nullable(),
+        }),
+      ),
+    },
+    async (c) => nodeBootReport(c, callingNode(c), await c.req.json()),
   );
   const security = [{ bearerAuth: [] }];
   register(

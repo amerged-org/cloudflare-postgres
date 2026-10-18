@@ -8927,6 +8927,234 @@
       }
     },
     {
+      "schema": "NodeBootReport",
+      "name": "report",
+      "valid": true,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "{\"event\":\"agent_started\",\"uptime_s\":12}"
+          },
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": null,
+            "identifier": null,
+            "transport": "kernel",
+            "priority": 3,
+            "message": "Out of memory: Killed process 4242 (postgres)"
+          },
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "init.scope",
+            "identifier": "systemd",
+            "transport": "journal",
+            "priority": 6,
+            "message": "Stopping pgcf-agent.service - PGCF node agent..."
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "no-earlier-boot-and-no-journal",
+      "valid": true,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": null,
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": []
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "message-of-2048-bytes",
+      "valid": true,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "message-of-2050-bytes",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "priority-above-debug",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 8,
+            "message": "{\"event\":\"agent_started\",\"uptime_s\":12}"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "unit-not-a-name",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "{\"event\":\"agent_started\",\"uptime_s\":12}"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "entry-with-a-field-of-the-journal",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "{\"event\":\"agent_started\",\"uptime_s\":12}",
+            "_PID": "104"
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "boot-id-not-a-uuid",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "boot_id": "boot",
+        "previous_boot_id": "9a7c1d2e-4b3f-4a65-8e10-6c5d4b3a2f10",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "{\"event\":\"agent_started\",\"uptime_s\":12}"
+          },
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": null,
+            "identifier": null,
+            "transport": "kernel",
+            "priority": 3,
+            "message": "Out of memory: Killed process 4242 (postgres)"
+          },
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "init.scope",
+            "identifier": "systemd",
+            "transport": "journal",
+            "priority": 6,
+            "message": "Stopping pgcf-agent.service - PGCF node agent..."
+          }
+        ]
+      }
+    },
+    {
+      "schema": "NodeBootReport",
+      "name": "no-previous-boot-id",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+        "kernel_release": "6.12.111+deb13-amd64",
+        "entries": [
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "pgcf-agent.service",
+            "identifier": "pgcf-agent",
+            "transport": "stdout",
+            "priority": 6,
+            "message": "{\"event\":\"agent_started\",\"uptime_s\":12}"
+          },
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": null,
+            "identifier": null,
+            "transport": "kernel",
+            "priority": 3,
+            "message": "Out of memory: Killed process 4242 (postgres)"
+          },
+          {
+            "at": "2026-10-17T12:00:00.000Z",
+            "unit": "init.scope",
+            "identifier": "systemd",
+            "transport": "journal",
+            "priority": 6,
+            "message": "Stopping pgcf-agent.service - PGCF node agent..."
+          }
+        ]
+      }
+    },
+    {
       "schema": "NodeUsageReport",
       "name": "usage",
       "valid": true,

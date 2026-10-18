@@ -6,6 +6,8 @@ import {
   OperationId,
   RegionId,
   NodeId,
+  NodeDiagnostic,
+  NodeDiagnosticSummary,
   listEnvelope,
 } from "@pgcf/contracts";
 import {
@@ -16,6 +18,10 @@ import {
 } from "@pgcf/contracts/nodes";
 import type { ApiContext } from "../env.ts";
 import type { ApiApp } from "../app.ts";
+import {
+  getNodeDiagnostic,
+  listNodeDiagnostics,
+} from "../domain/node-diagnostics.ts";
 import {
   approvePurchase,
   capacityDecision,
@@ -108,6 +114,47 @@ export function registerNodes(app: ApiApp): void {
         c,
         NodeId.parse(c.req.param("id")),
         NodeMarkLost.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/{id}/diagnostics",
+      security,
+      tags: ["Nodes"],
+      summary: "List a node's boot reports",
+      description:
+        "The reports a node sent after each reboot, newest first, without their journal lines. expected_reboot is true when a maintenance order of the node was open when its last sample of the previous boot arrived, or closed after it, false when none was (the node_unexpected_reboot alert), and null when the agent knew no earlier boot. Reports are kept for 30 days. Administrator keys only: any other key is told 404.",
+      request: { params: z.object({ id: NodeId }), query: ListQuery },
+      responses: responses(
+        listEnvelope(NodeDiagnosticSummary),
+        200,
+        "Boot reports",
+      ),
+    },
+    async (c) => listNodeDiagnostics(c, NodeId.parse(c.req.param("id"))),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/{id}/diagnostics/{diagnostic_id}",
+      security,
+      tags: ["Nodes"],
+      summary: "Read a node's boot report",
+      description:
+        "One report with the tail of the previous boot's journal: at most 1,000 lines of the agent, the gateway, cloudflared, networkd, PID 1 and the kernel, oldest first, each with its time, unit, program, transport, syslog priority and text (at most 2,048 bytes). Lines of the databases' units and of backup jobs are never reported. Administrator keys only: any other key is told 404.",
+      request: {
+        params: z.object({ id: NodeId, diagnostic_id: z.uuid() }),
+      },
+      responses: responses(NodeDiagnostic, 200, "Boot report"),
+    },
+    async (c) =>
+      getNodeDiagnostic(
+        c,
+        NodeId.parse(c.req.param("id")),
+        z.uuid().parse(c.req.param("diagnostic_id")),
       ),
   );
   register(

@@ -211,6 +211,9 @@ impl<M: Machine> Service<M> {
 
         service.boot(&page).await;
         service.pull_page(page).await;
+        // The link stands: the previous boot's journal goes to Cloudflare, if there was a boot.
+        let s = service.clone();
+        service.spawn(async move { s.report_boot().await });
         // The gateway is served once the node has found what runs: its first table is then what
         // runs, and the sessions it kept across the agent's restart go on.
         core.settled(config.timing.settle).await;
@@ -493,6 +496,18 @@ impl<M: Machine> Service<M> {
                     Err(reason) => self.core.report_order(&operation, Err(reason)),
                 }
             }
+        }
+    }
+
+    /// After a boot, the tail of the previous boot's journal (SEC-05). A node that stopped
+    /// answering has no shell to tell why.
+    async fn report_boot(&self) {
+        if let Err(error) =
+            crate::diagnostics::boot_report::report_boot(&*self.machine, &self.link).await
+        {
+            crate::timing::emit_event(json!({
+                "event": "boot_report_not_sent", "class": crate::diagnostics::error_code(&error),
+            }));
         }
     }
 
@@ -1123,6 +1138,42 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_agent_that_starts_after_a_reboot_posts_the_journal_of_the_boot_before() {
+        let Some((machine, _fixture, _root)) =
+            site("boot-journal", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        let reports = || cloud.acknowledged("/node/v1/diagnostics");
+        // The first start of the node: no boot before it, and the agent remembers this one.
+        let first = serve(&machine, &cloud, &base).await;
+        let before = machine.boot().unwrap().id;
+        eventually(30, "the first boot to be remembered", || {
+            machine.layout().agent().join("boot-id").exists()
+        })
+        .await;
+        first.stop();
+        drop(first);
+        assert!(reports().is_empty());
+        // The node reboots and the agent starts again: it says which boot the lines are of.
+        machine.reboot().await.unwrap();
+        let second = serve(&machine, &cloud, &base).await;
+        eventually(30, "the report of the previous boot", || {
+            !reports().is_empty()
+        })
+        .await;
+        let [report] = &reports()[..] else {
+            panic!("one report: {:?}", reports());
+        };
+        assert_eq!(report["previous_boot_id"], before);
+        assert_eq!(report["boot_id"], machine.boot().unwrap().id);
+        assert!(!report["entries"].as_array().unwrap().is_empty());
+        second.stop();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

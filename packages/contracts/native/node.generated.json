@@ -1651,6 +1651,71 @@
         "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
       }
     },
+    "NodeBootReport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "previous_boot_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            { "type": "null" }
+          ]
+        },
+        "kernel_release": { "type": "string", "pattern": "^[!-~]{1,64}$" },
+        "entries": {
+          "maxItems": 1000,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "at": { "$ref": "#/$defs/Timestamp" },
+              "unit": {
+                "anyOf": [
+                  { "type": "string", "minLength": 1, "maxLength": 255 },
+                  { "type": "null" }
+                ]
+              },
+              "identifier": {
+                "anyOf": [
+                  { "type": "string", "minLength": 1, "maxLength": 255 },
+                  { "type": "null" }
+                ]
+              },
+              "transport": { "type": "string", "pattern": "^[a-z]{1,16}$" },
+              "priority": { "type": "integer", "minimum": 0, "maximum": 7 },
+              "message": { "type": "string", "maxLength": 2048 }
+            },
+            "required": [
+              "at",
+              "unit",
+              "identifier",
+              "transport",
+              "priority",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["boot_id", "previous_boot_id", "kernel_release", "entries"],
+      "additionalProperties": false,
+      "$defs": {
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
     "NodeUsageReport": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
@@ -2059,7 +2124,8 @@
       "observations": "/node/v1/observations",
       "volumes": "/node/v1/volumes",
       "events": "/node/v1/events",
-      "usage": "/node/v1/usage"
+      "usage": "/node/v1/usage",
+      "diagnostics": "/node/v1/diagnostics"
     },
     "INSTALLER_PROGRESS_PATH": "/node/v1/installer/progress",
     "NODE_ENROLLMENT_SEED_PATH": "/var/lib/pgcf/enrollment/seed.json",
@@ -2074,6 +2140,9 @@
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
     "NODE_REPORT_EVENTS_MAX": 64,
     "NODE_REPORT_EVENT_FIELDS_MAX": 16,
+    "NODE_BOOT_REPORT_ENTRIES_MAX": 1000,
+    "NODE_BOOT_REPORT_MESSAGE_MAX_BYTES": 2048,
+    "NODE_BOOT_REPORT_MAX_BYTES": 1048576,
     "NODE_REQUEST_TOKEN_PREFIX": "pgcf_nr1",
     "NODE_REQUEST_SIGNATURE_DOMAIN": "pgcf-node-request/v1\n",
     "NODE_REQUEST_MAX_LIFETIME_SECONDS": 60,

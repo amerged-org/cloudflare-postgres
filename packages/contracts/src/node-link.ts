@@ -73,6 +73,7 @@ export const NODE_API_PATHS = {
   volumes: "/node/v1/volumes",
   events: "/node/v1/events",
   usage: "/node/v1/usage",
+  diagnostics: "/node/v1/diagnostics",
 } as const;
 /**
  * A node declared lost (plan 9.4) is fenced: its Tunnel token is revoked, and its key still signs
@@ -1438,6 +1439,80 @@ export const NodeEventReport = z
     { path: ["events"], message: "A report names each event once" },
   );
 export type NodeEventReport = z.infer<typeof NodeEventReport>;
+
+// ---------- Boot reports (POST /node/v1/diagnostics) ----------
+
+export const NODE_BOOT_REPORT_ENTRIES_MAX = 1000;
+export const NODE_BOOT_REPORT_MESSAGE_MAX_BYTES = 2048;
+/** The JSON body of a report: the agent drops the oldest entries until it fits. */
+export const NODE_BOOT_REPORT_MAX_BYTES = 1024 * 1024;
+const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
+
+/**
+ * One line of the previous boot's journal, reduced to what explains a stop: when, which unit and
+ * program said it, through which transport (`journal`, `stdout`, `kernel`, `syslog`, `audit`), at
+ * which syslog priority (0 emergency to 7 debug), and the text. `unit` is null for the kernel's
+ * lines. The agent never reports a line of a database's unit or of a backup job, whose output
+ * can hold the tenant's SQL.
+ */
+export const NodeJournalEntry = z.strictObject({
+  at: Timestamp,
+  unit: z.string().min(1).max(255).nullable(),
+  identifier: z.string().min(1).max(255).nullable(),
+  transport: z.string().regex(/^[a-z]{1,16}$/),
+  priority: z.number().int().min(0).max(7),
+  message: z
+    .string()
+    .max(NODE_BOOT_REPORT_MESSAGE_MAX_BYTES)
+    .refine(
+      (message) => utf8Bytes(message) <= NODE_BOOT_REPORT_MESSAGE_MAX_BYTES,
+      {
+        message: `A message is at most ${NODE_BOOT_REPORT_MESSAGE_MAX_BYTES} bytes`,
+      },
+    ),
+});
+export type NodeJournalEntry = z.infer<typeof NodeJournalEntry>;
+/**
+ * POST /node/v1/diagnostics: sent once after a boot, when the boot ID differs from the one the
+ * agent stored when it last reported. `kernel_release` is the kernel of `boot_id`. `previous_boot_id`
+ * is the stored ID, null when the agent had stored none (it was just installed or updated), and
+ * `entries` are the tail of the previous boot's journal from the agent, the gateway, cloudflared,
+ * networkd, PID 1 and the kernel, oldest first; they are empty when the node has no journal of the
+ * previous boot.
+ */
+export const NodeBootReport = z
+  .strictObject({
+    boot_id: z.uuid(),
+    previous_boot_id: z.uuid().nullable(),
+    kernel_release: KernelRelease,
+    entries: z.array(NodeJournalEntry).max(NODE_BOOT_REPORT_ENTRIES_MAX),
+  })
+  .refine(
+    (report) => utf8Bytes(JSON.stringify(report)) <= NODE_BOOT_REPORT_MAX_BYTES,
+    { message: "A boot report is at most 1 MiB" },
+  );
+export type NodeBootReport = z.infer<typeof NodeBootReport>;
+
+/**
+ * What the API says of a stored report. `expected_reboot` is true when a maintenance order of the
+ * node was open when its last sample of the previous boot arrived, or closed after it; false
+ * when none was (the API then raises `node_unexpected_reboot`); null when the agent knew no
+ * earlier boot (`previous_boot_id` null), so that no reboot is claimed.
+ */
+export const NodeDiagnosticSummary = z.strictObject({
+  id: z.uuid(),
+  node_id: NodeId,
+  kind: z.literal("boot"),
+  boot_id: z.uuid(),
+  previous_boot_id: z.uuid().nullable(),
+  received_at: Timestamp,
+  expected_reboot: z.boolean().nullable(),
+});
+export type NodeDiagnosticSummary = z.infer<typeof NodeDiagnosticSummary>;
+export const NodeDiagnostic = NodeDiagnosticSummary.extend({
+  report: NodeBootReport,
+});
+export type NodeDiagnostic = z.infer<typeof NodeDiagnostic>;
 
 // ---------- Link messages (GET /node/v1/link WebSocket) ----------
 

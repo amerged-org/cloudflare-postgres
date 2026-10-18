@@ -219,6 +219,76 @@ it("gives a node the columns of its hello and drops the releases that state no O
     expect(() => report(column, value), column).toThrow(/CHECK/);
 });
 
+it("keeps a boot report per node, bounded, and widens the alert kinds with the unexpected reboot", () => {
+  populate();
+  for (const name of migrations.filter((v) => v >= "0063" && v < "0073"))
+    apply(name);
+  const report = (
+    previous: string | null,
+    expected: number | null,
+    change: Record<string, string | number | null> = {},
+  ) => {
+    const row = {
+      id: crypto.randomUUID(),
+      node_id: node,
+      kind: "boot",
+      boot_id: crypto.randomUUID(),
+      previous_boot_id: previous,
+      received_at: NOW,
+      expected_reboot: expected,
+      body: "{}",
+      ...change,
+    };
+    run(
+      `INSERT INTO node_diagnostics(id,node_id,kind,boot_id,previous_boot_id,received_at,expected_reboot,body)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      ...Object.values(row),
+    );
+  };
+  // The episode that was there stays, and the new kind joins it.
+  const episodes = db.prepare("SELECT * FROM infrastructure_alerts").all();
+  apply("0073_node_diagnostics.sql");
+  expect(db.prepare("SELECT * FROM infrastructure_alerts").all()).toEqual(
+    episodes,
+  );
+  run(
+    `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
+     VALUES('eu-test','node_unexpected_reboot',1,?,'{}')`,
+    crypto.randomUUID(),
+  );
+  expect(() =>
+    run(
+      `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
+       VALUES('eu-test','node_rebooted',1,?,'{}')`,
+      crypto.randomUUID(),
+    ),
+  ).toThrow(/CHECK/);
+  // A reboot is expected, unexpected, or not claimed because no earlier boot was known.
+  const previous = crypto.randomUUID();
+  report(previous, 1);
+  report(previous, 0);
+  report(null, null);
+  for (const broken of [
+    () => report(previous, null),
+    () => report(null, 0),
+    () => report(previous, 2),
+    () => report(previous, 1, { kind: "journal" }),
+    () => report(previous, 1, { boot_id: "boot" }),
+    () => report(previous, 1, { received_at: "yesterday" }),
+    () => report(previous, 1, { body: "not json" }),
+    () => report(previous, 1, { body: "[" + "0,".repeat(600_000) + "0]" }),
+  ])
+    expect(broken).toThrow(/CHECK/);
+  expect(() =>
+    report(previous, 1, { node_id: `nod_${"z".repeat(20)}` }),
+  ).toThrow(/FOREIGN KEY/);
+  // The reports go with their node.
+  run("DELETE FROM nodes WHERE id=?", node);
+  expect(db.prepare("SELECT count(*) n FROM node_diagnostics").get()).toEqual({
+    n: 0,
+  });
+});
+
 it("widens the alert kinds with the refused enrollment and keeps the episodes", () => {
   populate();
   apply("0063_node_link.sql");

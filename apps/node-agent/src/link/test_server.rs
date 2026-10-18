@@ -506,6 +506,8 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
         post("NodeEventReport")
     } else if is("usage") {
         post("NodeUsageReport")
+    } else if is("diagnostics") {
+        post("NodeBootReport")
     } else {
         answer(404, error("not_found"))
     }
