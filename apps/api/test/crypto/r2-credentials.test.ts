@@ -45,7 +45,7 @@ const jwtOf = (sessionToken: string) => {
   return text.slice(4);
 };
 
-it("signs the documented HS256 JWT with the parent secret and derives the temporary secret from its digest", async () => {
+it("signs an HS256 JWT with the parent secret and derives the temporary secret from its digest", async () => {
   const credential = await signR2Credential(parent, request);
   const jwt = jwtOf(credential.sessionToken),
     { header, payload, signed, signature } = parts(jwt);
@@ -97,8 +97,8 @@ it("never lets a credential delete, copy or call HeadBucket, and reads only with
   for (const actions of Object.values(R2_ACTIONS))
     expect(actions.filter((action) => forbidden.has(action))).toEqual([]);
   expect(R2_ACTIONS.read_only).toEqual([
-    "HeadObject",
     "GetObject",
+    "HeadObject",
     "ListObjectsV2",
   ]);
   for (const action of R2_ACTIONS.read_only)
@@ -152,4 +152,68 @@ it("refuses a lifetime that is not positive and an empty prefix, without echoing
   } catch (error) {
     expect(String(error)).not.toContain(parent.secretAccessKey);
   }
+});
+
+/** The first 16 hexadecimal characters of the SHA-256 of `text`: a pin, not a secret. */
+const sha256Prefix = async (text: string) =>
+  bytesToHex(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+    ),
+  ).slice(0, 16);
+
+/**
+ * Cloudflare's page on local signing names the payload only in part (`actions`, `paths`); the
+ * claims `bucket`, `sub`, `iss`, `aud`, `iat` and `exp` and their order are the Stage 1 lab
+ * signer's, whose tokens R2 accepted. This vector is that signer's output on the same inputs. What
+ * it signs is pinned by the start of the SHA-256 digest of each value, so that the values
+ * themselves do not stand in the repository.
+ */
+it("signs byte for byte what the Stage 1 lab signer signed and R2 accepted", async () => {
+  const lab = await signR2Credential(
+    {
+      accessKeyId: "parentkeyid0123456789",
+      secretAccessKey: "parent-secret-" + "0123456789abcdef",
+    },
+    {
+      accountId: "0123456789abcdef0123456789abcdef",
+      endpoint:
+        "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/",
+      bucket: "pgcf-eu",
+      prefix: "eu-dev/abcdefghijklmnopqrst/g1-op_abcdefghijklmnopqrst/",
+      actions: [
+        "GetObject",
+        "HeadObject",
+        "PutObject",
+        "ListObjectsV2",
+        "CreateMultipartUpload",
+        "UploadPart",
+        "CompleteMultipartUpload",
+        "AbortMultipartUpload",
+        "ListMultipartUploads",
+        "ListParts",
+      ],
+      issuedAt: 1_800_000_000,
+      expiresAt: 1_800_000_000 + 7 * 86_400,
+    },
+  );
+  expect([
+    await sha256Prefix(lab.secretAccessKey),
+    await sha256Prefix(lab.sessionToken),
+  ]).toEqual(["5c4f7e2de304f19a", "16a8a2454c7bd1f8"]);
+});
+
+it("mints the lab's action lists", () => {
+  expect(R2_ACTIONS.read_write).toEqual([
+    "GetObject",
+    "HeadObject",
+    "PutObject",
+    "ListObjectsV2",
+    "CreateMultipartUpload",
+    "UploadPart",
+    "CompleteMultipartUpload",
+    "AbortMultipartUpload",
+    "ListMultipartUploads",
+    "ListParts",
+  ]);
 });

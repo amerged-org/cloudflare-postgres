@@ -236,7 +236,9 @@ it("fences in the order the plan sets: Tunnel, power off, then a stopped instanc
   await f.declare();
   const run = actions({ states: ["other", "stopped"] });
   const at = Date.parse("2026-10-18T12:01:00.000Z");
-  await runNodeFencing(env, at, run.impl);
+  expect(await runNodeFencing(env, at, run.impl)).toEqual([
+    "instance_not_stopped",
+  ]);
   const instance = (await env.DB.prepare(
     "SELECT provider_instance_id FROM nodes WHERE id=?",
   )
@@ -257,7 +259,7 @@ it("fences in the order the plan sets: Tunnel, power off, then a stopped instanc
     error: "instance_not_stopped",
   });
   const later = at + 60_000;
-  await runNodeFencing(env, later, run.impl);
+  expect(await runNodeFencing(env, later, run.impl)).toEqual([]);
   // The Tunnel and the order to power off are not repeated; only the status is read.
   expect(run.calls.slice(3)).toEqual([`state:${instance}`]);
   expect(await statusOf(f.node)).toMatchObject({
@@ -281,7 +283,9 @@ it("does not touch the instance before the Tunnel is gone, and retries each step
     },
   });
   const at = Date.now();
-  await runNodeFencing(env, at, run.impl);
+  expect(await runNodeFencing(env, at, run.impl)).toEqual([
+    "tunnel_delete_failed",
+  ]);
   expect(run.calls).toEqual([`tunnel:${f.node}`]);
   let status = await statusOf(f.node);
   expect(status).toMatchObject({
@@ -291,14 +295,16 @@ it("does not touch the instance before the Tunnel is gone, and retries each step
   });
   // The class of the failure is kept, never what the failing service said.
   expect(JSON.stringify(status)).not.toContain("secret-token-value");
-  await runNodeFencing(env, at + 60_000, run.impl);
+  expect(await runNodeFencing(env, at + 60_000, run.impl)).toEqual([
+    "power_off_failed",
+  ]);
   status = await statusOf(f.node);
   expect(status).toMatchObject({
     error: "power_off_failed",
     steps: { power_off_requested_at: null },
   });
   expect(status.steps.tunnel_deleted_at).not.toBeNull();
-  await runNodeFencing(env, at + 120_000, run.impl);
+  expect(await runNodeFencing(env, at + 120_000, run.impl)).toEqual([]);
   expect(run.calls.filter((call) => call.startsWith("tunnel"))).toHaveLength(2);
   expect(run.calls.filter((call) => call.startsWith("power"))).toHaveLength(2);
   expect(await statusOf(f.node)).toMatchObject({
@@ -326,6 +332,20 @@ it("cannot power off a node that has no provider instance", async () => {
     status: "fencing",
     error: "no_provider_instance",
   });
+});
+
+it("records a missing configuration and an unknown Tunnel as classes of their own", async () => {
+  const f = await lost();
+  await f.declare();
+  for (const code of ["fence_unconfigured", "tunnel_unknown"]) {
+    const run = actions({
+      tunnel: () => {
+        throw new Error(code);
+      },
+    });
+    expect(await runNodeFencing(env, Date.now(), run.impl)).toEqual([code]);
+    expect(await statusOf(f.node)).toMatchObject({ error: code });
+  }
 });
 
 it("reports the recovery point of each database of a lost node", async () => {

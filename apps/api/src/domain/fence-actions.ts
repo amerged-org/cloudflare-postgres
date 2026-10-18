@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
 import type { Env } from "../env.ts";
 import { contaboClient, type ContaboClient } from "../providers/contabo.ts";
 import type { FenceActions } from "./node-loss.ts";
@@ -9,10 +10,12 @@ import type { FenceActions } from "./node-loss.ts";
  * its instance off and reports its status. Nothing a service answers is kept or thrown on: a
  * failure is one class the caller records.
  *
- * The Tunnel is found by name, because nothing else ties it to the node: node enrollment names
- * the Tunnel of each node with `nodeTunnelName`.
+ * The Tunnel is found by name, because nothing else ties it to the node: node enrollment must
+ * create the Tunnel of each node under `nodeTunnelName`, the node's addition hostname. A node
+ * that has no Tunnel under that name is not fenced: its Tunnel may be alive under another name,
+ * so the step fails (`tunnel_unknown`) instead of counting the Tunnel as gone.
  */
-export const nodeTunnelName = (nodeId: string) => `pgcf-node-${nodeId}`;
+export const nodeTunnelName = nodeAdditionHostname;
 
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
 const TUNNEL_ID =
@@ -53,19 +56,28 @@ export function fenceActions(services: FenceServices): FenceActions {
       };
       const base = `${CLOUDFLARE_API}/accounts/${target.accountId}/cfd_tunnel`,
         name = nodeTunnelName(target.nodeId);
+      // Deleted Tunnels are listed too: a Tunnel an earlier run deleted is gone, not unknown.
       const listed = await call(
-        `${base}?name=${encodeURIComponent(name)}&is_deleted=false&per_page=100`,
+        `${base}?name=${encodeURIComponent(name)}&per_page=100`,
         "GET",
       );
       if (!Array.isArray(listed)) throw new Error("cloudflare_api_failed");
-      for (const tunnel of listed as { id?: unknown; name?: unknown }[]) {
+      let found = 0;
+      for (const tunnel of listed as {
+        id?: unknown;
+        name?: unknown;
+        deleted_at?: unknown;
+      }[]) {
         if (tunnel.name !== name) continue;
+        found++;
+        if (tunnel.deleted_at) continue;
         if (typeof tunnel.id !== "string" || !TUNNEL_ID.test(tunnel.id))
           throw new Error("cloudflare_api_failed");
         // A Tunnel with a connected connector cannot be deleted.
         await call(`${base}/${tunnel.id}/connections`, "DELETE");
         await call(`${base}/${tunnel.id}`, "DELETE");
       }
+      if (found === 0) throw new Error("tunnel_unknown");
     },
     async powerOff(target) {
       const current = await instance(target.providerInstanceId);

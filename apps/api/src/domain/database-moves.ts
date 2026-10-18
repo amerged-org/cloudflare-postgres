@@ -5,6 +5,7 @@ import {
   NodeId,
   newOperationId,
   ProvenSleepRecord,
+  type ArchiveCredentialReference,
   type DatabaseOrigin,
   type NodeDatabaseObservation,
   type NodeObservationReport,
@@ -12,31 +13,52 @@ import {
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
+import { regionArchive } from "./archive-bindings.ts";
+import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
+import { validatedArchivePrefix } from "./archive.ts";
 import {
   archiveCredentialStatement,
   ensureArchiveCredential,
   newArchiveCredentialId,
 } from "./archive-credentials.ts";
 import { supersededStatement } from "./lifecycle-orders.ts";
+import {
+  nodeDatabasePlacementGuard,
+  nodePlacementBindings,
+  nodePlacementGuard,
+} from "./placement.ts";
+import { parseBackupInfo } from "./restore-catalog.ts";
 import { isConstraintError } from "./rows.ts";
+import { nodeStoragePlacementSql } from "./storage-capacity.ts";
 
 /**
  * A move (ULTRA plan 9.5): one database changes node, or volume on the same node, and keeps its
- * ID. D1 stays the authority at every step, and the node only ever reports.
+ * ID. D1 stays the authority at every step, and the node only ever reports. Until the target is
+ * ready the database stays what D1 says it is, served by the source from its storage generation;
+ * a move that fails leaves it there.
  *
  * 1. `proving`: the source gets a `move` order. It proves the sleep of its storage generation,
- *    holds its wakes with 57P03, and reports the order done together with the database asleep and
- *    its proven-sleep record.
- * 2. `restoring`: D1 bumps the generation behind the admission fence. The database now belongs to
- *    the target with the next storage generation and a fresh archive path, the source gets a
- *    superseded order and no longer lists the database, and the target's page carries the move
- *    origin (the newest DONE backup of the source and its proven end) and credentials. The
- *    target restores through admission, replays to that end and takes its first base backup.
- * 3. `done`: the target reports the new storage generation ready, which includes the DONE backup.
- *    The source is told to remove its volume.
+ *    holds its wakes with 57P03 until the order ends, and reports the order done together with
+ *    the database asleep and its proven-sleep record.
+ * 2. `restoring`: D1 checks that the source archive holds the newest DONE backup and the WAL
+ *    through the proof, and that the target is still eligible (plan 4.8). It then stages the next
+ *    storage generation in the move: a fresh archive path, the move origin (the backup and the
+ *    proven end of the source) and the credentials of the target. The database row is not
+ *    touched: the target's page carries the staged entry (`moveTargets`), the source's page its
+ *    unchanged one, and the source keeps holding. The target restores through admission, replays
+ *    to the proven end and takes its first base backup.
+ * 3. `done`: the target reports the staged storage generation ready, or asleep after the proven
+ *    sleep of a later timeline of the same cluster; either includes the DONE backup. Behind the
+ *    admission fence, one batch then moves the database to the target with the staged
+ *    generation, ends the `move` order, and orders the source to retire its storage generation
+ *    and remove the volume.
  *
- * A move that fails while proving leaves everything as it was. One that fails while restoring
- * leaves the source's volume in place, retired but unremoved, for the operator.
+ * A move that fails while proving or restoring leaves everything as it was and ends the `move`
+ * order, so the source serves again. So does any change D1 makes to the database after the move
+ * staged its generation (a resize, a suspend, a wake claim): the target's work is then moot. A
+ * target that is another node is told to retire and remove the storage generation it staged; on
+ * the same node that cannot be said without retiring the source's own, so the staged volume
+ * stays for the operator.
  */
 export type MoveStatus = "proving" | "restoring" | "done" | "failed";
 export interface DatabaseMove {
@@ -54,7 +76,11 @@ export interface DatabaseMove {
 }
 interface MoveRow extends DatabaseMove {
   source_acknowledged_at: string | null;
+  source_archive_path: string;
   target_generation: number | null;
+  target_archive_path: string | null;
+  backup_id: string | null;
+  proven_sleep_json: string | null;
 }
 const VIEW_COLUMNS =
   "operation,database_id,source_node_id,target_node_id,status,failure,source_storage_generation,target_storage_generation,created_at,updated_at,completed_at";
@@ -95,6 +121,36 @@ interface StartRow {
   deleted_at: string | null;
 }
 const liveNodeSql = `n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=n.id)`;
+
+/**
+ * Whether the database `d` may be placed on the node `target` (ULTRA plan 4.8), by the rules
+ * that create and resize apply: the node is ready, schedulable, live, observed lately and open
+ * for new databases, and its storage has room for one more volume of the database's size class,
+ * which on the database's own node is the second volume of the move.
+ */
+function targetOpen(targetNodeId: string, now: number) {
+  return {
+    sql: `EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=d.size_class_id WHERE n.id=? AND n.region_id=d.region_id
+      AND n.ready=1 AND n.schedulable=1 AND ${liveNodeSql} AND ${nodePlacementGuard("n")}
+      AND ${nodeDatabasePlacementGuard("n")} AND ${nodeStoragePlacementSql("n", "s")})`,
+    bindings: [targetNodeId, ...nodePlacementBindings(now)],
+  };
+}
+
+async function targetFits(
+  db: D1Database,
+  databaseId: string,
+  targetNodeId: string,
+  now: number,
+): Promise<boolean> {
+  const open = targetOpen(targetNodeId, now);
+  return (
+    (await db
+      .prepare(`SELECT 1 fits FROM databases d WHERE d.id=? AND ${open.sql}`)
+      .bind(databaseId, ...open.bindings)
+      .first()) !== null
+  );
+}
 
 /**
  * Starts the move of a database to `targetNodeId`, which may be its own node: a move from one
@@ -156,8 +212,15 @@ export async function startDatabaseMove(
       "conflict",
       "The source and the target must be nodes that are neither lost nor fenced",
     );
+  if (!(await targetFits(db, databaseId, targetNodeId, now)))
+    throw new ApiError(
+      "conflict",
+      "The target node cannot take the database now: it is not open for placement, has no fresh observation or no room",
+      { reason: "node_capacity" },
+    );
   const operation = newOperationId(),
-    at = iso(now);
+    at = iso(now),
+    open = targetOpen(targetNodeId, now);
   let results: D1Result[];
   try {
     results = await db.batch([
@@ -165,7 +228,8 @@ export async function startDatabaseMove(
         .prepare(
           `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,created_at,updated_at)
           SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,d.storage_generation,d.archive_path,'proving',?,?
-          FROM databases d WHERE d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.deleted_at IS NULL`,
+          FROM databases d WHERE d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.deleted_at IS NULL
+          AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=d.node_id AND ${liveNodeSql}) AND ${open.sql}`,
         )
         .bind(
           operation,
@@ -176,6 +240,7 @@ export async function startDatabaseMove(
           row.generation,
           row.storage_generation,
           row.node_id,
+          ...open.bindings,
         ),
       db
         .prepare(
@@ -190,6 +255,7 @@ export async function startDatabaseMove(
       return sameOrRefuse(await activeMove(db, databaseId));
     throw error;
   }
+  // The database or a node changed since the checks above; asking again says which.
   if (results[0]!.meta.changes !== 1)
     throw new ApiError("conflict", "Database changed; retry the request", {
       reason: "generation_changed",
@@ -198,20 +264,31 @@ export async function startDatabaseMove(
 }
 
 /**
- * The origin of every database whose move restores onto this node now, with the operation that
- * made its generation. The node's page lists these entries with `origin`; once the target is
- * ready the entry has none. The credential reads the source archive only.
+ * The entry a move target's page carries for a database it restores: the staged generation, not
+ * the one D1 serves. `operation` is the move, which made the staged generation. The page lists
+ * this entry in place of any other entry for the database, also on the source's own node; once
+ * the move is done the database row says the same and the entry is gone. The credentials read
+ * the source archive and write the staged one.
  */
-export async function moveOrigins(
+export interface MoveTarget {
+  operation: string;
+  generation: number;
+  storage_generation: number;
+  archive: { path: string; credential: ArchiveCredentialReference };
+  origin: DatabaseOrigin;
+}
+
+/** The staged entry of every database whose move restores onto this node now. */
+export async function moveTargets(
   db: D1Database,
   nodeId: string,
   now: number,
-): Promise<Map<string, { operation: string; origin: DatabaseOrigin }>> {
+): Promise<Map<string, MoveTarget>> {
   const rows = (
     await db
       .prepare(
-        `SELECT operation,database_id,source_archive_path,backup_id,proven_sleep_json FROM database_moves
-        WHERE target_node_id=? AND status='restoring' ORDER BY database_id`,
+        `SELECT operation,database_id,source_archive_path,backup_id,proven_sleep_json,target_generation,target_storage_generation,target_archive_path
+        FROM database_moves WHERE target_node_id=? AND status='restoring' ORDER BY database_id`,
       )
       .bind(nodeId)
       .all<{
@@ -220,15 +297,29 @@ export async function moveOrigins(
         source_archive_path: string;
         backup_id: string;
         proven_sleep_json: string;
+        target_generation: number;
+        target_storage_generation: number;
+        target_archive_path: string;
       }>()
   ).results;
-  const origins = new Map<
-    string,
-    { operation: string; origin: DatabaseOrigin }
-  >();
+  const targets = new Map<string, MoveTarget>();
   for (const row of rows)
-    origins.set(row.database_id, {
+    targets.set(row.database_id, {
       operation: row.operation,
+      generation: row.target_generation,
+      storage_generation: row.target_storage_generation,
+      archive: {
+        path: row.target_archive_path,
+        credential: await ensureArchiveCredential(
+          db,
+          {
+            nodeId,
+            archivePath: row.target_archive_path,
+            access: "read_write",
+          },
+          now,
+        ),
+      },
       origin: {
         kind: "move",
         source: {
@@ -248,17 +339,57 @@ export async function moveOrigins(
         },
       },
     });
-  return origins;
+  return targets;
 }
 
-/** Ends a move that did not finish, and with it its order. `failure` is a short lowercase class. */
+/**
+ * Ends a move that did not finish, and with it its `move` order, so that the source serves
+ * again. `failure` is a short lowercase class. A target that staged a storage generation on
+ * another node is told to retire it and remove its volume.
+ */
 export async function failMove(
   db: D1Database,
   operation: string,
   failure: string,
   at: string,
 ): Promise<void> {
+  const move = await db
+    .prepare(
+      "SELECT status,database_id,source_node_id,target_node_id,target_storage_generation FROM database_moves WHERE operation=?",
+    )
+    .bind(operation)
+    .first<{
+      status: MoveStatus;
+      database_id: string;
+      source_node_id: string;
+      target_node_id: string;
+      target_storage_generation: number | null;
+    }>();
+  if (!move || (move.status !== "proving" && move.status !== "restoring"))
+    return;
+  const statements: D1PreparedStatement[] = [];
+  if (
+    move.status === "restoring" &&
+    move.target_node_id !== move.source_node_id
+  )
+    statements.push(
+      supersededStatement(
+        db,
+        {
+          nodeId: move.target_node_id,
+          databaseId: move.database_id,
+          storageGeneration: move.target_storage_generation!,
+          removeVolume: true,
+          now: at,
+        },
+        {
+          sql: "EXISTS(SELECT 1 FROM database_moves m WHERE m.operation=? AND m.status='restoring')",
+          bindings: [operation],
+        },
+      ),
+    );
   await db.batch([
+    ...statements,
     db
       .prepare(
         "UPDATE database_moves SET status='failed',failure=?,completed_at=?,updated_at=? WHERE operation=? AND status IN('proving','restoring')",
@@ -273,8 +404,9 @@ export async function failMove(
 }
 
 /**
- * Fails the moves that a lost node can no longer carry out: those still proving on it or toward
- * it, and those restoring onto it. A move restoring away from it has nothing left to wait for.
+ * Fails the moves that a lost node can no longer carry out or serve: every move still running
+ * from it or toward it. The database of a move restoring away from a lost node stays on it,
+ * and its recovery is the node's.
  */
 export async function failMovesOfLostNode(
   db: D1Database,
@@ -284,9 +416,9 @@ export async function failMovesOfLostNode(
   const moves = (
     await db
       .prepare(
-        `SELECT operation FROM database_moves WHERE (status='proving' AND (source_node_id=? OR target_node_id=?)) OR (status='restoring' AND target_node_id=?)`,
+        `SELECT operation FROM database_moves WHERE status IN('proving','restoring') AND (source_node_id=? OR target_node_id=?)`,
       )
-      .bind(nodeId, nodeId, nodeId)
+      .bind(nodeId, nodeId)
       .all<{ operation: string }>()
   ).results;
   for (const move of moves) await failMove(db, move.operation, "node_lost", at);
@@ -305,9 +437,56 @@ interface DatabaseState {
 }
 
 /**
- * Step 2: the generation bump. Behind the admission fence, one batch moves the database to the
- * target with the next storage generation and a fresh archive path, ends the `move` order, retires
- * the source's generation and issues the target its credentials. Returns whether it applied.
+ * Whether the source archive can serve the move as the source's report says: the backup is DONE
+ * with its data, and the WAL is archived from the backup's first segment through the last one of
+ * the proof. A fault of R2 or of the binding is thrown, not answered.
+ */
+async function sourceArchiveHolds(
+  env: Env,
+  database: DatabaseState,
+  observed: NodeDatabaseObservation,
+): Promise<boolean> {
+  const selected = regionArchive(env, {
+    id: database.region_id,
+    backup_bucket: database.backup_bucket,
+  });
+  const prefix = validatedArchivePrefix(
+    database,
+    database,
+    selected.bucketName,
+  );
+  const backupId = observed.backup!.backup_id,
+    last = observed.proven_sleep!.last_archived_segment;
+  const described = await selected.bucket.get(
+    `${prefix}base/${backupId}/backup.info`,
+  );
+  const info =
+    described && described.size <= 65536
+      ? parseBackupInfo(await described.text(), backupId)
+      : null;
+  if (!info || info.endWal > last) return false;
+  let data = false;
+  for await (const key of keysOf(selected.bucket, `${prefix}base/${backupId}/`))
+    if (BACKUP_DATA.test(key)) {
+      data = true;
+      break;
+    }
+  return (
+    data &&
+    (await walRangeArchived(selected.bucket, prefix, {
+      first: info.beginWal,
+      last,
+      segmentBytes: info.segmentBytes,
+    }))
+  );
+}
+
+/**
+ * Step 2: stages the next storage generation in the move, in one batch that holds only while the
+ * database, both nodes and the target's eligibility are what they were: a fresh archive path, the
+ * origin of the target, and its credentials. The storage generation is above every one this
+ * database has been staged with, so a node that retired one never meets it again. Returns whether
+ * it applied.
  */
 async function beginRestore(
   env: Env,
@@ -317,7 +496,13 @@ async function beginRestore(
   now: number,
 ): Promise<boolean> {
   const at = iso(now),
-    storageGeneration = move.source_storage_generation + 1,
+    staged = await env.DB.prepare(
+      "SELECT COALESCE(MAX(target_storage_generation),0) highest FROM database_moves WHERE database_id=?",
+    )
+      .bind(database.id)
+      .first<{ highest: number }>(),
+    storageGeneration =
+      Math.max(move.source_storage_generation, staged!.highest) + 1,
     generation = database.generation + 1,
     path = archiveDestinationPath(
       database.backup_bucket,
@@ -325,9 +510,68 @@ async function beginRestore(
       database.id,
       storageGeneration,
       move.operation,
-    );
-  const restoring = {
-    sql: "EXISTS(SELECT 1 FROM database_moves m WHERE m.operation=? AND m.status='restoring')",
+    ),
+    open = targetOpen(move.target_node_id, now);
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE database_moves SET status='restoring',target_generation=?,target_storage_generation=?,target_archive_path=?,backup_id=?,proven_sleep_json=?,updated_at=?
+      WHERE operation=? AND status='proving' AND EXISTS(SELECT 1 FROM databases d WHERE d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.archive_path=?
+        AND d.deleted_at IS NULL AND d.desired_state IN('running','suspended')
+        AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=d.node_id AND ${liveNodeSql}) AND ${open.sql})`,
+    ).bind(
+      generation,
+      storageGeneration,
+      path,
+      observed.backup!.backup_id,
+      JSON.stringify(observed.proven_sleep),
+      at,
+      move.operation,
+      database.id,
+      database.generation,
+      move.source_storage_generation,
+      move.source_node_id,
+      database.archive_path,
+      ...open.bindings,
+    ),
+    archiveCredentialStatement(
+      env.DB,
+      {
+        nodeId: move.target_node_id,
+        archivePath: path,
+        access: "read_write",
+      },
+      newArchiveCredentialId(),
+      now,
+    ),
+    archiveCredentialStatement(
+      env.DB,
+      {
+        nodeId: move.target_node_id,
+        archivePath: database.archive_path,
+        access: "read_only",
+      },
+      newArchiveCredentialId(),
+      now,
+    ),
+  ]);
+  return results[0]!.meta.changes === 1;
+}
+
+/**
+ * Step 3: the target is ready. Behind the admission fence, one batch moves the database to the
+ * target with the staged generation, ends the `move` order and retires the source's storage
+ * generation with its volume. It applies only while the database is as the move staged it, and
+ * the target is live. Returns whether it applied.
+ */
+async function completeMove(
+  env: Env,
+  move: MoveRow,
+  database: DatabaseState,
+  now: number,
+): Promise<boolean> {
+  const at = iso(now);
+  const finished = {
+    sql: "EXISTS(SELECT 1 FROM database_moves m WHERE m.operation=? AND m.status='done')",
     bindings: [move.operation],
   };
   const results = await withAdmissionMutation(
@@ -337,116 +581,47 @@ async function beginRestore(
       const guard = mutation.guard(database.id);
       return mutation.batch([
         env.DB.prepare(
-          `UPDATE databases SET node_id=?,generation=generation+1,storage_generation=?,archive_path=?,observed_state='provisioning',status_message=NULL,updated_at=?
+          `UPDATE databases SET node_id=?,generation=?,storage_generation=?,archive_path=?,observed_state='provisioning',status_message=NULL,updated_at=?
           WHERE id=? AND generation=? AND storage_generation=? AND node_id=? AND archive_path=? AND deleted_at IS NULL AND desired_state IN('running','suspended')
-          AND EXISTS(SELECT 1 FROM database_moves m WHERE m.operation=? AND m.status='proving')
+          AND EXISTS(SELECT 1 FROM database_moves m WHERE m.operation=? AND m.status='restoring')
           AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=? AND ${liveNodeSql}) AND (${guard.sql})`,
         ).bind(
           move.target_node_id,
-          storageGeneration,
-          path,
+          move.target_generation,
+          move.target_storage_generation,
+          move.target_archive_path,
           at,
           database.id,
-          database.generation,
+          move.target_generation! - 1,
           move.source_storage_generation,
           move.source_node_id,
-          database.archive_path,
+          move.source_archive_path,
           move.operation,
           move.target_node_id,
           ...guard.bindings,
         ),
         env.DB.prepare(
-          `UPDATE database_moves SET status='restoring',target_generation=?,target_storage_generation=?,target_archive_path=?,backup_id=?,proven_sleep_json=?,updated_at=?
-          WHERE operation=? AND status='proving' AND changes()=1 AND (${guard.sql})`,
-        ).bind(
-          generation,
-          storageGeneration,
-          path,
-          observed.backup!.backup_id,
-          JSON.stringify(observed.proven_sleep),
-          at,
-          move.operation,
-          ...guard.bindings,
-        ),
+          `UPDATE database_moves SET status='done',completed_at=?,updated_at=?
+          WHERE operation=? AND status='restoring' AND changes()=1 AND (${guard.sql})`,
+        ).bind(at, at, move.operation, ...guard.bindings),
         env.DB.prepare(
-          `UPDATE lifecycle_orders SET closed_at=? WHERE operation=? AND type='move' AND closed_at IS NULL AND ${restoring.sql}`,
-        ).bind(at, move.operation, ...restoring.bindings),
+          `UPDATE lifecycle_orders SET closed_at=? WHERE operation=? AND type='move' AND closed_at IS NULL AND ${finished.sql}`,
+        ).bind(at, move.operation, ...finished.bindings),
         supersededStatement(
           env.DB,
           {
             nodeId: move.source_node_id,
             databaseId: database.id,
             storageGeneration: move.source_storage_generation,
-            removeVolume: false,
+            removeVolume: true,
             now: at,
           },
-          restoring,
-        ),
-        archiveCredentialStatement(
-          env.DB,
-          {
-            nodeId: move.target_node_id,
-            archivePath: path,
-            access: "read_write",
-          },
-          newArchiveCredentialId(),
-          now,
-        ),
-        archiveCredentialStatement(
-          env.DB,
-          {
-            nodeId: move.target_node_id,
-            archivePath: database.archive_path,
-            access: "read_only",
-          },
-          newArchiveCredentialId(),
-          now,
+          finished,
         ),
       ]);
     },
   );
   return results[0]!.meta.changes === 1;
-}
-
-/** Step 3: the target is ready; the source's retired generation may now lose its volume. */
-async function completeMove(
-  db: D1Database,
-  move: MoveRow,
-  at: string,
-): Promise<void> {
-  const finished = {
-    sql: "EXISTS(SELECT 1 FROM database_moves m WHERE m.operation=? AND m.status='done')",
-    bindings: [move.operation],
-  };
-  await db.batch([
-    db
-      .prepare(
-        "UPDATE database_moves SET status='done',completed_at=?,updated_at=? WHERE operation=? AND status='restoring'",
-      )
-      .bind(at, at, move.operation),
-    db
-      .prepare(
-        `UPDATE lifecycle_orders SET closed_at=? WHERE node_id=? AND type='superseded' AND database_id=? AND storage_generation=? AND remove_volume=0 AND closed_at IS NULL AND ${finished.sql}`,
-      )
-      .bind(
-        at,
-        move.source_node_id,
-        move.database_id,
-        move.source_storage_generation,
-        ...finished.bindings,
-      ),
-    supersededStatement(
-      db,
-      {
-        nodeId: move.source_node_id,
-        databaseId: move.database_id,
-        storageGeneration: move.source_storage_generation,
-        removeVolume: true,
-        now: at,
-      },
-      finished,
-    ),
-  ]);
 }
 
 /**
@@ -462,7 +637,7 @@ export async function progressMoves(
   const at = iso(now);
   const active = (
     await env.DB.prepare(
-      `SELECT ${VIEW_COLUMNS},source_acknowledged_at,target_generation FROM database_moves
+      `SELECT ${VIEW_COLUMNS},source_acknowledged_at,source_archive_path,target_generation,target_archive_path,backup_id,proven_sleep_json FROM database_moves
       WHERE status IN('proving','restoring') AND (source_node_id=? OR target_node_id=?) ORDER BY operation`,
     )
       .bind(nodeId, nodeId)
@@ -507,7 +682,81 @@ export async function progressMoves(
       )
         continue;
       try {
-        if (!(await beginRestore(env, move, database, observed, now)))
+        if (!(await sourceArchiveHolds(env, database, observed))) {
+          await failMove(env.DB, move.operation, "no_recovery_point", at);
+          continue;
+        }
+      } catch (error) {
+        // R2 or its binding failed: the next report asks again, the source keeps holding.
+        console.error(
+          JSON.stringify({
+            event: "move_archive_check_failed",
+            database_id: move.database_id,
+            error_code:
+              error instanceof Error &&
+              /^[a-z][a-z0-9_]{2,63}$/.test(error.message)
+                ? error.message
+                : "archive_check_failed",
+          }),
+        );
+        continue;
+      }
+      if (!(await beginRestore(env, move, database, observed, now)))
+        await failMove(
+          env.DB,
+          move.operation,
+          (await targetFits(env.DB, move.database_id, move.target_node_id, now))
+            ? "database_changed"
+            : "target_not_eligible",
+          at,
+        );
+    } else {
+      if (move.target_node_id !== nodeId || !observed) continue;
+      // Anything D1 did to the database since it staged the move makes the target's work moot.
+      if (
+        database.node_id !== move.source_node_id ||
+        database.storage_generation !== move.source_storage_generation ||
+        database.archive_path !== move.source_archive_path ||
+        database.generation !== move.target_generation! - 1
+      ) {
+        await failMove(env.DB, move.operation, "database_changed", at);
+        continue;
+      }
+      if (
+        observed.storage_generation !== move.target_storage_generation ||
+        observed.generation < move.target_generation!
+      )
+        continue;
+      if (observed.state === "error") {
+        await failMove(
+          env.DB,
+          move.operation,
+          observed.error ?? "build_failed",
+          at,
+        );
+        continue;
+      }
+      const end = ProvenSleepRecord.parse(JSON.parse(move.proven_sleep_json!));
+      // The target promoted this cluster on a later timeline and holds its first DONE backup.
+      const promoted =
+        observed.backup !== null &&
+        (observed.state === "ready" ||
+          (observed.state === "asleep" &&
+            observed.proven_sleep!.timeline > end.timeline));
+      if (
+        observed.state === "asleep" &&
+        observed.proven_sleep!.system_identifier !== end.system_identifier
+      ) {
+        await failMove(env.DB, move.operation, "identity_mismatch", at);
+        continue;
+      }
+      if (!promoted) continue;
+      try {
+        if (
+          !(await completeMove(env, move, database, now)) &&
+          (await activeMove(env.DB, move.database_id))?.operation ===
+            move.operation
+        )
           await failMove(env.DB, move.operation, "database_changed", at);
       } catch (error) {
         // Another change holds the database for the moment; the next report tries again.
@@ -517,23 +766,6 @@ export async function progressMoves(
         )
           throw error;
       }
-    } else {
-      if (
-        move.target_node_id !== nodeId ||
-        !observed ||
-        database.node_id !== nodeId ||
-        observed.storage_generation !== move.target_storage_generation ||
-        observed.generation < move.target_generation!
-      )
-        continue;
-      if (observed.state === "ready") await completeMove(env.DB, move, at);
-      else if (observed.state === "error")
-        await failMove(
-          env.DB,
-          move.operation,
-          observed.error ?? "build_failed",
-          at,
-        );
     }
   }
 }

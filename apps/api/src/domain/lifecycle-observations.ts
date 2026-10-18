@@ -30,8 +30,10 @@ export async function applyLifecycleObservations(
 
 /**
  * The proven-sleep record and the newest DONE backup of the current storage generation of each
- * database the node serves. A newer storage generation replaces an older point, and within one
- * generation the later report wins. Only a change is written.
+ * database the node serves, with the generation the report answered. A report for a generation
+ * older than D1's is stale and ignored (`observationVerdict`); a newer storage generation replaces
+ * an older point, and within one storage generation the later report of an equal or newer
+ * generation wins. Only a change is written.
  */
 async function recordRecoveryPoints(
   db: D1Database,
@@ -45,18 +47,21 @@ async function recordRecoveryPoints(
     .map((observed) =>
       db
         .prepare(
-          `INSERT INTO database_recovery_points(database_id,node_id,storage_generation,state,proven_sleep_json,backup_json,observed_at,received_at)
-          SELECT d.id,?,?,?,?,?,?,? FROM databases d WHERE d.id=? AND d.node_id=? AND d.storage_generation=?
-          ON CONFLICT(database_id) DO UPDATE SET node_id=excluded.node_id,storage_generation=excluded.storage_generation,state=excluded.state,
+          `INSERT INTO database_recovery_points(database_id,node_id,storage_generation,generation,state,proven_sleep_json,backup_json,observed_at,received_at)
+          SELECT d.id,?,?,?,?,?,?,?,? FROM databases d WHERE d.id=? AND d.node_id=? AND d.storage_generation=? AND d.generation<=?
+          ON CONFLICT(database_id) DO UPDATE SET node_id=excluded.node_id,storage_generation=excluded.storage_generation,generation=excluded.generation,state=excluded.state,
             proven_sleep_json=excluded.proven_sleep_json,backup_json=excluded.backup_json,observed_at=excluded.observed_at,received_at=excluded.received_at
           WHERE excluded.storage_generation>database_recovery_points.storage_generation
-            OR (excluded.storage_generation=database_recovery_points.storage_generation AND excluded.observed_at>=database_recovery_points.observed_at
-              AND (excluded.node_id<>database_recovery_points.node_id OR excluded.state<>database_recovery_points.state
+            OR (excluded.storage_generation=database_recovery_points.storage_generation AND excluded.generation>=database_recovery_points.generation
+              AND excluded.observed_at>=database_recovery_points.observed_at
+              AND (excluded.node_id<>database_recovery_points.node_id OR excluded.generation<>database_recovery_points.generation
+                OR excluded.state<>database_recovery_points.state
                 OR excluded.proven_sleep_json IS NOT database_recovery_points.proven_sleep_json OR excluded.backup_json IS NOT database_recovery_points.backup_json))`,
         )
         .bind(
           nodeId,
           observed.storage_generation,
+          observed.generation,
           observed.state,
           observed.proven_sleep === null
             ? null
@@ -67,6 +72,7 @@ async function recordRecoveryPoints(
           observed.id,
           nodeId,
           observed.storage_generation,
+          observed.generation,
         ),
     );
   for (let i = 0; i < statements.length; i += 50)

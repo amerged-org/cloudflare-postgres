@@ -4,6 +4,7 @@ import {
   fenceActions,
   nodeTunnelName,
 } from "../../src/domain/fence-actions.ts";
+import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
 import type { FenceTarget } from "../../src/domain/node-loss.ts";
 import type { Instance } from "../../src/providers/contabo.ts";
 
@@ -55,7 +56,7 @@ it("deletes the Tunnel of the node after cleaning up its connections, and nothin
   await actions.deleteTunnel(target);
   const path = `/client/v4/accounts/${ACCOUNT}/cfd_tunnel`;
   expect(api.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
-    `GET ${path}?name=${nodeTunnelName(NODE)}&is_deleted=false&per_page=100`,
+    `GET ${path}?name=${nodeTunnelName(NODE)}&per_page=100`,
     `DELETE ${path}/${TUNNEL}/connections`,
     `DELETE ${path}/${TUNNEL}`,
   ]);
@@ -64,13 +65,42 @@ it("deletes the Tunnel of the node after cleaning up its connections, and nothin
   );
 });
 
-it("counts a Tunnel that is already gone as deleted", async () => {
-  const api = cloudflare(() => ok([]));
+it("names the Tunnel like the node's addition, so that enrollment and fencing agree", () => {
+  expect(nodeTunnelName(NODE)).toBe(nodeAdditionHostname(NODE));
+  expect(nodeTunnelName(NODE)).toBe(`pgcf-node-${"a".repeat(20)}`);
+});
+
+it("counts a Tunnel the API lists as deleted as gone, and leaves it alone", async () => {
+  const api = cloudflare(() =>
+    ok([
+      {
+        id: TUNNEL,
+        name: nodeTunnelName(NODE),
+        deleted_at: "2026-10-18T10:00:00Z",
+      },
+    ]),
+  );
   await fenceActions({
     cloudflare: { token: TOKEN, fetcher: api.fetcher },
     contabo: null,
   }).deleteTunnel(target);
   expect(api.calls).toHaveLength(1);
+});
+
+it("does not count a node without any Tunnel as fenced: it fails closed", async () => {
+  // Nothing under the node's name, or only other Tunnels: the node's Tunnel may be alive.
+  for (const listed of [[], [{ id: TUNNEL, name: "another" }]]) {
+    const api = cloudflare(() => ok(listed));
+    const error = await fenceActions({
+      cloudflare: { token: TOKEN, fetcher: api.fetcher },
+      contabo: null,
+    })
+      .deleteTunnel(target)
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe("tunnel_unknown");
+    expect(api.calls.every((c) => c.method === "GET")).toBe(true);
+  }
 });
 
 it("fails on an answer it cannot trust, without the token or the answer in the error", async () => {

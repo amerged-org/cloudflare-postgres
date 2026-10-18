@@ -202,6 +202,56 @@ it("gives a read-write credential only to the node that serves the generation, a
   ).toMatchObject({ id: expect.stringMatching(ARCHIVE_CREDENTIAL_ID_PATTERN) });
 });
 
+it("lets the target of a restoring move write its staged path while the source still serves the database, and only while it restores", async () => {
+  const f = await lifecycle(),
+    row = await f.row(),
+    now = Date.now(),
+    at = new Date(now).toISOString();
+  const staged = row.archive_path.replace(
+    /\/g1-op_[a-z0-9]{20}$/,
+    "/g2-op_" + "y".repeat(20),
+  );
+  const scope = (nodeId: string) => ({
+    nodeId,
+    archivePath: staged,
+    access: "read_write" as const,
+  });
+  // No move: the database is served from the source and nobody may write the next generation.
+  await expect(
+    ensureArchiveCredential(env.DB, scope(f.other), now),
+  ).rejects.toThrow("archive_credential_refused");
+  await env.DB.prepare(
+    `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,target_generation,target_storage_generation,target_archive_path,backup_id,proven_sleep_json,created_at,updated_at)
+    SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,1,d.archive_path,'restoring',2,2,?,'20261018T093000','{}',?,? FROM databases d WHERE d.id=?`,
+  )
+    .bind("op_" + "y".repeat(20), f.other, staged, at, at, f.id)
+    .run();
+  const reference = await ensureArchiveCredential(env.DB, scope(f.other), now);
+  // Not the source, which keeps serving its own path, and not the target for another path.
+  await expect(
+    ensureArchiveCredential(env.DB, scope(f.node), now),
+  ).rejects.toThrow("archive_credential_refused");
+  await expect(
+    ensureArchiveCredential(
+      env.DB,
+      { ...scope(f.other), archivePath: staged.replace("g2-", "g3-") },
+      now,
+    ),
+  ).rejects.toThrow("archive_credential_refused");
+  expect(
+    await deliverArchiveCredential(keyedEnv(), f.other, reference.id, now),
+  ).toMatchObject({ access: "read_write", path: staged });
+  // The move ends without the target: the right to write is gone, delivered or not.
+  await env.DB.prepare(
+    "UPDATE database_moves SET status='failed',failure='build_failed',completed_at=?,updated_at=? WHERE database_id=?",
+  )
+    .bind(at, at, f.id)
+    .run();
+  expect(
+    await deliverArchiveCredential(keyedEnv(), f.other, reference.id, now),
+  ).toBeNull();
+});
+
 it("issues and delivers nothing to a lost or fenced node", async () => {
   const f = await lifecycle(),
     row = await f.row(),

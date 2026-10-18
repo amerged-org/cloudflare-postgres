@@ -5,9 +5,14 @@ import { NodeStateError } from "./node-state.ts";
  * The reinstall guard (ULTRA plan 7.11, 9.4). A reinstall overwrites the disk, and with it any WAL
  * that never reached R2. The API therefore refuses to reinstall a lost node's instance, or to run
  * AddNode in recover mode on it, while a database of that node has no proven-sleep record for its
- * current storage generation: the node reported it asleep with that record, and nothing later
- * took it back. Only the owner's explicit acknowledgement lifts the refusal. A fence that is
- * declared but not yet complete refuses too: the old stack may still be running.
+ * current storage generation and D1's current generation: the node reported it asleep with that
+ * record, and nothing later took it back. D1's generation advances with every change and every
+ * wake claim, and the claim is committed after the wake was answered, so a generation above the
+ * one the proof answered means the database may have woken and committed since; the node's next
+ * report would have proven the sleep again. A change that was not a wake blocks as well until the
+ * node reports again, which errs on the side of the data. Only the owner's explicit
+ * acknowledgement lifts the refusal. A fence that is declared but not yet complete refuses too:
+ * the old stack may still be running.
  */
 const SHOWN = 20;
 
@@ -21,7 +26,7 @@ export async function reinstallBlockers(
       .prepare(
         `SELECT d.id,d.storage_generation FROM databases d WHERE d.node_id=? AND d.deleted_at IS NULL
         AND NOT EXISTS(SELECT 1 FROM database_recovery_points p WHERE p.database_id=d.id AND p.node_id=d.node_id
-          AND p.storage_generation=d.storage_generation AND p.state='asleep')
+          AND p.storage_generation=d.storage_generation AND p.generation>=d.generation AND p.state='asleep')
         ORDER BY d.id LIMIT ?`,
       )
       .bind(nodeId, limit)

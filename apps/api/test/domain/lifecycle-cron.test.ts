@@ -53,17 +53,19 @@ it("carries the fence of a lost node on and applies the recovery windows, each i
     await put(`${prefix}wals/${wal(n).slice(0, 16)}/${wal(n)}.gz`);
 
   const result = await runCron(env, now);
-  expect(result.step_failures).toEqual([]);
+  // No Cloudflare token in this environment: the fence cannot go on, and the step says so.
+  expect(result.step_failures).toEqual([
+    { step: "node_fencing", error_code: "fence_unconfigured" },
+  ]);
   expect(CRON_STEPS).toContain("node_fencing");
   expect(CRON_STEPS).toContain("backup_retention");
-  // No Cloudflare token in this environment: the first step of the fence failed and says so.
   expect(
     await env.DB.prepare(
       "SELECT fencing_error FROM node_losses WHERE node_id=?",
     )
       .bind(f.node)
       .first("fencing_error"),
-  ).toBe("tunnel_delete_failed");
+  ).toBe("fence_unconfigured");
   expect(
     (await env.ARCHIVE.list({ prefix: `${prefix}base/${old}/` })).objects,
   ).toEqual([]);

@@ -13,11 +13,12 @@ import {
 } from "../../src/domain/archive-credentials.ts";
 import {
   listDatabaseMoves,
-  moveOrigins,
+  moveTargets,
   startDatabaseMove,
 } from "../../src/domain/database-moves.ts";
 import { applyLifecycleObservations } from "../../src/domain/lifecycle-observations.ts";
 import { openNodeOrders } from "../../src/domain/lifecycle-orders.ts";
+import { declareNodeLost } from "../../src/domain/node-loss.ts";
 import {
   addNode,
   BACKUP,
@@ -32,13 +33,40 @@ import {
   report,
 } from "./lifecycle-fixture.ts";
 
-afterEach(cleanup);
+const keys = new Set<string>();
+afterEach(async () => {
+  if (keys.size) await env.ARCHIVE.delete([...keys]);
+  keys.clear();
+  await cleanup();
+});
 const actorFor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
+/**
+ * The archive of the database's current storage generation as its node left it: the newest base
+ * backup with its data, and the WAL through the last segment of the proof.
+ */
+async function archive(f: { row: () => Promise<{ archive_path: string }> }) {
+  const prefix = `${(await f.row()).archive_path.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "")}/database/`;
+  const put = async (key: string) => {
+    keys.add(key);
+    await env.ARCHIVE.put(
+      key,
+      key.endsWith("backup.info")
+        ? `status=DONE\nbegin_time=2026-10-18T09:30:00.000Z\nend_time=2026-10-18T09:31:00.000Z\nbegin_wal=000000010000000000000001\nend_wal=000000010000000000000001\nxlog_segment_size=16777216\n`
+        : "x",
+    );
+  };
+  const info = `${prefix}base/${BACKUP.backup_id}/backup.info`,
+    data = `${prefix}base/${BACKUP.backup_id}/data.tar.gz`,
+    segment = (n: string) =>
+      `${prefix}wals/0000000100000000/0000000100000000000000${n}.gz`;
+  for (const key of [info, data, segment("01"), segment("02")]) await put(key);
+  return { info, data, last: segment("02"), put };
+}
 async function ready() {
   const f = await lifecycle();
   expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
-  return f;
+  return { ...f, source: await archive(f) };
 }
 type Fixture = Awaited<ReturnType<typeof ready>>;
 const start = (f: Fixture, target = f.other) =>
@@ -75,23 +103,23 @@ const settle = (f: Fixture) =>
   )
     .bind(f.id)
     .run();
-/** The target reports the new storage generation. */
+/** The target reports the storage generation the move staged. */
 async function reportTarget(
   f: Fixture,
   move: { operation: string },
   patch: Record<string, unknown>,
   node = f.other,
 ) {
-  const row = await f.row();
+  const staged = await status(move.operation);
   await applyLifecycleObservations(
     env,
     node,
     report([
       observation({
         id: f.id,
-        generation: row.generation,
+        generation: staged.target_generation as number,
         operation: move.operation,
-        storage_generation: row.storage_generation,
+        storage_generation: staged.target_storage_generation as number,
         ...patch,
       }),
     ]),
@@ -99,10 +127,11 @@ async function reportTarget(
 }
 const status = async (operation: string) =>
   (await env.DB.prepare(
-    "SELECT status,failure,source_acknowledged_at,target_generation FROM database_moves WHERE operation=?",
+    "SELECT status,failure,source_acknowledged_at,target_generation,target_storage_generation FROM database_moves WHERE operation=?",
   )
     .bind(operation)
     .first())!;
+const ordersOf = (node: string) => openNodeOrders(env.DB, node);
 
 it("refuses a move that cannot start and says why", async () => {
   const f = await ready();
@@ -176,6 +205,83 @@ it("refuses a move that cannot start and says why", async () => {
       n: number;
     }>())!.n,
   ).toBe(0);
+});
+
+it("refuses a target that is not open for placement or has no room for the second volume, with a reason that says to retry", async () => {
+  const f = await ready();
+  const broken: [string, string, ...(string | number)[]][] = [
+    ["ready=0", "ready=0"],
+    ["schedulable=0", "schedulable=0"],
+    ["database_placement_enabled=0", "database_placement_enabled=0"],
+    ["closed", "database_placement_closed_at=?", new Date().toISOString()],
+    ["unobserved", "last_observed_at=NULL"],
+    [
+      "stale",
+      "last_observed_at=?",
+      new Date(Date.now() - 10 * 60_000).toISOString(),
+    ],
+    ["no room", "storage_gib_total=3"],
+  ];
+  for (const [, assignment, ...bindings] of broken) {
+    const node = await addNode(f.region);
+    await env.DB.prepare(`UPDATE nodes SET ${assignment} WHERE id=?`)
+      .bind(...bindings, node)
+      .run();
+    await expect(start(f, node)).rejects.toMatchObject({
+      code: "conflict",
+      details: { reason: "node_capacity" },
+    });
+  }
+  // On its own node the move needs a second volume: 5 GiB of the 5 the node has are taken.
+  await env.DB.prepare("UPDATE nodes SET storage_gib_total=5 WHERE id=?")
+    .bind(f.node)
+    .run();
+  await expect(start(f, f.node)).rejects.toMatchObject({
+    code: "conflict",
+    details: { reason: "node_capacity" },
+  });
+  expect(
+    (await env.DB.prepare("SELECT COUNT(*) n FROM database_moves").first<{
+      n: number;
+    }>())!.n,
+  ).toBe(0);
+  expect(await start(f)).toMatchObject({ status: "proving" });
+});
+
+it("puts no move order on a node that is declared lost between the checks and the write", async () => {
+  const f = await ready();
+  const uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+    .bind(f.other)
+    .first<string>("node_uid"))!;
+  let raced = false;
+  const racing = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === "batch")
+        return async (statements: D1PreparedStatement[]) => {
+          raced = true;
+          await declareNodeLost(env, f.other, {
+            expected_node_uid: uid,
+            reason: "gone",
+          });
+          return target.batch(statements);
+        };
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await expect(
+    startDatabaseMove(
+      { DB: racing },
+      { databaseId: f.id, targetNodeId: f.other },
+    ),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(raced).toBe(true);
+  expect(
+    (await env.DB.prepare("SELECT COUNT(*) n FROM database_moves").first<{
+      n: number;
+    }>())!.n,
+  ).toBe(0);
+  expect(await ordersOf(f.node)).toEqual([]);
 });
 
 it("starts as one order to the source and changes nothing else", async () => {
@@ -321,124 +427,149 @@ it("takes the proof only with or after the acknowledgement of the order", async 
   expect(await status(move.operation)).toMatchObject({ status: "restoring" });
 });
 
-it("bumps the generation behind the admission fence, with a fresh archive path, a fence on the source and credentials for the target", async () => {
+it("stages the next storage generation without touching the database it serves, and the source keeps holding", async () => {
   const f = await ready(),
-    before = await f.row(),
-    oldPath = before.archive_path;
-  await env.DB.exec(
-    `CREATE TRIGGER move_requires_fence BEFORE UPDATE OF node_id,archive_path,storage_generation ON databases WHEN NEW.id='${f.id}' AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.id AND e.mutation_id IS NOT NULL AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'database mutation lacks admission fence'); END`,
-  );
-  try {
-    const move = await restoring(f);
-    const row = await f.row();
-    expect(row).toMatchObject({
-      node_id: f.other,
-      generation: before.generation + 1,
-      storage_generation: 2,
-      observed_state: "provisioning",
-      observed_generation: before.generation,
-      desired_state: "running",
-    });
-    const path = parseArchivePath(row.archive_path)!;
-    expect(path).toMatchObject({
-      database: f.id,
-      generation: 2,
+    before = await f.row();
+  const move = await restoring(f);
+  expect(await f.row()).toEqual(before);
+  const staged = (await env.DB.prepare(
+    "SELECT target_generation,target_storage_generation,target_archive_path,backup_id,proven_sleep_json FROM database_moves WHERE operation=?",
+  )
+    .bind(move.operation)
+    .first<{
+      target_generation: number;
+      target_storage_generation: number;
+      target_archive_path: string;
+      backup_id: string;
+      proven_sleep_json: string;
+    }>())!;
+  expect(staged).toMatchObject({
+    target_generation: before.generation + 1,
+    target_storage_generation: 2,
+    backup_id: BACKUP.backup_id,
+  });
+  expect(parseArchivePath(staged.target_archive_path)).toMatchObject({
+    database: f.id,
+    generation: 2,
+    operation: move.operation,
+    region: f.region,
+  });
+  expect(staged.target_archive_path).not.toBe(before.archive_path);
+  expect(JSON.parse(staged.proven_sleep_json)).toEqual(PROOF);
+  // Still served by the source, which holds its wakes until the order ends.
+  expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
+  expect(await ordersOf(f.node)).toEqual([
+    {
+      type: "move",
       operation: move.operation,
-      region: f.region,
-    });
-    expect(row.archive_path).not.toBe(oldPath);
+      database: f.id,
+      storage_generation: 1,
+    },
+  ]);
+});
+
+it("does not stage a move whose source archive lacks what the proof names, and ends it", async () => {
+  for (const missing of ["last", "data", "info"] as const) {
+    const f = await ready(),
+      move = await start(f),
+      before = await f.row();
+    await env.ARCHIVE.delete(f.source[missing]);
+    await proven(f, move.operation);
     expect(await status(move.operation)).toMatchObject({
-      status: "restoring",
-      target_generation: before.generation + 1,
+      status: "failed",
+      failure: "no_recovery_point",
     });
-    const stored = (await env.DB.prepare(
-      "SELECT target_storage_generation,target_archive_path,backup_id,proven_sleep_json FROM database_moves WHERE operation=?",
-    )
-      .bind(move.operation)
-      .first<{
-        target_storage_generation: number;
-        target_archive_path: string;
-        backup_id: string;
-        proven_sleep_json: string;
-      }>())!;
-    expect(stored).toMatchObject({
-      target_storage_generation: 2,
-      target_archive_path: row.archive_path,
-      backup_id: BACKUP.backup_id,
-    });
-    expect(JSON.parse(stored.proven_sleep_json)).toEqual(PROOF);
-    // The route closed with the bump: the Actor admits nothing until the target is ready.
-    expect(await actorFor(f.id).admit(f.id, "app")).toEqual({
-      ok: false,
-      sqlstate: "57P03",
-    });
-    expect(
-      await env.DB.prepare(
-        "SELECT mutation_id,mutation_outcome FROM database_admission_epochs WHERE database_id=?",
-      )
-        .bind(f.id)
-        .first(),
-    ).toEqual({ mutation_id: null, mutation_outcome: "committed" });
-  } finally {
-    await env.DB.exec("DROP TRIGGER IF EXISTS move_requires_fence");
+    expect(await f.row()).toEqual(before);
+    expect(await ordersOf(f.node)).toEqual([]);
+    expect(await ordersOf(f.other)).toEqual([]);
+    await cleanup();
   }
 });
 
-it("leaves the source with a superseded order and no database, and the target with the move origin", async () => {
+it("waits for an archive it cannot read instead of ending the move", async () => {
+  const f = await ready(),
+    move = await start(f);
+  await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
+    .bind("unbound-bucket", f.region)
+    .run();
+  await proven(f, move.operation);
+  expect(await status(move.operation)).toMatchObject({ status: "proving" });
+  expect(await ordersOf(f.node)).toHaveLength(1);
+  await env.DB.prepare("UPDATE regions SET backup_bucket=? WHERE id=?")
+    .bind(env.ARCHIVE_BUCKET_NAME, f.region)
+    .run();
+  await proven(f, move.operation);
+  expect(await status(move.operation)).toMatchObject({ status: "restoring" });
+});
+
+it("ends a move whose target stopped being eligible before it was staged", async () => {
+  const f = await ready(),
+    move = await start(f),
+    before = await f.row();
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+  )
+    .bind(f.other)
+    .run();
+  await proven(f, move.operation);
+  expect(await status(move.operation)).toMatchObject({
+    status: "failed",
+    failure: "target_not_eligible",
+  });
+  expect(await f.row()).toEqual(before);
+  expect(await ordersOf(f.node)).toEqual([]);
+  expect((await moveTargets(env.DB, f.other, Date.now())).size).toBe(0);
+});
+
+it("gives the target the staged entry, with the origin and credentials, and the source nothing new", async () => {
   const f = await ready(),
     move = await restoring(f),
     row = await f.row(),
     now = Date.now();
-  const orders = await openNodeOrders(env.DB, f.node);
-  expect(orders).toEqual([
-    {
-      type: "superseded",
-      operation: expect.stringMatching(/^op_[a-z0-9]{20}$/),
-      database: f.id,
-      storage_generation: 1,
-      remove_volume: false,
+  expect(await ordersOf(f.other)).toEqual([]);
+  const targets = await moveTargets(env.DB, f.other, now);
+  expect([...targets.keys()]).toEqual([f.id]);
+  const staged = targets.get(f.id)!;
+  expect(DatabaseOrigin.parse(staged.origin)).toEqual(staged.origin);
+  expect(staged).toMatchObject({
+    operation: move.operation,
+    generation: row.generation + 1,
+    storage_generation: 2,
+    origin: {
+      kind: "move",
+      source: { database_id: f.id, backup_id: BACKUP.backup_id, end: PROOF },
     },
-  ]);
-  expect(orders[0]!.operation).not.toBe(move.operation);
-  expect(await openNodeOrders(env.DB, f.other)).toEqual([]);
-  const origins = await moveOrigins(env.DB, f.other, now);
-  expect([...origins.keys()]).toEqual([f.id]);
-  const { operation, origin } = origins.get(f.id)!;
-  expect(operation).toBe(move.operation);
-  expect(DatabaseOrigin.parse(origin)).toEqual(origin);
-  expect(origin).toMatchObject({
-    kind: "move",
-    source: {
-      database_id: f.id,
-      backup_id: BACKUP.backup_id,
-      end: PROOF,
-    },
+  });
+  expect(parseArchivePath(staged.archive.path)).toMatchObject({
+    database: f.id,
+    generation: 2,
+    operation: move.operation,
   });
   const source = (
-    origin as { source: { path: string; credential: { id: string } } }
+    staged.origin as {
+      source: { path: string; credential: { id: string } };
+    }
   ).source;
-  expect(parseArchivePath(source.path)).toMatchObject({
-    database: f.id,
-    generation: 1,
-  });
-  // The target reads the source archive and writes its own; the source reads and writes nothing.
-  const read = await deliverArchiveCredential(
-    keyedEnv(),
-    f.other,
-    source.credential.id,
-    now,
-  );
-  expect(read).toMatchObject({ access: "read_only", path: source.path });
-  const write = await ensureArchiveCredential(
-    env.DB,
-    { nodeId: f.other, archivePath: row.archive_path, access: "read_write" },
-    now,
-  );
+  expect(source.path).toBe(row.archive_path);
+  // The target reads the source archive and writes its own; the source gets no right to write it.
+  expect(
+    await deliverArchiveCredential(
+      keyedEnv(),
+      f.other,
+      source.credential.id,
+      now,
+    ),
+  ).toMatchObject({ access: "read_only", path: source.path });
   expect(
     ArchiveCredential.parse(
-      await deliverArchiveCredential(keyedEnv(), f.other, write.id, now),
+      await deliverArchiveCredential(
+        keyedEnv(),
+        f.other,
+        staged.archive.credential.id,
+        now,
+      ),
     ),
-  ).toMatchObject({ access: "read_write", path: row.archive_path });
+  ).toMatchObject({ access: "read_write", path: staged.archive.path });
   expect(
     (
       await env.DB.prepare(
@@ -449,72 +580,227 @@ it("leaves the source with a superseded order and no database, and the target wi
     { node_id: f.other, access: "read_only" },
     { node_id: f.other, access: "read_write" },
   ]);
-  // Both pages are valid under the node contract.
-  await desiredPage(f.node, [], orders);
+  await expect(
+    ensureArchiveCredential(
+      env.DB,
+      {
+        nodeId: f.node,
+        archivePath: staged.archive.path,
+        access: "read_write",
+      },
+      now,
+    ),
+  ).rejects.toThrow("archive_credential_refused");
+  // Both pages are valid under the node contract: the source's own entry, the target's staged one.
+  const own = await ensureArchiveCredential(
+    env.DB,
+    { nodeId: f.node, archivePath: row.archive_path, access: "read_write" },
+    now,
+  );
+  await desiredPage(
+    f.node,
+    [{ row, operation: f.operation, credential: own }],
+    await ordersOf(f.node),
+  );
   await desiredPage(
     f.other,
-    [{ row, operation: move.operation, credential: write, origin }],
+    [
+      {
+        row: {
+          ...row,
+          generation: staged.generation,
+          storage_generation: staged.storage_generation,
+          archive_path: staged.archive.path,
+        },
+        operation: staged.operation,
+        credential: staged.archive.credential,
+        origin: staged.origin,
+      },
+    ],
     [],
   );
 });
 
-it("finishes when the target is ready, and then removes the source's volume", async () => {
+it("finishes when the target is ready: the database moves behind the admission fence and the source retires its volume", async () => {
   const f = await ready(),
-    move = await restoring(f),
-    row = await f.row();
-  // Not yet: building, the wrong node, an older storage generation.
-  await reportTarget(f, move, { state: "building" });
-  await reportTarget(f, move, { state: "ready" }, f.node);
-  await reportTarget(f, move, { state: "ready", storage_generation: 1 });
-  expect(await status(move.operation)).toMatchObject({ status: "restoring" });
-  await reportTarget(f, move, { state: "ready" });
-  expect(await status(move.operation)).toMatchObject({ status: "done" });
-  expect(await f.row()).toEqual(row);
-  const orders = await openNodeOrders(env.DB, f.node);
-  expect(orders).toEqual([
-    {
-      type: "superseded",
-      operation: expect.stringMatching(/^op_[a-z0-9]{20}$/),
-      database: f.id,
-      storage_generation: 1,
-      remove_volume: true,
-    },
-  ]);
-  // The target keeps no origin once its generation was ready.
-  expect((await moveOrigins(env.DB, f.other, Date.now())).size).toBe(0);
-  // The source reports the removal; the order leaves its page.
-  await applyLifecycleObservations(
-    env,
-    f.node,
-    report([], [done(orders[0]!.operation)]),
+    before = await f.row();
+  await env.DB.exec(
+    `CREATE TRIGGER move_requires_fence BEFORE UPDATE OF node_id,archive_path,storage_generation ON databases WHEN NEW.id='${f.id}' AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.id AND e.mutation_id IS NOT NULL AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'database mutation lacks admission fence'); END`,
   );
-  expect(await openNodeOrders(env.DB, f.node)).toEqual([]);
-  // A report that arrives twice changes nothing.
-  await reportTarget(f, move, { state: "ready" });
-  expect(await status(move.operation)).toMatchObject({ status: "done" });
-  expect(await openNodeOrders(env.DB, f.node)).toEqual([]);
-  // The database can move again, now from the other node.
-  await settle(f);
-  expect(await start(f, f.node)).toMatchObject({
-    status: "proving",
-    source_node_id: f.other,
-    source_storage_generation: 2,
-  });
+  try {
+    const move = await restoring(f);
+    // Not yet: building, the wrong node, an older storage generation, a lower generation.
+    await reportTarget(f, move, { state: "building" });
+    await reportTarget(f, move, { state: "ready" }, f.node);
+    await reportTarget(f, move, { state: "ready", storage_generation: 1 });
+    await reportTarget(f, move, {
+      state: "ready",
+      generation: before.generation,
+    });
+    await reportTarget(f, move, { state: "ready", backup: null });
+    expect(await status(move.operation)).toMatchObject({
+      status: "restoring",
+    });
+    expect(await f.row()).toEqual(before);
+    const staged = (await moveTargets(env.DB, f.other, Date.now())).get(f.id)!;
+    await reportTarget(f, move, { state: "ready" });
+    expect(await status(move.operation)).toMatchObject({ status: "done" });
+    expect(await f.row()).toEqual({
+      ...before,
+      node_id: f.other,
+      generation: before.generation + 1,
+      storage_generation: 2,
+      archive_path: staged.archive.path,
+      observed_state: "provisioning",
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT mutation_id,mutation_outcome FROM database_admission_epochs WHERE database_id=?",
+      )
+        .bind(f.id)
+        .first(),
+    ).toEqual({ mutation_id: null, mutation_outcome: "committed" });
+    // The route is closed until the target's generation is settled.
+    expect(await actorFor(f.id).admit(f.id, "app")).toEqual({
+      ok: false,
+      sqlstate: "57P03",
+    });
+    // The move order ends and the source is told to retire its generation and remove the volume.
+    const orders = await ordersOf(f.node);
+    expect(orders).toEqual([
+      {
+        type: "superseded",
+        operation: expect.stringMatching(/^op_[a-z0-9]{20}$/),
+        database: f.id,
+        storage_generation: 1,
+        remove_volume: true,
+      },
+    ]);
+    // The target keeps no staged entry once its generation is the database's.
+    expect((await moveTargets(env.DB, f.other, Date.now())).size).toBe(0);
+    // The source reports the removal; the order leaves its page.
+    await applyLifecycleObservations(
+      env,
+      f.node,
+      report([], [done(orders[0]!.operation)]),
+    );
+    expect(await ordersOf(f.node)).toEqual([]);
+    // A report that arrives twice changes nothing.
+    await reportTarget(f, move, { state: "ready" });
+    expect(await status(move.operation)).toMatchObject({ status: "done" });
+    expect(await ordersOf(f.node)).toEqual([]);
+    // The database can move again, now from the other node.
+    await settle(f);
+    expect(await start(f, f.node)).toMatchObject({
+      status: "proving",
+      source_node_id: f.other,
+      source_storage_generation: 2,
+    });
+  } finally {
+    await env.DB.exec("DROP TRIGGER IF EXISTS move_requires_fence");
+  }
 });
 
-it("fails when the target cannot build, keeps the source's volume and says what the node reported", async () => {
+it("finishes when the target is asleep after the proven sleep of a later timeline of the same cluster", async () => {
   const f = await ready(),
     move = await restoring(f);
+  const sleeping = (patch: Record<string, unknown>) => ({
+    state: "asleep",
+    proven_sleep: { ...PROOF, ...patch },
+    backup: { ...BACKUP, timeline: 2 },
+  });
+  // The proof of the source's own timeline is not a promoted target.
+  await reportTarget(f, move, sleeping({ timeline: 1 }));
+  expect(await status(move.operation)).toMatchObject({ status: "restoring" });
+  await reportTarget(f, move, sleeping({ timeline: 2 }));
+  expect(await status(move.operation)).toMatchObject({ status: "done" });
+  expect((await f.row()).node_id).toBe(f.other);
+});
+
+it("ends a move whose target sleeps with another cluster's proof", async () => {
+  const f = await ready(),
+    move = await restoring(f),
+    before = await f.row();
+  await reportTarget(f, move, {
+    state: "asleep",
+    proven_sleep: { ...PROOF, timeline: 2, system_identifier: "1234" },
+    backup: { ...BACKUP, timeline: 2 },
+  });
+  expect(await status(move.operation)).toMatchObject({
+    status: "failed",
+    failure: "identity_mismatch",
+  });
+  expect(await f.row()).toEqual(before);
+});
+
+it("leaves the database with its source when the target cannot build, retires what the target staged, and the next attempt stages a new generation", async () => {
+  const f = await ready(),
+    move = await restoring(f),
+    before = await f.row();
   await reportTarget(f, move, { state: "error", error: "no_recovery_point" });
   expect(await status(move.operation)).toMatchObject({
     status: "failed",
     failure: "no_recovery_point",
   });
-  const orders = await openNodeOrders(env.DB, f.node);
-  expect(orders).toEqual([
-    expect.objectContaining({ type: "superseded", remove_volume: false }),
+  expect(await f.row()).toEqual(before);
+  // The source serves again; the target is told never to start what it staged, and to remove it.
+  expect(await ordersOf(f.node)).toEqual([]);
+  expect(await ordersOf(f.other)).toEqual([
+    {
+      type: "superseded",
+      operation: expect.stringMatching(/^op_[a-z0-9]{20}$/),
+      database: f.id,
+      storage_generation: 2,
+      remove_volume: true,
+    },
   ]);
-  expect((await f.row()).node_id).toBe(f.other);
+  expect((await moveTargets(env.DB, f.other, Date.now())).size).toBe(0);
+  expect((await actorFor(f.id).admit(f.id, "app")).ok).toBe(true);
+  // A new attempt counts on from the generation the target retired.
+  const again = await restoring(f);
+  expect(again.operation).not.toBe(move.operation);
+  expect(await status(again.operation)).toMatchObject({
+    target_storage_generation: 3,
+  });
+  await reportTarget(f, again, { state: "ready" });
+  expect(await f.row()).toMatchObject({
+    node_id: f.other,
+    storage_generation: 3,
+  });
+});
+
+it("cannot tell the node of a failed same-node move to retire its staged volume without retiring the source's", async () => {
+  const f = await ready(),
+    move = await restoring(f, f.node);
+  await reportTarget(
+    f,
+    move,
+    { state: "error", error: "storage_full" },
+    f.node,
+  );
+  expect(await status(move.operation)).toMatchObject({
+    status: "failed",
+    failure: "storage_full",
+  });
+  expect(await ordersOf(f.node)).toEqual([]);
+});
+
+it("fails a move whose database changed after the stage, and the database stays where it is", async () => {
+  const f = await ready(),
+    move = await restoring(f);
+  await env.DB.prepare(
+    "UPDATE databases SET generation=generation+1 WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  const changed = await f.row();
+  await reportTarget(f, move, { state: "ready" });
+  expect(await status(move.operation)).toMatchObject({
+    status: "failed",
+    failure: "database_changed",
+  });
+  expect(await f.row()).toEqual(changed);
+  expect(await ordersOf(f.node)).toEqual([]);
 });
 
 it("fails in proving when the source refuses, and the source serves again", async () => {
@@ -530,7 +816,7 @@ it("fails in proving when the source refuses, and the source serves again", asyn
     status: "failed",
     failure: "power_busy",
   });
-  expect(await openNodeOrders(env.DB, f.node)).toEqual([]);
+  expect(await ordersOf(f.node)).toEqual([]);
   expect(await f.row()).toEqual(before);
   // The next attempt is a new move.
   const again = await start(f);
@@ -540,7 +826,7 @@ it("fails in proving when the source refuses, and the source serves again", asyn
   ).toEqual(["failed", "proving"]);
 });
 
-it("fails a move whose database is deleted while it restores", async () => {
+it("fails a move whose database is deleted while it restores, and leaves the source's volume to the delete", async () => {
   const f = await ready(),
     move = await restoring(f);
   await env.DB.prepare(
@@ -553,28 +839,81 @@ it("fails a move whose database is deleted while it restores", async () => {
     status: "failed",
     failure: "database_deleted",
   });
+  // The deleted database still sits on the source, whose page orders the volume removed; the
+  // target removes what it staged.
+  expect(await ordersOf(f.node)).toEqual([]);
+  expect(await ordersOf(f.other)).toEqual([
+    expect.objectContaining({
+      type: "superseded",
+      storage_generation: 2,
+      remove_volume: true,
+    }),
+  ]);
 });
 
-it("moves between two volumes of the same node, whose page then serves the new generation and retires the old", async () => {
+it("ends a restoring move when either node is lost, and the lost node's page stays valid", async () => {
+  for (const lost of ["target", "source"] as const) {
+    const f = await ready(),
+      move = await restoring(f),
+      before = await f.row();
+    const node = lost === "target" ? f.other : f.node;
+    const uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+      .bind(node)
+      .first<string>("node_uid"))!;
+    await declareNodeLost(env, node, {
+      expected_node_uid: uid,
+      reason: "gone",
+    });
+    expect(await status(move.operation)).toMatchObject({
+      status: "failed",
+      failure: "node_lost",
+    });
+    expect(await f.row()).toEqual(before);
+    // A page under the node contract: the fence and superseded orders, no move order.
+    await desiredPage(node, [], await ordersOf(node));
+    if (lost === "target") expect(await ordersOf(f.node)).toEqual([]);
+    await cleanup();
+  }
+});
+
+it("moves between two volumes of the same node, whose page then serves the staged generation and retires the old", async () => {
   const f = await ready(),
     move = await restoring(f, f.node),
     row = await f.row();
-  expect(row).toMatchObject({ node_id: f.node, storage_generation: 2 });
-  const orders = await openNodeOrders(env.DB, f.node);
-  expect(orders).toEqual([
-    expect.objectContaining({ type: "superseded", storage_generation: 1 }),
-  ]);
-  const credential = await ensureArchiveCredential(
-    env.DB,
-    { nodeId: f.node, archivePath: row.archive_path, access: "read_write" },
-    Date.now(),
+  expect(row).toMatchObject({ node_id: f.node, storage_generation: 1 });
+  const orders = await ordersOf(f.node);
+  expect(orders).toEqual([expect.objectContaining({ type: "move" })]);
+  const staged = (await moveTargets(env.DB, f.node, Date.now())).get(f.id)!;
+  await desiredPage(
+    f.node,
+    [
+      {
+        row: {
+          ...row,
+          generation: staged.generation,
+          storage_generation: staged.storage_generation,
+          archive_path: staged.archive.path,
+        },
+        operation: staged.operation,
+        credential: staged.archive.credential,
+        origin: staged.origin,
+      },
+    ],
+    orders,
   );
-  const { operation, origin } = (
-    await moveOrigins(env.DB, f.node, Date.now())
-  ).get(f.id)!;
-  await desiredPage(f.node, [{ row, operation, credential, origin }], orders);
   await reportTarget(f, move, { state: "ready" }, f.node);
   expect(await status(move.operation)).toMatchObject({ status: "done" });
+  expect(await f.row()).toMatchObject({
+    node_id: f.node,
+    storage_generation: 2,
+  });
+  expect(await ordersOf(f.node)).toEqual([
+    expect.objectContaining({
+      type: "superseded",
+      storage_generation: 1,
+      remove_volume: true,
+    }),
+  ]);
 });
 
 it("never lowers a storage generation or serves one an order retired", async () => {
@@ -582,8 +921,10 @@ it("never lowers a storage generation or serves one an order retired", async () 
   const move = await restoring(f);
   await reportTarget(f, move, { state: "ready" });
   await settle(f);
+  await archive(f);
   // Back to the first node: the generation counts up from the other's, never from the first's.
   const back = await restoring(f, f.node);
+  await reportTarget(f, back, { state: "ready" }, f.node);
   expect(await f.row()).toMatchObject({
     node_id: f.node,
     storage_generation: 3,

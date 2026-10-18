@@ -8,16 +8,20 @@ import { bytesToBase64url, bytesToHex } from "@pgcf/contracts";
  * digest of the JWT, and the session token is `base64("jwt/" + JWT)`. Only this method accepts an
  * explicit list of actions, so a credential can be made unable to delete.
  *
+ * Cloudflare's page documents `actions`, `paths` and the derivation, not the other claims. The
+ * claim set and its order, and the action lists below, are the Stage 1 lab signer's, whose tokens
+ * R2 accepted; the tests pin one of its tokens byte for byte.
+ *
  * HeadBucket and GetBucketLocation are left out on purpose: Barman needs neither for archiving,
  * backing up or restoring (Stage 1 ran all four jobs with credentials that cannot call HeadBucket).
  */
 export const R2_ACTIONS = {
-  read_only: ["HeadObject", "GetObject", "ListObjectsV2"],
+  read_only: ["GetObject", "HeadObject", "ListObjectsV2"],
   read_write: [
-    "HeadObject",
     "GetObject",
-    "ListObjectsV2",
+    "HeadObject",
     "PutObject",
+    "ListObjectsV2",
     "CreateMultipartUpload",
     "UploadPart",
     "CompleteMultipartUpload",

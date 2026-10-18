@@ -39,8 +39,9 @@ WHEN NEW.operation <> OLD.operation OR NEW.node_id <> OLD.node_id OR NEW.type <>
 BEGIN SELECT RAISE(ABORT, 'lifecycle_order_immutable'); END;
 
 -- One move of a database to another node (or to another volume of the same node) under the same
--- ID. `proving`: the source proves its sleep. `restoring`: D1 bumped the generation and the
--- target restores. `done`: the target is ready with a DONE base backup. `failed`: see `failure`.
+-- ID. `proving`: the source proves its sleep. `restoring`: D1 staged the next storage generation
+-- here and the target restores; the database row still says the source. `done`: the target is ready
+-- with a DONE base backup and the row says the target. `failed`: see `failure`; the row is unchanged.
 CREATE TABLE database_moves (
   operation TEXT PRIMARY KEY NOT NULL
     CHECK (length(operation) = 23 AND substr(operation, 1, 3) = 'op_' AND NOT substr(operation, 4) GLOB '*[^a-z0-9]*'),
@@ -61,8 +62,10 @@ CREATE TABLE database_moves (
   backup_id TEXT CHECK (backup_id IS NULL OR length(backup_id) = 15),
   proven_sleep_json TEXT CHECK (proven_sleep_json IS NULL OR json_valid(proven_sleep_json)),
   failure TEXT CHECK (failure IS NULL OR (length(failure) BETWEEN 1 AND 64 AND NOT failure GLOB '*[^a-z0-9_]*')),
-  -- The superseded source archive is deleted by the Worker once the recovery window has passed.
+  -- The superseded source archive of a done move, and the archive a failed move's target staged,
+  -- are deleted by the Worker once the recovery window has passed.
   source_archive_deleted_at TEXT,
+  target_archive_deleted_at TEXT,
   created_at TEXT NOT NULL CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'),
   updated_at TEXT NOT NULL CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'),
   completed_at TEXT CHECK (completed_at IS NULL OR (length(completed_at) = 24 AND completed_at GLOB '????-??-??T??:??:??.???Z')),
@@ -75,13 +78,15 @@ CREATE TABLE database_moves (
   CHECK (status NOT IN ('restoring', 'done') OR target_generation IS NOT NULL),
   CHECK ((status = 'failed') = (failure IS NOT NULL)),
   CHECK ((status IN ('proving', 'restoring')) = (completed_at IS NULL)),
-  CHECK (source_archive_deleted_at IS NULL OR status = 'done')
+  CHECK (source_archive_deleted_at IS NULL OR status = 'done'),
+  CHECK (target_archive_deleted_at IS NULL OR (status = 'failed' AND target_archive_path IS NOT NULL))
 );
 CREATE UNIQUE INDEX database_moves_active_idx ON database_moves(database_id) WHERE status IN ('proving', 'restoring');
 CREATE INDEX database_moves_database_idx ON database_moves(database_id, created_at DESC, operation DESC);
 CREATE INDEX database_moves_source_node_idx ON database_moves(source_node_id) WHERE status IN ('proving', 'restoring');
 CREATE INDEX database_moves_target_node_idx ON database_moves(target_node_id) WHERE status IN ('proving', 'restoring');
 CREATE INDEX database_moves_archive_expiry_idx ON database_moves(completed_at) WHERE status = 'done' AND source_archive_deleted_at IS NULL;
+CREATE INDEX database_moves_staged_expiry_idx ON database_moves(completed_at) WHERE status = 'failed' AND target_archive_path IS NOT NULL AND target_archive_deleted_at IS NULL;
 -- A move ends once; it never goes back to an earlier phase.
 CREATE TRIGGER database_moves_monotonic BEFORE UPDATE ON database_moves
 WHEN NEW.operation <> OLD.operation OR NEW.database_id <> OLD.database_id OR NEW.source_node_id <> OLD.source_node_id
@@ -95,11 +100,14 @@ WHEN NEW.operation <> OLD.operation OR NEW.database_id <> OLD.database_id OR NEW
 BEGIN SELECT RAISE(ABORT, 'database_move_immutable'); END;
 
 -- The newest recovery state each database's node reported for its current storage generation:
--- the proven-sleep record while asleep and the newest DONE base backup.
+-- the proven-sleep record while asleep and the newest DONE base backup. `generation` is the D1
+-- generation the report answered: a proof says nothing about a generation after it, because every
+-- change and every wake claim advances D1's generation.
 CREATE TABLE database_recovery_points (
   database_id TEXT PRIMARY KEY NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
   node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   storage_generation INTEGER NOT NULL CHECK (storage_generation >= 1),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
   state TEXT NOT NULL CHECK (state IN ('building', 'ready', 'asleep', 'unproven', 'error', 'deleted')),
   proven_sleep_json TEXT CHECK (proven_sleep_json IS NULL OR json_valid(proven_sleep_json)),
   backup_json TEXT CHECK (backup_json IS NULL OR json_valid(backup_json)),

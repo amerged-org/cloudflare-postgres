@@ -13,13 +13,16 @@ import { markNodeLost, NodeStateError } from "./node-state.ts";
  * declaration writes the fence in one batch before anything else: the row restricts the node's key
  * to the fenced scope at once, the `fence` order and one `superseded` order per database (at its
  * current storage generation, volume kept) wait on the node's page for the day it comes back, and
- * the moves the node can no longer carry out end. Then the node is marked lost, which closes its
+ * every move from or toward the node ends, which ends its `move` order too: a fenced page holds
+ * none. Then the node is marked lost, which closes its
  * databases at the Edge. D1 generations are not bumped here: the databases are recovered from R2
  * by restores, which are new databases, and only after `fenced`.
  *
  * `runNodeFencing` finishes the fence in the plan's order, one step per run and each retried until
  * it holds: delete the node's Tunnel (its token dies with it), order the instance off, and read
  * the provider's status until it says stopped. The table refuses any other order of the steps.
+ * A step that fails is recorded with its class and reported to the caller, so that the cron step
+ * fails and a fence stuck for days raises `control_cron_step_failing`.
  */
 export interface FenceTarget {
   nodeId: string;
@@ -30,7 +33,10 @@ export interface FenceTarget {
   accountId: string | null;
 }
 export interface FenceActions {
-  /** Deletes the node's Tunnel and revokes its token; a Tunnel that is already gone is a success. */
+  /**
+   * Deletes the node's Tunnel and revokes its token. A Tunnel that is already deleted is a
+   * success; a node with no Tunnel under its name is `tunnel_unknown`, not a success.
+   */
   deleteTunnel(target: FenceTarget): Promise<void>;
   /** Resolves once the provider accepted the order to power the instance off. */
   powerOff(target: FenceTarget): Promise<void>;
@@ -207,16 +213,19 @@ interface FencingRow {
 /** How many nodes one run works on; a lost node is rare and each step calls out. */
 const FENCING_PER_RUN = 4;
 
+/** The classes a fence action may name itself; any other failure is the step's own class. */
+const ACTION_ERRORS = new Set(["fence_unconfigured", "tunnel_unknown"]);
+
 /**
- * Carries the fence of every declared node one step further, in order, and returns how many nodes
- * it worked on. A failed step records its class and stops that node until the next run; what a
- * service said when it failed is never kept.
+ * Carries the fence of every declared node one step further, in order, and returns the class of
+ * each step that failed. A failed step records its class and stops that node until the next run;
+ * what a service said when it failed is never kept.
  */
 export async function runNodeFencing(
   env: Pick<Env, "DB">,
   now: number,
   actions: FenceActions,
-): Promise<number> {
+): Promise<string[]> {
   const rows = (
     await env.DB.prepare(
       `SELECT l.node_id,l.region_id,n.provider_instance_id,r.backup_endpoint_url,l.tunnel_deleted_at,l.power_off_requested_at
@@ -226,7 +235,8 @@ export async function runNodeFencing(
       .bind(FENCING_PER_RUN)
       .all<FencingRow>()
   ).results;
-  const at = iso(now);
+  const at = iso(now),
+    failures: string[] = [];
   for (const row of rows) {
     const target: FenceTarget = {
       nodeId: row.node_id,
@@ -235,6 +245,7 @@ export async function runNodeFencing(
       accountId: accountOf(row.backup_endpoint_url),
     };
     const fail = async (code: string) => {
+      failures.push(code);
       console.error(
         JSON.stringify({
           event: "node_fencing_step_failed",
@@ -257,8 +268,12 @@ export async function runNodeFencing(
     if (row.tunnel_deleted_at === null) {
       try {
         await actions.deleteTunnel(target);
-      } catch {
-        await fail("tunnel_delete_failed");
+      } catch (error) {
+        await fail(
+          error instanceof Error && ACTION_ERRORS.has(error.message)
+            ? error.message
+            : "tunnel_delete_failed",
+        );
         continue;
       }
       await succeed("tunnel_deleted_at");
@@ -270,8 +285,12 @@ export async function runNodeFencing(
       }
       try {
         await actions.powerOff(target);
-      } catch {
-        await fail("power_off_failed");
+      } catch (error) {
+        await fail(
+          error instanceof Error && ACTION_ERRORS.has(error.message)
+            ? error.message
+            : "power_off_failed",
+        );
         continue;
       }
       await succeed("power_off_requested_at");
@@ -286,12 +305,17 @@ export async function runNodeFencing(
     if (state === "stopped") await succeed("powered_off_at");
     else await fail("instance_not_stopped");
   }
-  return rows.length;
+  return failures;
 }
 
-/** The runner of the minute cron, with the Worker's own Cloudflare and Contabo credentials. */
-export const runNodeFencingCron = (env: Env, now: number) =>
-  runNodeFencing(env, now, fenceActionsFromEnv(env));
+/**
+ * The runner of the minute cron, with the Worker's own Cloudflare and Contabo credentials. It
+ * fails after the run when a step of the fence failed, naming the class of the first.
+ */
+export async function runNodeFencingCron(env: Env, now: number) {
+  const failures = await runNodeFencing(env, now, fenceActionsFromEnv(env));
+  if (failures.length > 0) throw new Error(failures[0]);
+}
 
 function accountOf(endpoint: string): string | null {
   try {

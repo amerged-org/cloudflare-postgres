@@ -62,7 +62,7 @@ const DatabaseMove = z
     status: z
       .enum(["proving", "restoring", "done", "failed"])
       .describe(
-        "proving: the source proves its sleep. restoring: the generation was bumped and the target restores. done: the target is ready. failed: see failure.",
+        "proving: the source proves its sleep. restoring: the target restores the next storage generation while the source still serves the database. done: the target is ready and serves the database. failed: see failure; the database stays with the source.",
       ),
     failure: z
       .string()
@@ -147,7 +147,7 @@ export function registerLifecycle(app: ApiApp): void {
       tags: ["Nodes"],
       summary: "Move a database to another node under the same ID",
       description:
-        "Starts a move: the source proves the sleep of the database and holds its connections with 57P03, D1 then bumps the generation and the target restores the newest base backup and the WAL up to the source's proven end. The route reopens when the target reports the database ready; the source then removes its volume. The same request again returns the running move; another target is refused with `mutation_in_progress` while one runs. 409: the database is deleted or not settled, or a node is lost or fenced.",
+        "Starts a move: the source proves the sleep of the database and holds its connections with 57P03, and the target restores the newest base backup and the WAL up to the source's proven end under the next storage generation. Until the target reports the database ready the source keeps serving it, and a move that fails leaves it there. D1 then switches the database to the target and the source removes its volume. The same request again returns the running move; another target is refused with `mutation_in_progress` while one runs. 409: the database is deleted or not settled, a node is lost or fenced, or the target is not open for placement, has no fresh observation or no room (`node_capacity`, retry later).",
       request: {
         params: z.object({ id: DatabaseId }),
         body: body(MoveRequest),

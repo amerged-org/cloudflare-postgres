@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import {
   enforceBackupRetention,
@@ -8,6 +9,7 @@ import {
   runBackupRetention,
 } from "../../src/domain/backup-retention.ts";
 import { ensureArchiveCredential } from "../../src/domain/archive-credentials.ts";
+import { readRestoreCatalog } from "../../src/domain/restore-catalog.ts";
 import { applyLifecycleObservations } from "../../src/domain/lifecycle-observations.ts";
 import {
   BACKUP,
@@ -104,6 +106,31 @@ it("keeps what the recovery window needs: the newest backup at or before its sta
   expect(wals(names)).toEqual(Array.from({ length: 9 }, (_, i) => wal(i + 4)));
   expect(names).toContain(history);
   expect(await list(other)).toEqual([other]);
+});
+
+it("deletes the compressed backup labels and partial segments that lie before the anchor, like the segments", async () => {
+  const a = await archive();
+  await a.backup(21, 20, 1, 3);
+  await a.backup(11, 10, 4, 6);
+  await a.segments(1, 8);
+  const extra = (n: number, suffix: string) =>
+    `${a.prefix}wals/${wal(n).slice(0, 16)}/${wal(n)}${suffix}`;
+  for (const [n, suffix] of [
+    [2, ".00000028.backup.gz"],
+    [3, ".partial.gz"],
+    [3, ".partial"],
+    [5, ".00000028.backup.gz"],
+    [7, ".partial.gz"],
+  ] as const)
+    await put(extra(n, suffix));
+  await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY);
+  const names = await a.names();
+  expect(names.filter((n) => /backup\.gz$|partial/.test(n))).toEqual(
+    [
+      `wals/${wal(5).slice(0, 16)}/${wal(5)}.00000028.backup.gz`,
+      `wals/${wal(7).slice(0, 16)}/${wal(7)}.partial.gz`,
+    ].sort(),
+  );
 });
 
 it("never deletes the newest DONE backup, however old", async () => {
@@ -305,6 +332,81 @@ it("applies each database's own recovery window from its size class, once it has
   });
 });
 
+it("leaves a database alone while a restore from its archive runs, and applies the window after it", async () => {
+  const a = await archive();
+  await a.backup(21, 20, 1, 3);
+  await a.backup(11, 10, 4, 6);
+  await a.segments(1, 8);
+  const target = DatabaseWithOperation.parse(
+    await (await a.create("restored")).json(),
+  );
+  const operation = "op_" + "r".repeat(20),
+    at = new Date(a.now).toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO backup_retention_runs(database_id,archive_path,checked_at) SELECT id,archive_path,? FROM databases WHERE id=?",
+    ).bind(at, target.database.id),
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) VALUES (?,'database.restore','running',?,?,1,?,?)",
+    ).bind(operation, a.project, target.database.id, at, at),
+    env.DB.prepare(
+      "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,target_time,created_at) SELECT ?,?,id,archive_path,storage_generation,'20261018T093000',?,? FROM databases WHERE id=?",
+    ).bind(target.database.id, operation, at, at, a.id),
+  ]);
+  const before = await a.names();
+  expect(await enforceBackupRetention(env, a.now)).toMatchObject({
+    checked: 0,
+  });
+  expect(await a.names()).toEqual(before);
+  await env.DB.prepare(
+    "UPDATE operations SET status='succeeded',completed_at=?,updated_at=? WHERE id=?",
+  )
+    .bind(at, at, operation)
+    .run();
+  expect(await enforceBackupRetention(env, a.now)).toMatchObject({
+    checked: 1,
+    backups: 1,
+  });
+});
+
+it("trims an archive that is beyond the bounds of the restore catalog instead of leaving it to grow", async () => {
+  const a = await archive();
+  // Daily backups: the restore catalog refuses more than 64 of them.
+  const ids: string[] = [];
+  for (let i = 0; i < 65; i++)
+    ids.push(await a.backup(65 - i, 65 - i - 0.01, 2 * i + 1, 2 * i + 2));
+  await a.segments(1, 131);
+  await expect(readRestoreCatalog(env.ARCHIVE, a.prefix)).rejects.toMatchObject(
+    { details: { reason: "archive_unusable" } },
+  );
+  const run = await enforceBackupRetention(env, a.now);
+  expect(run).toMatchObject({ checked: 1, backups: 57, failed: 0 });
+  const names = await a.names();
+  // The anchor is the newest backup that ended before the window; everything newer stays.
+  expect(bases(names)).toEqual(ids.slice(57));
+  expect(wals(names)).toEqual(
+    Array.from({ length: 131 - 114 }, (_, i) => wal(115 + i)),
+  );
+  // The archive is within the catalog's bounds again.
+  expect(
+    (await readRestoreCatalog(env.ARCHIVE, a.prefix)).backups,
+  ).toHaveLength(8);
+});
+
+it("deletes nothing from an oversized archive whose newest old backups cannot be restored", async () => {
+  const a = await archive();
+  for (let i = 0; i < 65; i++)
+    await a.backup(65 - i, 65 - i - 0.01, 2 * i + 1, 2 * i + 2);
+  // Not one segment is archived: no backup has its WAL.
+  const before = await a.names();
+  expect(await retainBackups(env.ARCHIVE, a.prefix, a.now - 7 * DAY)).toEqual({
+    backups: 0,
+    objects: 0,
+    complete: true,
+  });
+  expect(await a.names()).toEqual(before);
+});
+
 it("takes the databases never checked first, a few per run, and leaves deleted databases to their own expiry", async () => {
   const a = await archive(),
     b = await archive();
@@ -394,6 +496,45 @@ it("expires the archive a move left behind once the recovery window has passed, 
     archives: 0,
     objects: 0,
   });
+});
+
+it("expires the archive a failed move's target staged, once the recovery window has passed since the move ended", async () => {
+  const a = await archive();
+  const current = (await a.row()).archive_path;
+  const operation = "op_" + "f".repeat(20);
+  const staged = current.replace(/\/g1-op_[a-z0-9]{20}$/, `/g2-${operation}`);
+  const root = staged.replace(`s3://${env.ARCHIVE_BUCKET_NAME}/`, "");
+  for (const key of [
+    `${root}/database/base/20261018T100000/backup.info`,
+    `${root}/database/wals/0000000200000000/000000020000000000000001.gz`,
+  ])
+    await put(key);
+  const failedAt = new Date(a.now - DAY).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO database_moves(operation,database_id,project_id,region_id,source_node_id,target_node_id,source_storage_generation,source_archive_path,status,failure,target_generation,target_storage_generation,target_archive_path,backup_id,proven_sleep_json,created_at,updated_at,completed_at)
+    SELECT ?,d.id,d.project_id,d.region_id,d.node_id,?,1,d.archive_path,'failed','build_failed',2,2,?,'20261018T093000','{}',?,?,? FROM databases d WHERE d.id=?`,
+  )
+    .bind(operation, a.other, staged, failedAt, failedAt, failedAt, a.id)
+    .run();
+  // Inside the window (7 days): kept, and the database's own archive is not touched.
+  expect(await expireSupersededArchives(env, a.now)).toEqual({
+    archives: 0,
+    objects: 0,
+  });
+  expect(await list(root + "/")).toHaveLength(2);
+  const later = a.now + 7 * DAY;
+  let archives = 0;
+  for (let pass = 0; archives === 0 && pass < 5; pass++)
+    archives += (await expireSupersededArchives(env, later, 1)).archives;
+  expect(archives).toBe(1);
+  expect(await list(root + "/")).toEqual([]);
+  expect(
+    await env.DB.prepare(
+      "SELECT target_archive_deleted_at FROM database_moves WHERE operation=?",
+    )
+      .bind(operation)
+      .first("target_archive_deleted_at"),
+  ).not.toBeNull();
 });
 
 it("refuses to expire a path that is still the database's current archive", async () => {

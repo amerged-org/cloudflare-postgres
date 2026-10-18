@@ -91,6 +91,49 @@ it("blocks a node while a database has no proven-sleep record for its current st
   expect(await reinstallBlockers(env.DB, f.node)).toEqual([]);
 });
 
+it("takes a wake that D1 committed after the report as taking the proof back", async () => {
+  const f = await node();
+  await f.reported("asleep");
+  expect(await reinstallBlockers(env.DB, f.node)).toEqual([]);
+  // A wake claim (or any change) moved D1 to generation 2; the node crashed before it reported again.
+  await env.DB.prepare("UPDATE databases SET generation=2 WHERE id=?")
+    .bind(f.id)
+    .run();
+  expect((await reinstallBlockers(env.DB, f.node)).map((b) => b.id)).toEqual([
+    f.id,
+  ]);
+  await f.declare();
+  await f.fenced();
+  await expect(assertReinstallAllowed(env.DB, f.node)).rejects.toMatchObject({
+    code: "conflict",
+    message: expect.stringContaining(f.id),
+  });
+});
+
+it("proves a sleep again only with a report of the current generation, and keeps a newer point against an older report", async () => {
+  const f = await node();
+  await f.reported("asleep");
+  await env.DB.prepare("UPDATE databases SET generation=2 WHERE id=?")
+    .bind(f.id)
+    .run();
+  // A report that still answers generation 1 is stale: it proves nothing about generation 2.
+  await f.reported("asleep", { generation: 1 });
+  expect(await reinstallBlockers(env.DB, f.node)).toHaveLength(1);
+  // The node applied generation 2 and slept again with a proof.
+  await f.reported("asleep", { generation: 2 });
+  expect(await reinstallBlockers(env.DB, f.node)).toEqual([]);
+  // A report of a node that was a step behind arrives later, awake and on the older generation.
+  await f.reported("ready", { generation: 1 });
+  expect(await reinstallBlockers(env.DB, f.node)).toEqual([]);
+  expect(
+    await env.DB.prepare(
+      "SELECT state,generation FROM database_recovery_points WHERE database_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ state: "asleep", generation: 2 });
+});
+
 it("refuses a reinstall that would overwrite unarchived WAL, names the databases, and yields to the owner's acknowledgement only", async () => {
   const f = await node();
   await f.declare();
