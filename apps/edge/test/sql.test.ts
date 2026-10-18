@@ -194,6 +194,55 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     });
   });
 
+  it("logs the stages of a request: where it was admitted, its body, its statements and the Edge's share", async () => {
+    const bindings = admitting(awake());
+    const send = async (queries: unknown[]) => {
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(
+        new Request(`${origin}/sql`, {
+          method: "POST",
+          headers: {
+            "CF-Connecting-IP": [192, 0, 2, 1].join("."),
+            ...neonHeaders(),
+          },
+          body: JSON.stringify({ queries }),
+          cf: { colo: "FRA" },
+        }),
+        bindings,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      expect(response.status).toBe(200);
+      return JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    };
+    const first = await send([
+      { query: "select 1", params: [] },
+      { query: "select 2", params: [] },
+    ]);
+    const second = await send([{ query: "select 1", params: [] }]);
+    expect(first).toMatchObject({ event: "sql_admission", colo: "FRA" });
+    expect(first.statements).toBe(2);
+    expect(second.statements).toBe(1);
+    expect(first.body_ms).toBeGreaterThanOrEqual(0);
+    // 1 is the isolate's first database request, so a cold start shows in the tail.
+    expect(first.isolate_requests).toBeGreaterThanOrEqual(1);
+    expect(second.isolate_requests).toBe(first.isolate_requests + 1);
+    // Everything of the request but the gateway's answer: plan 3.1's "Cloudflare adds at most".
+    for (const log of [first, second])
+      expect(log.edge_ms).toBe(log.duration_ms - log.gateway_ms);
+    // Statements are counted, never logged.
+    for (const [line] of logs.mock.calls) expect(line).not.toContain("select");
+  });
+
+  it("logs no statements for a request refused before its body is understood", async () => {
+    const response = await post(admitting(awake()), "not an object" as never);
+    expect(response.status).toBe(400);
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log.outcome).toBe("08P01");
+    expect(log.statements).toBeUndefined();
+    expect(log.edge_ms).toBe(log.duration_ms);
+  });
+
   it("the actual driver reads gateway and Edge refusals as PostgreSQL errors", async () => {
     neonConfig.fetchEndpoint = () => `${origin}/sql`;
     let bindings = admitting(awake("sql-error"));

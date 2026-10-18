@@ -6,6 +6,8 @@ import {
   AdmissionFailure,
   admitRoute,
   bounded,
+  edgeShare,
+  nextIsolateRequest,
   type AdmissionTimings,
   type Hints,
 } from "./admission.ts";
@@ -52,8 +54,12 @@ async function admit(
     timings,
   );
   const gatewayStarted = Date.now();
-  const socket = await connectGateway(region, token, env, signal);
-  timings.gateway_connect_ms = Date.now() - gatewayStarted;
+  let socket: WebSocket;
+  try {
+    socket = await connectGateway(region, token, env, signal);
+  } finally {
+    timings.gateway_connect_ms = Date.now() - gatewayStarted;
+  }
   if (signal.aborted) {
     try {
       socket.accept({ allowHalfOpen: true });
@@ -93,6 +99,7 @@ export default {
     )
       return new Response("WebSocket upgrade required", { status: 426 });
     const started = Date.now();
+    const isolateRequests = nextIsolateRequest();
     const cid = crypto.randomUUID();
     const timings: Timings = {};
     let hints: Hints | null = null;
@@ -104,7 +111,8 @@ export default {
         admit(request, env, routed, cid, signal, deadline, ctx, timings),
       );
       region = upstream.region;
-      // Attaching an unopened socket delegates the stream to the runtime.
+      // Attaching an unopened socket delegates the stream to the runtime: the Edge sees no frame
+      // after the upgrade, so a statement's time is the gateway's `conn_stages`, not an Edge line.
       return new Response(null, { status: 101, webSocket: upstream.socket });
     } catch (error) {
       const failure =
@@ -116,6 +124,7 @@ export default {
         ? decoyResponse(hints, env.ROUTE_MASTER_KEYS, request.signal, ctx)
         : refused(failure);
     } finally {
+      const duration = Math.max(0, Date.now() - started);
       console.log(
         JSON.stringify({
           event: "conn_admission",
@@ -126,7 +135,12 @@ export default {
           database_id: hints?.database ?? null,
           user: hints?.user ?? null,
           region_id: region,
-          duration_ms: Math.max(0, Date.now() - started),
+          // From the request's arrival to the answered upgrade.
+          duration_ms: duration,
+          // The part of it that was the Edge's own: all but the gateway's upgrade.
+          edge_ms: edgeShare(duration, timings.gateway_connect_ms),
+          // The database requests this isolate has taken, this one included; 1 is its first.
+          isolate_requests: isolateRequests,
           // Where an admission spent its time; each key is present only for a stage that ran.
           ...timings,
           outcome,

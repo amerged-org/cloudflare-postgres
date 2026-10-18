@@ -7,8 +7,6 @@ import {
 } from "cloudflare:test";
 import {
   newDatabaseId,
-  newNodeId,
-  newProjectId,
   newOperationId,
   isDatabaseId,
   isRoleName,
@@ -32,6 +30,7 @@ import {
 } from "../src/session-policy.ts";
 import type { Env, DatabaseWakeAdmission } from "../src/env.ts";
 import {
+  seedFixtureDatabase,
   seedKnownDatabase,
   publishPowerObservation,
   createUnrelatedRole,
@@ -326,64 +325,11 @@ beforeEach(async () => {
     testEnv.DB.prepare("DELETE FROM projects"),
     testEnv.DB.prepare("DELETE FROM size_classes"),
   ]);
-  database = newDatabaseId();
-  const project = newProjectId();
-  const node = newNodeId();
-  const now = new Date().toISOString();
-  const randomHash = Array.from(
-    crypto.getRandomValues(new Uint8Array(32)),
-    (value) => value.toString(16).padStart(2, "0"),
-  ).join("");
-  const password = crypto.randomUUID();
-  const iv = btoa(
-    String.fromCharCode(...crypto.getRandomValues(new Uint8Array(12))),
-  );
-  await testEnv.DB.batch([
-    testEnv.DB.prepare(
-      "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    ).bind(project, "edge-test", now, now),
-    testEnv.DB.prepare(
-      `INSERT INTO size_classes (id, memory_mib, cpu_millicores, storage_gib,
-      max_connections, archive_timeout_seconds, backup_retention_days, created_at, updated_at)
-      VALUES ('small', 512, 250, 1, 20, 300, 7, ?, ?)`,
-    ).bind(now, now),
-    testEnv.DB.prepare(
-      `INSERT INTO regions (id, provider, provider_region, gateway_url,
-      gateway_binding, backup_bucket, backup_endpoint_url, agent_key_hash, created_at, updated_at)
-      VALUES (?, 'test-provider', 'test-region', ?, 'GATEWAY', 'test-backups', ?, ?, ?, ?)`,
-    ).bind(
-      region,
-      `${gatewayOrigin}/pg`,
-      `https://${["backup", "invalid"].join(".")}`,
-      randomHash,
-      now,
-      now,
-    ),
-    testEnv.DB.prepare(
-      `INSERT INTO nodes (id, region_id, k8s_node_name, ready, schedulable,
-       allocatable_memory_mib, allocatable_cpu_millicores, platform_reserved_memory_mib,
-       storage_gib_total, created_at, updated_at, node_uid, last_observed_at, platform_reserved_cpu_millicores)
-       VALUES (?, ?, 'edge-fixture-node', 1, 1, 4096, 2000, 128, 20, ?, ?, ?, ?, 100)`,
-    ).bind(node, region, now, now, crypto.randomUUID(), now),
-    testEnv.DB.prepare(
-      `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
-      desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'edge-test', 'small', 'running', 'ready', 2, 2, ?, ?, ?)`,
-    ).bind(
-      database,
-      project,
-      region,
-      node,
-      `s3://test-backups/${region}/${database}/g1-${newOperationId()}`,
-      now,
-      now,
-    ),
-    testEnv.DB.prepare(
-      `INSERT INTO roles (database_id, name, owner, password_ciphertext,
-      password_iv, password_kid, created_at, updated_at) VALUES (?, 'app', 1, ?, ?, 'v1', ?, ?)`,
-    ).bind(database, password, iv, now, now),
-  ]);
-  await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+  database = await seedFixtureDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, {
+    region,
+    gatewayUrl: `${gatewayOrigin}/pg`,
+    gatewayBinding: "GATEWAY",
+  });
 });
 
 afterEach(async () => {
@@ -594,6 +540,67 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     response.webSocket!.accept({ allowHalfOpen: true });
     live.push({ socket: response.webSocket!, ctx });
     accept!.mockRestore();
+  });
+
+  it("relays any number of frames after the upgrade with no limiter, Actor, log or listener work per frame", async () => {
+    const limit = vi.fn(async () => ({ success: true }));
+    const limiter = { limit } as unknown as RateLimit;
+    const admitWake = vi.fn(
+      (
+        id: string,
+        user: string,
+        options: { deadline: number; waiterId: string },
+      ) =>
+        testEnv.DATABASE_ACTOR.get(
+          testEnv.DATABASE_ACTOR.idFromName(id),
+        ).admitWake(id, user, options),
+    );
+    const cancelWakeWaiter = vi.fn(async () => false);
+    const get = vi.fn(() => ({ admitWake, cancelWakeWaiter }));
+    let listened: ReturnType<typeof vi.spyOn> | null = null;
+    const gateway = {
+      async fetch(request: Request) {
+        const response = await testEnv.GATEWAY.fetch(request);
+        listened = vi.spyOn(response.webSocket!, "addEventListener");
+        return response;
+      },
+    } as Fetcher;
+    const connection = await open({
+      bindings: {
+        ...testEnv,
+        GATEWAY: gateway,
+        CONNECTION_RATE_LIMITER: limiter,
+        DATABASE_CONNECTION_RATE_LIMITER: limiter,
+        DATABASE_ACTOR: {
+          idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+          get,
+        },
+      },
+    });
+    // The admission: both limiters, one Actor call, one log line.
+    expect(limit).toHaveBeenCalledTimes(2);
+    expect(admitWake).toHaveBeenCalledTimes(1);
+    expect(logs.mock.calls).toHaveLength(1);
+    const frames = Array.from({ length: 200 }, (_, index) =>
+      Uint8Array.of(0x51, 0, 0, 0, 5, index, 0),
+    );
+    for (const frame of frames) connection.socket.send(frame);
+    await expect
+      .poll(() => concat(...connection.messages).length)
+      .toBe(frames.length * 7);
+    expect([...concat(...connection.messages)]).toEqual(
+      frames.flatMap((frame) => [...frame]),
+    );
+    expect(limit).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(admitWake).toHaveBeenCalledTimes(1);
+    expect(cancelWakeWaiter).not.toHaveBeenCalled();
+    expect(logs.mock.calls).toHaveLength(1);
+    // The only listeners on the gateway's socket are the ones this test's client added.
+    expect(listened!.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      "message",
+      "close",
+    ]);
   });
 
   it("rejects missing and duplicate admission hints before any gateway call", async () => {
@@ -1527,6 +1534,34 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     ).toMatchObject({ ok: true, claims: { cid: log.cid } });
     await open();
     expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).colo).toBeNull();
+  });
+
+  it("logs the Edge's own share of a connect and which database request of its isolate it was", async () => {
+    await open();
+    const first = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    await open();
+    const second = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    // 1 is the isolate's first database request, so a cold start shows in the connect tail.
+    expect(first.isolate_requests).toBeGreaterThanOrEqual(1);
+    expect(second.isolate_requests).toBe(first.isolate_requests + 1);
+    // Everything of the upgrade but the gateway's answer: plan 3.1's "Cloudflare adds at most".
+    for (const log of [first, second])
+      expect(log.edge_ms).toBe(log.duration_ms - log.gateway_connect_ms);
+  });
+
+  it("times the gateway stage of a slow upgrade and of one the gateway refused", async () => {
+    await setGatewayMode("slow");
+    await open();
+    const slow = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(slow.gateway_connect_ms).toBeGreaterThanOrEqual(20);
+    expect(slow.edge_ms).toBe(slow.duration_ms - slow.gateway_connect_ms);
+    await setGatewayMode("reject");
+    const refused = await open();
+    expect(await errorCode(refused)).toBe("08006");
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log.outcome).toBe("08006");
+    expect(log.gateway_connect_ms).toBeGreaterThanOrEqual(0);
+    expect(log.edge_ms).toBe(log.duration_ms - log.gateway_connect_ms);
   });
 
   it("gets the DatabaseActor with the configured location hint, and none without one", async () => {

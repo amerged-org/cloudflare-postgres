@@ -16,6 +16,8 @@ import {
   AdmissionFailure,
   admitRoute,
   bounded,
+  edgeShare,
+  nextIsolateRequest,
   type AdmissionTimings,
 } from "./admission.ts";
 import type { Env } from "./env.ts";
@@ -66,6 +68,11 @@ interface Transaction {
 }
 /** Milliseconds of each stage that ran, logged with the request. */
 interface Timings extends AdmissionTimings {
+  /** Reading and understanding the body: a client that uploads slowly shows here. */
+  body_ms?: number;
+  /** The statements of the request, counted and never logged. */
+  statements?: number;
+  /** The gateway's answer, from the send to its response head. */
   gateway_ms?: number;
   gateway_status?: number;
 }
@@ -319,6 +326,7 @@ export async function serveSql(
   ctx: ExecutionContext,
 ): Promise<Response> {
   const started = Date.now();
+  const isolateRequests = nextIsolateRequest();
   const cid = crypto.randomUUID();
   const timings: Timings = {};
   let target: Connection | null = null;
@@ -329,7 +337,10 @@ export async function serveSql(
       throw new SqlFailure("08P01", "HTTP SQL requires POST");
     const routed = (target = connection(request.headers));
     const characteristics = transaction(request.headers);
+    const bodyStarted = Date.now();
     const { queries, batch } = statements(await readBody(request));
+    timings.body_ms = Date.now() - bodyStarted;
+    timings.statements = queries.length;
     if (batch && queries.length === 0) return json({ results: [] }, 200);
     const body = JSON.stringify({
       password: base64url(routed.password),
@@ -373,14 +384,22 @@ export async function serveSql(
       400,
     );
   } finally {
+    const duration = Math.max(0, Date.now() - started);
     console.log(
       JSON.stringify({
         event: "sql_admission",
         cid,
+        // The Cloudflare location that admitted the request; none on a service binding.
+        colo: request.cf?.colo ?? null,
         database_id: target?.database ?? null,
         user: target?.user ?? null,
         region_id: region,
-        duration_ms: Math.max(0, Date.now() - started),
+        // From the request's arrival to the response head: the body streams after it.
+        duration_ms: duration,
+        // The part of it that was the Edge's own: all but the gateway's answer.
+        edge_ms: edgeShare(duration, timings.gateway_ms),
+        // The database requests this isolate has taken, this one included; 1 is its first.
+        isolate_requests: isolateRequests,
         ...timings,
         outcome,
       }),

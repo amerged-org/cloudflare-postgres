@@ -5,6 +5,16 @@ export function seedKnownDatabase(
   id: string,
 ): Promise<void>;
 
+export function seedFixtureDatabase(
+  db: D1Database,
+  namespace: object,
+  fixture: {
+    region: string;
+    gatewayUrl: string;
+    gatewayBinding: string | null;
+  },
+): Promise<string>;
+
 export function createUnrelatedRole(
   env: object,
   ctx: ExecutionContext,

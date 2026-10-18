@@ -29,6 +29,23 @@ export interface AdmissionTimings {
   token_ms?: number;
 }
 
+let isolateRequests = 0;
+/**
+ * Counts one database request (a WebSocket upgrade or an HTTP query) taken by this isolate, this
+ * one included. The first of an isolate pays for what the later ones find cached.
+ */
+export function nextIsolateRequest(): number {
+  return ++isolateRequests;
+}
+
+/**
+ * What the Edge itself spent on a request: all of `duration` but the wait for the gateway's
+ * answer (plan 3.1 bounds it at about 150 ms at p95). Network transit and the node are not in it.
+ */
+export function edgeShare(duration: number, gateway: number | undefined) {
+  return Math.max(0, duration - (gateway ?? 0));
+}
+
 export class AdmissionFailure extends Error {
   readonly sqlstate: string;
   /** The refusal is answered as an unknown database or role is: by the decoy. */
