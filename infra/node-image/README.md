@@ -16,7 +16,7 @@ Everything that goes into the image is pinned in [packages.lock.json](packages.l
 | Builder base | `debian:trixie-20260918-slim` by multi-platform digest |
 | Builder tools | Debian packages from the same snapshot as the image |
 | mkosi | tag `v27.1`, fetched by commit and checked |
-| Debian | snapshot.debian.org at `20261016T000000Z` (trixie, trixie-updates, trixie-security) |
+| Debian | snapshot.debian.org at `20261016T133910Z` (trixie, trixie-updates, trixie-security) |
 | PGDG | `apt-archive.postgresql.org` `trixie-pgdg-archive`, key [keys/pgdg.asc](keys/pgdg.asc) by sha256 and fingerprint |
 | cloudflared | the `2026.10.0` release `.deb` by URL, size and sha256 |
 | Packages | every installed `.deb` with name, version, architecture, URL, size and sha256 |
@@ -33,14 +33,32 @@ From the repository root, with Docker:
 
 ```sh
 node infra/node-image/node-image.ts resolve   # only when changing the snapshot or the package set
+node infra/node-image/node-image.ts advisories # does the lock lag Debian security, updates or PGDG?
 node infra/node-image/node-image.ts build --binaries DIR --release NAME
 node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw --accel kvm
 ```
 
 - **resolve** builds once from the snapshot and the PGDG archive with network access, maps every
   installed package to the signed index entry apt verified, and rewrites the `packages` list of the
-  lock. PostgreSQL, pgvector and barman-cli-cloud are pinned to exact versions in `mkosi.conf`, so a
-  new snapshot never moves them silently.
+  lock. PostgreSQL, pgvector, barman-cli-cloud and `libpq5` are pinned to exact versions in
+  `mkosi.conf`, so a new snapshot never moves them silently. `libpq5` needs its own pin: apt takes the
+  highest version, and the PGDG archive also holds the release candidates of the next major version
+  (it once handed the image `19~rc1`). `validateLock` refuses every locked version that contains
+  `~alpha`, `~beta` or `~rc`.
+- **advisories** asks whether the lock lags the archives it was resolved from. In the builder it
+  runs `apt-get update` against the live `trixie-security` and `trixie-updates` suites of
+  `deb.debian.org` and `trixie-pgdg` of `apt.postgresql.org`, verified with the container's
+  `debian-archive-keyring` and with `keys/pgdg.asc` for the locked fingerprint. It prints
+  `name locked available suite` for every package in the lock (`packages` and `extra`) that one of
+  these suites lists at a newer Debian version, and exits 1 if there is any. A package pinned in
+  `mkosi.conf` counts only within its major series: PGDG's `main` component carries `libpq5` of the
+  newest major only, so once PostgreSQL 19 is released `libpq5` 19 there is not an update of the
+  `libpq5` 18 that goes with the server. Nothing is installed or written to the lock. The remedy for
+  a Debian package is `resolve` with a newer snapshot (the first
+  [snapshot.debian.org](https://snapshot.debian.org/archive/debian-security/) timestamp whose
+  `trixie-security` index lists the new versions); for a package pinned in `mkosi.conf` (the PGDG
+  set) it is to raise that pin, because a snapshot never moves it, and then `resolve`. Either way a
+  new image release follows. The check holds no secret.
 - **build** downloads every locked `.deb` (size and sha256 checked, three attempts each), serves
   them as the only repository (mkosi `LocalMirror=`) and builds offline. The build fails if the
   installed set differs from the lock in any package or version. It writes `pgcf-node.raw`,
@@ -66,6 +84,10 @@ or a binary that is not the one in the image fails the job; on a push to `main` 
 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`. The job holds no
 secret, so it uploads nothing to R2 and registers nothing: that is the operator's step
 ([Registering a release](#registering-a-release)).
+
+The CI job `advisories` runs `advisories` every day at 05:23 UTC (the workflow's `schedule`) and on a
+manual dispatch with the input `advisories`; the other jobs skip on both. A red run means that a
+Debian security update, a `trixie-updates` change or a PGDG release is waiting for a new lock.
 
 ## Registering a release
 
