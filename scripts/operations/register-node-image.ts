@@ -34,6 +34,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { isDeepStrictEqual, parseArgs } from "node:util";
+import { API_KEY_PATTERN } from "../../packages/contracts/src/auth.ts";
 import {
   FleetRelease,
   FleetReleaseRegistration,
@@ -230,6 +231,10 @@ export function r2Credentials(
   ] as const;
   const missing = names.filter((name) => !environment[name]);
   if (missing.length > 0) throw new Error(`set ${missing.join(", ")}`);
+  // The key id is sent in a header; a malformed value is refused by name, because the runtime
+  // would quote it whole in the error for an invalid header value.
+  if (!/^[A-Za-z0-9_-]+$/.test(environment.PGCF_R2_ACCESS_KEY_ID!))
+    throw new Error("PGCF_R2_ACCESS_KEY_ID is not an R2 access key id");
   const endpoint = new URL(environment.PGCF_R2_ENDPOINT!);
   if (endpoint.protocol !== "https:" || endpoint.pathname !== "/")
     throw new Error("PGCF_R2_ENDPOINT must be an https origin");
@@ -462,6 +467,22 @@ export async function registerRelease(
 
 // ---------- The command ----------
 
+/** The management API's origin and administrator key; a malformed key is refused by name, never quoted (it is a header value). */
+export function apiCredentials(
+  environment: Record<string, string | undefined>,
+): { apiUrl: string; apiKey: string } {
+  const missing = ["PGCF_API_URL", "PGCF_API_KEY"].filter(
+    (name) => !environment[name],
+  );
+  if (missing.length > 0) throw new Error(`set ${missing.join(", ")}`);
+  if (!API_KEY_PATTERN.test(environment.PGCF_API_KEY!))
+    throw new Error("PGCF_API_KEY is not an API key");
+  return {
+    apiUrl: environment.PGCF_API_URL!,
+    apiKey: environment.PGCF_API_KEY!,
+  };
+}
+
 async function main(
   argv: string[],
   environment: Record<string, string | undefined>,
@@ -483,18 +504,7 @@ async function main(
   const credentials = values["dry-run"]
     ? undefined
     : r2Credentials(environment);
-  const api = values["dry-run"]
-    ? undefined
-    : (() => {
-        const missing = ["PGCF_API_URL", "PGCF_API_KEY"].filter(
-          (name) => !environment[name],
-        );
-        if (missing.length > 0) throw new Error(`set ${missing.join(", ")}`);
-        return {
-          apiUrl: environment.PGCF_API_URL!,
-          apiKey: environment.PGCF_API_KEY!,
-        };
-      })();
+  const api = values["dry-run"] ? undefined : apiCredentials(environment);
   const manifest = await releaseManifest({
     imageDir: resolve(values["image-dir"]),
     binariesDir: resolve(values.binaries),
