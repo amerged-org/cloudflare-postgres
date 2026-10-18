@@ -131,13 +131,13 @@ test(
             durable_objects: {
               bindings: [
                 { name: "DATABASE_ACTOR", class_name: "DatabaseActor" },
-                { name: "REGION_LINK", class_name: "RegionLink" },
+                { name: "NODE_ACTOR", class_name: "NodeActor" },
               ],
             },
             migrations: [
               {
                 tag: "v1",
-                new_sqlite_classes: ["DatabaseActor", "RegionLink"],
+                new_sqlite_classes: ["DatabaseActor", "NodeActor"],
               },
             ],
           },
@@ -166,9 +166,9 @@ test(
         .bind(now, now)
         .run();
       await DB.prepare(
-        `INSERT INTO regions(id,provider,provider_region,gateway_url,gateway_binding,backup_bucket,backup_endpoint_url,agent_key_hash,created_at,updated_at) VALUES(?,'fixture','fixture',?,'GATEWAY','test-backups','https://backup.invalid',?,?,?)`,
+        `INSERT INTO regions(id,provider,provider_region,gateway_url,gateway_binding,backup_bucket,backup_endpoint_url,created_at,updated_at) VALUES(?,'fixture','fixture',?,'GATEWAY','test-backups','https://backup.invalid',?,?)`,
       )
-        .bind(region, gatewayOrigin + "/pg", "a".repeat(64), now, now)
+        .bind(region, gatewayOrigin + "/pg", now, now)
         .run();
       async function seed() {
         const database = id("d"),
@@ -190,13 +190,22 @@ test(
             now,
           ),
           DB.prepare(
-            `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,created_at,updated_at) VALUES(?,?,?,?,'edge-rust','small','running','ready',2,2,?,?,?)`,
+            `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,runtime_attestation_json,created_at,updated_at) VALUES(?,?,?,?,'edge-rust','small','running','ready',2,2,?,?,?,?)`,
           ).bind(
             database,
             project,
             region,
             node,
             `s3://test-backups/${region}/${database}/g1-op_${"a".repeat(20)}`,
+            // The unit the node reported for the observed generation.
+            JSON.stringify({
+              database_id: database,
+              node_id: node,
+              generation: 2,
+              storage_generation: 1,
+              instance: randomUUID(),
+              observed_at: Date.now(),
+            }),
             now,
             now,
           ),
@@ -460,95 +469,6 @@ test(
           assert.equal(logs.includes("query-secret-canary"), false);
           assert.equal(logs.includes("header-secret-canary"), false);
           assert.equal(logs.includes("private-cookie"), false);
-        },
-      );
-      await t.test(
-        "Wasm signs the admission's verified target into a v3 route",
-        async (st) => {
-          await reset();
-          const { database } = await seed();
-          const pod = randomUUID(),
-            release = "release-" + randomUUID(),
-            at = new Date().toISOString();
-          // The region's assigned release declares v3 and every member of the region is assigned to
-          // it; only the declaration is read on this path. Later subtests keep v2 routes.
-          await DB.batch([
-            DB.prepare(
-              "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
-            ).bind(
-              release,
-              JSON.stringify({ route_token_version: 3 }),
-              "e".repeat(64),
-              at,
-            ),
-            DB.prepare(
-              "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
-            ).bind(region, release, at),
-            DB.prepare(
-              "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT id,node_uid,?,'customer',1,? FROM nodes WHERE region_id=?",
-            ).bind(release, at, region),
-          ]);
-          st.after(() =>
-            DB.batch([
-              DB.prepare(
-                "DELETE FROM fleet_node_releases WHERE release_id=?",
-              ).bind(release),
-              DB.prepare(
-                "DELETE FROM fleet_region_releases WHERE release_id=?",
-              ).bind(release),
-              DB.prepare("DELETE FROM fleet_releases WHERE id=?").bind(release),
-            ]),
-          );
-          await DB.prepare(
-            "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
-          )
-            .bind(
-              JSON.stringify({
-                v: 1,
-                database_id: database,
-                generation: 2,
-                storage_generation: 1,
-                node_uid: randomUUID(),
-                boot_id: randomUUID(),
-                cluster_uid: randomUUID(),
-                namespace_uid: randomUUID(),
-                cnpg_cluster_uid: randomUUID(),
-                storage_uid: randomUUID(),
-                pvc_uid: randomUUID(),
-                pv_uid: randomUUID(),
-                pod_uid: pod,
-                container_id: "3".repeat(64),
-                postgres_image_sha256: "4".repeat(64),
-                memory_request_bytes: 1,
-                memory_limit_bytes: 2,
-                observed_at: Date.now(),
-                configuration_fingerprint: "5".repeat(64),
-              }),
-              database,
-            )
-            .run();
-          const c = await open(database);
-          await until(async () => (await stats()).length === 1);
-          const keys = await deriveRegionKeyring(
-            parseRouteKeyring(JSON.stringify(keyring)),
-            region,
-          );
-          const verified = await verifyRouteToken((await stats())[0]!.token, {
-            region,
-            keys: keys.keys,
-          });
-          assert.ok(verified.ok);
-          assert.deepEqual(
-            {
-              v: verified.claims.v,
-              db: verified.claims.db,
-              rev: "rev" in verified.claims ? verified.claims.rev : null,
-              pod: "pod" in verified.claims ? verified.claims.pod : null,
-            },
-            { v: 3, db: database, rev: 2, pod },
-          );
-          c.socket.close(1000);
-          await until(async () => (await stats())[0]!.closes.length === 1);
         },
       );
       await t.test(
