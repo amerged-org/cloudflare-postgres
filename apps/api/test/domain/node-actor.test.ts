@@ -270,6 +270,12 @@ describe("the samples of a node", () => {
     }
     await until(async () => (await minutes(f.node)).length === 1);
     expect((await minutes(f.node))[0]!.samples).toBe(1);
+    // Both samples are folded before the alarm rings.
+    await until(
+      async () =>
+        (await actor(f.node).latest()).sample?.observed_at ===
+        new Date(now - 1_000).toISOString(),
+    );
     expect(await runDurableObjectAlarm(actor(f.node))).toBe(true);
     expect((await minutes(f.node))[0]!.samples).toBe(2);
     // Nothing is left to write.
@@ -311,9 +317,17 @@ describe("the samples of a node", () => {
           ),
         ).observed_at,
       ).toBe(first);
-      // The minute that ended holds both of its samples, once.
-      await until(async () => (await minutes(f.node))[0]?.samples === 2);
-      expect((await minutes(f.node)).length).toBe(1);
+      // The minute that ended holds both of its samples, once. The alarm of the new minute may
+      // have written its first sample's row already; that is another minute's.
+      const ended = minute / MINUTE - 1;
+      await until(
+        async () =>
+          (await minutes(f.node)).find((row) => row.minute === ended)
+            ?.samples === 2,
+      );
+      expect(
+        (await minutes(f.node)).filter((row) => row.minute === ended),
+      ).toHaveLength(1);
       socket.close(1000);
     }
     it("refreshes the vitals at the rollover", () => rollOver(false));
