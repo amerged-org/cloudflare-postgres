@@ -137,3 +137,9 @@ test("sshd takes user certificates only and the image ships no CA key: nothing l
   assert.equal(krl.subarray(0, 8).toString("latin1"), "SSHKRL\n\0");
   assert.equal(krl.readUInt32BE(8), 1);
 });
+
+test("the journal is synced every 15 s: the minutes before a freeze reach the disk", () => {
+  const journald = readFileSync(new URL("usr/lib/systemd/journald.conf.d/pgcf.conf", image), "utf8");
+  assert.deepEqual(assignments(journald, "SyncIntervalSec"), ["15s"]);
+  assert.deepEqual(assignments(journald, "Storage"), ["persistent"]);
+});

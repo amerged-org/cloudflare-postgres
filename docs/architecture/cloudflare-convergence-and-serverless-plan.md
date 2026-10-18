@@ -1213,7 +1213,8 @@ A reinstall issues a new token, and a lost node's key is restricted to the fence
    - first boot created the LVM partition, the volume group and the pool;
    - `pgcf-agent check` creates a scratch database on a thin volume and queries it;
    - after the VM reboots, the scratch database wakes again;
-   - nothing listens except on loopback.
+   - nothing listens except on loopback, and no ssh socket exists;
+   - the kernel surface, the database unit's system-call filter, the certificate-only sshd and the journal's 15 s sync are as sections 5.5 and 8 describe.
 5. Compress with zstd (Stage 1: the Contabo rescue system has zstd and gzip but no `xz` binary), and write the sha256 sums and `pgcf-node.json` (with the digests of the four binaries baked into the image). Then it collects the files a registration takes (the compressed image, `pgcf-node.json`, `packages.lock.json`, the four binaries and their sums, never the raw image) and runs the registration script's `--dry-run` on them; on a push to `main` of this repository (not of a fork) it keeps them for 7 days as the workflow artifact `pgcf-node-release-<commit sha>-<run attempt>`. The job holds no R2 or API credential, so it uploads nothing to R2 and registers nothing; the operator does (below).
 
 **Registering a release.** `scripts/operations/register-node-image.ts` takes a build's output and the binaries it was built with:

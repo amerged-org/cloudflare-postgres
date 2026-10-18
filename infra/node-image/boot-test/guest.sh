@@ -151,6 +151,12 @@ sshd_certificate_only() {
 	[ "$result" = 0 ]
 }
 
+# journald syncs every five minutes by default, and a freeze loses what it had not written (the
+# unexplained stall of 2026-10-18 in plan 11.1 left no journal). The image syncs every 15 s.
+journal_sync_interval() {
+	systemd-analyze cat-config systemd/journald.conf | grep -qx 'SyncIntervalSec=15s'
+}
+
 inbound_dropped() {
 	nft list chain inet pgcf input | grep -q 'policy drop;'
 }
@@ -309,6 +315,7 @@ backup_slice_top_level() {
 check no_failed_units no_failed_units
 check loopback_only loopback_only
 check no_ssh_socket no_ssh_socket
+check journal_sync_interval journal_sync_interval
 check inbound_dropped inbound_dropped
 check binaries binaries
 check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
