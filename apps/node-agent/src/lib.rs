@@ -8,6 +8,7 @@ pub mod diagnostics;
 mod dm;
 pub mod health;
 pub mod holder;
+pub mod link;
 pub mod measurements;
 #[cfg(target_os = "linux")]
 pub mod mount;
