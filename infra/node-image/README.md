@@ -57,9 +57,68 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
 
 The CI job `node-image` in [.github/workflows/ci.yml](../../.github/workflows/ci.yml) runs the unit
 tests, builds the four binaries with the pinned Rust toolchain, builds the image and runs the boot
-test with KVM. Compression and checksums are part of the build; uploading to the private R2 prefix
-`node-images/<release>/` and registering the release in the API (plan 9.1 step 5) follow once the
-API's release registration exists.
+test with KVM. Compression and checksums are part of the build. The job holds no secret, so it
+uploads and registers nothing: that is the operator's step ([Registering a release](#registering-a-release)).
+
+## Registering a release
+
+A node installs from, and updates to, a release the operator registered (plan 9.1, 9.2). One release
+is one image build with the four binaries it was built with and the package lock; it is the same for
+every node and every region. Its name is the `--release` of the build, which is also the image
+version of the nodes installed from it: lower-case letters, digits, `.`, `_` and `-`, at most 64
+characters (CI uses `sha-<12 hex digits of the commit>`).
+
+```sh
+# 1. The four binaries, built for linux/amd64 with the pinned Rust toolchain (CI does this too):
+cargo build --release --locked --bin pgcf-agent --bin pgcf-native-gateway --bin pgcf-archive --bin pgcf-wal-fetch
+mkdir -p .local/node-image/binaries && install -m 0755 target/release/pgcf-* .local/node-image/binaries/
+# 2. The image, with the local Docker builder (see Building above):
+node infra/node-image/node-image.ts build --binaries .local/node-image/binaries --release sha-0123456789ab
+# 3. Upload the six files and register the release:
+node scripts/operations/register-node-image.ts --image-dir .local/node-image/out --binaries .local/node-image/binaries
+```
+
+Step 1 builds on Linux; on another host build in a linux/amd64 container with the same toolchain.
+The third step reads these variables, in memory only, and never prints their values:
+
+| Variable | Holds |
+| --- | --- |
+| `PGCF_R2_ENDPOINT` | the archive bucket's S3 endpoint: `https://<account>.r2.cloudflarestorage.com`, or `https://<account>.eu.r2.cloudflarestorage.com` for an EU-jurisdiction bucket |
+| `PGCF_R2_BUCKET` | the archive bucket the API binds as `ARCHIVE` |
+| `PGCF_R2_ACCESS_KEY_ID`, `PGCF_R2_SECRET_ACCESS_KEY` | an R2 API token with object read and write on that bucket |
+| `PGCF_API_URL`, `PGCF_API_KEY` | the management API's origin and an administrator key |
+
+`--dry-run` reads the files, prints the manifest and stops before any network call.
+
+What the script does, and what the API checks:
+
+- It refuses a build whose compressed image or package lock is not the one `pgcf-node.json`
+  describes, and a release name that is no version.
+- It uploads `pgcf-node.raw.zst`, `packages.lock.json` and the four binaries to
+  `node-images/<version>/` with `x-amz-checksum-sha256`, so R2 itself verifies each digest. A file
+  that is already there with the same content (size and md5) is skipped, so a run that stopped
+  half way is repeated; one with another content stops the run, because a registered release is
+  never overwritten.
+- It calls `PUT /v1/fleet/releases/<version>` with the digest and size of each file. The API refuses
+  the registration unless the bucket holds every file at that size with that sha256, and it names
+  every URL of the stored, immutable spec itself, as `/node/v1/releases/<version>/<file>` on its
+  own origin (`NODE_API_ORIGIN`). Nothing in the registration is a URL or a credential.
+- `PUT /v1/regions/<region>/release` then assigns the release to a region: its nodes pull it, and
+  AddNode installs new nodes from it. It is a compare-and-set on the region's revision:
+
+  ```sh
+  curl -sS "$PGCF_API_URL/v1/regions/<region>/release" -H "Authorization: Bearer $PGCF_API_KEY"   # revision
+  curl -sS -X PUT "$PGCF_API_URL/v1/regions/<region>/release" -H "Authorization: Bearer $PGCF_API_KEY" \
+    -H 'Content-Type: application/json' -d '{"expected_revision":<revision>,"release_id":"<version>"}'
+  ```
+
+The Worker serves the files from its R2 binding. `GET` and `HEAD` of `/node/v1/releases/<version>/<file>`
+answer with the size, an ETag and `Accept-Ranges: bytes`, and a single `Range` with 206. The image is
+read with the install's progress token (`Authorization: Bearer`, from the installer's 0600 header
+file): the token is bound to one node and the version it was issued for, and stops working when the
+installer reports `rebooting` or `failed`, when the node enrolls and after 30 minutes. The binaries
+and the lock need no credential: they are open artifacts, which the agent checks against the size and
+sha256 its signed page pins.
 
 ## Disk layout
 
@@ -232,7 +291,8 @@ the generated module of these two files), validates every parameter and refuses 
 Contabo's 32 KiB userData limit. The
 script checks its tools, locks the rescue system's root password, checks the hardware (memory, MAC,
 IPv4 address and gateway, exactly one disk of the expected size), downloads the zstd image into
-RAM, verifies the compressed and raw sha256 and sizes before touching the disk, writes the disk,
+RAM from the Worker's route with the same progress token (a URL with a query is refused, and no
+redirect is followed), verifies the compressed and raw sha256 and sizes before touching the disk, writes the disk,
 reads it back, moves the backup GPT, writes the network settings, hostname, `resolv.conf` and the
 enrollment seed, reports each checkpoint (`started`, `hardware_ok`, `image_verified`,
 `disk_written`, `configured`, `rebooting`, or `failed` with the step) to the progress URL with the
@@ -267,7 +327,7 @@ from it. At the first boot `systemd-repart` wipes the signatures of the new LVM 
 old volume group does not come back; the new pool's zeroing keeps old blocks from reaching a
 database.
 
-The API side (lane D) renders the userData and serves the progress route (`POST` of
+The API side renders the userData from the registered release and serves the image and the progress route (`POST` of
 `{"checkpoint", "detail"}` with the Bearer token). It refuses the token once `rebooting` or `failed`
 has arrived, so a second run in rescue, for example after a reboot that leads back into rescue,
 stops at `started` before it touches the disk. Stage 1 left rescue through the API's

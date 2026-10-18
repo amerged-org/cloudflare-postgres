@@ -112,6 +112,7 @@ jobs:
         run: |
           pnpm typecheck
           pnpm exec tsc -p scripts/ci/tsconfig.json
+          pnpm exec tsc -p scripts/operations/tsconfig.json
       - name: Install the pinned PostgreSQL for native tests
         env:
           PGCF_TEST_POSTGRESQL_VERSION: 18.6-1.pgdg24.04+2
@@ -151,7 +152,7 @@ jobs:
       - name: Test
         run: |
           pnpm test
-          node --test scripts/ci/*.test.ts
+          node --test scripts/ci/*.test.ts scripts/operations/*.test.ts
       - name: Bind the already-tested Rust Edge artifact
         run: |
           node --input-type=module <<'JS'
