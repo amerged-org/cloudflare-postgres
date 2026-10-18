@@ -453,9 +453,10 @@ test(
             body:
               options.method === "GET"
                 ? undefined
-                : typeof body === "string"
+                : typeof body === "string" || body instanceof ReadableStream
                   ? body
                   : JSON.stringify(body),
+            ...(body instanceof ReadableStream ? { duplex: "half" } : {}),
           });
         return {
           status: response.status,
@@ -463,6 +464,19 @@ test(
           json: (await response.json()) as Record<string, unknown>,
         };
       }
+      const streamed = (bytes: number) => {
+        const chunk = new Uint8Array(1024 * 1024).fill(120);
+        let sent = 0;
+        return new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (sent >= bytes) return controller.close();
+            controller.enqueue(
+              chunk.subarray(0, Math.min(chunk.length, bytes - sent)),
+            );
+            sent += chunk.length;
+          },
+        });
+      };
       const failure = (code: string, message: string, severity = "ERROR") => ({
         message,
         code,
@@ -873,6 +887,11 @@ test(
             ],
             [
               await query("x".repeat(MAX_SQL_REQUEST_BYTES + 1), { database }),
+              failure("54000", "request is too large"),
+            ],
+            // A body that does not say how long it is is read only up to the same bound.
+            [
+              await query(streamed(MAX_SQL_REQUEST_BYTES + 1), { database }),
               failure("54000", "request is too large"),
             ],
           ] as const;
