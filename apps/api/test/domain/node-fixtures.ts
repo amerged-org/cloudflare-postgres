@@ -2,9 +2,11 @@
 // A node that is being installed, on real D1: the addition that reached its audit, the tokens of
 // its install, the installer's checkpoints and the enrollment.
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
 import {
   INSTALLER_CHECKPOINTS,
+  NodeSample,
   nodePublicKey,
   randomString,
   type NodeKey,
@@ -151,6 +153,32 @@ export const nextMessage = (socket: WebSocket) =>
     socket.addEventListener("message", (event) => resolve(String(event.data)), {
       once: true,
     }),
+  );
+/**
+ * What the NodeActor of a node holds of its link, read from the object's own storage and sockets:
+ * whether an agent that said hello is connected, and the newest sample with when it arrived.
+ */
+export const heldLink = (node: string) =>
+  runInDurableObject(
+    env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(node)),
+    (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ sample: string | null; received_at: number | null }>(
+          "SELECT sample,received_at FROM node_link WHERE singleton=1",
+        )
+        .toArray()[0];
+      return {
+        connected: state
+          .getWebSockets("agent")
+          .some(
+            (socket) =>
+              (socket.deserializeAttachment() as { hello?: boolean } | null)
+                ?.hello === true,
+          ),
+        received_at: row?.received_at ?? null,
+        sample: row?.sample ? NodeSample.parse(JSON.parse(row.sample)) : null,
+      };
+    },
   );
 /** The link of a node as the Worker hands it to the NodeActor, greeted with a hello unless told not to. */
 export async function openLink(

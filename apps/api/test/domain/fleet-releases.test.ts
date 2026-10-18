@@ -13,6 +13,7 @@ import {
   request,
 } from "./fixtures.ts";
 import { NODE_HEADER, NODE_UID_HEADER } from "../../src/node-actor.ts";
+import { heldLink } from "./node-fixtures.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -179,7 +180,6 @@ it("elects one of two competing assignments", async () => {
 it("tells the region's nodes to pull the page that names the release", async () => {
   const f = await setup();
   await f.approve();
-  const stub = env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(f.node));
   const socket = await hello(f, null);
   const hint = new Promise<string>((resolve) =>
     socket.addEventListener("message", (event) => resolve(String(event.data)), {
@@ -188,7 +188,7 @@ it("tells the region's nodes to pull the page that names the release", async () 
   );
   expect((await f.assign()).status).toBe(200);
   expect(JSON.parse(await hint)).toEqual({ type: "desired" });
-  expect((await stub.latest()).connected).toBe(true);
+  expect((await heldLink(f.node)).connected).toBe(true);
   socket.close(1000);
 });
 
@@ -216,8 +216,6 @@ it("converges a node when it runs the release of its region and its link is fres
   });
   expect(converged.desired_spec_sha256).toMatch(/^[0-9a-f]{64}$/);
   // A node that runs another release is pending, whatever its link says.
-  const stub = env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(f.node));
-  void stub;
   await env.DB.prepare(
     "UPDATE nodes SET reported_release_id='older' WHERE id=?",
   )

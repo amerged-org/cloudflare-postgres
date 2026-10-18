@@ -420,22 +420,4 @@ export class NodeActor extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets())
       socket.close(1008, "Node declared lost");
   }
-  /** What placement and the alerts read of the link without D1: the newest sample and whether it is connected. */
-  async latest(): Promise<{
-    connected: boolean;
-    received_at: number | null;
-    sample: NodeSample | null;
-  }> {
-    const link = this.link();
-    return {
-      connected: this.ctx
-        .getWebSockets("agent")
-        .some(
-          (socket) =>
-            (socket.deserializeAttachment() as Attachment | null)?.hello,
-        ),
-      received_at: link?.received_at ?? null,
-      sample: link?.sample ? NodeSample.parse(JSON.parse(link.sample)) : null,
-    };
-  }
 }

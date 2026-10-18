@@ -26,6 +26,7 @@ import {
 import {
   enroll,
   forgetInstalls,
+  heldLink,
   installed,
   nextMessage as next,
   openLink as connect,
@@ -283,7 +284,7 @@ describe("the samples of a node", () => {
     // Both samples are folded before the alarm rings.
     await until(
       async () =>
-        (await actor(f.node).latest()).sample?.observed_at ===
+        (await heldLink(f.node)).sample?.observed_at ===
         new Date(now - 1_000).toISOString(),
     );
     expect(await runDurableObjectAlarm(actor(f.node))).toBe(true);
@@ -460,7 +461,7 @@ describe("the samples of a node", () => {
     socket.send(sampleMessage(now + 10 * MINUTE));
     socket.send(sampleMessage(now - 40_000));
     await new Promise((resolve) => setTimeout(resolve, 60));
-    const latest = await actor(f.node).latest();
+    const latest = await heldLink(f.node);
     expect(latest.connected).toBe(true);
     expect(latest.sample!.observed_at).toBe(
       new Date(now - 20_000).toISOString(),
@@ -471,17 +472,17 @@ describe("the samples of a node", () => {
 
   it("reports no sample before the first and no link after it closed", async () => {
     const f = await fixture(0);
-    expect(await actor(f.node).latest()).toEqual({
+    expect(await heldLink(f.node)).toEqual({
       connected: false,
       received_at: null,
       sample: null,
     });
     const socket = await connect(f);
-    expect((await actor(f.node).latest()).connected).toBe(true);
+    expect((await heldLink(f.node)).connected).toBe(true);
     const end = closed(socket);
     socket.close(1000);
     await end;
-    await until(async () => !(await actor(f.node).latest()).connected);
+    await until(async () => !(await heldLink(f.node)).connected);
   });
 });
 
@@ -508,9 +509,9 @@ describe("a node's reading in the actor", () => {
     const f = await fixture(0);
     const socket = await connect(f);
     socket.send(sampleMessage(Date.now() - 1000));
-    await until(async () => (await actor(f.node).latest()).sample !== null);
+    await until(async () => (await heldLink(f.node)).sample !== null);
     await evictDurableObject(actor(f.node));
-    expect((await actor(f.node).latest()).sample).not.toBeNull();
+    expect((await heldLink(f.node)).sample).not.toBeNull();
     expect(
       await runInDurableObject(actor(f.node), (_instance, state) =>
         state.storage.sql
