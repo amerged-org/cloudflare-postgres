@@ -1124,6 +1124,33 @@
             "required": ["operation", "status"],
             "additionalProperties": false
           }
+        },
+        "events": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "at": { "$ref": "#/$defs/Timestamp" },
+              "event": { "type": "string", "pattern": "^[a-z0-9_]{1,48}$" },
+              "database_id": { "$ref": "#/$defs/DatabaseId" },
+              "fields": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9_]{1,32}$"
+                },
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": "number" },
+                    { "type": "string", "pattern": "^[a-z0-9_.:-]{1,64}$" }
+                  ]
+                }
+              }
+            },
+            "required": ["at", "event", "fields"],
+            "additionalProperties": false
+          }
         }
       },
       "required": ["observed_at", "databases", "orders"],
@@ -2014,6 +2041,8 @@
     "NODE_FENCED_ERROR": "node_fenced",
     "NODE_LINK_MESSAGE_MAX_BYTES": 65536,
     "NODE_DESIRED_PAGE_LIMIT_MAX": 200,
+    "NODE_REPORT_EVENTS_MAX": 64,
+    "NODE_REPORT_EVENT_FIELDS_MAX": 16,
     "NODE_REQUEST_TOKEN_PREFIX": "pgcf_nr1",
     "NODE_REQUEST_SIGNATURE_DOMAIN": "pgcf-node-request/v1\n",
     "NODE_REQUEST_MAX_LIFETIME_SECONDS": 60,

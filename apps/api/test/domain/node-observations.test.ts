@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation, newOperationId } from "@pgcf/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupFixtures,
   fixture,
@@ -718,6 +718,120 @@ describe("a report that is not valid", () => {
           })
         ).status,
       ).toBe(400);
+    expect((await row(db.id))!.observed_state).not.toBe("ready");
+  });
+});
+
+describe("the events a report carries", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const loggedEvents = (log: { mock: { calls: unknown[][] } }) =>
+    log.mock.calls.flatMap(([line]) => {
+      try {
+        const value = JSON.parse(String(line)) as Record<string, unknown>;
+        return value.event === "node_event" ? [value] : [];
+      } catch {
+        return [];
+      }
+    });
+  /** What D1 keeps of a node's events and minutes: an event adds to neither. */
+  const stored = async (f: F) => ({
+    ids: await env.DB.prepare(
+      "SELECT count(*) n FROM node_event_ids WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("n"),
+    minutes: await env.DB.prepare(
+      "SELECT count(*) n FROM node_minutes WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("n"),
+  });
+  const post = (f: F, body: object) =>
+    nodeRequest(f, "/node/v1/observations", { method: "POST", body });
+  const event = (id: string) => ({
+    at: "2026-10-18T10:11:12.345Z",
+    event: "wake",
+    database_id: id,
+    fields: { step_start: 61, outcome: "started", total_ms: 70 },
+  });
+
+  it("are logged one line each beside the observations, which they leave unchanged, and stored nowhere", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const f = await fixture();
+    const db = await created(f);
+    const before = await stored(f);
+    const response = await post(f, {
+      ...reportBody([await observationOf(db.id, 1)]),
+      events: [
+        event(db.id),
+        {
+          at: "2026-10-18T10:11:13.000Z",
+          event: "agent_started",
+          // A field named like a log key never replaces the key.
+          fields: { uptime_s: 12, event: "other", node_id: "nod_x" },
+        },
+      ],
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      databases: [{ id: db.id, verdict: "accept" }],
+      orders: 0,
+    });
+    expect((await row(db.id))!.observed_state).toBe("ready");
+    expect(loggedEvents(log)).toEqual([
+      {
+        event: "node_event",
+        node_id: f.node,
+        node_event: "wake",
+        at: "2026-10-18T10:11:12.345Z",
+        database_id: db.id,
+        step_start: 61,
+        outcome: "started",
+        total_ms: 70,
+      },
+      {
+        event: "node_event",
+        node_id: f.node,
+        node_event: "agent_started",
+        at: "2026-10-18T10:11:13.000Z",
+        uptime_s: 12,
+      },
+    ]);
+    expect(await stored(f)).toEqual(before);
+  });
+
+  it("are logged for a report without databases, and a report without events logs none", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const f = await fixture();
+    expect(
+      (await post(f, { ...reportBody([]), events: [event("d".repeat(20))] }))
+        .status,
+    ).toBe(200);
+    expect(loggedEvents(log)).toHaveLength(1);
+    expect((await post(f, reportBody([]))).status).toBe(200);
+    expect(loggedEvents(log)).toHaveLength(1);
+  });
+
+  it("refuse the whole report when one is not valid", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const f = await fixture();
+    const db = await created(f);
+    const good = event(db.id);
+    for (const events of [
+      [{ ...good, fields: { outcome: "has a space" } }],
+      [{ ...good, event: "Wake" }],
+      [{ ...good, text: "free" }],
+      Array.from({ length: 65 }, () => good),
+    ])
+      expect(
+        (
+          await post(f, {
+            ...reportBody([await observationOf(db.id, 1)]),
+            events,
+          })
+        ).status,
+      ).toBe(400);
+    expect(loggedEvents(log)).toEqual([]);
     expect((await row(db.id))!.observed_state).not.toBe("ready");
   });
 });

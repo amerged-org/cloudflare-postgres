@@ -1107,6 +1107,34 @@ export const NodeOrderResult = z
   );
 export type NodeOrderResult = z.infer<typeof NodeOrderResult>;
 
+/** The events a report carries, and the fields of one. */
+export const NODE_REPORT_EVENTS_MAX = 64;
+export const NODE_REPORT_EVENT_FIELDS_MAX = 16;
+/**
+ * One line of the agent's own log (plan 9.9): an event's name, and fields that are numbers or
+ * short tokens. The shape rules out whitespace, path separators, non-ASCII, nested values and
+ * long text. It does not rule out a token that is an address, a host name or a secret: the agent
+ * refuses the address forms it knows and its call sites emit only class codes and IDs. The API
+ * logs each event as a `node_event` line of Workers Logs and keeps nothing.
+ */
+export const NodeReportEvent = z.strictObject({
+  at: Timestamp,
+  event: z.string().regex(/^[a-z0-9_]{1,48}$/),
+  database_id: DatabaseId.optional(),
+  fields: z
+    .record(
+      z.string().regex(/^[a-z0-9_]{1,32}$/),
+      z.union([z.number(), z.string().regex(/^[a-z0-9_.:-]{1,64}$/)]),
+    )
+    .refine(
+      (fields) => Object.keys(fields).length <= NODE_REPORT_EVENT_FIELDS_MAX,
+      {
+        message: `An event carries at most ${NODE_REPORT_EVENT_FIELDS_MAX} fields`,
+      },
+    ),
+});
+export type NodeReportEvent = z.infer<typeof NodeReportEvent>;
+
 export const NodeObservationReport = z
   .strictObject({
     observed_at: Timestamp,
@@ -1114,6 +1142,7 @@ export const NodeObservationReport = z
       .array(NodeDatabaseObservation)
       .max(NODE_DESIRED_PAGE_LIMIT_MAX),
     orders: z.array(NodeOrderResult).max(NODE_ORDER_LIMIT),
+    events: z.array(NodeReportEvent).max(NODE_REPORT_EVENTS_MAX).optional(),
   })
   .refine(
     (report) =>

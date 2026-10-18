@@ -218,6 +218,12 @@ const observation = {
     failing_since: null,
   },
 };
+const reportEvent = {
+  at: now,
+  event: "wake",
+  database_id: id,
+  fields: { step_start: 61, outcome: "started", total_ms: 70 },
+};
 const observations = (...databases: object[]) => ({
   observed_at: now,
   databases,
@@ -925,6 +931,44 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     [
       "asleep-with-instance",
       observations({ ...observation, instance }),
+      false,
+      true,
+    ],
+    ["with-events", { ...observations(), events: [reportEvent] }, true],
+    [
+      "event-with-a-space",
+      {
+        ...observations(),
+        events: [{ ...reportEvent, fields: { outcome: "has a space" } }],
+      },
+      false,
+    ],
+    [
+      "event-with-a-nested-field",
+      {
+        ...observations(),
+        events: [{ ...reportEvent, fields: { outcome: { nested: 1 } } }],
+      },
+      false,
+    ],
+    [
+      "event-with-an-unknown-key",
+      { ...observations(), events: [{ ...reportEvent, text: "no" }] },
+      false,
+    ],
+    [
+      "event-with-too-many-fields",
+      {
+        ...observations(),
+        events: [
+          {
+            ...reportEvent,
+            fields: Object.fromEntries(
+              Array.from({ length: 17 }, (_, i) => [`f${i}`, i]),
+            ),
+          },
+        ],
+      },
       false,
       true,
     ],

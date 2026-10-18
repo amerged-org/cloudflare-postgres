@@ -7,6 +7,7 @@ pub mod api;
 pub mod archive;
 pub mod credentials;
 pub mod diagnostics;
+pub(crate) mod events;
 pub mod fence;
 pub mod gateway;
 pub mod layout;

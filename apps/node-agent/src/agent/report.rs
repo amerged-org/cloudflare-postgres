@@ -198,7 +198,7 @@ impl<M: Machine> Core<M> {
             .take(ORDERS_PER_REPORT)
             .cloned()
             .collect();
-        let report = json!({
+        let mut report = json!({
             "observed_at": facts::timestamp(super::now_ms()),
             "databases": databases
                 .iter()
@@ -209,11 +209,14 @@ impl<M: Machine> Core<M> {
                 .filter_map(|operation| reports.orders.remove(operation))
                 .collect::<Vec<_>>(),
         });
+        // The agent's own log lines ride along; none wait for a report of their own.
+        crate::events::attach(&mut report);
         Some(report)
     }
     /// A report that was not accepted: what it holds is posted again, unless something newer
     /// about the same database or order was queued since.
     pub fn unsent(&self, report: &Value) {
+        crate::events::give_back(report);
         let mut reports = self.reports.lock().unwrap_or_else(PoisonError::into_inner);
         for observation in report["databases"].as_array().into_iter().flatten() {
             if let Some(id) = observation["id"].as_str() {
