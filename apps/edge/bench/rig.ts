@@ -51,7 +51,7 @@ async function extractBase(ref: string): Promise<string> {
     [
       'import edge from "./index.ts";',
       'import { withSeed } from "../../test/bench-seed.js";',
-      'export { RegionLink } from "../../../api/src/region-link.ts";',
+      'export { NodeActor } from "../../../api/src/node-actor.ts";',
       'export { DatabaseActor } from "../../../api/src/database-actor.ts";',
       "export default withSeed(edge);",
       "",
@@ -234,11 +234,11 @@ export async function startRig(
         durable_objects: {
           bindings: [
             { name: "DATABASE_ACTOR", class_name: "DatabaseActor" },
-            { name: "REGION_LINK", class_name: "RegionLink" },
+            { name: "NODE_ACTOR", class_name: "NodeActor" },
           ],
         },
         migrations: [
-          { tag: "v1", new_sqlite_classes: ["DatabaseActor", "RegionLink"] },
+          { tag: "v1", new_sqlite_classes: ["DatabaseActor", "NodeActor"] },
         ],
         ratelimits: [
           {

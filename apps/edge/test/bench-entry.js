@@ -3,7 +3,7 @@
 // Actor, and the route that seeds a database.
 import edge from "../src/index.ts";
 import { withSeed } from "./bench-seed.js";
-export { RegionLink } from "../../api/src/region-link.ts";
+export { NodeActor } from "../../api/src/node-actor.ts";
 export { DatabaseActor } from "../../api/src/database-actor.ts";
 
 export default withSeed(edge);
