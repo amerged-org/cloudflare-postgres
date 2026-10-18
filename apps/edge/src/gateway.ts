@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { REFUSAL_BYTES, refusalCode } from "@pgcf/contracts/edge-policy";
 import { ROUTE_TOKEN_HEADER } from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
 
@@ -6,26 +7,6 @@ export interface GatewayRegion {
   readonly id: string;
   readonly gateway_url: string;
   readonly gateway_binding: string | null;
-}
-
-/** The most of a gateway's refusal the Edge reads: its error code is short. */
-const REFUSAL_BYTES = 512;
-
-/**
- * The error code of a gateway's refusal, `{"error": "<snake_case>"}`; nothing else of its answer
- * is kept, so no free text reaches a log. A body that is not exactly that has no code.
- */
-export function refusalCode(text: string): string | undefined {
-  try {
-    const answer: unknown = JSON.parse(text);
-    if (typeof answer !== "object" || answer === null) return undefined;
-    const code = (answer as { error?: unknown }).error;
-    return typeof code === "string" && /^[a-z0-9_]{1,64}$/.test(code)
-      ? code
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Reads the refusal's head, cancels the rest of its body and returns its error code, if any. */

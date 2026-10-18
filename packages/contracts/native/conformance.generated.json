@@ -38,6 +38,64 @@
         "expected": null
       }
     ],
+    "refusals": [
+      { "text": "{\"error\":\"route_refused\"}", "expected": "route_refused" },
+      {
+        "text": "{\"error\":\"route_refused\",\"detail\":\"free text the Edge must not log\"}",
+        "expected": "route_refused"
+      },
+      {
+        "text": "{\"detail\":\"free text\",\"error\":\"route_refused\"}",
+        "expected": "route_refused"
+      },
+      {
+        "text": " \n{\"error\" : \"route_refused\"}\t\n",
+        "expected": "route_refused"
+      },
+      { "text": "{\"error\":\"a\"}", "expected": "a" },
+      {
+        "text": "{\"error\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+        "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "text": "{\"error\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+        "expected": null
+      },
+      { "text": "{\"error\":\"0_9\"}", "expected": "0_9" },
+      { "text": "{\"error\":\"a\",\"error\":\"b\"}", "expected": "b" },
+      { "text": "{\"error\":\"\"}", "expected": null },
+      { "text": "{\"error\":\"Route_Refused\"}", "expected": null },
+      { "text": "{\"error\":\"route-refused\"}", "expected": null },
+      { "text": "{\"error\":\"route refused\"}", "expected": null },
+      { "text": "{\"error\":\"route_refused\\n\"}", "expected": null },
+      { "text": "{\"error\":\"r\\u00e9fused\"}", "expected": null },
+      { "text": "{\"error\":1}", "expected": null },
+      { "text": "{\"error\":null}", "expected": null },
+      { "text": "{\"error\":true}", "expected": null },
+      { "text": "{\"error\":[\"route_refused\"]}", "expected": null },
+      { "text": "{\"error\":{\"error\":\"route_refused\"}}", "expected": null },
+      {
+        "text": "{\"detail\":{\"error\":\"route_refused\"}}",
+        "expected": null
+      },
+      { "text": "{}", "expected": null },
+      { "text": "null", "expected": null },
+      { "text": "1", "expected": null },
+      { "text": "\"route_refused\"", "expected": null },
+      { "text": "[]", "expected": null },
+      { "text": "[\"route_refused\"]", "expected": null },
+      { "text": "[{\"error\":\"route_refused\"}]", "expected": null },
+      { "text": "", "expected": null },
+      { "text": "unavailable", "expected": null },
+      { "text": "{", "expected": null },
+      { "text": "{\"error\":\"route_refused\"", "expected": null },
+      { "text": "{\"error\":\"route_refused\"}x", "expected": null },
+      {
+        "text": "{\"error\":\"route_refused\",\"detail\":\"",
+        "expected": null
+      },
+      { "text": "﻿{\"error\":\"route_refused\"}", "expected": null }
+    ],
     "sql": {
       "connections": [
         {

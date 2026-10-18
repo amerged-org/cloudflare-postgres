@@ -31,7 +31,9 @@ import {
   DECOY_MAX_FRAMES,
   DECOY_SALT_DOMAIN,
   DECOY_SCRAM_ITERATIONS,
+  REFUSAL_BYTES,
   decoySalt,
+  refusalCode,
 } from "../src/edge-policy.ts";
 
 export function edgeContract() {
@@ -46,6 +48,7 @@ export function edgeContract() {
       DECOY_SCRAM_ITERATIONS,
       MAX_SQL_REQUEST_BYTES,
       MAX_SQL_STATEMENTS,
+      REFUSAL_BYTES,
     },
     wire: {
       routeKeyDomain: ROUTE_TOKEN_NODE_KEY_DOMAIN,
@@ -128,6 +131,7 @@ export async function edgeVectors() {
     });
   return {
     ips: ips.map((ip) => ({ ip, expected: connectionRateKey(ip) })),
+    refusals: refusalVectors(),
     sql: sqlVectors(),
     signing,
     salts: await Promise.all(
@@ -151,6 +155,47 @@ export async function edgeVectors() {
       })),
     ),
   };
+}
+
+/** The bodies of a gateway's refusal, and the error code the Rust Edge must read as TypeScript does. */
+function refusalVectors() {
+  return [
+    '{"error":"route_refused"}',
+    '{"error":"route_refused","detail":"free text the Edge must not log"}',
+    '{"detail":"free text","error":"route_refused"}',
+    ' \n{"error" : "route_refused"}\t\n',
+    '{"error":"a"}',
+    `{"error":"${"a".repeat(64)}"}`,
+    `{"error":"${"a".repeat(65)}"}`,
+    '{"error":"0_9"}',
+    '{"error":"a","error":"b"}',
+    '{"error":""}',
+    '{"error":"Route_Refused"}',
+    '{"error":"route-refused"}',
+    '{"error":"route refused"}',
+    '{"error":"route_refused\\n"}',
+    '{"error":"r\\u00e9fused"}',
+    '{"error":1}',
+    '{"error":null}',
+    '{"error":true}',
+    '{"error":["route_refused"]}',
+    '{"error":{"error":"route_refused"}}',
+    '{"detail":{"error":"route_refused"}}',
+    "{}",
+    "null",
+    "1",
+    '"route_refused"',
+    "[]",
+    '["route_refused"]',
+    '[{"error":"route_refused"}]',
+    "",
+    "unavailable",
+    "{",
+    '{"error":"route_refused"',
+    '{"error":"route_refused"}x',
+    '{"error":"route_refused","detail":"',
+    '\ufeff{"error":"route_refused"}',
+  ].map((text) => ({ text, expected: refusalCode(text) ?? null }));
 }
 
 /** What a TypeScript function of HTTP SQL answers: its value, or the failure it refuses with. */

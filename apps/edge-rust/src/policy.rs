@@ -280,6 +280,18 @@ pub fn limit_failure(limits: &[Limit], outcomes: &[Result<bool, ()>]) -> Option<
         .find(|(_, outcome)| matches!(outcome, Ok(false)))
         .map(|(limit, _)| Failure::new("53300", limit.message))
 }
+/// The error code of a gateway's refusal, `{"error": "<snake_case>"}`; nothing else of its answer
+/// is kept, so no free text reaches a log. A body that is not exactly that has no code.
+/// `refusalCode` in packages/contracts/src/edge-policy.ts holds this to the same vectors.
+pub fn refusal_code(text: &str) -> Option<String> {
+    let answer: Value = serde_json::from_str(text).ok()?;
+    let code = answer.get("error")?.as_str()?;
+    (matches!(code.len(), 1..=64)
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+    .then(|| code.into())
+}
 /// What the Edge itself spent on a request: all of `duration` but the `waits` that were another's,
 /// the client's upload and the gateway's answer. Network transit and the node are not in it.
 pub fn edge_share(duration: u64, waits: &[Option<u64>]) -> u64 {
@@ -312,8 +324,12 @@ pub struct Timings {
     /// The gateway's answer to an HTTP query, from the send to its response head.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_ms: Option<u64>,
+    /// The status of a gateway's answer to an HTTP query, or of its refusal of an upgrade.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_status: Option<u16>,
+    /// The error code of that refusal (`{"error": …}`), when it sent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_error: Option<String>,
     /// When the gateway stage began, for the handler to read; never logged.
     #[serde(skip)]
     pub gateway_started: Option<u64>,

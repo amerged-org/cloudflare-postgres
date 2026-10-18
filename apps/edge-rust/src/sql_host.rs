@@ -165,8 +165,10 @@ async fn forward(
                 })
                 .map_err(|_| SqlFailure::gateway());
         }
-    } else if let Some(body) = response.body() {
-        let _ = JsFuture::from(body.cancel()).await;
+        timings.borrow_mut().gateway_error = policy::refusal_code(&text);
+    } else {
+        let code = gateway::read_refusal(&response).await;
+        timings.borrow_mut().gateway_error = code;
     }
     Err(SqlFailure::unknown_outcome())
 }

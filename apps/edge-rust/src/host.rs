@@ -177,6 +177,20 @@ impl Drop for Timer {
         global.clear_timeout_with_handle(self.id);
     }
 }
+/// Completes after `milliseconds`, or at once if the host cannot set the timer: nothing waits on
+/// a timer that does not run.
+pub async fn sleep(milliseconds: u64) {
+    let (sender, receiver) = oneshot::channel();
+    let sender = RefCell::new(Some(sender));
+    let Ok(_timer) = Timer::new(milliseconds, move || {
+        if let Some(sender) = sender.borrow_mut().take() {
+            let _ = sender.send(());
+        }
+    }) else {
+        return;
+    };
+    let _ = receiver.await;
+}
 pub struct Interrupted {
     receiver: oneshot::Receiver<()>,
     _listener: Listener,

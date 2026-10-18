@@ -191,7 +191,8 @@ async fn upgrade(admit: Admit) -> Result<Upgraded, Failure> {
     let (region, token) = admit.route().await?;
     let started = host::now();
     admit.timings.borrow_mut().gateway_started = Some(started);
-    let connected = gateway::connect(&region, &token, &admit.env, &admit.signal).await;
+    let connected =
+        gateway::connect(&region, &token, &admit.env, &admit.signal, &admit.timings).await;
     admit.timings.borrow_mut().gateway_connect_ms = Some(host::now().saturating_sub(started));
     Ok(Upgraded {
         socket: connected?,

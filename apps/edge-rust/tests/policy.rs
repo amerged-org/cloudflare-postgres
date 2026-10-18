@@ -3,7 +3,7 @@ use pgcf_edge_rust::{
     decoy::{Decoy, derive_salt},
     policy::{
         Admission, Failure, GatewayRegion, Log, Signable, Timings, actor_failure, admission,
-        connection_rate_key, edge_share, limit_failure, limits, routing_hints,
+        connection_rate_key, edge_share, limit_failure, limits, refusal_code, routing_hints,
     },
 };
 use pgcf_native_protocol::{
@@ -493,6 +493,19 @@ fn the_edge_share_is_all_of_a_request_but_the_waits_that_were_anothers() {
     assert_eq!(edge_share(10, &[Some(25)]), 0);
 }
 #[test]
+fn the_typescript_edge_reads_a_gateways_refusal_as_the_rust_edge_does() {
+    let refusals = vectors()["edge"]["refusals"].clone();
+    assert!(refusals.as_array().unwrap().len() > 30);
+    for row in refusals.as_array().unwrap() {
+        let code = refusal_code(row["text"].as_str().unwrap());
+        assert_eq!(
+            serde_json::to_value(code).unwrap(),
+            row["expected"],
+            "{row}"
+        );
+    }
+}
+#[test]
 fn an_interrupted_upgrade_counts_its_pending_wait_as_the_gateways() {
     let mut pending = Timings {
         gateway_started: Some(1_000),
@@ -552,6 +565,28 @@ fn the_log_line_names_the_request_and_every_stage_that_ran_and_no_secret() {
             "outcome": "accepted",
         })
     );
+    // A gateway's refusal is named by its status and error code, and by nothing else of its answer.
+    let refusal = Timings {
+        gateway_connect_ms: Some(4),
+        gateway_status: Some(503),
+        gateway_error: Some("route_refused".into()),
+        ..Timings::default()
+    };
+    let line = Log {
+        event: "conn_admission",
+        cid: "01234567-89ab-4def-8123-0123456789ab",
+        colo: None,
+        hints: Some(&hints),
+        region: Some("eu-test"),
+        duration_ms: 6,
+        edge_ms: 2,
+        isolate_requests: 1,
+        outcome: "08006",
+    }
+    .line(&refusal);
+    assert_eq!(line["gateway_status"], 503);
+    assert_eq!(line["gateway_error"], "route_refused");
+    assert_eq!(line["outcome"], "08006");
     // A request refused before it was routed names nothing it did not learn.
     let refused = Log {
         event: "sql_admission",

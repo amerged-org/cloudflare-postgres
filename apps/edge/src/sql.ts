@@ -10,6 +10,7 @@
  * The password of the connection string goes to the gateway in the request body only; it is
  * never logged, and neither are statements or parameters.
  */
+import { refusalCode } from "@pgcf/contracts/edge-policy";
 import {
   MAX_SQL_REQUEST_BYTES,
   SqlFailure,
@@ -34,7 +35,7 @@ import {
   type AdmissionTimings,
 } from "./admission.ts";
 import type { Env } from "./env.ts";
-import { readRefusal, refusalCode, type GatewayRegion } from "./gateway.ts";
+import { readRefusal, type GatewayRegion } from "./gateway.ts";
 
 /** Milliseconds of each stage that ran, logged with the request. */
 interface Timings extends AdmissionTimings {

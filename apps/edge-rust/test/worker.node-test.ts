@@ -120,6 +120,23 @@ test(
       workers: [
         { config: edgeConfig("rust-edge", "1", 12000) },
         { config: edgeConfig("limited-edge", "2", 1, true, ["7", 1]) },
+        // A generous public limiter beside a binding limiter of one: which of them counted.
+        {
+          config: edgeConfig("binding-limited-edge", "9", 12000, true, [
+            "10",
+            1,
+          ]),
+        },
+        {
+          config: {
+            name: "binding-caller",
+            main: resolve(import.meta.dirname, "binding-caller.ts"),
+            compatibility_date: "2026-10-02",
+            services: ["rust-edge", "limited-edge", "binding-limited-edge"].map(
+              (name) => ({ binding: name, service: name }),
+            ),
+          },
+        },
         { config: edgeConfig("no-actor-edge", "4", 12000, false) },
         {
           config: edgeConfig(
@@ -333,6 +350,16 @@ test(
       };
       const mode = (database: string, value: string) =>
         route(database, "gateway_url=?", gatewayOrigin + "/pg?mode=" + value);
+      // Where a request to `worker` is sent. One without a source address (`ip: null`) arrives as
+      // a call over a service binding does: from the caller Worker, which removes the address the
+      // harness gives every request it sends.
+      const entry = (worker: string, ip: string | null) =>
+        ip === null
+          ? {
+              worker: server.getWorker("binding-caller"),
+              headers: { "X-Target": worker },
+            }
+          : { worker: server.getWorker(worker), headers: {} };
       async function open(
         database: string,
         options: {
@@ -344,22 +371,21 @@ test(
           signal?: AbortSignal;
         } = {},
       ) {
+        const ip = options.ip === undefined ? "192.0.2.1" : options.ip;
+        const via = entry(options.worker ?? "rust-edge", ip);
         const headers = {
           Upgrade: "websocket",
-          ...(options.ip === null
-            ? {}
-            : { "CF-Connecting-IP": options.ip ?? "192.0.2.1" }),
+          ...(ip === null ? {} : { "CF-Connecting-IP": ip }),
+          ...via.headers,
           ...options.headers,
         };
-        const response = await server
-          .getWorker(options.worker ?? "rust-edge")
-          .fetch(
-            origin +
-              "/v2?" +
-              (options.query ??
-                new URLSearchParams({ database, user: options.user ?? "app" })),
-            { headers, signal: options.signal },
-          );
+        const response = await via.worker.fetch(
+          origin +
+            "/v2?" +
+            (options.query ??
+              new URLSearchParams({ database, user: options.user ?? "app" })),
+          { headers, signal: options.signal },
+        );
         assert.equal(response.status, 101);
         assert.ok(response.webSocket);
         const socket = response.webSocket;
@@ -428,6 +454,7 @@ test(
         options: {
           database: string;
           worker?: string;
+          ip?: string | null;
           method?: string;
           connection?: string | null;
           headers?: Record<string, string>;
@@ -437,27 +464,28 @@ test(
           options.connection === undefined
             ? `postgres://app:secret@host.invalid/${options.database}`
             : options.connection;
-        const response = await server
-          .getWorker(options.worker ?? "rust-edge")
-          .fetch(origin + "/sql", {
-            method: options.method ?? "POST",
-            headers: {
-              "CF-Connecting-IP": "192.0.2.1",
-              "Neon-Raw-Text-Output": "true",
-              "Neon-Array-Mode": "true",
-              ...(connection === null
-                ? {}
-                : { "Neon-Connection-String": connection }),
-              ...options.headers,
-            },
-            body:
-              options.method === "GET"
-                ? undefined
-                : typeof body === "string" || body instanceof ReadableStream
-                  ? body
-                  : JSON.stringify(body),
-            ...(body instanceof ReadableStream ? { duplex: "half" } : {}),
-          });
+        const ip = options.ip === undefined ? "192.0.2.1" : options.ip;
+        const via = entry(options.worker ?? "rust-edge", ip);
+        const response = await via.worker.fetch(origin + "/sql", {
+          method: options.method ?? "POST",
+          headers: {
+            ...(ip === null ? {} : { "CF-Connecting-IP": ip }),
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            ...(connection === null
+              ? {}
+              : { "Neon-Connection-String": connection }),
+            ...via.headers,
+            ...options.headers,
+          },
+          body:
+            options.method === "GET"
+              ? undefined
+              : typeof body === "string" || body instanceof ReadableStream
+                ? body
+                : JSON.stringify(body),
+          ...(body instanceof ReadableStream ? { duplex: "half" } : {}),
+        });
         return {
           status: response.status,
           headers: response.headers,
@@ -673,6 +701,46 @@ test(
             ip: "192.0.2.9",
           });
           assert.equal((await stats()).length, 3);
+          // The limiter of service bindings alone decides: beside a public limiter that would
+          // let any number through, the second connect of the same caller is still refused.
+          const generous = { worker: "binding-limited-edge", ip: null };
+          await open(first.database, generous);
+          assert.equal(
+            await sqlstate(await open(first.database, generous)),
+            "53300",
+          );
+          assert.equal((await stats()).length, 4);
+          // The same of HTTP queries, in a bucket of their own.
+          const sent = { database: second.database, ...generous };
+          assert.equal((await query({ query: "SELECT 1" }, sent)).status, 200);
+          assert.equal(
+            (await query({ query: "SELECT 1" }, sent)).json.code,
+            "53300",
+          );
+          assert.equal((await stats()).length, 5);
+        },
+      );
+      await t.test(
+        "an HTTP query counts in limiter buckets of its own, beside the connection's",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          // The public limiter of this Worker lets one connect per address, database and role
+          // through, and the query below comes from the same address to the same database and role.
+          const worker = "limited-edge";
+          await open(database, { worker });
+          const first = await query(
+            { query: "SELECT 1" },
+            { database, worker },
+          );
+          assert.equal(first.status, 200);
+          // Its bucket of its own holds one as well.
+          const second = await query(
+            { query: "SELECT 1" },
+            { database, worker },
+          );
+          assert.equal(second.json.code, "53300");
+          assert.equal((await stats()).length, 2);
         },
       );
       await t.test(
@@ -688,10 +756,13 @@ test(
         },
       );
       await t.test(
-        "the DatabaseActor is got at the configured location hint",
+        "a configured location hint leaves admission working",
         async () => {
           await reset();
           const { database } = await seed();
+          // workerd takes any hint and places nothing by it (a hint of "no-such-place" is admitted
+          // as well), so that the Actor is got at the hint is not observable here, only that
+          // getting it with one works.
           await open(database, { worker: "hinted-edge" });
           assert.equal((await stats()).length, 1);
         },
@@ -906,7 +977,7 @@ test(
         "an HTTP query passes on the gateway's error and never retries a lost answer",
         async () => {
           await reset();
-          const { database } = await seed();
+          const { database, node } = await seed();
           await mode(database, "sql-error");
           const error = await query(
             { query: "SELECT * FROM missing" },
@@ -917,16 +988,40 @@ test(
             error.json,
             failure("42P01", "relation does not exist"),
           );
-          assert.equal((await stats()).length, 1);
-          await reset();
-          await mode(database, "reject");
-          const lost = await query(
-            { query: "INSERT INTO t VALUES (1)" },
-            { database },
+          let rows = await stats();
+          assert.equal(rows.length, 1);
+          // An error the Edge passes on is the client's to read: the log has no error code of it.
+          let line = await logged(
+            "sql_admission",
+            (await claimsOf(rows[0]!.token, node)).cid,
           );
-          assert.equal(lost.status, 400);
-          assert.equal(lost.json.code, "08007");
-          assert.equal((await stats()).length, 1);
+          assert.equal(line.gateway_status, 400);
+          assert.equal("gateway_error" in line, false);
+          // The same of a 400 that is not an error of a statement. The outcome is unknown to
+          // the client, but the log names what the gateway answered, and not its free text.
+          for (const [refusal, status, code] of [
+            ["reject", 503, "route_refused"],
+            ["uncoded-400", 400, "bad_request"],
+          ] as const) {
+            await reset();
+            await mode(database, refusal);
+            const lost = await query(
+              { query: "INSERT INTO t VALUES (1)" },
+              { database },
+            );
+            assert.equal(lost.status, 400);
+            assert.equal(lost.json.code, "08007");
+            rows = await stats();
+            assert.equal(rows.length, 1);
+            line = await logged(
+              "sql_admission",
+              (await claimsOf(rows[0]!.token, node)).cid,
+            );
+            assert.equal(line.outcome, "08007");
+            assert.equal(line.gateway_status, status);
+            assert.equal(line.gateway_error, code);
+            assert.equal(JSON.stringify(line).includes("free text"), false);
+          }
           await reset();
           await route(database, "gateway_binding='MISSING'");
           const unconfigured = await query({ query: "SELECT 1" }, { database });
@@ -1039,46 +1134,85 @@ test(
         "redirect and non-upgrade response fail once without leaking to redirect target",
         async () => {
           await reset();
-          const { database } = await seed();
+          const { database, node } = await seed();
           await mode(database, "redirect");
           assert.equal(await sqlstate(await open(database)), "08006");
           let rows = await stats();
           assert.equal(rows.length, 1);
           assert.equal(rows[0]!.path, "/pg");
+          // The log names the status of a gateway's refusal; a redirect has no error code.
+          let line = await logged(
+            "conn_admission",
+            (await claimsOf(rows[0]!.token, node)).cid,
+          );
+          assert.equal(line.gateway_status, 307);
+          assert.equal("gateway_error" in line, false);
           await reset();
           await mode(database, "reject");
           assert.equal(await sqlstate(await open(database)), "08006");
           rows = await stats();
           assert.equal(rows.length, 1);
+          // The gateway answered with its error code and free text: only the code is logged.
+          line = await logged(
+            "conn_admission",
+            (await claimsOf(rows[0]!.token, node)).cid,
+          );
+          assert.equal(line.outcome, "08006");
+          assert.equal(line.gateway_status, 503);
+          assert.equal(line.gateway_error, "route_refused");
+          assert.equal(JSON.stringify(line).includes("free text"), false);
         },
       );
       await t.test(
-        "a refusal is prompt even when the upstream body cancel never settles",
+        "a refusal is prompt even when the upstream body never ends and its cancel never settles",
         async () => {
           await reset();
-          const { database } = await seed();
+          const { database, node } = await seed();
           await mode(database, "stalled-cancel");
+          // The gateway sends one byte of its refusal and neither ends the body nor lets it be
+          // cancelled: the Edge answers all the same, and logs the status without a code.
+          const promptly = async <T>(answer: Promise<T>) => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              return await Promise.race([
+                answer,
+                new Promise<never>((_, reject) => {
+                  timer = setTimeout(
+                    () =>
+                      reject(new Error("refusal blocked on the upstream body")),
+                    2500,
+                  );
+                }),
+              ]);
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+          };
           const began = Date.now();
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          try {
-            const c = await Promise.race([
-              open(database),
-              new Promise<never>((_, reject) => {
-                timer = setTimeout(
-                  () =>
-                    reject(
-                      new Error("refusal blocked on upstream body cleanup"),
-                    ),
-                  2500,
-                );
-              }),
-            ]);
-            assert.equal(await sqlstate(c), "08006");
-            assert.ok(Date.now() - began < 2500);
-            assert.equal((await stats()).length, 1);
-          } finally {
-            if (timer) clearTimeout(timer);
-          }
+          const c = await promptly(open(database));
+          assert.equal(await sqlstate(c), "08006");
+          assert.ok(Date.now() - began < 2500);
+          let rows = await stats();
+          assert.equal(rows.length, 1);
+          let line = await logged(
+            "conn_admission",
+            (await claimsOf(rows[0]!.token, node)).cid,
+          );
+          assert.equal(line.gateway_status, 503);
+          assert.equal("gateway_error" in line, false);
+          // An HTTP query is answered as promptly.
+          const lost = await promptly(
+            query({ query: "INSERT INTO t VALUES (1)" }, { database }),
+          );
+          assert.equal(lost.json.code, "08007");
+          rows = await stats();
+          assert.equal(rows.length, 2);
+          line = await logged(
+            "sql_admission",
+            (await claimsOf(rows[1]!.token, node)).cid,
+          );
+          assert.equal(line.gateway_status, 503);
+          assert.equal("gateway_error" in line, false);
         },
       );
       await t.test(
