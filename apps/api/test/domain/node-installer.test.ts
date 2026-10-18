@@ -489,12 +489,43 @@ describe("the node firewall before the rescue", () => {
     expect(s.p.rescue).toHaveBeenCalledTimes(1);
   });
 
+  it("sends no rescue while Contabo still applies the firewall to a listed instance, without assigning it again, and goes on once it reports ok", async () => {
+    const s = await started();
+    s.p.firewall.instanceStatus[0]!.status = "processing";
+    await s.drive();
+    expect(s.p.assignFirewall).not.toHaveBeenCalled();
+    expect(s.p.rescue).not.toHaveBeenCalled();
+    expect(await s.addition()).toMatchObject({
+      status: "audited",
+      install_blocker: "node_firewall_unconfirmed",
+    });
+    expect(await tokens(s.a.id)).toBeNull();
+    s.p.firewall.instanceStatus[0]!.status = "ok";
+    await s.drive();
+    expect(s.p.rescue).toHaveBeenCalledTimes(1);
+  });
+
   it("does not assign an instance the firewall already holds", async () => {
     const s = await started();
     await s.drive();
     expect(s.p.getFirewall).toHaveBeenCalledTimes(1);
     expect(s.p.assignFirewall).not.toHaveBeenCalled();
     expect(s.p.rescue).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no install blocker once the firewall is confirmed and the provider rejects the rescue", async () => {
+    const s = await started("rejected", { inbound: [rule("accept", "22")] });
+    await s.drive();
+    expect(await s.addition()).toMatchObject({
+      install_blocker: "node_firewall_unconfirmed",
+    });
+    s.p.firewall.rules.inbound = [];
+    await s.drive();
+    expect(await s.addition()).toMatchObject({
+      status: "failed",
+      failure_code: "bootstrap_failed",
+      install_blocker: null,
+    });
   });
 
   it("takes a rule that only drops traffic for Contabo's final deny", async () => {

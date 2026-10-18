@@ -19,7 +19,7 @@ const refuse = (message: string): never => {
   throw new NodeStateError("conflict", message);
 };
 
-/** Close an untouched audited adoption or record an existing provider cancellation; never mutates the provider. */
+/** Close an untouched audited adoption or record an existing provider cancellation; the cancellation never mutates the provider. */
 export async function cancelAlreadyCancelledProviderAddition(
   env: Env,
   operationId: string,

@@ -16,6 +16,7 @@ import {
   approveNodePurchase,
   claimNodeDispatch,
   configureNodeRegionPolicy,
+  markNodeInstallBlocked,
   nodeRegionOccupiedSlots,
   readNodeAddition,
   recordNodeAudit,
@@ -137,6 +138,23 @@ it("cancels an empty audited adoption and allows a distinct new adoption", async
     observed_at: new Date().toISOString(),
   });
   expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
+});
+
+it("shows no install blocker on an audited adoption that was cancelled while the node firewall was unconfirmed", async () => {
+  const f = await adoptedFixture(),
+    blocked = await markNodeInstallBlocked(
+      env.DB,
+      f.addition,
+      "node_firewall_unconfirmed",
+    );
+  expect(blocked.install_blocker).toBe("node_firewall_unconfirmed");
+  vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(f.actual);
+  const result = await cancelRoute({ ...f, addition: blocked });
+  expect(result.response.status).toBe(200);
+  expect(await result.response.json()).toMatchObject({
+    status: "cancelled",
+    install_blocker: null,
+  });
 });
 
 it("refuses audited adoption cancellation when its server becomes an observed Node during the provider read", async () => {
@@ -374,6 +392,22 @@ it("records an already cancelled paid provider without deleting it, frees only i
     f.addition.intent.operation_id,
   );
   expect(result.terminate).toHaveBeenCalledTimes(1);
+});
+
+it("shows no install blocker on a paid addition whose provider cancellation was recorded while the node firewall was unconfirmed", async () => {
+  const f = await paidFixture(),
+    blocked = await markNodeInstallBlocked(
+      env.DB,
+      f.addition,
+      "node_firewall_unconfirmed",
+    );
+  vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(f.actual);
+  const result = await cancelRoute({ ...f, addition: blocked });
+  expect(result.response.status).toBe(200);
+  expect(await result.response.json()).toMatchObject({
+    status: "cancelled",
+    install_blocker: null,
+  });
 });
 
 it("retains a live provider reservation when its cancellation date is absent or invalid", async () => {

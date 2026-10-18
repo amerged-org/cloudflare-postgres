@@ -143,9 +143,10 @@ function rescueKeys(env: Env): string[] {
  * login on, until the installer turns it off (plan 9.2). So the instance sits behind the operator's
  * Contabo firewall, deny-all inbound (plan 8), before the rescue is requested. The firewall is
  * confirmed when it is active, no inbound rule of it accepts traffic, and a read lists the
- * instance, after one assignment if the first read did not. Contabo applies an assignment on its
- * own time, so an unconfirmed firewall is asked again on the next cycle; a firewall that cannot be
- * read confirms nothing.
+ * instance with the status `ok`, after one assignment if the first read did not list it. Contabo
+ * applies an assignment on its own time and reports the application apart from the list, so an
+ * instance that is listed and not yet `ok` is waited for, not assigned again; an unconfirmed
+ * firewall is asked again on the next cycle; a firewall that cannot be read confirms nothing.
  */
 async function ensureNodeFirewall(
   provider: Pick<ContaboClient, "getFirewall" | "assignFirewall">,
@@ -161,12 +162,17 @@ async function ensureNodeFirewall(
   const closed = (firewall: ContaboFirewall) =>
     firewall.status === "active" &&
     firewall.rules.inbound.every((rule) => rule.action === "drop");
-  const holds = (firewall: ContaboFirewall) =>
+  const listed = (firewall: ContaboFirewall) =>
     firewall.instances.some((held) => held.instanceId === instanceId);
+  const applied = (firewall: ContaboFirewall) =>
+    listed(firewall) &&
+    firewall.instanceStatus.some(
+      (held) => held.instanceId === instanceId && held.status === "ok",
+    );
   try {
     let firewall = await provider.getFirewall(firewallId, request());
     if (!closed(firewall)) return false;
-    if (!holds(firewall)) {
+    if (!listed(firewall)) {
       const assignment = await provider.assignFirewall(
         firewallId,
         instanceId,
@@ -175,7 +181,7 @@ async function ensureNodeFirewall(
       if (assignment.kind !== "accepted") return false;
       firewall = await provider.getFirewall(firewallId, request());
     }
-    return closed(firewall) && holds(firewall);
+    return closed(firewall) && applied(firewall);
   } catch (error) {
     if (error instanceof ContaboError) return false;
     throw error;

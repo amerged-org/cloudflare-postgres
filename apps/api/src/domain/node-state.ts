@@ -990,9 +990,18 @@ export async function markNodeAdditionFailed(
       "conflict",
       "Completed node state cannot be failed",
     );
-  return changed(db, addition, "status='failed',failure_code=?", [code]);
+  return changed(
+    db,
+    addition,
+    "status='failed',failure_code=?,install_blocker=NULL",
+    [code],
+  );
 }
-/** Tombstone only an audited adoption before any provider-host, installation or cluster progress. */
+/**
+ * Tombstone only an audited adoption before the rescue was requested or any cluster progress. The
+ * install cycle may have assigned the server to the node firewall already; that stays (the
+ * operator unassigns it by hand, docs/operations/operator-installation.md).
+ */
 export async function cancelAuditedNodeAdoption(
   db: D1Database,
   addition: NodeAddition,
@@ -1020,7 +1029,7 @@ export async function cancelAuditedNodeAdoption(
   return changed(
     db,
     addition,
-    "status='cancelled',slot_held=0",
+    "status='cancelled',slot_held=0,install_blocker=NULL",
     [],
     `AND status='audited' AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=? AND intent_json=?
       AND dispatch_request_id IS NULL AND requested_instance_id=? AND provider_instance_id=?
@@ -1068,7 +1077,7 @@ export async function cancelProviderCancelledNodeAddition(
   return changed(
     db,
     addition,
-    "status='cancelled',slot_held=0",
+    "status='cancelled',slot_held=0,install_blocker=NULL",
     [],
     `AND status=? AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=?
       AND dispatch_request_id=? AND provider_instance_id=? AND receipt_json=?

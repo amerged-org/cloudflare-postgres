@@ -355,7 +355,7 @@ const ContaboWireEvent = z.strictObject({
   operation_id: OperationId,
   stage: ContaboAccountingStage,
   kind: z.enum(["oauth", "resource"]),
-  method: z.enum(["GET", "POST", "PUT"]),
+  method: z.enum(["GET", "POST"]),
   request_id: z.uuid(),
   wire_id: z.uuid(),
 });
@@ -400,7 +400,7 @@ export class ContaboError extends Error {
     if (status !== undefined) this.status = status;
   }
 }
-export type ContaboMutationResult<T> =
+type MutationResult<T> =
   | {
       kind: "accepted";
       code: "accepted";
@@ -430,7 +430,6 @@ export type ContaboMutationResult<T> =
       status?: number;
       dispatched: true;
     };
-export type MutationResult<T> = ContaboMutationResult<T>;
 export interface ContaboClientOptions {
   clientId: string;
   clientSecret: string;
@@ -853,7 +852,7 @@ export class ContaboClient {
   }
   private async mutation<T>(
     path: string,
-    method: "POST" | "PUT",
+    method: "POST",
     body: string | undefined,
     input: ContaboRequest,
     status: number,
