@@ -354,11 +354,14 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
 fn query(sql: &str) -> Vec<u8> {
     frame(b'Q', format!("{sql}\0").as_bytes())
 }
-fn sqlstate(body: &[u8]) -> String {
+/// The value of the ErrorResponse field `tag` (`C` SQLSTATE, `D` DETAIL, `H` HINT).
+fn error_field(body: &[u8], tag: u8) -> Option<String> {
     body.split(|byte| *byte == 0)
-        .find_map(|field| field.strip_prefix(b"C"))
-        .map(|code| String::from_utf8_lossy(code).into_owned())
-        .unwrap_or_default()
+        .find_map(|field| field.strip_prefix(&[tag]))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+fn sqlstate(body: &[u8]) -> String {
+    error_field(body, b'C').unwrap_or_default()
 }
 impl Client {
     async fn send(&mut self, bytes: Vec<u8>) {
@@ -421,15 +424,25 @@ impl Client {
         let length = i32::from_be_bytes(row.1[2..6].try_into().unwrap()) as usize;
         String::from_utf8(row.1[6..6 + length].to_vec()).unwrap()
     }
-    /// The SQLSTATE of the error the gateway ended the connection with.
-    async fn refused(&mut self) -> String {
+    /// The error the gateway ended the connection with: SQLSTATE, DETAIL and HINT.
+    async fn refusal(&mut self) -> (String, Option<String>, Option<String>) {
         loop {
             match self.message().await {
-                Some((b'E', body)) => return sqlstate(&body),
+                Some((b'E', body)) => {
+                    return (
+                        sqlstate(&body),
+                        error_field(&body, b'D'),
+                        error_field(&body, b'H'),
+                    );
+                }
                 Some(_) => {}
                 None => panic!("closed without an error"),
             }
         }
+    }
+    /// The SQLSTATE of the error the gateway ended the connection with.
+    async fn refused(&mut self) -> String {
+        self.refusal().await.0
     }
     /// Nothing reaches the client within `bound`.
     async fn silent(&mut self, bound: Duration) {
@@ -611,29 +624,45 @@ async fn a_held_wake_reaches_the_unit_the_agent_started_for_it() {
     node.finish().await;
 }
 
+/// The contract's answer to every refused wake: 57P03 with the DETAIL of an admission refusal and
+/// the HINT of its retry hint (`refusals` of node-local.generated.json), the other reasons bare.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refused_wake_ends_its_held_connections_with_57p03() {
+async fn a_refused_wake_ends_its_held_connections_with_the_57p03_the_contract_names() {
     let Some(_bin) = binaries() else { return };
     let mut node = Node::start().await;
     node.table(vec![entry(1, &operation('a'), Mode::Sleeping, None)])
         .await;
-    let wake = operation('w');
-    let mut client = node.upgrade(&ticket(1, 2, &wake)).await.unwrap();
-    client.send(startup()).await;
-    node.receive(|message| matches!(message, FromGateway::Wake { .. }))
-        .await;
-    node.send(ToGateway::WakeResult {
-        result: WakeResult {
-            database: DATABASE.into(),
-            operation: wake,
-            generation: 2,
-            outcome: Outcome::Refused,
-            reason: Some("no_headroom".into()),
-            retry_after_seconds: Some(5),
-            steps_ms: Default::default(),
-        },
-    });
-    assert_eq!(client.refused().await, "57P03");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../packages/contracts/native/node-local.generated.json"
+    ))
+    .unwrap();
+    let refusals = vectors["refusals"].as_array().unwrap();
+    assert!(refusals.len() > 2);
+    for (index, vector) in refusals.iter().enumerate() {
+        let (generation, wake) = (2 + index as u64, operation('w'));
+        let mut client = node
+            .upgrade(&ticket(index + 1, generation, &wake))
+            .await
+            .unwrap();
+        client.send(startup()).await;
+        node.receive(|message| matches!(message, FromGateway::Wake { .. }))
+            .await;
+        node.send(ToGateway::WakeResult {
+            result: WakeResult {
+                database: DATABASE.into(),
+                operation: wake,
+                generation,
+                outcome: Outcome::Refused,
+                reason: Some(vector["reason"].as_str().unwrap().into()),
+                retry_after_seconds: vector["retry_after_seconds"].as_u64().map(|s| s as u32),
+                steps_ms: Default::default(),
+            },
+        });
+        let (code, detail, hint) = client.refusal().await;
+        assert_eq!(code, "57P03", "{vector}");
+        assert_eq!(detail.as_deref(), vector["detail"].as_str(), "{vector}");
+        assert_eq!(hint.as_deref(), vector["hint"].as_str(), "{vector}");
+    }
     node.finish().await;
 }
 

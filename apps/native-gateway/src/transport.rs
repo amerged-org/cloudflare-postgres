@@ -14,7 +14,7 @@ use pgcf_native_protocol::{
     agent::{Mode, Writer},
     constant,
     route::{Keyring, ReplayCache, RouteClaims, valid_websocket_key, verify},
-    startup::{Event, StartupReader, error_response},
+    startup::{Event, StartupReader, error_response_with},
     wake::{self, Outcome, WakeClaims},
 };
 use std::{
@@ -656,11 +656,12 @@ async fn held_state(
     if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
         return Some(Err(HeldEnd::Draining));
     }
-    if held
+    if let Some(result) = held
         .verdict()
-        .is_some_and(|result| result.outcome == Outcome::Refused)
+        .filter(|result| result.outcome == Outcome::Refused)
     {
-        return Some(Err(HeldEnd::Refused));
+        let (detail, hint) = result.refusal_fields();
+        return Some(Err(HeldEnd::Refused { detail, hint }));
     }
     match wake_state(gateway, ticket).await {
         WakeState::Released {
@@ -673,7 +674,11 @@ async fn held_state(
 }
 /// How a held wake connection ended without its release.
 enum HeldEnd {
-    Refused,
+    /// The agent refused the wake; its 57P03 carries the contract's detail and hint.
+    Refused {
+        detail: Option<&'static str>,
+        hint: Option<String>,
+    },
     Bound,
     Stale,
     Draining,
@@ -681,30 +686,38 @@ enum HeldEnd {
 }
 /// Answers a held connection that is not released with its FATAL ErrorResponse.
 async fn end_held(websocket: &mut WebSocket, stages: &mut Stages, end: HeldEnd) {
-    let (held, outcome, state, message) = match end {
-        HeldEnd::Refused => (
+    let (held, outcome, state, message, detail, hint) = match end {
+        HeldEnd::Refused { detail, hint } => (
             "refused",
             "wake_refused",
             "57P03",
             "database is not accepting connections",
+            detail,
+            hint,
         ),
         HeldEnd::Bound => (
             "bound",
             "wake_timeout",
             "57P03",
             "database did not wake in time",
+            None,
+            None,
         ),
         HeldEnd::Stale => (
             "stale",
             "route_stale",
             "57P03",
             "database is not accepting connections",
+            None,
+            None,
         ),
         HeldEnd::Draining => (
             "draining",
             "gateway_draining",
             "08006",
             "gateway restarting",
+            None,
+            None,
         ),
         HeldEnd::ClientClosed => {
             stages.held_outcome = Some("client_closed");
@@ -714,7 +727,7 @@ async fn end_held(websocket: &mut WebSocket, stages: &mut Stages, end: HeldEnd) 
     };
     stages.held_outcome = Some(held);
     stages.outcome = outcome;
-    let _ = send_error(websocket, state, message).await;
+    let _ = send_error_with(websocket, state, message, detail, hint.as_deref()).await;
 }
 /// A wake ticket (route v5) of a database the agent's table has not released: the connection is
 /// upgraded at once, its StartupMessage is read and held, and its wake is queued for the agent. It
@@ -1072,9 +1085,20 @@ fn update(
     );
 }
 async fn send_error(socket: &mut WebSocket, state: &str, message: &str) -> Result<(), Failure> {
+    send_error_with(socket, state, message, None, None).await
+}
+async fn send_error_with(
+    socket: &mut WebSocket,
+    state: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+) -> Result<(), Failure> {
     timeout(
         Duration::from_millis(500),
-        socket.send(Message::Binary(error_response(state, message).into())),
+        socket.send(Message::Binary(
+            error_response_with(state, message, detail, hint).into(),
+        )),
     )
     .await??;
     let _ = timeout(Duration::from_millis(500), socket.close(None)).await;

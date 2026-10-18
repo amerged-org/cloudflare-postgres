@@ -15,7 +15,8 @@ use pgcf_native_gateway::{
 use pgcf_native_protocol::{
     agent::{Database, Mode, Writer},
     route::Keyring,
-    wake, wire,
+    wake::{self, Outcome, WakeResult},
+    wire,
 };
 use pgcf_test_postgres::Directory;
 use serde_json::{Value, json};
@@ -932,6 +933,44 @@ async fn a_wake_ticket_is_held_without_a_dial_until_the_table_releases_the_unit(
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["rows"], json!([["woken"]]));
     assert_eq!(fixture.gateway.wakes.held(DATABASE), 0);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_refused_wake_answers_with_the_detail_and_hint_of_the_contract() {
+    let fixture = Fixture::with(Mode::Sleeping).await;
+    let port = fixture.port;
+    let request = body(PASSWORD, &[("select $1", json!(["woken"]))], None);
+    let answer = tokio::spawn(async move {
+        post(port, &wake_token(25, 2), request.to_string().as_bytes()).await
+    });
+    timeout(Duration::from_secs(5), async {
+        while fixture.gateway.wakes.held(DATABASE) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fixture.gateway.wakes.result(&WakeResult {
+        database: DATABASE.into(),
+        operation: wake_operation(),
+        generation: 2,
+        outcome: Outcome::Refused,
+        reason: Some("no_headroom".into()),
+        retry_after_seconds: Some(5),
+        steps_ms: Default::default(),
+    }));
+    let (status, answer) = answer.await.unwrap();
+    assert_eq!(
+        (status, &answer["code"], &answer["detail"], &answer["hint"]),
+        (
+            400,
+            &json!("57P03"),
+            &json!("node at awake capacity"),
+            &json!("retry after 5 s")
+        ),
+        "{answer}"
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     fixture.stop().await;
 }
 #[tokio::test]

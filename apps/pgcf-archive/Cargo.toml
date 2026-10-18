@@ -17,3 +17,4 @@ path = "src/main.rs"
 
 [dev-dependencies]
 pgcf-test-postgres = { path = "../../packages/test-postgres" }
+serde_json = "=1.0.151"

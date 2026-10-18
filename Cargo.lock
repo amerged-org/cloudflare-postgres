@@ -1316,6 +1316,7 @@ name = "pgcf-archive"
 version = "0.1.0"
 dependencies = [
  "pgcf-test-postgres",
+ "serde_json",
 ]
 
 [[package]]

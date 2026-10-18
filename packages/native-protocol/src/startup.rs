@@ -207,7 +207,23 @@ fn parse(raw: Vec<u8>, minor: u16, rest: Vec<u8>) -> Event {
     }
 }
 pub fn error_response(sqlstate: &str, message: &str) -> Vec<u8> {
-    let body = format!("SFATAL\0VFATAL\0C{sqlstate}\0M{message}\0\0").into_bytes();
+    error_response_with(sqlstate, message, None, None)
+}
+/// A FATAL ErrorResponse with the DETAIL and HINT fields it is given.
+pub fn error_response_with(
+    sqlstate: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+) -> Vec<u8> {
+    let mut body = format!("SFATAL\0VFATAL\0C{sqlstate}\0M{message}\0");
+    for (field, value) in [('D', detail), ('H', hint)] {
+        if let Some(value) = value {
+            body.push_str(&format!("{field}{value}\0"));
+        }
+    }
+    body.push('\0');
+    let body = body.into_bytes();
     let mut result = vec![b'E'];
     result.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     result.extend(body);

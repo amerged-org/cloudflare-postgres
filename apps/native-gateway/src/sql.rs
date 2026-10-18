@@ -77,19 +77,31 @@ struct ErrorBody<'a> {
     message: &'a str,
     code: &'a str,
     severity: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'a str>,
 }
-fn error_body(message: &str, code: &str, severity: &str) -> Vec<u8> {
+fn error_body(
+    message: &str,
+    code: &str,
+    severity: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+) -> Vec<u8> {
     serde_json::to_vec(&ErrorBody {
         message,
         code,
         severity,
+        detail,
+        hint,
     })
     .expect("strings serialize")
 }
 fn refused(outcome: &'static str, code: &str, message: &str) -> Refused {
     Refused {
         outcome,
-        body: error_body(message, code, "ERROR"),
+        body: error_body(message, code, "ERROR", None, None),
     }
 }
 fn too_large() -> Refused {
@@ -188,7 +200,13 @@ fn parse(body: &[u8]) -> Result<Request, Refused> {
 fn authentication_failed() -> Refused {
     Refused {
         outcome: "authentication_failed",
-        body: error_body("password authentication failed", "28P01", "FATAL"),
+        body: error_body(
+            "password authentication failed",
+            "28P01",
+            "FATAL",
+            None,
+            None,
+        ),
     }
 }
 fn begin(transaction: &Transaction) -> String {
@@ -613,11 +631,22 @@ async fn wake(
         if gateway.draining.load(Ordering::Acquire) || *stop.borrow() {
             return Err(refused("gateway_draining", "08006", "gateway restarting"));
         }
-        if held
+        if let Some(result) = held
             .verdict()
-            .is_some_and(|result| result.outcome == Outcome::Refused)
+            .filter(|result| result.outcome == Outcome::Refused)
         {
-            return Err(not_accepting("wake_refused"));
+            // The contract's detail and hint travel with the 57P03, as on a WebSocket.
+            let (detail, hint) = result.refusal_fields();
+            return Err(Refused {
+                outcome: "wake_refused",
+                body: error_body(
+                    "database is not accepting connections",
+                    "57P03",
+                    "ERROR",
+                    detail,
+                    hint.as_deref(),
+                ),
+            });
         }
         match transport::wake_state(gateway, ticket).await {
             WakeState::Released {

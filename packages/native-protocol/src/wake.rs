@@ -341,6 +341,16 @@ pub struct WakeResult {
     pub steps_ms: BTreeMap<String, u64>,
 }
 impl WakeResult {
+    /// The DETAIL and HINT of the 57P03 that answers the connections held for this refused wake.
+    pub fn refusal_fields(&self) -> (Option<&'static str>, Option<String>) {
+        match self.reason.as_deref() {
+            Some(reason) => (
+                refusal_detail(reason),
+                refusal_hint(reason, self.retry_after_seconds),
+            ),
+            None => (None, None),
+        }
+    }
     /// `started`, or `refused` with a reason of `REASONS`. Exactly the refusal that waiting can
     /// undo carries the retry hint.
     pub fn valid(&self) -> bool {
