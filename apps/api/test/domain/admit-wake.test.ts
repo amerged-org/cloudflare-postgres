@@ -327,7 +327,7 @@ it("an awake admission writes nothing durable and parses its snapshot once", asy
         ]),
     );
   const before = await durable();
-  const snapshots = vi.spyOn(DatabaseAdmissionSnapshot, "parse");
+  const snapshots = vi.spyOn(DatabaseAdmissionSnapshot, "safeParse");
   const presences = vi.spyOn(DatabasePresence, "parse");
   for (let attempt = 0; attempt < 3; attempt++)
     expect((await actor(f.id).admitWake(f.id, "app")).ok).toBe(true);
@@ -344,6 +344,48 @@ it("a manual suspension is not wakeable and answers 57P03", async () => {
   });
   expect(await ticket(f.id)).toEqual([]);
   expect(await wakeOperations(f.id)).toBe(0);
+});
+
+it("a stored snapshot of an earlier release is no snapshot: the Actor falls back, and the next publish replaces it", async () => {
+  // Live after the node release: the Actors still held snapshots with cache_capable, roles without
+  // valid_until and no node, so every read of them threw a ZodError and a cron step failed each minute.
+  const f = await sleeper();
+  await runInDurableObject(actor(f.id), (instance, state) => {
+    const stored = state.storage.sql
+      .exec<{ snapshot: string }>(
+        "SELECT snapshot FROM database_snapshot WHERE singleton=1",
+      )
+      .toArray()[0]!;
+    const old = JSON.parse(stored.snapshot) as Record<string, unknown>;
+    delete old.node;
+    old.cache_capable = true;
+    old.roles = [{ name: "app", revision: 1 }];
+    state.storage.sql.exec(
+      "UPDATE database_snapshot SET snapshot=? WHERE singleton=1",
+      JSON.stringify(old),
+    );
+    Reflect.set(instance, "ensureAwake", async () => ({
+      ok: false,
+      sqlstate: "08006",
+    }));
+  });
+  expect(
+    await actor(f.id).admitWake(f.id, "app", {
+      deadline: Date.now() + 1000,
+      waiterId: crypto.randomUUID(),
+    }),
+  ).toEqual({ ok: false, sqlstate: "08006" });
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  await runInDurableObject(actor(f.id), (_instance, state) => {
+    const stored = state.storage.sql
+      .exec<{ snapshot: string }>(
+        "SELECT snapshot FROM database_snapshot WHERE singleton=1",
+      )
+      .toArray()[0]!;
+    expect(
+      DatabaseAdmissionSnapshot.safeParse(JSON.parse(stored.snapshot)).success,
+    ).toBe(true);
+  });
 });
 
 it("a snapshot without wakeable falls back to ensureAwake", async () => {
