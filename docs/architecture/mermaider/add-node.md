@@ -23,7 +23,7 @@ flowchart TD
 ## Sources
 
 - [apps/api/src/domain/node-capacity.ts · placePendingDatabases:37](../../../apps/api/src/domain/node-capacity.ts#L37)
-- [apps/api/src/domain/node-installer.ts · driveNodeInstall:252](../../../apps/api/src/domain/node-installer.ts#L252)
+- [apps/api/src/domain/node-installer.ts · driveNodeInstall:250](../../../apps/api/src/domain/node-installer.ts#L250)
 - [apps/api/src/domain/node-state.ts · claimNodeDispatch:764](../../../apps/api/src/domain/node-state.ts#L764)
 - [apps/api/src/workflows/add-node.ts · dispatchNodeOrder:69](../../../apps/api/src/workflows/add-node.ts#L69)
 - [apps/api/src/workflows/add-node.ts · reconcileNodeProvider:112](../../../apps/api/src/workflows/add-node.ts#L112)

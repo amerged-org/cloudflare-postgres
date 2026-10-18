@@ -84,13 +84,12 @@ it("pins every download by an https URL, a digest and a size", () => {
   expect(FleetReleaseSpec.safeParse(query).success).toBe(false);
 });
 
-it("an uncompressed image pins identical transport and raw bytes, and a raw disk is whole sectors", () => {
+it("an image is always the compressed one, and a raw disk is whole sectors", () => {
   const raw = spec();
   raw.image.format = "raw";
-  expect(FleetReleaseSpec.safeParse(raw).success).toBe(false);
   raw.image.sha256 = raw.image.raw_sha256;
   raw.image.size_bytes = raw.image.raw_bytes;
-  expect(FleetReleaseSpec.safeParse(raw).success).toBe(true);
+  expect(FleetReleaseSpec.safeParse(raw).success).toBe(false);
   const odd = spec();
   odd.image.raw_bytes += 1;
   expect(FleetReleaseSpec.safeParse(odd).success).toBe(false);

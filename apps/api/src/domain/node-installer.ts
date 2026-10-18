@@ -95,8 +95,6 @@ function parametersOf(
   if (origin === undefined) throw new Error("node_api_origin_unconfigured");
   const { image } = spec,
     { v4, v6 } = instance.ipConfig;
-  // The installer decompresses the image itself and has no use for an uncompressed one.
-  if (image.format !== "raw.zst") throw new Error("node_image_not_compressed");
   return {
     imageUrl: image.url,
     imageZstSha256: image.sha256,

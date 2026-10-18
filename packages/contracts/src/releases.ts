@@ -38,31 +38,18 @@ export const FleetReleaseOs = z.strictObject({
   package_lock: FleetPinnedFile,
 });
 
-/** The disk a new node is installed from (plan 9.2); the pull installer downloads it. */
-export const FleetNodeImage = z
-  .strictObject({
-    url: HttpsUrl.refine((value) => {
-      const url = new URL(value);
-      return !url.username && !url.password && !url.search && !url.hash;
-    }),
-    sha256: Sha256,
-    format: z.enum(["raw.zst", "raw"]),
-    size_bytes: Positive,
-    raw_sha256: Sha256,
-    raw_bytes: Positive.refine((value) => value % 512 === 0),
-  })
-  .superRefine((image, context) => {
-    if (
-      image.format === "raw" &&
-      (image.sha256 !== image.raw_sha256 ||
-        image.size_bytes !== image.raw_bytes)
-    )
-      context.addIssue({
-        code: "custom",
-        message:
-          "An uncompressed disk must pin identical transport and raw bytes",
-      });
-  });
+/** The disk a new node is installed from (plan 9.2); the pull installer downloads it, compressed. */
+export const FleetNodeImage = z.strictObject({
+  url: HttpsUrl.refine((value) => {
+    const url = new URL(value);
+    return !url.username && !url.password && !url.search && !url.hash;
+  }),
+  sha256: Sha256,
+  format: z.literal("raw.zst"),
+  size_bytes: Positive,
+  raw_sha256: Sha256,
+  raw_bytes: Positive.refine((value) => value % 512 === 0),
+});
 export type FleetNodeImage = z.infer<typeof FleetNodeImage>;
 
 /**
