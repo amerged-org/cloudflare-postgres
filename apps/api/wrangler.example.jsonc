@@ -34,10 +34,10 @@
     // uses) and, for the node's Tunnel and its hostnames, NODE_GATEWAY_DOMAIN and
     // NODE_GATEWAY_ZONE_ID (see the secrets below). A node whose region has no release assigned
     // waits for one.
-    // NODE_SHELL_HOSTNAME: "true" also gives each node a shell hostname (<node>-ssh.<domain>) on its
-    // Tunnel; any other value, or none (the default), gives none and removes the one a node has.
-    // Keep it off until Cloudflare Access guards the shell: otherwise anyone who can run cloudflared
-    // reaches it.
+    // NODE_SHELL_HOSTNAME: "true" also gives each node a shell hostname (pgcf-shell-<id>.<domain>) on
+    // its Tunnel; any other value, or none (the default), gives none and removes the one a node has.
+    // Keep it off until Cloudflare Access guards the shell (scripts/operations/setup-access.ts
+    // --shell): otherwise anyone who can run cloudflared reaches it.
     // Alternatively set INFRASTRUCTURE_ALERT_WEBHOOK_URL to the receiver's HTTPS endpoint.
     // Import INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN as a private Worker secret.
     "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",

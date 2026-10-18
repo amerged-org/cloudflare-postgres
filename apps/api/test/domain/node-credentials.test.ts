@@ -7,7 +7,7 @@ import {
   parseRouteKeyring,
   serializeRouteKeyring,
 } from "@pgcf/contracts/route-token";
-import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
+import { nodeAdditionHostname, nodeShellHostname } from "@pgcf/contracts/nodes";
 import { cleanupFixtures, fixture, nodeRequest } from "./fixtures.ts";
 import {
   ACCOUNT,
@@ -80,7 +80,7 @@ it("makes the shell hostname of a node only while NODE_SHELL_HOSTNAME is exactly
   vi.stubGlobal("fetch", api.fetcher);
   const hostnames = () => api.records.map((record) => record.name);
   const gateway = `${nodeAdditionHostname(f.node)}.${DOMAIN}`;
-  const shell = `${nodeAdditionHostname(f.node)}-ssh.${DOMAIN}`;
+  const shell = `${nodeShellHostname(f.node)}.${DOMAIN}`;
   const ask = async (variable: string | undefined) => {
     const response = await nodeRequest(f, CREDENTIALS, {
       bindings: { ...configured, NODE_SHELL_HOSTNAME: variable },

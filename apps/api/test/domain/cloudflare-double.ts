@@ -2,7 +2,7 @@
 // The Cloudflare API as the Worker sees it for a node's Tunnel: Tunnels, their configuration and
 // DNS records, kept in memory, answering by method and path, and recording the calls.
 import { expect } from "vitest";
-import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
+import { nodeAdditionHostname, nodeShellHostname } from "@pgcf/contracts/nodes";
 
 export const ACCOUNT = "0123456789abcdef0123456789abcdef";
 export const ZONE = "fedcba9876543210fedcba9876543210";
@@ -12,7 +12,9 @@ export const NODE = "nod_" + "a".repeat(20);
 export const NAME = nodeAdditionHostname(NODE);
 export const DOMAIN = "nodes.example.org";
 export const GATEWAY = `${NAME}.${DOMAIN}`;
-export const SHELL = `${NAME}-ssh.${DOMAIN}`;
+export const SHELL = `${nodeShellHostname(NODE)}.${DOMAIN}`;
+/** What the shell hostname was called before it had a family of its own. */
+export const LEGACY_SHELL = `${NAME}-ssh.${DOMAIN}`;
 export const TUNNEL = "11111111-2222-4333-8444-555555555555";
 
 export interface Tunnel {

@@ -278,8 +278,9 @@ restart never stops a database, because the databases are independent units.
 `cloudflared tunnel --no-autoupdate --protocol quic --metrics 127.0.0.1:20241 run --token-file
 %d/tunnel-token`, with the token from `LoadCredentialEncrypted=` (`--token-file` exists since
 2025.4.0). Ingress goes to the gateway and, once the shell hostname is on, to `ssh://localhost:22`,
-both behind Cloudflare Access. The shell hostname is off until Access exists: the API makes it only
-while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
+both behind Cloudflare Access (`scripts/operations/setup-access.ts`, the operator installation
+runbook). The shell hostname, `pgcf-shell-<id>.<domain>`, is off until its Access application
+exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
 
 ## What the image expects from the agent
 

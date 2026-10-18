@@ -4,6 +4,7 @@ import { newNodeId } from "../src/ids.ts";
 import {
   NodeAdditionRequest,
   nodeAdditionHostname,
+  nodeShellHostname,
   ProviderInstanceId,
   NodeMarkLost,
   NodeLoss,
@@ -250,6 +251,15 @@ it("generates the actual requested hostname from the immutable reserved node ide
   const id = newNodeId();
   expect(nodeAdditionHostname(id)).toBe(`pgcf-node-${id.slice(4)}`);
   expect(nodeAdditionHostname(id).length).toBeLessThanOrEqual(63);
+});
+it("gives the shell a hostname in a family of its own, so no wildcard over the gateways' hostnames covers it", () => {
+  const id = newNodeId();
+  expect(nodeShellHostname(id)).toBe(`pgcf-shell-${id.slice(4)}`);
+  expect(nodeShellHostname(id).length).toBeLessThanOrEqual(63);
+  // pgcf-node-* (the gateways) matches neither the shell nor a name made from the gateway's.
+  expect(nodeShellHostname(id)).not.toMatch(/^pgcf-node-/);
+  expect(nodeAdditionHostname(id)).not.toMatch(/^pgcf-shell-/);
+  expect(() => nodeShellHostname("nod_short")).toThrow();
 });
 it("accepts explicit adoption or configured Contabo order intent without region defaults", () => {
   expect(
