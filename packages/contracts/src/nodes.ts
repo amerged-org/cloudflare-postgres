@@ -355,6 +355,8 @@ export const NodeAddition = z.strictObject({
       "verification_failed",
     ])
     .nullable(),
+  /** Why an audited server has not been sent its installer yet; the next pass asks again. Null outside `audited`. */
+  install_blocker: z.enum(["node_firewall_unconfirmed"]).nullable(),
   created_at: Timestamp,
   updated_at: Timestamp,
 });

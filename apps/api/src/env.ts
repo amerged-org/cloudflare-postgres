@@ -36,7 +36,12 @@ export type Env = Cloudflare.Env & {
   ARCHIVE_BINDINGS?: string;
   ARCHIVE_EU?: R2Bucket;
   ARCHIVE_US?: R2Bucket;
-  BOOTSTRAP_FIREWALL_BINDINGS: string;
+  /**
+   * The Contabo firewall every node sits behind: active, no inbound rule that accepts, created
+   * once by the operator (docs/operations/operator-installation.md). AddNode assigns an instance
+   * it does not list and sends no rescue until it does.
+   */
+  CONTABO_NODE_FIREWALL_ID: string;
   CONTABO_ORDER_DEFAULT_USER: string;
   CONTABO_ORDER_SSH_KEY_IDS: string;
 };

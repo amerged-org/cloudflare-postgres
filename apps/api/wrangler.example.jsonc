@@ -45,7 +45,10 @@
     // Set the same value on the Edge Worker. An existing object never moves.
     "DATABASE_ACTOR_LOCATION_HINT": "weur",
     "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
-    "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",
+    // The id of the Contabo firewall every node sits behind: active, created once with no inbound
+    // rule, as docs/operations/operator-installation.md describes. AddNode sends the installer's
+    // rescue only once the firewall lists the instance.
+    "CONTABO_NODE_FIREWALL_ID": "<CONTABO_NODE_FIREWALL_ID>",
     "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",

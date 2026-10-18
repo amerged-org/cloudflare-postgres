@@ -7,22 +7,25 @@ import {
 import type { NodeAddition } from "@pgcf/contracts/nodes";
 import type { Env } from "../env.ts";
 import {
+  ContaboError,
   contaboClient,
   hasAllocatedContaboHardware,
   type ContaboClient,
+  type ContaboFirewall,
   type ContaboInstance,
 } from "../providers/contabo.ts";
 import { installSources, issueNodeInstall } from "./node-install.ts";
 import {
   markNodeAdditionFailed,
   markNodeBootstrapping,
+  markNodeInstallBlocked,
   readNodeAddition,
 } from "./node-state.ts";
 
 /** The calls the install makes of Contabo (ULTRA plan 9.2). */
 export type InstallProvider = Pick<
   ContaboClient,
-  "getInstance" | "rescue" | "restart"
+  "getInstance" | "getFirewall" | "assignFirewall" | "rescue" | "restart"
 >;
 
 const MIB = 1024 ** 2;
@@ -135,6 +138,56 @@ function rescueKeys(env: Env): string[] {
   return keys;
 }
 
+/**
+ * The rescue system runs sshd on the public port 22, and Contabo's own cloud-config turns password
+ * login on, until the installer turns it off (plan 9.2). So the instance sits behind the operator's
+ * Contabo firewall, deny-all inbound (plan 8), before the rescue is requested. The firewall is
+ * confirmed when it is active, no inbound rule of it accepts traffic, and a read lists the
+ * instance with the status `ok`, after one assignment if the first read did not list it. Contabo
+ * applies an assignment on its own time and reports the application apart from the list, so an
+ * instance that is listed and not yet `ok` is waited for, not assigned again; an unconfirmed
+ * firewall is asked again on the next cycle; a firewall that cannot be read confirms nothing.
+ */
+async function ensureNodeFirewall(
+  provider: Pick<ContaboClient, "getFirewall" | "assignFirewall">,
+  firewallId: string,
+  instanceId: string,
+  operationId: string,
+): Promise<boolean> {
+  const request = () => ({
+    requestId: crypto.randomUUID(),
+    accounting: { operation_id: operationId, stage: "firewall" as const },
+  });
+  // A rule that drops admits nothing; Contabo may report its final deny as one.
+  const closed = (firewall: ContaboFirewall) =>
+    firewall.status === "active" &&
+    firewall.rules.inbound.every((rule) => rule.action === "drop");
+  const listed = (firewall: ContaboFirewall) =>
+    firewall.instances.some((held) => held.instanceId === instanceId);
+  const applied = (firewall: ContaboFirewall) =>
+    listed(firewall) &&
+    firewall.instanceStatus.some(
+      (held) => held.instanceId === instanceId && held.status === "ok",
+    );
+  try {
+    let firewall = await provider.getFirewall(firewallId, request());
+    if (!closed(firewall)) return false;
+    if (!listed(firewall)) {
+      const assignment = await provider.assignFirewall(
+        firewallId,
+        instanceId,
+        request(),
+      );
+      if (assignment.kind !== "accepted") return false;
+      firewall = await provider.getFirewall(firewallId, request());
+    }
+    return closed(firewall) && applied(firewall);
+  } catch (error) {
+    if (error instanceof ContaboError) return false;
+    throw error;
+  }
+}
+
 async function startInstall(
   env: Env,
   addition: NodeAddition,
@@ -155,6 +208,17 @@ async function startInstall(
     accounting: { operation_id: operation, stage: "inspection" },
   });
   if (!hasAllocatedContaboHardware(instance)) return;
+  if (
+    !(await ensureNodeFirewall(
+      provider,
+      env.CONTABO_NODE_FIREWALL_ID,
+      instance.id,
+      operation,
+    ))
+  ) {
+    await markNodeInstallBlocked(env.DB, addition, "node_firewall_unconfirmed");
+    return;
+  }
   const keys = rescueKeys(env);
   const tokens = await issueNodeInstall(env, {
     node_id: nodeId,

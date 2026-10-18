@@ -46,6 +46,38 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   hostname is reachable by anyone who can run cloudflared.
 - `CONTABO_ORDER_SSH_KEY_IDS` also names the keys the provider's rescue action wants beside the
   installer; the installer itself uses none.
+- `CONTABO_NODE_FIREWALL_ID` names the Contabo firewall every node sits behind (plan 8). AddNode
+  requests the rescue only once that firewall is `active`, has no inbound rule that accepts and
+  lists the instance with the status `ok`, because the rescue system's `sshd` is reachable on the
+  public port 22 until the installer turns password login off. Without the firewall no node gets
+  its installer; create it once, as below.
+
+### The node firewall
+
+Create the firewall once, in the Contabo customer control panel or with `POST /v1/firewalls` and
+the body `{"name":"pgcf-nodes","status":"active","rules":{"inbound":[]}}`: active, with no inbound
+rule. A firewall that no rule opens admits no inbound connection, and the pull install and the
+node's Tunnel only connect outward, so nothing needs to be opened. Contabo lists the firewall as
+included with every VPS (contabo.com/blog/contabo-firewall); confirm that on the account first,
+because a new paid resource needs the owner's explicit, costed go. Put the firewall's id in the
+`CONTABO_NODE_FIREWALL_ID` Worker variable (an identifier, not a secret) and deploy.
+
+- Assign a node that exists already, such as EU1, to the firewall by hand before AddNode runs for
+  it. AddNode finds it listed and does not assign it again.
+- AddNode assigns any other instance itself, then reads the firewall back. Contabo applies an
+  assignment on its own time, so the first read may not list the instance yet, or list it with a
+  status other than `ok` (`processing`); the next cycle reads again and does not assign it twice.
+- AddNode never takes an instance off the firewall. An addition that is cancelled or fails after
+  the assignment leaves the instance behind it, and an adopted server that served inbound traffic
+  before loses it. Unassign such a server in the Contabo customer control panel.
+- While the firewall is not confirmed the addition stays `audited`, no rescue is requested and the
+  addition's `install_blocker` reads `node_firewall_unconfirmed`. The cause is one of: the variable
+  is unset or wrong, or the provider cannot be read; the firewall is not `active`; it has a rule
+  that accepts (a rule that drops is fine); the instance is not listed yet, or listed with a status
+  other than `ok`, and stays so (`error_processing`). Fix the cause; AddNode asks again on every
+  cycle and starts the install when the firewall is confirmed.
+- To verify an install, try a TCP connect to port 22 of the instance's public IPv4 address from
+  outside during the rescue and after the reboot. Both must time out.
 
 ## Edge Worker
 
