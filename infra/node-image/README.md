@@ -49,7 +49,7 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
   runs `apt-get update` against the live `trixie-security` and `trixie-updates` suites of
   `deb.debian.org` and `trixie-pgdg` of `apt.postgresql.org`, verified with the container's
   `debian-archive-keyring` and with `keys/pgdg.asc` for the locked fingerprint. It prints
-  `name locked available suite` for every locked package (the `.deb` list and `extra`) that one of
+  `name locked available suite` for every package in the lock (`packages` and `extra`) that one of
   these suites lists at a newer Debian version, and exits 1 if there is any. Nothing is installed or
   written to the lock; the remedy is `resolve` with a newer snapshot (the first
   [snapshot.debian.org](https://snapshot.debian.org/archive/debian-security/) timestamp whose
