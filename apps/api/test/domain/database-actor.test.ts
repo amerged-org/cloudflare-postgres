@@ -220,7 +220,6 @@ it("only a validated management seed for the exact actor creates its persistent 
   await actor(id).seed(snapshot);
   expect(count()).toBe(0);
   expect(await applicationTables(id)).toEqual([
-    "database_activity",
     "database_presence",
     "database_wake",
   ]);

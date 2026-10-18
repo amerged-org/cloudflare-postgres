@@ -19,7 +19,7 @@ import { roleRevisionHash } from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
 import { powerTransitionStatements } from "./domain/lifecycle.ts";
 import { hintDatabases } from "./domain/node-hints.ts";
-import { effectiveSleepAfterSql, type DatabaseRow } from "./domain/rows.ts";
+import type { DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 import {
   AdmissionMutationIntent,
@@ -445,9 +445,6 @@ export class DatabaseActor extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_wake(singleton INTEGER PRIMARY KEY CHECK(singleton=1),operation TEXT NOT NULL,revision INTEGER NOT NULL,hint_claimed INTEGER NOT NULL CHECK(hint_claimed IN(0,1)))",
     );
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS database_activity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL,observed_at TEXT NOT NULL,last_activity_at TEXT NOT NULL,active_connections INTEGER NOT NULL)",
-    );
     this.hasSchema = true;
   }
   private identity(id: string): void {
@@ -458,9 +455,9 @@ export class DatabaseActor extends DurableObject<Env> {
     this.hasSchema ??=
       this.ctx.storage.sql
         .exec<{ count: number }>(
-          "SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN('database_presence','database_wake','database_activity')",
+          "SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN('database_presence','database_wake')",
         )
-        .toArray()[0]!.count === 3;
+        .toArray()[0]!.count === 2;
     if (!this.hasSchema) return undefined;
     const row = this.ctx.storage.sql
       .exec<{
@@ -1455,186 +1452,6 @@ export class DatabaseActor extends DurableObject<Env> {
         timer = setTimeout(resolve, milliseconds);
       }),
     ]).finally(() => clearTimeout(timer));
-  }
-  /** Trusted gateway activity RPC; absence of authenticated measurements never starts an idle intent. */
-  async recordActivity(databaseId: string, value: unknown): Promise<boolean> {
-    this.identity(DatabaseId.parse(databaseId));
-    if (!this.presence() || this.presence()!.deleted) return false;
-    const parsed = z
-      .strictObject({
-        revision: z.number().int().positive(),
-        observed_at: Timestamp,
-        last_activity_at: Timestamp,
-        active_connections: z.number().int().nonnegative().max(1_000_000),
-      })
-      .safeParse(value);
-    if (!parsed.success) return false;
-    const activity = parsed.data,
-      now = Date.now();
-    if (
-      Date.parse(activity.observed_at) > now + 5000 ||
-      Date.parse(activity.observed_at) < now - 30_000 ||
-      activity.last_activity_at > activity.observed_at
-    )
-      return false;
-    // The report of every ready database comes through here every few seconds: its read of the row
-    // is not made inside the gate, where a slow one would hold every other event of the database.
-    // A report of a generation that has moved on is stored harmlessly: whoever uses it compares its
-    // revision with the row's.
-    try {
-      const current = await this.env.DB.prepare(
-        "SELECT generation FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=? AND d.deleted_at IS NULL AND p.deleted_at IS NULL",
-      )
-        .bind(databaseId)
-        .first<{ generation: number }>();
-      if (current?.generation !== activity.revision) return false;
-    } catch {
-      return false;
-    }
-    return this.gate("recordActivity", async () => {
-      try {
-        return (
-          this.ctx.storage.sql.exec(
-            "INSERT INTO database_activity(singleton,revision,observed_at,last_activity_at,active_connections) VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,observed_at=excluded.observed_at,last_activity_at=excluded.last_activity_at,active_connections=excluded.active_connections WHERE excluded.revision>database_activity.revision OR (excluded.revision=database_activity.revision AND excluded.observed_at>database_activity.observed_at AND excluded.last_activity_at>=database_activity.last_activity_at)",
-            activity.revision,
-            activity.observed_at,
-            activity.last_activity_at,
-            activity.active_connections,
-          ).rowsWritten === 1
-        );
-      } catch {
-        return false;
-      }
-    });
-  }
-
-  /**
-   * A refusal that needs no gate: no current report, a row that moved on, or a database busy or
-   * idle for less than its sleep threshold. Undefined when the database may be idle.
-   */
-  private async idleRefusal(
-    databaseId: string,
-    revision: number,
-  ): Promise<
-    | { ok: false; reason: "activity_unavailable" | "not_idle" | "changed" }
-    | undefined
-  > {
-    const activity = this.ctx.storage.sql
-      .exec<{
-        revision: number;
-        observed_at: string;
-        last_activity_at: string;
-        active_connections: number;
-      }>("SELECT * FROM database_activity WHERE singleton=1")
-      .toArray()[0];
-    if (
-      !activity ||
-      activity.revision !== revision ||
-      Date.parse(activity.observed_at) < Date.now() - 30_000
-    )
-      return { ok: false, reason: "activity_unavailable" };
-    const row = await this.env.DB.prepare(
-      `SELECT d.*,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? AND d.deleted_at IS NULL`,
-    )
-      .bind(databaseId)
-      .first<DatabaseRow & { effective_sleep_after_seconds: number | null }>();
-    if (
-      !row ||
-      row.generation !== revision ||
-      row.desired_state !== "running" ||
-      row.observed_state !== "ready" ||
-      row.observed_generation !== revision ||
-      row.observed_power !== "awake"
-    )
-      return { ok: false, reason: "changed" };
-    if (
-      activity.active_connections !== 0 ||
-      row.effective_sleep_after_seconds === null ||
-      Date.now() - Date.parse(activity.last_activity_at) <
-        row.effective_sleep_after_seconds * 1000
-    )
-      return { ok: false, reason: "not_idle" };
-    return undefined;
-  }
-
-  async requestIdle(
-    databaseId: string,
-    revision: number,
-  ): Promise<
-    | { ok: true; operation: string; revision: number }
-    | { ok: false; reason: "activity_unavailable" | "not_idle" | "changed" }
-  > {
-    this.identity(DatabaseId.parse(databaseId));
-    if (!this.presence() || this.presence()!.deleted)
-      return { ok: false, reason: "changed" };
-    // Most probes find nothing to do. Their answer is given before the gate, from the report in the
-    // Actor's own storage and one read of the row; a database that may be idle takes the gate,
-    // which decides on fresh reads as before.
-    const early = await this.idleRefusal(databaseId, revision);
-    if (early) return early;
-    return this.gate("requestIdle", async () => {
-      const activity = this.ctx.storage.sql
-        .exec<{
-          revision: number;
-          observed_at: string;
-          last_activity_at: string;
-          active_connections: number;
-        }>("SELECT * FROM database_activity WHERE singleton=1")
-        .toArray()[0];
-      if (
-        !activity ||
-        activity.revision !== revision ||
-        Date.parse(activity.observed_at) < Date.now() - 30_000
-      )
-        return { ok: false, reason: "activity_unavailable" };
-      const row = await this.env.DB.prepare(
-        `SELECT d.*,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? AND d.deleted_at IS NULL`,
-      )
-        .bind(databaseId)
-        .first<
-          DatabaseRow & { effective_sleep_after_seconds: number | null }
-        >();
-      if (
-        !row ||
-        row.generation !== revision ||
-        row.desired_state !== "running" ||
-        row.observed_state !== "ready" ||
-        row.observed_generation !== revision ||
-        row.observed_power !== "awake"
-      )
-        return { ok: false, reason: "changed" };
-      if (
-        activity.active_connections !== 0 ||
-        row.effective_sleep_after_seconds === null ||
-        Date.now() - Date.parse(activity.last_activity_at) <
-          row.effective_sleep_after_seconds * 1000
-      )
-        return { ok: false, reason: "not_idle" };
-      const operation = newOperationId(),
-        now = new Date().toISOString();
-      const result = await withAdmissionMutation(
-        this.env,
-        [databaseId],
-        async (mutation) =>
-          mutation.batch(
-            powerTransitionStatements(
-              this.env.DB,
-              row,
-              "hibernate",
-              operation,
-              now,
-              undefined,
-              mutation.guard(databaseId),
-            ),
-          ),
-        undefined,
-        this.localAdmissionActor(databaseId),
-      );
-      if (result[0]!.meta.changes !== 1)
-        return { ok: false, reason: "changed" };
-      await hintDatabases(this.env, [databaseId]).catch(() => 0);
-      return { ok: true, operation, revision: revision + 1 };
-    });
   }
   override async fetch(): Promise<Response> {
     return new Response(null, { status: 404 });

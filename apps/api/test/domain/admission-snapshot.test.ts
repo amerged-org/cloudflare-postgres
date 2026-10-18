@@ -82,47 +82,30 @@ async function requireActorPowerFence(id: string) {
   );
 }
 
-it("the capable Actor fences its actual idle hibernation before changing desired power", async () => {
+it("fences the idle sleep a node reports before changing desired power", async () => {
   const f = await admissionSnapshotFixture();
   expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
-  await env.DB.prepare(
-    "UPDATE size_classes SET sleep_after_seconds=60 WHERE id=?",
-  )
-    .bind(f.size)
-    .run();
-  expect(
-    await actorFor(f.id).recordActivity(f.id, {
-      revision: f.generation,
-      observed_at: new Date().toISOString(),
-      last_activity_at: new Date(Date.now() - 120000).toISOString(),
-      active_connections: 0,
-    }),
-  ).toBe(true);
   await requireActorPowerFence(f.id);
   try {
-    const result = await actorFor(f.id).requestIdle(f.id, f.generation);
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error("fixture idle power transition refused");
-    expect(result.revision).toBe(f.generation + 1);
-    expect(
-      await env.DB.prepare(
-        "SELECT desired_state,generation,suspension_reason,power_operation FROM databases WHERE id=?",
-      )
-        .bind(f.id)
-        .first(),
-    ).toEqual({
+    expect((await report(f, f.id, f.generation, "asleep")).status).toBe(200);
+    const row = (await env.DB.prepare(
+      "SELECT desired_state,generation,suspension_reason,power_operation FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first<{ generation: number; power_operation: string }>())!;
+    expect(row).toEqual({
       desired_state: "suspended",
-      generation: result.revision,
+      generation: f.generation + 1,
       suspension_reason: "idle",
-      power_operation: result.operation,
+      power_operation: expect.any(String),
     });
     expect(
       await env.DB.prepare(
         "SELECT kind,generation FROM operations WHERE id=? AND database_id=?",
       )
-        .bind(result.operation, f.id)
+        .bind(row.power_operation, f.id)
         .first(),
-    ).toEqual({ kind: "database.hibernate", generation: result.revision });
+    ).toEqual({ kind: "database.hibernate", generation: f.generation + 1 });
     expect(
       await env.DB.prepare(
         "SELECT admission_revision,route_revision,mutation_id,mutation_outcome FROM database_admission_epochs WHERE database_id=?",

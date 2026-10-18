@@ -283,6 +283,29 @@ describe("the desired page of a node", () => {
     expect((await nodeRequest(f, "/node/v1/desired?limit=0")).status).toBe(400);
   });
 
+  it("carries the effective idle time: the database's own, else its class's, else none", async () => {
+    const f = await fixture();
+    const db = await served(f);
+    const set = (
+      table: "databases" | "size_classes",
+      id: string,
+      value: number | null,
+    ) =>
+      env.DB.prepare(`UPDATE ${table} SET sleep_after_seconds=? WHERE id=?`)
+        .bind(value, id)
+        .run();
+    const idle = async () => (await entry(f, db.id))!.sleep_after_seconds;
+    expect(await idle()).toBeNull();
+    await set("size_classes", f.size, 1800);
+    expect(await idle()).toBe(1800);
+    await set("databases", db.id, 600);
+    expect(await idle()).toBe(600);
+    await set("size_classes", f.size, null);
+    expect(await idle()).toBe(600);
+    await set("databases", db.id, null);
+    expect(await idle()).toBeNull();
+  });
+
   it("serves the databases of its own node only", async () => {
     const f = await fixture();
     const other = await fixture();

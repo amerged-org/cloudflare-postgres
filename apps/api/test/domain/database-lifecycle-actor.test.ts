@@ -33,29 +33,9 @@ async function ready() {
   await actor(id).seed((await readDatabasePresence(env.DB, id))!);
   return { ...f, id };
 }
+/** The node puts the ready database to sleep after its idle time and reports the proven sleep. */
 async function idle(f: Awaited<ReturnType<typeof ready>>) {
-  await env.DB.prepare(
-    "UPDATE size_classes SET sleep_after_seconds=60 WHERE id=?",
-  )
-    .bind(f.size)
-    .run();
-  const now = new Date().toISOString();
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: 1,
-      observed_at: now,
-      last_activity_at: new Date(Date.now() - 120_000).toISOString(),
-      active_connections: 0,
-    }),
-  ).toBe(true);
-  const result = await actor(f.id).requestIdle(f.id, 1);
-  expect(result.ok).toBe(true);
-  const row = await env.DB.prepare(
-    "SELECT generation,power_operation FROM databases WHERE id=?",
-  )
-    .bind(f.id)
-    .first<{ generation: number; power_operation: string }>();
-  expect((await report(f, f.id, row!.generation, "asleep")).status).toBe(200);
+  expect((await report(f, f.id, 1, "asleep")).status).toBe(200);
 }
 async function untilWake(id: string, generation = 3) {
   for (let i = 0; i < 100; i++) {
@@ -584,88 +564,6 @@ it("expires or cancels waiters and stops shared polling when the final waiter le
   );
 });
 
-it("sleeps after the database's own idle time, else its class's, else never", async () => {
-  const f = await ready();
-  const set = (
-    table: "databases" | "size_classes",
-    id: string,
-    value: number | null,
-  ) =>
-    env.DB.prepare(`UPDATE ${table} SET sleep_after_seconds=? WHERE id=?`)
-      .bind(value, id)
-      .run();
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: 1,
-      observed_at: new Date().toISOString(),
-      last_activity_at: new Date(Date.now() - 120_000).toISOString(),
-      active_connections: 0,
-    }),
-  ).toBe(true);
-  await set("size_classes", f.size, 60);
-  await set("databases", f.id, 600);
-  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
-    ok: false,
-    reason: "not_idle",
-  });
-  await set("size_classes", f.size, 1800);
-  await set("databases", f.id, null);
-  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
-    ok: false,
-    reason: "not_idle",
-  });
-  // A class without a value is always warm; a database's own value still sleeps it.
-  await set("size_classes", f.size, null);
-  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
-    ok: false,
-    reason: "not_idle",
-  });
-  await set("databases", f.id, 60);
-  expect((await actor(f.id).requestIdle(f.id, 1)).ok).toBe(true);
-});
-
-it("requires fresh authenticated zero-connection activity", async () => {
-  const f = await ready();
-  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
-    ok: false,
-    reason: "activity_unavailable",
-  });
-  const now = new Date().toISOString();
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: 2,
-      observed_at: now,
-      last_activity_at: now,
-      active_connections: 0,
-    }),
-  ).toBe(false);
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: 1,
-      observed_at: new Date(Date.now() - 60_000).toISOString(),
-      last_activity_at: now,
-      active_connections: 0,
-    }),
-  ).toBe(false);
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: 1,
-      observed_at: now,
-      last_activity_at: now,
-      active_connections: 1,
-    }),
-  ).toBe(true);
-  expect(await actor(f.id).requestIdle(f.id, 1)).toEqual({
-    ok: false,
-    reason: "not_idle",
-  });
-  expect(
-    await env.DB.prepare("SELECT generation FROM databases WHERE id=?")
-      .bind(f.id)
-      .first("generation"),
-  ).toBe(1);
-});
-
 it("current role revocation rejects a waiting caller even after an exact ready observation", async () => {
   const f = await ready();
   await idle(f);
@@ -775,35 +673,6 @@ it("a deadline bounds even a stalled authoritative read without manufacturing re
       prepare.mockRestore();
     }
   });
-});
-
-it("an idle connect supersedes an unknown pending shutdown without claiming it awake", async () => {
-  const f = await ready();
-  await env.DB.prepare(
-    "UPDATE size_classes SET sleep_after_seconds=60 WHERE id=?",
-  )
-    .bind(f.size)
-    .run();
-  const now = new Date().toISOString();
-  await actor(f.id).recordActivity(f.id, {
-    revision: 1,
-    observed_at: now,
-    last_activity_at: new Date(Date.now() - 120000).toISOString(),
-    active_connections: 0,
-  });
-  const sleep = await actor(f.id).requestIdle(f.id, 1);
-  expect(sleep.ok).toBe(true);
-  const pending = actor(f.id).ensureAwake(f.id, "app", {
-    deadline: Date.now() + 3000,
-  });
-  await untilWake(f.id);
-  expect(
-    await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
-      .bind(f.id)
-      .first("observed_state"),
-  ).toBe("provisioning");
-  await report(f, f.id, 3);
-  expect((await pending).ok).toBe(true);
 });
 
 it("manual suspension can claim an already verified idle sleeper and keeps connect auto-wake disabled", async () => {

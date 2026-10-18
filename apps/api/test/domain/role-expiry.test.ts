@@ -41,35 +41,14 @@ async function createRole(
   await report(f, f.id, generation!);
   await actor(f.id).seed((await readDatabasePresence(env.DB, f.id))!);
 }
-/** Puts the ready database to idle sleep through the real activity and idle path. */
+/** The node puts the ready database to sleep after its idle time and reports the proven sleep. */
 async function sleep(f: Awaited<ReturnType<typeof ready>>) {
-  await env.DB.prepare(
-    "UPDATE size_classes SET sleep_after_seconds=60 WHERE id=?",
-  )
-    .bind(f.size)
-    .run();
   const row = (await env.DB.prepare(
     "SELECT generation FROM databases WHERE id=?",
   )
     .bind(f.id)
     .first<{ generation: number }>())!;
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: row.generation,
-      observed_at: new Date().toISOString(),
-      last_activity_at: new Date(Date.now() - 120_000).toISOString(),
-      active_connections: 0,
-    }),
-  ).toBe(true);
-  expect((await actor(f.id).requestIdle(f.id, row.generation)).ok).toBe(true);
-  const sleeping = (await env.DB.prepare(
-    "SELECT generation,power_operation FROM databases WHERE id=?",
-  )
-    .bind(f.id)
-    .first<{ generation: number; power_operation: string }>())!;
-  expect((await report(f, f.id, sleeping.generation, "asleep")).status).toBe(
-    200,
-  );
+  expect((await report(f, f.id, row.generation, "asleep")).status).toBe(200);
 }
 const wakes = async (id: string) =>
   env.DB.prepare(

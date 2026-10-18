@@ -18,26 +18,8 @@ export async function sleeping() {
   const id = created.database.id;
   await report(f, id, 1);
   await actor(id).seed((await readDatabasePresence(env.DB, id))!);
-  await env.DB.prepare(
-    "UPDATE size_classes SET sleep_after_seconds=60 WHERE id=?",
-  )
-    .bind(f.size)
-    .run();
-  expect(
-    await actor(id).recordActivity(id, {
-      revision: 1,
-      observed_at: new Date().toISOString(),
-      last_activity_at: new Date(Date.now() - 120_000).toISOString(),
-      active_connections: 0,
-    }),
-  ).toBe(true);
-  expect((await actor(id).requestIdle(id, 1)).ok).toBe(true);
-  const row = (await env.DB.prepare(
-    "SELECT generation,power_operation FROM databases WHERE id=?",
-  )
-    .bind(id)
-    .first<{ generation: number; power_operation: string }>())!;
-  expect((await report(f, id, row.generation, "asleep")).status).toBe(200);
+  // The node puts the idle database to sleep on its own and reports the proven sleep.
+  expect((await report(f, id, 1, "asleep")).status).toBe(200);
   return { ...f, id };
 }
 export async function untilWake(id: string) {
