@@ -173,6 +173,52 @@ it("drops the releases of the Talos spec and the per-node release tables", () =>
   ).toEqual([]);
 });
 
+it("gives a node the columns of its hello and drops the releases that state no OS facts", () => {
+  populate();
+  for (const name of migrations.filter((v) => v >= "0063" && v < "0072"))
+    apply(name);
+  run(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES('old','{}',?,?)",
+    "b".repeat(64),
+    NOW,
+  );
+  run(
+    "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES('eu-test','old',1,?)",
+    NOW,
+  );
+  apply("0072_node_os.sql");
+  const count = (table: string) =>
+    db.prepare(`SELECT count(*) n FROM ${table}`).get();
+  expect(count("fleet_releases")).toEqual({ n: 0 });
+  expect(count("fleet_region_releases")).toEqual({ n: 0 });
+  // The node keeps its row, with nothing reported yet.
+  expect(
+    db
+      .prepare(
+        "SELECT os_boot_id,os_booted_at,os_kernel_release,os_packages_sha256 FROM nodes WHERE id=?",
+      )
+      .get(node),
+  ).toEqual({
+    os_boot_id: null,
+    os_booted_at: null,
+    os_kernel_release: null,
+    os_packages_sha256: null,
+  });
+  const report = (column: string, value: string) =>
+    run(`UPDATE nodes SET ${column}=? WHERE id=?`, value, node);
+  report("os_boot_id", crypto.randomUUID());
+  report("os_booted_at", NOW);
+  report("os_kernel_release", "6.12.113+deb13-amd64");
+  report("os_packages_sha256", "a".repeat(64));
+  for (const [column, value] of [
+    ["os_boot_id", "boot"],
+    ["os_booted_at", "yesterday"],
+    ["os_kernel_release", "k".repeat(65)],
+    ["os_packages_sha256", "A".repeat(64)],
+  ] as const)
+    expect(() => report(column, value), column).toThrow(/CHECK/);
+});
+
 it("widens the alert kinds with the refused enrollment and keeps the episodes", () => {
   populate();
   apply("0063_node_link.sql");

@@ -794,6 +794,52 @@ describe("what a node reports", () => {
     ).toBe(false);
   });
 
+  it("says hello with the boot and the operating system of the node, and refuses a hello without them", () => {
+    const os = {
+      boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+      booted_at: now,
+      kernel_release: "6.12.111+deb13-amd64",
+      packages_sha256: "a".repeat(64),
+    };
+    const hello = {
+      type: "hello",
+      protocol: 1,
+      agent_version: "0.1.0",
+      release_id: "release-25",
+      os,
+    };
+    expect(AgentLinkMessage.safeParse(hello).success).toBe(true);
+    expect(
+      AgentLinkMessage.safeParse({ ...hello, os: undefined }).success,
+    ).toBe(false);
+    expect(AgentLinkMessage.safeParse({ ...hello, os: null }).success).toBe(
+      false,
+    );
+    for (const change of [
+      { boot_id: "not-a-uuid" },
+      { booted_at: "2026-10-17T12:00:00Z" },
+      { kernel_release: "" },
+      { kernel_release: "k".repeat(65) },
+      { kernel_release: "6.12 amd64" },
+      { packages_sha256: "A".repeat(64) },
+      { packages_sha256: "a".repeat(63) },
+      { extra: 1 },
+    ])
+      expect(
+        AgentLinkMessage.safeParse({ ...hello, os: { ...os, ...change } })
+          .success,
+        JSON.stringify(change),
+      ).toBe(false);
+    for (const field of Object.keys(os))
+      expect(
+        AgentLinkMessage.safeParse({
+          ...hello,
+          os: { ...os, [field]: undefined },
+        }).success,
+        field,
+      ).toBe(false);
+  });
+
   it("reports each volume with its filesystem while mounted", () => {
     const volume = {
       database: id,

@@ -480,13 +480,30 @@ impl<M: Machine> Service<M> {
                     // The node reboots: the page lists the order until it is answered, and the
                     // agent that starts after the boot finds the packages in place.
                     Ok(true) => {}
-                    Ok(false) => match self.machine.health_check().await {
-                        Ok(()) => self.core.report_order(&operation, Ok(())),
-                        Err(_) => self.core.report_order(&operation, Err("check_failed")),
-                    },
+                    Ok(false) => {
+                        self.report_os().await;
+                        match self.machine.health_check().await {
+                            Ok(()) => self.core.report_order(&operation, Ok(())),
+                            Err(_) => self.core.report_order(&operation, Err("check_failed")),
+                        }
+                    }
                     Err(reason) => self.core.report_order(&operation, Err(reason)),
                 }
             }
+        }
+    }
+
+    /// The packages may have changed without a reboot: the next hello of the link names the
+    /// digest of what is installed now (SEC-03). After a reboot the agent starts again and says it.
+    async fn report_os(&self) {
+        let reported = match crate::machine::os_report(&*self.machine).await {
+            Ok(os) => self.link.set_os(&os),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = reported {
+            crate::timing::emit_event(json!({
+                "event": "os_not_reported", "class": crate::diagnostics::error_code(&error),
+            }));
         }
     }
 
@@ -794,6 +811,7 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
                 timing: LinkTiming {
                     interval: Duration::from_millis(300),
                     ..LinkTiming::default()
@@ -952,6 +970,7 @@ mod tests {
                     image_version: "25".into(),
                     agent_version: "0.1.0".into(),
                     release_id: None,
+                    os: crate::machine::os_report(&*machine).await.unwrap(),
                     timing: LinkTiming {
                         interval: Duration::from_millis(300),
                         ..LinkTiming::default()
@@ -1078,6 +1097,7 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: None,
+                os: crate::machine::os_report(&**machine).await.unwrap(),
                 timing: LinkTiming {
                     interval: Duration::from_millis(300),
                     ..LinkTiming::default()
@@ -1210,6 +1230,22 @@ mod tests {
             "{calls:?}"
         );
         assert!(at("reboot").is_none(), "{calls:?}");
+        // The packages changed and the node did not boot again: the link says hello again, with
+        // the digest of what is installed now, and the boot of before.
+        eventually(30, "the new packages to be said", || {
+            cloud.with(|inner| inner.hellos.len()) == 2
+        })
+        .await;
+        let hellos = cloud.with(|inner| inner.hellos.clone());
+        assert_eq!(hellos[1]["os"]["boot_id"], hellos[0]["os"]["boot_id"]);
+        assert_ne!(
+            hellos[1]["os"]["packages_sha256"],
+            hellos[0]["os"]["packages_sha256"]
+        );
+        assert_eq!(
+            hellos[1]["os"]["packages_sha256"],
+            crate::update::packages_digest(&machine.installed_packages().await.unwrap())
+        );
         service.stop();
     }
 
@@ -1313,6 +1349,16 @@ mod tests {
         let service = serve(&machine, &cloud, &base).await;
         eventually(60, "the order to be answered", || answer().is_some()).await;
         assert_eq!(answer(), Some(json!("done")));
+        // The agent that started after the boot says another boot, the kernel the lock named and
+        // the lock's packages: what the API compares with the release.
+        let hellos = cloud.with(|inner| inner.hellos.clone());
+        let (before, after) = (&hellos[0]["os"], &hellos.last().unwrap()["os"]);
+        assert_ne!(before["boot_id"], after["boot_id"]);
+        assert_eq!(after["kernel_release"], "6.12.99-amd64");
+        assert_eq!(
+            after["packages_sha256"],
+            crate::update::packages_digest(&machine.installed_packages().await.unwrap())
+        );
         let calls = machine.calls();
         assert!(calls.contains(&"health_check".to_string()), "{calls:?}");
         assert!(
@@ -1341,6 +1387,7 @@ mod tests {
                 image_version: "25".into(),
                 agent_version: "0.1.0".into(),
                 release_id: None,
+                os: crate::machine::os_report(&*machine).await.unwrap(),
                 timing: LinkTiming {
                     interval: Duration::from_millis(300),
                     ..LinkTiming::default()

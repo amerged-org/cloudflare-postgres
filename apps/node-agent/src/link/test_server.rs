@@ -48,6 +48,11 @@ pub fn vector(schema: &str, name: &str) -> Value {
         .unwrap_or_else(|| panic!("no vector {schema}/{name}"))["value"]
         .clone()
 }
+/// The contract's examples of an installed package set: the `dpkg-query` output, the set it states
+/// and the digest the contract computes of it.
+pub fn package_vectors() -> Vec<Value> {
+    VECTORS["packages"].as_array().unwrap().clone()
+}
 /// A desired database of the contract's example page, under another identifier.
 pub fn database(id: &str) -> Value {
     let page = vector("NodeDesiredPage", "full-page");

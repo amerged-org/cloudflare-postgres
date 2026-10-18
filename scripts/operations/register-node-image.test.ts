@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
   apiCredentials,
   digestFile,
   existingObject,
+  lockOs,
   parseBuildSummary,
   r2Credentials,
   registerRelease,
@@ -32,6 +33,38 @@ const BINARIES = [
   "pgcf-wal-fetch",
 ];
 const binaryBytes = (name: string) => `binary ${name}`;
+
+// A package lock as the builder writes it: every package of the image, and the extra ones (which
+// the image holds too, so they are listed twice).
+const locked = (name: string, version: string) => ({
+  name,
+  version,
+  architecture: "amd64",
+  url: `https://snapshot.example/${name}_${version}.deb`,
+  sha256: sha(name),
+  size: 100,
+});
+const lockText = (packages: [string, string][], extra: [string, string][]) =>
+  `${JSON.stringify({
+    debian: { snapshot: "20261016T000000Z" },
+    extra: extra.map(([name, version]) => locked(name, version)),
+    packages: packages.map(([name, version]) => locked(name, version)),
+  })}\n`;
+const PACKAGES: [string, string][] = [
+  ["linux-image-amd64", "6.12.113-1"],
+  ["libc6", "2.41-1"],
+  ["bash", "5.2"],
+  ["linux-image-6.12.113+deb13-amd64", "6.12.113-1"],
+  ["libc6-dev", "2.41-1"],
+  ["cloudflared", "2026.10.0"],
+];
+const LOCK = lockText(PACKAGES, [["cloudflared", "2026.10.0"]]);
+// What a node that runs that lock reports: the lines sorted as lines, so "libc6-dev=" is before
+// "libc6=", and the extra package that is also locked once.
+const LOCK_PACKAGES_SHA256 = sha(
+  "bash=5.2\ncloudflared=2026.10.0\nlibc6-dev=2.41-1\nlibc6=2.41-1\n" +
+    "linux-image-6.12.113+deb13-amd64=6.12.113-1\nlinux-image-amd64=6.12.113-1\n",
+);
 
 // What `node infra/node-image/node-image.ts build` writes beside the image.
 function summary(release: string, files: { zst: string; lock: string }) {
@@ -59,7 +92,7 @@ async function build(release = "sha-0123456789ab") {
   const [imageDir, binariesDir] = [join(root, "out"), join(root, "binaries")];
   await mkdir(imageDir);
   await mkdir(binariesDir);
-  const files = { zst: "compressed image bytes", lock: '{"packages":[]}\n' };
+  const files = { zst: "compressed image bytes", lock: LOCK };
   await writeFile(join(imageDir, "pgcf-node.raw.zst"), files.zst);
   await writeFile(
     join(imageDir, "pgcf-node.json"),
@@ -141,6 +174,9 @@ test("the manifest registers the digests of the files the build produced, under 
         sha256: sha(b.files.lock),
         size_bytes: Buffer.byteLength(b.files.lock),
       },
+      // What a node that runs the lock reports in its hello, from the lock the image was built from.
+      packages_sha256: LOCK_PACKAGES_SHA256,
+      kernel_release: "6.12.113+deb13-amd64",
     });
     // Six files go to the prefix the API reads them from.
     assert.deepEqual(
@@ -162,6 +198,45 @@ test("the manifest registers the digests of the files the build produced, under 
   } finally {
     await rm(b.root, { recursive: true, force: true });
   }
+});
+
+test("a lock states the OS a node that runs it reports: the digest of its packages and its one kernel", async () => {
+  assert.deepEqual(await lockOs(LOCK), {
+    packages_sha256: LOCK_PACKAGES_SHA256,
+    kernel_release: "6.12.113+deb13-amd64",
+  });
+  // The committed lock is read the way the build writes it.
+  const committed = await readFile(
+    new URL("../../infra/node-image/packages.lock.json", import.meta.url),
+    "utf8",
+  );
+  const kernels = (
+    JSON.parse(committed) as { packages: { name: string }[] }
+  ).packages
+    .map((entry) => entry.name)
+    .filter((name) => /^linux-image-[0-9]/.test(name));
+  assert.equal(kernels.length, 1);
+  const os = await lockOs(committed);
+  assert.equal(os.kernel_release, kernels[0]!.slice("linux-image-".length));
+  assert.match(os.packages_sha256, /^[0-9a-f]{64}$/);
+  const without = PACKAGES.filter(
+    ([name]) => !name.startsWith("linux-image-6"),
+  );
+  for (const [text, problem] of [
+    [lockText(without, []), /exactly one kernel/],
+    [
+      lockText(
+        [...PACKAGES, ["linux-image-6.12.111+deb13-amd64", "6.12.111-1"]],
+        [],
+      ),
+      /exactly one kernel/,
+    ],
+    [lockText(PACKAGES, [["bash", "5.3"]]), /bash is locked in two versions/],
+    [JSON.stringify({ packages: [{ name: "bash" }], extra: [] }), /lock/],
+    [JSON.stringify({ packages: [] }), /lock/],
+    ["not json", /lock/],
+  ] as const)
+    await assert.rejects(lockOs(text), problem);
 });
 
 test("a release is refused when the files are not the ones the build summarized", async () => {

@@ -3,7 +3,7 @@
 //! starts them and signalled as systemd signals them, in directories that stand for the thin
 //! volumes. Only systemd, LVM and the users are stood in for; their own behaviour is proved in the
 //! lab (`units::lab`, `storage::lab_tests`) and on a node.
-use super::{Account, CpuTimes, Machine, Memory, initdb_arguments};
+use super::{Account, Boot, CpuTimes, Machine, Memory, initdb_arguments};
 use crate::{
     layout::Layout,
     link::NodeIdentity,
@@ -67,6 +67,10 @@ struct State {
     credentials: Vec<(String, String, u64, bool)>,
     /// The Debian packages of the node, as dpkg would list them.
     packages: BTreeMap<String, String>,
+    /// How often the node booted since the test began, and the kernel it runs: a boot starts the
+    /// newest kernel image that is installed.
+    boots: u64,
+    kernel_release: String,
 }
 
 pub struct Local {
@@ -101,6 +105,7 @@ impl Local {
             gid,
             state: Mutex::new(State {
                 available_bytes: 8 << 30,
+                kernel_release: "6.12.111+deb13-amd64".into(),
                 ..State::default()
             }),
         })
@@ -739,7 +744,17 @@ impl Machine for Local {
     }
 
     async fn reboot(&self) -> io::Result<()> {
-        self.state().calls.push("reboot".into());
+        let mut state = self.state();
+        state.calls.push("reboot".into());
+        state.boots += 1;
+        let newest = state.packages.keys().rev().find_map(|name| {
+            let abi = name.strip_prefix("linux-image-")?;
+            abi.starts_with(|c: char| c.is_ascii_digit())
+                .then(|| abi.to_string())
+        });
+        if let Some(abi) = newest {
+            state.kernel_release = abi;
+        }
         Ok(())
     }
 
@@ -753,6 +768,14 @@ impl Machine for Local {
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
+    fn boot(&self) -> Option<Boot> {
+        let state = self.state();
+        Some(Boot {
+            id: format!("00000000-0000-4000-8000-{:012x}", state.boots),
+            booted_at: 1_792_318_800 + state.boots * 600,
+            kernel_release: state.kernel_release.clone(),
+        })
+    }
     fn memory(&self) -> Option<Memory> {
         Some(Memory {
             total_bytes: 12 << 30,

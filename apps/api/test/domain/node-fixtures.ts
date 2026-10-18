@@ -19,7 +19,7 @@ import {
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
 import { NODE_HEADER, NODE_UID_HEADER } from "../../src/node-actor.ts";
-import { fixture, rawRequest } from "./fixtures.ts";
+import { fixture, nodeOs, rawRequest } from "./fixtures.ts";
 
 const installs: string[] = [];
 /** Removes the installs the test made; the fixtures' own cleanup removes the nodes and additions. */
@@ -207,6 +207,7 @@ export async function openLink(
         protocol: 1,
         agent_version: "0.1.0",
         release_id: null,
+        os: nodeOs(),
       }),
     );
     expect(JSON.parse(await welcome)).toEqual({ type: "welcome", protocol: 1 });

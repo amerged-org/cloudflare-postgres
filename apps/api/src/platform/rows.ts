@@ -7,7 +7,7 @@ import {
   Region,
   SizeClass,
 } from "@pgcf/contracts";
-import type { FleetNodeReleaseStatus } from "@pgcf/contracts/releases";
+import type { NodeFleet } from "../domain/fleet-releases.ts";
 export type Row = Record<string, unknown>;
 export const projectRow = (row: Row): Project =>
   Project.parse({
@@ -60,16 +60,12 @@ export const nodeRow = (row: Row): Node =>
     memory_window_valid: row.memory_window_valid === 1,
   });
 
-export function nodeInventoryRow(
-  row: Row,
-  fleet: {
-    status: FleetNodeReleaseStatus;
-    observation: NodeInventory["observation"];
-  },
-): NodeInventory {
+export function nodeInventoryRow(row: Row, fleet: NodeFleet): NodeInventory {
   return NodeInventory.parse({
     ...nodeRow(row),
     release: NodeInventory.shape.release.strip().parse(fleet.status),
     observation: fleet.observation,
+    os: fleet.os,
+    os_converged: fleet.os_converged,
   });
 }

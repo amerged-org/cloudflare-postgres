@@ -6,6 +6,7 @@ import type { z } from "zod";
 import * as link from "../src/node-link.ts";
 import * as local from "../src/node-local.ts";
 import { bytesToBase64url } from "../src/encoding.ts";
+import { FleetReleaseId, packagesSha256 } from "../src/releases.ts";
 
 const id = `d${"b".repeat(19)}`,
   other = `e${"b".repeat(19)}`,
@@ -310,6 +311,19 @@ const archiveCredential = {
   expires_at: credential.expires_at,
 };
 
+const hello = {
+  type: "hello",
+  protocol: 1,
+  agent_version: "0.1.0",
+  release_id: "release-25",
+  os: {
+    boot_id: "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+    booted_at: now,
+    kernel_release: "6.12.111+deb13-amd64",
+    packages_sha256: "a".repeat(64),
+  },
+};
+
 type Case = [name: string, value: unknown, valid: boolean, refinement?: true];
 /** The schemas the node agent reads or writes, by the name the JSON Schemas carry. */
 export const nodeSchemas = {
@@ -329,6 +343,7 @@ export const nodeSchemas = {
   AgentLinkMessage: link.AgentLinkMessage,
   ServerLinkMessage: link.ServerLinkMessage,
   InstallerProgress: link.InstallerProgress,
+  FleetReleaseId,
 } as const satisfies Record<string, z.ZodType>;
 
 const cases: Record<keyof typeof nodeSchemas, Case[]> = {
@@ -1296,20 +1311,13 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["detail", { error: "node_fenced", detail: "lost" }, false],
   ],
   AgentLinkMessage: [
-    [
-      "hello",
-      {
-        type: "hello",
-        protocol: 1,
-        agent_version: "0.1.0",
-        release_id: "release-25",
-      },
-      true,
-    ],
+    ["hello", hello, true],
     ["sample", { type: "sample", sample }, true],
+    ["other-protocol", { ...hello, protocol: 2, release_id: null }, false],
+    ["hello-without-os", { ...hello, os: undefined }, false],
     [
-      "other-protocol",
-      { type: "hello", protocol: 2, agent_version: "0.1.0", release_id: null },
+      "boot-id-not-a-uuid",
+      { ...hello, os: { ...hello.os, boot_id: "boot" } },
       false,
     ],
   ],
@@ -1324,6 +1332,11 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     ["checkpoint", { checkpoint: "image_verified", detail: "" }, true],
     ["failed-step", { checkpoint: "failed", detail: "tools" }, true],
     ["unknown-checkpoint", { checkpoint: "booted", detail: "" }, false],
+  ],
+  FleetReleaseId: [
+    ["release", "release-25", true],
+    ["upper-case", "Release-25", false],
+    ["path", "../release", false],
   ],
 };
 
@@ -1342,6 +1355,49 @@ export function nodeSchemaVectors() {
       return { schema, name, valid, refinement: refinement ?? false, value };
     }),
   );
+}
+
+/**
+ * The digest of an installed package set (`packagesSha256`) beside the `dpkg-query` output the
+ * node reads the set from: the same digest on both sides. dpkg lists by name; the digest sorts
+ * whole lines, which orders `libc6-dev=` before `libc6=`. An `rc` line is a package that was
+ * removed with its configuration kept, not an installed one. Debian keeps the previous kernel
+ * after an update: of the kernel images the node counts only the running one, which the lock
+ * holds alone.
+ */
+export async function packageVectors() {
+  const installed = [
+    ["bash", "5.2"],
+    ["bsdutils", "1:2.41.5-0+deb13u1"],
+    ["libc6", "2.41-1"],
+    ["libc6-dev", "2.41-1"],
+    ["linux-image-6.12.113+deb13-amd64", "6.12.113-1"],
+    ["linux-image-amd64", "6.12.113-1"],
+  ].map(([name, version]) => ({ name: name!, version: version! }));
+  // dpkg-query lists the packages by name: `<status>\t<name>\t<version>`, the status abbreviated
+  // to two letters and a space.
+  const dpkg = (extra: [status: string, name: string, version: string]) =>
+    [...installed.map(({ name, version }) => ["ii ", name, version]), extra]
+      .sort((a, b) => (a[1]! < b[1]! ? -1 : 1))
+      .map(([status, name, version]) => `${status}\t${name}\t${version}\n`)
+      .join("");
+  const sha256 = await packagesSha256(installed);
+  return [
+    {
+      name: "removed-package",
+      kernel_release: "6.12.113+deb13-amd64",
+      dpkg: dpkg(["rc ", "oldpkg", "1.0-1"]),
+      packages: installed,
+      sha256,
+    },
+    {
+      name: "previous-kernel-kept",
+      kernel_release: "6.12.113+deb13-amd64",
+      dpkg: dpkg(["ii ", "linux-image-6.12.111+deb13-amd64", "6.12.111-1"]),
+      packages: installed,
+      sha256,
+    },
+  ];
 }
 
 /** A fixed Ed25519 seed; never a node's key. */

@@ -38,18 +38,19 @@ fn message_bound() -> usize {
 
 /// Keeps the link up until the node is fenced: connects, says hello, sends the latest sample
 /// whenever there is a new one, turns the server's messages into events and reconnects with
-/// backoff. `hello` is the serialized `AgentLinkMessage` hello, `samples` the serialized samples.
+/// backoff. `hello` is the `AgentLinkMessage` hello, which a new connection says again when it
+/// changes; `samples` holds the serialized samples.
 pub(super) async fn run(
     api: Arc<Api>,
     events: Arc<Events>,
     mut samples: watch::Receiver<Option<String>>,
-    hello: String,
+    mut hello: watch::Receiver<Value>,
     timing: Timing,
 ) {
     let mut backoff = Backoff::new(timing.backoff_minimum, timing.backoff_maximum);
     loop {
         let started = Instant::now();
-        match serve(&api, &events, &mut samples, &hello, &timing).await {
+        match serve(&api, &events, &mut samples, &mut hello, &timing).await {
             // A fence ends only with a reinstall: the link never comes back (plan 9.4).
             Err(error) if error.is::<Fenced>() => {
                 events.fence();
@@ -82,11 +83,12 @@ async fn serve(
     api: &Api,
     events: &Events,
     samples: &mut watch::Receiver<Option<String>>,
-    hello: &str,
+    hello: &mut watch::Receiver<Value>,
     timing: &Timing,
 ) -> Result<(), Error> {
     let mut socket = timeout(timing.handshake, open(api)).await??;
-    send(&mut socket, Message::text(hello), timing.handshake).await?;
+    let greeting = hello.borrow_and_update().to_string();
+    send(&mut socket, Message::text(greeting), timing.handshake).await?;
     let welcome = timeout(timing.handshake, welcome(&mut socket)).await??;
     if welcome["type"] != "welcome" {
         return Err("link did not welcome the node".into());
@@ -111,6 +113,11 @@ async fn serve(
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(_)) => return Err("link message is not text".into()),
                 }
+            }
+            // A hello that changed is said on a new connection: a link says hello once.
+            changed = hello.changed() => {
+                changed?;
+                return Ok(());
             }
             changed = samples.changed() => {
                 changed?;
@@ -228,9 +235,8 @@ mod tests {
             ..Timing::default()
         }
     }
-    fn hello() -> String {
-        json!({"type":"hello","protocol":1,"agent_version":"0.1.0","release_id":"release-25"})
-            .to_string()
+    fn hello() -> Value {
+        crate::link::test_server::vector("AgentLinkMessage", "hello")
     }
     fn sample(available: u64) -> Value {
         let mut sample = crate::link::test_server::vector("NodeSample", "sample");
@@ -252,6 +258,8 @@ mod tests {
         cloud: Cloud,
         events: Arc<Events>,
         samples: watch::Sender<Option<String>>,
+        /// The link keeps saying this hello; kept so that the channel stays open.
+        _hello: watch::Sender<Value>,
         task: JoinHandle<()>,
     }
     impl Drop for Link {
@@ -264,17 +272,19 @@ mod tests {
         let (api, events) = enrolled(&cloud).await;
         prepare(&cloud);
         let (samples, receiver) = watch::channel(None);
+        let (_hello, hello_receiver) = watch::channel(hello());
         let task = tokio::spawn(run(
             Arc::new(api),
             events.clone(),
             receiver,
-            hello(),
+            hello_receiver,
             timing,
         ));
         Link {
             cloud,
             events,
             samples,
+            _hello,
             task,
         }
     }
@@ -284,7 +294,7 @@ mod tests {
         let link = link(quick(), |_| {}).await;
         assert_eq!(next(&link.events).await, Some(LinkEvent::Desired(None)));
         let hellos = link.cloud.with(|inner| inner.hellos.clone());
-        assert_eq!(hellos, [serde_json::from_str::<Value>(&hello()).unwrap()]);
+        assert_eq!(hellos, [hello()]);
         // The upgrade was signed as a GET of the link with no body.
         let upgrade = link.cloud.requests().pop().unwrap();
         assert_eq!(

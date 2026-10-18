@@ -18,6 +18,7 @@ import {
   nodeRequestVectors,
   nodeSchemas,
   nodeSchemaVectors,
+  packageVectors,
   refusalVectors,
 } from "./node-vectors.ts";
 
@@ -65,6 +66,7 @@ const files = {
   "node-vectors.generated.json": {
     schemas: nodeSchemaVectors(),
     requests: await nodeRequestVectors(),
+    packages: await packageVectors(),
   },
   "node-local.generated.json": {
     version: 1,

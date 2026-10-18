@@ -49,6 +49,16 @@ pub fn uptime_seconds(uptime: &str) -> Option<u64> {
     (seconds.is_finite() && seconds >= 0.0).then_some(seconds as u64)
 }
 
+/// The boot time of `/proc/stat` (`btime`), in seconds since the epoch. `None` for a text that has
+/// no such line.
+pub fn boot_time(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The busy CPU in millicores since the previous reading: the share of the clock ticks that were
 /// not idle, times the cores. Without a previous reading the whole time since boot is averaged.
 pub fn busy_millicores(previous: Option<CpuTimes>, now: CpuTimes) -> u64 {
@@ -128,6 +138,15 @@ mod tests {
         assert_eq!(uptime_seconds("0.99 0.00\n"), Some(0));
         for broken in ["", "up 12", "-3.0 1.0", "NaN 1", "inf 1"] {
             assert_eq!(uptime_seconds(broken), None, "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn the_boot_time_is_the_btime_line_of_proc_stat() {
+        let stat = STAT.replace("btime 1", "btime 1792318800");
+        assert_eq!(boot_time(&stat), Some(1_792_318_800));
+        for broken in ["", "btime", "btime x", "btime -1", "cpu  1 2 3\nctxt 5\n"] {
+            assert_eq!(boot_time(broken), None, "{broken:?}");
         }
     }
 

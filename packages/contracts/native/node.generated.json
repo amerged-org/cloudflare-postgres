@@ -1766,9 +1766,35 @@
                 { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$" },
                 { "type": "null" }
               ]
+            },
+            "os": {
+              "type": "object",
+              "properties": {
+                "boot_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "booted_at": { "$ref": "#/$defs/Timestamp" },
+                "kernel_release": {
+                  "type": "string",
+                  "pattern": "^[!-~]{1,64}$"
+                },
+                "packages_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "boot_id",
+                "booted_at",
+                "kernel_release",
+                "packages_sha256"
+              ],
+              "additionalProperties": false
             }
           },
-          "required": ["type", "protocol", "agent_version", "release_id"],
+          "required": ["type", "protocol", "agent_version", "release_id", "os"],
           "additionalProperties": false
         },
         {
@@ -2015,6 +2041,11 @@
       },
       "required": ["checkpoint", "detail"],
       "additionalProperties": false
+    },
+    "FleetReleaseId": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
     }
   },
   "constants": {

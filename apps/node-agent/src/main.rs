@@ -20,7 +20,7 @@ mod linux {
         diagnostics::error_code,
         layout::Layout,
         link::{Link, LinkConfig, LinkEvents, Paths, Timing as LinkTiming, Transport},
-        machine::{Node, restore_runtime},
+        machine::{Node, os_report, restore_runtime},
         notify::notify,
         release,
         sample::uptime_seconds,
@@ -33,13 +33,14 @@ mod linux {
     use tokio::signal::unix::{SignalKind, signal};
 
     /// One attempt to enroll, if the node is not, and to start the link.
-    async fn link_once(layout: &Layout) -> Result<(Link, LinkEvents), Error> {
+    async fn link_once(node: &Node, layout: &Layout) -> Result<(Link, LinkEvents), Error> {
         let image_version = release::this_image_version().ok_or("the image has no version")?;
         let config = LinkConfig {
             paths: Paths::new(layout.state.clone()),
             image_version,
             agent_version: env!("CARGO_PKG_VERSION").into(),
             release_id: release::release_id(&layout.bin().join("current")),
+            os: os_report(node).await?,
             timing: LinkTiming::default(),
         };
         Link::start(config, Transport::production()?).await
@@ -47,10 +48,10 @@ mod linux {
 
     /// The link of the node to Cloudflare, retried until it stands: the node may not be enrolled
     /// yet (the installer writes the seed), and Cloudflare may not be reachable.
-    async fn link(layout: &Layout) -> (Link, LinkEvents) {
+    async fn link(node: &Node, layout: &Layout) -> (Link, LinkEvents) {
         let mut wait = Duration::from_secs(1);
         loop {
-            match link_once(layout).await {
+            match link_once(node, layout).await {
                 Ok(link) => return link,
                 Err(error) => {
                     emit_event(json!({"event": "link_not_started", "class": error_code(&error)}));
@@ -62,7 +63,7 @@ mod linux {
     }
 
     async fn start(node: Arc<Node>, layout: &Layout) -> Result<Arc<Service<Node>>, Error> {
-        let (link, events) = link(layout).await;
+        let (link, events) = link(&node, layout).await;
         let gateway = gateway_owner().ok_or("the gateway's user does not exist")?;
         Service::start(
             node,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { Node } from "./api.ts";
+import { NodeOs } from "./node-link.ts";
 import { FleetNodeReleaseStatus } from "./releases.ts";
 
 /** What the node's link last reported: `stale` after `NODE_STALE_MS` of silence. */
@@ -20,5 +21,14 @@ export const NodeInventory = Node.extend({
     node_uid: true,
   }),
   observation: NodeFleetObservation,
+  /** The boot and operating system the node reported in its last hello; null before the first one. */
+  os: NodeOs.nullable(),
+  /**
+   * Whether the node runs the operating system of its region's release: its kernel and its
+   * installed packages are the release's. False after a maintenance cycle that did not reach the
+   * node, or when its packages drifted; null while the node has not reported, or its region has no
+   * release.
+   */
+  os_converged: z.boolean().nullable(),
 }).meta({ id: "NodeInventory" });
 export type NodeInventory = z.infer<typeof NodeInventory>;

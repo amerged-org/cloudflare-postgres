@@ -243,6 +243,36 @@ pub fn installed_packages(output: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The packages that count for the node's digest (`packages_sha256` of the contract): of the kernel
+/// images (`linux-image-<abi>`) only the running one's. Debian keeps the previous kernel after an
+/// update, for the boot menu, while the release's lock holds the one kernel it installs.
+pub fn without_idle_kernels(
+    mut installed: BTreeMap<String, String>,
+    kernel_release: &str,
+) -> BTreeMap<String, String> {
+    installed.retain(|name, _| match name.strip_prefix("linux-image-") {
+        Some(abi) if abi.starts_with(|c: char| c.is_ascii_digit()) => abi == kernel_release,
+        _ => true,
+    });
+    installed
+}
+
+/// The digest of a set of installed packages, as the contract states it (`packagesSha256`): sha256
+/// over the lines `name=version\n`, sorted as whole lines, bytewise, in lowercase hex.
+pub fn packages_digest(installed: &BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines: Vec<String> = installed
+        .iter()
+        .map(|(name, version)| format!("{name}={version}\n"))
+        .collect();
+    lines.sort();
+    let mut digest = Sha256::new();
+    for line in &lines {
+        digest.update(line.as_bytes());
+    }
+    hex(&digest.finalize())
+}
+
 /// The image's apt sources (deb822) with the snapshot of the release: the `URIs:` of the Debian
 /// snapshot archives name the snapshot's time. `None` if the file has no such line.
 pub fn apt_sources(text: &str, snapshot: &str) -> Option<String> {
@@ -363,6 +393,67 @@ mod tests {
         assert_eq!(
             installed_packages(output),
             installed(&[("bash", "5.2"), ("libc6", "2.41-1")])
+        );
+    }
+
+    #[test]
+    fn the_installed_packages_have_the_digest_the_contract_computes() {
+        use crate::link::test_server::package_vectors;
+        for vector in package_vectors() {
+            let (name, dpkg) = (&vector["name"], vector["dpkg"].as_str().unwrap());
+            let stated: BTreeMap<String, String> = vector["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|package| {
+                    (
+                        package["name"].as_str().unwrap().to_string(),
+                        package["version"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            let kernel = vector["kernel_release"].as_str().unwrap();
+            // A package dpkg lists as removed with its configuration kept ('rc') is not installed.
+            let installed = installed_packages(dpkg);
+            assert!(!installed.contains_key("oldpkg"), "{name}");
+            let counted = without_idle_kernels(installed, kernel);
+            assert_eq!(counted, stated, "{name}");
+            assert_eq!(
+                packages_digest(&counted),
+                vector["sha256"].as_str().unwrap(),
+                "{name}"
+            );
+        }
+        // One package more, one version more: another set.
+        let digest = packages_digest(&installed(&[("bash", "5.2")]));
+        let more = installed(&[("bash", "5.2"), ("libc6", "2.41-1")]);
+        assert_ne!(packages_digest(&more), digest);
+        assert_ne!(packages_digest(&installed(&[("bash", "5.3")])), digest);
+    }
+
+    #[test]
+    fn of_the_kernel_images_only_the_running_one_counts_for_the_digest() {
+        let node = installed(&[
+            ("bash", "5.2"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+            ("linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
+            ("linux-image-amd64", "6.12.113-1"),
+            ("linux-libc-dev", "6.12.113-1"),
+        ]);
+        // After the reboot into the new kernel the previous one is idle; before it, the new one is.
+        assert_eq!(
+            without_idle_kernels(node.clone(), "6.12.113+deb13-amd64"),
+            installed(&[
+                ("bash", "5.2"),
+                ("linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
+                ("linux-image-amd64", "6.12.113-1"),
+                ("linux-libc-dev", "6.12.113-1"),
+            ])
+        );
+        assert_eq!(
+            without_idle_kernels(node, "6.12.111+deb13-amd64").len(),
+            4,
+            "the meta package and the other packages stay"
         );
     }
 

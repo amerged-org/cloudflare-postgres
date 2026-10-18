@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The node itself: `Storage` on LVM, `Units` over systemd's D-Bus, the users in `/etc/passwd`
 //! and `initdb` as the database's user.
-use super::{Account, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
+use super::{Account, Boot, CpuTimes, Machine, Memory, gateway_environment, initdb_arguments};
 use crate::{
     layout::Layout,
     link::NodeIdentity,
@@ -505,6 +505,15 @@ impl Machine for Node {
                 String::from_utf8_lossy(&output.stderr).trim()
             )))
         }
+    }
+
+    fn boot(&self) -> Option<Boot> {
+        let read = |path| std::fs::read_to_string(path).ok();
+        Boot::parse(
+            &read("/proc/sys/kernel/random/boot_id")?,
+            &read("/proc/stat")?,
+            &read("/proc/sys/kernel/osrelease")?,
+        )
     }
 
     fn memory(&self) -> Option<Memory> {

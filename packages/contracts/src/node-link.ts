@@ -36,6 +36,7 @@ import {
   FleetReleaseId,
   FleetReleaseOs,
   ImageVersion,
+  KernelRelease,
 } from "./releases.ts";
 import { USAGE_HOUR_MS } from "./usage.ts";
 import {
@@ -625,7 +626,8 @@ export type NodeDesiredQuery = z.infer<typeof NodeDesiredQuery>;
 export const NodeRelease = z.strictObject({
   id: FleetReleaseId,
   binaries: FleetReleaseBinaries,
-  os: FleetReleaseOs,
+  /** What the node installs. What it is expected to report back stays with the API. */
+  os: FleetReleaseOs.omit({ packages_sha256: true, kernel_release: true }),
 });
 export type NodeRelease = z.infer<typeof NodeRelease>;
 
@@ -1439,12 +1441,26 @@ export type NodeEventReport = z.infer<typeof NodeEventReport>;
 
 // ---------- Link messages (GET /node/v1/link WebSocket) ----------
 
+/**
+ * The boot and the operating system a node reports in its hello: the kernel's boot ID and the
+ * time of the boot (a reboot is a new ID), `uname -r`, and `packagesSha256` of the packages dpkg
+ * reports as installed. The API compares the last two with the release of the node's region.
+ */
+export const NodeOs = z.strictObject({
+  boot_id: z.uuid(),
+  booted_at: Timestamp,
+  kernel_release: KernelRelease,
+  packages_sha256: Sha256,
+});
+export type NodeOs = z.infer<typeof NodeOs>;
+
 export const AgentLinkMessage = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("hello"),
     protocol: z.literal(NODE_PROTOCOL_VERSION),
     agent_version: z.string().min(1).max(64),
     release_id: FleetReleaseId.nullable(),
+    os: NodeOs,
   }),
   z.strictObject({ type: z.literal("sample"), sample: NodeSample }),
 ]);

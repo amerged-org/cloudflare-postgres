@@ -9164,7 +9164,13 @@
         "type": "hello",
         "protocol": 1,
         "agent_version": "0.1.0",
-        "release_id": "release-25"
+        "release_id": "release-25",
+        "os": {
+          "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+          "booted_at": "2026-10-17T12:00:00.000Z",
+          "kernel_release": "6.12.111+deb13-amd64",
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
       }
     },
     {
@@ -9209,7 +9215,43 @@
         "type": "hello",
         "protocol": 2,
         "agent_version": "0.1.0",
-        "release_id": null
+        "release_id": null,
+        "os": {
+          "boot_id": "2f1c8a6e-3b57-4d0a-9c1e-7a4b5d6e8f90",
+          "booted_at": "2026-10-17T12:00:00.000Z",
+          "kernel_release": "6.12.111+deb13-amd64",
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "schema": "AgentLinkMessage",
+      "name": "hello-without-os",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "type": "hello",
+        "protocol": 1,
+        "agent_version": "0.1.0",
+        "release_id": "release-25"
+      }
+    },
+    {
+      "schema": "AgentLinkMessage",
+      "name": "boot-id-not-a-uuid",
+      "valid": false,
+      "refinement": false,
+      "value": {
+        "type": "hello",
+        "protocol": 1,
+        "agent_version": "0.1.0",
+        "release_id": "release-25",
+        "os": {
+          "boot_id": "boot",
+          "booted_at": "2026-10-17T12:00:00.000Z",
+          "kernel_release": "6.12.111+deb13-amd64",
+          "packages_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
       }
     },
     {
@@ -9267,6 +9309,27 @@
       "valid": false,
       "refinement": false,
       "value": { "checkpoint": "booted", "detail": "" }
+    },
+    {
+      "schema": "FleetReleaseId",
+      "name": "release",
+      "valid": true,
+      "refinement": false,
+      "value": "release-25"
+    },
+    {
+      "schema": "FleetReleaseId",
+      "name": "upper-case",
+      "valid": false,
+      "refinement": false,
+      "value": "Release-25"
+    },
+    {
+      "schema": "FleetReleaseId",
+      "name": "path",
+      "valid": false,
+      "refinement": false,
+      "value": "../release"
     }
   ],
   "requests": [
@@ -9323,6 +9386,36 @@
         "exp": 1760702460
       },
       "token": "pgcf_nr1.eyJ2IjoxLCJub2RlIjoibm9kX25ubm5ubm5ubm5ubm5ubm5ubm5uIiwidWlkIjoiMDEyMzQ1NjctODlhYi00ZGVmLTgxMjMtMDEyMzQ1Njc4OWFiIiwibWV0aG9kIjoiR0VUIiwicGF0aCI6Ii9ub2RlL3YxL2xpbmsiLCJib2R5IjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsImlhdCI6MTc2MDcwMjQwMCwiZXhwIjoxNzYwNzAyNDYwfQ.oaVtxXP5Cdwl2rLRc-dCaLYpBxFPFjhkkFsV91vaahjQ-S269u1-O8T9Pt2TRS_aUYvpk1o9zMoPIbT6HYCpDg"
+    }
+  ],
+  "packages": [
+    {
+      "name": "removed-package",
+      "kernel_release": "6.12.113+deb13-amd64",
+      "dpkg": "ii \tbash\t5.2\nii \tbsdutils\t1:2.41.5-0+deb13u1\nii \tlibc6\t2.41-1\nii \tlibc6-dev\t2.41-1\nii \tlinux-image-6.12.113+deb13-amd64\t6.12.113-1\nii \tlinux-image-amd64\t6.12.113-1\nrc \toldpkg\t1.0-1\n",
+      "packages": [
+        { "name": "bash", "version": "5.2" },
+        { "name": "bsdutils", "version": "1:2.41.5-0+deb13u1" },
+        { "name": "libc6", "version": "2.41-1" },
+        { "name": "libc6-dev", "version": "2.41-1" },
+        { "name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1" },
+        { "name": "linux-image-amd64", "version": "6.12.113-1" }
+      ],
+      "sha256": "462f968f28c0d5a21b9cc9e4eaa820b91bdf64ec67a812b5acad20336bdef3d7"
+    },
+    {
+      "name": "previous-kernel-kept",
+      "kernel_release": "6.12.113+deb13-amd64",
+      "dpkg": "ii \tbash\t5.2\nii \tbsdutils\t1:2.41.5-0+deb13u1\nii \tlibc6\t2.41-1\nii \tlibc6-dev\t2.41-1\nii \tlinux-image-6.12.111+deb13-amd64\t6.12.111-1\nii \tlinux-image-6.12.113+deb13-amd64\t6.12.113-1\nii \tlinux-image-amd64\t6.12.113-1\n",
+      "packages": [
+        { "name": "bash", "version": "5.2" },
+        { "name": "bsdutils", "version": "1:2.41.5-0+deb13u1" },
+        { "name": "libc6", "version": "2.41-1" },
+        { "name": "libc6-dev", "version": "2.41-1" },
+        { "name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1" },
+        { "name": "linux-image-amd64", "version": "6.12.113-1" }
+      ],
+      "sha256": "462f968f28c0d5a21b9cc9e4eaa820b91bdf64ec67a812b5acad20336bdef3d7"
     }
   ]
 }
