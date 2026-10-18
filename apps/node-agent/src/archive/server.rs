@@ -416,9 +416,10 @@ mod tests {
     #[tokio::test]
     async fn an_upload_over_the_bound_is_failed_and_never_logged() {
         let node = Node::start("bound", Duration::from_millis(300)).await;
-        node.fixture.set("delay", "1");
+        // The unit's own bound is whole seconds, so it ends at one second, before the upload.
+        node.fixture.set("delay", "1.5");
         assert_eq!(node.archive(SEGMENT).await, "failed upload_timeout\n");
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(1700)).await;
         assert!(!node.fixture.object(ARCHIVE, SEGMENT).exists());
         assert!(node.log().entries().unwrap().is_empty());
     }
@@ -426,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn calls_that_cannot_finish_in_time_are_all_failed_and_none_logged() {
         let node = Node::start("busy", Duration::from_millis(300)).await;
-        node.fixture.set("delay", "0.8");
+        node.fixture.set("delay", "1.5");
         // One call runs out of time; the database's other calls are refused while it runs.
         let calls = futures_util::future::join_all((0..3).map(|_| node.archive(SEGMENT))).await;
         for answer in &calls {
@@ -435,7 +436,7 @@ mod tests {
                 "{answer:?}"
             );
         }
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::sleep(Duration::from_millis(1700)).await;
         assert!(node.log().entries().unwrap().is_empty());
         assert!(!node.fixture.object(ARCHIVE, SEGMENT).exists());
     }
@@ -586,6 +587,18 @@ mod tests {
             node.fetch("000000010000000000000002").await,
             "failed fetch_failed\n"
         );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_archive_is_missing_even_when_barman_says_so_near_the_bound() {
+        // A call that waited for its slot is left little time to run in; barman's answer for an
+        // absent object comes late in it, and is no timeout.
+        let node = Node::start("late", Duration::from_secs(4)).await;
+        node.register(Some(node.recovery(None)));
+        node.fixture.set("delay", "3");
+        let started = std::time::Instant::now();
+        assert_eq!(node.fetch("000000010000000000000002").await, "missing\n");
+        assert!(started.elapsed() >= Duration::from_secs(3));
     }
 
     #[tokio::test]

@@ -45,21 +45,54 @@ impl Fixture {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(&store).unwrap();
         let store = store.display();
-        // systemd-run: the unit's command with the unit's environment file; the options are the
-        // contract of `systemd_run_arguments`.
+        // systemd-run: the unit's command with the unit's environment file, as `systemd-run --wait
+        // --pipe` behaves on systemd 257 (measured on Debian 13): the unit ends itself after
+        // `RuntimeMaxSec` (the command is terminated, the exit status is 1 whatever it was, the
+        // result is `timeout`), the exit status is otherwise the command's, and unless `--quiet`
+        // it reports on stderr. The options are the contract of `systemd_run_arguments`.
         script(
             &root.join("bin/systemd-run"),
             r#"#!/bin/sh
-env_file=
+env_file=; runtime=; quiet=
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; break ;;
-    -p) shift; case "$1" in EnvironmentFile=*) env_file=${1#EnvironmentFile=} ;; esac ;;
+    --quiet) quiet=1 ;;
+    -p) shift; case "$1" in
+      EnvironmentFile=*) env_file=${1#EnvironmentFile=} ;;
+      RuntimeMaxSec=*) runtime=${1#RuntimeMaxSec=} ;;
+    esac ;;
   esac
   shift
 done
+[ -n "$quiet" ] || echo "Running as unit: fixture.service; invocation ID: 0" >&2
 if [ -n "$env_file" ]; then set -a; . "$env_file"; set +a; fi
-exec "$@"
+ended="$env_file.ended"
+# The unit's processes are one group, as in a cgroup that is killed whole.
+set -m
+"$@" &
+command=$!
+if [ -n "$runtime" ]; then
+  # The unit's own timer: it outlives this client if the client is killed.
+  (
+    left=$((runtime * 10))
+    while [ $left -gt 0 ] && kill -0 $command 2>/dev/null; do sleep 0.1; left=$((left - 1)); done
+    if kill -0 $command 2>/dev/null; then touch "$ended" 2>/dev/null; kill -TERM -- -$command 2>/dev/null; fi
+  ) &
+fi
+wait $command
+status=$?
+if [ -f "$ended" ]; then result=timeout; status=1
+elif [ $status -eq 0 ]; then result=success
+else result=exit-code; fi
+if [ -z "$quiet" ]; then
+  echo "Finished with result: $result" >&2
+  echo "Main processes terminated with: code=exited, status=$status/FAILURE" >&2
+  echo "Service runtime: 1.000s" >&2
+  echo "CPU time consumed: 7ms" >&2
+  echo "Memory peak: 1.7M (swap: 0B)" >&2
+fi
+exit $status
 "#
             .into(),
         );
@@ -95,6 +128,7 @@ STORE='{store}'
 {CREDENTIAL_CHECK}
 while [ $# -gt 0 ]; do case "$1" in -p|--endpoint-url) shift ;; --spool-dir) echo "$2" >> "$STORE/spool-dirs"; shift ;; *) break ;; esac; shift; done
 dest=$1; server=$2; name=$3; target=$4
+if [ -f "$STORE/delay" ]; then sleep "$(cat "$STORE/delay")"; fi
 if [ -f "$STORE/fetch-fail" ]; then echo 'simulated R2 outage' >&2; exit 4; fi
 key="$STORE/objects/${{dest#s3://}}/$server/wals/$name.gz"
 if [ ! -f "$key" ]; then echo "WAL file $name for server $server does not exist" >&2; exit 1; fi
@@ -102,6 +136,15 @@ gunzip -c "$key" > "$target.part" && mv "$target.part" "$target"
 "#
             ),
         );
+        // The first start of a new executable can take a second or more on a laptop, which the
+        // bounds of the tests do not allow for.
+        for file in fs::read_dir(root.join("bin")).unwrap() {
+            let _ = Command::new(file.unwrap().path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         Self { root }
     }
     pub fn runner(&self) -> Runner {

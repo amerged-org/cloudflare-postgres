@@ -308,7 +308,6 @@ pub fn systemd_run_arguments(
     let mut arguments: Vec<String> = [
         "--wait",
         "--pipe",
-        "--quiet",
         "--collect",
         &format!("--unit={unit}"),
         &format!("--uid={}", db.user),
@@ -443,7 +442,7 @@ impl Runner {
                         &environment,
                         &self.barman,
                     );
-                    self.start(arguments, job.timeout, started).await
+                    self.start(arguments, job.timeout).await
                 }
                 Err(error) => (Exit::Unstartable, String::new(), error.to_string()),
             };
@@ -455,12 +454,7 @@ impl Runner {
             elapsed: started.elapsed(),
         }
     }
-    async fn start(
-        &self,
-        arguments: Vec<String>,
-        timeout: Duration,
-        started: std::time::Instant,
-    ) -> (Exit, String, String) {
+    async fn start(&self, arguments: Vec<String>, timeout: Duration) -> (Exit, String, String) {
         let mut child = match tokio::process::Command::new(&self.systemd_run)
             .args(arguments)
             .stdin(std::process::Stdio::null())
@@ -482,19 +476,10 @@ impl Runner {
             STDERR_TAIL,
             true,
         ));
-        let exit = match tokio::time::timeout(timeout + self.grace, child.wait()).await {
-            Ok(Ok(status)) => match status.code() {
-                // The unit ends itself at its bound (`RuntimeMaxSec`) and the client reports it
-                // as a failure.
-                Some(code)
-                    if code != 0 && started.elapsed() + Duration::from_secs(1) >= timeout =>
-                {
-                    Exit::TimedOut
-                }
-                Some(code) => Exit::Code(code),
-                None => Exit::Signal,
-            },
-            Ok(Err(_)) => Exit::Unstartable,
+        // The unit ends itself at its bound (`RuntimeMaxSec`) and the client reports it; a client
+        // that does not is killed, with the unit it left to that timer.
+        let waited = match tokio::time::timeout(timeout + self.grace, child.wait()).await {
+            Ok(waited) => waited,
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -518,7 +503,46 @@ impl Runner {
                 .await
                 .unwrap_or(Ok(Vec::new())),
         );
-        (exit, stdout, stderr)
+        let (stderr, result) = unit_report(&stderr);
+        let exit = match waited {
+            // The client's status is the command's, except that a unit the bound ended is
+            // status 1 like a command that failed with 1.
+            Ok(status) => match status.code() {
+                Some(code) if code != 0 && result == Some(TIMEOUT_RESULT) => Exit::TimedOut,
+                Some(code) => Exit::Code(code),
+                None => Exit::Signal,
+            },
+            Err(_) => Exit::Unstartable,
+        };
+        (exit, stdout, stderr.to_string())
+    }
+}
+
+/// What `systemd-run --wait` reports on stderr unless it is `--quiet`: a line `Running as unit:`
+/// first and, after the command's own output, `Finished with result: <result>` and the unit's
+/// accounting (systemd 257 on Debian 13). The result is `success`, `exit-code`, `signal`,
+/// `oom-kill` or, for a unit `RuntimeMaxSec` ended, `timeout`.
+const REPORT_RESULT: &str = "Finished with result: ";
+const TIMEOUT_RESULT: &str = "timeout";
+/// The command's stderr without the report, and the result the report names. The report is the
+/// last thing on stderr, so the last such line is systemd's and not the command's.
+fn unit_report(stderr: &str) -> (&str, Option<&str>) {
+    let stderr = match stderr.strip_prefix("Running as unit: ") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
+        None => stderr,
+    };
+    let at = stderr
+        .rfind(REPORT_RESULT)
+        .filter(|at| *at == 0 || stderr.as_bytes()[*at - 1] == b'\n');
+    match at {
+        Some(at) => (
+            &stderr[..at],
+            stderr[at + REPORT_RESULT.len()..]
+                .lines()
+                .next()
+                .map(str::trim),
+        ),
+        None => (stderr, None),
     }
 }
 
@@ -808,7 +832,6 @@ mod tests {
         let expected: Vec<String> = [
             "--wait",
             "--pipe",
-            "--quiet",
             "--collect",
             "--unit=pgcf-job-wal-archive-abcdefghijklmnopqrst-7",
             "--uid=pgcf-abcdefghijklmnopqrst",
@@ -878,6 +901,43 @@ mod tests {
             Path::new("/usr/bin"),
         );
         assert!(bound.contains(&"RuntimeMaxSec=2".to_string()));
+    }
+
+    #[test]
+    fn the_report_of_systemd_run_is_cut_off_and_the_result_it_names_is_read() {
+        // As systemd 257 printed it for a unit that `RuntimeMaxSec` ended.
+        let report = "Finished with result: timeout\nMain processes terminated with: code=killed, status=15/TERM\nService runtime: 2.233s\nCPU time consumed: 7ms\nMemory peak: 1.7M (swap: 0B)\n";
+        let stderr = format!(
+            "Running as unit: pgcf-job-backup-x-7.service; invocation ID: ab\ncommand said this\n{report}"
+        );
+        assert_eq!(
+            unit_report(&stderr),
+            ("command said this\n", Some("timeout"))
+        );
+        // The end of a long stderr: the first line is cut, the report is whole.
+        assert_eq!(
+            unit_report(&format!("ng said this\n{report}")),
+            ("ng said this\n", Some("timeout"))
+        );
+        assert_eq!(
+            unit_report("Finished with result: exit-code\nService runtime: 1s\n"),
+            ("", Some("exit-code"))
+        );
+        // No report: a command alone, or a client that never got to print one.
+        assert_eq!(
+            unit_report("only the command\n"),
+            ("only the command\n", None)
+        );
+        assert_eq!(unit_report(""), ("", None));
+        // A command's line is not the report, wherever it stands, since the report comes last.
+        let forged = "Finished with result: timeout\n";
+        assert_eq!(
+            unit_report(&format!(
+                "{forged}x {forged}Finished with result: exit-code\nService runtime: 1s\n"
+            )),
+            (format!("{forged}x {forged}").as_str(), Some("exit-code"))
+        );
+        assert_eq!(unit_report("x Finished with result: timeout\n").1, None);
     }
 
     #[test]
@@ -998,12 +1058,54 @@ mod tests {
             );
         }
 
+        /// systemd-run reports a unit that `RuntimeMaxSec` ended and a command that failed with
+        /// the same exit status 1 (measured on systemd 257), so the status cannot tell them
+        /// apart, and the time a job took can only guess.
+        #[tokio::test]
+        async fn a_unit_the_bound_ended_timed_out_and_a_command_that_failed_near_it_did_not() {
+            let fixture = Fixture::new("near-bound");
+            let volume = volume();
+            let runner = fixture.runner();
+            // The first start of a new executable can take longer than the bounds below.
+            let (db, warmup) = wal_job(&volume, Duration::from_secs(30));
+            assert!(
+                runner
+                    .run(&db, &warmup, 128, &credential())
+                    .await
+                    .succeeded()
+            );
+            // A unit still running at its bound is ended by systemd.
+            let (db, job) = wal_job(&volume, Duration::from_secs(1));
+            fixture.set("delay", "3");
+            let started = std::time::Instant::now();
+            let outcome = runner.run(&db, &job, 128, &credential()).await;
+            assert_eq!(outcome.exit, Exit::TimedOut, "{outcome:?}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            // A command that fails in the last seconds of its bound failed.
+            let (db, job) = wal_job(&volume, Duration::from_secs(4));
+            fixture.set("fail", "");
+            let outcome = runner.run(&db, &job, 128, &credential()).await;
+            assert_eq!(outcome.exit, Exit::Code(4), "{outcome:?}");
+            assert!(outcome.stderr.contains("simulated R2 outage"));
+        }
+
+        #[tokio::test]
+        async fn what_systemd_run_says_of_the_unit_stays_out_of_the_commands_stderr() {
+            let fixture = Fixture::new("report");
+            let volume = volume();
+            let (db, job) = wal_job(&volume, Duration::from_secs(30));
+            fixture.set("fail", "");
+            let outcome = fixture.runner().run(&db, &job, 128, &credential()).await;
+            assert_eq!(outcome.stderr, "simulated R2 outage\n");
+        }
+
         #[tokio::test]
         async fn a_job_over_its_bound_is_killed_and_does_not_finish() {
             let fixture = Fixture::new("bound");
             let volume = volume();
             let (db, job) = wal_job(&volume, Duration::from_millis(200));
-            fixture.set("delay", "1");
+            // The unit's own bound is whole seconds: it ends at one second, before the upload.
+            fixture.set("delay", "1.5");
             let started = std::time::Instant::now();
             let runner = fixture.runner().with_grace(Duration::ZERO);
             let outcome = runner.run(&db, &job, 128, &credential()).await;
@@ -1013,7 +1115,7 @@ mod tests {
                 "{:?}",
                 started.elapsed()
             );
-            tokio::time::sleep(Duration::from_millis(1300)).await;
+            tokio::time::sleep(Duration::from_millis(1700)).await;
             assert!(!fixture.finished(), "the killed upload went on");
             assert_eq!(
                 std::fs::read_dir(fixture.jobs_directory()).unwrap().count(),
