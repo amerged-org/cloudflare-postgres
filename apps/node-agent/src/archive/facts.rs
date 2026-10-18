@@ -20,6 +20,8 @@ pub struct Backup {
     pub end_wal: Option<String>,
     /// When the backup ended, in milliseconds since the Unix epoch.
     pub completed_at_ms: Option<i64>,
+    /// The size of a WAL segment of the backed-up cluster.
+    pub segment_bytes: Option<u64>,
 }
 #[derive(Deserialize)]
 struct Listing {
@@ -33,6 +35,7 @@ struct Entry {
     systemid: Option<String>,
     end_wal: Option<String>,
     end_time_iso: Option<String>,
+    xlog_segment_size: Option<u64>,
 }
 
 /// The backups of a listing; `backup_list_unreadable` for anything else.
@@ -42,6 +45,7 @@ pub fn parse_backup_list(stdout: &str) -> Result<Vec<Backup>, &'static str> {
         .backups_list
         .into_iter()
         .map(|entry| Backup {
+            segment_bytes: entry.xlog_segment_size,
             backup_id: entry.backup_id,
             status: entry.status,
             timeline: entry.timeline.unwrap_or(0),
@@ -198,6 +202,7 @@ mod tests {
                     .unix_timestamp_nanos()
                     / 1_000_000) as i64
             }),
+            segment_bytes: Some(1 << 20),
         }
     }
 
@@ -214,6 +219,7 @@ mod tests {
                     system_identifier: "7697781764826800331".into(),
                     end_wal: Some("000000010000000000000016".into()),
                     completed_at_ms: Some(1_792_279_520_372),
+                    segment_bytes: Some(1 << 20),
                 },
                 Backup {
                     backup_id: "20261017T232528".into(),
@@ -222,6 +228,7 @@ mod tests {
                     system_identifier: "7697781764826800331".into(),
                     end_wal: Some("000000010000000000000018".into()),
                     completed_at_ms: Some(1_792_279_533_233),
+                    segment_bytes: Some(1 << 20),
                 },
             ]
         );

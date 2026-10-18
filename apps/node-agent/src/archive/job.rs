@@ -197,13 +197,14 @@ impl Job {
             writable: false,
         }
     }
-    /// Fetches `name` to `destination`, with the files after it prefetched into `spool`, a
-    /// directory of this operation alone.
+    /// Fetches `name` to `destination`, with the next `prefetch` files fetched ahead into
+    /// `spool`, a directory of this operation alone.
     pub fn wal_fetch(
         store: &Store,
         spool: &Path,
         name: &str,
         destination: &Path,
+        prefetch: u32,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -211,7 +212,7 @@ impl Job {
             program: "barman-cloud-wal-restore",
             arguments: [
                 "-p",
-                &WAL_PREFETCH.to_string(),
+                &prefetch.to_string(),
                 "--spool-dir",
                 &text(spool),
                 "--endpoint-url",
@@ -728,6 +729,7 @@ mod tests {
             Path::new("/var/lib/pgcf/db/abcdefghijklmnopqrst/spool-op_bbbbbbbbbbbbbbbbbbbb"),
             "00000002.history",
             Path::new("/var/lib/pgcf/db/abcdefghijklmnopqrst/data/pg_wal/RECOVERYHISTORY"),
+            WAL_PREFETCH,
             AGENT_BOUND,
         );
         assert_eq!(fetch.program, "barman-cloud-wal-restore");

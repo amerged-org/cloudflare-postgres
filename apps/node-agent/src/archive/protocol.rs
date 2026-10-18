@@ -27,6 +27,10 @@ fn upper_hex(value: &str, length: usize) -> bool {
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
 }
+/// A whole WAL segment: the only file whose size is the cluster's segment size.
+pub fn is_segment(name: &str) -> bool {
+    upper_hex(name, 24)
+}
 /// A file PostgreSQL archives or restores: a WAL segment, a timeline history file, a partial
 /// segment or a backup history file.
 pub fn valid_name(name: &str) -> bool {
@@ -41,7 +45,7 @@ pub fn valid_name(name: &str) -> bool {
             .split_once('.')
             .is_some_and(|(segment, offset)| upper_hex(segment, 24) && upper_hex(offset, 8));
     }
-    upper_hex(name, 24)
+    is_segment(name)
 }
 /// Where in the data directory a restored file goes: one file directly in `pg_wal`.
 pub fn valid_destination(destination: &str) -> bool {

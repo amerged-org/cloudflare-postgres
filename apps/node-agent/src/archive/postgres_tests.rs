@@ -305,6 +305,7 @@ fn recover(
             source: store(ARCHIVE, Access::ReadOnly),
             spool,
             required_through: required_through.map(Into::into),
+            segment_bytes: 1 << 20,
         }),
         upload_log: UploadLog::new(volume.join("uploads")),
     });
@@ -366,6 +367,7 @@ async fn a_base_backup_of_a_real_cluster_recovers_through_the_socket_to_a_point_
         system_identifier: system_identifier.clone(),
         end_wal: None,
         completed_at_ms: Some(1),
+        segment_bytes: Some(1 << 20),
     };
     let rows = |pg: &Postgres| pg.sql("SELECT count(*) FROM t");
     let promoted = |pg: &Postgres| {

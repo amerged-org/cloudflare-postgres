@@ -293,6 +293,7 @@ mod tests {
             system_identifier: "7697773764701949975".into(),
             end_wal: Some("000000010000000000000003".into()),
             completed_at_ms: Some(1),
+            segment_bytes: Some(1 << 20),
         }
     }
     fn restored(in_recovery: bool, system_identifier: &str, timeline: u32) -> Restored {

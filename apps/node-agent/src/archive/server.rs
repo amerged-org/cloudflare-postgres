@@ -5,8 +5,8 @@
 //! request only when the object is durably in R2 and the segment is in the fsynced upload log.
 //! Anything else is `failed`, and PostgreSQL retries. The agent never deletes in R2.
 use super::{
-    job::{Busy, Database, Exit, Job, Jobs, Outcome, Store},
-    protocol::{AGENT_BOUND, MAX_LINE_BYTES, Reply, Request},
+    job::{Busy, Database, Exit, Job, Jobs, Outcome, Store, WAL_PREFETCH},
+    protocol::{AGENT_BOUND, MAX_LINE_BYTES, Reply, Request, is_segment},
     upload_log::UploadLog,
 };
 use crate::credentials::{Credential, Credentials};
@@ -40,15 +40,17 @@ pub struct Recovery {
     /// hold every segment of its timeline through this one, so none of them is ever `missing`:
     /// a recovery that stopped short of it would lose committed transactions.
     pub required_through: Option<String>,
+    /// The size of a WAL segment of the archive's cluster (`xlog_segment_size` of the backup).
+    /// barman's prefetch threads swallow their failures and leave a cut-off file in the spool,
+    /// which a later call delivers with exit 0: a segment of another size is never answered `ok`,
+    /// since PostgreSQL stops with FATAL on it.
+    pub segment_bytes: u64,
 }
 impl Recovery {
     fn requires(&self, name: &str) -> bool {
-        self.required_through.as_deref().is_some_and(|last| {
-            name.len() == 24
-                && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
-                && name[..8] == last[..8]
-                && name <= last
-        })
+        self.required_through
+            .as_deref()
+            .is_some_and(|last| is_segment(name) && name[..8] == last[..8] && name <= last)
     }
 }
 
@@ -261,34 +263,63 @@ impl Server {
             Err(reason) => return Reply::Failed(Some(reason)),
         };
         let target = registration.database.data_directory().join(destination);
-        let job = Job::wal_fetch(&recovery.source, &recovery.spool, name, &target, self.bound);
-        let outcome = match self
-            .jobs
-            .run(&registration.database, &job, &credential, Some(deadline))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(Busy) => return Reply::Failed(Some("agent_busy")),
-        };
-        if outcome.succeeded() && target.is_file() {
-            return Reply::Ok;
-        }
-        // barman 3.20 exits 1 with "does not exist" for an object R2 reports absent; every other
-        // failure (an expired credential, a refused or lost connection) has another status.
-        if outcome.exit == Exit::Code(1) && outcome.stderr.contains("does not exist") {
-            return if recovery.requires(name) {
-                Reply::Failed(Some("segment_missing"))
-            } else {
-                Reply::Missing
+        // A segment of the wrong size came out of the spool, where a prefetch that failed left it
+        // (see `Recovery::segment_bytes`): it is fetched once more, without prefetch.
+        for prefetch in [WAL_PREFETCH, 0] {
+            let job = Job::wal_fetch(
+                &recovery.source,
+                &recovery.spool,
+                name,
+                &target,
+                prefetch,
+                self.bound,
+            );
+            let outcome = match self
+                .jobs
+                .run(&registration.database, &job, &credential, Some(deadline))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(Busy) => return Reply::Failed(Some("agent_busy")),
             };
+            if !(outcome.succeeded() && target.is_file()) {
+                return fetch_failed(recovery, registration, name, &outcome, &credential);
+            }
+            let whole = !is_segment(name)
+                || std::fs::metadata(&target)
+                    .is_ok_and(|file| file.len() == recovery.segment_bytes);
+            if whole {
+                return Reply::Ok;
+            }
+            let _ = std::fs::remove_file(&target);
         }
-        log("fetch_failed", registration, name, &outcome, &credential);
-        Reply::Failed(Some(if outcome.exit == Exit::TimedOut {
-            "fetch_timeout"
-        } else {
-            "fetch_failed"
-        }))
+        Reply::Failed(Some("fetch_wrong_size"))
     }
+}
+
+/// The answer to a fetch that did not deliver the file.
+fn fetch_failed(
+    recovery: &Recovery,
+    registration: &Registration,
+    name: &str,
+    outcome: &Outcome,
+    credential: &Credential,
+) -> Reply {
+    // barman 3.20 exits 1 with "does not exist" for an object R2 reports absent; every other
+    // failure (an expired credential, a refused or lost connection) has another status.
+    if outcome.exit == Exit::Code(1) && outcome.stderr.contains("does not exist") {
+        return if recovery.requires(name) {
+            Reply::Failed(Some("segment_missing"))
+        } else {
+            Reply::Missing
+        };
+    }
+    log("fetch_failed", registration, name, outcome, credential);
+    Reply::Failed(Some(if outcome.exit == Exit::TimedOut {
+        "fetch_timeout"
+    } else {
+        "fetch_failed"
+    }))
 }
 
 impl Entry {
@@ -364,7 +395,7 @@ mod tests {
     use super::*;
     use crate::{
         archive::test_support::{
-            ARCHIVE, Node, SEGMENT, SOURCE, credential, directory, now, store,
+            ARCHIVE, Node, SEGMENT, SEGMENT_BYTES, SOURCE, credential, directory, now, store,
         },
         credentials::{Access, Credential},
     };
@@ -563,13 +594,10 @@ mod tests {
         // A database that is not recovering has no archive to read from.
         assert_eq!(node.fetch(SEGMENT).await, "failed not_recovering\n");
         node.register(Some(node.recovery(None)));
-        node.fixture
-            .put_object(SOURCE, SEGMENT, b"wal bytes of the source");
+        let segment = vec![3u8; SEGMENT_BYTES as usize];
+        node.fixture.put_object(SOURCE, SEGMENT, &segment);
         assert_eq!(node.fetch(SEGMENT).await, "ok\n");
-        assert_eq!(
-            std::fs::read(node.volume().join("data/pg_wal/RECOVERYXLOG")).unwrap(),
-            b"wal bytes of the source"
-        );
+        assert!(std::fs::read(node.volume().join("data/pg_wal/RECOVERYXLOG")).unwrap() == segment);
         // The fetch reads the source with its own spool, in this operation's directory.
         assert_eq!(
             node.fixture.spool_directories(),
@@ -602,6 +630,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cut_off_prefetch_is_fetched_again_and_a_cut_off_archive_is_a_failure() {
+        let node = Node::start("short", AGENT_BOUND).await;
+        node.register(Some(node.recovery(None)));
+        let whole = vec![4u8; SEGMENT_BYTES as usize];
+        node.fixture.put_object(SOURCE, SEGMENT, &whole);
+        // The prefetch of an earlier call was cut off by an R2 error, and barman exited 0 all
+        // the same; the next call delivers what is in the spool.
+        let spool = node.volume().join("spool-op_cccccccccccccccccccc");
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::write(spool.join(SEGMENT), &whole[..700]).unwrap();
+        let destination = node.volume().join("data/pg_wal/RECOVERYXLOG");
+        assert_eq!(node.fetch(SEGMENT).await, "ok\n");
+        assert!(std::fs::read(&destination).unwrap() == whole);
+        assert!(!spool.join(SEGMENT).exists());
+        // The second try asked for no prefetch, so that nothing can cut it off again.
+        assert_eq!(node.fixture.prefetches(), [4, 0]);
+        // An archive whose object itself is cut off cannot be answered ok.
+        let second = "000000010000000000000002";
+        node.fixture.put_object(SOURCE, second, &whole[..100]);
+        assert_eq!(node.fetch(second).await, "failed fetch_wrong_size\n");
+        assert!(!destination.exists());
+        // Only a segment has the size of one: a history file, a partial or backup history file
+        // are as long as they are.
+        node.fixture
+            .put_object(SOURCE, "00000002.history", b"1\t0/3000000\tx\n");
+        assert_eq!(node.fetch("00000002.history").await, "ok\n");
+    }
+
+    #[tokio::test]
     async fn a_move_target_is_never_told_the_archive_ends_before_the_sources_last_segment() {
         let node = Node::start("move", AGENT_BOUND).await;
         node.register(Some(node.recovery(Some("000000020000000000000005"))));
@@ -626,6 +683,7 @@ mod tests {
             source: store(SOURCE, Access::ReadOnly),
             spool: PathBuf::from("/spool"),
             required_through: through.map(Into::into),
+            segment_bytes: SEGMENT_BYTES,
         };
         let recovery = node_recovery(Some("000000020000000000000005"));
         assert!(recovery.requires("000000020000000000000001"));

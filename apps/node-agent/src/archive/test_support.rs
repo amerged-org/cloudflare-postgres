@@ -119,15 +119,19 @@ exit $status
 "#
             ),
         );
-        // barman-cloud-wal-restore: exit 1 and barman's message when the object is absent.
+        // barman-cloud-wal-restore: a file in the spool is delivered first (barman's
+        // `_try_to_deliver_from_spool`), whatever its size; then exit 1 and barman's message when
+        // the object is absent.
         script(
             &root.join("bin/barman-cloud-wal-restore"),
             format!(
                 r#"#!/bin/sh
 STORE='{store}'
 {CREDENTIAL_CHECK}
-while [ $# -gt 0 ]; do case "$1" in -p|--endpoint-url) shift ;; --spool-dir) echo "$2" >> "$STORE/spool-dirs"; shift ;; *) break ;; esac; shift; done
+spool=
+while [ $# -gt 0 ]; do case "$1" in -p) echo "$2" >> "$STORE/prefetches"; shift ;; --endpoint-url) shift ;; --spool-dir) spool=$2; echo "$2" >> "$STORE/spool-dirs"; shift ;; *) break ;; esac; shift; done
 dest=$1; server=$2; name=$3; target=$4
+if [ -n "$spool" ] && [ -f "$spool/$name" ]; then mv "$spool/$name" "$target"; exit 0; fi
 if [ -f "$STORE/delay" ]; then sleep "$(cat "$STORE/delay")"; fi
 if [ -f "$STORE/fetch-fail" ]; then echo 'simulated R2 outage' >&2; exit 4; fi
 key="$STORE/objects/${{dest#s3://}}/$server/wals/$name.gz"
@@ -195,6 +199,14 @@ gunzip -c "$key" > "$target.part" && mv "$target.part" "$target"
             .map(|line| line.trim().parse().unwrap())
             .collect()
     }
+    /// The `-p` of each fetch.
+    pub fn prefetches(&self) -> Vec<u32> {
+        fs::read_to_string(self.store("prefetches"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect()
+    }
     pub fn spool_directories(&self) -> Vec<String> {
         fs::read_to_string(self.store("spool-dirs"))
             .unwrap_or_default()
@@ -241,6 +253,8 @@ use tokio::{
 };
 
 pub const SEGMENT: &str = "000000010000000000000001";
+/// The size of a WAL segment of the test clusters.
+pub const SEGMENT_BYTES: u64 = 2048;
 pub const ARCHIVE: &str = "s3://pgcf-eu/eu-dev/abcdefghijklmnopqrst/g1-op_aaaaaaaaaaaaaaaaaaaa";
 pub const SOURCE: &str = "s3://pgcf-eu/eu-dev/zyxwvutsrqponmlkjihg/g1-op_bbbbbbbbbbbbbbbbbbbb";
 
@@ -279,7 +293,11 @@ impl Node {
         let root = directory(name);
         let volume = root.join("volume");
         std::fs::create_dir_all(volume.join("data/pg_wal")).unwrap();
-        std::fs::write(volume.join("data/pg_wal").join(SEGMENT), vec![9u8; 2048]).unwrap();
+        std::fs::write(
+            volume.join("data/pg_wal").join(SEGMENT),
+            vec![9u8; SEGMENT_BYTES as usize],
+        )
+        .unwrap();
         let uid = std::fs::metadata(&volume).unwrap().uid();
         let table = Arc::new(Table::default());
         let credentials = Arc::new(Credentials::default());
@@ -328,6 +346,7 @@ impl Node {
             source: store(SOURCE, Access::ReadOnly),
             spool: self.volume().join("spool-op_cccccccccccccccccccc"),
             required_through: required_through.map(Into::into),
+            segment_bytes: SEGMENT_BYTES,
         }
     }
     pub async fn ask(&self, line: &str) -> String {
