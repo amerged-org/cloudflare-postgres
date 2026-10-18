@@ -294,11 +294,13 @@ export function createApp(): ApiApp {
   app.use("/node/v1/*", nodeLookup);
   app.use("*", async (c, next) => {
     if (c.req.raw.body !== null) {
+      // Only a request that names an enrolled node's key may carry a node's larger body; the
+      // installer's progress and the enrollment are read like any other request.
       const { text, bytes } = await readJsonBody(
         c.req.raw,
-        c.req.path.startsWith("/node/v1/")
-          ? NODE_JSON_BODY_MAX_BYTES
-          : JSON_BODY_MAX_BYTES,
+        c.get("nodeClaim") === undefined
+          ? JSON_BODY_MAX_BYTES
+          : NODE_JSON_BODY_MAX_BYTES,
       );
       // The bytes a node signed are the bytes it sent, not what parsing leaves of them.
       c.set("body", bytes);

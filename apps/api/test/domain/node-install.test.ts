@@ -2,11 +2,13 @@
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ErrorBody,
   INFRA_ALERT_ACTIONS,
   INSTALLER_CHECKPOINTS,
   InfraAlert,
   NodeEnrollmentResponse,
 } from "@pgcf/contracts";
+import { JSON_BODY_MAX_BYTES } from "../../src/app.ts";
 import {
   infrastructureAlertStatus,
   runInfrastructureHealthAlerts,
@@ -298,6 +300,37 @@ describe("enrolling a node", () => {
     expect((await enroll({ ...i.request, public_key: "short" })).status).toBe(
       400,
     );
+    expect(
+      await env.DB.prepare("SELECT 1 FROM nodes WHERE id=?").bind(i.id).first(),
+    ).toBeNull();
+  });
+
+  it("reads no larger body than any request without a node's key", async () => {
+    const i = await installed();
+    const padded = (path: string, body: unknown, headers = {}) =>
+      rawRequest(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "CF-Connecting-IP": v4,
+          ...headers,
+        },
+        body: JSON.stringify(body) + " ".repeat(JSON_BODY_MAX_BYTES),
+      });
+    const refused = await padded("/node/v1/enroll", i.request);
+    expect(refused.status).toBe(400);
+    expect(ErrorBody.parse(await refused.json()).error.message).toBe(
+      `JSON body exceeds ${JSON_BODY_MAX_BYTES / 1024} KiB`,
+    );
+    expect(
+      (
+        await padded(
+          "/node/v1/installer/progress",
+          { checkpoint: "started", detail: "" },
+          { Authorization: `Bearer ${i.issued.progress_token}` },
+        )
+      ).status,
+    ).toBe(400);
     expect(
       await env.DB.prepare("SELECT 1 FROM nodes WHERE id=?").bind(i.id).first(),
     ).toBeNull();
