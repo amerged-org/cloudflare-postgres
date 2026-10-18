@@ -824,7 +824,7 @@ describe("what a node reports", () => {
     ];
     expect(NodeEventReport.safeParse({ events }).success).toBe(true);
     for (const broken of [
-      events.map(({ id: _, ...event }) => event),
+      events.map((event) => ({ ...event, id: undefined })),
       events.map((event) => ({ ...event, id: "not-a-uuid" })),
       [events[0], { ...events[1], id: events[0]!.id }],
       [events[0], events[0]],

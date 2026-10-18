@@ -1,12 +1,20 @@
-  {
-      "report": [
-          {
-              "vg": [
-                  {"vg_name":"pgcf", "vg_uuid":"OGRWom-BMfC-6ccA-5YoZ-kGfR-MuBj-v84HvO", "vg_size":"1002438656", "vg_free":"1002438656", "vg_extent_size":"4194304", "vg_permissions":"writeable", "vg_missing_pv_count":"0", "pv_count":"1", "vg_mda_size":"68153344"}
-              ]
-          }
+{
+  "report": [
+    {
+      "vg": [
+        {
+          "vg_name": "pgcf",
+          "vg_uuid": "OGRWom-BMfC-6ccA-5YoZ-kGfR-MuBj-v84HvO",
+          "vg_size": "1002438656",
+          "vg_free": "1002438656",
+          "vg_extent_size": "4194304",
+          "vg_permissions": "writeable",
+          "vg_missing_pv_count": "0",
+          "pv_count": "1",
+          "vg_mda_size": "68153344"
+        }
       ]
-      ,
-      "log": [
-      ]
-  }
+    }
+  ],
+  "log": []
+}
