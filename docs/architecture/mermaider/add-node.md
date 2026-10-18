@@ -8,7 +8,7 @@ flowchart TD
     n_05cae6515ea2["Cancelled: return"]
     n_f6c7e8a30e85["Ready: place pending databases and<br/>hint their nodes"]
     n_a67701fc2401["As eligible: claim order dispatch<br/>and resolve provider identity"]
-    n_d893dc3cbbc2["Audited or bootstrapping: send the<br/>installer once, then watch the<br/>install until the node enrolls"]
+    n_d893dc3cbbc2["Audited or bootstrapping: confirm<br/>the node firewall, send the<br/>installer once, then watch the<br/>install until the node enrolls"]
     n_8092c49190cf["Wait; re-read D1 next cycle (never<br/>trust cached outputs as authority)"]
     n_83212f141b4e["After 288 cycles:<br/>waiting_for_operator"]
     n_98d16e133cfc -->|"cancelled"| n_05cae6515ea2
@@ -23,8 +23,8 @@ flowchart TD
 ## Sources
 
 - [apps/api/src/domain/node-capacity.ts · placePendingDatabases:37](../../../apps/api/src/domain/node-capacity.ts#L37)
-- [apps/api/src/domain/node-installer.ts · driveNodeInstall:250](../../../apps/api/src/domain/node-installer.ts#L250)
-- [apps/api/src/domain/node-state.ts · claimNodeDispatch:764](../../../apps/api/src/domain/node-state.ts#L764)
+- [apps/api/src/domain/node-installer.ts · driveNodeInstall:308](../../../apps/api/src/domain/node-installer.ts#L308)
+- [apps/api/src/domain/node-state.ts · claimNodeDispatch:766](../../../apps/api/src/domain/node-state.ts#L766)
 - [apps/api/src/workflows/add-node.ts · dispatchNodeOrder:69](../../../apps/api/src/workflows/add-node.ts#L69)
 - [apps/api/src/workflows/add-node.ts · reconcileNodeProvider:112](../../../apps/api/src/workflows/add-node.ts#L112)
 - [apps/api/src/workflows/add-node.ts · AddNode:213](../../../apps/api/src/workflows/add-node.ts#L213)
