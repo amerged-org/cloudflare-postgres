@@ -21,6 +21,7 @@ import { registerFleetReleases } from "./routes/fleet-releases.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodeLink } from "./routes/node-link.ts";
+import { nodeLookup } from "./domain/node-auth.ts";
 import { registerNodes } from "./routes/nodes.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
 import { NodeStateError } from "./domain/node-state.ts";
@@ -284,6 +285,8 @@ export function createApp(): ApiApp {
     return apiError(c, "internal", "Internal server error");
   });
 
+  // A node's key is looked up before its body is read; its signature covers the body.
+  app.use("/node/v1/*", nodeLookup);
   app.use("*", async (c, next) => {
     if (c.req.raw.body !== null) {
       const { text, bytes } = await readJsonBody(

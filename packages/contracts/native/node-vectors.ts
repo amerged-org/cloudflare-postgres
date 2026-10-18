@@ -881,6 +881,18 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
+      "ready-without-backup",
+      observations({
+        ...observation,
+        state: "ready",
+        instance,
+        proven_sleep: null,
+        backup: null,
+      }),
+      false,
+      true,
+    ],
+    [
       "asleep-with-instance",
       observations({ ...observation, instance }),
       false,

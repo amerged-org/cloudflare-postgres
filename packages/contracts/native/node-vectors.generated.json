@@ -7515,6 +7515,33 @@
     },
     {
       "schema": "NodeObservationReport",
+      "name": "ready-without-backup",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "storage_generation": 1,
+            "state": "ready",
+            "proven_sleep": null,
+            "backup": null,
+            "archive": {
+              "last_segment": "000000010000000000000002",
+              "ready_files": 0,
+              "failing_since": null
+            },
+            "instance": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c"
+          }
+        ],
+        "orders": []
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
       "name": "asleep-with-instance",
       "valid": false,
       "refinement": true,

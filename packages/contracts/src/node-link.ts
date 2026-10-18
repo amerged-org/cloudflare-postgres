@@ -960,6 +960,8 @@ export const NodeDatabaseObservation = z
     /**
      * The invocation ID of the PostgreSQL unit while the database is `ready`. The route names
      * it (`UnitWriter.instance`, route token v6), so Cloudflare must learn it from the node.
+     * Required exactly while ready, and with the `backup` a ready database names, a breaking
+     * change for an agent built before them: its whole report is refused until it sends both.
      */
     instance: z.uuid().optional(),
     error: z.enum(NODE_DATABASE_ERRORS).optional(),
@@ -970,7 +972,10 @@ export const NodeDatabaseObservation = z
      * suspends only when a new generation asks again.
      */
     refusal: z.enum(["power_busy", "power_archive"]).optional(),
-    /** The newest DONE base backup of this storage generation. */
+    /**
+     * The newest DONE base backup of this storage generation. A ready database has one: the
+     * agent reports ready only when its first base backup is DONE (plan 5.10, 7.8).
+     */
     backup: z
       .strictObject({
         backup_id: z.string().regex(BACKUP_ID),
@@ -1000,6 +1005,13 @@ export const NodeDatabaseObservation = z
         path: ["instance"],
         message:
           "A ready database names the unit's instance, and no other does",
+      });
+    if (db.state === "ready" && db.backup === null)
+      ctx.addIssue({
+        code: "custom",
+        path: ["backup"],
+        message:
+          "A ready database has a DONE base backup of its storage generation",
       });
     if ((db.state === "asleep") !== (db.proven_sleep !== null))
       ctx.addIssue({

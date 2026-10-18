@@ -743,6 +743,10 @@ async function takeObservation(
     )
       return "conflict";
   }
+  // A unit of a storage generation D1 does not name is a retired volume or an unknown one; the
+  // page wins and the node applies the entry it names.
+  if (observation.storage_generation !== row.storage_generation)
+    return "conflict";
   if (
     observation.state === "asleep" &&
     row.desired_state === "running" &&

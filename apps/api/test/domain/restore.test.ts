@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
 import {
+  assignRelease,
   fixture,
   cleanupFixtures,
   desiredPage,
@@ -78,6 +79,19 @@ async function archived(
     before,
   };
 }
+it("creates and restores a database in a region whose node release is assigned", async () => {
+  // Assigning the release is the rollout step of every region; it must not stop its databases.
+  const f = await archived(async (node) => {
+    await assignRelease(node);
+  });
+  const restored = await request(
+    `/v1/databases/${f.id}/restore`,
+    f.integrator,
+    "POST",
+    { name: "after-release", mode: "full" },
+  );
+  expect(restored.status).toBe(202);
+});
 it("keeps a fresh restore target denied and refuses restore creation while its project scope is fenced", async () => {
   const f = await archived();
   const restored = await request(

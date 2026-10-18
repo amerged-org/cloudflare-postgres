@@ -11,6 +11,7 @@ import {
   readDatabasePresence,
   syncDatabaseActor,
 } from "../../src/domain/database-actor-sync.ts";
+import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
 import { cleanupFixtures, fixture, report } from "./fixtures.ts";
 
 afterEach(async () => {
@@ -71,6 +72,25 @@ it("fresh unknown actors reject hints without creating application tables or que
   expect((await actor(id).ensureAwake(id, "app")).ok).toBe(false);
   expect(await applicationTables(id)).toEqual([]);
   expect(count()).toBe(0);
+});
+
+it("names no unit of a storage generation D1 has moved on from", async () => {
+  const f = await ready();
+  expect((await actor(f.id).ensureAwake(f.id, "app")).ok).toBe(true);
+  // D1 names the next storage generation; the unit the node reported is of the old volume, and
+  // the Actor's fallback read of D1 must not route to it.
+  await env.DB.prepare("UPDATE databases SET storage_generation=2 WHERE id=?")
+    .bind(f.id)
+    .run();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
+  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
 });
 
 it("rejects a known hint flood at the Actor's per-minute allowance before D1 or wake", async () => {

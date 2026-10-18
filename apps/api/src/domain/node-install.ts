@@ -14,92 +14,29 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 
-/**
- * Where an enrollment may come from (plan 8): the public IPv4 the provider reports for the
- * instance, or an address in its IPv6 prefix, because a VPS with both reaches Cloudflare over
- * either.
- */
-export type InstallSource =
-  { readonly v4: string } | { readonly v6: string; readonly prefix: number };
-
 const PROGRESS_TOKEN_PREFIX = "pgcf_pt_";
 /** The checkpoints that must have arrived before the node may enroll: the whole install. */
 const REQUIRED_CHECKPOINTS = INSTALLER_CHECKPOINTS.filter(
   (checkpoint) => checkpoint !== "failed",
 );
 
-function ipv4Bytes(text: string): Uint8Array | null {
-  const parts = text.split(".");
-  if (parts.length !== 4) return null;
-  const bytes = parts.map((part) =>
-    /^(0|[1-9][0-9]{0,2})$/.test(part) ? Number(part) : NaN,
-  );
-  return bytes.every((value) => value <= 255) ? Uint8Array.from(bytes) : null;
-}
-function ipv6Bytes(text: string): Uint8Array | null {
-  if (!/^[0-9a-fA-F:]{2,39}$/.test(text)) return null;
-  const halves = text.split("::");
-  if (halves.length > 2) return null;
-  const groups = (part: string) => (part === "" ? [] : part.split(":"));
-  const head = groups(halves[0]!),
-    tail = halves.length === 2 ? groups(halves[1]!) : [];
-  const missing = 8 - head.length - tail.length;
-  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
-  const all = [
-    ...head,
-    ...Array<string>(missing > 0 ? missing : 0).fill("0"),
-    ...tail,
-  ];
-  if (
-    all.length !== 8 ||
-    !all.every((group) => /^[0-9a-fA-F]{1,4}$/.test(group))
-  )
-    return null;
-  const bytes = new Uint8Array(16);
-  all.forEach((group, index) => {
-    const value = parseInt(group, 16);
-    bytes[index * 2] = value >> 8;
-    bytes[index * 2 + 1] = value & 0xff;
-  });
-  return bytes;
-}
-function samePrefix(a: Uint8Array, b: Uint8Array, bits: number): boolean {
-  for (let bit = 0; bit < bits; bit += 8) {
-    const mask = bits - bit >= 8 ? 0xff : (0xff << (8 - (bits - bit))) & 0xff;
-    if ((a[bit / 8]! & mask) !== (b[bit / 8]! & mask)) return false;
-  }
-  return true;
-}
-/** Whether `address` is one the provider reports for the instance. */
+/** A dotted-quad IPv4 in its one canonical text: no leading zeros, no spaces. */
+const isIpv4 = (text: string) =>
+  /^(?:(?:0|[1-9][0-9]{0,2})\.){3}(?:0|[1-9][0-9]{0,2})$/.test(text) &&
+  text.split(".").every((part) => Number(part) <= 255);
+/**
+ * Whether `address` is the public IPv4 the provider reports for the instance (plan 8): the one
+ * address an enrollment may come from.
+ */
 export function sourceAllowed(
   address: string | undefined,
-  sources: readonly InstallSource[],
+  sources: readonly string[],
 ): boolean {
-  if (address === undefined) return false;
-  const v4 = ipv4Bytes(address),
-    v6 = v4 === null ? ipv6Bytes(address) : null;
-  return sources.some((source) => {
-    if ("v4" in source)
-      return (
-        v4 !== null &&
-        samePrefix(v4, ipv4Bytes(source.v4) ?? new Uint8Array(), 32)
-      );
-    const prefix = ipv6Bytes(source.v6);
-    return (
-      v6 !== null && prefix !== null && samePrefix(v6, prefix, source.prefix)
-    );
-  });
+  return address !== undefined && isIpv4(address) && sources.includes(address);
 }
 /** The sources of a provider's network configuration (`ipConfig` of a Contabo instance). */
-export function installSources(config: {
-  v4: { ip: string };
-  v6?: { ip: string; netmaskCidr: number } | undefined;
-}): InstallSource[] {
-  const sources: InstallSource[] = [];
-  if (ipv4Bytes(config.v4.ip) !== null) sources.push({ v4: config.v4.ip });
-  if (config.v6 && ipv6Bytes(config.v6.ip) !== null)
-    sources.push({ v6: config.v6.ip, prefix: config.v6.netmaskCidr });
-  return sources;
+export function installSources(config: { v4: { ip: string } }): string[] {
+  return isIpv4(config.v4.ip) ? [config.v4.ip] : [];
 }
 
 export interface IssuedInstall {
@@ -117,7 +54,7 @@ export async function issueNodeInstall(
   input: {
     node_id: string;
     image_version: string;
-    sources: readonly InstallSource[];
+    sources: readonly string[];
     now?: number;
   },
 ): Promise<IssuedInstall> {
@@ -309,7 +246,7 @@ export async function enrollNode(
   if (
     !sourceAllowed(
       c.req.header("CF-Connecting-IP"),
-      JSON.parse(row.allowed_sources_json) as InstallSource[],
+      JSON.parse(row.allowed_sources_json) as string[],
     )
   )
     throw refuse("source", "forbidden");

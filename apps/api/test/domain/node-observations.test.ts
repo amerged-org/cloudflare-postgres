@@ -135,6 +135,28 @@ describe("a database the node reports ready", () => {
     expect(await verdicts(await report(f, db.id, 2))).toEqual(["accept"]);
   });
 
+  it("is not accepted for another storage generation than D1's", async () => {
+    const f = await fixture();
+    const db = await created(f);
+    // A unit of a storage generation D1 never named must neither open the database nor end its
+    // create; the older one is a retired volume, the newer one an unknown.
+    await env.DB.prepare("UPDATE databases SET storage_generation=2 WHERE id=?")
+      .bind(db.id)
+      .run();
+    for (const storage_generation of [1, 7])
+      expect(
+        await verdicts(
+          await report(f, db.id, 1, "ready", { storage_generation }),
+        ),
+      ).toEqual(["conflict"]);
+    expect(await row(db.id)).toMatchObject({
+      observed_state: "pending",
+      runtime_attestation_json: null,
+    });
+    expect((await status(db.operation))!.status).not.toBe("succeeded");
+    expect(await verdicts(await report(f, db.id, 1))).toEqual(["accept"]);
+  });
+
   it("is not accepted for a database that is not wanted running", async () => {
     const f = await fixture();
     const db = await created(f);

@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { newDatabaseId, newOperationId } from "@pgcf/contracts";
+import { newDatabaseId, newNodeId, newOperationId } from "@pgcf/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanupFixtures, fixture, nodeRequest, request } from "./fixtures.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  nodeKeyPair,
+  nodeRequest,
+  request,
+} from "./fixtures.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -30,8 +36,11 @@ const volume = (id: string, extra: Record<string, unknown> = {}) => ({
   },
   ...extra,
 });
-const post = (f: F, path: string, body: unknown) =>
-  nodeRequest(f, path, { method: "POST", body });
+const post = (
+  f: Parameters<typeof nodeRequest>[0],
+  path: string,
+  body: unknown,
+) => nodeRequest(f, path, { method: "POST", body });
 const volumes = (f: F, list: unknown[], at = new Date().toISOString()) =>
   post(f, "/node/v1/volumes", { observed_at: at, volumes: list });
 const stored = (node: string) =>
@@ -429,6 +438,53 @@ describe("the usage of a node", () => {
       duplicates: 2,
       refused: 0,
     });
+  });
+
+  it("is recorded only for the databases the node serves, also when another node of its region posts them", async () => {
+    const f = await fixture();
+    const id = await database(f);
+    const key = await nodeKeyPair(),
+      now = new Date().toISOString(),
+      neighbour = {
+        node: newNodeId(),
+        nodeUid: crypto.randomUUID(),
+        nodeKey: key.privateKey,
+      };
+    await env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,public_key,enrolled_at) VALUES (?,?,?,1,4096,2000,30,128,100,?,?,?,?,?,?)",
+    )
+      .bind(
+        neighbour.node,
+        f.region,
+        "node-neighbour",
+        now,
+        now,
+        now,
+        neighbour.nodeUid,
+        key.publicKey,
+        now,
+      )
+      .run();
+    const forged = row(id, 0, {
+      ingress_bytes: 10 ** 12,
+      egress_bytes: 10 ** 12,
+    });
+    expect(
+      await (
+        await post(neighbour, "/node/v1/usage", { rows: [forged] })
+      ).json(),
+    ).toEqual({ recorded: 0, duplicates: 0, refused: 1 });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) n FROM usage_samples WHERE database_id=?",
+      )
+        .bind(id)
+        .first("n"),
+    ).toBe(0);
+    // The foreign row did not pre-empt the interval: the serving node still records its own.
+    expect(
+      await (await post(f, "/node/v1/usage", { rows: [row(id, 0)] })).json(),
+    ).toEqual({ recorded: 1, duplicates: 0, refused: 0 });
   });
 
   it("acknowledges a row it cannot record, so the node's outbox drains", async () => {

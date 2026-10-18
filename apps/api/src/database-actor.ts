@@ -103,7 +103,7 @@ function roleAdmitted(
   );
 }
 export type { DatabaseAdmission } from "@pgcf/contracts";
-export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
+export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.storage_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
   d.runtime_attestation_json,COALESCE(e.route_revision,1) route_revision,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at,
   CASE WHEN NOT EXISTS(SELECT 1 FROM database_admission_epochs ae WHERE ae.database_id=d.id AND ae.mutation_id IS NOT NULL) THEN 0 ELSE 1 END admission_blocked
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
@@ -115,6 +115,7 @@ interface AdmissionRow {
   route_revision: number;
   generation: number;
   observed_generation: number;
+  storage_generation: number;
   observed_power: string;
   suspension_reason: string | null;
   power_operation: string | null;
@@ -150,7 +151,7 @@ function admittedRoute(
     : { ok: false, sqlstate: "57P03" };
 }
 
-/** The node's report of the observed generation names the unit that serves it. */
+/** The node's report of the observed generation and the storage generation names the unit that serves it. */
 function verifiedTarget(
   row: AdmissionRow,
   databaseId: string,
@@ -162,7 +163,8 @@ function verifiedTarget(
   return runtime.success &&
     runtime.data.database_id === databaseId &&
     runtime.data.node_id === row.node_id &&
-    runtime.data.generation === row.observed_generation
+    runtime.data.generation === row.observed_generation &&
+    runtime.data.storage_generation === row.storage_generation
     ? {
         revision: runtime.data.generation,
         route_revision: row.route_revision,

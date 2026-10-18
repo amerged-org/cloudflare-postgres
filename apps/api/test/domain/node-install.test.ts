@@ -26,36 +26,30 @@ afterEach(async () => {
 });
 
 describe("where an enrollment may come from", () => {
-  it("accepts the instance's IPv4 and any address of its IPv6 prefix, nothing else", () => {
+  it("accepts the instance's public IPv4 and nothing else", () => {
     expect(sourceAllowed(v4, sources)).toBe(true);
-    expect(sourceAllowed("2001:db8:1234:5678:abcd::7", sources)).toBe(true);
-    expect(
-      sourceAllowed("2001:db8:1234:5678:ffff:ffff:ffff:ffff", sources),
-    ).toBe(true);
     for (const other of [
       undefined,
       "",
       "192.0.2.11",
       "192.0.2.010",
       "192.0.2",
-      "2001:db8:1234:5679::10",
-      "2001:db8:1234::10",
+      // An address of the instance's IPv6 prefix is not its IPv4.
+      v6,
+      "2001:db8:1234:5678:abcd::7",
+      "::ffff:192.0.2.10",
       "::1",
       "not an address",
       "192.0.2.10 ",
     ])
       expect(sourceAllowed(other, sources), String(other)).toBe(false);
-    expect(sourceAllowed(v4, [{ v6: "2001:db8::", prefix: 32 }])).toBe(false);
-    expect(
-      sourceAllowed("2001:db8:ffff::1", [{ v6: "2001:db8::", prefix: 32 }]),
-    ).toBe(true);
+    expect(sourceAllowed(v4, [])).toBe(false);
   });
 
-  it("takes both addresses from the provider's network configuration", () => {
-    expect(
-      installSources({ v4: { ip: v4 }, v6: { ip: v6, netmaskCidr: 64 } }),
-    ).toEqual([{ v4 }, { v6, prefix: 64 }]);
-    expect(installSources({ v4: { ip: v4 } })).toEqual([{ v4 }]);
+  it("takes only the IPv4 from the provider's network configuration", () => {
+    const dual = { v4: { ip: v4 }, v6: { ip: v6, netmaskCidr: 64 } };
+    expect(installSources(dual)).toEqual([v4]);
+    expect(installSources({ v4: { ip: v4 } })).toEqual([v4]);
     expect(installSources({ v4: { ip: "" } })).toEqual([]);
   });
 });
@@ -302,7 +296,13 @@ describe("enrolling a node", () => {
 
   it("is refused from another address, without one and for another image version", async () => {
     const i = await installed();
-    for (const address of [null, "192.0.2.99", "2001:db8:1234:5679::1", "::1"])
+    for (const address of [
+      null,
+      "192.0.2.99",
+      v6,
+      "2001:db8:1234:5679::1",
+      "::1",
+    ])
       expect((await enroll(i.request, address)).status, String(address)).toBe(
         403,
       );

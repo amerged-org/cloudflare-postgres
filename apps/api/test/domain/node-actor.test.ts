@@ -277,6 +277,50 @@ describe("the samples of a node", () => {
     socket.close(1000);
   }, 60_000);
 
+  describe("when a minute's first sample comes less than 5 s into the minute", () => {
+    // The alarm of a minute rings 5 s after it ends, so a first sample sooner than that moves the
+    // alarm on before it rings. The node's vitals must follow the sample all the same.
+    async function rollOver(forceAlarm: boolean) {
+      const f = await fixture();
+      const socket = await connect(f);
+      const minute = Math.floor(Date.now() / MINUTE) * MINUTE;
+      const send = async (message: string) => {
+        socket.send(message);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      };
+      await send(sampleMessage(minute - 40_000));
+      await until(async () => (await minutes(f.node)).length === 1);
+      await send(sampleMessage(minute - 25_000));
+      if (forceAlarm) await runDurableObjectAlarm(actor(f.node));
+      const first = new Date(minute + 2_000).toISOString();
+      await send(sampleMessage(minute + 2_000));
+      await until(
+        async () =>
+          (await env.DB.prepare("SELECT last_observed_at FROM nodes WHERE id=?")
+            .bind(f.node)
+            .first("last_observed_at")) === first,
+      );
+      expect(
+        NodeSample.parse(
+          JSON.parse(
+            (await env.DB.prepare(
+              "SELECT last_sample_json FROM nodes WHERE id=?",
+            )
+              .bind(f.node)
+              .first<{ last_sample_json: string }>())!.last_sample_json,
+          ),
+        ).observed_at,
+      ).toBe(first);
+      // The minute that ended holds both of its samples, once.
+      await until(async () => (await minutes(f.node))[0]?.samples === 2);
+      expect((await minutes(f.node)).length).toBe(1);
+      socket.close(1000);
+    }
+    it("refreshes the vitals at the rollover", () => rollOver(false));
+    it("refreshes the vitals at the rollover also when the alarm already wrote the minute", () =>
+      rollOver(true));
+  });
+
   it("opens an enrolled node for placement at its first sample and keeps a lost node closed", async () => {
     const i = await installed();
     expect((await enroll(i.request)).status).toBe(200);

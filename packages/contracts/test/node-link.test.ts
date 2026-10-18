@@ -619,6 +619,27 @@ describe("what a node reports", () => {
     ).toBe(true);
   });
 
+  it("reports a database ready only with the DONE base backup of its storage generation", () => {
+    const ready = {
+      ...observation,
+      state: "ready",
+      proven_sleep: null,
+      instance,
+    };
+    const accepted = (change: object) =>
+      NodeObservationReport.safeParse({
+        observed_at: now,
+        databases: [{ ...ready, ...change }],
+        orders: [],
+      }).success;
+    expect(accepted({})).toBe(true);
+    expect(accepted({ backup: null })).toBe(false);
+    // A database still building has none yet.
+    expect(
+      accepted({ state: "building", instance: undefined, backup: null }),
+    ).toBe(true);
+  });
+
   it("samples memory, CPU, the pool, the volumes and the archive within their bounds", () => {
     const sample = {
       observed_at: now,
@@ -1048,7 +1069,11 @@ describe("the order of generations", () => {
         instance,
         proven_sleep: null,
         refusal: "power_busy",
-        backup: null,
+        backup: {
+          backup_id: "20261017T110000",
+          timeline: 1,
+          completed_at: now,
+        },
         archive: { last_segment: null, ready_files: 0, failing_since: null },
       }).success,
     ).toBe(true);

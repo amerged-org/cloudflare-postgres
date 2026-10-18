@@ -21,7 +21,7 @@ export interface NodeCaller {
   /** Declared lost (plan 9.4): its key signs the desired page and its observations only. */
   fenced: boolean;
 }
-interface NodeKeyRow {
+export interface NodeKeyRow {
   id: string;
   node_uid: string;
   region_id: string;
@@ -29,12 +29,27 @@ interface NodeKeyRow {
   lost_at: string | null;
 }
 
+/** The token of a signed request and the record of the node it claims to come from. */
+export interface NodeClaim {
+  token: string;
+  row: NodeKeyRow;
+}
+
+/** The two paths a node calls without its key: the installer's report and the enrollment. */
+const UNSIGNED_PATHS: ReadonlySet<string> = new Set([
+  NODE_API_PATHS.enroll,
+  INSTALLER_PROGRESS_PATH,
+]);
+const isSigned = (path: string) =>
+  !UNSIGNED_PATHS.has(path) && path !== "/node/v1/openapi.json";
+
 /**
- * Authenticates a request signed with a node's key (`pgcf_nr1`): the key is looked up by the
- * node and install the token claims, and the signature binds the request's method, its path with
- * the query and its body. The refusal never says which of them failed.
+ * Looks up the node a signed request claims to come from, from the token in its headers alone.
+ * It runs before the body is read, so a caller that is no node of ours costs the Worker no more
+ * than this one read; the signature, which covers the body, is verified once the body is in.
  */
-export async function authenticateNode(c: ApiContext): Promise<NodeCaller> {
+export const nodeLookup: MiddlewareHandler<ApiEnv> = async (c, next) => {
+  if (!isSigned(new URL(c.req.url).pathname)) return next();
   const authorization = c.req.header("Authorization");
   const token = authorization?.startsWith("Bearer ")
     ? authorization.slice(7)
@@ -50,53 +65,55 @@ export async function authenticateNode(c: ApiContext): Promise<NodeCaller> {
         )
           .bind(subject.node, subject.uid)
           .first<NodeKeyRow>();
+  // The refusal never says which of the token, the node or the key failed.
   if (row === null)
     throw new ApiError("unauthorized", "Invalid node credentials");
-  const url = new URL(c.req.url),
-    body = c.get("body") ?? new Uint8Array();
+  c.set("nodeClaim", { token, row } satisfies NodeClaim);
+  return next();
+};
+
+/**
+ * Authenticates every call a node makes with its key (`pgcf_nr1`): the signature binds the
+ * request's method, its path with the query and its body, and the key is the one `nodeLookup`
+ * found for the node and install the token claims. A fenced node reaches only the paths of
+ * `NODE_FENCED_PATHS`; every other request is answered `403 {"error":"node_fenced"}`, which the
+ * agent takes as a fence.
+ */
+export const nodeAuthentication: MiddlewareHandler<ApiEnv> = async (
+  c,
+  next,
+) => {
+  const url = new URL(c.req.url);
+  if (!isSigned(url.pathname)) return next();
+  const claim = c.get("nodeClaim");
+  if (claim === undefined)
+    throw new ApiError("unauthorized", "Invalid node credentials");
+  const { token, row } = claim;
   const verified = await verifyNodeRequest(token, {
     publicKey: row.public_key,
     node: row.id,
     uid: row.node_uid,
     method: c.req.method,
     path: url.pathname + url.search,
-    body,
+    body: c.get("body") ?? new Uint8Array(),
   });
   if (!verified.ok)
     throw new ApiError("unauthorized", "Invalid node credentials");
-  return {
-    id: row.id,
-    uid: row.node_uid,
-    region_id: row.region_id,
-    fenced: row.lost_at !== null,
-  };
-}
-
-/** The two paths a node calls without its key: the installer's report and the enrollment. */
-const UNSIGNED_PATHS: ReadonlySet<string> = new Set([
-  NODE_API_PATHS.enroll,
-  INSTALLER_PROGRESS_PATH,
-]);
-
-/**
- * Authenticates every call a node makes with its key, before the request is read any further. A
- * fenced node reaches only the paths of `NODE_FENCED_PATHS`; every other request is answered
- * `403 {"error":"node_fenced"}`, which the agent takes as a fence.
- */
-export const nodeAuthentication: MiddlewareHandler<ApiEnv> = async (
-  c,
-  next,
-) => {
-  const path = new URL(c.req.url).pathname;
-  if (UNSIGNED_PATHS.has(path) || path === "/node/v1/openapi.json")
-    return next();
-  const node = await authenticateNode(c);
-  if (node.fenced && !(NODE_FENCED_PATHS as readonly string[]).includes(path))
+  const fenced = row.lost_at !== null;
+  if (
+    fenced &&
+    !(NODE_FENCED_PATHS as readonly string[]).includes(url.pathname)
+  )
     return c.json(
       { error: NODE_FENCED_ERROR } satisfies NodeFencedResponse,
       403,
     );
-  c.set("node", node);
+  c.set("node", {
+    id: row.id,
+    uid: row.node_uid,
+    region_id: row.region_id,
+    fenced,
+  } satisfies NodeCaller);
   return next();
 };
 

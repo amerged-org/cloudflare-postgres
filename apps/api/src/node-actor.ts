@@ -258,15 +258,11 @@ export class NodeActor extends DurableObject<Env> {
       JSON.stringify(folded),
     );
     // The first sample after enrollment opens the node for placement at once; the rest wait for
-    // their minute to end.
-    if (
-      previous !== undefined &&
-      previous.minute !== folded.minute &&
-      link.flushed !== written(previous)
-    )
-      await this.flush(link, previous, null);
-    else if (previous === undefined)
-      await this.flush(link, folded, sample, true);
+    // their minute to end, and the first sample of the next minute writes it with the node's
+    // vitals as that sample has them.
+    if (previous === undefined) await this.flush(link, folded, sample, true);
+    else if (previous.minute !== folded.minute)
+      await this.flush(link, previous, sample);
     await this.ctx.storage.setAlarm(
       (folded.minute + 1) * MINUTE_MS + FLUSH_DELAY_MS,
     );
@@ -279,20 +275,25 @@ export class NodeActor extends DurableObject<Env> {
     await this.flush(link, minute, JSON.parse(link.sample) as NodeSample);
   }
 
-  /** Writes a minute's row, and with `sample` the node's vitals, in one batch. */
+  /**
+   * Writes a minute's row, unless it is written, and the node's vitals as `sample` has them, in
+   * one batch. The vitals never wait for the minute's alarm: it moves on with every sample.
+   */
   private async flush(
     link: NonNullable<ReturnType<NodeActor["link"]>>,
     minute: Minute,
-    sample: NodeSample | null,
+    sample: NodeSample,
     opening = false,
   ): Promise<void> {
     const db = this.env.DB,
       now = new Date().toISOString(),
       pool = minute.pool;
-    const statements = [
-      db
-        .prepare(
-          `INSERT INTO node_minutes(node_id,minute,samples,memory_total_bytes,memory_used_bytes_sum,memory_used_bytes_max,
+    const statements: D1PreparedStatement[] = [];
+    if (link.flushed !== written(minute))
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO node_minutes(node_id,minute,samples,memory_total_bytes,memory_used_bytes_sum,memory_used_bytes_max,
              cpu_cores,cpu_busy_millicores_sum,cpu_busy_millicores_max,awake_sum,awake_max,awake_memory_mib_sum,
              awake_memory_mib_max,starting_max,queued_max,no_room_samples,pool_data_total_bytes,pool_data_used_bytes,
              pool_metadata_total_bytes,pool_metadata_used_bytes,pool_nominal_bytes,volumes_total,volumes_mounted,
@@ -309,72 +310,70 @@ export class NodeActor extends DurableObject<Env> {
              pool_nominal_bytes=excluded.pool_nominal_bytes,volumes_total=excluded.volumes_total,
              volumes_mounted=excluded.volumes_mounted,archive_ready_files=excluded.archive_ready_files,
              archive_oldest_ready_seconds=excluded.archive_oldest_ready_seconds`,
-        )
-        .bind(
-          link.node_id,
-          minute.minute,
-          minute.samples,
-          minute.memory_total_bytes,
-          minute.memory_used_bytes_sum,
-          minute.memory_used_bytes_max,
-          minute.cpu_cores,
-          minute.cpu_busy_millicores_sum,
-          minute.cpu_busy_millicores_max,
-          minute.awake_sum,
-          minute.awake_max,
-          minute.awake_memory_mib_sum,
-          minute.awake_memory_mib_max,
-          minute.starting_max,
-          minute.queued_max,
-          minute.no_room_samples,
-          pool?.data_total_bytes ?? null,
-          pool?.data_used_bytes ?? null,
-          pool?.metadata_total_bytes ?? null,
-          pool?.metadata_used_bytes ?? null,
-          pool?.nominal_bytes ?? null,
-          minute.volumes_total,
-          minute.volumes_mounted,
-          minute.archive_ready_files,
-          minute.archive_oldest_ready_seconds,
-          link.node_id,
-          link.node_uid,
-        ),
-    ];
-    if (sample) {
-      // A lost node stays closed and not ready: samples of a fenced node change nothing about it.
-      statements.push(
-        db
-          .prepare(
-            `UPDATE nodes SET last_observed_at=?,last_sample_json=?,allocatable_memory_mib=?,allocatable_cpu_millicores=?,
-               storage_gib_total=COALESCE(?,storage_gib_total),ready=1,
-               schedulable=CASE WHEN last_observed_at IS NULL THEN 1 ELSE schedulable END,updated_at=?
-             WHERE id=? AND node_uid=? AND lost_at IS NULL`,
           )
           .bind(
-            sample.observed_at,
-            JSON.stringify(sample),
-            Math.floor(sample.memory.total_bytes / 1024 ** 2),
-            sample.cpu.cores * 1000,
-            sample.pool === null
-              ? null
-              : Math.floor(sample.pool.data_total_bytes / 1024 ** 3),
-            now,
+            link.node_id,
+            minute.minute,
+            minute.samples,
+            minute.memory_total_bytes,
+            minute.memory_used_bytes_sum,
+            minute.memory_used_bytes_max,
+            minute.cpu_cores,
+            minute.cpu_busy_millicores_sum,
+            minute.cpu_busy_millicores_max,
+            minute.awake_sum,
+            minute.awake_max,
+            minute.awake_memory_mib_sum,
+            minute.awake_memory_mib_max,
+            minute.starting_max,
+            minute.queued_max,
+            minute.no_room_samples,
+            pool?.data_total_bytes ?? null,
+            pool?.data_used_bytes ?? null,
+            pool?.metadata_total_bytes ?? null,
+            pool?.metadata_used_bytes ?? null,
+            pool?.nominal_bytes ?? null,
+            minute.volumes_total,
+            minute.volumes_mounted,
+            minute.archive_ready_files,
+            minute.archive_oldest_ready_seconds,
             link.node_id,
             link.node_uid,
           ),
       );
-      if (opening)
-        statements.push(
-          db
-            .prepare(
-              `UPDATE node_additions SET status='ready',revision=revision+1,updated_at=?
-               WHERE node_id=? AND status IN('audited','bootstrapping')
-                 AND EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND lost_at IS NULL)`,
-            )
-            .bind(now, link.node_id, link.node_id, link.node_uid),
-        );
-    }
-    if (minute.minute % 60 === 0)
+    // A lost node stays closed and not ready: samples of a fenced node change nothing about it.
+    statements.push(
+      db
+        .prepare(
+          `UPDATE nodes SET last_observed_at=?,last_sample_json=?,allocatable_memory_mib=?,allocatable_cpu_millicores=?,
+             storage_gib_total=COALESCE(?,storage_gib_total),ready=1,
+             schedulable=CASE WHEN last_observed_at IS NULL THEN 1 ELSE schedulable END,updated_at=?
+           WHERE id=? AND node_uid=? AND lost_at IS NULL`,
+        )
+        .bind(
+          sample.observed_at,
+          JSON.stringify(sample),
+          Math.floor(sample.memory.total_bytes / 1024 ** 2),
+          sample.cpu.cores * 1000,
+          sample.pool === null
+            ? null
+            : Math.floor(sample.pool.data_total_bytes / 1024 ** 3),
+          now,
+          link.node_id,
+          link.node_uid,
+        ),
+    );
+    if (opening)
+      statements.push(
+        db
+          .prepare(
+            `UPDATE node_additions SET status='ready',revision=revision+1,updated_at=?
+             WHERE node_id=? AND status IN('audited','bootstrapping')
+               AND EXISTS(SELECT 1 FROM nodes WHERE id=? AND node_uid=? AND lost_at IS NULL)`,
+          )
+          .bind(now, link.node_id, link.node_id, link.node_uid),
+      );
+    if (minute.minute % 60 === 0 && link.flushed !== written(minute))
       statements.push(
         db
           .prepare("DELETE FROM node_minutes WHERE node_id=? AND minute<?")

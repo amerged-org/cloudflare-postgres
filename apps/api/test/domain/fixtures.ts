@@ -382,7 +382,11 @@ export async function observationOf(
     ...(state === "ready" ? { instance: instanceOf(id) } : {}),
     proven_sleep:
       state === "asleep" ? { ...PROVEN_SLEEP, proven_at: now } : null,
-    backup: null,
+    // A ready database has the DONE base backup of its storage generation.
+    backup:
+      state === "ready"
+        ? { backup_id: "20261017T110000", timeline: 1, completed_at: now }
+        : null,
     archive: { last_segment: null, ready_files: 0, failing_since: null },
     ...extra,
   };

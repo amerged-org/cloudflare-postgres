@@ -119,6 +119,31 @@ describe("a request signed with a node's key", () => {
     ).not.toBe(200);
   });
 
+  it("is refused for an unknown node before its body is read", async () => {
+    const f = await fixture();
+    const huge = JSON.stringify({ pad: "x".repeat(5 * 1024 * 1024) });
+    const send = (headers: Record<string, string>, body: string) =>
+      rawRequest(OBSERVATIONS, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body,
+      });
+    // Whatever the body is, a caller without a node's credentials gets the same refusal: the
+    // Worker neither buffers nor parses what it sends.
+    expect((await send({}, huge)).status).toBe(401);
+    expect((await send({}, "not json")).status).toBe(401);
+    const unknown = await nodeToken(
+      f,
+      OBSERVATIONS,
+      "POST",
+      new TextEncoder().encode(huge),
+      { node: `nod_${"z".repeat(20)}` },
+    );
+    expect(
+      (await send({ Authorization: `Bearer ${unknown}` }, huge)).status,
+    ).toBe(401);
+  });
+
   it("is refused after its lifetime and before its start", async () => {
     const f = await fixture();
     expect((await post(f, { now: Date.now() - 120_000 })).status).toBe(401);

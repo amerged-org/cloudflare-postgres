@@ -252,9 +252,10 @@ export async function nodeEvents(
 /**
  * `POST /node/v1/usage` (plan 3.4, 5.6). A node's interval row is the counters of its gateway for
  * the database, so it is recorded as a gateway sample of that node, identified by the interval.
- * What the node could not count stays null and the rollup names it; a row of nothing known is
- * not recorded, and is acknowledged like one that is refused. The awake time of a database is not read from these rows: it is the time between
- * the lifecycle events of its observations.
+ * What the node could not count stays null and the rollup names it; a row of nothing known, or of
+ * a database another node serves, is not recorded, and is acknowledged like one that is refused.
+ * The awake time of a database is not read from these rows: it is the time between the lifecycle
+ * events of its observations.
  */
 export async function nodeUsage(
   c: ApiContext,
@@ -266,10 +267,12 @@ export async function nodeUsage(
     throw new ApiError("invalid_request", "Invalid usage report");
   const rows = parsed.data.rows,
     now = Date.now();
+  // Only the node that serves a database meters it: another node of the region could inflate the
+  // usage of a tenant it does not serve, or take the interval before the real rows.
   const known = await c.env.DB.prepare(
-    "SELECT id FROM databases WHERE region_id=? AND id IN(SELECT value FROM json_each(?))",
+    "SELECT id FROM databases WHERE node_id=? AND id IN(SELECT value FROM json_each(?))",
   )
-    .bind(node.region_id, JSON.stringify(rows.map((row) => row.database)))
+    .bind(node.id, JSON.stringify(rows.map((row) => row.database)))
     .all<{ id: string }>();
   const databases = new Set(known.results.map((row) => row.id));
   const entries: {
@@ -278,7 +281,7 @@ export async function nodeUsage(
   }[] = [];
   let skipped = 0;
   for (const row of rows) {
-    // A row of nothing known, of a database D1 does not have or from the future cannot be
+    // A row of nothing known, of a database this node does not serve or from the future cannot be
     // recorded, and waiting would only keep the node's outbox from draining.
     if (
       !databases.has(row.database) ||

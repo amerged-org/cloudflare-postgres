@@ -17,6 +17,9 @@ UPDATE databases SET desired_postgres_release_id=NULL,desired_postgres_image=NUL
   desired_postgres_version=NULL,desired_postgres_schema_revision=NULL;
 DELETE FROM fleet_region_releases;
 DELETE FROM fleet_releases;
+-- A release is a node image and names no PostgreSQL component, so the trigger that demanded one in
+-- the region's release would refuse every new database of a region as soon as its release is assigned.
+DROP TRIGGER database_postgres_release_supported;
 
 -- The regional agent key goes: `agent_key_hash` is NOT NULL UNIQUE and cannot be dropped, so the
 -- table is rebuilt. Dropping it would cascade away the rows of its cascading children, so those
@@ -80,8 +83,8 @@ ALTER TABLE databases ADD COLUMN proven_sleep_json TEXT CHECK(proven_sleep_json 
 
 -- The installer of a node (plan 9.2, 8): two one-time tokens stored as HMACs. The progress token
 -- reports the installer's checkpoints until `rebooting` or `failed`; the enrollment token is burnt
--- by the node's enrollment, which must come from one of the addresses the provider reports for
--- the instance, after the checkpoints up to `rebooting` arrived.
+-- by the node's enrollment, which must come from the public IPv4 the provider reports for the
+-- instance, after the checkpoints up to `rebooting` arrived.
 CREATE TABLE node_installs (
   node_id TEXT PRIMARY KEY NOT NULL
     CHECK (length(node_id) = 24 AND substr(node_id, 1, 4) = 'nod_' AND NOT substr(node_id, 5) GLOB '*[^a-z0-9]*'),

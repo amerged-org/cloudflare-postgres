@@ -9,10 +9,7 @@ import {
   randomString,
   type NodeKey,
 } from "@pgcf/contracts";
-import {
-  issueNodeInstall,
-  type InstallSource,
-} from "../../src/domain/node-install.ts";
+import { issueNodeInstall } from "../../src/domain/node-install.ts";
 import {
   configureNodeRegionPolicy,
   recordNodeAudit,
@@ -32,11 +29,9 @@ export async function forgetInstalls(): Promise<void> {
 }
 
 export const v4 = "192.0.2.10";
+/** An address of the instance's IPv6 prefix: the provider reports it, and no enrollment may use it. */
 export const v6 = "2001:db8:1234:5678::10";
-export const sources: InstallSource[] = [
-  { v4 },
-  { v6: "2001:db8:1234:5678::1", prefix: 64 },
-];
+export const sources = [v4];
 const providerId = () => String(BigInt("1" + randomString("0123456789", 9)));
 
 /** An addition that has reached its audit: the instance exists and the installer may run. */
@@ -115,7 +110,7 @@ export const progress = (token: string, checkpoint: string, detail = "") =>
   });
 export const enroll = (
   body: Record<string, unknown>,
-  address: string | null = v6,
+  address: string | null = v4,
 ) =>
   rawRequest("/node/v1/enroll", {
     method: "POST",
