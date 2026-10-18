@@ -67,7 +67,9 @@ alone refuses every connection and HTTP query to a public gateway with `08006` b
 sent, and logs `config_error: "access_secrets_incomplete"` (never a value). A gateway on a service
 binding does not go through Access and never receives the token. An Access refusal (401, 403, or
 a redirect to the login page, which the Edge does not follow) shows in the log as the
-`gateway_status` of the refused connection.
+`gateway_status` of the refused connection. The token expires after the duration chosen when it
+was created: refresh it before then and rotate it as described in
+[credentials](credentials.md).
 
 The Rust/Wasm replacement lives in `apps/edge-rust`. The common CI workflow builds it; it is not
 deployed. Build the selected source once using the Rust toolchain and `rustEdge` tools from
