@@ -16,6 +16,14 @@
 // and a hash of the role revisions, and no Pod, because the Pod is not known when it is signed.
 // `v: 5` is the wake flag; v5 is issued only for a wake ticket. Rust: native-protocol wake.rs.
 //
+// A v6 token is the route to a node (ULTRA plan 5.3, 5.8): it names the database generation, the
+// admission route revision, the node and the systemd invocation ID of the PostgreSQL unit that
+// serves the database. Its key, and that of a v5 ticket signed for a node, is derived per node
+// (K = HMAC-SHA256(master[kid], "pgcf-route-key/v2\n" + nodeId)), so a node verifies only the
+// tokens made for it. The region-derived keys and v2-v4 stay until the Rust gateway
+// (packages/native-protocol) and the Rust Edge (apps/edge-rust) verify and sign v6; they are the
+// only readers of them, through the conformance vectors.
+//
 // Temporary rollout compatibility: v2 tokens (prefix "v2", domain "pgcf-route/v2\n")
 // carry no route revision or target. The Edge signs them only for an admission without
 // a target, which the Actor returns only outside a v3 region: one whose assigned release
@@ -30,6 +38,8 @@ import {
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import {
   DATABASE_ID_PATTERN,
+  NODE_ID_PATTERN,
+  NodeId,
   OperationId,
   REGION_ID_PATTERN,
   RoleName,
@@ -49,9 +59,12 @@ const ADMISSION_TOKEN_PREFIX = "v4";
 const ADMISSION_SIGNATURE_DOMAIN = "pgcf-route/v4\n";
 const WAKE_TOKEN_PREFIX = "v5";
 const WAKE_SIGNATURE_DOMAIN = "pgcf-route/v5\n";
+const NODE_TOKEN_PREFIX = "v6";
+const NODE_SIGNATURE_DOMAIN = "pgcf-route/v6\n";
 const LEGACY_TOKEN_PREFIX = "v2";
 const LEGACY_SIGNATURE_DOMAIN = "pgcf-route/v2\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
+const NODE_KEY_DOMAIN = "pgcf-route-key/v2\n";
 const SIGNATURE_BYTES = 32;
 /** Authoritative wire constants for generated native consumers. */
 export const ROUTE_TOKEN_PREFIX = TOKEN_PREFIX;
@@ -61,6 +74,9 @@ export const ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN =
   ADMISSION_SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_WAKE_PREFIX = WAKE_TOKEN_PREFIX;
 export const ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN = WAKE_SIGNATURE_DOMAIN;
+export const ROUTE_TOKEN_NODE_PREFIX = NODE_TOKEN_PREFIX;
+export const ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN = NODE_SIGNATURE_DOMAIN;
+export const ROUTE_TOKEN_NODE_KEY_DOMAIN = NODE_KEY_DOMAIN;
 /** Temporary rollout compatibility; the module comment names the removal condition. */
 export const ROUTE_TOKEN_LEGACY_PREFIX = LEGACY_TOKEN_PREFIX;
 export const ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN = LEGACY_SIGNATURE_DOMAIN;
@@ -99,6 +115,19 @@ export type AdmissionRouteTokenClaims = z.infer<
 >;
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const RoleRevisionHash = z.string().regex(/^[a-f0-9]{64}$/);
+/**
+ * The route to a node: the database generation, the admission route revision, the node and the
+ * invocation ID of the PostgreSQL unit that serves the database (`UnitWriter.instance`).
+ */
+export const nodeRouteTokenClaimsSchema = z.strictObject({
+  v: z.literal(6),
+  ...connectionClaims,
+  rev: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  route_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  node: NodeId,
+  inst: z.string().regex(cidPattern),
+});
+export type NodeRouteTokenClaims = z.infer<typeof nodeRouteTokenClaimsSchema>;
 /** A wake ticket: the operation, the claimed generation, the route revision and the role hash. */
 export const wakeRouteTokenClaimsSchema = z.strictObject({
   v: z.literal(5),
@@ -188,6 +217,28 @@ export async function deriveRegionKeyring(
   return { active: master.active, keys };
 }
 
+/** K = HMAC-SHA256(master, "pgcf-route-key/v2\n" + nodeId), 32 raw bytes. */
+export async function deriveNodeKey(
+  master: Uint8Array,
+  nodeId: string,
+): Promise<Uint8Array> {
+  if (!NODE_ID_PATTERN.test(nodeId)) throw new RangeError("invalid node id");
+  if (master.length < ROUTE_KEY_MIN_BYTES)
+    throw new RangeError("master key too short");
+  return hmac(master, NODE_KEY_DOMAIN + nodeId);
+}
+
+/** Derives the keyring the gateway of `nodeId` verifies with. */
+export async function deriveNodeKeyring(
+  master: RouteKeyring,
+  nodeId: string,
+): Promise<RouteKeyring> {
+  const keys = new Map<string, Uint8Array>();
+  for (const [kid, bytes] of master.keys)
+    keys.set(kid, await deriveNodeKey(bytes, nodeId));
+  return { active: master.active, keys };
+}
+
 export interface SignRouteTokenInput {
   /** Master keyring; the active key signs. */
   readonly keyring: RouteKeyring;
@@ -236,6 +287,8 @@ export interface SignWakeRouteTokenInput extends Omit<
   "target"
 > {
   readonly wake: DatabaseWakeTicket;
+  /** The node the ticket is for; its key signs. Without it the region's key signs. */
+  readonly node?: string;
 }
 
 /** A v5 wake ticket for a sleeping database. */
@@ -254,6 +307,40 @@ export async function signWakeRouteToken(
     }),
     WAKE_TOKEN_PREFIX,
     WAKE_SIGNATURE_DOMAIN,
+    input.node,
+  );
+}
+
+export interface SignNodeRouteTokenInput extends Omit<
+  SignRouteTokenInput,
+  "target"
+> {
+  readonly node: string;
+  /** What the node's unit runs: its generation, the route revision and its invocation ID. */
+  readonly target: {
+    readonly revision: number;
+    readonly route_revision: number;
+    readonly instance: string;
+  };
+}
+
+/** A v6 route to a node for an awake database. */
+export async function signNodeRouteToken(
+  input: SignNodeRouteTokenInput,
+): Promise<string> {
+  return seal(
+    input,
+    nodeRouteTokenClaimsSchema.safeParse({
+      v: 6,
+      ...connection(input),
+      rev: input.target?.revision,
+      route_revision: input.target?.route_revision,
+      node: input.node,
+      inst: input.target?.instance,
+    }),
+    NODE_TOKEN_PREFIX,
+    NODE_SIGNATURE_DOMAIN,
+    input.node,
   );
 }
 
@@ -300,22 +387,28 @@ function connection(input: Omit<SignRouteTokenInput, "target">) {
   };
 }
 
+/** Signs with the key of `node` when given, else with the key of the region. */
 async function seal(
   input: Omit<SignRouteTokenInput, "target">,
   claims: z.ZodSafeParseResult<
     | RouteTokenClaims
     | AdmissionRouteTokenClaims
     | WakeRouteTokenClaims
+    | NodeRouteTokenClaims
     | LegacyRouteTokenClaims
   >,
   prefix: string,
   domain: string,
+  node?: string,
 ): Promise<string> {
   const master = input.keyring.keys.get(input.keyring.active);
   if (master === undefined) throw new RangeError("active key missing");
   if (!claims.success) throw new RangeError("invalid route token claims");
   const payload = bytesToBase64url(encoder.encode(JSON.stringify(claims.data)));
-  const key = await deriveRegionKey(master, input.region);
+  const key =
+    node === undefined
+      ? await deriveRegionKey(master, input.region)
+      : await deriveNodeKey(master, node);
   const signature = await hmac(key, domain + payload);
   return `${prefix}.${payload}.${bytesToBase64url(signature)}`;
 }
@@ -328,6 +421,7 @@ export type RouteTokenFailure =
   | "bad_signature"
   | "invalid_claims"
   | "wrong_region"
+  | "wrong_node"
   | "invalid_lifetime"
   | "not_yet_valid"
   | "expired"
@@ -340,15 +434,18 @@ export type RouteTokenResult =
         | RouteTokenClaims
         | AdmissionRouteTokenClaims
         | WakeRouteTokenClaims
+        | NodeRouteTokenClaims
         | LegacyRouteTokenClaims;
     }
   | { readonly ok: false; readonly reason: RouteTokenFailure };
 
 export interface VerifyRouteTokenInput {
-  /** Region keys by kid (the gateway's derived keyring). */
+  /** The keys by kid (the gateway's derived keyring). */
   readonly keys: ReadonlyMap<string, Uint8Array>;
   /** The region this verifier serves. */
   readonly region: string;
+  /** The node this verifier serves; a v6 route names its node, and another one is refused. */
+  readonly node?: string;
   /** Milliseconds since the epoch. */
   readonly now?: number;
 }
@@ -364,7 +461,8 @@ export async function verifyRouteToken(
   if (
     token.length >
     (token.startsWith(`${ADMISSION_TOKEN_PREFIX}.`) ||
-    token.startsWith(`${WAKE_TOKEN_PREFIX}.`)
+    token.startsWith(`${WAKE_TOKEN_PREFIX}.`) ||
+    token.startsWith(`${NODE_TOKEN_PREFIX}.`)
       ? ROUTE_TOKEN_ADMISSION_MAX_LENGTH
       : ROUTE_TOKEN_MAX_LENGTH)
   )
@@ -374,9 +472,10 @@ export async function verifyRouteToken(
   const legacy = parts[0] === LEGACY_TOKEN_PREFIX;
   const admission = parts[0] === ADMISSION_TOKEN_PREFIX;
   const wake = parts[0] === WAKE_TOKEN_PREFIX;
+  const node = parts[0] === NODE_TOKEN_PREFIX;
   if (
     parts.length !== 3 ||
-    (parts[0] !== TOKEN_PREFIX && !legacy && !admission && !wake)
+    (parts[0] !== TOKEN_PREFIX && !legacy && !admission && !wake && !node)
   )
     return fail("malformed");
   const payload = parts[1] as string;
@@ -410,7 +509,9 @@ export async function verifyRouteToken(
         ? ADMISSION_SIGNATURE_DOMAIN
         : wake
           ? WAKE_SIGNATURE_DOMAIN
-          : SIGNATURE_DOMAIN) + payload,
+          : node
+            ? NODE_SIGNATURE_DOMAIN
+            : SIGNATURE_DOMAIN) + payload,
   );
   if (!constantTimeEqual(expected, signature)) return fail("bad_signature");
 
@@ -421,11 +522,19 @@ export async function verifyRouteToken(
         ? cnpgAdmissionRouteTokenClaimsSchema
         : wake
           ? wakeRouteTokenClaimsSchema
-          : routeTokenClaimsSchema
+          : node
+            ? nodeRouteTokenClaimsSchema
+            : routeTokenClaimsSchema
   ).safeParse(decoded);
   if (!claims.success) return fail("invalid_claims");
   const { rg, iat, exp } = claims.data;
   if (rg !== input.region) return fail("wrong_region");
+  if (
+    input.node !== undefined &&
+    "node" in claims.data &&
+    claims.data.node !== input.node
+  )
+    return fail("wrong_node");
   if (exp <= iat || exp - iat > ROUTE_TOKEN_MAX_LIFETIME_SECONDS)
     return fail("invalid_lifetime");
   const now = time / 1000;

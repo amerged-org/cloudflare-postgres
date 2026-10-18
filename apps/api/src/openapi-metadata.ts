@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-export type DocumentationAuth = "none" | "api" | "project" | "admin" | "agent";
+export type DocumentationAuth =
+  "none" | "api" | "project" | "admin" | "node" | "installer";
 export interface RouteMetadata {
   operationId: string;
   summary: string;
@@ -23,9 +24,9 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "none",
     [500],
   ),
-  "GET /agent/v1/openapi.json": route(
-    "getAgentApiReference",
-    "Read the regional agent API reference",
+  "GET /node/v1/openapi.json": route(
+    "getNodeApiReference",
+    "Read the node API reference",
     "none",
     [500],
   ),
@@ -93,6 +94,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "setDatabaseIdleTime",
     "Set a database's idle time before it sleeps",
     "project",
+  ),
+  "PUT /v1/databases/{id}/resources": route(
+    "setDatabaseResources",
+    "Set a database's own memory, CPU and storage",
+    "admin",
   ),
   "DELETE /v1/databases/{id}": route(
     "deleteDatabase",
@@ -182,7 +188,27 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /v1/nodes/{id}/mark-lost": route(
     "markNodeLost",
-    "Mark a physical node lost with its current identity fence",
+    "Declare a physical node lost and fence it",
+    "admin",
+  ),
+  "GET /v1/nodes/{id}/loss": route(
+    "getNodeLoss",
+    "Read the fencing and the recovery points of a lost node",
+    "admin",
+  ),
+  "POST /v1/nodes/{id}/reinstall-override": route(
+    "overrideNodeReinstallGuard",
+    "Acknowledge that reinstalling a lost node may overwrite unarchived WAL",
+    "admin",
+  ),
+  "POST /v1/databases/{id}/move": route(
+    "moveDatabase",
+    "Move a database to another node under the same ID",
+    "admin",
+  ),
+  "GET /v1/databases/{id}/moves": route(
+    "listDatabaseMoves",
+    "List the moves of a database",
     "admin",
   ),
   "POST /v1/nodes/additions": route(
@@ -245,44 +271,9 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read regional fleet release assignment",
     "admin",
   ),
-  "PUT /v1/nodes/{id}/release": route(
-    "assignNodeFleetRelease",
-    "Assign a fleet release to a physical node identity",
-    "admin",
-  ),
   "GET /v1/nodes/{id}/release": route(
     "getNodeFleetRelease",
-    "Read node release assignment and runtime convergence",
-    "admin",
-  ),
-  "GET /v1/fleet/update-policy": route(
-    "getFleetUpdatePolicy",
-    "Read automatic fleet update policy",
-    "admin",
-  ),
-  "PUT /v1/fleet/update-policy": route(
-    "setFleetUpdatePolicy",
-    "Set automatic fleet update policy",
-    "admin",
-  ),
-  "GET /v1/fleet/update-candidates": route(
-    "listFleetUpdateCandidates",
-    "List tracked fleet update candidates",
-    "admin",
-  ),
-  "GET /v1/fleet/update-candidates/{id}": route(
-    "getFleetUpdateCandidate",
-    "Read fleet update candidate and qualification state",
-    "admin",
-  ),
-  "POST /v1/fleet/update-candidates/{id}/reject": route(
-    "rejectFleetUpdateCandidate",
-    "Reject a fleet update candidate",
-    "admin",
-  ),
-  "POST /v1/fleet/update-candidates/{id}/resume": route(
-    "resumeFleetUpdateCandidate",
-    "Resume supported fleet update candidate processing",
+    "Read how a node stands against its region's release",
     "admin",
   ),
   "GET /v1/resource-profiles/{id}/rollout": route(
@@ -320,16 +311,6 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Assign a resource profile to a database",
     "project",
   ),
-  "GET /v1/regions/{target}/archive-sources/{source}": route(
-    "getRegionArchiveSource",
-    "Read a regional archive source binding",
-    "admin",
-  ),
-  "PUT /v1/regions/{target}/archive-sources/{source}": route(
-    "setRegionArchiveSource",
-    "Configure a source archive for regional restores",
-    "admin",
-  ),
   "GET /v1/regions/{id}/capacity-policy": route(
     "getRegionCapacityPolicy",
     "Read regional capacity and purchase policy",
@@ -365,34 +346,59 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Read measured operational health and alert episodes",
     "admin",
   ),
-  "GET /agent/v1/desired": route(
-    "getAgentDesiredState",
-    "Read authoritative regional desired state",
-    "agent",
+  "GET /v1/regions/{id}/node-policy": route(
+    "getRegionNodePolicy",
+    "Read the rules a region's nodes decide by when they act alone",
+    "admin",
   ),
-  "POST /agent/v1/observations": route(
-    "reportAgentObservations",
-    "Report regional database and node observations",
-    "agent",
+  "PUT /v1/regions/{id}/node-policy": route(
+    "setRegionNodePolicy",
+    "Set the rules a region's nodes decide by when they act alone",
+    "admin",
   ),
-  "GET /agent/v1/link": route(
-    "openAgentHintLink",
-    "Open the regional desired-state hint WebSocket",
-    "agent",
+  "POST /node/v1/enroll": route(
+    "enrollNode",
+    "Enroll a node with the installer's one-time token and its key",
+    "none",
   ),
-  "POST /agent/v1/activity": route(
-    "reportAgentActivity",
-    "Report database activity observations",
-    "agent",
+  "POST /node/v1/installer/progress": route(
+    "reportInstallerProgress",
+    "Report a checkpoint of the pull installer",
+    "installer",
   ),
-  "POST /agent/v1/usage": route(
-    "reportAgentUsage",
-    "Report measured database and node usage",
-    "agent",
+  "GET /node/v1/link": route(
+    "openNodeLink",
+    "Open the node's WebSocket link",
+    "node",
   ),
-  "POST /agent/v1/fleet-observations": route(
-    "reportAgentFleetInventory",
-    "Report authenticated component runtime inventory",
-    "agent",
+  "GET /node/v1/desired": route(
+    "getNodeDesiredPage",
+    "Read the node's desired page",
+    "node",
+  ),
+  "GET /node/v1/archive-credentials/{id}": route(
+    "getNodeArchiveCredential",
+    "Read a temporary R2 credential the node's desired page names",
+    "node",
+  ),
+  "POST /node/v1/observations": route(
+    "reportNodeObservations",
+    "Report the state of the node's databases and the results of its orders",
+    "node",
+  ),
+  "POST /node/v1/volumes": route(
+    "reportNodeVolumes",
+    "Report every thin volume of the node",
+    "node",
+  ),
+  "POST /node/v1/events": route(
+    "reportNodeEvents",
+    "Report the node's admission, early sleep and wake events",
+    "node",
+  ),
+  "POST /node/v1/usage": route(
+    "reportNodeUsage",
+    "Report the node's metered usage of its databases",
+    "node",
   ),
 };

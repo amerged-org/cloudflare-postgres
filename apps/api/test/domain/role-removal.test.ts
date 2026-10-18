@@ -2,7 +2,6 @@
 import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
-  DesiredResponse,
   Operation,
   Role,
   listEnvelope,
@@ -11,11 +10,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observation,
-  observedBody,
+  nodeRequest,
+  observationOf,
   refusal,
+  reportBody,
   request,
+  verdicts,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -27,8 +29,14 @@ const generationOf = async (id: string) =>
   (await env.DB.prepare("SELECT generation FROM databases WHERE id=?")
     .bind(id)
     .first<number>("generation"))!;
-const post = (f: Fixture, body: unknown[]) =>
-  request("/agent/v1/observations", f.agent, "POST", observedBody(body));
+/** The node reports these observations; the answer is the verdict on each. */
+const post = async (f: Fixture, ...observations: Promise<object>[]) =>
+  verdicts(
+    await nodeRequest(f, "/node/v1/observations", {
+      method: "POST",
+      body: reportBody(await Promise.all(observations)),
+    }),
+  );
 
 /** A ready database holding the owner and the given roles; the region has seen its generation. */
 async function ready(...roles: Record<string, unknown>[]): Promise<Ready> {
@@ -47,9 +55,9 @@ async function ready(...roles: Record<string, unknown>[]): Promise<Ready> {
         )
       ).status,
     ).toBe(201);
-  expect(
-    await (await post(f, [observation(id, await generationOf(id))])).json(),
-  ).toEqual({ accepted: 1 });
+  expect(await post(f, observationOf(id, await generationOf(id)))).toEqual([
+    "accept",
+  ]);
   return { ...f, id };
 }
 const removeRole = (
@@ -77,19 +85,15 @@ const listed = async (f: Ready) =>
     )
     .data.map((role) => role.name);
 async function desired(f: Ready) {
-  const page = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  return page.databases.find((db) => db.id === f.id)!;
+  return (await desiredPage(f)).databases.find((db) => db.id === f.id)!;
 }
 const readOperation = async (f: Fixture, id: string) =>
   Operation.parse(
     await (await request(`/v1/operations/${id}`, f.integrator)).json(),
   );
-const report = (id: string, generation: number, roles: unknown) => ({
-  ...observation(id, generation),
-  roles,
-});
+/** A ready observation that reports what became of the roles the page asked to remove. */
+const withRoles = (id: string, generation: number, roles: unknown) =>
+  observationOf(id, generation, "ready", { roles });
 
 describe("role removal", () => {
   it("makes the role unroutable and unlisted at once and hands its name to the region", async () => {
@@ -247,29 +251,25 @@ describe("role removal", () => {
     const generation = await generationOf(f.id);
     // A report of an older generation proves nothing about this removal.
     expect(
-      await (
-        await post(f, [
-          report(f.id, generation - 1, {
-            removed: ["report_job"],
-            blocked: [],
-          }),
-        ])
-      ).json(),
-    ).toEqual({ accepted: 0 });
+      await post(
+        f,
+        withRoles(f.id, generation - 1, {
+          removed: ["report_job"],
+          blocked: [],
+        }),
+      ),
+    ).toEqual(["stale"]);
     expect((await readOperation(f, operation.id)).status).toBe("pending");
     expect(
-      await (
-        await post(f, [report(f.id, generation, { removed: [], blocked: [] })])
-      ).json(),
-    ).toEqual({ accepted: 1 });
+      await post(f, withRoles(f.id, generation, { removed: [], blocked: [] })),
+    ).toEqual(["accept"]);
     expect((await readOperation(f, operation.id)).status).toBe("pending");
     expect(
-      await (
-        await post(f, [
-          report(f.id, generation, { removed: ["report_job"], blocked: [] }),
-        ])
-      ).json(),
-    ).toEqual({ accepted: 1 });
+      await post(
+        f,
+        withRoles(f.id, generation, { removed: ["report_job"], blocked: [] }),
+      ),
+    ).toEqual(["accept"]);
     expect(await readOperation(f, operation.id)).toMatchObject({
       status: "succeeded",
       error: null,
@@ -299,12 +299,11 @@ describe("role removal", () => {
     const first = await removal(f, "report_job");
     let generation = await generationOf(f.id);
     expect(
-      await (
-        await post(f, [
-          report(f.id, generation, { removed: [], blocked: ["report_job"] }),
-        ])
-      ).json(),
-    ).toEqual({ accepted: 1 });
+      await post(
+        f,
+        withRoles(f.id, generation, { removed: [], blocked: ["report_job"] }),
+      ),
+    ).toEqual(["accept"]);
     const failed = await readOperation(f, first.operation.id);
     expect(failed).toMatchObject({
       status: "failed",
@@ -334,9 +333,10 @@ describe("role removal", () => {
     expect(second.operation.status).toBe("pending");
     generation = await generationOf(f.id);
     expect(second.operation.generation).toBe(generation);
-    await post(f, [
-      report(f.id, generation, { removed: ["report_job"], blocked: [] }),
-    ]);
+    await post(
+      f,
+      withRoles(f.id, generation, { removed: ["report_job"], blocked: [] }),
+    );
     expect((await readOperation(f, second.operation.id)).status).toBe(
       "succeeded",
     );
@@ -354,13 +354,15 @@ describe("role removal", () => {
     const f = await ready({ name: "report_job" });
     const { operation } = await removal(f, "report_job");
     const generation = await generationOf(f.id);
-    await post(f, [
-      report(f.id, generation, { removed: [], blocked: ["report_job"] }),
-    ]);
+    await post(
+      f,
+      withRoles(f.id, generation, { removed: [], blocked: ["report_job"] }),
+    );
     // The owner cleaned up and the region's level-triggered pass dropped the role.
-    await post(f, [
-      report(f.id, generation, { removed: ["report_job"], blocked: [] }),
-    ]);
+    await post(
+      f,
+      withRoles(f.id, generation, { removed: ["report_job"], blocked: [] }),
+    );
     expect((await readOperation(f, operation.id)).status).toBe("failed");
     expect(
       await env.DB.prepare(
@@ -414,14 +416,13 @@ describe("role removal", () => {
     const verifying = await removal(f, "report_job");
     expect(verifying.operation.id).not.toBe(operation.id);
     expect(verifying.operation.status).toBe("pending");
-    await post(f, [
-      {
-        ...report(f.id, await generationOf(f.id), {
-          removed: [],
-          blocked: ["report_job"],
-        }),
-      },
-    ]);
+    await post(
+      f,
+      withRoles(f.id, await generationOf(f.id), {
+        removed: [],
+        blocked: ["report_job"],
+      }),
+    );
     expect((await readOperation(f, verifying.operation.id)).status).toBe(
       "failed",
     );
@@ -433,11 +434,12 @@ describe("role removal", () => {
     const { operation } = await removal(f, "report_job");
     // The region has applied the new generation, but its report names no removal yet, and the
     // database is suspended and reports its hibernation.
-    await post(f, [
-      report(f.id, await generationOf(f.id), { removed: [], blocked: [] }),
-    ]);
-    const suspended = DatabaseWithOperation.parse(
-      await (
+    await post(
+      f,
+      withRoles(f.id, await generationOf(f.id), { removed: [], blocked: [] }),
+    );
+    expect(
+      (
         await request(
           `/v1/databases/${f.id}/suspend`,
           f.integrator,
@@ -445,23 +447,12 @@ describe("role removal", () => {
           undefined,
           key(),
         )
-      ).json(),
-    );
+      ).status,
+    ).toBe(202);
     const generation = await generationOf(f.id);
-    expect(
-      await (
-        await post(f, [
-          {
-            ...observation(f.id, generation, "hibernated"),
-            power: {
-              operation: suspended.operation.id,
-              revision: generation,
-              state: "hibernated",
-            },
-          },
-        ])
-      ).json(),
-    ).toEqual({ accepted: 1 });
+    expect(await post(f, observationOf(f.id, generation, "asleep"))).toEqual([
+      "accept",
+    ]);
     expect(await readOperation(f, operation.id)).toMatchObject({
       status: "succeeded",
       error: null,
@@ -495,12 +486,13 @@ describe("role removal", () => {
       retryAfter: null,
     });
     // Once the region has confirmed the removal the slot is free again.
-    await post(f, [
-      report(f.id, await generationOf(f.id), {
+    await post(
+      f,
+      withRoles(f.id, await generationOf(f.id), {
         removed: ["filler_1"],
         blocked: [],
       }),
-    ]);
+    );
     expect(
       (
         await request(

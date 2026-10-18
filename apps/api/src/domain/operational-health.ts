@@ -243,7 +243,8 @@ export async function readOperationalHealth(
   if (scope === "regions") {
     const result = await db
       .prepare(
-        `SELECT id,created_at,agent_last_seen_at,
+        `SELECT id,created_at,
+          (SELECT MAX(n.last_observed_at) FROM nodes n WHERE n.region_id=regions.id) agent_last_seen_at,
           (SELECT json_group_array(json_object('kind',a.kind,'active',a.active,'event_id',a.event_id,
             'occurred_at',json_extract(a.payload,'$.occurred_at'),'delivered_at',a.delivered_at,'last_attempt_at',a.last_attempt_at))
            FROM infrastructure_alerts a WHERE a.region_id=regions.id) alerts_json

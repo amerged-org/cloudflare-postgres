@@ -920,108 +920,8 @@
                 "spec": {
                   "type": "object",
                   "properties": {
-                    "version": { "type": "number", "const": 1 },
-                    "versions_lock_sha256": {
-                      "type": "string",
-                      "pattern": "^[0-9a-f]{64}$"
-                    },
-                    "configuration_schema_revision": {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 2147483647
-                    },
-                    "platform_source_commit": {
-                      "type": "string",
-                      "pattern": "^[0-9a-f]{40}$"
-                    },
-                    "storage_authority_keys_sha256": {
-                      "type": "string",
-                      "pattern": "^[0-9a-f]{64}$"
-                    },
-                    "thin_storage_qualification": {
-                      "type": "object",
-                      "properties": {
-                        "profile_sha256": {
-                          "type": "string",
-                          "pattern": "^[0-9a-f]{64}$"
-                        },
-                        "driver_image": {
-                          "type": "string",
-                          "maxLength": 512,
-                          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
-                        },
-                        "host_extension_image": {
-                          "type": "string",
-                          "maxLength": 512,
-                          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
-                        },
-                        "kernel_version": {
-                          "type": "string",
-                          "maxLength": 128,
-                          "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
-                        },
-                        "receipt_sha256": {
-                          "type": "string",
-                          "pattern": "^[0-9a-f]{64}$"
-                        },
-                        "qualified_at": {
-                          "type": "string",
-                          "format": "date-time",
-                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
-                        },
-                        "gates": {
-                          "type": "object",
-                          "properties": {
-                            "data_full": { "type": "boolean", "const": true },
-                            "metadata_full": {
-                              "type": "boolean",
-                              "const": true
-                            },
-                            "noflush_quiescence": {
-                              "type": "boolean",
-                              "const": true
-                            },
-                            "resume_marker": {
-                              "type": "boolean",
-                              "const": true
-                            },
-                            "startup_bound": {
-                              "type": "boolean",
-                              "const": true
-                            },
-                            "trim_delete_recreate": {
-                              "type": "boolean",
-                              "const": true
-                            },
-                            "retained_thick_preservation": {
-                              "type": "boolean",
-                              "const": true
-                            }
-                          },
-                          "required": [
-                            "data_full",
-                            "metadata_full",
-                            "noflush_quiescence",
-                            "resume_marker",
-                            "startup_bound",
-                            "trim_delete_recreate",
-                            "retained_thick_preservation"
-                          ],
-                          "additionalProperties": false
-                        }
-                      },
-                      "required": [
-                        "profile_sha256",
-                        "driver_image",
-                        "host_extension_image",
-                        "kernel_version",
-                        "receipt_sha256",
-                        "qualified_at",
-                        "gates"
-                      ],
-                      "additionalProperties": false
-                    },
-                    "talos_raw_image": {
+                    "version": { "type": "number", "const": 2 },
+                    "image": {
                       "type": "object",
                       "properties": {
                         "url": {
@@ -1035,11 +935,11 @@
                         },
                         "format": {
                           "type": "string",
-                          "enum": ["raw.xz", "raw"]
+                          "enum": ["raw.zst", "raw"]
                         },
-                        "bytes": {
+                        "size_bytes": {
                           "type": "integer",
-                          "exclusiveMinimum": 0,
+                          "minimum": 1,
                           "maximum": 9007199254740991
                         },
                         "raw_sha256": {
@@ -1048,7 +948,7 @@
                         },
                         "raw_bytes": {
                           "type": "integer",
-                          "exclusiveMinimum": 0,
+                          "minimum": 1,
                           "maximum": 9007199254740991
                         }
                       },
@@ -1056,272 +956,150 @@
                         "url",
                         "sha256",
                         "format",
-                        "bytes",
+                        "size_bytes",
                         "raw_sha256",
                         "raw_bytes"
                       ],
                       "additionalProperties": false
                     },
-                    "route_token_version": {
-                      "anyOf": [
-                        { "type": "number", "const": 3 },
-                        { "type": "number", "const": 4 }
-                      ]
-                    },
-                    "runtime_attestation_version": {
-                      "type": "number",
-                      "const": 2
-                    },
-                    "admission_snapshot_version": {
-                      "type": "number",
-                      "const": 1
-                    },
-                    "thin_storage_sampling_version": {
-                      "type": "number",
-                      "const": 1
-                    },
-                    "components": {
-                      "minItems": 1,
-                      "maxItems": 128,
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "name": {
-                            "type": "string",
-                            "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
-                          },
-                          "kind": {
-                            "type": "string",
-                            "enum": ["image", "chart", "worker_bundle"]
-                          },
-                          "version": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128
-                          },
-                          "reference": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 512,
-                            "pattern": "^[^\\s\\p{C}]+$"
-                          },
-                          "sha256": {
-                            "type": "string",
-                            "pattern": "^[0-9a-f]{64}$"
-                          },
-                          "workload": {
-                            "type": "object",
-                            "properties": {
-                              "namespace": {
-                                "type": "string",
-                                "maxLength": 63,
-                                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-                              },
-                              "selector": {
-                                "type": "object",
-                                "propertyNames": {
-                                  "type": "string",
-                                  "minLength": 1,
-                                  "maxLength": 253
-                                },
-                                "additionalProperties": {
-                                  "type": "string",
-                                  "maxLength": 63
-                                }
-                              },
-                              "scope": {
-                                "type": "string",
-                                "enum": ["node", "cluster"]
-                              }
-                            },
-                            "required": ["namespace", "selector"],
-                            "additionalProperties": false
-                          }
-                        },
-                        "required": [
-                          "name",
-                          "kind",
-                          "version",
-                          "reference",
-                          "sha256"
-                        ],
-                        "additionalProperties": false
-                      }
-                    },
-                    "roles": {
+                    "binaries": {
                       "type": "object",
                       "properties": {
-                        "control_relay": {
+                        "pgcf-agent": {
                           "type": "object",
                           "properties": {
-                            "host_configuration_required": {
-                              "type": "boolean"
-                            },
-                            "kubernetes_images": {
-                              "type": "object",
-                              "properties": {
-                                "kubelet": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                },
-                                "apiServer": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                },
-                                "controllerManager": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                },
-                                "scheduler": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                }
-                              },
-                              "required": [
-                                "kubelet",
-                                "apiServer",
-                                "controllerManager",
-                                "scheduler"
-                              ],
-                              "additionalProperties": false
-                            },
-                            "talos_version": {
+                            "url": {
                               "type": "string",
-                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                              "maxLength": 2048,
+                              "pattern": "^https:\\/\\/"
                             },
-                            "talos_installer": {
-                              "type": "string",
-                              "maxLength": 512,
-                              "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
-                            },
-                            "talos_schematic_sha256": {
+                            "sha256": {
                               "type": "string",
                               "pattern": "^[0-9a-f]{64}$"
                             },
-                            "talos_extensions": {
-                              "maxItems": 32,
-                              "type": "array",
-                              "items": {
-                                "type": "string",
-                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
-                              }
-                            },
-                            "kubernetes_version": {
-                              "type": "string",
-                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
-                            },
-                            "components": {
-                              "minItems": 1,
-                              "maxItems": 128,
-                              "type": "array",
-                              "items": {
-                                "type": "string",
-                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
-                              }
+                            "size_bytes": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 9007199254740991
                             }
                           },
-                          "required": [
-                            "talos_version",
-                            "talos_installer",
-                            "talos_schematic_sha256",
-                            "talos_extensions",
-                            "kubernetes_version",
-                            "components"
-                          ],
+                          "required": ["url", "sha256", "size_bytes"],
                           "additionalProperties": false
                         },
-                        "customer": {
+                        "pgcf-native-gateway": {
                           "type": "object",
                           "properties": {
-                            "host_configuration_required": {
-                              "type": "boolean"
-                            },
-                            "kubernetes_images": {
-                              "type": "object",
-                              "properties": {
-                                "kubelet": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                },
-                                "apiServer": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                },
-                                "controllerManager": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                },
-                                "scheduler": {
-                                  "type": "string",
-                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
-                                }
-                              },
-                              "required": [
-                                "kubelet",
-                                "apiServer",
-                                "controllerManager",
-                                "scheduler"
-                              ],
-                              "additionalProperties": false
-                            },
-                            "talos_version": {
+                            "url": {
                               "type": "string",
-                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                              "maxLength": 2048,
+                              "pattern": "^https:\\/\\/"
                             },
-                            "talos_installer": {
-                              "type": "string",
-                              "maxLength": 512,
-                              "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
-                            },
-                            "talos_schematic_sha256": {
+                            "sha256": {
                               "type": "string",
                               "pattern": "^[0-9a-f]{64}$"
                             },
-                            "talos_extensions": {
-                              "maxItems": 32,
-                              "type": "array",
-                              "items": {
-                                "type": "string",
-                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
-                              }
-                            },
-                            "kubernetes_version": {
-                              "type": "string",
-                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
-                            },
-                            "components": {
-                              "minItems": 1,
-                              "maxItems": 128,
-                              "type": "array",
-                              "items": {
-                                "type": "string",
-                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
-                              }
+                            "size_bytes": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 9007199254740991
                             }
                           },
-                          "required": [
-                            "talos_version",
-                            "talos_installer",
-                            "talos_schematic_sha256",
-                            "talos_extensions",
-                            "kubernetes_version",
-                            "components"
-                          ],
+                          "required": ["url", "sha256", "size_bytes"],
+                          "additionalProperties": false
+                        },
+                        "pgcf-archive": {
+                          "type": "object",
+                          "properties": {
+                            "url": {
+                              "type": "string",
+                              "maxLength": 2048,
+                              "pattern": "^https:\\/\\/"
+                            },
+                            "sha256": {
+                              "type": "string",
+                              "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "size_bytes": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 9007199254740991
+                            }
+                          },
+                          "required": ["url", "sha256", "size_bytes"],
+                          "additionalProperties": false
+                        },
+                        "pgcf-wal-fetch": {
+                          "type": "object",
+                          "properties": {
+                            "url": {
+                              "type": "string",
+                              "maxLength": 2048,
+                              "pattern": "^https:\\/\\/"
+                            },
+                            "sha256": {
+                              "type": "string",
+                              "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "size_bytes": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 9007199254740991
+                            }
+                          },
+                          "required": ["url", "sha256", "size_bytes"],
                           "additionalProperties": false
                         }
                       },
-                      "required": ["control_relay", "customer"],
+                      "required": [
+                        "pgcf-agent",
+                        "pgcf-native-gateway",
+                        "pgcf-archive",
+                        "pgcf-wal-fetch"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "os": {
+                      "type": "object",
+                      "properties": {
+                        "image_version": {
+                          "type": "string",
+                          "pattern": "^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$"
+                        },
+                        "debian_snapshot": {
+                          "type": "string",
+                          "pattern": "^[0-9]{8}T[0-9]{6}Z$"
+                        },
+                        "package_lock": {
+                          "type": "object",
+                          "properties": {
+                            "url": {
+                              "type": "string",
+                              "maxLength": 2048,
+                              "pattern": "^https:\\/\\/"
+                            },
+                            "sha256": {
+                              "type": "string",
+                              "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "size_bytes": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 9007199254740991
+                            }
+                          },
+                          "required": ["url", "sha256", "size_bytes"],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "image_version",
+                        "debian_snapshot",
+                        "package_lock"
+                      ],
                       "additionalProperties": false
                     }
                   },
-                  "required": [
-                    "version",
-                    "versions_lock_sha256",
-                    "configuration_schema_revision",
-                    "components",
-                    "roles"
-                  ],
+                  "required": ["version", "image", "binaries", "os"],
                   "additionalProperties": false
                 },
                 "spec_sha256": {

@@ -2,7 +2,6 @@
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation, newNodeId } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
-import { choosePlacement } from "../../src/domain/placement.ts";
 import {
   placePendingDatabases,
   runNodeCapacity,
@@ -13,78 +12,25 @@ import {
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { patchSample, reports } from "./node-samples.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
 });
 
-it("refuses stale, missing, future and lost node observations for placement", () => {
-  const now = Date.now();
-  const node = {
-    id: "fixture-node",
-    region_id: "eu-test",
-    ready: true,
-    schedulable: true,
-    allocatable_memory_mib: 8192,
-    platform_reserved_memory_mib: 128,
-    reserved_memory_mib: 0,
-    allocatable_cpu_millicores: 2000,
-    platform_reserved_cpu_millicores: 100,
-    reserved_cpu_millicores: 0,
-    storage_gib_total: 30,
-    reserved_storage_gib: 0,
-    last_observed_at: new Date(now).toISOString(),
-    lost_at: null,
-  };
-  const size = { memory_mib: 512, cpu_millicores: 500, storage_gib: 5 };
-  expect(choosePlacement([node], node.region_id, size)?.id).toBe(node.id);
-  expect(
-    choosePlacement(
-      [{ ...node, last_observed_at: new Date(now - 180_001).toISOString() }],
-      node.region_id,
-      size,
-    ),
-  ).toBeNull();
-  expect(
-    choosePlacement(
-      [{ ...node, last_observed_at: null }],
-      node.region_id,
-      size,
-    ),
-  ).toBeNull();
-  expect(
-    choosePlacement(
-      [{ ...node, last_observed_at: new Date(now + 60_000).toISOString() }],
-      node.region_id,
-      size,
-    ),
-  ).toBeNull();
-  expect(
-    choosePlacement(
-      [{ ...node, lost_at: new Date(now).toISOString() }],
-      node.region_id,
-      size,
-    ),
-  ).toBeNull();
-});
-
 it("rechecks node freshness inside pending placement's atomic reservation", async () => {
-  const f = await fixture(128, 0);
+  const f = await fixture(0);
   const pending = DatabaseWithOperation.parse(await (await f.create()).json());
-  await env.DB.prepare(
-    "UPDATE nodes SET allocatable_memory_mib=4096,storage_gib_total=30 WHERE id=?",
-  )
-    .bind(f.node)
-    .run();
+  await reports(f.node);
   const prototype = Object.getPrototypeOf(env.DB);
   const batch = prototype.batch;
   const spy = vi
     .spyOn(prototype, "batch")
     .mockImplementationOnce(async function (statements) {
-      await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
-        .bind(new Date(Date.now() - 180_001).toISOString(), f.node)
-        .run();
+      await patchSample(f.node, {
+        observedAt: new Date(Date.now() - 180_001).toISOString(),
+      });
       return batch.call(env.DB, statements);
     });
   expect(await placePendingDatabases(env.DB, f.region)).toEqual([]);
@@ -241,9 +187,9 @@ it("does not turn stale observations into automatic paid replacement intent", as
   )
     .bind(f.region)
     .run();
-  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
-    .bind(new Date(Date.now() - 180_001).toISOString(), f.node)
-    .run();
+  await patchSample(f.node, {
+    observedAt: new Date(Date.now() - 180_001).toISOString(),
+  });
   expect((await runNodeCapacity(env, f.region)).action).toBe(
     "observations_stale",
   );

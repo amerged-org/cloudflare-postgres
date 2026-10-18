@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation, DesiredResponse } from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { recoverQuiescence } from "../../src/domain/lifecycle.ts";
 import { afterEach, expect, it } from "vitest";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
   request,
-  observation,
-  observedBody,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
 async function ready() {
   const f = await fixture();
   const result = DatabaseWithOperation.parse(await (await f.create()).json());
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(result.database.id, 1)]),
-  );
+  await report(f, result.database.id, 1);
   return { ...f, id: result.database.id };
 }
 const change = (
@@ -55,35 +51,15 @@ it("authorizes suspend/resume and keeps one operation, reservation and archive a
       await (await change(f, "suspend", "second-key")).json(),
     ).operation.id,
   ).toBe(suspended.operation.id);
-  const desired = DesiredResponse.parse(
-    await (await request(`/agent/v1/desired`, f.agent)).json(),
-  );
-  const db = desired.databases.find((d) => d.id === f.id)!;
-  expect(db.power).toEqual({
+  const db = (await desiredPage(f)).databases.find((d) => d.id === f.id)!;
+  expect(db).toMatchObject({
     operation: suspended.operation.id,
-    revision: 2,
-    mode: "quiesce",
-    reason: "manual",
+    generation: 2,
+    desired_state: "suspended",
   });
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([
-          {
-            ...observation(f.id, 2, "hibernated"),
-            power: {
-              operation: suspended.operation.id,
-              revision: 2,
-              state: "hibernated",
-            },
-          },
-        ]),
-      )
-    ).status,
-  ).toBe(200);
+  expect(await verdicts(await report(f, f.id, 2, "asleep"))).toEqual([
+    "accept",
+  ]);
   expect((await request(`/v1/databases/${f.id}`, f.integrator)).status).toBe(
     200,
   );
@@ -122,40 +98,22 @@ it("requires exact power-ready identity and current generation before completing
   const resume = DatabaseWithOperation.parse(
     await (await change(f, "resume")).json(),
   );
-  for (const value of [
-    observation(f.id, 3),
-    {
-      ...observation(f.id, 3),
-      power: { operation: suspended.operation.id, revision: 3, state: "awake" },
-    },
-    {
-      ...observation(f.id, 2),
-      power: { operation: resume.operation.id, revision: 2, state: "awake" },
-    },
-  ]) {
-    await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      observedBody([value]),
-    );
+  // A report names the generation and the operation that made it: another operation of the
+  // generation conflicts, and an older generation is stale.
+  for (const [generation, operation, verdict] of [
+    [3, suspended.operation.id, "conflict"],
+    [2, resume.operation.id, "stale"],
+  ] as const) {
+    expect(
+      await verdicts(await report(f, f.id, generation, "ready", { operation })),
+    ).toEqual([verdict]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(resume.operation.id)
         .first("status"),
     ).toBe("pending");
   }
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, 3),
-        power: { operation: resume.operation.id, revision: 3, state: "awake" },
-      },
-    ]),
-  );
+  expect(await verdicts(await report(f, f.id, 3))).toEqual(["accept"]);
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(resume.operation.id)
@@ -171,7 +129,7 @@ it("requires exact power-ready identity and current generation before completing
   expect(events).toHaveLength(1);
   expect(
     JSON.parse(events[0]!.resource_snapshot as string).reserved_cpu_millicores,
-  ).toBe(600);
+  ).toBe(500);
   await expect(
     env.DB.prepare(
       "UPDATE lifecycle_events SET resource_snapshot='{}' WHERE database_id=?",
@@ -186,21 +144,8 @@ it("refuses quiescence safely with a newer running intent and ignores stale refu
   const suspended = DatabaseWithOperation.parse(
     await (await change(f, "suspend")).json(),
   );
-  const refusal = {
-    ...observation(f.id, 2, "error"),
-    power: {
-      operation: suspended.operation.id,
-      revision: 2,
-      state: "awake",
-      refusal: "busy",
-    },
-  };
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([refusal]),
-  );
+  const refuse = () => report(f, f.id, 2, "ready", { refusal: "power_busy" });
+  expect(await verdicts(await refuse())).toEqual(["accept"]);
   const row = await env.DB.prepare(
     "SELECT desired_state,generation,power_operation FROM databases WHERE id=?",
   )
@@ -213,12 +158,7 @@ it("refuses quiescence safely with a newer running intent and ignores stale refu
       .bind(suspended.operation.id)
       .first(),
   ).toEqual({ status: "failed", error_code: "power_busy" });
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([refusal]),
-  );
+  expect(await verdicts(await refuse())).toEqual(["stale"]);
   expect(
     await env.DB.prepare(
       "SELECT desired_state,generation,power_operation FROM databases WHERE id=?",
@@ -227,12 +167,7 @@ it("refuses quiescence safely with a newer running intent and ignores stale refu
       .first(),
   ).toEqual(row);
   await request(`/v1/databases/${f.id}`, f.integrator, "DELETE");
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([refusal]),
-  );
+  expect(await verdicts(await refuse())).toEqual(["stale"]);
   expect(
     await env.DB.prepare("SELECT desired_state FROM databases WHERE id=?")
       .bind(f.id)
@@ -268,7 +203,7 @@ it("timeout compensation is exact, monotonic and cannot undo a later resume or d
     revision: 2,
   };
   const recovery = await recoverQuiescence(env, expected, "timeout");
-  expect(recovery).toMatchObject({ revision: 3, regionId: f.region });
+  expect(recovery).toMatchObject({ revision: 3, nodeId: f.node });
   expect(await recoverQuiescence(env, expected, "timeout")).toBeNull();
   expect(
     await env.DB.prepare("SELECT status,error_code FROM operations WHERE id=?")

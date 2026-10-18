@@ -15,7 +15,6 @@ import {
   ProjectId,
   Region,
   RegionCreate,
-  RegionCreated,
   RegionId,
   SizeClass,
   SizeClassId,
@@ -215,7 +214,7 @@ export function registerPlatform(app: ApiApp): void {
       security,
       tags: ["Regions"],
       request: { headers, body: body(RegionCreate) },
-      responses: response(RegionCreated, 201),
+      responses: response(Region, 201),
     },
     async (c) => createRegion(c, RegionCreate.parse(await c.req.json())),
   );

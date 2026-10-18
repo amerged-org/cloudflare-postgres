@@ -7303,6 +7303,7 @@
               "ready_files": 0,
               "failing_since": null
             },
+            "instance": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
             "refusal": "power_archive",
             "roles": { "removed": ["report"], "blocked": [] }
           }
@@ -7475,7 +7476,102 @@
               "last_segment": "000000010000000000000002",
               "ready_files": 0,
               "failing_since": null
+            },
+            "instance": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c"
+          }
+        ],
+        "orders": []
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
+      "name": "ready-without-instance",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "storage_generation": 1,
+            "state": "ready",
+            "proven_sleep": null,
+            "backup": {
+              "backup_id": "20261017T110000",
+              "timeline": 1,
+              "completed_at": "2026-10-17T12:00:00.000Z"
+            },
+            "archive": {
+              "last_segment": "000000010000000000000002",
+              "ready_files": 0,
+              "failing_since": null
             }
+          }
+        ],
+        "orders": []
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
+      "name": "ready-without-backup",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "storage_generation": 1,
+            "state": "ready",
+            "proven_sleep": null,
+            "backup": null,
+            "archive": {
+              "last_segment": "000000010000000000000002",
+              "ready_files": 0,
+              "failing_since": null
+            },
+            "instance": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c"
+          }
+        ],
+        "orders": []
+      }
+    },
+    {
+      "schema": "NodeObservationReport",
+      "name": "asleep-with-instance",
+      "valid": false,
+      "refinement": true,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "databases": [
+          {
+            "id": "dbbbbbbbbbbbbbbbbbbb",
+            "generation": 4,
+            "operation": "op_cccccccccccccccccccc",
+            "storage_generation": 1,
+            "state": "asleep",
+            "proven_sleep": {
+              "system_identifier": "7428512345678901234",
+              "timeline": 1,
+              "checkpoint_lsn": "0/3000028",
+              "last_archived_segment": "000000010000000000000002",
+              "proven_at": "2026-10-17T12:00:00.000Z"
+            },
+            "backup": {
+              "backup_id": "20261017T110000",
+              "timeline": 1,
+              "completed_at": "2026-10-17T12:00:00.000Z"
+            },
+            "archive": {
+              "last_segment": "000000010000000000000002",
+              "ready_files": 0,
+              "failing_since": null
+            },
+            "instance": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c"
           }
         ],
         "orders": []

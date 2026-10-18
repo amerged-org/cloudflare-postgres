@@ -11,13 +11,13 @@ import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { keyring } from "../crypto/keyring.ts";
 import { databaseInsertStatement, hint } from "./databases.ts";
-import { startupReservationStatement } from "./startup-admission.ts";
+import { choosePlacement, placementNodes } from "./placement.ts";
 import {
-  generateMaintenanceCredential,
-  maintenanceCreationStatement,
-} from "./maintenance.ts";
-import { choosePlacement, databaseMemoryPolicyAllows } from "./placement.ts";
-import { startupPlacementNodes } from "./node-capacity.ts";
+  assertResourcesAllowed,
+  effectiveResources,
+  ownResources,
+  regionBounds,
+} from "./resources.ts";
 import {
   databaseForRequest,
   databaseView,
@@ -122,48 +122,38 @@ export async function restoreDatabase(
           "The deleted source archive is outside recovery retention",
           { reason: "archive_expired" },
         );
-      const targetRegionId = body.region_id ?? source.region_id;
-      const [sourceRegion, region, size] = await Promise.all([
+      // A node reads archives of its own region only (ULTRA plan 7.3), so a restore into another
+      // region could never build: the target is in the source's region.
+      if ((body.region_id ?? source.region_id) !== source.region_id)
+        throw new ApiError(
+          "conflict",
+          "A restore goes into the source's own region",
+          { reason: "region_unavailable" },
+        );
+      const [region, size] = await Promise.all([
         c.env.DB.prepare(
-          "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
+          "SELECT id,backup_bucket,backup_endpoint_url FROM regions WHERE id=?",
         )
           .bind(source.region_id)
-          .first<RegionRow>(),
-        c.env.DB.prepare(
-          "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
-        )
-          .bind(targetRegionId)
           .first<RegionRow>(),
         c.env.DB.prepare("SELECT * FROM size_classes WHERE id=? AND enabled=1")
           .bind(source.size_class_id)
           .first<SizeRow>(),
       ]);
-      if (!sourceRegion || !size)
+      if (!region || !size)
         throw new ApiError("conflict", "Source region or size is unavailable", {
           reason: "source_unavailable",
         });
-      if (!region)
-        throw new ApiError("conflict", "Restore target region is unavailable", {
-          reason: "region_unavailable",
-        });
-      if (
-        !(await databaseMemoryPolicyAllows(
-          c.env.DB,
-          targetRegionId,
-          size.memory_mib,
-        ))
-      )
-        throw new ApiError(
-          "invalid_request",
-          "Source size class exceeds the target's configured per-database memory maximum",
-        );
-      const selected = regionArchive(c.env, sourceRegion),
-        prefix = validatedArchivePrefix(
-          source,
-          sourceRegion,
-          selected.bucketName,
-        );
-      regionArchive(c.env, region);
+      // The target keeps what the source runs with: its size class and its own resources.
+      const own = ownResources(source),
+        effective = effectiveResources(size, own);
+      assertResourcesAllowed(
+        effective,
+        own,
+        await regionBounds(c.env.DB, region.id),
+      );
+      const selected = regionArchive(c.env, region),
+        prefix = validatedArchivePrefix(source, region, selected.bucketName);
       const backup = await restoreBackup(
         selected.bucket,
         prefix,
@@ -201,15 +191,12 @@ export async function restoreDatabase(
           ),
         })),
       );
-      const maintenance = await generateMaintenanceCredential(
-        c.env.CREDENTIAL_KEYS,
-        targetId,
-      );
-      const node = choosePlacement(
-        await startupPlacementNodes(c.env.DB, targetRegionId, size.id),
-        targetRegionId,
-        size,
-      );
+      const decidedAt = Date.now(),
+        node = choosePlacement(
+          await placementNodes(c.env.DB, region.id, decidedAt),
+          effective,
+          decidedAt,
+        );
       const archive = archiveDestinationPath(
         region.backup_bucket,
         region.id,
@@ -252,29 +239,23 @@ export async function restoreDatabase(
         databaseInsertStatement(c.env.DB, {
           body: {
             project_id: source.project_id,
-            region_id: targetRegionId,
+            region_id: region.id,
             size_class_id: source.size_class_id,
             sleep_after_seconds: source.sleep_after_seconds ?? null,
             name: body.name,
           },
           size,
           region,
+          resources: own,
           nodeId: node?.id ?? null,
+          pendingMemoryMib: node?.pending_memory_mib,
+          pendingStorageGib: node?.pending_storage_gib,
+          decidedAt,
           id: targetId,
           archivePath: archive,
           now,
           authority,
         }),
-        maintenanceCreationStatement(
-          c.env.DB,
-          {
-            databaseId: targetId,
-            projectId: source.project_id,
-            createdAt: now,
-            creationGeneration: 1,
-          },
-          maintenance,
-        ),
         c.env.DB.prepare(
           "UPDATE databases SET storage_generation=? WHERE id=? AND project_id=? AND created_at=?",
         ).bind(storageGeneration, targetId, source.project_id, now),
@@ -304,17 +285,6 @@ export async function restoreDatabase(
         c.env.DB.prepare(
           "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.restore','pending',project_id,id,generation,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
         ).bind(op, now, now, targetId, source.project_id, now),
-        ...(node
-          ? [
-              startupReservationStatement(c.env.DB, {
-                databaseId: targetId,
-                operationId: op,
-                generation: 1,
-                nodeId: node.id,
-                now,
-              }),
-            ]
-          : []),
         c.env.DB.prepare(
           "INSERT INTO database_restores(target_database_id,operation_id,source_database_id,source_archive_path,source_storage_generation,backup_id,target_time,created_at) SELECT id,?,?,?,?,?,?,? FROM databases WHERE id=? AND project_id=? AND created_at=?",
         ).bind(
@@ -349,7 +319,7 @@ export async function restoreDatabase(
           "Source credentials, retention or placement changed; retry the request",
           { reason: "generation_changed" },
         );
-      if (node) hint(c, targetRegionId, [targetId]);
+      if (node) hint(c, [targetId]);
       return response(c, op);
     },
   });

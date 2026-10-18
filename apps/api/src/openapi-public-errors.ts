@@ -32,6 +32,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "PATCH /v1/databases/{id}": [400, 401, 404, 409, 500, 503],
   // 409: the database is deleted.
   "PUT /v1/databases/{id}/idle-time": [400, 401, 404, 409, 500],
+  // 403: not an admin key; 503: the node cannot take the growth.
+  "PUT /v1/databases/{id}/resources": [400, 401, 403, 404, 409, 500, 503],
   "DELETE /v1/databases/{id}": [400, 401, 404, 409, 500],
   "POST /v1/databases/{id}/restore": [400, 401, 404, 409, 500],
   "POST /v1/databases/{id}/suspend": [400, 401, 404, 409, 500],
@@ -56,6 +58,10 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   // setNodeDatabasePlacement's failed identity CAS is 409 even for a missing/lost node.
   "PUT /v1/nodes/{id}/database-placement": [400, 401, 403, 409, 500],
   "POST /v1/nodes/{id}/mark-lost": [400, 401, 403, 404, 409, 500],
+  "GET /v1/nodes/{id}/loss": [400, 401, 403, 404, 500],
+  "POST /v1/nodes/{id}/reinstall-override": [400, 401, 403, 404, 409, 500],
+  "POST /v1/databases/{id}/move": [400, 401, 403, 404, 409, 500],
+  "GET /v1/databases/{id}/moves": [400, 401, 403, 404, 500],
   // reserveNodeAddition's slot refusal is NodeStateError.capacity_unavailable -> 503.
   "POST /v1/nodes/additions": [400, 401, 403, 404, 409, 500, 503],
   // This list reads each stored addition through readNodeAddition and its intent-integrity guard.
@@ -71,20 +77,10 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   // Immutable global history lists do not check existence/current assignment or refuse empty pages.
   "GET /v1/fleet/releases": [400, 401, 403, 500],
   "PUT /v1/regions/{id}/release": [400, 401, 403, 404, 409, 500],
+  "GET /v1/regions/{id}/node-policy": [400, 401, 403, 404, 500],
+  "PUT /v1/regions/{id}/node-policy": [400, 401, 403, 404, 500],
   "GET /v1/regions/{id}/release": [400, 401, 403, 404, 500],
-  "PUT /v1/nodes/{id}/release": [400, 401, 403, 404, 409, 500],
   "GET /v1/nodes/{id}/release": [400, 401, 403, 404, 500],
-  "GET /v1/fleet/update-policy": [400, 401, 403, 500],
-  "PUT /v1/fleet/update-policy": [400, 401, 403, 404, 409, 500],
-  "GET /v1/fleet/update-candidates": [400, 401, 403, 500],
-  "GET /v1/fleet/update-candidates/{id}": [400, 401, 403, 404, 500],
-  "POST /v1/fleet/update-candidates/{id}/reject": [
-    400, 401, 403, 404, 409, 500,
-  ],
-  "POST /v1/fleet/update-candidates/{id}/resume": [
-    400, 401, 403, 404, 409, 500,
-  ],
-
   "GET /v1/resource-profiles/{id}/rollout": [400, 401, 403, 404, 500],
   "PUT /v1/resource-profiles/{id}/rollout": [400, 401, 403, 404, 409, 500],
   "GET /v1/resource-profiles/{id}": [400, 401, 404, 500],
@@ -92,12 +88,6 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/resource-profiles/{id}/revisions/{revision}": [400, 401, 404, 500],
   "GET /v1/databases/{id}/resource-profile": [400, 401, 404, 500],
   "PUT /v1/databases/{id}/resource-profile": [400, 401, 404, 409, 500, 503],
-  "GET /v1/regions/{target}/archive-sources/{source}": [
-    400, 401, 403, 404, 500,
-  ],
-  "PUT /v1/regions/{target}/archive-sources/{source}": [
-    400, 401, 403, 404, 409, 500,
-  ],
   "GET /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 500],
   "PUT /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 409, 500],
   // A dry-run decision for an absent policy/region is 200/action=unconfigured.
@@ -123,6 +113,7 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",
+  "PUT /v1/databases/{id}/resources",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
   "POST /v1/databases/{id}/suspend",
@@ -135,14 +126,9 @@ export const idempotentPublicRoutes: ReadonlySet<string> = new Set([
   "PUT /v1/regions/{id}/configuration",
   "PUT /v1/fleet/releases/{id}",
   "PUT /v1/regions/{id}/release",
-  "PUT /v1/nodes/{id}/release",
-  "PUT /v1/fleet/update-policy",
-  "POST /v1/fleet/update-candidates/{id}/reject",
-  "POST /v1/fleet/update-candidates/{id}/resume",
   "PUT /v1/resource-profiles/{id}/rollout",
   "PUT /v1/resource-profiles/{id}",
   "PUT /v1/databases/{id}/resource-profile",
-  "PUT /v1/regions/{target}/archive-sources/{source}",
 ]);
 
 /** withIdempotency refuses an omitted key on these routes (400) before submitting durable work, and
@@ -154,6 +140,7 @@ export const requiredIdempotentPublicRoutes: ReadonlySet<string> = new Set([
   "POST /v1/databases",
   "PATCH /v1/databases/{id}",
   "PUT /v1/databases/{id}/idle-time",
+  "PUT /v1/databases/{id}/resources",
   "DELETE /v1/databases/{id}",
   "POST /v1/databases/{id}/restore",
   "POST /v1/databases/{id}/suspend",
@@ -177,7 +164,7 @@ export const locationResponses: Readonly<
   },
   "POST /v1/regions": {
     "201":
-      "Created region resource path; one-time regional credentials cannot be replayed.",
+      "Created region resource path, also returned on a completed idempotency replay.",
   },
   "POST /v1/databases": {
     "202": "Database operation resource path.",
@@ -200,6 +187,9 @@ export const locationResponses: Readonly<
   "PUT /v1/databases/{id}/resource-profile": {
     "202":
       "Database resize operation resource path for the selected resource profile.",
+  },
+  "PUT /v1/databases/{id}/resources": {
+    "202": "Database resize operation resource path for the new resources.",
   },
   "DELETE /v1/databases/{id}/roles/{name}": {
     "202": "Role deletion operation resource path.",

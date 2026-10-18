@@ -2,6 +2,7 @@
 import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
 import type { CronWatchdog } from "./cron-watchdog.ts";
+import type { NodeCaller, NodeClaim } from "./domain/node-auth.ts";
 
 export type Env = Cloudflare.Env & {
   CF_VERSION_METADATA: WorkerVersionMetadata;
@@ -9,6 +10,11 @@ export type Env = Cloudflare.Env & {
   CRON_WATCHDOG?: DurableObjectNamespace<CronWatchdog>;
   INFRASTRUCTURE_BACKUP_CF_TOKEN?: string;
   RESEND_API_KEY?: string;
+  /** The parent R2 key that signs the temporary credentials of the nodes (ULTRA plan 7.3). */
+  R2_PARENT_ACCESS_KEY_ID?: string;
+  R2_PARENT_SECRET_ACCESS_KEY?: string;
+  /** Deletes the Tunnel of a node declared lost (ULTRA plan 9.4). */
+  CLOUDFLARE_API_TOKEN?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   DATABASE_ACTOR_LOCATION_HINT?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;
@@ -28,6 +34,12 @@ export interface ApiVariables {
   /** The class of an unexpected failure, set by the error handler for the request's one failure line. */
   failureCause?: string;
   auth?: AuthPrincipal;
+  /** The record of the node a signed call claims to come from, found before its body is read. */
+  nodeClaim?: NodeClaim;
+  /** The node of a call signed with its key. */
+  node?: NodeCaller;
+  /** The bytes of the request body as they arrived; a node's signature covers them. */
+  body?: Uint8Array;
 }
 
 export interface ApiEnv {

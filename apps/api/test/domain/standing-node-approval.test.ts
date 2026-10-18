@@ -703,16 +703,28 @@ it("keeps a threshold-blocked reserved intent waiting and completes capacity che
   expect(start).not.toHaveBeenCalled();
 });
 
-it("rechecks RAM for an old automatic headroom key before its first provider write", async () => {
+/** The state of a region whose nodes report through the node link: no regional RAM window exists. */
+async function withoutRamWindow() {
   const f = await ramAuthority(80);
-  const reserved = await reserveNodeAddition(env.DB, {
+  await env.DB.prepare("DELETE FROM node_memory_samples WHERE node_id=?")
+    .bind(f.node)
+    .run();
+  return f;
+}
+const headroom = (f: Awaited<ReturnType<typeof ramAuthority>>) =>
+  reserveNodeAddition(env.DB, {
     request_key: `capacity-headroom-${f.region}-1`,
     request: { region_id: f.region, mode: "order", order: f.order },
   });
+
+it("authorizes a headroom purchase by the autoscale switch alone, without the regional RAM window", async () => {
+  const f = await withoutRamWindow();
   const approved = await approveStandingNodePurchase(
     env.DB,
-    reserved.intent.operation_id,
+    (await headroom(f)).intent.operation_id,
   );
+  // The capacity cron decided from placement that no node fits; the RAM of the region is no part
+  // of it, so a threshold above the present RAM does not revoke the purchase.
   await configureNodeRegionPolicy(env.DB, {
     region_id: f.region,
     purchases_enabled: true,
@@ -722,14 +734,33 @@ it("rechecks RAM for an old automatic headroom key before its first provider wri
     standing_cost_profile: f.profile,
     ram_expansion_threshold_ppm: 850_000,
   });
-  await expect(
-    claimNodeDispatch(env.DB, approved.intent.operation_id, approved.revision),
-  ).rejects.toMatchObject({ code: "approval_required" });
+  const claimed = await claimNodeDispatch(
+    env.DB,
+    approved.intent.operation_id,
+    approved.revision,
+  );
+  expect(claimed.claimed).toBe(true);
   expect(
     await env.DB.prepare(
       "SELECT dispatch_request_id FROM node_additions WHERE operation_id=?",
     )
       .bind(approved.intent.operation_id)
       .first("dispatch_request_id"),
-  ).toBeNull();
+  ).not.toBeNull();
+});
+
+it("revokes an undispatched headroom purchase when automatic expansion is disabled", async () => {
+  const f = await withoutRamWindow();
+  const approved = await approveStandingNodePurchase(
+    env.DB,
+    (await headroom(f)).intent.operation_id,
+  );
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET autoscale_enabled=0 WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  await expect(
+    claimNodeDispatch(env.DB, approved.intent.operation_id, approved.revision),
+  ).rejects.toMatchObject({ code: "approval_required" });
 });

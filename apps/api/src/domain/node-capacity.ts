@@ -1,24 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-import {
-  DatabaseId,
-  RegionId,
-  SIDECAR,
-  databaseCpuReservationMillicores,
-  postgresCpuRequestMillicores,
-} from "@pgcf/contracts";
+import { DatabaseId, RegionId } from "@pgcf/contracts";
 import {
   choosePlacement,
+  nodeOnline,
+  placementGuard,
   placementNodes,
-  nodePlacementGuard,
-  nodePlacementBindings,
-  nodeDatabasePlacementGuard,
-  nodeMemoryReservationGuard,
-  databaseMemoryPolicyAllows,
-  type PlacementNode,
 } from "./placement.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 import type { Env } from "../env.ts";
-import { regionalRamWindowSql } from "./memory-capacity.ts";
 import { cronErrorCode } from "./cron-health.ts";
 import {
   NodeAdditionRequest,
@@ -32,35 +21,19 @@ import {
   approveStandingNodePurchase,
 } from "./node-state.ts";
 import { startAddNode } from "../platform/nodes.ts";
-import {
-  startupHeadroomSql,
-  startupReservationStatement,
-  nodeCpuHeadroomSql,
-} from "./startup-admission.ts";
-
-import {
-  nodeStoragePlacementSql,
-  selectedStorageProfileSql,
-} from "./storage-capacity.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
-/** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
-export async function startupPlacementNodes(
-  db: D1Database,
-  regionId: string,
-  sizeClassId: string,
-): Promise<PlacementNode[]> {
-  const nodes = await placementNodes(db, regionId);
-  const available = await db
-    .prepare(
-      `SELECT n.id FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-    WHERE n.region_id=? AND ${nodeCpuHeadroomSql()} AND ${startupHeadroomSql()} AND ${nodeStoragePlacementSql()}`,
-    )
-    .bind(sizeClassId, regionId)
-    .all<{ id: string }>();
-  const ids = new Set(available.results.map((node) => node.id));
-  return nodes.filter((node) => ids.has(node.id));
-}
+import { hintDatabases } from "./node-hints.ts";
+import { ApiError } from "../app.ts";
+import {
+  assertResourcesAllowed,
+  effectiveResources,
+  NO_OVERRIDES,
+  ownResources,
+  regionBounds,
+  usageSnapshot,
+} from "./resources.ts";
 
+/** Places the databases that wait for verified regional capacity, oldest first, where they now fit. */
 export async function placePendingDatabases(
   db: D1Database,
   regionId: string,
@@ -88,38 +61,38 @@ export async function placePendingDatabases(
       .bind(row.size_class_id)
       .first<SizeRow>();
     if (!size) continue;
-    const node = choosePlacement(
-      await startupPlacementNodes(db, regionId, size.id),
-      regionId,
-      size,
-    );
+    const effective = effectiveResources(size, ownResources(row)),
+      decidedAt = Date.now(),
+      node = choosePlacement(
+        await placementNodes(db, regionId, decidedAt),
+        effective,
+        decidedAt,
+      );
     if (!node) continue;
-    const now = new Date().toISOString();
+    const now = new Date().toISOString(),
+      guard = placementGuard("n", {
+        nodeId: node.id,
+        pendingMemoryMib: node.pending_memory_mib,
+        pendingStorageGib: node.pending_storage_gib,
+        now: decidedAt,
+      });
     const results = await db.batch([
       db
         .prepare(
-          `UPDATE databases SET node_id=?,storage_profile_json=(SELECT ${selectedStorageProfileSql("storage_node")} FROM nodes storage_node WHERE storage_node.id=?),status_message=NULL,updated_at=?
+          `UPDATE databases SET node_id=?,placed_at=?,status_message=NULL,updated_at=?
         WHERE (id=? AND project_id=? AND region_id=? AND node_id IS NULL AND generation=? AND updated_at=?)
         AND (desired_state='running' AND deleted_at IS NULL AND size_class_id=?)
         AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
         AND EXISTS(SELECT 1 FROM operations o WHERE o.id=? AND o.database_id=databases.id AND o.project_id=databases.project_id
           AND o.kind IN('database.create','database.restore') AND o.status='pending')
         AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=databases.size_class_id AND s.enabled=1
-          WHERE (n.id=? AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1)
+          WHERE n.region_id=databases.region_id AND ${guard.sql}
           AND ${admissionScopesOpenSql("databases.project_id", "databases.region_id", "n.id")}
-          AND ((${nodePlacementGuard()})
-          AND ${nodeDatabasePlacementGuard()}
-          AND ${startupHeadroomSql()}
-          AND n.platform_reserved_cpu_millicores IS NOT NULL)
-          AND (${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?`)}
-          AND ${nodeCpuHeadroomSql()})
-          AND ${nodeStoragePlacementSql()}
-          AND (s.memory_mib=? AND s.cpu_millicores=?
-          AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=?))`,
+          AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=?)`,
         )
         .bind(
           node.id,
-          node.id,
+          now,
           now,
           row.id,
           row.project_id,
@@ -128,33 +101,20 @@ export async function placePendingDatabases(
           row.updated_at,
           row.size_class_id,
           row.startup_operation_id,
-          node.id,
-          ...nodePlacementBindings(),
-          SIDECAR.requestMemoryMib,
-          SIDECAR.requestMemoryMib,
+          ...guard.bindings,
           size.memory_mib,
           size.cpu_millicores,
-          postgresCpuRequestMillicores(size),
           size.storage_gib,
         ),
       db
         .prepare(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-        SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?,'$.reserved_memory_mib',?) FROM databases
+        SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases
         WHERE changes()=1 AND id=? AND node_id=? AND updated_at=?`,
         )
         .bind(
           now,
-          JSON.stringify({
-            memory_mib: size.memory_mib,
-            cpu_millicores: size.cpu_millicores,
-            reserved_memory_mib: size.memory_mib + SIDECAR.requestMemoryMib,
-            reserved_cpu_millicores: databaseCpuReservationMillicores(size),
-            storage_allocated_bytes: size.storage_gib * 2 ** 30,
-          }),
-          size.storage_gib * 2 ** 30,
-          databaseCpuReservationMillicores(size),
-          size.memory_mib + SIDECAR.requestMemoryMib,
+          JSON.stringify(usageSnapshot(effective)),
           row.id,
           node.id,
           now,
@@ -165,19 +125,18 @@ export async function placePendingDatabases(
         AND EXISTS(SELECT 1 FROM databases d WHERE d.id=? AND d.node_id=? AND d.updated_at=?)`,
         )
         .bind(now, row.id, row.id, node.id, now),
-      startupReservationStatement(db, {
-        databaseId: row.id,
-        operationId: row.startup_operation_id,
-        generation: row.generation,
-        nodeId: node.id,
-        now,
-      }),
     ]);
     if (results[0]!.meta.changes === 1) placed.push(row.id);
   }
   return placed;
 }
 
+/**
+ * The next capacity step of a region (ULTRA plan 9.7). Waiting databases are placed where they fit
+ * first. A node is added only when no node fits the waiting database, or the smallest size class
+ * when none waits, and every node that should report does: nodes that went quiet are not a reason
+ * to buy.
+ */
 export async function runNodeCapacity(
   env: Env,
   regionId: string,
@@ -190,18 +149,12 @@ export async function runNodeCapacity(
     .bind(regionId)
     .first<{
       max_nodes: number | null;
-      ram_expansion_threshold_ppm: number | null;
       autoscale_enabled: number;
       order_config: string | null;
       adopt_instance_ids: string;
-      placement_mode: "reserved" | "actual_ram";
     }>();
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
-  if (placed.length) {
-    await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify(
-      placed,
-    );
-  }
+  if (placed.length) await hintDatabases(env, placed);
   const result = {
     region_id: regionId,
     dry_run: dryRun,
@@ -210,32 +163,6 @@ export async function runNodeCapacity(
     operation_id: null as string | null,
   };
   if (!policy) return { ...result, action: "unconfigured" };
-  const pending = await env.DB.prepare(
-    `SELECT d.id,d.size_class_id FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
-    WHERE d.region_id=? AND d.node_id IS NULL AND d.desired_state='running' AND d.deleted_at IS NULL ORDER BY d.created_at,d.id LIMIT 1`,
-  )
-    .bind(regionId)
-    .first<{ id: string; size_class_id: string }>();
-  const smallest = await env.DB.prepare(
-    "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,COALESCE(cpu_request_millicores,cpu_millicores),cpu_millicores,storage_gib,id LIMIT 1",
-  ).first<SizeRow>();
-  const regionalWindow =
-    policy.placement_mode === "actual_ram" ||
-    policy.ram_expansion_threshold_ppm !== null
-      ? await env.DB.prepare(regionalRamWindowSql("?")).bind(regionId).first<{
-          minute: number;
-          working_set_bytes: number;
-          capacity_memory_bytes: number;
-        }>()
-      : null;
-  const threshold =
-    regionalWindow !== null &&
-    policy.ram_expansion_threshold_ppm !== null &&
-    BigInt(regionalWindow.working_set_bytes) * 1_000_000n >=
-      BigInt(regionalWindow.capacity_memory_bytes) *
-        BigInt(policy.ram_expansion_threshold_ppm)
-      ? regionalWindow
-      : null;
   const active = await env.DB.prepare(
     "SELECT operation_id FROM node_additions WHERE region_id=? AND slot_held=1 AND status NOT IN('ready','cancelled') ORDER BY created_at LIMIT 1",
   )
@@ -266,67 +193,46 @@ export async function runNodeCapacity(
       operation_id: active.operation_id,
     };
   }
-  if (
-    !pending &&
-    !threshold &&
-    ((policy.placement_mode === "actual_ram" && regionalWindow !== null) ||
-      !smallest ||
-      choosePlacement(
-        await placementNodes(env.DB, regionId),
-        regionId,
-        smallest,
-      ))
+  const waiting = await env.DB.prepare(
+    `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
+    WHERE d.region_id=? AND d.node_id IS NULL AND d.desired_state='running' AND d.deleted_at IS NULL ORDER BY d.created_at,d.id LIMIT 1`,
   )
-    return result;
-  const stale = await env.DB.prepare(
-    `SELECT id FROM nodes n WHERE region_id=? AND lost_at IS NULL AND database_placement_enabled=1 AND NOT COALESCE((${nodePlacementGuard()}),0) LIMIT 1`,
-  )
-    .bind(regionId, ...nodePlacementBindings())
-    .first();
-  if (stale) return { ...result, action: "observations_stale" };
-  if (policy.placement_mode === "actual_ram" && threshold === null && pending) {
-    const size = await env.DB.prepare(
-      "SELECT * FROM size_classes WHERE id=? AND enabled=1",
-    )
-      .bind(pending.size_class_id)
-      .first<SizeRow>();
-    if (
-      !size ||
-      !(await databaseMemoryPolicyAllows(env.DB, regionId, size.memory_mib))
-    )
-      return { ...result, action: "size_policy_unavailable" };
-    const candidate = choosePlacement(
-      await placementNodes(env.DB, regionId),
-      regionId,
-      size,
-    );
-    if (candidate) {
-      const held = await env.DB.prepare(
-        "SELECT 1 FROM database_start_admissions WHERE node_id=? AND node_uid=? LIMIT 1",
+    .bind(regionId)
+    .first<DatabaseRow>();
+  const size = waiting
+    ? await env.DB.prepare(
+        "SELECT * FROM size_classes WHERE id=? AND enabled=1",
       )
-        .bind(candidate.id, candidate.node_uid!)
-        .first();
-      return {
-        ...result,
-        action: held ? "starts_in_progress" : "memory_headroom_wait",
-      };
-    }
+        .bind(waiting.size_class_id)
+        .first<SizeRow>()
+    : await env.DB.prepare(
+        "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,cpu_millicores,storage_gib,id LIMIT 1",
+      ).first<SizeRow>();
+  // A disabled class cannot be placed, and a region without classes has nothing to place.
+  if (!size)
+    return waiting ? { ...result, action: "size_policy_unavailable" } : result;
+  const own = waiting ? ownResources(waiting) : NO_OVERRIDES,
+    need = effectiveResources(size, own);
+  try {
+    assertResourcesAllowed(need, own, await regionBounds(env.DB, regionId));
+  } catch (error) {
+    if (error instanceof ApiError)
+      return { ...result, action: "size_policy_unavailable" };
+    throw error;
   }
-  if (policy.placement_mode === "actual_ram" && threshold === null) {
-    const unknown = await env.DB.prepare(
-      `SELECT id FROM nodes n WHERE region_id=? AND lost_at IS NULL AND database_placement_enabled=1 AND database_placement_closed_at IS NULL
-      AND NOT EXISTS(SELECT 1 FROM node_memory_samples m WHERE m.node_id=n.id AND m.node_uid=n.node_uid
-        AND m.observed_at=(SELECT MAX(observed_at) FROM node_memory_samples WHERE node_id=n.id AND node_uid=n.node_uid)
-        AND julianday(m.observed_at)>=julianday('now','-90 seconds') AND julianday(m.observed_at)<=julianday('now','+5 seconds')
-        AND m.memory_pressure=0 AND m.capacity_memory_bytes>0 AND m.working_set_bytes BETWEEN 0 AND m.capacity_memory_bytes
-        AND m.available_bytes BETWEEN 0 AND m.capacity_memory_bytes) LIMIT 1`,
+  const now = Date.now(),
+    nodes = await placementNodes(env.DB, regionId, now);
+  if (choosePlacement(nodes, need, now) !== null)
+    return { ...result, action: waiting ? "placement_pending" : "idle" };
+  if (
+    nodes.some(
+      (node) =>
+        node.lost_at === null &&
+        node.database_placement_enabled === 1 &&
+        !nodeOnline(node, now),
     )
-      .bind(regionId)
-      .first();
-    if (unknown || regionalWindow === null)
-      return { ...result, action: "memory_observations_unknown" };
-    if (pending) return { ...result, action: "capacity_wait" };
-  }
+  )
+    return { ...result, action: "observations_stale" };
   if (!policy.autoscale_enabled) return { ...result, action: "disabled" };
   if (
     policy.max_nodes !== null &&
@@ -348,24 +254,15 @@ export async function runNodeCapacity(
         mode: "adopt",
         provider_instance_id: instanceId,
       });
-      key = threshold
-        ? `capacity-ram-${threshold.minute}`
-        : `capacity-adopt-${instanceId}`;
+      key = `capacity-adopt-${instanceId}`;
       break;
     }
   }
   if (request === null && policy.order_config !== null) {
-    if (threshold === null)
-      return {
-        ...result,
-        action:
-          regionalWindow === null
-            ? "memory_observations_unknown"
-            : "capacity_wait",
-      };
     const order = NodeOrderConfiguration.parse(JSON.parse(policy.order_config));
     request = { region_id: regionId, mode: "order", order };
-    key = `capacity-ram-${threshold.minute}`;
+    // One purchase attempt per hour of continued shortage.
+    key = `capacity-headroom-${regionId}-${Math.floor(now / 3_600_000)}`;
   }
   if (request === null || key === null)
     return { ...result, action: "selection_unconfigured" };

@@ -36,6 +36,7 @@ function fixtures() {
     node_id: newNodeId(),
     name: "fixture",
     size_class_id: "small",
+    resources: { memory_mib: 512, cpu_millicores: 500, storage_gib: 5 },
     sleep_after_seconds: null,
     effective_sleep_after_seconds: 60,
     desired_state: "running" as const,

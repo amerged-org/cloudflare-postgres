@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation, DesiredResponse } from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observation,
-  observedBody,
   request,
+  report,
 } from "./fixtures.ts";
 
 const resources = {
@@ -100,12 +100,7 @@ it("versions central profiles without mutating an earlier resource class", async
 it("assigns a profile through the existing generation and regional desired-state path", async () => {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(created.database.id, 1)]),
-  );
+  await report(f, created.database.id, 1);
   const path = "/v1/resource-profiles/entry";
   expect(
     (
@@ -149,16 +144,10 @@ it("assigns a profile through the existing generation and regional desired-state
   const operation = DatabaseWithOperation.parse(await applied.json());
   expect(operation.database.generation).toBe(2);
   expect(operation.operation.kind).toBe("database.resize");
-  const desired = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
   expect(
-    desired.databases.find((d) => d.id === created.database.id)?.size,
-  ).toMatchObject({
-    memory_mib: 256,
-    cpu_millicores: 250,
-    cpu_request_millicores: 25,
-  });
+    (await desiredPage(f)).databases.find((d) => d.id === created.database.id)
+      ?.resources,
+  ).toMatchObject({ memory_mib: 256, cpu_millicores: 250 });
   expect(await (await request(assignment, f.admin)).json()).toMatchObject({
     profile_id: "entry",
     profile_revision: 1,
@@ -180,12 +169,7 @@ it("assigns a profile through the existing generation and regional desired-state
       )
     ).status,
   ).toBe(202);
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(created.database.id, 2)]),
-  );
+  await report(f, created.database.id, 2);
   expect(await (await request(assignment, f.integrator)).json()).toMatchObject({
     profile_id: "entry",
     profile_revision: 1,

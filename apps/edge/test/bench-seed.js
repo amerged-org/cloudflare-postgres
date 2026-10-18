@@ -9,13 +9,12 @@ export function withSeed(edge) {
     async fetch(request, env, ctx) {
       const url = new URL(request.url);
       if (url.pathname !== "/__seed") return edge.fetch(request, env, ctx);
-      return new Response(
-        await seedFixtureDatabase(env.DB, env.DATABASE_ACTOR, {
-          region: "eu-bench",
-          gatewayUrl: "http://gateway.invalid/pg",
-          gatewayBinding: "GATEWAY",
-        }),
-      );
+      const { database } = await seedFixtureDatabase(env, {
+        region: "eu-bench",
+        gatewayUrl: "http://gateway.invalid/pg",
+        gatewayBinding: "GATEWAY",
+      });
+      return new Response(database);
     },
   };
 }

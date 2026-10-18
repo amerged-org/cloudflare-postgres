@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation, DesiredResponse } from "@pgcf/contracts";
+import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
-import { placementNodes } from "../../src/domain/placement.ts";
 import { runResourceProfileRollouts } from "../../src/domain/resource-profiles.ts";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observation,
-  observedBody,
   request,
+  report,
 } from "./fixtures.ts";
 
 const resources = {
@@ -36,16 +35,7 @@ async function configured(createProfile = true) {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = created.database.id;
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(id, 1)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, id, 1)).status).toBe(200);
   if (createProfile)
     expect(
       (
@@ -65,16 +55,7 @@ async function configured(createProfile = true) {
       })
     ).status,
   ).toBe(202);
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(id, 2)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, id, 2)).status).toBe(200);
   return { ...f, id, assignment };
 }
 it("accepts a future profile for a confirmed sleeping database without starting it", async () => {
@@ -85,25 +66,7 @@ it("accepts a future profile for a confirmed sleeping database without starting 
     ).json(),
   );
   const generation = suspend.database.generation;
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([
-          {
-            ...observation(f.id, generation, "hibernated"),
-            power: {
-              operation: suspend.operation.id,
-              revision: generation,
-              state: "hibernated",
-            },
-          },
-        ]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, f.id, generation, "asleep")).status).toBe(200);
   expect(
     (
       await request("/v1/resource-profiles/entry", f.admin, "PUT", {
@@ -127,63 +90,23 @@ it("accepts a future profile for a confirmed sleeping database without starting 
   const result = DatabaseWithOperation.parse(await assigned.json());
   expect(result.database.desired_state).toBe("suspended");
   expect(result.database.generation).toBe(generation + 1);
-  expect(
-    (await placementNodes(env.DB, f.region))[0]!.reserved_cpu_millicores,
-  ).toBe(0);
-  const desired = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
+  const desired = await desiredPage(f);
   expect(desired.databases.find((d) => d.id === f.id)).toMatchObject({
     desired_state: "suspended",
-    size: { memory_mib: 512 },
+    resources: { memory_mib: 512 },
   });
-  expect(
-    await env.DB.prepare(
-      "SELECT count(*) n FROM database_start_admissions WHERE database_id=?",
-    )
-      .bind(f.id)
-      .first("n"),
-  ).toBe(0);
   expect(await (await request(f.assignment, f.admin)).json()).toMatchObject({
     profile_revision: 2,
     applied: false,
   });
   // A stale proof cannot complete the new configuration revision.
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, generation, "hibernated"),
-        power: {
-          operation: suspend.operation.id,
-          revision: generation,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  await report(f, f.id, generation, "asleep");
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(result.operation.id)
       .first("status"),
   ).toBe("pending");
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, generation + 1, "hibernated"),
-        power: {
-          operation: suspend.operation.id,
-          revision: generation + 1,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  await report(f, f.id, generation + 1, "asleep");
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(result.operation.id)
@@ -281,12 +204,10 @@ it("converges one profile change across two regions using owned database operati
   expect(results.reduce((a, b) => a + b, 0)).toBe(2);
   // Both cron contenders use generation CAS; each database gets exactly one resize.
   for (const f of [eu, us]) {
-    const desired = DesiredResponse.parse(
-      await (await request("/agent/v1/desired", f.agent)).json(),
-    );
+    const desired = await desiredPage(f);
     expect(desired.databases.find((d) => d.id === f.id)).toMatchObject({
       generation: 3,
-      size: { memory_mib: 512 },
+      resources: { memory_mib: 512 },
     });
     expect(
       await env.DB.prepare(
@@ -295,12 +216,7 @@ it("converges one profile change across two regions using owned database operati
         .bind(f.id)
         .first("n"),
     ).toBe(1);
-    await request(
-      "/agent/v1/observations",
-      f.agent,
-      "POST",
-      observedBody([observation(f.id, 3)]),
-    );
+    await report(f, f.id, 3);
     expect(
       await (await request(f.assignment, f.integrator)).json(),
     ).toMatchObject({
@@ -352,17 +268,7 @@ it("does not classify degraded or failed hibernation as deferred application", a
     ).json(),
   );
   const generation = stopped.database.generation;
-  const power = {
-    operation: stopped.operation.id,
-    revision: generation,
-    state: "hibernated",
-  };
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([{ ...observation(f.id, generation, "hibernated"), power }]),
-  );
+  await report(f, f.id, generation, "asleep");
   await request("/v1/resource-profiles/entry/rollout", f.admin, "PUT", {
     profile_revision: 1,
     expected_revision: 0,
@@ -370,12 +276,7 @@ it("does not classify degraded or failed hibernation as deferred application", a
   expect(await (await request(f.assignment, f.admin)).json()).toMatchObject({
     application_state: "deferred_until_wake",
   });
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([{ ...observation(f.id, generation, "error"), power }]),
-  );
+  await report(f, f.id, generation, "error", { error: "volume_missing" });
   expect(await (await request(f.assignment, f.admin)).json()).toMatchObject({
     application_state: "pending",
   });
@@ -430,21 +331,7 @@ it("rejects a changed ordinary class snapshot during a cold resize", async () =>
       await request(`/v1/databases/${f.id}/suspend`, f.admin, "POST")
     ).json(),
   );
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, stopped.database.generation, "hibernated"),
-        power: {
-          operation: stopped.operation.id,
-          revision: stopped.database.generation,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  await report(f, f.id, stopped.database.generation, "asleep");
   const target = `cold-${f.size}`;
   expect(
     (await request(`/v1/size-classes/${target}`, f.admin, "PUT", resources))
@@ -487,22 +374,7 @@ it("finishes the cold configuration operation when its next wake proves the curr
       await request(`/v1/databases/${f.id}/suspend`, f.admin, "POST")
     ).json(),
   );
-  const power = {
-    operation: stopped.operation.id,
-    revision: stopped.database.generation,
-    state: "hibernated",
-  };
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, stopped.database.generation, "hibernated"),
-        power,
-      },
-    ]),
-  );
+  await report(f, f.id, stopped.database.generation, "asleep");
   await request("/v1/resource-profiles/entry", f.admin, "PUT", {
     expected_revision: 1,
     resources: { ...resources, memory_mib: 512 },
@@ -522,21 +394,7 @@ it("finishes the cold configuration operation when its next wake proves the curr
     ).json(),
   );
   const generation = resumed.database.generation;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, generation),
-        power: {
-          operation: resumed.operation.id,
-          revision: generation,
-          state: "awake",
-        },
-      },
-    ]),
-  );
+  await report(f, f.id, generation);
   expect(
     await env.DB.prepare("SELECT status FROM operations WHERE id=?")
       .bind(configuredOp.operation.id)
@@ -555,21 +413,7 @@ it("marks a superseded cold configuration explicitly instead of leaving its oper
       await request(`/v1/databases/${f.id}/suspend`, f.admin, "POST")
     ).json(),
   );
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, stopped.database.generation, "hibernated"),
-        power: {
-          operation: stopped.operation.id,
-          revision: stopped.database.generation,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  await report(f, f.id, stopped.database.generation, "asleep");
   await request("/v1/resource-profiles/entry", f.admin, "PUT", {
     expected_revision: 1,
     resources: { ...resources, memory_mib: 512 },

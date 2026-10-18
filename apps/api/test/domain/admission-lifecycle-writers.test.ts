@@ -7,7 +7,7 @@ import {
 } from "cloudflare:test";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
-import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { cleanupFixtures, fixture, report, request } from "./fixtures.ts";
 import { recoverQuiescence } from "../../src/domain/lifecycle.ts";
 import { databaseResizeStatement } from "../../src/domain/databases.ts";
 import { withAdmissionMutation } from "../../src/domain/admission-mutations.ts";
@@ -28,11 +28,7 @@ const actorFor = (id: string) =>
 async function ready() {
   const f = await fixture(8192),
     created = DatabaseWithOperation.parse(await (await f.create()).json());
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_generation=generation,power_operation=NULL WHERE id=?",
-  )
-    .bind(created.database.id)
-    .run();
+  expect((await report(f, created.database.id, 1)).status).toBe(200);
   expect(
     (await actorFor(created.database.id).admit(created.database.id, "app")).ok,
   ).toBe(true);
@@ -298,7 +294,7 @@ it("quiescence compensation fences the current Actor before changing a rejected 
     { databaseId: f.id, operation: suspended.operation.id, revision: 2 },
     "timeout",
   );
-  expect(recovered).toMatchObject({ revision: 3, regionId: f.region });
+  expect(recovered).toMatchObject({ revision: 3, nodeId: f.node });
   expect(await actorFor(f.id).admit(f.id, "app")).toEqual({
     ok: false,
     sqlstate: "57P03",
@@ -326,7 +322,6 @@ it("a delayed resize statement cannot change the database after an actual aborte
           row,
           size,
           new Date().toISOString(),
-          undefined,
           undefined,
           mutation.guard(f.id),
         );

@@ -852,3 +852,110 @@ describe("0001_init.sql", () => {
     expect(() => insert(newProjectId())).not.toThrow();
   });
 });
+
+it("adds per-database resources and the capacity alert kinds while preserving databases and episodes", () => {
+  const directory = new URL("../../../apps/api/migrations/", import.meta.url);
+  // D1 applies a migration as one transaction, which `defer_foreign_keys` lasts for.
+  const exec = (file: string) => {
+    db.exec("BEGIN");
+    try {
+      db.exec(readFileSync(new URL(file, directory), "utf8"));
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  };
+  const apply = (below: string) => {
+    for (const file of readdirSync(directory)
+      .sort()
+      .filter(
+        (name) =>
+          name.endsWith(".sql") && name > "0001_init.sql" && name < below,
+      ))
+      exec(file);
+  };
+  apply("0064");
+  const id = newDatabaseId();
+  insertDatabase(id);
+  const kept = JSON.stringify({
+    kind: "regional_node_stale",
+    occurred_at: NOW,
+  });
+  run(
+    "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES('eu-1','regional_node_stale',1,?,?)",
+    crypto.randomUUID(),
+    kept,
+  );
+  const episodes = db.prepare("SELECT * FROM infrastructure_alerts").all();
+  const databases = db.prepare("SELECT * FROM databases").all();
+  const alert = (kind: string) =>
+    run(
+      "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES('eu-1',?,1,?,?)",
+      kind,
+      crypto.randomUUID(),
+      JSON.stringify({ kind, occurred_at: NOW }),
+    );
+  expect(() => alert("database_volume_warning")).toThrow(/CHECK/);
+  const thinTriggers = () =>
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN('database_selected_thin_insert','database_selected_thin_placement')",
+      )
+      .all();
+  expect(thinTriggers()).toHaveLength(2);
+  exec("0064_placement_resources.sql");
+  expect(db.prepare("SELECT * FROM infrastructure_alerts").all()).toEqual(
+    episodes,
+  );
+  for (const kind of [
+    "regional_node_capacity_refusals",
+    "regional_node_pool_closed",
+    "database_volume_warning",
+    "database_volume_critical",
+    "node_enrollment_refused",
+  ])
+    alert(kind);
+  expect(() => alert("regional_node_disk_warning")).toThrow(/CHECK/);
+  // The databases keep their columns and gain empty resources and no placement time.
+  expect(db.prepare("SELECT * FROM databases").all()).toEqual(
+    databases.map((row) => ({
+      ...row,
+      own_memory_mib: null,
+      own_cpu_millicores: null,
+      own_storage_gib: null,
+      placed_at: null,
+    })),
+  );
+  // A database's own values replace its class's in the view; null takes the class's.
+  // Placement writes no thin storage profile, so the triggers that demanded one are gone.
+  expect(thinTriggers()).toEqual([]);
+  const effective = () =>
+    db.prepare("SELECT * FROM database_resources WHERE database_id=?").get(id);
+  expect(effective()).toEqual({
+    database_id: id,
+    memory_mib: 512,
+    cpu_millicores: 500,
+    storage_gib: 10,
+  });
+  run(
+    "UPDATE databases SET own_memory_mib=1024,own_storage_gib=12 WHERE id=?",
+    id,
+  );
+  expect(effective()).toEqual({
+    database_id: id,
+    memory_mib: 1024,
+    cpu_millicores: 500,
+    storage_gib: 12,
+  });
+  for (const set of [
+    "own_memory_mib=1000",
+    "own_memory_mib=0",
+    "own_cpu_millicores=99",
+    "own_storage_gib=0",
+  ])
+    expect(
+      () => run(`UPDATE databases SET ${set} WHERE id=?`, id),
+      set,
+    ).toThrow(/CHECK/);
+});

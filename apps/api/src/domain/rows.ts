@@ -16,6 +16,7 @@ import {
   type DatabaseHealthSource,
 } from "./operational-health.ts";
 import type { Page } from "../platform/pagination.ts";
+import { effectiveOf, effectiveResourcesColumnsSql } from "./resources.ts";
 
 export interface DatabaseRow extends DatabaseHealthSource {
   id: string;
@@ -24,14 +25,20 @@ export interface DatabaseRow extends DatabaseHealthSource {
   node_id: string | null;
   name: string;
   size_class_id: string;
+  /** The database's own resources; null takes the size class's. */
+  own_memory_mib?: number | null;
+  own_cpu_millicores?: number | null;
+  own_storage_gib?: number | null;
+  /** When the database was placed on its node; null before it is. */
+  placed_at?: string | null;
+  /** Read with effectiveResourcesColumnsSql. */
+  effective_memory_mib?: number;
+  effective_cpu_millicores?: number;
+  effective_storage_gib?: number;
   sleep_after_seconds?: number | null;
   /** Read with effectiveSleepAfterSql. */
   effective_sleep_after_seconds?: number | null;
   pg_major: 18;
-  desired_postgres_release_id?: string | null;
-  desired_postgres_image?: string | null;
-  desired_postgres_version?: string | null;
-  desired_postgres_schema_revision?: number | null;
   observed_postgres_image?: string | null;
   observed_postgres_image_id?: string | null;
   desired_state: DesiredState;
@@ -91,7 +98,6 @@ export interface RegionRow {
   id: string;
   backup_bucket: string;
   backup_endpoint_url: string;
-  agent_key_hash: string;
 }
 export interface SizeRow extends Omit<SizeClass, "enabled"> {
   enabled: number;
@@ -115,6 +121,7 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
     node_id: row.node_id,
     name: row.name,
     size_class_id: row.size_class_id,
+    resources: effectiveOf(row),
     sleep_after_seconds: row.sleep_after_seconds ?? null,
     effective_sleep_after_seconds: row.effective_sleep_after_seconds,
     desired_state: row.desired_state,
@@ -189,7 +196,7 @@ export async function databaseForRequest(
 ): Promise<DatabaseRow> {
   await getAuth(c);
   const row = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")} FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
   )
     .bind(id)
     .first<DatabaseRow>();

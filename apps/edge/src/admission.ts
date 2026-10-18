@@ -2,12 +2,11 @@
 /**
  * The admission every database request takes, a WebSocket connection (`index.ts`) and an HTTP
  * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission run together, and
- * an admitted request is signed its route to the region's gateway.
+ * an admitted request is signed its route to the node's gateway.
  */
 import {
   parseRouteKeyring,
-  signLegacyRouteToken,
-  signRouteToken,
+  signNodeRouteToken,
   signWakeRouteToken,
 } from "@pgcf/contracts/route-token";
 import type { DatabaseWakeAdmission, Env } from "./env.ts";
@@ -24,8 +23,8 @@ export interface AdmissionTimings {
   /** The limiters, which run in parallel with the Actor's admission. */
   limiters_ms?: number;
   admit_ms?: number;
-  /** The route token version signed: v5 for a wake ticket. */
-  route?: "v5" | "v4" | "v3" | "v2";
+  /** The route token version signed: v6 for an awake database, v5 for a wake ticket. */
+  route?: "v6" | "v5";
   token_ms?: number;
 }
 
@@ -193,19 +192,24 @@ export async function admitRoute(
     cid,
   };
   // A wake ticket is signed as route v5: the gateway holds the request until its wake is
-  // released. The gateway dials only an admitted verified target. Temporary rollout compatibility
-  // (route-token.ts): an admission without a verified target still receives a v2 route.
+  // released. An awake database is signed as route v6, which names the unit the node reported.
+  // Both are signed with the key of the node the database runs on.
   const tokenStarted = Date.now();
   let token: string;
   if ("wake" in admitted) {
     timings.route = "v5";
-    token = await signWakeRouteToken({ ...connection, wake: admitted.wake });
-  } else if (admitted.target) {
-    timings.route = admitted.target.route_revision === undefined ? "v3" : "v4";
-    token = await signRouteToken({ ...connection, target: admitted.target });
+    token = await signWakeRouteToken({
+      ...connection,
+      node: admitted.node,
+      wake: admitted.wake,
+    });
   } else {
-    timings.route = "v2";
-    token = await signLegacyRouteToken(connection);
+    timings.route = "v6";
+    token = await signNodeRouteToken({
+      ...connection,
+      node: admitted.node,
+      target: admitted.target,
+    });
   }
   timings.token_ms = Date.now() - tokenStarted;
   check();

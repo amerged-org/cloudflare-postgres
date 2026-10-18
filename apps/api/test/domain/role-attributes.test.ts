@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import {
-  DatabaseWithOperation,
-  DesiredResponse,
-  Role,
-  listEnvelope,
-} from "@pgcf/contracts";
+import { DatabaseWithOperation, Role, listEnvelope } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   cleanupFixtures,
+  desiredPage,
   fixture,
-  observation,
-  observedBody,
   request,
+  report,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -45,10 +40,7 @@ const listRoles = async (f: Fixture, id: string) =>
     await (await request(`/v1/databases/${id}/roles`, f.integrator)).json(),
   ).data;
 async function desiredRoles(f: Fixture, id: string): Promise<unknown[]> {
-  const body = DesiredResponse.parse(
-    await (await request("/agent/v1/desired", f.agent)).json(),
-  );
-  return body.databases.find((db) => db.id === id)!.roles;
+  return (await desiredPage(f)).databases.find((db) => db.id === id)!.roles;
 }
 
 describe("role attributes", () => {
@@ -96,7 +88,7 @@ describe("role attributes", () => {
     });
   });
 
-  it("sends the attributes to the region only for the role that has them", async () => {
+  it("sends the attributes to the node only for the role that has them", async () => {
     const f = await fixture(),
       id = await database(f);
     const until = inOneHour();
@@ -109,7 +101,7 @@ describe("role attributes", () => {
       bypass_rls: true,
     });
     const roles = (await desiredRoles(f, id)) as Record<string, unknown>[];
-    // A plain role keeps the wire shape every deployed consumer accepts.
+    // A plain role keeps the plain wire shape.
     expect(Object.keys(roles[1]!).sort()).toEqual([
       "name",
       "owner",
@@ -133,7 +125,7 @@ describe("role attributes", () => {
     ]);
   });
 
-  it("refuses an expiry that is not in the future, unknown memberships and the owner as a target", async () => {
+  it("refuses an expiry that is not in the future, unknown memberships, the owner as a target and the internal role as a name", async () => {
     const f = await fixture(),
       id = await database(f);
     for (const body of [
@@ -150,6 +142,7 @@ describe("role attributes", () => {
       { name: "boss", member_of: ["pgcf_maintenance"] },
       { name: "boss", member_of: ["pg_read_all_data"] },
       { name: "limit", connection_limit: 0 },
+      { name: "pgcf_maintenance" },
     ]) {
       const response = await createRole(f, id, body);
       expect(response.status, JSON.stringify(body)).toBe(400);
@@ -258,13 +251,7 @@ describe("role attributes", () => {
   it("leaves usage and metering records as role changes always left them", async () => {
     const f = await fixture(),
       id = await database(f);
-    const post = (generation: number) =>
-      request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(id, generation)]),
-      );
+    const post = (generation: number) => report(f, id, generation);
     const count = async (table: string) =>
       env.DB.prepare(`SELECT COUNT(*) count FROM ${table} WHERE database_id=?`)
         .bind(id)

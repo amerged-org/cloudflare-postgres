@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
 import { bytesToHex, listEnvelope } from "@pgcf/contracts";
 import { FleetRelease, FleetReleaseSpec } from "@pgcf/contracts/releases";
-import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { cleanupFixtures, fixture, releaseSpec, request } from "./fixtures.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -15,44 +15,7 @@ afterEach(async () => {
 });
 
 async function approved(id: string, at = "2026-10-01T00:00:00.000Z") {
-  const names = [
-    "api",
-    "edge",
-    "node-bootstrap",
-    "regional",
-    "postgres",
-    "barman",
-    "cloudflared",
-    "cilium",
-    "flux-source",
-    "flux-kustomize",
-    "flux-helm",
-    "flux-notification",
-    "cert-manager",
-    "cloudnative-pg",
-    "openebs-lvm",
-  ];
-  const role = {
-    talos_version: "1.14.1",
-    talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
-    talos_schematic_sha256: "b".repeat(64),
-    talos_extensions: [],
-    kubernetes_version: "1.36.5",
-    components: names.slice(3),
-  };
-  const spec = FleetReleaseSpec.parse({
-    version: 1,
-    versions_lock_sha256: "c".repeat(64),
-    configuration_schema_revision: 1,
-    components: names.map((name) => ({
-      name,
-      kind: ["api", "edge"].includes(name) ? "worker_bundle" : "image",
-      version: "1.0.0",
-      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
-      sha256: "d".repeat(64),
-    })),
-    roles: { control_relay: role, customer: role },
-  });
+  const spec = FleetReleaseSpec.parse(releaseSpec());
   const value = FleetRelease.parse({
     id,
     spec,

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-import { DatabaseId, RegionId, DESIRED_PAGE_LIMIT_MAX } from "@pgcf/contracts";
+import { DatabaseId, RegionId } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
 import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
 import { recoverAdmissionMutations } from "./domain/admission-mutations.ts";
 import { recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
-import { runFleetUpdates } from "./domain/fleet-updates.ts";
+import { hintNode } from "./domain/node-hints.ts";
+import { runBackupRetention } from "./domain/backup-retention.ts";
+import { runNodeFencingCron } from "./domain/node-loss.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runInfrastructureBackupCron } from "./domain/infrastructure-backups.ts";
 import {
@@ -116,12 +118,13 @@ export async function runCron(
   await attempt("admission_recovery", undefined, () =>
     recoverAdmissionMutations(env, now),
   );
+  await attempt("node_fencing", undefined, () => runNodeFencingCron(env, now));
   await attempt("resource_profile_rollouts", undefined, () =>
     runResourceProfileRollouts(env, now),
   );
   const power = await attempt(
     "power_timeouts",
-    { recovered: 0, regions: new Map<string, Set<string>>() },
+    { recovered: 0, nodes: new Map<string, Set<string>>() },
     async () => {
       await env.DB.prepare(
         "INSERT INTO power_timeout_cursor(singleton,database_id) VALUES(1,NULL) ON CONFLICT(singleton) DO NOTHING",
@@ -143,7 +146,7 @@ export async function runCron(
         .bind(powerCursor.cursor ?? "", cutoff)
         .all<{ id: string; generation: number; power_operation: string }>();
       let recovered = 0;
-      const regions = new Map<string, Set<string>>();
+      const nodes = new Map<string, Set<string>>();
       for (const row of expiredPower.results.slice(0, 8)) {
         const recovery = await recoverQuiescence(
           env,
@@ -157,9 +160,11 @@ export async function runCron(
         );
         if (recovery) {
           recovered++;
-          const ids = regions.get(recovery.regionId) ?? new Set<string>();
-          ids.add(row.id);
-          regions.set(recovery.regionId, ids);
+          if (recovery.nodeId !== null) {
+            const ids = nodes.get(recovery.nodeId) ?? new Set<string>();
+            ids.add(row.id);
+            nodes.set(recovery.nodeId, ids);
+          }
         }
       }
       const nextPower =
@@ -169,7 +174,7 @@ export async function runCron(
       )
         .bind(nextPower, powerCursor.cursor)
         .run();
-      return { recovered, regions };
+      return { recovered, nodes };
     },
   );
   const expired = await attempt("operation_timeouts", 0, async () => {
@@ -202,7 +207,7 @@ export async function runCron(
   const purged = await attempt("idempotency_purge", 0, () =>
     purgeIdempotency(env.DB, now),
   );
-  const hinted = await attempt("region_hints", 0, async () => {
+  const hinted = await attempt("node_hints", 0, async () => {
     await env.DB.prepare(
       "INSERT INTO region_hint_cursor(singleton,region_id,database_id) VALUES(1,NULL,NULL) ON CONFLICT(singleton) DO NOTHING",
     ).run();
@@ -219,7 +224,7 @@ export async function runCron(
       DatabaseId.parse(hintCursor.database_id);
     }
     const pending = await env.DB.prepare(
-      `SELECT d.region_id,d.id FROM databases d WHERE d.node_id IS NOT NULL AND (d.generation>d.observed_generation OR (EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')) OR EXISTS(SELECT 1 FROM role_deletions rd WHERE rd.database_id=d.id AND rd.status IN('pending','running'))))
+      `SELECT d.region_id,d.id,d.node_id FROM databases d WHERE d.node_id IS NOT NULL AND (d.generation>d.observed_generation OR (EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')) OR EXISTS(SELECT 1 FROM role_deletions rd WHERE rd.database_id=d.id AND rd.status IN('pending','running'))))
       AND (d.region_id>? OR (d.region_id=? AND d.id>?)) ORDER BY d.region_id,d.id LIMIT 201`,
     )
       .bind(
@@ -227,23 +232,19 @@ export async function runCron(
         hintCursor.region_id ?? "",
         hintCursor.database_id ?? "",
       )
-      .all<{ region_id: string; id: string }>();
+      .all<{ region_id: string; id: string; node_id: string }>();
     const hintPage = pending.results.slice(0, 200);
-    const regions = power.regions;
+    const nodes = power.nodes;
     for (const db of hintPage) {
       RegionId.parse(db.region_id);
       DatabaseId.parse(db.id);
-      const ids = regions.get(db.region_id) ?? new Set<string>();
+      const ids = nodes.get(db.node_id) ?? new Set<string>();
       ids.add(db.id);
-      regions.set(db.region_id, ids);
+      nodes.set(db.node_id, ids);
     }
     let notified = 0;
-    for (const [regionId, ids] of regions) {
-      const stub = env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId));
-      notified += await stub.notify(
-        ids.size <= DESIRED_PAGE_LIMIT_MAX ? [...ids] : undefined,
-      );
-    }
+    for (const [nodeId, ids] of nodes)
+      notified += await hintNode(env, nodeId, [...ids]);
     const lastHint = pending.results.length > 200 ? hintPage.at(-1)! : null;
     await env.DB.prepare(
       "UPDATE region_hint_cursor SET region_id=?,database_id=? WHERE singleton=1 AND region_id IS ? AND database_id IS ?",
@@ -282,7 +283,9 @@ export async function runCron(
   await attempt("retained_archives", undefined, () =>
     cleanupRetainedArchives(env, now),
   );
-  await attempt("fleet_updates", undefined, () => runFleetUpdates(env, now));
+  await attempt("backup_retention", undefined, () =>
+    runBackupRetention(env, now),
+  );
 
   if (previous !== null)
     try {

@@ -9,19 +9,19 @@
   "files": [
     {
       "path": "docs/architecture/mermaider/add-node.md",
-      "sha256": "cb0aebfe11ff70f59d843860f9de62ff0480e3932953d3de7d1498b901ecca36"
+      "sha256": "259216a1b45191eadd66ef718af169988a7d399dc5fb281957f3a633bf043784"
     },
     {
       "path": "docs/architecture/mermaider/add-node.mmd",
-      "sha256": "94d6f2a039c35e749f18f74e398d6a7ed458d8a80178cb2b9754505ed0ccf326"
+      "sha256": "4f745ab37c186c91c5495dda9be4b44b0a57dfe811e34dbbd56b0681333f76de"
     },
     {
       "path": "docs/architecture/mermaider/api-resources.md",
-      "sha256": "282647132df89ba44dce6baccae5ff88c98bde9fb929361e5e5f7cfb80d03575"
+      "sha256": "d1d460bd68047b60efdc225f7730e91e8231aa2ba35bc6d3cb1591211fb85499"
     },
     {
       "path": "docs/architecture/mermaider/api-resources.mmd",
-      "sha256": "50ee80c845e1626eab19b30f096e5b49ee02f4656472b49cc2fef195145e8cfe"
+      "sha256": "05c503d67857750c7f4fed5e6c6fc4374655f99ff4b48b6ada21e235b878a28d"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
@@ -33,11 +33,11 @@
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
-      "sha256": "ff99f898e4bb7a21765e24c443f42c40a0c6d0e2c7339582318a7d9345145499"
+      "sha256": "69f4dd69f6b3a0be961483a67603118f35a52d4c91bc4308991f1d12621453cf"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.mmd",
-      "sha256": "2806a90a56cf8c1ab7e94175feca7f27821cd7c62d3727a449ac1a84ec0bb9d1"
+      "sha256": "3f0848ac74747b9acbe8a0f3fb92b511f6930c8af0eaf84f21b0272c44461373"
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.md",
@@ -49,10 +49,10 @@
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "7a0f0339f9f6268b38bbfffbf5e8cb00f94e8835b8fe899996f8772553bf3564"
+      "sha256": "8244ab259ea32bc3f4c1630085ca36a93a3f92b8e9ba591218b44b801cf36d38"
     }
   ],
-  "fingerprint": "6fac186f5103818a01097a9553fb95b514bc985ab1be64049ecea796b00dc3bb",
+  "fingerprint": "012b133fdd4dfaee9481d4ff1f198f7dcc70ae35350d3ee243a57496d01bfc3a",
   "toolVersion": "0.1.1",
   "version": 1
 }

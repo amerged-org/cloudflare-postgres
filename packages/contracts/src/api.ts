@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { MAINTENANCE_ROLE } from "./maintenance.ts";
-import {
-  ApiKeyScope,
-  ApiKeyString,
-  AgentKeyString,
-  RegionRouteKeyring,
-} from "./auth.ts";
+import { ApiKeyScope, ApiKeyString } from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
+import {
+  DatabaseEffectiveResources,
+  DatabaseResourcesCreate,
+} from "./database-resources.ts";
 import {
   ApiKeyId,
   DatabaseId,
@@ -27,7 +26,7 @@ import {
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.1.0";
+export const API_CONTRACT_VERSION = "1.2.0";
 
 /** ISO-8601 UTC timestamp exactly as Date#toISOString renders it. */
 export const Timestamp = z.iso
@@ -250,7 +249,7 @@ const RegionFields = {
   backup_endpoint_url: HttpsUrl,
 };
 
-/** Admin view; the agent key hash is never returned. */
+/** Admin view. `agent_last_seen_at` is the newest link message of any node of the region. */
 export const Region = z
   .strictObject({
     id: RegionId,
@@ -285,16 +284,6 @@ export const PlacementRegion = z
     examples: [{ id: "eu-1", provider_region: "EU" }],
   });
 export type PlacementRegion = z.infer<typeof PlacementRegion>;
-
-/** The agent key and derived routing keyring are returned exactly once, at creation. */
-export const RegionCreated = z
-  .strictObject({
-    region: Region,
-    agent_key: AgentKeyString,
-    route_keyring: RegionRouteKeyring,
-  })
-  .meta({ id: "RegionCreated" });
-export type RegionCreated = z.infer<typeof RegionCreated>;
 
 // ---------- Nodes ----------
 
@@ -456,6 +445,9 @@ export const Database = z
     node_id: NodeId.nullable(),
     name: DatabaseName,
     size_class_id: SizeClassId,
+    resources: DatabaseEffectiveResources.describe(
+      "The memory, CPU and storage the database runs with: its own values set through PUT /v1/databases/{id}/resources, else its size class's.",
+    ),
     sleep_after_seconds: DatabaseSleepAfter,
     effective_sleep_after_seconds: z
       .number()
@@ -464,7 +456,7 @@ export const Database = z
       .max(2_592_000)
       .nullable()
       .describe(
-        "The idle-sleep threshold: seconds without client activity before the database sleeps, its own sleep_after_seconds, else its size class's; null when the database is always warm. A database with a qualified warm-reclaim policy (/v1/databases/{id}/warm-reclaim) keeps its warm-idle path instead.",
+        "The idle-sleep threshold: seconds without client activity before the database sleeps, its own sleep_after_seconds, else its size class's; null when the database is always warm.",
       ),
     desired_state: DesiredState,
     observed_state: ObservedState,
@@ -502,6 +494,9 @@ export const DatabaseCreate = z
     name: DatabaseName,
     size_class_id: SizeClassId,
     sleep_after_seconds: DatabaseSleepAfter.optional(),
+    resources: DatabaseResourcesCreate.describe(
+      "The database's own memory, CPU and storage instead of its size class's. Admin keys only (403 otherwise).",
+    ).optional(),
   })
   .meta({ id: "DatabaseCreate" });
 export type DatabaseCreate = z.infer<typeof DatabaseCreate>;
@@ -528,18 +523,22 @@ export const DatabaseIdleTime = z
   .meta({ id: "DatabaseIdleTime" });
 export type DatabaseIdleTime = z.infer<typeof DatabaseIdleTime>;
 
+/** A node reads only its own region's archives, so a restore stays in the source's region. */
+const RestoreRegion = RegionId.describe(
+  "The source's region, which is also the default. Another region is refused with 409 `region_unavailable`.",
+).optional();
 export const DatabaseRestore = z
   .discriminatedUnion("mode", [
     z.strictObject({
       mode: z.literal("full"),
       name: DatabaseName,
-      region_id: RegionId.optional(),
+      region_id: RestoreRegion,
     }),
     z.strictObject({
       mode: z.literal("pitr"),
       name: DatabaseName,
       target_time: Timestamp,
-      region_id: RegionId.optional(),
+      region_id: RestoreRegion,
     }),
   ])
   .meta({ id: "DatabaseRestore" });

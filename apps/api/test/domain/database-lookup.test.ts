@@ -10,10 +10,9 @@ import { afterEach, expect, it } from "vitest";
 import {
   cleanupFixtures,
   fixture,
-  observation,
-  observedBody,
   refusal,
   request,
+  report,
 } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
@@ -130,16 +129,7 @@ it("pages through the regions newest first with a cursor", async () => {
 async function ready(f: Fixture) {
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = created.database.id;
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(id, 1)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, id, 1)).status).toBe(200);
   return { id, create: created.operation };
 }
 
@@ -147,16 +137,7 @@ it("lists the operations of one database newest first with a cursor", async () =
   const f = await fixture();
   const { id, create } = await ready(f);
   const observe = async (generation: number) =>
-    expect(
-      (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(id, generation)]),
-        )
-      ).status,
-    ).toBe(200);
+    expect((await report(f, id, generation)).status).toBe(200);
   const role = await request(
     `/v1/databases/${id}/roles`,
     f.integrator,

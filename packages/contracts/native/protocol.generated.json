@@ -42,6 +42,9 @@
     "admissionRouteSignatureDomain": "pgcf-route/v4\n",
     "wakeRouteTokenPrefix": "v5",
     "wakeRouteSignatureDomain": "pgcf-route/v5\n",
+    "nodeRouteTokenPrefix": "v6",
+    "nodeRouteSignatureDomain": "pgcf-route/v6\n",
+    "nodeRouteKeyDomain": "pgcf-route-key/v2\n",
     "legacyRouteTokenPrefix": "v2",
     "legacyRouteSignatureDomain": "pgcf-route/v2\n"
   },
@@ -102,6 +105,7 @@
             "required": ["id", "gateway_url", "gateway_binding"],
             "additionalProperties": false
           },
+          "node": { "$ref": "#/$defs/NodeId" },
           "target": {
             "type": "object",
             "properties": {
@@ -110,22 +114,22 @@
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991
               },
-              "pod_uid": {
-                "type": "string",
-                "format": "uuid",
-                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-              },
               "route_revision": {
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991
+              },
+              "instance": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
               }
             },
-            "required": ["revision", "pod_uid"],
+            "required": ["revision", "route_revision", "instance"],
             "additionalProperties": false
           }
         },
-        "required": ["ok", "region"],
+        "required": ["ok", "region", "node", "target"],
         "additionalProperties": false
       },
       {
@@ -145,7 +149,8 @@
       "RegionId": {
         "type": "string",
         "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
-      }
+      },
+      "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" }
     }
   },
   "routeClaims": {
@@ -295,6 +300,60 @@
     "$defs": {
       "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
       "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+    }
+  },
+  "nodeRouteClaims": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "v": { "type": "number", "const": 6 },
+      "db": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "user": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
+      "cid": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "rg": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$" },
+      "kid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+      },
+      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "rev": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "route_revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "node": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
+      "inst": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      }
+    },
+    "required": [
+      "v",
+      "db",
+      "user",
+      "cid",
+      "rg",
+      "kid",
+      "iat",
+      "exp",
+      "rev",
+      "route_revision",
+      "node",
+      "inst"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
+      "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" }
     }
   },
   "legacyRouteClaims": {

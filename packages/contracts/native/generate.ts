@@ -17,6 +17,11 @@ import {
   routeTokenClaimsSchema,
   cnpgAdmissionRouteTokenClaimsSchema,
   wakeRouteTokenClaimsSchema,
+  nodeRouteTokenClaimsSchema,
+  ROUTE_TOKEN_NODE_PREFIX,
+  ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN,
+  ROUTE_TOKEN_NODE_KEY_DOMAIN,
+  signNodeRouteToken,
   ROUTE_TOKEN_WAKE_PREFIX,
   ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
   roleRevisionHash,
@@ -140,6 +145,9 @@ const contract = {
     admissionRouteSignatureDomain: ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN,
     wakeRouteTokenPrefix: ROUTE_TOKEN_WAKE_PREFIX,
     wakeRouteSignatureDomain: ROUTE_TOKEN_WAKE_SIGNATURE_DOMAIN,
+    nodeRouteTokenPrefix: ROUTE_TOKEN_NODE_PREFIX,
+    nodeRouteSignatureDomain: ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN,
+    nodeRouteKeyDomain: ROUTE_TOKEN_NODE_KEY_DOMAIN,
     legacyRouteTokenPrefix: ROUTE_TOKEN_LEGACY_PREFIX,
     legacyRouteSignatureDomain: ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
   },
@@ -157,6 +165,7 @@ const contract = {
   routeClaims,
   admissionRouteClaims: schema(cnpgAdmissionRouteTokenClaimsSchema),
   wakeRouteClaims: schema(wakeRouteTokenClaimsSchema),
+  nodeRouteClaims: schema(nodeRouteTokenClaimsSchema),
   legacyRouteClaims: schema(legacyRouteTokenClaimsSchema),
 };
 const key = new Uint8Array(32).fill(7),
@@ -453,6 +462,153 @@ const wakeSigned = {
     keyring: { active: "test", keys: new Map([["test", key]]) },
   }),
 };
+// Route v6 names a node and its unit. The verifier's key is the one derived for that node;
+// the fixture key stands for it, as it does for the region key above.
+const nodeId = `nod_${"n".repeat(20)}`,
+  otherNode = `nod_${"o".repeat(20)}`;
+const nodeClaims = {
+  ...legacyClaims,
+  v: 6,
+  rev: 7,
+  route_revision: 19,
+  node: nodeId,
+  inst: "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
+};
+async function nodeToken(
+  value: unknown,
+  domain = ROUTE_TOKEN_NODE_SIGNATURE_DOMAIN,
+): Promise<string> {
+  return rawToken(JSON.stringify(value), ROUTE_TOKEN_NODE_PREFIX, domain);
+}
+// Only v6-prefixed tokens: a node verifier reads nothing else of this group.
+const nodeRouteInputs: {
+  name: string;
+  token: string | null;
+  now?: number;
+  region?: string;
+  node?: string;
+}[] = [
+  { name: "valid", token: await nodeToken(nodeClaims) },
+  {
+    name: "v4-domain",
+    token: await nodeToken(nodeClaims, ROUTE_TOKEN_ADMISSION_SIGNATURE_DOMAIN),
+  },
+  {
+    name: "v5-claims-under-v6",
+    token: await nodeToken(wakeClaims),
+  },
+  {
+    name: "v4-claims-under-v6",
+    token: await nodeToken({ ...claims, v: 4, route_revision: 19 }),
+  },
+  {
+    name: "pod-instead-of-instance",
+    token: await nodeToken({
+      ...nodeClaims,
+      inst: undefined,
+      pod: claims.pod,
+    }),
+  },
+  {
+    name: "missing-instance",
+    token: await nodeToken({ ...nodeClaims, inst: undefined }),
+  },
+  {
+    name: "uppercase-instance",
+    token: await nodeToken({
+      ...nodeClaims,
+      inst: nodeClaims.inst.toUpperCase(),
+    }),
+  },
+  {
+    name: "missing-node",
+    token: await nodeToken({ ...nodeClaims, node: undefined }),
+  },
+  {
+    name: "bad-node",
+    token: await nodeToken({ ...nodeClaims, node: "nod_short" }),
+  },
+  {
+    name: "missing-route-revision",
+    token: await nodeToken({ ...nodeClaims, route_revision: undefined }),
+  },
+  {
+    name: "zero-route-revision",
+    token: await nodeToken({ ...nodeClaims, route_revision: 0 }),
+  },
+  {
+    name: "unsafe-generation",
+    token: await nodeToken({ ...nodeClaims, rev: 2 ** 53 }),
+  },
+  {
+    name: "reserved-role",
+    token: await nodeToken({ ...nodeClaims, user: "postgres" }),
+  },
+  { name: "wrong-node", token: await nodeToken(nodeClaims), node: otherNode },
+  {
+    name: "wrong-region",
+    token: await nodeToken(nodeClaims),
+    region: "us-test",
+  },
+  {
+    name: "unknown-kid",
+    token: await nodeToken({ ...nodeClaims, kid: "other" }),
+  },
+  {
+    name: "bad-signature",
+    token: (await nodeToken(nodeClaims)).slice(0, -3) + "AAA",
+  },
+  {
+    name: "bad-lifetime",
+    token: await nodeToken({ ...nodeClaims, exp: 1031 }),
+  },
+  { name: "not-yet-valid", token: await nodeToken(nodeClaims), now: 994999 },
+  { name: "skew-start", token: await nodeToken(nodeClaims), now: 995000 },
+  { name: "skew-end", token: await nodeToken(nodeClaims), now: 1035000 },
+  { name: "expired", token: await nodeToken(nodeClaims), now: 1035001 },
+  { name: "missing", token: null },
+  { name: "malformed", token: "v6.a.b" },
+  {
+    name: "too-long",
+    token: `v6.${"A".repeat(ROUTE_TOKEN_ADMISSION_MAX_LENGTH)}.x`,
+  },
+];
+const nodeRoutes = await Promise.all(
+  nodeRouteInputs.map(async (input) => ({
+    name: input.name,
+    token: input.token,
+    now: input.now ?? 1000000,
+    region: input.region ?? region,
+    node: input.node ?? nodeId,
+    expected: await verifyRouteToken(input.token, {
+      keys: new Map([["test", key]]),
+      region: input.region ?? region,
+      node: input.node ?? nodeId,
+      now: input.now ?? 1000000,
+    }),
+  })),
+);
+const nodeSignedInput = {
+  region,
+  node: nodeId,
+  db: database,
+  user: "app",
+  cid: legacyClaims.cid,
+  now: 1000000,
+  ttlSeconds: 30,
+  target: {
+    revision: nodeClaims.rev,
+    route_revision: nodeClaims.route_revision,
+    instance: nodeClaims.inst,
+  },
+};
+const nodeSigned = {
+  input: nodeSignedInput,
+  token: await signNodeRouteToken({
+    ...nodeSignedInput,
+    keyring: { active: "test", keys: new Map([["test", key]]) },
+  }),
+};
 const roleRevisionHashes = await Promise.all(
   [
     [],
@@ -577,6 +733,8 @@ for (const [name, value] of [
       routes,
       wakeRoutes,
       wakeSigned,
+      nodeRoutes,
+      nodeSigned,
       roleRevisionHashes,
       startups,
       postgresActivity: activityVectors(),

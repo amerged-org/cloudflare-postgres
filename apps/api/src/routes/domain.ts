@@ -12,12 +12,9 @@ import {
   DatabaseId,
   DatabaseListQuery,
   DatabaseWithOperation,
-  DesiredQuery,
-  DesiredResponse,
   ErrorBody,
   IdempotencyKey,
   ListQuery,
-  ObservationReport,
   Operation,
   OperationId,
   Role,
@@ -28,7 +25,6 @@ import {
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
-import { agentRegion } from "../domain/agent-auth.ts";
 import { restoreDatabase } from "../domain/restore.ts";
 import { archiveSummary, backupCatalog } from "../domain/archive.ts";
 import {
@@ -40,8 +36,6 @@ import {
   setDatabaseIdleTime,
 } from "../domain/databases.ts";
 import { changePower } from "../domain/lifecycle.ts";
-import { desired } from "../domain/desired.ts";
-import { observations, truncateAgentText } from "../domain/observations.ts";
 import {
   databaseForRequest,
   databaseView,
@@ -91,6 +85,7 @@ const exampleDatabase = {
   node_id: "nod_abcdefghij1234567890",
   name: "orders",
   size_class_id: "small",
+  resources: { memory_mib: 1024, cpu_millicores: 500, storage_gib: 5 },
   sleep_after_seconds: 300,
   effective_sleep_after_seconds: 300,
   desired_state: "running",
@@ -170,27 +165,6 @@ function register(
 }
 
 export function registerDomain(app: ApiApp): void {
-  app.use("/agent/v1/observations", async (c, next) => {
-    if (c.req.method === "POST" && c.req.raw.body !== null) {
-      const value: unknown = await c.req.raw.clone().json();
-      if (
-        value &&
-        typeof value === "object" &&
-        "databases" in value &&
-        Array.isArray(value.databases)
-      )
-        for (const db of value.databases)
-          if (
-            db &&
-            typeof db === "object" &&
-            "message" in db &&
-            typeof db.message === "string"
-          )
-            db.message = truncateAgentText(db.message);
-      c.req.raw = new Request(c.req.raw, { body: JSON.stringify(value) });
-    }
-    await next();
-  });
   register(
     app,
     {
@@ -503,52 +477,5 @@ export function registerDomain(app: ApiApp): void {
       responses: responses(BackupCatalog),
     },
     async (c) => backupCatalog(c, DatabaseId.parse(c.req.param("id"))),
-  );
-  register(
-    app,
-    {
-      method: "get",
-      path: "/agent/v1/desired",
-      security,
-      tags: ["Agent"],
-      request: { query: DesiredQuery },
-      responses: responses(DesiredResponse),
-    },
-    async (c) => desired(c, DesiredQuery.parse(c.req.query())),
-  );
-  register(
-    app,
-    {
-      method: "post",
-      path: "/agent/v1/observations",
-      security,
-      tags: ["Agent"],
-      request: { body: body(ObservationReport) },
-      responses: responses(
-        z.object({ accepted: z.number().int().nonnegative() }),
-      ),
-    },
-    async (c) => observations(c, await c.req.json()),
-  );
-  register(
-    app,
-    {
-      method: "get",
-      path: "/agent/v1/link",
-      security,
-      tags: ["Agent"],
-      responses: { ...errors, 101: { description: "Agent WebSocket link" } },
-    },
-    async (c) => {
-      const region = await agentRegion(c);
-      const stub = c.env.REGION_LINK.get(
-        c.env.REGION_LINK.idFromName(region.id),
-      );
-      return stub.fetch(
-        new Request(c.req.raw.url, {
-          headers: { Upgrade: c.req.header("Upgrade") ?? "" },
-        }),
-      );
-    },
   );
 }

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { DatabaseId, DatabaseRegionRoute, RoleName } from "@pgcf/contracts";
-import { DatabaseRuntimeAttestationV2 } from "@pgcf/contracts/reclaim";
+import {
+  DatabaseId,
+  DatabaseRegionRoute,
+  DatabaseRuntime,
+  NodeId,
+  RoleName,
+  Timestamp,
+} from "@pgcf/contracts";
 import { z } from "zod";
 
 const Revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -20,14 +26,20 @@ export const DatabaseAdmissionSnapshot = z
     generation: Revision,
     updated_at: z.iso.datetime(),
     roles: z
-      .array(z.strictObject({ name: RoleName, revision: Revision }))
+      .array(
+        z.strictObject({
+          name: RoleName,
+          revision: Revision,
+          /** PostgreSQL refuses the role from the start of this second on. */
+          valid_until: Timestamp.nullable(),
+        }),
+      )
       .max(100)
       .refine(
         (roles) =>
           new Set(roles.map((role) => role.name)).size === roles.length,
       ),
     deleted: z.boolean(),
-    cache_capable: z.boolean(),
     admissible: z.boolean(),
     /**
      * An idle sleeper the Actor may issue a wake ticket for without reading D1 (pool design
@@ -36,7 +48,10 @@ export const DatabaseAdmissionSnapshot = z
      */
     wakeable: z.boolean().optional(),
     region: DatabaseRegionRoute,
-    runtime: DatabaseRuntimeAttestationV2.nullable(),
+    /** The node of the database, whose key signs the routes to it. */
+    node: NodeId.nullable(),
+    /** What the node reported of the unit that serves the database now. */
+    runtime: DatabaseRuntime.nullable(),
   })
   .refine(
     (snapshot) =>
@@ -45,13 +60,11 @@ export const DatabaseAdmissionSnapshot = z
   )
   .refine(
     (snapshot) =>
-      !snapshot.cache_capable ||
       !snapshot.admissible ||
       (snapshot.runtime !== null &&
         snapshot.runtime.database_id === snapshot.database_id &&
-        snapshot.runtime.generation === snapshot.generation &&
-        snapshot.runtime.admission_epoch === snapshot.admission_revision &&
-        snapshot.runtime.route_revision === snapshot.route_revision),
+        snapshot.runtime.node_id === snapshot.node &&
+        snapshot.runtime.generation === snapshot.generation),
   );
 export type DatabaseAdmissionSnapshot = z.infer<
   typeof DatabaseAdmissionSnapshot

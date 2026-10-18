@@ -14,17 +14,18 @@ export const CRON_STEPS = [
   "capacity_alerts",
   "infrastructure_backup_dispatch",
   "admission_recovery",
+  "node_fencing",
   "resource_profile_rollouts",
   "power_timeouts",
   "operation_timeouts",
   "role_deletion_timeouts",
   "idempotency_purge",
-  "region_hints",
+  "node_hints",
   "database_actors",
   "usage",
   "node_capacity",
   "retained_archives",
-  "fleet_updates",
+  "backup_retention",
 ] as const;
 export type CronStep = (typeof CRON_STEPS)[number];
 export interface CronStepFailure {

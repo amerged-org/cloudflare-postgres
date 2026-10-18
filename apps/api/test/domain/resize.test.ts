@@ -6,12 +6,13 @@ import {
   cleanupFixtures,
   fixture,
   request,
-  observation,
-  observedBody,
+  report,
+  verdicts,
 } from "./fixtures.ts";
 import type { D1Migration } from "cloudflare:test";
 import { databaseResizeStatement } from "../../src/domain/databases.ts";
 import type { DatabaseRow, SizeRow } from "../../src/domain/rows.ts";
+import { patchSample } from "./node-samples.ts";
 
 const classes: string[] = [];
 const historySQL = (query: string) =>
@@ -31,21 +32,12 @@ afterEach(async () => {
   for (const id of classes.splice(0))
     await env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(id).run();
 });
-async function ready() {
-  const f = await fixture();
+async function ready(memory?: number) {
+  const f = await fixture(memory);
   const first = await f.create();
   expect(first.status).toBe(202);
   const created = DatabaseWithOperation.parse(await first.json());
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(created.database.id, 1)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, created.database.id, 1)).status).toBe(200);
   return { ...f, id: created.database.id, createOp: created.operation.id };
 }
 async function size(
@@ -267,29 +259,39 @@ describe("manual in-place resize on real Workers D1", () => {
     ).toBe(0);
   });
 
-  it("rejects cross-project authorization, storage shrink and unsupported storage growth", async () => {
+  it("rejects cross-project authorization and storage shrink, and takes storage growth", async () => {
     const f = await ready();
     const target = await size(f);
     expect((await resize(f, target, undefined, f.otherKey)).status).toBe(404);
     expect((await resize(f, await size(f, { storage: 4 }))).status).toBe(400);
-    expect((await resize(f, await size(f, { storage: 6 }))).status).toBe(400);
     expect(
       await env.DB.prepare("SELECT generation FROM databases WHERE id=?")
         .bind(f.id)
         .first("generation"),
     ).toBe(1);
+    const grown = DatabaseWithOperation.parse(
+      await (await resize(f, await size(f, { storage: 6 }))).json(),
+    );
+    expect(grown.database.generation).toBe(2);
+    expect(grown.database.resources.storage_gib).toBe(6);
   });
 
-  it("rejects unknown CPU and insufficient current-node capacity without changing the class", async () => {
+  it("rejects growth that the current node cannot take without changing the class", async () => {
     const f = await ready();
+    // The node has 4 GiB: the database and 3,584 MiB more are all of it.
     const target = await size(f, { memory: 4096, cpu: 1000 });
     expect((await resize(f, target, "no-room")).status).toBe(503);
-    await env.DB.prepare(
-      "UPDATE nodes SET platform_reserved_cpu_millicores=NULL WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
-    expect((await resize(f, await size(f), "unknown-cpu")).status).toBe(503);
+    // More cores than the node has.
+    expect(
+      (await resize(f, await size(f, { cpu: 9000 }), "no-cores")).status,
+    ).toBe(503);
+    // A node that stopped reporting takes no growth.
+    await patchSample(f.node, {
+      observedAt: new Date(Date.now() - 181_000).toISOString(),
+    });
+    expect(
+      (await resize(f, await size(f, { memory: 768 }), "offline")).status,
+    ).toBe(503);
     expect(
       await env.DB.prepare(
         "SELECT generation,size_class_id FROM databases WHERE id=?",
@@ -306,19 +308,19 @@ describe("manual in-place resize on real Workers D1", () => {
     ).toBe(0);
     expect(
       await env.DB.prepare(
-        "SELECT COUNT(*) n FROM idempotency_keys WHERE key IN('no-room','unknown-cpu')",
+        "SELECT COUNT(*) n FROM idempotency_keys WHERE key IN('no-room','no-cores','offline')",
       ).first("n"),
     ).toBe(0);
+    // Less memory needs no room, and no report either.
+    expect(
+      (await resize(f, await size(f, { memory: 256 }), "smaller")).status,
+    ).toBe(202);
   });
 
-  it("serializes resize and another create against the same CPU reservation without partial operations", async () => {
-    const f = await ready();
-    const target = await size(f, { cpu: 800 });
-    await env.DB.prepare(
-      "UPDATE nodes SET allocatable_cpu_millicores=1300 WHERE id=?",
-    )
-      .bind(f.node)
-      .run();
+  it("serializes resize and another create against the same room without partial operations", async () => {
+    // 2,560 MiB: the database (512) grown to 1,536 and a new 512 would be 80 %, one of them fits.
+    const f = await ready(2560);
+    const target = await size(f, { memory: 1536 });
     const responses = await Promise.all([
       resize(f, target, "race-resize"),
       f.create("race-create", f.integrator, "race-create"),
@@ -333,11 +335,11 @@ describe("manual in-place resize on real Workers D1", () => {
       .first("node_id");
     expect(placed).toBe(responses[0]!.status === 202 ? null : f.node);
     const reserved = await env.DB.prepare(
-      "SELECT SUM(s.cpu_millicores+100) n FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.node_id=? AND d.observed_state<>'deleted'",
+      "SELECT SUM(r.memory_mib) n FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE d.node_id=? AND d.observed_state<>'deleted'",
     )
       .bind(f.node)
       .first<number>("n");
-    expect(reserved).toBeLessThanOrEqual(1200);
+    expect(reserved).toBeLessThan(0.8 * 2560);
     expect(
       await env.DB.prepare(
         "SELECT COUNT(*) n FROM operations WHERE project_id=? AND status='pending'",
@@ -380,7 +382,7 @@ describe("manual in-place resize on real Workers D1", () => {
     ).toBe(0);
   });
 
-  it("requires the current configuration proof after a concurrent role revision", async () => {
+  it("requires the current generation after a concurrent role revision", async () => {
     const f = await ready();
     const target = await size(f);
     const resized = DatabaseWithOperation.parse(
@@ -399,31 +401,13 @@ describe("manual in-place resize on real Workers D1", () => {
         )
       ).status,
     ).toBe(201);
-    expect(
-      await (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(f.id, 2)]),
-        )
-      ).json(),
-    ).toEqual({ accepted: 0 });
+    expect(await verdicts(await report(f, f.id, 2))).toEqual(["stale"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(resized.operation.id)
         .first("status"),
     ).toBe("pending");
-    expect(
-      await (
-        await request(
-          "/agent/v1/observations",
-          f.agent,
-          "POST",
-          observedBody([observation(f.id, 3)]),
-        )
-      ).json(),
-    ).toEqual({ accepted: 1 });
+    expect(await verdicts(await report(f, f.id, 3))).toEqual(["accept"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(resized.operation.id)
@@ -485,24 +469,17 @@ describe("manual in-place resize on real Workers D1", () => {
     const changed = DatabaseWithOperation.parse(
       await (await resize(f, target)).json(),
     );
-    const report = (generation: number, state = "ready") =>
-      request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(f.id, generation, state)]),
-      );
-    expect(await (await report(1)).json()).toEqual({ accepted: 0 });
-    expect(await (await report(3)).json()).toEqual({ accepted: 0 });
-    expect(await (await report(2, "provisioning")).json()).toEqual({
-      accepted: 1,
-    });
+    const send = async (generation: number, state = "ready") =>
+      verdicts(await report(f, f.id, generation, state));
+    expect(await send(1)).toEqual(["stale"]);
+    expect(await send(3)).toEqual(["conflict"]);
+    expect(await send(2, "building")).toEqual(["accept"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(changed.operation.id)
         .first("status"),
     ).toBe("running");
-    expect(await (await report(2)).json()).toEqual({ accepted: 1 });
+    expect(await send(2)).toEqual(["accept"]);
     expect(
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(changed.operation.id)
@@ -519,11 +496,11 @@ describe("manual in-place resize on real Workers D1", () => {
     expect(JSON.parse(events[0]!.resource_snapshot)).toEqual({
       memory_mib: 1024,
       cpu_millicores: 750,
-      reserved_memory_mib: 1152,
-      reserved_cpu_millicores: 850,
+      reserved_memory_mib: 1024,
+      reserved_cpu_millicores: 750,
       storage_allocated_bytes: 5 * 2 ** 30,
     });
-    await report(2);
+    await send(2);
     expect(
       (
         await env.DB.prepare(

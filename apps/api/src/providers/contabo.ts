@@ -266,7 +266,7 @@ const ActionReceipt = z.object({
   tenantId: Short,
   customerId: Short,
   instanceId: Id,
-  action: z.enum(["rescue", "restart"]),
+  action: z.enum(["rescue", "restart", "stop"]),
 });
 export type ContaboActionReceipt = z.infer<typeof ActionReceipt>;
 const Port = z
@@ -1240,9 +1240,16 @@ export class ContaboClient {
   ): Promise<MutationResult<ContaboActionReceipt>> {
     return this.action(parsed(Id, idInput), "restart", undefined, request);
   }
+  /** Powers the instance off; fencing a lost node (ULTRA plan 9.4) is its only caller. */
+  async stop(
+    idInput: string,
+    request: ContaboRequest,
+  ): Promise<MutationResult<ContaboActionReceipt>> {
+    return this.action(parsed(Id, idInput), "stop", undefined, request);
+  }
   private action(
     id: string,
-    action: "rescue" | "restart",
+    action: "rescue" | "restart" | "stop",
     body: string | undefined,
     request: ContaboRequest,
   ): Promise<MutationResult<ContaboActionReceipt>> {

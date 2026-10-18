@@ -7,15 +7,11 @@ import {
   Timestamp,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
-import { databaseWakeRoomSql } from "./storage-capacity.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
-import {
-  databaseStartupHeadroomSql,
-  startupReservationStatement,
-} from "./startup-admission.ts";
+import { databaseResumeFitsSql } from "./placement.ts";
 
 import {
   withAdmissionMutation,
@@ -30,14 +26,10 @@ export function powerTransitionStatements(
   now: string,
   wakeRole?: string,
   admission?: AdmissionSqlGuard,
-  ticket = false,
 ): D1PreparedStatement[] {
   const sleeping = action === "suspend" || action === "hibernate";
-  // A wake claims no RAM or CPU start headroom (pool design 2026-10-16): a pool hit starts in an
-  // already running slot, and the controller's miss path keeps its own start checks. A thin
-  // database wakes only while its pool has room, except for the claim of a wake `ticket`: the
-  // Edge answered it before the claim, a pool hit may already serve it, and the controller
-  // checked the room before that hit.
+  // Only a resume asks whether its node can start the database now. A wake is the claim of a
+  // connection the Edge held, and the node admits every start itself (plan 4.6).
   const authorizedRole = action === "wake" ? RoleName.parse(wakeRole) : null;
   const statements = [
     db
@@ -47,7 +39,7 @@ export function powerTransitionStatements(
       AND (EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation AND desired_state='suspended' AND suspension_reason='idle'))
       AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL)))
-      AND ${sleeping || (action === "wake" && ticket) ? "1=1" : action === "wake" ? databaseWakeRoomSql("databases") : databaseStartupHeadroomSql("databases")}
+      AND ${action === "resume" ? databaseResumeFitsSql("databases") : "1=1"}
       AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
@@ -105,32 +97,17 @@ export function powerTransitionStatements(
         ...(admission?.bindings ?? []),
       ),
   ];
-  if (!sleeping && row.node_id !== null)
-    statements.splice(
-      2,
-      0,
-      startupReservationStatement(db, {
-        databaseId: row.id,
-        operationId: operation,
-        generation: row.generation + 1,
-        nodeId: row.node_id,
-        now,
-      }),
-    );
   return statements;
 }
 
-async function hasStartupHeadroom(
-  db: D1Database,
-  id: string,
-): Promise<boolean> {
+async function nodeCanResume(db: D1Database, id: string): Promise<boolean> {
   const row = await db
     .prepare(
-      `SELECT ${databaseStartupHeadroomSql("d")} headroom FROM databases d WHERE d.id=?`,
+      `SELECT ${databaseResumeFitsSql("d")} fits FROM databases d WHERE d.id=?`,
     )
     .bind(id)
-    .first<{ headroom: number }>();
-  return row?.headroom === 1;
+    .first<{ fits: number }>();
+  return row?.fits === 1;
 }
 
 export async function changePower(
@@ -243,7 +220,7 @@ export async function changePower(
       );
       if (result[0]!.meta.changes !== 1) {
         // A start that the node cannot hold is told apart from a change that raced the request.
-        if (!sleeping && !(await hasStartupHeadroom(c.env.DB, id)))
+        if (!sleeping && !(await nodeCanResume(c.env.DB, id)))
           throw new ApiError(
             "conflict",
             "Current node has insufficient memory, CPU or storage",
@@ -253,7 +230,7 @@ export async function changePower(
           reason: "generation_changed",
         });
       }
-      hint(c, row.region_id, [id]);
+      hint(c, [id]);
       return databaseOperationResponse(c, op);
     },
   });
@@ -265,7 +242,11 @@ export async function recoverQuiescence(
   expected: { databaseId: string; operation: string; revision: number },
   reason: "busy" | "archive" | "unknown" | "timeout",
   now = new Date().toISOString(),
-): Promise<{ operation: string; revision: number; regionId: string } | null> {
+): Promise<{
+  operation: string;
+  revision: number;
+  nodeId: string | null;
+} | null> {
   const db = env.DB;
   DatabaseId.parse(expected.databaseId);
   OperationId.parse(expected.operation);
@@ -286,7 +267,6 @@ export async function recoverQuiescence(
   return withAdmissionMutation(env, [row.id], async (mutation) => {
     const guard = mutation.guard(row.id);
     const operation = newOperationId();
-    const mayRestart = reason === "unknown" || reason === "timeout";
     const statements = [
       db
         .prepare(
@@ -295,7 +275,7 @@ export async function recoverQuiescence(
           AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
           AND EXISTS(SELECT 1 FROM operations o WHERE o.id=databases.power_operation AND o.database_id=databases.id AND o.project_id=databases.project_id
             AND o.generation<=databases.generation AND o.kind IN('database.suspend','database.hibernate') AND o.status IN('pending','running'))
-          AND ${mayRestart ? databaseStartupHeadroomSql() : "1=1"} AND (${guard.sql})`,
+          AND (${guard.sql})`,
         )
         .bind(
           operation,
@@ -343,21 +323,9 @@ export async function recoverQuiescence(
           ...guard.bindings,
         ),
     ];
-    if (mayRestart && row.node_id !== null)
-      statements.splice(
-        2,
-        0,
-        startupReservationStatement(db, {
-          databaseId: row.id,
-          operationId: operation,
-          generation: row.generation + 1,
-          nodeId: row.node_id,
-          now,
-        }),
-      );
     const result = await mutation.batch(statements);
     return result[0]!.meta.changes === 1
-      ? { operation, revision: row.generation + 1, regionId: row.region_id }
+      ? { operation, revision: row.generation + 1, nodeId: row.node_id }
       : null;
   });
 }

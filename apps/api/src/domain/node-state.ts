@@ -22,6 +22,7 @@ import {
   StandingNodeCostProfile,
 } from "@pgcf/contracts/nodes";
 import { regionalRamExpansionSql } from "./memory-capacity.ts";
+import { assertReinstallAllowed } from "./reinstall-guard.ts";
 
 export class NodeStateError extends Error {
   readonly code:
@@ -376,11 +377,26 @@ export async function assertNodeRecoveryAuthority(
       "conflict",
       "Recovery requires the exact lost predecessor and exclusive instance authority",
     );
+  await assertReinstallAllowed(db, request.predecessor_node_id);
 }
 function automaticCapacityOrderKey(key: string): boolean {
   return ["capacity-ram-", "capacity-order-", "capacity-headroom-"].some(
     (prefix) => key.startsWith(prefix),
   );
+}
+/**
+ * The authority of an automatic purchase, for the policy row `policy`: the region's autoscale
+ * switch. A `capacity-headroom-` order was placed by the capacity cron because no node fits (ULTRA
+ * plan 9.7), so nothing more is read; the older `capacity-ram-` and `capacity-order-` keys also
+ * need the regional RAM window. `headroom` is the SQL that says the key is a headroom key.
+ */
+function automaticAuthoritySql(
+  policy: string,
+  region: string,
+  key: string,
+  headroom = `${key} LIKE 'capacity-headroom-%'`,
+): string {
+  return `(${policy}.autoscale_enabled=1 AND (${headroom} OR ${regionalRamExpansionSql(region, key)}))`;
 }
 export async function reserveNodeAddition(
   db: D1Database,
@@ -427,6 +443,8 @@ export async function reserveNodeAddition(
       "configuration_required",
       "Order must match the configured provider selection",
     );
+  if (request.mode === "recover")
+    await assertReinstallAllowed(db, request.predecessor_node_id);
   const nodeId = newNodeId(),
     operationId = newOperationId(),
     now = new Date().toISOString();
@@ -466,8 +484,7 @@ export async function reserveNodeAddition(
       SELECT ?,?,p.region_id,?,?,?,?,'reserved',?,?,? FROM node_region_policies p JOIN regions r ON r.id=p.region_id AND r.provider='contabo'
       WHERE p.region_id=? AND (p.max_nodes IS NULL OR ${slotCount}<p.max_nodes
         OR (?='recover' AND ${slotCount}<=p.max_nodes)) AND (?<>'order' OR p.order_config=?)
-      AND (?<>'order' OR ?=0
-        OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("p.region_id", "?")}))
+      AND (?<>'order' OR ?=0 OR ${automaticAuthoritySql("p", "p.region_id", "?", "?=1")})
       AND ${authority}
       AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status<>'ready' AND (requested_instance_id=? OR provider_instance_id=?)))
       AND ((?=0 AND (?<>'order' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram')))
@@ -490,6 +507,7 @@ export async function reserveNodeAddition(
         request.mode === "order" ? canonical(request.order) : null,
         request.mode,
         Number(automaticCapacityOrderKey(input.request_key)),
+        Number(input.request_key.startsWith("capacity-headroom-")),
         input.request_key,
         ...authorityBindings,
         provider,
@@ -685,7 +703,7 @@ export async function approveStandingNodePurchase(
           AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id AND setup_units IS NULL)
             AND COALESCE((SELECT SUM(setup_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id),0)+?<=?))
           AND ((COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram') AND (node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%'))
-            OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))`,
+            OR ${automaticAuthoritySql("p", "node_additions.region_id", "node_additions.request_key")}))`,
       )
       .bind(
         encoded,
@@ -781,13 +799,13 @@ export async function claimNodeDispatch(
     WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json IS NOT NULL
       AND json_extract(approval_json,'$.intent_hash')=intent_hash AND json_extract(approval_json,'$.expires_at')>?
       AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1 AND p.order_config=? AND (p.max_nodes IS NULL OR ${slotCount}<=p.max_nodes)
-        AND ((node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%') OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))
+        AND ((node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%') OR ${automaticAuthoritySql("p", "node_additions.region_id", "node_additions.request_key")}))
       AND (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE operation_id=node_additions.operation_id)
         OR EXISTS(SELECT 1 FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id
           WHERE a.operation_id=node_additions.operation_id AND a.profile_hash=p.standing_cost_profile_hash
             AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
             AND ((COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram') AND (node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%'))
-              OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")}))))`,
+              OR ${automaticAuthoritySql("p", "node_additions.region_id", "node_additions.request_key")})))`,
     )
     .bind(
       requestId,

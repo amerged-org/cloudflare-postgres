@@ -17,7 +17,7 @@ import {
 type Document = ReturnType<ApiApp["getOpenAPI31Document"]>;
 type PathItem = NonNullable<Document["paths"]>[string];
 type Operation = NonNullable<PathItem["get"]>;
-type Scope = "public" | "agent";
+type Scope = "public" | "node";
 const methods = ["get", "head", "post", "put", "patch", "delete"] as const;
 const scopes = [
   [
@@ -33,16 +33,28 @@ const scopes = [
       "A resource of another project is reported as `404`, never `403`.",
     ].join("\n\n"),
   ],
-  ["agent", "/agent/v1/openapi.json", "PGCF regional agent API", undefined],
+  [
+    "node",
+    "/node/v1/openapi.json",
+    "PGCF node API",
+    [
+      "A node calls these routes. Every one but the enrollment and the installer's report carries `Authorization: Bearer pgcf_nr1.<claims>.<signature>`: an Ed25519 signature of the request's method, its path with the query and the SHA-256 of its body, valid for 60 seconds.",
+      "Request bodies are JSON of at most 4 MiB.",
+      'A node declared lost reaches only the desired page and the observations; every other route answers `403 {"error":"node_fenced"}`.',
+    ].join("\n\n"),
+  ],
 ] as const;
-/** Agent auth is regional; handler reads and state fences determine the remaining refusals. */
-const agentRouteErrors: Readonly<Record<string, readonly number[]>> = {
-  "GET /agent/v1/desired": [400, 401, 404, 409, 500],
-  "POST /agent/v1/observations": [400, 401, 500],
-  "GET /agent/v1/link": [401, 500],
-  "POST /agent/v1/activity": [400, 401, 404, 409, 500],
-  "POST /agent/v1/usage": [400, 401, 404, 500],
-  "POST /agent/v1/fleet-observations": [400, 401, 404, 409, 500],
+/** A node's key is checked before the request is read; handler reads and state fences give the rest. */
+const nodeRouteErrors: Readonly<Record<string, readonly number[]>> = {
+  "POST /node/v1/enroll": [400, 401, 403, 409, 500],
+  "POST /node/v1/installer/progress": [400, 401, 409, 500],
+  "GET /node/v1/link": [401, 403, 500],
+  "GET /node/v1/desired": [400, 401, 403, 404, 409, 500],
+  "GET /node/v1/archive-credentials/{id}": [400, 401, 403, 404, 500],
+  "POST /node/v1/observations": [400, 401, 403, 500],
+  "POST /node/v1/volumes": [400, 401, 403, 500],
+  "POST /node/v1/events": [400, 401, 403, 500],
+  "POST /node/v1/usage": [400, 401, 403, 500],
 };
 const errors: Record<number, string> = {
   400: "Invalid request",
@@ -59,8 +71,9 @@ const authDescription: Record<DocumentationAuth, string> = {
   project:
     "Accepts an administrator or integrator API key; a resource outside the integrator's project is reported as not found.",
   admin: "Requires an administrator API key.",
-  agent:
-    "Requires the current regional agent bearer, rather than a management API key.",
+  node: "Requires a request signed with the node's key, rather than a management API key.",
+  installer:
+    "Requires the install's one-time progress token, rather than a management API key.",
 };
 const responseHeaders = {
   "X-Request-Id": {
@@ -144,7 +157,7 @@ function conformToContracts(value: unknown): void {
 function inScope(scope: Scope, path: string): boolean {
   return scope === "public"
     ? path.startsWith("/v1/") || path === "/healthz"
-    : path.startsWith("/agent/");
+    : path.startsWith("/node/");
 }
 
 function workerVersion(env: Env): WorkerVersionMetadata {
@@ -183,11 +196,15 @@ function describeOperation(key: string, operation: Operation): void {
       ? []
       : [
           {
-            [metadata.auth === "agent" ? "AgentBearer" : "bearerAuth"]: [],
+            [metadata.auth === "node"
+              ? "NodeBearer"
+              : metadata.auth === "installer"
+                ? "EnrollmentBearer"
+                : "bearerAuth"]: [],
           },
         ];
   const statuses =
-    metadata.errors ?? publicRouteErrors[key] ?? agentRouteErrors[key];
+    metadata.errors ?? publicRouteErrors[key] ?? nodeRouteErrors[key];
   if (statuses) {
     for (const status of Object.keys(operation.responses ?? {}))
       if (Number(status) >= 400 && !statuses.includes(Number(status)))
@@ -221,11 +238,9 @@ function describeOperation(key: string, operation: Operation): void {
       description:
         key === "POST /v1/api-keys"
           ? "Optional for authenticated API-key creation. One-time credentials cannot be replayed: reuse of the same key returns 409. Bootstrap creation ignores this header. Keys are kept for 24 hours."
-          : key === "POST /v1/regions"
-            ? "Optional for region creation. One-time regional agent credentials cannot be replayed: reuse of the same key returns 409. Keys are kept for 24 hours."
-            : requiredIdempotentPublicRoutes.has(key)
-              ? "Required; a request without it is refused with 400. Reusing a key with the same request returns the retained result; a different request conflicts. Keys are kept for 24 hours per API key; a request that failed is not retained."
-              : "Reusing a key with the same request returns the retained result; a different request conflicts. Keys are kept for 24 hours per API key; a request that failed is not retained. Omit only where optional.",
+          : requiredIdempotentPublicRoutes.has(key)
+            ? "Required; a request without it is refused with 400. Reusing a key with the same request returns the retained result; a different request conflicts. Keys are kept for 24 hours per API key; a request that failed is not retained."
+            : "Reusing a key with the same request returns the retained result; a different request conflicts. Keys are kept for 24 hours per API key; a request that failed is not retained. Omit only where optional.",
       schema: { type: "string", pattern: "^[A-Za-z0-9._~-]{1,128}$" },
     });
   operation.parameters.push({
@@ -268,7 +283,7 @@ function describeOperation(key: string, operation: Operation): void {
       delete response.content;
     }
   }
-  if (key === "GET /agent/v1/link")
+  if (key === "GET /node/v1/link")
     operation.responses!["426"] = {
       description: "WebSocket upgrade required",
       headers: responseHeaders,

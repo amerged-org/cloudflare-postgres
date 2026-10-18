@@ -9,10 +9,9 @@ import { afterEach, expect, it } from "vitest";
 import {
   cleanupFixtures,
   fixture,
-  observation,
-  observedBody,
   refusal,
   request,
+  report,
 } from "./fixtures.ts";
 
 const classes: string[] = [];
@@ -24,16 +23,7 @@ afterEach(async () => {
 async function ready() {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
-  expect(
-    (
-      await request(
-        "/agent/v1/observations",
-        f.agent,
-        "POST",
-        observedBody([observation(created.database.id, 1)]),
-      )
-    ).status,
-  ).toBe(200);
+  expect((await report(f, created.database.id, 1)).status).toBe(200);
   const put = (body: unknown, key?: string | null, auth = f.integrator) =>
     request(
       `/v1/databases/${created.database.id}/idle-time`,

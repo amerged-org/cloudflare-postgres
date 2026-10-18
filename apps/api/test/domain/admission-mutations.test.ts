@@ -3,44 +3,39 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
-import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  report,
+  request,
+  verdicts,
+} from "./fixtures.ts";
+import { reports } from "./node-samples.ts";
 import {
   withAdmissionMutation,
   type AdmissionSqlGuard,
 } from "../../src/domain/admission-mutations.ts";
 import { reconcileDatabaseActors } from "../../src/domain/database-actor-sync.ts";
 import { placePendingDatabases } from "../../src/domain/node-capacity.ts";
-import {
-  admissionSnapshotFixture,
-  admissionFixtureReleases,
-} from "./admission-snapshot-fixture.ts";
+import { admissionSnapshotFixture } from "./admission-snapshot-fixture.ts";
+import { nextMessage, openLink } from "./node-fixtures.ts";
 import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
-import { admissionSnapshotCapable } from "../../src/domain/fleet-releases.ts";
 
-afterEach(async () => {
-  await cleanupFixtures();
-  for (const id of admissionFixtureReleases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
-});
+afterEach(cleanupFixtures);
 const actorFor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
 async function ready() {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
-  await env.DB.prepare(
-    "UPDATE databases SET observed_state='ready',observed_generation=generation,power_operation=NULL WHERE id=?",
-  )
-    .bind(created.database.id)
-    .run();
+  expect(await verdicts(await report(f, created.database.id, 1))).toEqual([
+    "accept",
+  ]);
   return { ...f, id: created.database.id };
 }
 
-it("a committed v4 role change cannot admit the preceding ready runtime without a power operation", async () => {
+it("a committed role change cannot admit the preceding ready runtime without a power operation", async () => {
   const f = await admissionSnapshotFixture(),
     id = f.id;
-  expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(true);
   expect(await publishDatabaseAdmission(env, id)).toBe(true);
   const actor = env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
   expect((await actor.admit(id, "app")).ok).toBe(true);
@@ -64,8 +59,8 @@ it("a committed v4 role change cannot admit the preceding ready runtime without 
       power_operation: null;
     }>();
   expect(row).toEqual({
-    generation: f.proof.generation + 1,
-    observed_generation: f.proof.generation,
+    generation: f.generation + 1,
+    observed_generation: f.generation,
     power_operation: null,
   });
   expect(await actor.admit(id, "app")).toEqual({
@@ -200,25 +195,8 @@ it("a callback cannot report success without an authoritative guarded batch rece
 
 it("a scoped epoch commit immediately hints the affected regional desired state", async () => {
   const f = await ready();
-  const response = await env.REGION_LINK.get(
-    env.REGION_LINK.idFromName(f.region),
-  ).fetch("https://link.invalid/", { headers: { Upgrade: "websocket" } });
-  const socket = response.webSocket!;
-  socket.accept();
-  const messages: unknown[] = [];
-  socket.addEventListener("message", (event) => {
-    messages.push(JSON.parse(event.data as string));
-  });
-  socket.send(
-    JSON.stringify({
-      type: "hello",
-      protocol: 1,
-      agent_version: "test",
-      instance_id: crypto.randomUUID(),
-    }),
-  );
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  expect(messages).toContainEqual({ type: "welcome", protocol: 1 });
+  const socket = await openLink(f);
+  const hint = nextMessage(socket);
   try {
     await withAdmissionMutation(
       env,
@@ -233,8 +211,7 @@ it("a scoped epoch commit immediately hints the affected regional desired state"
       },
       { kind: "region", id: f.region },
     );
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(messages).toContainEqual({ type: "desired", ids: [f.id] });
+    expect(JSON.parse(await hint)).toEqual({ type: "desired", ids: [f.id] });
   } finally {
     socket.close();
   }
@@ -313,11 +290,7 @@ it("pending placement cannot join a node or region while its scope is closed", a
     await (await f.create()).json(),
   ).database;
   expect(created.node_id).toBeNull();
-  await env.DB.prepare(
-    "UPDATE nodes SET allocatable_memory_mib=4096 WHERE id=?",
-  )
-    .bind(f.node)
-    .run();
+  await reports(f.node);
   await withAdmissionMutation(
     env,
     [],
@@ -342,7 +315,6 @@ it("pending placement cannot join a node or region while its scope is closed", a
 
 it("actual role create and password reset acquire their admission fence before touching credentials", async () => {
   const f = await admissionSnapshotFixture();
-  expect(await admissionSnapshotCapable(env.DB, f.region)).toBe(true);
   expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   await env.DB.exec(
     `CREATE TRIGGER role_admission_insert BEFORE INSERT ON roles WHEN NEW.database_id='${f.id}' AND NOT EXISTS(SELECT 1 FROM database_admission_epochs e WHERE e.database_id=NEW.database_id AND e.mutation_id IS NOT NULL AND e.mutation_status='pending') BEGIN SELECT RAISE(ABORT,'credential write lacks admission fence'); END`,

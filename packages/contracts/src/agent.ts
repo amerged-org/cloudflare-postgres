@@ -6,7 +6,6 @@ import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
 import { FleetDesiredRelease, FleetReleaseId } from "./releases.ts";
-import { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 import { NodeStorageSample } from "./node-physical-storage.ts";
 import {
   DesiredDatabaseStorage,
@@ -29,7 +28,6 @@ export {
   thinMetadataEstimateBytes,
   thinWriteExposure,
 } from "./database-storage.ts";
-export { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 export {
   NodePhysicalStorage,
   NodeStorageSample,
@@ -51,6 +49,25 @@ import {
   DesiredRoleRemoval,
   refineRoles,
 } from "./node-link.ts";
+
+const ArchiveReadCredential = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine((value) => !/[\r\n\0]/.test(value));
+/** The bucket-scoped read keys of other regions' archives, by source region. */
+export const RecoverySourceCredentialsMap = z.record(
+  RegionId,
+  z.strictObject({
+    access_key_id: ArchiveReadCredential,
+    secret_access_key: ArchiveReadCredential,
+    bucket: BucketName,
+    endpoint_url: HttpsUrl,
+  }),
+);
+export type RecoverySourceCredentialsMap = z.infer<
+  typeof RecoverySourceCredentialsMap
+>;
 
 export const AGENT_PROTOCOL_VERSION = 1;
 export const DESIRED_PAGE_LIMIT_MAX = 200;

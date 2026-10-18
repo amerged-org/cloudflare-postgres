@@ -18,7 +18,7 @@ flowchart LR
     n_056b63fe76be["Durable Object<br/>DATABASE_ACTOR<br/>class_name: DatabaseActor"]
     n_d0efe52f1f47["Durable Object<br/>CRON_WATCHDOG<br/>class_name: CronWatchdog"]
     n_7a30182df25a["pgcf-api-dev<br/>configuration template"]
-    n_260ca5b8b289["Durable Object<br/>REGION_LINK<br/>class_name: RegionLink"]
+    n_260ca5b8b289["Durable Object<br/>NODE_ACTOR<br/>class_name: NodeActor"]
     n_7a30182df25a --> n_f305dbc12c79
     n_7a30182df25a --> n_260ca5b8b289
     n_839713e89618 -->|"scheduled event"| n_7a30182df25a
@@ -41,8 +41,8 @@ flowchart LR
 - [apps/api/wrangler.example.jsonc:46](../../../apps/api/wrangler.example.jsonc#L46)
 - [apps/api/wrangler.example.jsonc:47](../../../apps/api/wrangler.example.jsonc#L47)
 - [apps/api/wrangler.example.jsonc:50](../../../apps/api/wrangler.example.jsonc#L50)
-- [apps/api/wrangler.example.jsonc:61](../../../apps/api/wrangler.example.jsonc#L61)
-- [apps/api/wrangler.example.jsonc:66](../../../apps/api/wrangler.example.jsonc#L66)
-- [apps/api/wrangler.example.jsonc:68](../../../apps/api/wrangler.example.jsonc#L68)
+- [apps/api/wrangler.example.jsonc:67](../../../apps/api/wrangler.example.jsonc#L67)
+- [apps/api/wrangler.example.jsonc:72](../../../apps/api/wrangler.example.jsonc#L72)
+- [apps/api/wrangler.example.jsonc:74](../../../apps/api/wrangler.example.jsonc#L74)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

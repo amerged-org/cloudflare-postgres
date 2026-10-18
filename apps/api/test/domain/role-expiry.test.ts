@@ -4,13 +4,8 @@ import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { readDatabasePresence } from "../../src/domain/database-actor-sync.ts";
-import {
-  cleanupFixtures,
-  fixture,
-  observation,
-  observedBody,
-  request,
-} from "./fixtures.ts";
+import { publishDatabaseAdmission } from "../../src/domain/database-admission-snapshot.ts";
+import { cleanupFixtures, fixture, request, report } from "./fixtures.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -23,12 +18,7 @@ async function ready() {
   const f = await fixture();
   const result = DatabaseWithOperation.parse(await (await f.create()).json());
   const id = result.database.id;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(id, 1)]),
-  );
+  await report(f, id, 1);
   return { ...f, id };
 }
 async function createRole(
@@ -48,55 +38,17 @@ async function createRole(
   )
     .bind(f.id)
     .first<number>("generation");
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([observation(f.id, generation!)]),
-  );
+  await report(f, f.id, generation!);
   await actor(f.id).seed((await readDatabasePresence(env.DB, f.id))!);
 }
-/** Puts the ready database to idle sleep through the real activity and idle path. */
+/** The node puts the ready database to sleep after its idle time and reports the proven sleep. */
 async function sleep(f: Awaited<ReturnType<typeof ready>>) {
-  await env.DB.prepare(
-    "UPDATE size_classes SET sleep_after_seconds=60 WHERE id=?",
-  )
-    .bind(f.size)
-    .run();
   const row = (await env.DB.prepare(
     "SELECT generation FROM databases WHERE id=?",
   )
     .bind(f.id)
     .first<{ generation: number }>())!;
-  expect(
-    await actor(f.id).recordActivity(f.id, {
-      revision: row.generation,
-      observed_at: new Date().toISOString(),
-      last_activity_at: new Date(Date.now() - 120_000).toISOString(),
-      active_connections: 0,
-    }),
-  ).toBe(true);
-  expect((await actor(f.id).requestIdle(f.id, row.generation)).ok).toBe(true);
-  const sleeping = (await env.DB.prepare(
-    "SELECT generation,power_operation FROM databases WHERE id=?",
-  )
-    .bind(f.id)
-    .first<{ generation: number; power_operation: string }>())!;
-  await request(
-    "/agent/v1/observations",
-    f.agent,
-    "POST",
-    observedBody([
-      {
-        ...observation(f.id, sleeping.generation, "hibernated"),
-        power: {
-          operation: sleeping.power_operation,
-          revision: sleeping.generation,
-          state: "hibernated",
-        },
-      },
-    ]),
-  );
+  expect((await report(f, f.id, row.generation, "asleep")).status).toBe(200);
 }
 const wakes = async (id: string) =>
   env.DB.prepare(
@@ -134,7 +86,7 @@ it("an expired credential is answered as an expired password and never wakes the
   ).toBe("suspended");
 });
 
-it("the authoritative read refuses an expired role even where a stale presence still lists it", async () => {
+it("the admission snapshot refuses an expired role even where a stale presence still lists it", async () => {
   const f = await ready();
   const until = new Date(Date.now() + 1200).toISOString();
   await createRole(f, { name: "report_job", valid_until: until });
@@ -180,7 +132,7 @@ it("refuses a role from the whole second its expiry falls in, as PostgreSQL does
   expect((await actor(f.id).admit(f.id, "app")).ok).toBe(true);
 });
 
-it("the authoritative read applies the same second, where a stale presence lists the role", async () => {
+it("the admission snapshot applies the same second, where a stale presence lists the role", async () => {
   const f = await ready();
   await createRole(f, {
     name: "report_job",
@@ -192,6 +144,7 @@ it("the authoritative read applies the same second, where a stale presence lists
   )
     .bind(endOfThisSecond(), f.id, "report_job")
     .run();
+  expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   await actor(f.id).seed({
     ...current,
     revision: current.revision + 1,

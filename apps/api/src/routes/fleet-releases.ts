@@ -12,10 +12,8 @@ import {
   FleetRelease,
   FleetReleaseSpec,
   FleetRegionReleaseUpdate,
-  FleetNodeReleaseUpdate,
   FleetRegionReleaseStatus,
   FleetNodeReleaseStatus,
-  FleetNodeReleaseObservation,
 } from "@pgcf/contracts/releases";
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
@@ -26,8 +24,6 @@ import {
   getFleetRegionRelease,
   assignFleetRegionRelease,
   getFleetNodeRelease,
-  assignFleetNodeRelease,
-  observeFleetNodeRelease,
 } from "../domain/fleet-releases.ts";
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
 const errors = Object.fromEntries(
@@ -96,7 +92,7 @@ export function registerFleetReleases(app: ApiApp): void {
       method: "put",
       path: "/v1/fleet/releases/{id}",
       description:
-        "Approves an immutable artifact-pinned release. This records desired configuration; it does not execute a patch or assert current convergence.",
+        "Approves an immutable release: one node image with its binaries and package lock, the same for every node. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
       request: {
         headers,
         params: z.object({ id: FleetReleaseId }),
@@ -157,52 +153,13 @@ export function registerFleetReleases(app: ApiApp): void {
     app,
     {
       ...common,
-      method: "put",
-      path: "/v1/nodes/{id}/release",
-      description:
-        "Assigns the region's selected release to the current physical Node UID and declared role using a revision compare-and-set.",
-      request: {
-        headers,
-        params: z.object({ id: NodeId }),
-        body: body(FleetNodeReleaseUpdate),
-      },
-      responses: responses(FleetNodeReleaseStatus),
-    },
-    async (c) =>
-      assignFleetNodeRelease(
-        c,
-        NodeId.parse(c.req.param("id")),
-        FleetNodeReleaseUpdate.parse(await c.req.json()),
-      ),
-  );
-  register(
-    app,
-    {
-      ...common,
       method: "get",
       path: "/v1/nodes/{id}/release",
       description:
-        "Reports convergence from fresh authenticated component inventory. Inventory is an agent observation, not independent artifact attestation.",
+        "Reports how the node stands against its region's release: whether its last hello named the release and its link is fresh.",
       request: { params: z.object({ id: NodeId }) },
       responses: responses(FleetNodeReleaseStatus),
     },
     async (c) => getFleetNodeRelease(c, NodeId.parse(c.req.param("id"))),
-  );
-  register(
-    app,
-    {
-      ...common,
-      method: "post",
-      path: "/agent/v1/fleet-observations",
-      description:
-        "Records a full inventory for the current registered regional agent, assignment revision and physical Node UID.",
-      request: { body: body(FleetNodeReleaseObservation) },
-      responses: responses(z.strictObject({ accepted: z.literal(true) })),
-    },
-    async (c) =>
-      observeFleetNodeRelease(
-        c,
-        FleetNodeReleaseObservation.parse(await c.req.json()),
-      ),
   );
 }

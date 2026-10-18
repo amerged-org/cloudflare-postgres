@@ -177,17 +177,17 @@ export const NodeRegionPolicy = z
     node_ram_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
       .describe(
-        `Per-node RAM warning (alert regional_node_ram_warning) when any non-lost node, including one closed to database placement, reaches it: the node's own ten-minute working-set average against its memory capacity, from ten consecutive one-minute samples with unchanged capacity, the newest at most 90 s old. ${WARNING}`,
+        `Per-node RAM warning (alert regional_node_ram_warning) when any non-lost node, including one closed to database placement, reaches it: the 30-minute average of the node's active RAM, (MemTotal - MemAvailable) / MemTotal, over its samples, the newest at most 180 s old and the window at least ten minutes long. ${WARNING}`,
       ),
     node_cpu_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
       .describe(
-        `Per-node CPU warning (alert regional_node_cpu_warning) when any non-lost node reaches it: the node's reported CPU usage averaged over its ten latest consecutive one-minute samples (newest at most 90 s old, all with CPU data and the same capacity) against its reported CPU capacity. Only reporters that add these optional fields to node memory samples supply CPU (the node agent); otherwise CPU is unknown and never warns. ${WARNING}`,
+        `Per-node CPU warning (alert regional_node_cpu_warning) when any non-lost node reaches it: the 30-minute average of the node's CPU load, busy time over all its cores, over its samples, the newest at most 180 s old and the window at least ten minutes long. ${WARNING}`,
       ),
     node_storage_warning_threshold_ppm: ThresholdPpm.nullable()
       .optional()
       .describe(
-        `Per-node storage warning (alert regional_node_storage_warning) when any ready, non-lost node's latest LVM sample (at most 120 s old) reaches it: the fuller of thin-pool data and metadata when a thin pool exists, otherwise (total - free) / total of the volume group. ${WARNING}`,
+        `Per-node storage warning (alert regional_node_storage_warning) when any non-lost node's newest sample (at most 180 s old) reaches it: the fuller of its thin pool's data and metadata. Placement closes a node's pool at 800000 for data and 500000 for metadata, so 500000 warns before it does. ${WARNING}`,
       ),
     cap_warning_enabled: z
       .boolean()
@@ -216,7 +216,7 @@ export const NodeRegionPolicy = z
       .nullable()
       .default(null)
       .describe(
-        "actual_ram: largest size-class memory placed in this region (MiB).",
+        "The most memory one database of this region may have (MiB), for a size class and for a database's own memory; null means 4096.",
       ),
     postgres_memory_request_mib: z
       .number()

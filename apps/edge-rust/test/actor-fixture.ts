@@ -27,7 +27,7 @@ export class DatabaseActor extends ActualDatabaseActor {
     };
   }
 }
-export { RegionLink } from "../../api/src/region-link.ts";
+export { NodeActor } from "../../api/src/node-actor.ts";
 import { readDatabasePresence } from "../../api/src/domain/database-actor-sync.ts";
 
 export default {

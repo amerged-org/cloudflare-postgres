@@ -11,18 +11,11 @@ import {
 import { DatabaseAdmissionSnapshot } from "../../src/domain/admission-state.ts";
 import { DatabasePresence } from "../../src/database-actor.ts";
 import { cleanupFixtures } from "./fixtures.ts";
-import {
-  admissionFixtureReleases,
-  admissionSnapshotFixture,
-} from "./admission-snapshot-fixture.ts";
+import { admissionSnapshotFixture } from "./admission-snapshot-fixture.ts";
 
 afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
-  for (const id of admissionFixtureReleases.splice(0))
-    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
-      .bind(id)
-      .run();
 });
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
@@ -32,13 +25,13 @@ const route = (region: string) => ({
   gateway_binding: null,
 });
 
-/** A cache-capable database the controller reported asleep after an idle (or manual) sleep. */
+/** A database the node reported asleep after an idle (or manual) sleep. */
 async function sleeper(reason: "idle" | "manual" = "idle") {
   const f = await admissionSnapshotFixture();
   const sleepOperation = newOperationId(),
-    sleepGeneration = f.proof.generation + 1,
+    sleepGeneration = f.generation + 1,
     at = new Date().toISOString();
-  // Controlled committed regional sleep metadata, as the capable idle sleeper test writes it.
+  // Controlled committed sleep metadata, as the idle sleeper test writes it.
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,?,'succeeded',?,?,?,?,?,?)",
@@ -142,9 +135,9 @@ const wakeOperations = (id: string) =>
   )
     .bind(id)
     .first("n");
-async function regionNotifications(region: string) {
+async function nodeNotifications(node: string) {
   return runInDurableObject(
-    env.REGION_LINK.get(env.REGION_LINK.idFromName(region)),
+    env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(node)),
     (instance) => vi.spyOn(Object.getPrototypeOf(instance), "notify"),
   );
 }
@@ -159,6 +152,7 @@ it("admitWake answers a sleeping wakeable database before any D1 statement runs"
   expect(admitted).toEqual({
     ok: true,
     region: route(f.region),
+    node: f.node,
     wake: await expectedWake(f),
   });
   expect(held.started()).toBe(1);
@@ -196,6 +190,7 @@ it("parallel admitWake calls during the claim reuse one ticket", async () => {
     expect(admitted).toEqual({
       ok: true,
       region: route(f.region),
+      node: f.node,
       wake: first.wake,
     });
   commit.open();
@@ -213,26 +208,22 @@ it("parallel admitWake calls during the claim reuse one ticket", async () => {
   expect(await actor(f.id).admitWake(f.id, "reader")).toEqual({
     ok: true,
     region: route(f.region),
+    node: f.node,
     wake: first.wake,
   });
   expect(await wakeOperations(f.id)).toBe(1);
 });
 
-it("the ticket claim commits generation+1 with the ticket operation and hints the region", async () => {
+it("the ticket claim commits generation+1 with the ticket operation and hints the node", async () => {
   const f = await sleeper();
-  const notify = await regionNotifications(f.region);
+  const notify = await nodeNotifications(f.node);
   const admitted = await actor(f.id).admitWake(f.id, "reader");
   if (!admitted.ok || !("wake" in admitted)) throw new Error("no wake ticket");
   const { operation, generation } = admitted.wake;
   await expect
     .poll(() => notify.mock.calls.length, { interval: 5, timeout: 3000 })
     .toBe(1);
-  const [ids, page] = notify.mock.calls[0]! as [
-    string[],
-    { databases: { id: string; power?: { operation: string } }[] },
-  ];
-  expect(ids).toEqual([f.id]);
-  expect(page.databases[0]).toMatchObject({ id: f.id, power: { operation } });
+  expect(notify.mock.calls[0]![0]).toEqual([f.id]);
   expect(await row(f.id)).toEqual({
     generation,
     desired_state: "running",
@@ -257,7 +248,7 @@ it("the ticket claim commits generation+1 with the ticket operation and hints th
   ).toEqual([{ operation, revision: generation }]);
 });
 
-it("a refused claim marks the ticket refused, notifies the region and the next admitWake issues a new ticket", async () => {
+it("a refused claim marks the ticket refused, notifies the node and the next admitWake issues a new ticket", async () => {
   const f = await sleeper();
   // The row moved to a manual suspension after the snapshot the Actor answers from.
   await env.DB.prepare(
@@ -265,7 +256,7 @@ it("a refused claim marks the ticket refused, notifies the region and the next a
   )
     .bind(f.id)
     .run();
-  const notify = await regionNotifications(f.region);
+  const notify = await nodeNotifications(f.node);
   const refused = await actor(f.id).admitWake(f.id, "reader");
   if (!refused.ok || !("wake" in refused)) throw new Error("no wake ticket");
   await expect
@@ -301,17 +292,18 @@ it("a refused claim marks the ticket refused, notifies the region and the next a
     });
 });
 
-it("an awake admissible snapshot answers a v4 target", async () => {
+it("an awake admissible snapshot answers the node and its target", async () => {
   const f = await admissionSnapshotFixture();
   expect(await publishDatabaseAdmission(env, f.id)).toBe(true);
   const prepare = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
   expect(await actor(f.id).admitWake(f.id, "app")).toEqual({
     ok: true,
     region: route(f.region),
+    node: f.node,
     target: {
-      revision: f.proof.generation,
-      pod_uid: f.proof.pod_uid,
-      route_revision: f.proof.route_revision,
+      revision: f.generation,
+      route_revision: f.epoch.route_revision,
+      instance: f.runtime.instance,
     },
   });
   expect(prepare).not.toHaveBeenCalled();
