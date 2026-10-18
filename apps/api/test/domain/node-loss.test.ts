@@ -56,13 +56,15 @@ function actions(
     states?: ("stopped" | "other")[];
   } = {},
 ) {
-  const calls: string[] = [];
+  const calls: string[] = [],
+    tunnelMade: boolean[] = [];
   let tunnels = 0,
     powers = 0,
     polls = 0;
   const impl: FenceActions = {
     async deleteTunnel(target) {
       calls.push(`tunnel:${target.nodeId}`);
+      tunnelMade.push(target.tunnelMade);
       script.tunnel?.(++tunnels);
     },
     async powerOff(target) {
@@ -75,7 +77,7 @@ function actions(
       return states[Math.min(polls++, states.length - 1)]!;
     },
   };
-  return { impl, calls };
+  return { impl, calls, tunnelMade };
 }
 
 it("declares a node lost: the fence and a superseded order for each database, nothing else changed", async () => {
@@ -273,6 +275,25 @@ it("fences in the order the plan sets: Tunnel, power off, then a stopped instanc
   });
   await runNodeFencing(env, later + 60_000, run.impl);
   expect(run.calls).toHaveLength(4);
+});
+
+it("tells the fence that a node that never read its credentials made no Tunnel", async () => {
+  const f = await lost();
+  await f.declare();
+  const run = actions();
+  await runNodeFencing(env, Date.now(), run.impl);
+  expect(run.tunnelMade).toEqual([false]);
+});
+
+it("tells the fence that a node with a gateway made its Tunnel", async () => {
+  const f = await lost();
+  await env.DB.prepare("UPDATE nodes SET gateway_url=? WHERE id=?")
+    .bind("https://pgcf-node.example.test", f.node)
+    .run();
+  await f.declare();
+  const run = actions();
+  await runNodeFencing(env, Date.now(), run.impl);
+  expect(run.tunnelMade).toEqual([true]);
 });
 
 it("does not touch the instance before the Tunnel is gone, and retries each step on its own", async () => {

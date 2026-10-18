@@ -14,6 +14,7 @@ const target: FenceTarget = {
   regionId: "eu-dev",
   providerInstanceId: "12345",
   accountId: ACCOUNT,
+  tunnelMade: true,
 };
 const TUNNEL = "11111111-2222-4333-8444-555555555555";
 
@@ -97,6 +98,20 @@ it("does not count a node without any Tunnel as fenced: it fails closed", async 
       .catch((e) => e);
     expect(error).toBeInstanceOf(Error);
     expect(error.message).toBe("tunnel_unknown");
+    expect(api.calls.every((c) => c.method === "GET")).toBe(true);
+  }
+});
+
+it("has no Tunnel to delete for a node that never read its credentials", async () => {
+  // The Tunnel is made, under the name the node ID gives it, when the node first reads its
+  // credentials. A node that never did (one of the retired Kubernetes runtime, or one lost before
+  // it enrolled) has none under any name, so nothing is alive to fence and the step is done.
+  for (const listed of [[], [{ id: TUNNEL, name: "another" }]]) {
+    const api = cloudflare(() => ok(listed));
+    await fenceActions({
+      cloudflare: { token: TOKEN, fetcher: api.fetcher },
+      contabo: null,
+    }).deleteTunnel({ ...target, tunnelMade: false });
     expect(api.calls.every((c) => c.method === "GET")).toBe(true);
   }
 });

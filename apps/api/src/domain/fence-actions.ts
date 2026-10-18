@@ -13,8 +13,9 @@ import type { FenceActions } from "./node-loss.ts";
  *
  * The Tunnel is found by name, because nothing else ties it to the node: the credentials of each
  * node make its Tunnel under `nodeTunnelName`, the node's addition hostname. A node that has no
- * Tunnel under that name is not fenced: its Tunnel may be alive under another name, so the step
- * fails (`tunnel_unknown`) instead of counting the Tunnel as gone.
+ * Tunnel under that name is not fenced if it made one: its Tunnel may be alive under another name,
+ * so the step fails (`tunnel_unknown`) instead of counting the Tunnel as gone. A node that never
+ * read its credentials made none, and has none to delete.
  */
 
 export interface FenceServices {
@@ -59,7 +60,7 @@ export function fenceActions(services: FenceServices): FenceActions {
         await call("DELETE", `${base}/${tunnel.id}/connections`);
         await call("DELETE", `${base}/${tunnel.id}`);
       }
-      if (found === 0) throw new Error("tunnel_unknown");
+      if (found === 0 && target.tunnelMade) throw new Error("tunnel_unknown");
     },
     async powerOff(target) {
       const current = await instance(target.providerInstanceId);
