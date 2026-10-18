@@ -493,7 +493,11 @@ impl Machine for Node {
             .arg("check")
             .stdin(Stdio::null())
             .output()
-            .await?;
+            .await;
+        // The check tags the volumes it finds mounted when the pool takes no writes, in a storage
+        // of its own: what this one listed before may be out of date, however the check ended.
+        self.storage.changed_elsewhere();
+        let output = output?;
         if output.status.success() {
             Ok(())
         } else {

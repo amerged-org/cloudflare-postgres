@@ -322,6 +322,12 @@ impl<R: CommandRunner> Storage<R> {
         Some((suspect, minor))
     }
 
+    /// Call when a process other than this one may have changed a volume or a tag: the health
+    /// check, which runs with a storage of its own.
+    pub fn changed_elsewhere(&self) {
+        self.listing.changed();
+    }
+
     /// Whether the database's volume of this generation exists on the node. A yes can come from
     /// the recent list; a no, and any doubt, is read from lvm2.
     pub fn exists(&self, id: &VolumeId) -> Result<bool, Error> {
@@ -888,6 +894,20 @@ mod tests {
         // A command that only reads leaves the list.
         assert!(storage.exists(&id).unwrap());
         assert_eq!(storage.runner.ran("lvs"), read + 1);
+    }
+
+    /// The health check runs in a process of its own, with a storage of its own, and tags the
+    /// volumes it finds mounted when the pool takes no writes.
+    #[test]
+    fn a_change_made_by_another_process_drops_the_list() {
+        let storage = clean_storage();
+        let id = listed_volume();
+        assert!(storage.exists(&id).unwrap());
+        assert!(storage.exists(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 1);
+        storage.changed_elsewhere();
+        assert!(storage.exists(&id).unwrap());
+        assert_eq!(storage.runner.ran("lvs"), 2);
     }
 
     #[test]

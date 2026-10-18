@@ -2,7 +2,8 @@
 //! The volume list lvm2 reported last, kept so that a wake can ask its two questions of a volume
 //! (does it exist, must it be repaired) without running `lvs`, which reads every volume. The list
 //! answers only while it is young and while no lvm2 command that may change a volume or a tag has
-//! ended since it was read; whatever else is asked is read from lvm2 again.
+//! ended since it was read, in this process or in the health check's; whatever else is asked is
+//! read from lvm2 again.
 use super::lvm::LogicalVolume;
 use std::{
     sync::{Arc, Mutex, PoisonError},
