@@ -223,6 +223,10 @@ pub struct Core<M: Machine> {
     meter: Meter,
     /// Something in `reports` changed.
     pub(crate) changed: Notify,
+    /// The maintenance orders whose databases all sleep with their proofs: the packages and the
+    /// check follow, which the service does, since it reaches the files.
+    slept: Mutex<Vec<String>>,
+    pub(crate) slept_signal: Notify,
 }
 
 impl<M: Machine> Core<M> {
@@ -275,12 +279,18 @@ impl<M: Machine> Core<M> {
             reports: Mutex::new(report::Reports::default()),
             meter: Meter::load(layout.agent().join("usage.json")),
             changed: Notify::new(),
+            slept: Mutex::new(Vec::new()),
+            slept_signal: Notify::new(),
         });
         (core, early, resumed)
     }
 
     pub(crate) fn layout(&self) -> &Layout {
         self.machine.layout()
+    }
+    /// The maintenance orders waiting for their packages and their check.
+    pub fn take_slept(&self) -> Vec<String> {
+        std::mem::take(&mut *self.slept.lock().unwrap_or_else(PoisonError::into_inner))
     }
     pub(crate) fn policy(&self) -> Policy {
         self.policy

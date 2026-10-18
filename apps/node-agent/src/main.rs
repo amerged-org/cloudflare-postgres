@@ -38,7 +38,7 @@ mod linux {
             paths: Paths::new(layout.state.clone()),
             image_version,
             agent_version: env!("CARGO_PKG_VERSION").into(),
-            release_id: release::release_id(&layout.state.join("bin/current")),
+            release_id: release::release_id(&layout.bin().join("current")),
             timing: LinkTiming::default(),
         };
         Link::start(config, Transport::production()?).await
@@ -96,7 +96,12 @@ mod linux {
             () = &mut stop => return Ok(()),
         };
         emit_event(json!({"event": "agent_started"}));
-        stop.await;
+        tokio::select! {
+            () = &mut stop => {}
+            // A release that changes this binary was installed (plan 9.3): exit, and systemd
+            // starts the agent from the new link.
+            () = service.restart_requested() => emit_event(json!({"event": "agent_restarting"})),
+        }
         // The databases run on: they are units of their own.
         service.stop();
         Ok(())

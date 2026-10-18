@@ -30,6 +30,7 @@ pub mod storage;
 mod testpg;
 pub mod timing;
 pub mod units;
+pub mod update;
 pub mod usage;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 

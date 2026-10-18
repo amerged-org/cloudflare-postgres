@@ -19,15 +19,22 @@ use crate::{
     machine::{CpuTimes, Machine},
     sample::{Inputs, busy_millicores, node_sample},
     storage::VolumeId,
+    update,
 };
 use pgcf_native_protocol::wake::WakeRequest;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinSet,
+};
 
 /// How often each loop runs. The defaults are the plan's (4.3, 4.9); tests shorten them.
 #[derive(Clone, Debug)]
@@ -85,6 +92,12 @@ pub struct Service<M: Machine> {
     credentials_revision: Mutex<Option<u64>>,
     cpu: Mutex<Option<CpuTimes>>,
     tasks: Mutex<JoinSet<()>>,
+    /// The release of the newest page (plan 9.3).
+    release: Mutex<Option<update::Release>>,
+    /// A release is being installed.
+    updating: AtomicBool,
+    /// The release that was installed runs another agent: the agent restarts to run it.
+    restart: Notify,
 }
 
 /// The identifiers of the archive credentials an entry of the page needs: its own, and the one
@@ -171,6 +184,9 @@ impl<M: Machine> Service<M> {
             credentials_revision: Mutex::new(None),
             cpu: Mutex::new(None),
             tasks: Mutex::new(JoinSet::new()),
+            release: Mutex::new(None),
+            updating: AtomicBool::new(false),
+            restart: Notify::new(),
         });
 
         // The two sockets of the agent: the archive socket for the databases' units, and the
@@ -206,6 +222,8 @@ impl<M: Machine> Service<M> {
 
         let s = service.clone();
         service.spawn(async move { s.follow(&mut events).await });
+        let s = service.clone();
+        service.spawn(async move { s.maintenance().await });
         let s = service.clone();
         service.spawn(async move { s.serve_wakes(wakes).await });
         let s = service.clone();
@@ -353,13 +371,14 @@ impl<M: Machine> Service<M> {
         }
     }
 
-    async fn pull_page(&self, page: Page) {
+    async fn pull_page(self: &Arc<Self>, page: Page) {
         self.deliver_credentials(&page).await;
         self.apply_credentials(&page).await;
         self.core.apply(&page).await;
+        self.consider_update(&page.release);
     }
 
-    async fn pull(&self, ids: Option<&[String]>) {
+    async fn pull(self: &Arc<Self>, ids: Option<&[String]>) {
         match self.link.desired_page(ids).await {
             Ok(page) => self.pull_page(page).await,
             Err(error) => crate::timing::emit_event(json!({
@@ -370,7 +389,7 @@ impl<M: Machine> Service<M> {
 
     /// What Cloudflare asks: a pull of the page, or the fence (after which the page holds the
     /// fence order and the link ends).
-    async fn follow(&self, events: &mut LinkEvents) {
+    async fn follow(self: &Arc<Self>, events: &mut LinkEvents) {
         while let Some(event) = events.next().await {
             match event {
                 LinkEvent::Desired(ids) => self.pull(ids.as_deref()).await,
@@ -380,13 +399,159 @@ impl<M: Machine> Service<M> {
     }
 
     /// The whole page again at an interval: a message the link lost is made up for.
-    async fn full_pulls(&self) {
+    async fn full_pulls(self: &Arc<Self>) {
         let mut tick = tokio::time::interval(self.intervals.full_pull);
         tick.tick().await;
         loop {
             tick.tick().await;
             self.pull(None).await;
         }
+    }
+
+    // ---- updates (plan 9.3)
+
+    /// The release of the page: if the node does not run it, it is installed, in the background.
+    fn consider_update(self: &Arc<Self>, page_release: &Value) {
+        let Some(release) = update::Release::parse(page_release) else {
+            return;
+        };
+        *self.release.lock().unwrap_or_else(PoisonError::into_inner) = Some(release.clone());
+        let bin = self.machine.layout().bin();
+        if update::current_release(&bin).as_deref() == Some(release.id.as_str())
+            || self.updating.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let service = self.clone();
+        self.spawn(async move {
+            service.install(&release, &bin).await;
+            service.updating.store(false, Ordering::Release);
+        });
+    }
+
+    /// Installs the release's binaries, and restarts what runs one that changed: the gateway
+    /// (its sessions reconnect) and then the agent, which exits and is started by systemd from the
+    /// new link. The databases keep running: they are units of their own.
+    async fn install(&self, release: &update::Release, bin: &std::path::Path) {
+        let link = self.link.clone();
+        let switched = update::install_binaries(bin, release, |pinned, path| {
+            let link = link.clone();
+            async move {
+                link.fetch(&pinned.url, pinned.size_bytes, &pinned.sha256, &path)
+                    .await
+            }
+        })
+        .await;
+        let switched = match switched {
+            Ok(switched) => switched,
+            Err(error) => {
+                crate::timing::emit_event(json!({
+                    "event": "release_not_installed", "release": release.id,
+                    "class": crate::diagnostics::error_code(&error),
+                }));
+                return;
+            }
+        };
+        crate::timing::emit_event(json!({"event": "release_installed", "release": release.id}));
+        if switched.gateway
+            && let Err(error) = self.machine.restart_service("pgcf-gateway.service").await
+        {
+            crate::timing::emit_event(json!({
+                "event": "gateway_not_restarted", "class": crate::diagnostics::error_code(&error.into()),
+            }));
+        }
+        if switched.agent {
+            self.restart.notify_one();
+        }
+    }
+
+    /// Completes when the agent has to restart to run the release it installed. The caller stops
+    /// the service and exits; systemd starts the new binary.
+    pub async fn restart_requested(&self) {
+        self.restart.notified().await;
+    }
+
+    /// The maintenance orders whose databases sleep: their packages, their reboot and their check.
+    async fn maintenance(&self) {
+        loop {
+            self.core.slept_signal.notified().await;
+            for operation in self.core.take_slept() {
+                match self.cycle().await {
+                    // The node reboots: the page lists the order until it is answered, and the
+                    // agent that starts after the boot finds the packages in place.
+                    Ok(true) => {}
+                    Ok(false) => match self.machine.health_check().await {
+                        Ok(()) => self.core.report_order(&operation, Ok(())),
+                        Err(_) => self.core.report_order(&operation, Err("check_failed")),
+                    },
+                    Err(reason) => self.core.report_order(&operation, Err(reason)),
+                }
+            }
+        }
+    }
+
+    /// Brings the packages to the lock of the release (plan 9.3): what the node lacks or has in
+    /// another version is installed, and `true` is returned if the node reboots for it.
+    async fn cycle(&self) -> Result<bool, &'static str> {
+        let release = self
+            .release
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or("release_missing")?;
+        let work = self.machine.layout().agent().join("packages");
+        let outcome = self.install_packages(&release, &work).await;
+        let _ = std::fs::remove_dir_all(&work);
+        outcome
+    }
+    async fn install_packages(
+        &self,
+        release: &update::Release,
+        work: &std::path::Path,
+    ) -> Result<bool, &'static str> {
+        let _ = std::fs::remove_dir_all(work);
+        crate::link::file::create_private_directory(work).map_err(|_| "packages_not_installed")?;
+        let lock = work.join("packages.lock.json");
+        let pinned = &release.package_lock;
+        self.link
+            .fetch(&pinned.url, pinned.size_bytes, &pinned.sha256, &lock)
+            .await
+            .map_err(|_| "lock_not_read")?;
+        let lock = std::fs::read(&lock)
+            .ok()
+            .and_then(|bytes| update::Lock::parse(&bytes))
+            .ok_or("lock_not_read")?;
+        let installed = self
+            .machine
+            .installed_packages()
+            .await
+            .map_err(|_| "packages_not_read")?;
+        let plan = update::plan(&lock, &installed);
+        if plan.versions.is_empty() && plan.files.is_empty() {
+            return Ok(false);
+        }
+        let mut files = Vec::new();
+        for package in &plan.files {
+            let path = work.join(format!("{}.deb", package.name));
+            self.link
+                .fetch(
+                    &package.pinned.url,
+                    package.pinned.size_bytes,
+                    &package.pinned.sha256,
+                    &path,
+                )
+                .await
+                .map_err(|_| "package_not_read")?;
+            files.push(path);
+        }
+        self.machine
+            .install_packages(&release.debian_snapshot, &plan.versions, &files)
+            .await
+            .map_err(|_| "packages_not_installed")?;
+        if plan.reboot {
+            self.machine.reboot().await.map_err(|_| "reboot_failed")?;
+        }
+        Ok(plan.reboot)
     }
 
     // ---- the gateway brings the wakes
@@ -854,6 +1019,307 @@ mod tests {
                 ToGateway::Database { database } if database.database == id && database.mode != Mode::Running
             ) || matches!(message, ToGateway::Removed { database } if database == &id)),
             "{received:?}"
+        );
+        service.stop();
+    }
+
+    // ---- updates (plan 9.3)
+
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        crate::update::hex(&Sha256::digest(bytes))
+    }
+    /// The files the node runs, in `bin/<id>/`, and the `current` link to them.
+    fn runs(machine: &crate::machine::local::Local, id: &str, files: &[(&str, &[u8])]) {
+        let bin = machine.layout().state.join("bin");
+        std::fs::create_dir_all(bin.join(id)).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(bin.join(id).join(name), bytes).unwrap();
+        }
+        let _ = std::fs::remove_file(bin.join("current"));
+        std::os::unix::fs::symlink(bin.join(id), bin.join("current")).unwrap();
+    }
+    /// The release `id` as the page names it: its binaries served by the double, and the package
+    /// lock, which is `lock` (served too).
+    fn release_of(cloud: &Cloud, id: &str, files: &[(&str, &[u8])], lock: &[u8]) -> Value {
+        let pin = |name: &str, bytes: &[u8]| {
+            let url = cloud.serve_file(&format!("/files/{id}/{name}"), bytes.to_vec());
+            json!({"url": url, "sha256": digest(bytes), "size_bytes": bytes.len()})
+        };
+        let binaries: serde_json::Map<String, Value> = files
+            .iter()
+            .map(|(name, bytes)| (name.to_string(), pin(name, bytes)))
+            .collect();
+        json!({
+            "id": id, "binaries": binaries,
+            "os": {"image_version": "25", "debian_snapshot": "20261016T000000Z",
+                   "package_lock": pin("packages.lock.json", lock)}
+        })
+    }
+    const NAMES: [&str; 4] = [
+        "pgcf-agent",
+        "pgcf-native-gateway",
+        "pgcf-archive",
+        "pgcf-wal-fetch",
+    ];
+    fn same(bytes: &'static [u8]) -> Vec<(&'static str, &'static [u8])> {
+        NAMES.iter().map(|name| (*name, bytes)).collect()
+    }
+    /// The agent on `machine`, linked as the node that keeps its identity under `base`.
+    async fn serve(
+        machine: &Arc<crate::machine::local::Local>,
+        cloud: &Cloud,
+        base: &std::path::Path,
+    ) -> Arc<Service<crate::machine::local::Local>> {
+        cloud.seed(base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                timing: LinkTiming {
+                    interval: Duration::from_millis(300),
+                    ..LinkTiming::default()
+                },
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: timing(),
+                gateway: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_release_is_downloaded_checked_and_switched_to_and_what_runs_it_restarts() {
+        let Some((machine, _fixture, _root)) =
+            site("update", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        runs(&machine, "r0", &same(b"old"));
+        let cloud = Cloud::start().await;
+        // r1 changes the agent and the gateway, and not the archive clients.
+        let mut files = same(b"old");
+        files[0].1 = b"new agent";
+        files[1].1 = b"new gateway";
+        let release = release_of(&cloud, "r1", &files, b"{}");
+        cloud.with(|inner| inner.release = Some(release));
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+
+        let bin = machine.layout().state.join("bin");
+        eventually(30, "the link to move to r1", || {
+            crate::update::current_release(&bin).as_deref() == Some("r1")
+        })
+        .await;
+        for (name, bytes) in &files {
+            assert_eq!(
+                &std::fs::read(bin.join("current").join(name)).unwrap(),
+                bytes
+            );
+        }
+        // The gateway restarts, the agent asks for its own restart, and the old release stays.
+        eventually(10, "the gateway to restart", || {
+            machine
+                .calls()
+                .contains(&"restart pgcf-gateway.service".to_string())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), service.restart_requested())
+            .await
+            .expect("the agent asks to be restarted");
+        assert!(bin.join("r0").exists());
+        assert!(
+            machine
+                .calls()
+                .iter()
+                .all(|call| !call.contains("cloudflared")),
+            "{:?}",
+            machine.calls()
+        );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintenance_order_installs_what_the_lock_pins_checks_the_node_and_reports() {
+        let Some((machine, _fixture, _root)) =
+            site("maintenance", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[
+            ("bash", "5.2"),
+            ("postgresql-18", "18.6-1"),
+            ("cloudflared", "2026.10.0"),
+        ]);
+        let cloud = Cloud::start().await;
+        let deb = b"cloudflared 2026.10.1".to_vec();
+        let url = cloud.serve_file("/files/cloudflared.deb", deb.clone());
+        let lock = json!({
+            "packages": [
+                {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+                {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": "https://snapshot.example/pg.deb", "size": 10, "sha256": "b".repeat(64)},
+            ],
+            "extra": [
+                {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
+            ],
+        })
+        .to_string();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        let operation = "op_mmmmmmmmmmmmmmmmmmmm";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+
+        eventually(60, "the order to be reported", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| order["operation"] == operation && order["status"] == "done")
+        })
+        .await;
+        // The pinned versions are installed from the release's snapshot, the extra package as the
+        // file it downloaded, and the node is checked afterwards. No reboot: no kernel changed.
+        let calls = machine.calls();
+        let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
+        assert!(
+            calls.contains(
+                &"install 20261016T000000Z postgresql-18=18.7-1 + cloudflared.deb".to_string()
+            ),
+            "{calls:?}"
+        );
+        assert!(
+            at("install").unwrap() < at("health_check").unwrap(),
+            "{calls:?}"
+        );
+        assert!(at("reboot").is_none(), "{calls:?}");
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lock_that_is_not_the_pinned_one_installs_nothing_and_fails_the_order() {
+        let Some((machine, _fixture, _root)) = site("maintenance-lock", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[("bash", "5.1")]);
+        let cloud = Cloud::start().await;
+        let lock = json!({"packages": [
+            {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+        ], "extra": []})
+        .to_string();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        // What the URL serves is not what the page pinned.
+        let url = release["os"]["package_lock"]["url"].as_str().unwrap();
+        cloud.serve_file(
+            url.strip_prefix(&cloud.url("")).unwrap(),
+            lock.replace("5.2", "9.9"),
+        );
+        let operation = "op_llllllllllllllllllll";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to be answered", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| {
+                    order["operation"] == operation
+                        && order["status"] == "failed"
+                        && order["reason"] == "lock_not_read"
+                })
+        })
+        .await;
+        assert!(
+            machine
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("install"))
+        );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kernel_takes_a_reboot_and_the_order_is_answered_after_it() {
+        let Some((machine, _fixture, _root)) = site("maintenance-kernel", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[("bash", "5.2")]);
+        let cloud = Cloud::start().await;
+        let lock = json!({
+            "packages": [
+                {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+                {"name": "linux-image-6.12.99-amd64", "version": "6.12.99-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+            ],
+            "extra": [],
+        })
+        .to_string();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        let operation = "op_kkkkkkkkkkkkkkkkkkkk";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        // How the order was answered, once it was.
+        let answer = || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .find(|order| order["operation"] == operation)
+                .map(|order| order["status"].clone())
+        };
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the node to reboot", || {
+            machine.calls().contains(&"reboot".to_string())
+        })
+        .await;
+        // The node is going down: nothing is checked, and the order is not answered.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!machine.calls().contains(&"health_check".to_string()));
+        assert_eq!(answer(), None);
+        service.stop();
+
+        // After the boot the page still lists the order. The packages are the lock's now, so
+        // nothing is installed and the node does not reboot again; it is checked and answers.
+        machine.clear_calls();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to be answered", || answer().is_some()).await;
+        assert_eq!(answer(), Some(json!("done")));
+        let calls = machine.calls();
+        assert!(calls.contains(&"health_check".to_string()), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.starts_with("install") && call != "reboot"),
+            "{calls:?}"
         );
         service.stop();
     }

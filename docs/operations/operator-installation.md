@@ -26,6 +26,21 @@ closed.
 Route tokens are versioned. The Edge signs a token that the gateway verifies before it dials
 PostgreSQL.
 
+Adding a node installs it from the region's release (plan 9.2) and gives it its own Tunnel:
+
+- The region has a release assigned (`PUT /v1/regions/{id}/release`). Its image is what the pull
+  installer writes; AddNode waits until there is one.
+- `NODE_API_ORIGIN` is this Worker's `https` origin, which the installed node enrolls at, and
+  `NODE_DNS_SERVERS` a JSON array of one to three resolvers the node is installed with.
+- `CLOUDFLARE_API_TOKEN` (a private secret with edit access to Tunnels and to the zone's DNS
+  records) makes the node's Tunnel when the node first reads its credentials. Its gateway and its
+  shell get the hostnames `<node>.<domain>` and `<node>-ssh.<domain>` under `NODE_GATEWAY_DOMAIN`,
+  a domain of the zone `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's
+  R2 endpoint. Without the token, the domain or the zone a node gets no credentials and stays
+  closed to placement.
+- `CONTABO_ORDER_SSH_KEY_IDS` also names the keys the provider's rescue action wants beside the
+  installer; the installer itself uses none.
+
 ## Edge Worker
 
 The deployed Edge Worker is the TypeScript `apps/edge`; the management API and DatabaseActor stay

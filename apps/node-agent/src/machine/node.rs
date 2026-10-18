@@ -15,6 +15,7 @@ use crate::{
     },
 };
 use std::{
+    collections::BTreeMap,
     io,
     num::NonZeroU32,
     os::unix::fs::{DirBuilderExt, PermissionsExt, chown},
@@ -23,6 +24,8 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
+/// The image's apt sources for the Debian snapshot (`mkosi.postinst.chroot`).
+const APT_SOURCES: &str = "/etc/apt/sources.list.d/trixie.sources";
 /// The group of the gateway, which reads the database's socket directory (plan 5.5).
 const GATEWAY_GROUP: &str = "pgcf-gateway";
 /// The locale of every database (plan Appendix C): the image has it.
@@ -412,6 +415,96 @@ impl Machine for Node {
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
         Ok(())
+    }
+
+    async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
+        self.units.start_service(unit, true).await
+    }
+
+    async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
+        let output = tokio::process::Command::new("dpkg-query")
+            .args(["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(io::Error::other("dpkg-query failed"));
+        }
+        Ok(crate::update::installed_packages(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    async fn install_packages(
+        &self,
+        snapshot: &str,
+        versions: &[String],
+        files: &[std::path::PathBuf],
+    ) -> io::Result<()> {
+        // The node's apt sources name the snapshot of the image; the release names another.
+        let sources = Path::new(APT_SOURCES);
+        let rewritten = crate::update::apt_sources(&std::fs::read_to_string(sources)?, snapshot)
+            .ok_or_else(|| io::Error::other("the apt sources name no snapshot"))?;
+        crate::link::file::write_private(sources, rewritten.as_bytes())?;
+        std::fs::set_permissions(sources, std::fs::Permissions::from_mode(0o644))?;
+        let apt = |arguments: Vec<String>| async move {
+            let output = tokio::process::Command::new("apt-get")
+                .args(&arguments)
+                .env("LC_ALL", "C")
+                .env("DEBIAN_FRONTEND", "noninteractive")
+                .stdin(Stdio::null())
+                .output()
+                .await?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "apt-get {} ended with {}: {}",
+                    arguments.first().map_or("", String::as_str),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )))
+            }
+        };
+        apt(vec!["update".into()]).await?;
+        // The conffiles of the image (nftables) are kept as they are; versions are exact, so a
+        // package may also go down; recommendations are not installed.
+        let mut install: Vec<String> = [
+            "install",
+            "--yes",
+            "--no-install-recommends",
+            "--allow-downgrades",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+        ]
+        .map(String::from)
+        .into();
+        install.extend(versions.iter().cloned());
+        install.extend(files.iter().map(|file| file.to_string_lossy().into_owned()));
+        apt(install).await
+    }
+
+    async fn reboot(&self) -> io::Result<()> {
+        run("systemctl", &["reboot"]).await
+    }
+
+    async fn health_check(&self) -> io::Result<()> {
+        // The binary of the release that is installed, not this process: a check of the new build.
+        let output = tokio::process::Command::new(self.layout.bin().join("current/pgcf-agent"))
+            .arg("check")
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "pgcf-agent check ended with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
     }
 
     fn memory(&self) -> Option<Memory> {

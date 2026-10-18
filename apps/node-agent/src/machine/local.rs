@@ -65,6 +65,8 @@ struct State {
     direct_archive: bool,
     /// The credentials applied: region, node, revision, restart.
     credentials: Vec<(String, String, u64, bool)>,
+    /// The Debian packages of the node, as dpkg would list them.
+    packages: BTreeMap<String, String>,
 }
 
 pub struct Local {
@@ -115,6 +117,13 @@ impl Local {
     }
     pub fn clear_calls(&self) {
         self.state().calls.clear();
+    }
+    /// The Debian packages the node has.
+    pub fn set_packages(&self, packages: &[(&str, &str)]) {
+        self.state().packages = packages
+            .iter()
+            .map(|(name, version)| (name.to_string(), version.to_string()))
+            .collect();
     }
     /// Whether `database` has a postmaster running.
     pub fn running(&self, database: &str) -> bool {
@@ -692,6 +701,56 @@ impl Machine for Local {
             restart,
         ));
         Ok(())
+    }
+
+    async fn restart_service(&self, unit: &str) -> Result<(), units::Error> {
+        self.state().calls.push(format!("restart {unit}"));
+        Ok(())
+    }
+
+    async fn installed_packages(&self) -> io::Result<BTreeMap<String, String>> {
+        Ok(self.state().packages.clone())
+    }
+
+    /// Apt's effect on the package list: the versions named are installed. A package file is only
+    /// recorded.
+    async fn install_packages(
+        &self,
+        snapshot: &str,
+        versions: &[String],
+        files: &[std::path::PathBuf],
+    ) -> io::Result<()> {
+        let mut state = self.state();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|file| file.file_name()?.to_str().map(String::from))
+            .collect();
+        let mut call = format!("install {snapshot} {}", versions.join(" "));
+        if !names.is_empty() {
+            call += &format!(" + {}", names.join(" "));
+        }
+        state.calls.push(call);
+        for spec in versions {
+            if let Some((name, version)) = spec.split_once('=') {
+                state.packages.insert(name.into(), version.into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn reboot(&self) -> io::Result<()> {
+        self.state().calls.push("reboot".into());
+        Ok(())
+    }
+
+    /// The scratch database, made or woken, answers: the same check the node runs.
+    async fn health_check(&self) -> io::Result<()> {
+        self.state().calls.push("health_check".into());
+        let account = self.ensure_account(crate::agent::check::SCRATCH).await?;
+        crate::agent::check::run(self, &account)
+            .await
+            .map(|_| ())
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     fn memory(&self) -> Option<Memory> {

@@ -10,7 +10,7 @@ use crate::{
     storage::{self, Inventory, NoRoom, PoolSample, Removal, VolumeId},
     units::{self, Started, UnitState, limits::Limits},
 };
-use std::{future::Future, io, num::NonZeroU32};
+use std::{collections::BTreeMap, future::Future, io, num::NonZeroU32, path::PathBuf};
 
 /// What a boot loses, restored when the agent starts and before any page comes (plan 5.6 job 4,
 /// the image's `README.md`): the CPU quota of every stopped unit is lifted, because a quota can
@@ -217,6 +217,27 @@ pub trait Machine: Send + Sync + 'static {
         credentials: &serde_json::Value,
         restart: bool,
     ) -> impl Future<Output = io::Result<()>> + Send;
+
+    // ---- updates (plan 9.3)
+    /// Restarts one of the image's own services and waits for the job.
+    fn restart_service(&self, unit: &str) -> impl Future<Output = Result<(), units::Error>> + Send;
+    /// The installed Debian packages and their versions.
+    fn installed_packages(
+        &self,
+    ) -> impl Future<Output = io::Result<BTreeMap<String, String>>> + Send;
+    /// Installs exactly these package versions from the Debian snapshot `snapshot`, and these
+    /// package files, with apt and without asking anything.
+    fn install_packages(
+        &self,
+        snapshot: &str,
+        versions: &[String],
+        files: &[PathBuf],
+    ) -> impl Future<Output = io::Result<()>> + Send;
+    /// Reboots the node. The databases are asleep with their proofs when this is called.
+    fn reboot(&self) -> impl Future<Output = io::Result<()>> + Send;
+    /// The health check (`pgcf-agent check`, plan 5.6 job 10) of the release that is installed:
+    /// ok only when the scratch database answered.
+    fn health_check(&self) -> impl Future<Output = io::Result<()>> + Send;
 
     // ---- the kernel's facts
     /// `MemTotal` and `MemAvailable` now.

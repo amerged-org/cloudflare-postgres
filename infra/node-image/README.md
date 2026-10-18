@@ -193,9 +193,20 @@ restart never stops a database, because the databases are independent units.
   `PGCF_ROUTE_KEY`, mode 0600) and the encrypted `/var/lib/pgcf/credentials/tunnel-token.cred`,
   then starts `pgcf-gateway` and `pgcf-cloudflared`. It deletes the enrollment seed
   `/var/lib/pgcf/enrollment/seed.json` afterwards.
-- In the maintenance cycle (plan 9.3) it installs pinned versions with
-  `-o Dpkg::Options::=--force-confold`: the image changes the `nftables` conffile. The image's apt
-  sources name its own snapshot and the PGDG archive; a release names a newer snapshot.
+- A release the page names (plan 9.3) changes the binaries without a reboot: the agent downloads
+  the four into `/var/lib/pgcf/bin/<release>/`, checks their size and sha256, and only then moves
+  `current`. It restarts `pgcf-gateway` if the gateway's binary changed (the gateway is not drained
+  first yet) and exits if its own changed, so that `Restart=always` starts the new one; the
+  databases keep running. The previous release's directory stays, older ones go.
+- In the maintenance cycle (plan 9.3) it reads the release's package lock (the `packages.lock.json`
+  of the image the release is built from), installs what differs from `dpkg` with
+  `apt-get install --no-install-recommends --allow-downgrades -o Dpkg::Options::=--force-confold
+  name=version…`, and cloudflared's `.deb` as a file whose sha256 it checked: the image changes the
+  `nftables` conffile. The image's apt sources name its own snapshot and the PGDG archive; the
+  agent writes the release's snapshot into the `URIs:` of `/etc/apt/sources.list.d/trixie.sources`.
+  The node reboots if a kernel image, `libc6`, `systemd`, `libsystemd0` or `udev` changed. After
+  the packages, or after the boot, it runs `pgcf-agent check` of the installed release and answers
+  the order.
 
 ## Security
 

@@ -117,6 +117,10 @@ pub struct Inner {
     pub samples: Vec<Value>,
     /// The archive path a credential identifier is for, where it is not the example's.
     pub credential_paths: std::collections::HashMap<String, String>,
+    /// Files served to anyone at `/files/...`, as a release's binaries are by their URLs.
+    pub files: std::collections::HashMap<String, Vec<u8>>,
+    /// The release the pages name, where it is not the example's.
+    pub release: Option<Value>,
 }
 pub struct Cloud {
     pub origin: String,
@@ -179,6 +183,8 @@ impl Cloud {
             hellos: vec![],
             samples: vec![],
             credential_paths: Default::default(),
+            files: Default::default(),
+            release: None,
         }));
         let (commands, _) = broadcast::channel(16);
         let task = tokio::spawn({
@@ -227,6 +233,15 @@ impl Cloud {
                 .to_string(),
         )
         .unwrap();
+    }
+    /// The URL of `path` on this double.
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.origin)
+    }
+    /// Serves `bytes` to anyone at `path` (`/files/...`); the URL names this double.
+    pub fn serve_file(&self, path: &str, bytes: impl Into<Vec<u8>>) -> String {
+        self.with(|inner| inner.files.insert(path.to_string(), bytes.into()));
+        self.url(path)
     }
     pub fn fail_next(&self, failures: impl IntoIterator<Item = Failure>) {
         self.with(|inner| inner.failures.extend(failures));
@@ -392,9 +407,15 @@ fn error(code: &str) -> Value {
 struct Answer {
     status: u16,
     body: Value,
+    /// The bytes of a file, instead of the JSON body.
+    raw: Option<Vec<u8>>,
 }
 fn answer(status: u16, body: Value) -> Answer {
-    Answer { status, body }
+    Answer {
+        status,
+        body,
+        raw: None,
+    }
 }
 
 fn identity() -> Value {
@@ -438,7 +459,7 @@ fn desired(inner: &Inner, query: &[(String, String)]) -> Value {
     let release = if inner.fenced {
         Value::Null
     } else {
-        example["release"].clone()
+        inner.release.clone().unwrap_or(example["release"].clone())
     };
     json!({"node":node,"release":release,"policy":example["policy"],"credentials_revision":3,"orders":inner.orders,"databases":rows,"next":next})
 }
@@ -486,17 +507,18 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
 }
 
 async fn respond<S: AsyncWriteExt + Unpin>(stream: &mut S, answer: &Answer) {
-    let body = answer.body.to_string();
-    let _ = stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                answer.status,
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await;
+    let (body, kind) = match &answer.raw {
+        Some(bytes) => (bytes.clone(), "application/octet-stream"),
+        None => (answer.body.to_string().into_bytes(), "application/json"),
+    };
+    let mut message = format!(
+        "HTTP/1.1 {} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        answer.status,
+        body.len()
+    )
+    .into_bytes();
+    message.extend_from_slice(&body);
+    let _ = stream.write_all(&message).await;
     let _ = stream.shutdown().await;
 }
 
@@ -512,12 +534,13 @@ async fn serve(
     };
     let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
     let enrolling = request.target == constant("NODE_API_PATHS")["enroll"].as_str().unwrap();
+    let public = request.method == "GET" && request.target.starts_with("/files/");
     let upgrade = request
         .header("upgrade")
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     let (answer, failure) = {
         let mut inner = inner.lock().unwrap();
-        let signed = if enrolling {
+        let signed = if enrolling || public {
             None
         } else {
             Some(match &inner.public_key {
@@ -538,6 +561,15 @@ async fn serve(
         };
         let answer = if enrolling {
             enroll(&mut inner, &body)
+        } else if public {
+            match inner.files.get(&request.target) {
+                Some(bytes) => Answer {
+                    status: 200,
+                    body: Value::Null,
+                    raw: Some(bytes.clone()),
+                },
+                None => answer(404, error("not_found")),
+            }
         } else if matches!(signed, Some(Err(_))) {
             answer(401, error("unauthorized"))
         } else if upgrade && inner.fenced {

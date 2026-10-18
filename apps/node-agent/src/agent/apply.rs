@@ -693,7 +693,9 @@ impl<M: Machine> Core<M> {
     }
 
     /// `maintenance` (plan 9.3): new wakes are held, and every database that runs sleeps with the
-    /// proof. Installing the release's packages and the reboot are the maintenance cycle's.
+    /// proof. A database that does not sleep fails the order. Otherwise the cycle goes on with the
+    /// release's packages, the reboot and the check, which the service takes over (`take_slept`),
+    /// and the order is answered when they are done.
     async fn obey_maintenance(self: &Arc<Self>, operation: &str) {
         self.maintenance.store(true, Ordering::Relaxed);
         let mut failed = None;
@@ -704,7 +706,16 @@ impl<M: Machine> Core<M> {
                 failed = Some(refusal.observation());
             }
         }
-        self.report_order(operation, failed.map_or(Ok(()), Err));
+        match failed {
+            Some(reason) => self.report_order(operation, Err(reason)),
+            None => {
+                self.slept
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(operation.to_string());
+                self.slept_signal.notify_one();
+            }
+        }
     }
 }
 
@@ -1263,10 +1274,16 @@ mod tests {
         rig.core
             .apply(&Rig::page(vec![db.clone()], vec![maintenance]))
             .await;
+        // The databases sleep with their proofs; the packages and the check are the service's, and
+        // the order is answered when they are done.
+        let mut slept = Vec::new();
         eventually(60, "the maintenance order", || {
-            rig.core.pending_order("op_tttttttttttttttttttt").is_some()
+            slept.extend(rig.core.take_slept());
+            !slept.is_empty()
         })
         .await;
+        assert_eq!(slept, ["op_tttttttttttttttttttt"]);
+        assert!(rig.core.pending_order("op_tttttttttttttttttttt").is_none());
         assert_eq!(handle.phase(), Phase::Asleep);
         let mut ticket = Rig::ticket(&entry);
         ticket.generation = entry.generation + 1;

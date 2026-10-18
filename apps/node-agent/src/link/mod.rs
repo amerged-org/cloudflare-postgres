@@ -280,6 +280,22 @@ impl Link {
         self.inner.outbox.flush().await
     }
 
+    /// Brings a file a release pins to `destination` if it has exactly the pinned size and digest
+    /// (plan 9.3); a file that does not is removed.
+    pub async fn fetch(
+        &self,
+        url: &str,
+        size: u64,
+        sha256: &str,
+        destination: &std::path::Path,
+    ) -> Result<(), Error> {
+        self.inner
+            .api
+            .transport()
+            .fetch(url, size, sha256, destination)
+            .await
+    }
+
     async fn post(&self, name: &str, schema: &str, report: &Value) -> Result<(), Error> {
         if !contract_valid(schema, report) {
             return Err(format!("native {name} report invalid").into());

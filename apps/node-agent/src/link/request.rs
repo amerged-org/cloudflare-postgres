@@ -12,6 +12,7 @@ use rustls::RootCertStore;
 use serde_json::Value;
 use std::{
     net::{IpAddr, Ipv4Addr},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -23,6 +24,10 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// less than 1 MB. A page the contract accepts is never refused for its size.
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// A pinned file (a binary, a package) may take its time on a node's connection.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Package archives answer a request with a redirect to the file; no more hops than that.
+const DOWNLOAD_REDIRECTS: usize = 5;
 
 /// Cloudflare refused the node's key with 403 `node_fenced`: the node was declared lost (plan
 /// 9.4). Its key signs only the desired page and the observations.
@@ -44,6 +49,8 @@ pub struct Transport {
     /// otherwise reach a dual-stack Cloudflare address over IPv6, be refused for good, and never
     /// enroll.
     pub(super) enrollment: Client,
+    /// The client of the files a release pins: HTTPS only, with a few redirects and no credential.
+    download: Client,
     pub(super) tls: Arc<rustls::ClientConfig>,
 }
 impl Transport {
@@ -68,6 +75,14 @@ impl Transport {
         Ok(Self {
             client: client(None)?,
             enrollment: client(Some(Ipv4Addr::UNSPECIFIED.into()))?,
+            download: Client::builder()
+                .use_preconfigured_tls(config())
+                .https_only(true)
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::limited(DOWNLOAD_REDIRECTS))
+                .timeout(DOWNLOAD_TIMEOUT)
+                .build()?,
             tls: Arc::new(config()),
         })
     }
@@ -76,6 +91,69 @@ impl Transport {
         Self::new(RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         })
+    }
+
+    /// Brings the file at `url` to `destination` (mode 0600) if, and only if, it has exactly
+    /// `size` bytes and the digest `sha256`. The size bounds the download, so a server cannot
+    /// fill the disk, and a file that fails any check is removed.
+    pub async fn fetch(
+        &self,
+        url: &str,
+        size: u64,
+        sha256: &str,
+        destination: &Path,
+    ) -> Result<(), Error> {
+        let result = self.download_to(url, size, sha256, destination).await;
+        if result.is_err() {
+            let _ = std::fs::remove_file(destination);
+        }
+        result
+    }
+    async fn download_to(
+        &self,
+        url: &str,
+        size: u64,
+        sha256: &str,
+        destination: &Path,
+    ) -> Result<(), Error> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+        let mut response = self.download.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err("download refused".into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length != size)
+        {
+            return Err("download has another size than its pin".into());
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(destination)
+            .await?;
+        let (mut digest, mut seen) = (Sha256::new(), 0u64);
+        while let Some(chunk) = response.chunk().await? {
+            seen += chunk.len() as u64;
+            if seen > size {
+                return Err("download is larger than its pin".into());
+            }
+            digest.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.sync_all().await?;
+        let digest: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if seen != size || digest != sha256 {
+            return Err("download does not match its pin".into());
+        }
+        Ok(())
     }
 }
 
@@ -220,6 +298,43 @@ pub(super) mod tests {
             cloud.requests().last().unwrap().signed,
             Some(Err("signature"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_file_is_kept_only_when_it_has_the_pinned_size_and_digest() {
+        use sha2::{Digest, Sha256};
+        let cloud = Cloud::start().await;
+        let url = cloud.serve_file("/files/a", b"hello world".to_vec());
+        let digest: String = Sha256::digest(b"hello world")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let transport = Transport::new(cloud.roots()).unwrap();
+        let directory = tempdir();
+        let fetch = |url: &str, size: u64, digest: &str, name: &str| {
+            let (transport, path) = (transport.clone(), directory.join(name));
+            let (url, digest) = (url.to_string(), digest.to_string());
+            async move { transport.fetch(&url, size, &digest, &path).await }
+        };
+        fetch(&url, 11, &digest, "good").await.unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("good")).unwrap(),
+            b"hello world"
+        );
+        // Another digest, a smaller or a larger size than the pin, a file that is not there and a
+        // URL that is not HTTPS: refused, and nothing is left behind.
+        let other = "0".repeat(64);
+        let refused = [
+            fetch(&url, 11, &other, "digest").await,
+            fetch(&url, 10, &digest, "smaller").await,
+            fetch(&url, 12, &digest, "larger").await,
+            fetch(&cloud.url("/files/missing"), 11, &digest, "missing").await,
+            fetch(&url.replace("https:", "http:"), 11, &digest, "plain").await,
+        ];
+        assert!(refused.iter().all(Result::is_err), "{refused:?}");
+        for name in ["digest", "smaller", "larger", "missing", "plain"] {
+            assert!(!directory.join(name).exists(), "{name}");
+        }
     }
 
     #[tokio::test]

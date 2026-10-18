@@ -58,6 +58,11 @@ impl Layout {
     pub fn agent(&self) -> PathBuf {
         self.state.join("agent")
     }
+    /// The binaries of the releases: `<bin>/<release>/`, and `<bin>/current` linking to the one
+    /// that runs (plan 9.3).
+    pub fn bin(&self) -> PathBuf {
+        self.state.join("bin")
+    }
     /// One database's files: its state, its upload log.
     pub fn database_files(&self, database: &str) -> PathBuf {
         self.agent().join("databases").join(database)
