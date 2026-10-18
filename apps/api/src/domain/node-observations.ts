@@ -726,10 +726,11 @@ async function takeObservation(
   // page wins and the node applies the entry it names.
   if (observation.storage_generation !== row.storage_generation)
     return "conflict";
+  // A database D1 knew awake at this generation, ready or found unproven after a crash, that the
+  // node reports asleep: the node slept it on its own. One never ready has no observed generation.
   if (
     observation.state === "asleep" &&
     row.desired_state === "running" &&
-    row.observed_state === "ready" &&
     row.observed_power === "awake" &&
     row.observed_generation === row.generation
   )
