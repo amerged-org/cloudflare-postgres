@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Allowlist: a node enables exactly these units. Everything else a package would enable stays off,
+# notably the default PostgreSQL cluster service, apt's automatic updates, the weekly fstrim of
+# every mount (the agent trims database volumes itself) and e2scrub, which snapshots every ext4
+# logical volume.
+enable pgcf-agent.service
+enable pgcf-gateway.service
+enable pgcf-cloudflared.service
+enable ssh.service
+# Host keys are created on the first boot; the image carries none.
+enable sshd-keygen.service
+enable nftables.service
+enable systemd-networkd.service
+enable systemd-networkd-wait-online.service
+enable systemd-timesyncd.service
+enable getty@.service
+enable lvm2-monitor.service
+enable dm-event.socket
+enable lvm2-lvmpolld.socket
+enable blk-availability.service
+enable remote-fs.target
+disable *

@@ -249,7 +249,7 @@ test("every Linux build job validates the shared toolchain before dependencies a
   );
   const jobs = workflow
     .slice(workflow.indexOf("\njobs:\n") + "\njobs:\n".length)
-    .split(/^ {2}(?=[a-z_]+:\s*$)/m)
+    .split(/^ {2}(?=[a-z_-]+:\s*$)/m)
     .filter((job) => job.includes("runs-on: ubuntu-24.04"));
   assert.ok(jobs.length > 0);
   for (const job of jobs) {

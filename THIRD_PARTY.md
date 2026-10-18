@@ -78,6 +78,30 @@ SDK/wasm-bindgen host glue retains upstream licensing; the admission and decoy
 state machines are first-party Rust. No maintained TypeScript Edge wrapper is
 included in that artifact.
 
+## Node image
+
+The node image ([infra/node-image](infra/node-image/README.md)) redistributes unmodified Debian 13
+and PGDG binary packages. [packages.lock.json](infra/node-image/packages.lock.json) records every
+one with its exact version, download URL, size and sha256, and the image keeps each package's
+`/usr/share/doc/<package>/copyright`. Corresponding sources are on snapshot.debian.org at the locked
+snapshot and on apt-archive.postgresql.org.
+
+| Component | License | Role |
+| --- | --- | --- |
+| [Debian 13 "trixie"](https://www.debian.org/) packages, Linux 6.12 | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
+| [systemd 257](https://github.com/systemd/systemd) | LGPL-2.1-or-later | Units, sandboxing, cgroups, credentials, first-boot partitioning |
+| [GRUB 2](https://www.gnu.org/software/grub/) | GPL-3.0-or-later | BIOS and UEFI boot loader |
+| [PostgreSQL 18.6](https://www.postgresql.org/) (PGDG `18.6-1.pgdg13+2`) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
+| [pgvector 0.8.7](https://github.com/pgvector/pgvector) (PGDG `0.8.7-1.pgdg13+1`) | PostgreSQL License | Extension |
+| [barman-cli-cloud 3.20.1](https://github.com/EnterpriseDB/barman) (PGDG `3.20.1-1.pgdg13+1`) | GPL-3.0 | WAL archive, base backup and restore to R2; run as a separate program, not linked |
+| [lvm2](https://sourceware.org/lvm2/), [thin-provisioning-tools](https://github.com/jthornber/thin-provisioning-tools) | GPL-2.0, LGPL-2.1 / GPL-3.0 | Thin pool and volumes, run as separate programs |
+| [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE) | The node's Tunnel; release `.deb` pinned by sha256 `9721287c28f78cb623e77c7b95a63feea87e909054d75666a0ec9eff20e5d548` |
+| [mkosi v27.1](https://github.com/systemd/mkosi) (commit `ecf7f5702bb2052b7a69cab3fe7d37bc3b9ad77b`) | LGPL-2.1-or-later | Build tool only; not in the image |
+
+The PGDG archive signing key in [infra/node-image/keys/pgdg.asc](infra/node-image/keys/pgdg.asc)
+(fingerprint `B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8`) is the public key published by the
+PostgreSQL project.
+
 ## Application dependencies
 
 Direct npm dependencies at the versions resolved in [pnpm-lock.yaml](pnpm-lock.yaml). Licenses are

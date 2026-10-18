@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# The node's outbound Tunnel. The agent stores the Tunnel token as an encrypted credential after
+# enrollment and then starts this unit; before that the condition keeps it inactive.
+[Unit]
+Description=PGCF Cloudflare Tunnel
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/pgcf/credentials/tunnel-token.cred
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+User=pgcf-cloudflared
+Group=pgcf-cloudflared
+LoadCredentialEncrypted=tunnel-token:/var/lib/pgcf/credentials/tunnel-token.cred
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol quic --metrics 127.0.0.1:20241 run --token-file %d/tunnel-token
+Restart=always
+RestartSec=5s
+TimeoutStartSec=60
+UMask=0077
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

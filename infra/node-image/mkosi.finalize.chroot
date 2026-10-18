@@ -1,0 +1,24 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Last look at the finished tree: the image is identical on every node, so it must hold no
+# secret and no per-node identity.
+set -euo pipefail
+
+fail() { echo "node image check failed: $*" >&2; exit 1; }
+
+# Package maintainer scripts write generated keys under /etc and /var; /usr holds only files
+# shipped verbatim by packages (botocore's API examples contain placeholder key headers).
+keys=$(grep -rIlsE -- '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----' /etc /root /var /boot /efi /opt /srv /home || true)
+[ -z "$keys" ] || fail "private key material in: $keys"
+compgen -G '/etc/ssh/ssh_host_*' >/dev/null && fail "ssh host keys present"
+[ ! -e /var/lib/systemd/credential.secret ] || fail "systemd credential host key present"
+[ ! -e /var/lib/systemd/random-seed ] || fail "random seed present"
+if [ -s /etc/machine-id ] && ! grep -qx uninitialized /etc/machine-id; then
+	fail "machine-id is set"
+fi
+root_password=$(awk -F: '$1 == "root" { print $2 }' /etc/shadow)
+case $root_password in
+'*' | '!'*) ;;
+*) fail "root has a usable password field" ;;
+esac
+[ ! -d /var/lib/postgresql/18/main ] || fail "the package created a default cluster"

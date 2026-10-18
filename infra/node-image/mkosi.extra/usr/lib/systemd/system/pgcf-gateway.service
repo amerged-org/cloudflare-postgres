@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+# The gateway in local mode: listens on loopback for cloudflared, takes its table of writers from
+# the agent's socket (/run/pgcf/agent/gateway.sock) and dials each database's Unix socket. The
+# agent writes the node's region and route key to the environment file after enrollment and then
+# starts this unit; before that the condition keeps it inactive.
+[Unit]
+Description=PGCF gateway
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+After=network.target pgcf-agent.service
+ConditionPathExists=/var/lib/pgcf/credentials/gateway.env
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=pgcf-gateway
+Group=pgcf-gateway
+Environment=PGCF_GATEWAY_MODE=local
+EnvironmentFile=/var/lib/pgcf/credentials/gateway.env
+ExecStart=/var/lib/pgcf/bin/current/pgcf-native-gateway
+Restart=always
+RestartSec=1s
+OOMScoreAdjust=-900
+MemoryLow=128M
+LimitNOFILE=65536
+UMask=0077
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

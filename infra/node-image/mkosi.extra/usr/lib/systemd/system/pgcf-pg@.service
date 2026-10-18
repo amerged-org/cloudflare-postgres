@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+# One PostgreSQL per database; the instance is the database ID. The agent is the only starter:
+# nothing enables this unit, and systemd never restarts it on its own (every start goes through
+# the agent's admission). The agent sets the per-database limits (MemoryMax, MemoryHigh, CPUWeight,
+# IO limits, TasksMax) as persistent unit properties, never by reloading; CPUQuota only after
+# ready, cleared again at stop (the empty assignment CPUQuota=). It creates the socket directory
+# /run/pgcf/<id> (owner pgcf-<id>, group pgcf-gateway, mode 0750) when it creates the database and
+# at its own start, and removes it with the database; no ExecStartPre= does, which would add a
+# process to every start.
+[Unit]
+Description=PGCF database %i
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+# A start on an unmounted volume must fail, not silently skip.
+AssertPathIsMountPoint=/var/lib/pgcf/db/%i
+# Stop before the volume is unmounted at shutdown, without tying the database's life to the mount.
+After=var-lib-pgcf-db-%i.mount
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=pgcf-%i
+Group=pgcf-%i
+Slice=pgcf.slice
+# postgres itself, never pg_ctl: the postmaster sends READY=1 when it accepts connections.
+ExecStart=/usr/lib/postgresql/18/bin/postgres -D /var/lib/pgcf/db/%i/data -c listen_addresses= -c unix_socket_directories=/run/pgcf/%i
+# READY=1 comes only after crash recovery or a restore's replay, which can outlast any fixed
+# timeout (Stage 1 replayed for 97 s); the agent owns the start deadline.
+TimeoutStartSec=infinity
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=no
+OOMPolicy=continue
+OOMScoreAdjust=-900
+Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+Environment=PG_OOM_ADJUST_VALUE=0
+UMask=0077
+
+# Smallest class until the agent applies the database's own size.
+MemoryMax=256M
+MemoryHigh=230M
+MemorySwapMax=0
+TasksMax=64
+CPUWeight=100
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+# The socket directory must exist: a start without it fails instead of running unreachable.
+ReadWritePaths=/var/lib/pgcf/db/%i /run/pgcf/%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+TemporaryFileSystem=/dev/shm:size=64M,mode=1777
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=yes

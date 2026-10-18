@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# The node agent: the only local actor (LVM, mounts, users, systemd, backups, the Cloudflare link).
+# It runs as root in the host mount namespace on purpose: volumes it mounts must be visible to the
+# database units, so no filesystem sandboxing option may be added here. Database units are
+# independent units, so an agent restart never stops a database.
+[Unit]
+Description=PGCF node agent
+Documentation=https://github.com/amerged-org/cloudflare-postgres/blob/main/infra/node-image/README.md
+Wants=dbus.service
+After=local-fs.target dbus.service systemd-repart.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/var/lib/pgcf/bin/current/pgcf-agent run
+Restart=always
+RestartSec=1s
+KillMode=control-group
+# The gateway's channel (gateway.sock) and the databases' archive socket (archive.sock).
+RuntimeDirectory=pgcf/agent
+RuntimeDirectoryMode=0755
+OOMScoreAdjust=-900
+MemoryLow=128M
+
+[Install]
+WantedBy=multi-user.target
