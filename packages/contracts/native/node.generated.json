@@ -1553,10 +1553,7 @@
                       "identity_mismatch",
                       "control_version",
                       "volume_missing",
-                      "uuid_mismatch",
                       "volume_suspended",
-                      "volume_open",
-                      "holder_busy",
                       "mount_failed",
                       "start_timeout",
                       "release_failed"

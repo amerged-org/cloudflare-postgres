@@ -832,7 +832,7 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
           roles: { removed: ["report"], blocked: [] },
         }),
         orders: [
-          { operation: op("s"), status: "failed", reason: "volume_open" },
+          { operation: op("s"), status: "failed", reason: "volume_missing" },
         ],
       },
       true,
@@ -930,7 +930,9 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       "done-order-with-reason",
       {
         ...observations(),
-        orders: [{ operation: op("s"), status: "done", reason: "volume_open" }],
+        orders: [
+          { operation: op("s"), status: "done", reason: "volume_missing" },
+        ],
       },
       false,
       true,

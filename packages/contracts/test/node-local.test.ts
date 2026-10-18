@@ -127,7 +127,7 @@ describe("the agent's gateway channel", () => {
     expect(WAKE_REASONS).toContain("no_room");
   });
 
-  it("names the reasons of the node runtime, those of every hold the contract defines, and none of the Kubernetes mode", () => {
+  it("names the reasons of the node runtime and of every hold the contract defines, and none the node never names", () => {
     // Orders hold or refuse wakes (move, maintenance, fence, superseded, suspended), recovery
     // holds an unproven database, and the mount and pg_control steps have their own failures.
     for (const reason of [
@@ -146,16 +146,17 @@ describe("the agent's gateway channel", () => {
       "identity_mismatch",
       "control_version",
       "volume_missing",
-      "uuid_mismatch",
       "volume_suspended",
-      "volume_open",
-      "holder_busy",
       "mount_failed",
       "start_timeout",
       "release_failed",
     ])
       expect(WAKE_REASONS).toContain(reason);
+    // The agent has no holder file for mounts and compares no volume UUID, so it never names these.
     for (const reason of [
+      "uuid_mismatch",
+      "volume_open",
+      "holder_busy",
       "no_desired_row",
       "not_sleeping",
       "thick_storage",

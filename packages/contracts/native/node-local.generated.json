@@ -31,10 +31,7 @@
       "identity_mismatch",
       "control_version",
       "volume_missing",
-      "uuid_mismatch",
       "volume_suspended",
-      "volume_open",
-      "holder_busy",
       "mount_failed",
       "start_timeout",
       "release_failed"
@@ -379,10 +376,7 @@
     { "reason": "identity_mismatch" },
     { "reason": "control_version" },
     { "reason": "volume_missing" },
-    { "reason": "uuid_mismatch" },
     { "reason": "volume_suspended" },
-    { "reason": "volume_open" },
-    { "reason": "holder_busy" },
     { "reason": "mount_failed" },
     { "reason": "start_timeout" },
     { "reason": "release_failed" }

@@ -7312,7 +7312,7 @@
           {
             "operation": "op_ssssssssssssssssssss",
             "status": "failed",
-            "reason": "volume_open"
+            "reason": "volume_missing"
           }
         ]
       }
@@ -7765,7 +7765,7 @@
           {
             "operation": "op_ssssssssssssssssssss",
             "status": "done",
-            "reason": "volume_open"
+            "reason": "volume_missing"
           }
         ]
       }

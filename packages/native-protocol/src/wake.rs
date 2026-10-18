@@ -31,7 +31,7 @@ pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
 /// Every reason the node agent's wake result may name (`WAKE_REASONS` of
 /// `packages/contracts/src/node-local.ts`).
-pub const REASONS: [&str; 22] = [
+pub const REASONS: [&str; 19] = [
     "no_room",
     "no_headroom",
     "deleted",
@@ -47,10 +47,7 @@ pub const REASONS: [&str; 22] = [
     "identity_mismatch",
     "control_version",
     "volume_missing",
-    "uuid_mismatch",
     "volume_suspended",
-    "volume_open",
-    "holder_busy",
     "mount_failed",
     "start_timeout",
     "release_failed",

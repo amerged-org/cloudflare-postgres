@@ -63,8 +63,7 @@ export type WakeOutcome = (typeof WAKE_OUTCOMES)[number];
  * pending or running, plan 7.10); `storage_full` (the volume cannot start). Then the checks of
  * the wake itself: `desired_stale` (the ticket names another generation than the agent's),
  * `wake_in_progress`, `identity_mismatch` and `control_version` (`pg_control` against the
- * proven-sleep record), the single-writer holder rule and the mount (`volume_missing`,
- * `uuid_mismatch`, `volume_suspended`, `volume_open`, `holder_busy`, `mount_failed`, plan 7.11),
+ * proven-sleep record), the mount (`volume_missing`, `volume_suspended`, `mount_failed`),
  * `start_timeout` and `release_failed`.
  */
 export const WAKE_REASONS = [
@@ -83,10 +82,7 @@ export const WAKE_REASONS = [
   "identity_mismatch",
   "control_version",
   "volume_missing",
-  "uuid_mismatch",
   "volume_suspended",
-  "volume_open",
-  "holder_busy",
   "mount_failed",
   "start_timeout",
   "release_failed",
