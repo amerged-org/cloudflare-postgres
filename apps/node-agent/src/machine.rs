@@ -401,6 +401,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_boot_starts_the_highest_kernel_version_not_the_last_name() {
+        use crate::machine::local::Local;
+        let Some(machine) = Local::new("os-kernel-order") else {
+            return;
+        };
+        // 6.12.99 sorts after 6.12.113 as text, and 6.9 after 6.12: GRUB orders by version.
+        for (images, newest) in [
+            (
+                ["6.12.99-amd64", "6.12.113+deb13-amd64"],
+                "6.12.113+deb13-amd64",
+            ),
+            (["6.9.12-amd64", "6.12.1-amd64"], "6.12.1-amd64"),
+        ] {
+            let packages: Vec<(String, &str)> = images
+                .iter()
+                .map(|abi| (format!("linux-image-{abi}"), "1"))
+                .collect();
+            let packages: Vec<(&str, &str)> = packages
+                .iter()
+                .map(|(name, v)| (name.as_str(), *v))
+                .collect();
+            machine.set_packages(&packages);
+            machine.reboot().await.unwrap();
+            assert_eq!(machine.boot().unwrap().kernel_release, newest);
+        }
+    }
+
     #[test]
     fn the_gateways_environment_names_its_region_its_node_and_the_nodes_keyring() {
         let keyring =

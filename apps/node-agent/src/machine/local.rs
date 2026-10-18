@@ -54,6 +54,8 @@ struct State {
     volume_error: Option<storage::Error>,
     /// `start` fails once.
     start_fails: bool,
+    /// `reboot` fails once, and the node keeps running.
+    reboot_fails: bool,
     /// How long the next start takes before the postmaster begins.
     start_delay: Option<Duration>,
     /// LVM, or systemd, cannot be read: what they hold is not known.
@@ -68,7 +70,7 @@ struct State {
     /// The Debian packages of the node, as dpkg would list them.
     packages: BTreeMap<String, String>,
     /// How often the node booted since the test began, and the kernel it runs: a boot starts the
-    /// newest kernel image that is installed.
+    /// installed kernel image of the highest version.
     boots: u64,
     kernel_release: String,
 }
@@ -197,6 +199,9 @@ impl Local {
     }
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
+    }
+    pub fn fail_next_reboot(&self) {
+        self.state().reboot_fails = true;
     }
     pub fn set_volumes_unreadable(&self, unreadable: bool) {
         self.state().volumes_unreadable = unreadable;
@@ -718,7 +723,8 @@ impl Machine for Local {
     }
 
     /// Apt's effect on the package list: the versions named are installed. A package file is only
-    /// recorded.
+    /// recorded: the lock of a release lists the package of each file among its packages too, so
+    /// the versions already name it.
     async fn install_packages(
         &self,
         snapshot: &str,
@@ -746,12 +752,25 @@ impl Machine for Local {
     async fn reboot(&self) -> io::Result<()> {
         let mut state = self.state();
         state.calls.push("reboot".into());
+        if std::mem::take(&mut state.reboot_fails) {
+            return Err(io::Error::other(
+                "systemctl reboot ended with exit status: 1",
+            ));
+        }
         state.boots += 1;
-        let newest = state.packages.keys().rev().find_map(|name| {
-            let abi = name.strip_prefix("linux-image-")?;
-            abi.starts_with(|c: char| c.is_ascii_digit())
-                .then(|| abi.to_string())
-        });
+        // GRUB boots the highest version, which is not the last name: 6.12.99 is below 6.12.113.
+        let numbers = |abi: &str| -> Vec<u64> {
+            abi.split(|c: char| !c.is_ascii_digit())
+                .filter_map(|number| number.parse().ok())
+                .collect()
+        };
+        let newest = state
+            .packages
+            .keys()
+            .filter_map(|name| name.strip_prefix("linux-image-"))
+            .filter(|abi| abi.starts_with(|c: char| c.is_ascii_digit()))
+            .max_by_key(|abi| numbers(abi))
+            .map(String::from);
         if let Some(abi) = newest {
             state.kernel_release = abi;
         }

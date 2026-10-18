@@ -476,25 +476,29 @@ impl<M: Machine> Service<M> {
         loop {
             self.core.slept_signal.notified().await;
             for operation in self.core.take_slept() {
-                match self.cycle().await {
+                let outcome = self.cycle().await;
+                // A cycle that failed may have installed part of the set or all of it before the
+                // reboot failed: only the boot of a node that reboots says what it holds.
+                if !matches!(outcome, Ok(true)) {
+                    self.report_os().await;
+                }
+                match outcome {
                     // The node reboots: the page lists the order until it is answered, and the
                     // agent that starts after the boot finds the packages in place.
                     Ok(true) => {}
-                    Ok(false) => {
-                        self.report_os().await;
-                        match self.machine.health_check().await {
-                            Ok(()) => self.core.report_order(&operation, Ok(())),
-                            Err(_) => self.core.report_order(&operation, Err("check_failed")),
-                        }
-                    }
+                    Ok(false) => match self.machine.health_check().await {
+                        Ok(()) => self.core.report_order(&operation, Ok(())),
+                        Err(_) => self.core.report_order(&operation, Err("check_failed")),
+                    },
                     Err(reason) => self.core.report_order(&operation, Err(reason)),
                 }
             }
         }
     }
 
-    /// The packages may have changed without a reboot: the next hello of the link names the
-    /// digest of what is installed now (SEC-03). After a reboot the agent starts again and says it.
+    /// The packages may have changed without a reboot, in a cycle that ended or failed: the next
+    /// hello of the link names the digest of what is installed now (SEC-03). After a reboot the
+    /// agent starts again and says it.
     async fn report_os(&self) {
         let reported = match crate::machine::os_report(&*self.machine).await {
             Ok(os) => self.link.set_os(&os),
@@ -1193,6 +1197,7 @@ mod tests {
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
                 {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": "https://snapshot.example/pg.deb", "size": 10, "sha256": "b".repeat(64)},
+                {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
             ],
             "extra": [
                 {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
@@ -1217,12 +1222,14 @@ mod tests {
         })
         .await;
         // The pinned versions are installed from the release's snapshot, the extra package as the
-        // file it downloaded, and the node is checked afterwards. No reboot: no kernel changed.
+        // file it downloaded (a real lock lists it among its packages too), and the node is checked
+        // afterwards. No reboot: no kernel changed.
         let calls = machine.calls();
         let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
         assert!(
             calls.contains(
-                &"install 20261016T000000Z postgresql-18=18.7-1 + cloudflared.deb".to_string()
+                &"install 20261016T000000Z postgresql-18=18.7-1 cloudflared=2026.10.1 + cloudflared.deb"
+                    .to_string()
             ),
             "{calls:?}"
         );
@@ -1233,7 +1240,9 @@ mod tests {
         assert!(at("reboot").is_none(), "{calls:?}");
         // The packages changed and the node did not boot again: the hello says the digest of what
         // is installed now, on the link that was up or on a new one, and no hello says another boot.
-        let after = crate::update::packages_digest(&machine.installed_packages().await.unwrap());
+        let installed = machine.installed_packages().await.unwrap();
+        assert_eq!(installed["cloudflared"], "2026.10.1");
+        let after = crate::update::packages_digest(&installed);
         assert_ne!(after, before);
         eventually(30, "the new packages to be said", || {
             cloud.with(|inner| {
@@ -1377,6 +1386,63 @@ mod tests {
                 .all(|call| !call.starts_with("install") && call != "reboot"),
             "{calls:?}"
         );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cycle_whose_reboot_fails_still_says_the_packages_it_installed() {
+        let Some((machine, _fixture, _root)) = site("maintenance-reboot-fails", &|root| {
+            root.join("r/agent/archive.sock")
+        }) else {
+            return;
+        };
+        runs(&machine, "r1", &same(b"bin"));
+        machine.set_packages(&[
+            ("bash", "5.2"),
+            ("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
+        ]);
+        let before = crate::machine::os_report(&*machine).await.unwrap();
+        machine.fail_next_reboot();
+        let cloud = Cloud::start().await;
+        let lock = json!({
+            "packages": [
+                {"name": "bash", "version": "5.3", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
+                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+            ],
+            "extra": [],
+        })
+        .to_string();
+        let release = release_of(&cloud, "r1", &same(b"bin"), lock.as_bytes());
+        let operation = "op_ffffffffffffffffffff";
+        cloud.with(|inner| {
+            inner.release = Some(release);
+            inner.orders = vec![json!({"type": "maintenance", "operation": operation})];
+        });
+        let base = tempdir();
+        let service = serve(&machine, &cloud, &base).await;
+        eventually(60, "the order to fail", || {
+            cloud
+                .acknowledged("/node/v1/observations")
+                .iter()
+                .flat_map(|report| report["orders"].as_array().cloned().unwrap_or_default())
+                .any(|order| {
+                    order["operation"] == operation
+                        && order["status"] == "failed"
+                        && order["reason"] == "reboot_failed"
+                })
+        })
+        .await;
+        // The packages are installed and the node did not boot again. Of the two kernels only the
+        // running one counts, so the digest changed with bash alone, and the hello says it: a
+        // rollback to the release that was running must not find the old digest.
+        let after = crate::machine::os_report(&*machine).await.unwrap();
+        assert_ne!(after["packages_sha256"], before["packages_sha256"]);
+        assert_eq!(after["boot_id"], before["boot_id"]);
+        assert_eq!(after["kernel_release"], "6.12.111+deb13-amd64");
+        eventually(30, "the new packages to be said", || {
+            cloud.with(|inner| inner.hellos.iter().any(|hello| hello["os"] == after))
+        })
+        .await;
         service.stop();
     }
 

@@ -135,5 +135,6 @@ erDiagram
 - [apps/api/migrations/0069_node_vocabulary.sql:1](../../../apps/api/migrations/0069_node_vocabulary.sql#L1)
 - [apps/api/migrations/0070_drop_node_firewall_allocations.sql:1](../../../apps/api/migrations/0070_drop_node_firewall_allocations.sql#L1)
 - [apps/api/migrations/0071_node_install_blocker.sql:1](../../../apps/api/migrations/0071_node_install_blocker.sql#L1)
+- [apps/api/migrations/0072_node_os.sql:1](../../../apps/api/migrations/0072_node_os.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.
