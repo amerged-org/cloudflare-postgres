@@ -92,7 +92,7 @@ test("the kernel refuses io_uring and line-discipline autoload: a database's use
 test("the database directory is traversable but not listable: tmpfiles resets its mode at every boot", () => {
   const tmpfiles = records(readFileSync(new URL("usr/lib/tmpfiles.d/pgcf.conf", image), "utf8"));
   const directory = tmpfiles.find((fields) => fields[1] === "/var/lib/pgcf/db");
-  // The agent creates it 0711 (store.rs); a tenant must reach its own directory but not list the IDs.
+  // The agent creates it 0711 (store.rs); a tenant reaches its own directory but nobody lists this one.
   assert.deepEqual(directory?.slice(0, 5), ["d", "/var/lib/pgcf/db", "0711", "root", "root"]);
 });
 
@@ -109,7 +109,7 @@ test("systemd's ssh generator is masked and off on the kernel command line: no s
   for (const line of kernels) assert.ok(line.split(/\s+/).includes("systemd.ssh_auto=no"), line);
 });
 
-test("sshd takes user certificates only and the image ships no CA key: nothing logs in until the install writes one", () => {
+test("sshd takes user certificates only and the image ships no CA key: nothing logs in until a CA key is written", () => {
   const directives = records(readFileSync(new URL("etc/ssh/sshd_config.d/10-pgcf.conf", image), "utf8")).map(
     (fields) => [(fields[0] ?? "").toLowerCase(), fields.slice(1).join(" ")] as const,
   );
@@ -126,7 +126,10 @@ test("sshd takes user certificates only and the image ships no CA key: nothing l
   const ca = values("trustedusercakeys")[0];
   assert.ok(ca !== undefined && ca.startsWith("/"), "a CA file is named");
   assert.equal(existsSync(new URL(ca.slice(1), image)), false, "the public image carries no CA key");
-  assert.equal(readFileSync(new URL("etc/ssh/principals/root", image), "utf8"), "pgcf-break-glass\n");
+  // sshd skips '#' lines in a principals file, so the file carries the licence header of its neighbours.
+  const principals = readFileSync(new URL("etc/ssh/principals/root", image), "utf8");
+  assert.match(principals, /^# SPDX-License-Identifier: Apache-2\.0\n/);
+  assert.deepEqual(records(principals), [["pgcf-break-glass"]]);
   assert.deepEqual(values("authorizedprincipalsfile"), ["/etc/ssh/principals/%u"]);
   // A missing RevokedKeys file makes sshd refuse every public key, so the image ships an empty KRL:
   // the header of PROTOCOL.krl (magic, format 1, version, date, flags, reserved, comment), no section.
