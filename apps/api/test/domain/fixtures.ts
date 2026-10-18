@@ -7,6 +7,8 @@ import {
 import {
   ErrorBody,
   NodeDesiredPage,
+  RELEASE_FILES,
+  bytesToHex,
   hashApiKey,
   newApiKey,
   newApiKeyId,
@@ -15,21 +17,29 @@ import {
   nodePublicKey,
   nodeRequestClaims,
   randomString,
+  releaseObjectKey,
   signNodeRequest,
+  type FleetReleaseRegistration,
   type NodeKey,
+  type ReleaseFile,
 } from "@pgcf/contracts";
 import { expect } from "vitest";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
 import { reportStatements } from "./node-samples.ts";
 
+/** The origin the Worker under test names in the URLs of a release and in an installer's userData. */
+export const API_ORIGIN = "https://api.example.org";
 const fixtures: {
   projects: string[];
   regions: string[];
   keyIds: string[];
   size: string;
 }[] = [];
+const stagedObjects: string[] = [];
 export async function cleanupFixtures(): Promise<void> {
+  if (stagedObjects.length > 0)
+    await env.ARCHIVE.delete(stagedObjects.splice(0));
   for (const fixture of fixtures.splice(0)) {
     const [project, other] = fixture.projects;
     const [region, foreign] = fixture.regions;
@@ -116,7 +126,11 @@ export async function request(
       headers,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }),
-    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join(".") },
+    {
+      ...env,
+      DB_ENDPOINT_HOST: ["db", "invalid"].join("."),
+      NODE_API_ORIGIN: API_ORIGIN,
+    },
     context,
   );
   await waitOnExecutionContext(context);
@@ -333,7 +347,12 @@ export async function rawRequest(
   const context = own ?? createExecutionContext();
   const response = await createApp().fetch(
     new Request(new URL(path, `https://${["api", "invalid"].join(".")}`), init),
-    { ...env, DB_ENDPOINT_HOST: ["db", "invalid"].join("."), ...bindings },
+    {
+      ...env,
+      DB_ENDPOINT_HOST: ["db", "invalid"].join("."),
+      NODE_API_ORIGIN: API_ORIGIN,
+      ...bindings,
+    },
     context,
   );
   if (!own) await waitOnExecutionContext(context);
@@ -624,15 +643,72 @@ export const releaseSpec = (version = "1.2.0") => ({
     package_lock: pinned("packages.lock.json"),
   },
 });
-/** Approves a release and assigns it to the region. */
+/**
+ * What the operator's tool does for a version: the six files of a release go into the archive
+ * bucket under `node-images/<version>/`, each with the sha256 R2 verified at upload, and the
+ * digests and sizes are what is registered. `bodies` replaces the content of a file; `skip` leaves
+ * it out.
+ */
+export async function stageRelease(
+  version: string,
+  options: {
+    skip?: readonly ReleaseFile[];
+    bodies?: Partial<Record<ReleaseFile, Uint8Array>>;
+  } = {},
+): Promise<FleetReleaseRegistration> {
+  const text = new TextEncoder();
+  const digests = {} as Record<
+    ReleaseFile,
+    { sha256: string; size_bytes: number }
+  >;
+  for (const file of RELEASE_FILES) {
+    const body = options.bodies?.[file] ?? text.encode(`${version}/${file}`);
+    const sha256 = bytesToHex(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", body)),
+    );
+    digests[file] = { sha256, size_bytes: body.byteLength };
+    if (options.skip?.includes(file)) continue;
+    const key = releaseObjectKey(version, file);
+    await env.ARCHIVE.put(key, body, { sha256 });
+    stagedObjects.push(key);
+  }
+  return {
+    image: {
+      ...digests["pgcf-node.raw.zst"],
+      raw_sha256: bytesToHex(
+        new Uint8Array(
+          await crypto.subtle.digest("SHA-256", text.encode(`raw/${version}`)),
+        ),
+      ),
+      raw_bytes: 4096,
+    },
+    binaries: {
+      "pgcf-agent": digests["pgcf-agent"],
+      "pgcf-native-gateway": digests["pgcf-native-gateway"],
+      "pgcf-archive": digests["pgcf-archive"],
+      "pgcf-wal-fetch": digests["pgcf-wal-fetch"],
+    },
+    os: {
+      debian_snapshot: "20261015T000000Z",
+      package_lock: digests["packages.lock.json"],
+    },
+  };
+}
+/** Registers a release and assigns it to the region. */
 export async function assignRelease(
   f: Pick<Fixture, "region" | "admin">,
   id = `release-${randomString("abcdefghijklmnopqrstuvwxyz0123456789", 8)}`,
   expectedRevision = 0,
 ) {
   expect(
-    (await request(`/v1/fleet/releases/${id}`, f.admin, "PUT", releaseSpec()))
-      .status,
+    (
+      await request(
+        `/v1/fleet/releases/${id}`,
+        f.admin,
+        "PUT",
+        await stageRelease(id),
+      )
+    ).status,
   ).toBe(200);
   expect(
     (

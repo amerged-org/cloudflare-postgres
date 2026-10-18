@@ -386,7 +386,8 @@ describe("the release and the orders on a node's page", () => {
     const page = await pull(f);
     expect(page.release).toMatchObject({
       id,
-      os: { image_version: "1.2.0", debian_snapshot: "20261015T000000Z" },
+      // The release id is also the image version the node enrolled as.
+      os: { image_version: id, debian_snapshot: "20261015T000000Z" },
     });
     expect(Object.keys(page.release!.binaries)).toEqual([
       "pgcf-agent",

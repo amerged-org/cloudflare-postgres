@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { createExecutionContext } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   FleetNodeReleaseStatus,
   FleetRegionReleaseStatus,
+  FleetRelease,
+  releaseFileUrl,
+  releaseObjectKey,
 } from "@pgcf/contracts/releases";
+import { createApp } from "../../src/app.ts";
 import {
+  API_ORIGIN,
   cleanupFixtures,
   fixture,
   nodeSample,
-  releaseSpec,
+  refusal,
   request,
+  stageRelease,
 } from "./fixtures.ts";
 import { NODE_HEADER, NODE_UID_HEADER } from "../../src/node-actor.ts";
 import { heldLink } from "./node-fixtures.ts";
@@ -27,7 +34,7 @@ afterEach(async () => {
 async function setup() {
   const f = await fixture(),
     id = `release-${crypto.randomUUID()}`,
-    value = releaseSpec();
+    value = await stageRelease(id);
   releases.push(id);
   const approve = (body: unknown = value, key?: string) =>
     request(`/v1/fleet/releases/${id}`, f.admin, "PUT", body, key);
@@ -107,12 +114,16 @@ it("approves immutable releases with idempotent replay and rejects a changed one
   ).rejects.toThrow();
 });
 
-it("refuses a release of the old spec, an unknown field and an unpinned download", async () => {
+it("refuses a body that is not a registration: a full spec, a URL, an unknown field or an unpinned digest", async () => {
   const f = await setup();
   for (const body of [
-    { ...f.value, version: 1 },
+    { ...f.value, version: 2 },
     { ...f.value, roles: {} },
-    { ...f.value, route_token_version: 6 },
+    {
+      ...f.value,
+      image: { ...f.value.image, url: "https://elsewhere.example/i" },
+    },
+    { ...f.value, image: { ...f.value.image, format: "raw" } },
     {
       ...f.value,
       binaries: {
@@ -121,9 +132,130 @@ it("refuses a release of the old spec, an unknown field and an unpinned download
       },
     },
     { ...f.value, os: { ...f.value.os, debian_snapshot: "today" } },
+    { ...f.value, os: { ...f.value.os, image_version: "other" } },
     {},
   ])
     expect((await f.approve(body)).status).toBe(400);
+  // The version is the node's image version and its directory: a name, at most 64 characters.
+  const long = `release-${"a".repeat(60)}`;
+  expect(
+    (
+      await request(
+        `/v1/fleet/releases/${long}`,
+        f.admin,
+        "PUT",
+        await stageRelease(long),
+      )
+    ).status,
+  ).toBe(400);
+});
+
+it("names the URLs of the spec itself: every file of the release is served by this Worker", async () => {
+  const f = await setup();
+  const release = FleetRelease.parse(await (await f.approve()).json());
+  const url = (file: Parameters<typeof releaseFileUrl>[2]) =>
+    releaseFileUrl(API_ORIGIN, f.id, file);
+  expect(release.spec.image).toMatchObject({
+    url: url("pgcf-node.raw.zst"),
+    format: "raw.zst",
+    sha256: f.value.image.sha256,
+    size_bytes: f.value.image.size_bytes,
+    raw_sha256: f.value.image.raw_sha256,
+    raw_bytes: f.value.image.raw_bytes,
+  });
+  expect(release.spec.binaries["pgcf-native-gateway"]).toEqual({
+    url: url("pgcf-native-gateway"),
+    ...f.value.binaries["pgcf-native-gateway"],
+  });
+  expect(release.spec.os).toEqual({
+    image_version: f.id,
+    debian_snapshot: f.value.os.debian_snapshot,
+    package_lock: {
+      url: url("packages.lock.json"),
+      ...f.value.os.package_lock,
+    },
+  });
+  expect(release.spec.image.url).toMatch(
+    new RegExp(
+      `^https://[^/]+/node/v1/releases/${f.id}/pgcf-node\\.raw\\.zst$`,
+    ),
+  );
+});
+
+it("registers only what the archive bucket holds: every file, at its size, with the sha256 R2 verified", async () => {
+  const f = await setup();
+  const conflict = async (
+    version: string,
+    body: Awaited<ReturnType<typeof stageRelease>>,
+    file: string,
+  ) => {
+    const response = await request(
+      `/v1/fleet/releases/${version}`,
+      f.admin,
+      "PUT",
+      body,
+    );
+    expect(await refusal(response.clone())).toMatchObject({
+      status: 409,
+      code: "conflict",
+    });
+    expect(JSON.stringify(await response.json())).toContain(file);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM fleet_releases WHERE id=?")
+        .bind(version)
+        .first(),
+    ).toBeNull();
+  };
+  // A file that was never uploaded.
+  const missing = `${f.id}-a`;
+  await conflict(
+    missing,
+    await stageRelease(missing, { skip: ["pgcf-archive"] }),
+    "pgcf-archive",
+  );
+  // An object of another size than the registered one.
+  const resized = `${f.id}-b`;
+  const sized = await stageRelease(resized);
+  sized.binaries["pgcf-agent"].size_bytes += 1;
+  await conflict(resized, sized, "pgcf-agent");
+  // An object whose digest differs from the registered one.
+  const forged = `${f.id}-c`;
+  const digests = await stageRelease(forged);
+  digests.os.package_lock.sha256 = "0".repeat(64);
+  await conflict(forged, digests, "packages.lock.json");
+  // An object uploaded without a sha256 that R2 verified: nothing proves its digest.
+  const unverified = `${f.id}-d`;
+  const registration = await stageRelease(unverified, {
+    skip: ["pgcf-wal-fetch"],
+  });
+  await env.ARCHIVE.put(
+    releaseObjectKey(unverified, "pgcf-wal-fetch"),
+    new TextEncoder().encode(`${unverified}/pgcf-wal-fetch`),
+  );
+  await conflict(unverified, registration, "pgcf-wal-fetch");
+  await env.ARCHIVE.delete(releaseObjectKey(unverified, "pgcf-wal-fetch"));
+  // The registration works once the files are there.
+  expect((await f.approve()).status).toBe(200);
+});
+
+it("refuses to register where the Worker has no origin to name the URLs by", async () => {
+  const f = await setup();
+  const response = await createApp().fetch(
+    new Request(`https://api.example.org/v1/fleet/releases/${f.id}`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${f.admin}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(f.value),
+    }),
+    { ...env, NODE_API_ORIGIN: undefined },
+    createExecutionContext(),
+  );
+  expect(await refusal(response)).toMatchObject({
+    status: 409,
+    code: "conflict",
+  });
 });
 
 it("enforces admin scope and the revision compare-and-set of a region's release", async () => {

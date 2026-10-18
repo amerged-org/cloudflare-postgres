@@ -38,7 +38,7 @@ const scopes = [
     "/node/v1/openapi.json",
     "PGCF node API",
     [
-      "A node calls these routes. Every one but the enrollment and the installer's report carries `Authorization: Bearer pgcf_nr1.<claims>.<signature>`: an Ed25519 signature of the request's method, its path with the query and the SHA-256 of its body, valid for 60 seconds.",
+      "A node calls these routes. Every one but the enrollment, the installer's report and the release files carries `Authorization: Bearer pgcf_nr1.<claims>.<signature>`: an Ed25519 signature of the request's method, its path with the query and the SHA-256 of its body, valid for 60 seconds.",
       "Request bodies are JSON of at most 4 MiB.",
       'A node declared lost reaches only the desired page and the observations; every other route answers `403 {"error":"node_fenced"}`.',
     ].join("\n\n"),
@@ -48,6 +48,8 @@ const scopes = [
 const nodeRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "POST /node/v1/enroll": [400, 401, 403, 409, 500],
   "POST /node/v1/installer/progress": [400, 401, 409, 500],
+  "GET /node/v1/releases/{version}/pgcf-node.raw.zst": [401, 404, 416, 500],
+  "GET /node/v1/releases/{version}/{file}": [404, 416, 500],
   "GET /node/v1/link": [401, 403, 500],
   "GET /node/v1/desired": [400, 401, 403, 404, 409, 500],
   "GET /node/v1/credentials": [401, 403, 500],

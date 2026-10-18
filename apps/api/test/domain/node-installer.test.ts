@@ -3,9 +3,12 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   INSTALLER_PROGRESS_PATH,
+  NodeEnrollmentResponse,
   NodeEnrollmentSeed,
+  bytesToHex,
   hashApiKey,
 } from "@pgcf/contracts";
+import { releaseFileUrl } from "@pgcf/contracts/releases";
 import { INSTALLER_SCRIPT } from "@pgcf/contracts/node-installer";
 import {
   driveNodeInstall,
@@ -13,8 +16,20 @@ import {
 } from "../../src/domain/node-installer.ts";
 import { readNodeAddition } from "../../src/domain/node-state.ts";
 import type { Instance } from "../../src/providers/contabo.ts";
-import { cleanupFixtures } from "./fixtures.ts";
-import { auditedAddition, forgetInstalls } from "./node-fixtures.ts";
+import {
+  API_ORIGIN,
+  assignRelease,
+  cleanupFixtures,
+  rawRequest,
+} from "./fixtures.ts";
+import {
+  auditedAddition,
+  enroll,
+  forgetInstalls,
+  newKey,
+  progress,
+  v4,
+} from "./node-fixtures.ts";
 
 afterEach(async () => {
   await forgetInstalls();
@@ -28,7 +43,7 @@ afterEach(async () => {
 });
 
 const MIB = 1024 ** 2;
-const API = "https://api.example.org";
+const API = API_ORIGIN;
 const settings = {
   ...env,
   NODE_API_ORIGIN: API,
@@ -375,5 +390,70 @@ describe("the install of a node that is being installed", () => {
       .run();
     await driveNodeInstall(settings, s.operation, s.p.provider);
     expect(await s.status()).toBe("failed");
+  });
+});
+
+describe("the install of a node from a registered release, as the installer carries it out", () => {
+  const sha256 = async (bytes: ArrayBuffer) =>
+    bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+
+  it("reads the image the release registered with the token of its userData, reports every checkpoint and enrolls", async () => {
+    const a = await auditedAddition();
+    const version = `installer-test-${crypto.randomUUID().slice(0, 8)}`;
+    await assignRelease(a.f, version);
+    const p = provider(a.instance);
+    const operation = a.addition.intent.operation_id;
+    await driveNodeInstall(settings, operation, p.provider);
+    const { values } = parameters(p.rescue.mock.calls[0]![1].userData);
+    // The userData names the Worker's route and carries no presigned URL and no bucket key.
+    expect(values.PGCF_IMAGE_URL).toBe(
+      releaseFileUrl(API, version, "pgcf-node.raw.zst"),
+    );
+    expect(p.rescue.mock.calls[0]![1].userData).not.toMatch(
+      /X-Amz|r2\.cloudflarestorage|R2_/,
+    );
+    const image = new URL(values.PGCF_IMAGE_URL!).pathname;
+    expect((await rawRequest(image)).status).toBe(401);
+    const token = { Authorization: `Bearer ${values.PGCF_PROGRESS_TOKEN}` };
+    const report = (checkpoint: string) =>
+      progress(values.PGCF_PROGRESS_TOKEN!, checkpoint);
+
+    expect((await report("started")).status).toBe(200);
+    expect((await report("hardware_ok")).status).toBe(200);
+    // The size by HEAD, then the bytes: what the installer verifies is what was registered.
+    const head = await rawRequest(image, { method: "HEAD", headers: token });
+    const download = await rawRequest(image, { headers: token });
+    const bytes = await download.arrayBuffer();
+    expect(head.headers.get("Content-Length")).toBe(String(bytes.byteLength));
+    expect(String(bytes.byteLength)).toBe(values.PGCF_IMAGE_ZST_BYTES);
+    expect(await sha256(bytes)).toBe(values.PGCF_IMAGE_ZST_SHA256);
+    for (const checkpoint of [
+      "image_verified",
+      "disk_written",
+      "configured",
+      "rebooting",
+    ])
+      expect((await report(checkpoint)).status, checkpoint).toBe(200);
+
+    // The installer is done: its token reads nothing and reports nothing any more.
+    expect((await rawRequest(image, { headers: token })).status).toBe(401);
+    expect((await report("failed")).status).toBe(401);
+
+    // The first boot enrolls with the seed the installer wrote, from the instance's own address.
+    const { publicKey } = await newKey();
+    const enrolled = await enroll(
+      {
+        node_id: values.PGCF_NODE_ID,
+        enrollment_token: values.PGCF_ENROLLMENT_TOKEN,
+        public_key: publicKey,
+        image_version: version,
+      },
+      v4,
+    );
+    expect(enrolled.status).toBe(200);
+    expect(NodeEnrollmentResponse.parse(await enrolled.json())).toMatchObject({
+      id: a.id,
+      region_id: a.f.region,
+    });
   });
 });

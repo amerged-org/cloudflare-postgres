@@ -5,6 +5,7 @@ import {
   NODE_FENCED_ERROR,
   NODE_FENCED_PATHS,
   NODE_REQUEST_TOKEN_PREFIX,
+  RELEASE_FILE_PATH,
   nodeRequestSubject,
   verifyNodeRequest,
   type NodeFencedResponse,
@@ -36,13 +37,19 @@ export interface NodeClaim {
   row: NodeKeyRow;
 }
 
-/** The two paths a node calls without its key: the installer's report and the enrollment. */
+/** The paths a node calls without its key: the installer's report and the enrollment. */
 const UNSIGNED_PATHS: ReadonlySet<string> = new Set([
   NODE_API_PATHS.enroll,
   INSTALLER_PROGRESS_PATH,
 ]);
+/**
+ * The files of a release are read without a node key: the installer, which has no key yet, reads
+ * the image with its install token, and the agent reads what its signed page pins.
+ */
 const isSigned = (path: string) =>
-  !UNSIGNED_PATHS.has(path) && path !== "/node/v1/openapi.json";
+  !UNSIGNED_PATHS.has(path) &&
+  path !== "/node/v1/openapi.json" &&
+  !path.startsWith(`${RELEASE_FILE_PATH}/`);
 
 /**
  * Looks up the node a signed request claims to come from, from the token in its headers alone.

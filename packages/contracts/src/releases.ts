@@ -78,6 +78,109 @@ export const FleetReleaseSpec = z.strictObject({
 });
 export type FleetReleaseSpec = z.infer<typeof FleetReleaseSpec>;
 
+/**
+ * The files of a release (plan 9.1, 9.2). They are objects under `node-images/<version>/` in the
+ * archive bucket, and the Worker serves them at `/node/v1/releases/<version>/<file>`: the image
+ * to the installer with its install token, the rest to the agents. The version is the release id,
+ * the image version a node enrolls as and the name of the binaries' directory.
+ */
+export const RELEASE_IMAGE_FILE = "pgcf-node.raw.zst";
+export const RELEASE_LOCK_FILE = "packages.lock.json";
+export const RELEASE_BINARY_FILES = [
+  "pgcf-agent",
+  "pgcf-native-gateway",
+  "pgcf-archive",
+  "pgcf-wal-fetch",
+] as const;
+export const RELEASE_FILES = [
+  RELEASE_IMAGE_FILE,
+  RELEASE_LOCK_FILE,
+  ...RELEASE_BINARY_FILES,
+] as const;
+export type ReleaseFile = (typeof RELEASE_FILES)[number];
+export const ReleaseFileName = z.enum(RELEASE_FILES);
+export const RELEASE_FILE_PATH = "/node/v1/releases";
+export const RELEASE_OBJECT_PREFIX = "node-images";
+export const releaseObjectKey = (version: string, file: ReleaseFile): string =>
+  `${RELEASE_OBJECT_PREFIX}/${version}/${file}`;
+export const releaseFileUrl = (
+  origin: string,
+  version: string,
+  file: ReleaseFile,
+): string => `${apiOrigin(origin)}${RELEASE_FILE_PATH}/${version}/${file}`;
+function apiOrigin(origin: string): string {
+  const url = new URL(origin);
+  if (
+    url.protocol !== "https:" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    url.username !== "" ||
+    url.password !== ""
+  )
+    throw new Error("The API origin is an https origin and nothing else");
+  return url.origin;
+}
+
+const Digest = z.strictObject({ sha256: Sha256, size_bytes: Positive });
+/**
+ * What the operator registers for a version (`PUT /v1/fleet/releases/{version}`): the digest and
+ * size of each file the build produced. The Worker names the URLs itself, so the spec every node
+ * receives points at its own delivery route and nowhere else.
+ */
+export const FleetReleaseRegistration = z.strictObject({
+  image: Digest.safeExtend({
+    raw_sha256: Sha256,
+    raw_bytes: Positive.refine((value) => value % 512 === 0),
+  }),
+  binaries: z.strictObject({
+    "pgcf-agent": Digest,
+    "pgcf-native-gateway": Digest,
+    "pgcf-archive": Digest,
+    "pgcf-wal-fetch": Digest,
+  }),
+  os: z.strictObject({
+    debian_snapshot: FleetReleaseOs.shape.debian_snapshot,
+    package_lock: Digest,
+  }),
+});
+export type FleetReleaseRegistration = z.infer<typeof FleetReleaseRegistration>;
+/** The version of a registered release: a release id that is also a valid image version. */
+export const FleetReleaseVersion = FleetReleaseId.max(64);
+
+/** The release spec of a registration: every file served by `origin`'s delivery route. */
+export function fleetReleaseSpec(
+  origin: string,
+  version: string,
+  registration: FleetReleaseRegistration,
+): FleetReleaseSpec {
+  const url = (file: ReleaseFile) => releaseFileUrl(origin, version, file);
+  const pinned = (file: ReleaseFile, digest: z.infer<typeof Digest>) => ({
+    url: url(file),
+    ...digest,
+  });
+  return FleetReleaseSpec.parse({
+    version: 2,
+    image: {
+      ...pinned(RELEASE_IMAGE_FILE, registration.image),
+      format: "raw.zst",
+      raw_sha256: registration.image.raw_sha256,
+      raw_bytes: registration.image.raw_bytes,
+    },
+    binaries: Object.fromEntries(
+      RELEASE_BINARY_FILES.map((file) => [
+        file,
+        pinned(file, registration.binaries[file]),
+      ]),
+    ),
+    os: {
+      image_version: version,
+      debian_snapshot: registration.os.debian_snapshot,
+      package_lock: pinned(RELEASE_LOCK_FILE, registration.os.package_lock),
+    },
+  });
+}
+
 export const FleetRelease = z.strictObject({
   id: FleetReleaseId,
   spec: FleetReleaseSpec,

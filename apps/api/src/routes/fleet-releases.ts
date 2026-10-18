@@ -10,7 +10,10 @@ import {
 import {
   FleetReleaseId,
   FleetRelease,
-  FleetReleaseSpec,
+  FleetReleaseRegistration,
+  FleetReleaseVersion,
+  RELEASE_FILE_PATH,
+  RELEASE_IMAGE_FILE,
   FleetRegionReleaseUpdate,
   FleetRegionReleaseStatus,
   FleetNodeReleaseStatus,
@@ -25,6 +28,10 @@ import {
   assignFleetRegionRelease,
   getFleetNodeRelease,
 } from "../domain/fleet-releases.ts";
+import {
+  serveInstallerImage,
+  serveReleaseFile,
+} from "../domain/release-files.ts";
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
 const errors = Object.fromEntries(
   [400, 401, 403, 404, 409, 500].map((status) => [
@@ -92,19 +99,19 @@ export function registerFleetReleases(app: ApiApp): void {
       method: "put",
       path: "/v1/fleet/releases/{id}",
       description:
-        "Approves an immutable release: one node image with its binaries and package lock, the same for every node. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
+        "Registers an immutable release: one node image with its binaries and package lock, the same for every node. The body holds the digest and size of each file the build produced; the files must already be in the archive bucket under `node-images/{id}/`, uploaded with their sha256 for R2 to verify, and the Worker names every URL of the stored spec itself. The id is the image version the node enrolls as. This records desired configuration; assigning it to a region makes the region's nodes pull it.",
       request: {
         headers,
-        params: z.object({ id: FleetReleaseId }),
-        body: body(FleetReleaseSpec),
+        params: z.object({ id: FleetReleaseVersion }),
+        body: body(FleetReleaseRegistration),
       },
       responses: responses(FleetRelease),
     },
     async (c) =>
       approveFleetRelease(
         c,
-        FleetReleaseId.parse(c.req.param("id")),
-        FleetReleaseSpec.parse(await c.req.json()),
+        FleetReleaseVersion.parse(c.req.param("id")),
+        FleetReleaseRegistration.parse(await c.req.json()),
       ),
   );
   register(
@@ -161,5 +168,59 @@ export function registerFleetReleases(app: ApiApp): void {
       responses: responses(FleetNodeReleaseStatus),
     },
     async (c) => getFleetNodeRelease(c, NodeId.parse(c.req.param("id"))),
+  );
+  const octets = {
+    "application/octet-stream": {
+      schema: z.string().meta({ format: "binary" }),
+    },
+  };
+  const bytes = {
+    200: { description: "The whole file", content: octets },
+    206: { description: "The bytes of the requested range", content: octets },
+    416: {
+      description:
+        "The range starts beyond the end of the file; `Content-Range` names its size",
+    },
+  };
+  // A name that is no file of a registered release is not found, however it is spelled.
+  const delivery = {
+    tags: ["Node"],
+    request: { params: z.object({ version: z.string() }) },
+  };
+  const method =
+    "GET and HEAD answer with the size, ETag and `Accept-Ranges: bytes`; a single `Range` of bytes is answered with 206.";
+  // The image has its own route: it alone needs the installer's token, and OpenAPI shows that.
+  register(
+    app,
+    {
+      ...delivery,
+      method: "get",
+      path: `${RELEASE_FILE_PATH}/{version}/${RELEASE_IMAGE_FILE}`,
+      security: [{ EnrollmentBearer: [] }],
+      description: `The zstd-compressed node image of a registered release, streamed from the archive bucket to the pull installer in the Contabo rescue system. ${method} The credential is the progress token of the install, which is bound to one node and the version it was issued for and stops working when the installer reports \`rebooting\` or \`failed\`, when the node enrolls and when the token expires.`,
+      responses: {
+        ...errors,
+        ...bytes,
+      },
+    },
+    async (c) => serveInstallerImage(c, c.req.param("version")!),
+  );
+  register(
+    app,
+    {
+      ...delivery,
+      method: "get",
+      path: `${RELEASE_FILE_PATH}/{version}/{file}`,
+      description: `A binary (\`pgcf-agent\`, \`pgcf-native-gateway\`, \`pgcf-archive\`, \`pgcf-wal-fetch\`) or the \`packages.lock.json\` of a registered release, streamed from the archive bucket. The agent reads these without a credential and checks the size and sha256 its desired page pins; they are open artifacts. ${method}`,
+      request: {
+        params: z.object({ version: z.string(), file: z.string() }),
+      },
+      responses: {
+        ...errors,
+        ...bytes,
+      },
+    },
+    async (c) =>
+      serveReleaseFile(c, c.req.param("version")!, c.req.param("file")!),
   );
 }

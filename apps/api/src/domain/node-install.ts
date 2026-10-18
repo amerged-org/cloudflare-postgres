@@ -121,11 +121,12 @@ interface Checkpoint {
   at: string;
 }
 
-/** `POST /node/v1/installer/progress`, authenticated by the install's progress token. */
-export async function recordInstallerProgress(
-  c: ApiContext,
-  raw: unknown,
-): Promise<Response> {
+/**
+ * The install whose progress token the request carries, while that install is open: the token is
+ * refused once `rebooting` or `failed` arrived, once the node enrolled and once it expired. The
+ * same token reads the image the installer writes, so the installer carries one credential.
+ */
+export async function openInstall(c: ApiContext): Promise<InstallRow> {
   const authorization = c.req.header("Authorization"),
     token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : "";
   if (!token.startsWith(PROGRESS_TOKEN_PREFIX))
@@ -136,14 +137,23 @@ export async function recordInstallerProgress(
   )
     .bind(hash)
     .first<InstallRow>();
-  const now = new Date().toISOString();
   if (
     !row ||
     row.progress_closed_at !== null ||
     row.enrolled_at !== null ||
-    row.expires_at <= now
+    row.expires_at <= new Date().toISOString()
   )
     throw new ApiError("unauthorized", "Invalid installer credentials");
+  return row;
+}
+
+/** `POST /node/v1/installer/progress`, authenticated by the install's progress token. */
+export async function recordInstallerProgress(
+  c: ApiContext,
+  raw: unknown,
+): Promise<Response> {
+  const row = await openInstall(c),
+    now = new Date().toISOString();
   const progress = InstallerProgress.safeParse(raw);
   if (!progress.success)
     throw new ApiError("invalid_request", "Invalid installer progress");

@@ -3,10 +3,18 @@ import { NODE_STALE_MS, bytesToHex, type NodeInventory } from "@pgcf/contracts";
 import {
   FleetRelease,
   FleetReleaseId,
-  FleetReleaseSpec,
   FleetNodeReleaseStatus,
   FleetRegionReleaseStatus,
+  RELEASE_BINARY_FILES,
+  RELEASE_IMAGE_FILE,
+  RELEASE_LOCK_FILE,
+  fleetReleaseSpec,
+  releaseObjectKey,
+  type FleetPinnedFile,
   type FleetRegionReleaseUpdate,
+  type FleetReleaseRegistration,
+  type FleetReleaseSpec,
+  type ReleaseFile,
 } from "@pgcf/contracts/releases";
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
@@ -83,13 +91,69 @@ export async function getFleetRelease(
   await requireScope(c, "admin");
   return c.json(await release(c.env.DB, id), 200);
 }
+/** The spec of a registration, with every URL named by this Worker's own delivery route. */
+function registeredSpec(
+  c: ApiContext,
+  id: string,
+  registration: FleetReleaseRegistration,
+): FleetReleaseSpec {
+  const origin = c.env.NODE_API_ORIGIN;
+  if (origin === undefined)
+    return conflict(
+      "NODE_API_ORIGIN is not configured, so the release's URLs cannot be named",
+    );
+  try {
+    return fleetReleaseSpec(origin, id, registration);
+  } catch {
+    return conflict("NODE_API_ORIGIN is not an https origin");
+  }
+}
+const hex = (bytes: ArrayBuffer) => bytesToHex(new Uint8Array(bytes));
+/**
+ * A release is registered only when the archive bucket holds each of its six files at the
+ * registered size and R2 itself verified the registered sha256 when the file was uploaded
+ * (`x-amz-checksum-sha256`), so a mistyped version or a half-finished upload is refused here
+ * and not at the install of a node.
+ */
+async function assertFilesStored(
+  bucket: R2Bucket,
+  id: string,
+  spec: FleetReleaseSpec,
+): Promise<void> {
+  const pins: [ReleaseFile, { sha256: string; size_bytes: number }][] = [
+    [RELEASE_IMAGE_FILE, spec.image],
+    [RELEASE_LOCK_FILE, spec.os.package_lock],
+    ...RELEASE_BINARY_FILES.map(
+      (file) => [file, spec.binaries[file]] as [ReleaseFile, FleetPinnedFile],
+    ),
+  ];
+  const stored = await Promise.all(
+    pins.map(([file]) => bucket.head(releaseObjectKey(id, file))),
+  );
+  pins.forEach(([file, pin], index) => {
+    const object = stored[index],
+      key = releaseObjectKey(id, file);
+    if (!object) conflict(`${key} is not in the archive bucket`);
+    else if (object.size !== pin.size_bytes)
+      conflict(
+        `${key} has ${object.size} bytes, not the registered ${pin.size_bytes}`,
+      );
+    else if (
+      object.checksums.sha256 === undefined ||
+      hex(object.checksums.sha256) !== pin.sha256
+    )
+      conflict(
+        `${key} was not uploaded with the registered sha256 for R2 to verify`,
+      );
+  });
+}
 export async function approveFleetRelease(
   c: ApiContext,
   id: string,
-  raw: FleetReleaseSpec,
+  registration: FleetReleaseRegistration,
 ): Promise<Response> {
   await requireScope(c, "admin");
-  const spec = FleetReleaseSpec.parse(raw),
+  const spec = registeredSpec(c, id, registration),
     specJson = canonical(spec),
     hash = await sha256(specJson);
   const read = async () => {
@@ -101,6 +165,12 @@ export async function approveFleetRelease(
   return withIdempotency(c, {
     replay: read,
     execute: async (lease) => {
+      const known = await c.env.DB.prepare(
+        "SELECT 1 FROM fleet_releases WHERE id=?",
+      )
+        .bind(id)
+        .first();
+      if (known === null) await assertFilesStored(c.env.ARCHIVE, id, spec);
       await c.env.DB.batch([
         c.env.DB.prepare(
           "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING",

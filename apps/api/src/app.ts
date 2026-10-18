@@ -95,6 +95,8 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/regions/:id/node-policy",
   "/node/v1/enroll",
   "/node/v1/installer/progress",
+  "/node/v1/releases/:version/pgcf-node.raw.zst",
+  "/node/v1/releases/:version/:file",
   "/node/v1/link",
   "/node/v1/desired",
   "/node/v1/credentials",

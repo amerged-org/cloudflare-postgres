@@ -361,6 +361,16 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "Report a checkpoint of the pull installer",
     "installer",
   ),
+  "GET /node/v1/releases/{version}/pgcf-node.raw.zst": route(
+    "getNodeImage",
+    "Read a release's node image with the installer's token",
+    "installer",
+  ),
+  "GET /node/v1/releases/{version}/{file}": route(
+    "getReleaseFile",
+    "Read a binary or the package lock of a release",
+    "none",
+  ),
   "GET /node/v1/link": route(
     "openNodeLink",
     "Open the node's WebSocket link",
