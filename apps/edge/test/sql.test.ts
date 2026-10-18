@@ -227,11 +227,63 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     // 1 is the isolate's first database request, so a cold start shows in the tail.
     expect(first.isolate_requests).toBeGreaterThanOrEqual(1);
     expect(second.isolate_requests).toBe(first.isolate_requests + 1);
-    // Everything of the request but the gateway's answer: plan 3.1's "Cloudflare adds at most".
+    // Everything of the request but the client's upload and the gateway's answer: plan 3.1's
+    // "Cloudflare adds at most".
     for (const log of [first, second])
-      expect(log.edge_ms).toBe(log.duration_ms - log.gateway_ms);
+      expect(log.edge_ms).toBe(log.duration_ms - log.gateway_ms - log.body_ms);
     // Statements are counted, never logged.
     for (const [line] of logs.mock.calls) expect(line).not.toContain("select");
+  });
+
+  it("does not count a client's slow upload, nor a refused one's, as the Edge's own time", async () => {
+    const bindings = admitting(awake());
+    const upload = async (chunks: string[]) => {
+      const encoder = new TextEncoder();
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(
+        new Request(`${origin}/sql`, {
+          method: "POST",
+          headers: {
+            "CF-Connecting-IP": [192, 0, 2, 1].join("."),
+            ...neonHeaders(),
+          },
+          body: new ReadableStream({
+            async start(controller) {
+              for (const [index, chunk] of chunks.entries()) {
+                if (index > 0)
+                  await new Promise((done) => setTimeout(done, 300));
+                controller.enqueue(encoder.encode(chunk));
+              }
+              controller.close();
+            },
+          }),
+          duplex: "half",
+        } as RequestInit),
+        bindings,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      return {
+        status: response.status,
+        log: JSON.parse(logs.mock.calls.at(-1)![0] as string),
+      };
+    };
+    const slow = await upload([
+      '{"queries":[{"query":"select 1",',
+      '"params":[]}]}',
+    ]);
+    expect(slow.status).toBe(200);
+    expect(slow.log.body_ms).toBeGreaterThanOrEqual(300);
+    expect(slow.log.edge_ms).toBe(
+      slow.log.duration_ms - slow.log.gateway_ms - slow.log.body_ms,
+    );
+    // The upload is the client's as well when the body then turns out not to be a query.
+    const refused = await upload(['{"queries":', "7}"]);
+    expect(refused.status).toBe(400);
+    expect(refused.log.body_ms).toBeGreaterThanOrEqual(300);
+    expect(refused.log.edge_ms).toBe(
+      refused.log.duration_ms - refused.log.body_ms,
+    );
   });
 
   it("logs no statements for a request refused before its body is understood", async () => {
@@ -240,7 +292,8 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
     expect(log.outcome).toBe("08P01");
     expect(log.statements).toBeUndefined();
-    expect(log.edge_ms).toBe(log.duration_ms);
+    expect(log.gateway_ms).toBeUndefined();
+    expect(log.edge_ms).toBe(log.duration_ms - log.body_ms);
   });
 
   it("the actual driver reads gateway and Edge refusals as PostgreSQL errors", async () => {

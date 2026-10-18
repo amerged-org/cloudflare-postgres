@@ -18,6 +18,8 @@ import { connectGateway } from "./gateway.ts";
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 interface Timings extends AdmissionTimings {
   gateway_connect_ms?: number;
+  /** When the gateway stage began, for the handler to read; never logged. */
+  gateway_started?: number;
 }
 
 function routingHints(url: URL): Hints {
@@ -53,7 +55,7 @@ async function admit(
     ctx,
     timings,
   );
-  const gatewayStarted = Date.now();
+  const gatewayStarted = (timings.gateway_started = Date.now());
   let socket: WebSocket;
   try {
     socket = await connectGateway(region, token, env, signal);
@@ -124,7 +126,13 @@ export default {
         ? decoyResponse(hints, env.ROUTE_MASTER_KEYS, request.signal, ctx)
         : refused(failure);
     } finally {
-      const duration = Math.max(0, Date.now() - started);
+      const finished = Date.now();
+      const duration = Math.max(0, finished - started);
+      const { gateway_started, ...stages } = timings;
+      // An upgrade that the client or the deadline interrupted is still pending: the wait so far
+      // is the gateway's, not the Edge's.
+      if (gateway_started !== undefined)
+        stages.gateway_connect_ms ??= finished - gateway_started;
       console.log(
         JSON.stringify({
           event: "conn_admission",
@@ -138,11 +146,11 @@ export default {
           // From the request's arrival to the answered upgrade.
           duration_ms: duration,
           // The part of it that was the Edge's own: all but the gateway's upgrade.
-          edge_ms: edgeShare(duration, timings.gateway_connect_ms),
+          edge_ms: edgeShare(duration, stages.gateway_connect_ms),
           // The database requests this isolate has taken, this one included; 1 is its first.
           isolate_requests: isolateRequests,
           // Where an admission spent its time; each key is present only for a stage that ran.
-          ...timings,
+          ...stages,
           outcome,
         }),
       );

@@ -542,7 +542,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     accept!.mockRestore();
   });
 
-  it("relays any number of frames after the upgrade with no limiter, Actor, log or listener work per frame", async () => {
+  it("hands the client the gateway's own socket, so frames cost no limiter, Actor or log work", async () => {
     const limit = vi.fn(async () => ({ success: true }));
     const limiter = { limit } as unknown as RateLimit;
     const admitWake = vi.fn(
@@ -557,11 +557,11 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     );
     const cancelWakeWaiter = vi.fn(async () => false);
     const get = vi.fn(() => ({ admitWake, cancelWakeWaiter }));
-    let listened: ReturnType<typeof vi.spyOn> | null = null;
+    let upstream: WebSocket | null = null;
     const gateway = {
       async fetch(request: Request) {
         const response = await testEnv.GATEWAY.fetch(request);
-        listened = vi.spyOn(response.webSocket!, "addEventListener");
+        upstream = response.webSocket;
         return response;
       },
     } as Fetcher;
@@ -577,6 +577,8 @@ describe("native edge admission with real Workers D1 and route-token modules", (
         },
       },
     });
+    // Not a relay in JavaScript: the runtime carries the frames between the client and the gateway.
+    expect(connection.socket).toBe(upstream);
     // The admission: both limiters, one Actor call, one log line.
     expect(limit).toHaveBeenCalledTimes(2);
     expect(admitWake).toHaveBeenCalledTimes(1);
@@ -596,11 +598,6 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(admitWake).toHaveBeenCalledTimes(1);
     expect(cancelWakeWaiter).not.toHaveBeenCalled();
     expect(logs.mock.calls).toHaveLength(1);
-    // The only listeners on the gateway's socket are the ones this test's client added.
-    expect(listened!.mock.calls.map((call: unknown[]) => call[0])).toEqual([
-      "message",
-      "close",
-    ]);
   });
 
   it("rejects missing and duplicate admission hints before any gateway call", async () => {
@@ -1561,6 +1558,23 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
     expect(log.outcome).toBe("08006");
     expect(log.gateway_connect_ms).toBeGreaterThanOrEqual(0);
+    expect(log.edge_ms).toBe(log.duration_ms - log.gateway_connect_ms);
+  });
+
+  it("counts the wait on a gateway upgrade that the client interrupted as the gateway's, not the Edge's", async () => {
+    await setGatewayMode("held");
+    const controller = new AbortController();
+    const pending = open({ signal: controller.signal });
+    await expect.poll(async () => (await stats())[0]?.waiting).toBe(true);
+    await new Promise((done) => setTimeout(done, 200));
+    controller.abort();
+    const connection = await pending;
+    expect(await errorCode(connection)).toBe("08006");
+    await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
+    await waitOnExecutionContext(connection.ctx);
+    const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(log.outcome).toBe("08006");
+    expect(log.gateway_connect_ms).toBeGreaterThanOrEqual(200);
     expect(log.edge_ms).toBe(log.duration_ms - log.gateway_connect_ms);
   });
 

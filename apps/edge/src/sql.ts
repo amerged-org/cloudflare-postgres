@@ -68,7 +68,7 @@ interface Transaction {
 }
 /** Milliseconds of each stage that ran, logged with the request. */
 interface Timings extends AdmissionTimings {
-  /** Reading and understanding the body: a client that uploads slowly shows here. */
+  /** Reading and understanding the body: a client that uploads slowly shows here, not in edge_ms. */
   body_ms?: number;
   /** The statements of the request, counted and never logged. */
   statements?: number;
@@ -338,8 +338,13 @@ export async function serveSql(
     const routed = (target = connection(request.headers));
     const characteristics = transaction(request.headers);
     const bodyStarted = Date.now();
-    const { queries, batch } = statements(await readBody(request));
-    timings.body_ms = Date.now() - bodyStarted;
+    let understood: ReturnType<typeof statements>;
+    try {
+      understood = statements(await readBody(request));
+    } finally {
+      timings.body_ms = Date.now() - bodyStarted;
+    }
+    const { queries, batch } = understood;
     timings.statements = queries.length;
     if (batch && queries.length === 0) return json({ results: [] }, 200);
     const body = JSON.stringify({
@@ -396,8 +401,8 @@ export async function serveSql(
         region_id: region,
         // From the request's arrival to the response head: the body streams after it.
         duration_ms: duration,
-        // The part of it that was the Edge's own: all but the gateway's answer.
-        edge_ms: edgeShare(duration, timings.gateway_ms),
+        // The part of it that was the Edge's own: all but the client's upload and the gateway.
+        edge_ms: edgeShare(duration, timings.body_ms, timings.gateway_ms),
         // The database requests this isolate has taken, this one included; 1 is its first.
         isolate_requests: isolateRequests,
         ...timings,

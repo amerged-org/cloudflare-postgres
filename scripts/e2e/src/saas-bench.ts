@@ -11,13 +11,17 @@
  * `--scale` loads faster). `call` runs the request once on a fresh connection and prints one JSON
  * line: connect_ms (the wake, when the database was cold), ws_open_ms (the Edge's share of it),
  * first_answer_ms, request_ms and statements_ms. The caller lets the database sleep first;
- * `--idle-s` is the time it was idle, recorded in the line. `--followups n` runs n more requests
- * on fresh connections after it and adds their request_ms and the number of requests until one
- * was within 25 % of warm. `run` makes the call on each database in every round, waiting
- * `--idle-s` between rounds so that the databases sleep by themselves (the first round starts
- * at once: the caller has let them sleep), and ends with a summary line: p50 and p95 of
- * connect, first answer and request, the failure count and whether the gate (p95 under 1 s,
- * no failure) was met. It exits 1 when a call failed.
+ * `--idle-s` is the time it was idle, recorded in the line. A cold call is made only when the
+ * management API reports the database `hibernated` (recorded as observed_state_before): one that
+ * is awake, or whose state cannot be read, is a failed call (failed_at cold_check) and is never
+ * timed as cold. `--followups n` runs n more requests on fresh connections after it and adds
+ * their request_ms and the number of requests until one was within 25 % of warm; a follow-up
+ * that fails ends the series and is kept in the line (followup_failures, followup_failed_at,
+ * followup_error). `run` makes the call on each database in every round, waiting `--idle-s`
+ * between rounds so that the databases sleep by themselves (the first round starts at once: the
+ * caller has let them sleep), and ends with a summary line: p50 and p95 of connect, first
+ * answer and request, the failure and follow-up failure counts and whether the gate (p95 under
+ * 1 s, no failure) was met. It exits 1 when a call or a follow-up failed.
  *
  * `--via probe` makes each call from inside Cloudflare instead of from this machine: a probe
  * Worker, deployed privately, answers `POST <url>?database=<id>&seed=<n>&call=<n>&scale=<n>` with
@@ -27,8 +31,9 @@
  *
  * Environment variables (names only; their values never enter the repository or the output):
  *   PGCF_API_URL, PGCF_API_KEY   the management API and an integrator key of the database's
- *                                project; the role's connection URI is read from it, and its host
- *                                is the Edge hostname the benchmark connects to
+ *                                project; the database's state is read from it before every
+ *                                cold call, and the role's connection URI, whose host is the
+ *                                Edge hostname the benchmark connects to, for `--via local`
  *   PGCF_BENCH_ROLE              the role to connect as (default app)
  *   PGCF_BENCH_PROBE_URL, PGCF_BENCH_PROBE_TOKEN
  *                                the probe Worker and its bearer token, for `--via probe`
@@ -58,23 +63,24 @@ function environment(name: string): string {
   return value;
 }
 
+/** A GET of the management API under the integrator key: its JSON answer. */
+async function api(path: string, what: string): Promise<unknown> {
+  const response = await fetch(new URL(path, environment("PGCF_API_URL")), {
+    headers: { Authorization: `Bearer ${environment("PGCF_API_KEY")}` },
+    redirect: "manual",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`${what} refused (${response.status})`);
+  return response.json();
+}
+
 /** The role's connection URI from the management API: the Edge host, the database, the password. */
 async function connectionUri(database: string): Promise<string> {
   const role = process.env.PGCF_BENCH_ROLE ?? "app";
-  const response = await fetch(
-    new URL(
-      `/v1/databases/${database}/roles/${encodeURIComponent(role)}/connection-uri`,
-      environment("PGCF_API_URL"),
-    ),
-    {
-      headers: { Authorization: `Bearer ${environment("PGCF_API_KEY")}` },
-      redirect: "manual",
-      signal: AbortSignal.timeout(15_000),
-    },
-  );
-  if (!response.ok)
-    throw new Error(`connection URI refused (${response.status})`);
-  const body = (await response.json()) as {
+  const body = (await api(
+    `/v1/databases/${database}/roles/${encodeURIComponent(role)}/connection-uri`,
+    "connection URI",
+  )) as {
     uri?: unknown;
     includes_password?: unknown;
   };
@@ -193,6 +199,43 @@ async function request(
   }
 }
 
+/** The state the management API reports for a database: `hibernated` while it sleeps. */
+async function observedState(database: string): Promise<string> {
+  const body = (await api(`/v1/databases/${database}`, "database")) as {
+    observed_state?: unknown;
+  };
+  if (typeof body.observed_state !== "string")
+    throw new Error("the database state is missing");
+  return body.observed_state;
+}
+
+/**
+ * The cold request of a database, made only when the API reports it asleep: a database that is
+ * awake would be timed warm, and one whose state cannot be read cannot be shown to be cold.
+ */
+async function coldRequest(
+  options: Calling,
+  database: string,
+  call: number,
+): Promise<{ before?: string; cold: Timed }> {
+  const skipped = (error_class: string): Timed => ({
+    ok: false,
+    statements_ms: [],
+    failed_at: "cold_check",
+    error: { error_class, sqlstate: null, errno: null },
+  });
+  let before: string;
+  try {
+    before = await observedState(database);
+  } catch (error) {
+    if (error instanceof UsageError) throw error;
+    // The reason can name the API's address; the line carries only its class.
+    return { cold: skipped("Unavailable") };
+  }
+  if (before !== "hibernated") return { before, cold: skipped("NotCold") };
+  return { before, cold: await request(options, database, call) };
+}
+
 /** The cold request of a database, then its follow-ups: one record, printed as one line. */
 async function measure(
   options: Calling,
@@ -200,24 +243,33 @@ async function measure(
   round: number,
   calls: { next: number },
 ): Promise<Timed> {
-  const cold = await request(options, database, calls.next++);
+  const { before, cold } = await coldRequest(options, database, calls.next++);
   const record: Record<string, unknown> = {
     db: database,
     round,
     via: options.via,
     idle_s: options.idleS,
     at: new Date().toISOString(),
+    observed_state_before: before,
     ...cold,
   };
   if (options.followups > 0 && cold.ok) {
     const requests = [cold.request_ms!];
-    for (let n = 0; n < options.followups; n++) {
+    let broken: Timed | undefined;
+    for (let n = 0; n < options.followups && !broken; n++) {
       const next = await request(options, database, calls.next++);
-      if (!next.ok) break;
-      requests.push(next.request_ms!);
+      if (next.ok) requests.push(next.request_ms!);
+      else broken = next;
     }
     record.followups_ms = requests.slice(1);
-    record.requests_until_warm = requestsUntilWarm(requests);
+    if (broken) {
+      // A failed request ends the series: it is kept, and no "until warm" is claimed from it.
+      cold.followup_failures = 1;
+      record.followup_failures = 1;
+      record.followup_failed_at = broken.failed_at;
+      record.followup_error = broken.error;
+      record.requests_until_warm = null;
+    } else record.requests_until_warm = requestsUntilWarm(requests);
   }
   console.log(JSON.stringify(record));
   return cold;
@@ -251,7 +303,8 @@ async function main(): Promise<number> {
   }
   const calls = { next: 0 };
   if (options.command === "call") {
-    return (await measure(options, options.database, 1, calls)).ok ? 0 : 1;
+    const measured = await measure(options, options.database, 1, calls);
+    return measured.ok && !measured.followup_failures ? 0 : 1;
   }
   const results: Timed[] = [];
   for (let round = 1; round <= options.rounds; round++) {
@@ -271,7 +324,7 @@ async function main(): Promise<number> {
   }
   const summary = summarize(results);
   console.log(JSON.stringify({ summary }));
-  return summary.failures === 0 ? 0 : 1;
+  return summary.failures === 0 && summary.followup_failures === 0 ? 0 : 1;
 }
 
 try {

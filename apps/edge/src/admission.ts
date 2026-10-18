@@ -39,11 +39,15 @@ export function nextIsolateRequest(): number {
 }
 
 /**
- * What the Edge itself spent on a request: all of `duration` but the wait for the gateway's
- * answer (plan 3.1 bounds it at about 150 ms at p95). Network transit and the node are not in it.
+ * What the Edge itself spent on a request: all of `duration` but the `waits` that were another's,
+ * the client's upload and the gateway's answer (plan 3.1 bounds it at about 150 ms at p95).
+ * Network transit and the node are not in it.
  */
-export function edgeShare(duration: number, gateway: number | undefined) {
-  return Math.max(0, duration - (gateway ?? 0));
+export function edgeShare(duration: number, ...waits: (number | undefined)[]) {
+  return Math.max(
+    0,
+    duration - waits.reduce<number>((sum, wait) => sum + (wait ?? 0), 0),
+  );
 }
 
 export class AdmissionFailure extends Error {

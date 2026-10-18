@@ -55,24 +55,26 @@ test(
     const rig = await startRig({ password });
     const { database } = rig.workerd;
     const key = randomBytes(16).toString("hex");
-    // The management API's one route the benchmark reads: the role's connection URI.
+    // The management API's two routes the benchmark reads: the database's state, which must be
+    // asleep for a cold call, and the role's connection URI.
+    let observedState = "hibernated";
     const api = createServer((request, response) => {
-      const known =
-        request.headers.authorization === `Bearer ${key}` &&
-        request.url === `/v1/databases/${database}/roles/app/connection-uri`;
-      response.writeHead(known ? 200 : 404, {
-        "Content-Type": "application/json",
-      });
-      response.end(
-        JSON.stringify(
-          known
+      const authorized = request.headers.authorization === `Bearer ${key}`;
+      const answer =
+        authorized && request.url === `/v1/databases/${database}`
+          ? { observed_state: observedState, effective_sleep_after_seconds: 60 }
+          : authorized &&
+              request.url ===
+                `/v1/databases/${database}/roles/app/connection-uri`
             ? {
                 uri: `postgres://app:${password}@127.0.0.1:${rig.workerd.port}/${database}`,
                 includes_password: true,
               }
-            : {},
-        ),
-      );
+            : null;
+      response.writeHead(answer ? 200 : 404, {
+        "Content-Type": "application/json",
+      });
+      response.end(JSON.stringify(answer ?? {}));
     });
     await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
     const env = {
@@ -105,6 +107,7 @@ test(
       assert.equal(record!.ok, true);
       assert.equal(record!.db, database);
       assert.equal(record!.idle_s, 60);
+      assert.equal(record!.observed_state_before, "hibernated");
       assert.equal((record!.statements_ms as number[]).length, 5);
       assert.equal((record!.followups_ms as number[]).length, 3);
       const { connect_ms, ws_open_ms, first_answer_ms, request_ms } =
@@ -140,6 +143,17 @@ test(
       };
       assert.equal(summary.calls, 3);
       assert.equal(summary.failures, 0);
+      // A database that is awake is not timed as cold: no connection is opened for the call.
+      observedState = "ready";
+      const awake = await bench(
+        ["call", "--database", database, "--scale", "0.01"],
+        env,
+      );
+      assert.equal(awake.code, 1);
+      assert.equal(awake.lines[0]!.failed_at, "cold_check");
+      assert.equal(awake.lines[0]!.observed_state_before, "ready");
+      assert.equal(awake.lines[0]!.connect_ms, undefined);
+      observedState = "hibernated";
       // A dataset of another scale answers other row counts: the call fails, it is not timed as fast.
       const wrong = await bench(
         ["call", "--database", database, "--scale", "1"],
@@ -149,7 +163,7 @@ test(
       assert.equal(wrong.lines[0]!.ok, false);
       assert.equal(wrong.lines[0]!.failed_at, "auth");
       // Neither the key nor the password reaches the output.
-      for (const output of [setup, call, run, wrong])
+      for (const output of [setup, call, run, awake, wrong])
         for (const secret of [key, password])
           assert.ok(!JSON.stringify(output).includes(secret));
     } finally {

@@ -169,13 +169,18 @@ export interface Timed {
   request_ms?: number;
   /** Each statement's own round trip, in the order of `STATEMENT_NAMES`. */
   statements_ms: number[];
-  /** Where a failed call stopped: the connection, or the statement that failed. */
-  failed_at?: "connect" | StatementName;
+  /**
+   * Where a failed call stopped: the check that the database was asleep (made by the driver, not
+   * by the call), the connection, or the statement that failed.
+   */
+  failed_at?: "cold_check" | "connect" | StatementName;
   error?: {
     error_class: string;
     sqlstate: string | null;
     errno: string | null;
   };
+  /** Set by the driver: the follow-up requests after this call that failed. */
+  followup_failures?: number;
 }
 
 class UnexpectedResult extends Error {
@@ -254,11 +259,14 @@ export function requestsUntilWarm(
 
 export interface Summary {
   calls: number;
+  /** Calls that failed, among them those not made because the database was not asleep. */
   failures: number;
+  /** Follow-up requests that failed after a cold call that did not. */
+  followup_failures: number;
   request_ms: { p50: number | null; p95: number | null };
   first_answer_ms: { p50: number | null; p95: number | null };
   connect_ms: { p50: number | null; p95: number | null };
-  /** The plan's gate: every call succeeded and the whole request's p95 is under it. */
+  /** The plan's gate: every call and follow-up succeeded and the whole request's p95 is under it. */
   gate_met: boolean;
 }
 
@@ -270,15 +278,21 @@ export function summarize(calls: readonly Timed[]): Summary {
     return { p50: percentile(values, 0.5), p95: percentile(values, 0.95) };
   };
   const request = column((call) => call.request_ms);
+  const followupFailures = calls.reduce(
+    (sum, call) => sum + (call.followup_failures ?? 0),
+    0,
+  );
   return {
     calls: calls.length,
     failures: calls.length - done.length,
+    followup_failures: followupFailures,
     request_ms: request,
     first_answer_ms: column((call) => call.first_answer_ms),
     connect_ms: column((call) => call.connect_ms),
     gate_met:
       calls.length > 0 &&
       done.length === calls.length &&
+      followupFailures === 0 &&
       request.p95 !== null &&
       request.p95 < GATE_MS,
   };

@@ -62,6 +62,15 @@ test("a summary counts failures apart and meets the gate only without one", () =
   assert.equal(failed.failures, 1);
   assert.deepEqual(failed.request_ms, summary.request_ms);
   assert.equal(failed.gate_met, false);
+  // A follow-up that failed after a good cold call is a failure of the run too.
+  const followed = summarize([
+    ...calls,
+    { ...done(500), followup_failures: 1 },
+  ]);
+  assert.equal(followed.failures, 0);
+  assert.equal(followed.followup_failures, 1);
+  assert.equal(followed.gate_met, false);
+  assert.equal(summary.followup_failures, 0);
   const none = summarize([]);
   assert.equal(none.request_ms.p95, null);
   assert.equal(none.gate_met, false);
