@@ -67,7 +67,8 @@ and Fetcher bindings; it does not rebuild the Worker. Local fixtures prove bindi
 protocol behavior. They do not replace Dev PostgreSQL/TLS and VPC transport acceptance.
 
 Start the replacement's private configuration from `apps/edge-rust/wrangler.example.jsonc`;
-it has the same bindings and secret as the TypeScript example. The example intentionally has no
+it has the same bindings, variable and secret as the TypeScript example, and serves the same
+routes (`/v2` WebSocket connections and `/sql` HTTP queries). The example intentionally has no
 custom build command: delivery uses the qualified artifact instead of compiling again. Do not
 activate the replacement until the selected bytes pass Dev database acceptance. Record the
 actual Worker version and result in the ULTRA plan.

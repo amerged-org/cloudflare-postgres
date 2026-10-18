@@ -63,16 +63,40 @@ pub fn uuid() -> Result<String, Failure> {
         &s[20..]
     ))
 }
+/// The DatabaseActor, got at the location hint the API creates it at; an existing one never moves.
 pub fn actor(env: &Env, database: &str) -> Result<ActorRpc, Failure> {
     let namespace = env
         .durable_object("DATABASE_ACTOR")
         .map_err(|_| Failure::gateway())?;
-    Ok(namespace
+    let id = namespace
         .id_from_name(database)
-        .map_err(|_| Failure::gateway())?
-        .get_stub()
-        .map_err(|_| Failure::gateway())?
-        .into_rpc())
+        .map_err(|_| Failure::gateway())?;
+    let hint = env
+        .var("DATABASE_ACTOR_LOCATION_HINT")
+        .map(|hint| hint.to_string())
+        .ok()
+        .filter(|hint| !hint.is_empty());
+    let stub = match hint {
+        Some(hint) => id.get_stub_with_location_hint(&hint),
+        None => id.get_stub(),
+    };
+    Ok(stub.map_err(|_| Failure::gateway())?.into_rpc())
+}
+thread_local! {
+    static ISOLATE_REQUESTS: Cell<u64> = const { Cell::new(0) };
+}
+/// Counts one database request (a WebSocket upgrade or an HTTP query) taken by this isolate, this
+/// one included. The first of an isolate pays for what the later ones find cached.
+pub fn next_isolate_request() -> u64 {
+    ISOLATE_REQUESTS.with(|count| {
+        count.set(count.get() + 1);
+        count.get()
+    })
+}
+/// The Cloudflare location that admitted the request; none on a service binding.
+pub fn colo(request: &worker::Request) -> Option<String> {
+    let cf = js_sys::Reflect::get(request.inner(), &"cf".into()).ok()?;
+    js_sys::Reflect::get(&cf, &"colo".into()).ok()?.as_string()
 }
 pub fn owned_context(ctx: &Context) -> Context {
     let value: &JsValue = ctx.as_ref().as_ref();

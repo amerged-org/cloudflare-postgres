@@ -2,6 +2,7 @@
 //! Full Rust/Wasm Edge application. Durable admission remains in the existing TypeScript Actor.
 pub mod decoy;
 pub mod policy;
+pub mod sql;
 
 #[cfg(target_arch = "wasm32")]
 mod decoy_host;
@@ -11,6 +12,8 @@ mod gateway;
 mod host;
 #[cfg(target_arch = "wasm32")]
 mod runtime;
+#[cfg(target_arch = "wasm32")]
+mod sql_host;
 #[cfg(target_arch = "wasm32")]
 #[worker::event(fetch)]
 pub async fn fetch(

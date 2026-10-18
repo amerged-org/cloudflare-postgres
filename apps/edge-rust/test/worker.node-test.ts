@@ -17,6 +17,7 @@ import {
   deriveNodeKeyring,
   verifyRouteToken,
 } from "../../../packages/contracts/src/route-token.ts";
+import { MAX_SQL_REQUEST_BYTES } from "../../../packages/contracts/src/edge-sql.ts";
 
 const encodeGssRequest = () => Uint8Array.of(0, 0, 0, 8, 4, 210, 22, 48);
 function encodeCancelRequest(pid: number, secret: number) {
@@ -52,6 +53,9 @@ interface Observation {
   closes: number[];
   byte_count: number;
   text_frames: number;
+  /** An HTTP query, as the gateway received it. */
+  method?: string;
+  body?: string;
 }
 
 test(
@@ -69,11 +73,16 @@ test(
       namespace: string,
       limit: number,
       actor = true,
+      binding: [namespace: string, limit: number] = ["6", 12000],
+      hint?: string,
     ) => ({
       name,
       main,
       compatibility_date: "2026-10-02",
-      vars: { ROUTE_MASTER_KEYS: JSON.stringify(keyring) },
+      vars: {
+        ROUTE_MASTER_KEYS: JSON.stringify(keyring),
+        ...(hint ? { DATABASE_ACTOR_LOCATION_HINT: hint } : {}),
+      },
       ...(actor
         ? {
             durable_objects: {
@@ -99,14 +108,29 @@ test(
           namespace_id: "3",
           simple: { limit: 12000, period: 60 as const },
         },
+        {
+          name: "BINDING_CONNECTION_RATE_LIMITER",
+          namespace_id: binding[0],
+          simple: { limit: binding[1], period: 60 as const },
+        },
       ],
     });
     const server = createTestHarness({
       root: directory,
       workers: [
         { config: edgeConfig("rust-edge", "1", 12000) },
-        { config: edgeConfig("limited-edge", "2", 1) },
+        { config: edgeConfig("limited-edge", "2", 1, true, ["7", 1]) },
         { config: edgeConfig("no-actor-edge", "4", 12000, false) },
+        {
+          config: edgeConfig(
+            "hinted-edge",
+            "8",
+            12000,
+            true,
+            ["6", 12000],
+            "weur",
+          ),
+        },
         {
           config: {
             ...edgeConfig("abort-edge", "5", 12000),
@@ -256,6 +280,16 @@ test(
             node,
           )
         ).keys;
+      // The claims of a route the gateway received, verified with the key of its node.
+      async function claimsOf(token: string, node: string) {
+        const verified = await verifyRouteToken(token, {
+          region,
+          node,
+          keys: await nodeKeys(node),
+        });
+        assert.ok(verified.ok);
+        return verified.claims;
+      }
       // Keeps the Actor from answering the admissions of one database until released.
       const hold = async (database: string, action: "hold" | "release") =>
         assert.equal(
@@ -369,6 +403,71 @@ test(
       }
       const errorFrame = (messages: Uint8Array[]) =>
         messages.some((v) => v[0] === 0x45);
+      // The log line of an event, as the Worker wrote it; `cid` picks one when several were.
+      async function logged(event: string, cid?: string) {
+        let found: Record<string, unknown> | undefined;
+        await until(() => {
+          for (const entry of server.getLogs().toReversed()) {
+            try {
+              const line = JSON.parse(entry.message);
+              if (line.event === event && (!cid || line.cid === cid)) {
+                found = line;
+                return true;
+              }
+            } catch {
+              /* Another line of the log. */
+            }
+          }
+          return false;
+        });
+        return found!;
+      }
+      // A request to the HTTP query endpoint, as the Neon serverless driver sends it.
+      async function query(
+        body: unknown,
+        options: {
+          database: string;
+          worker?: string;
+          method?: string;
+          connection?: string | null;
+          headers?: Record<string, string>;
+        },
+      ) {
+        const connection =
+          options.connection === undefined
+            ? `postgres://app:secret@host.invalid/${options.database}`
+            : options.connection;
+        const response = await server
+          .getWorker(options.worker ?? "rust-edge")
+          .fetch(origin + "/sql", {
+            method: options.method ?? "POST",
+            headers: {
+              "CF-Connecting-IP": "192.0.2.1",
+              "Neon-Raw-Text-Output": "true",
+              "Neon-Array-Mode": "true",
+              ...(connection === null
+                ? {}
+                : { "Neon-Connection-String": connection }),
+              ...options.headers,
+            },
+            body:
+              options.method === "GET"
+                ? undefined
+                : typeof body === "string"
+                  ? body
+                  : JSON.stringify(body),
+          });
+        return {
+          status: response.status,
+          headers: response.headers,
+          json: (await response.json()) as Record<string, unknown>,
+        };
+      }
+      const failure = (code: string, message: string, severity = "ERROR") => ({
+        message,
+        code,
+        severity,
+      });
       await t.test(
         "health, unknown path and upgrade requirements execute inside Wasm",
         async () => {
@@ -539,6 +638,337 @@ test(
           await open(second.database, opts);
           await open(first.database, { ...opts, ip: "2001:db8:1:3::1" });
           assert.equal((await stats()).length, 3);
+        },
+      );
+      await t.test(
+        "a caller without a source IP counts in the limiter of service bindings, not the public ones",
+        async () => {
+          await reset();
+          const first = await seed(),
+            second = await seed();
+          const binding = { worker: "limited-edge", ip: null };
+          await open(first.database, binding);
+          assert.equal(
+            await sqlstate(await open(first.database, binding)),
+            "53300",
+          );
+          // Another database has a budget of its own, and the public limiter was never asked.
+          await open(second.database, binding);
+          await open(first.database, {
+            worker: "limited-edge",
+            ip: "192.0.2.9",
+          });
+          assert.equal((await stats()).length, 3);
+        },
+      );
+      await t.test(
+        "the limiters and the Actor admit together, so a connect the limiter denied was still admitted",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          const opts = { worker: "limited-edge", ip: "198.51.100.7" };
+          await open(database, opts);
+          assert.equal(await sqlstate(await open(database, opts)), "53300");
+          assert.equal((await diagnostics(database)).received.length, 2);
+          assert.equal((await stats()).length, 1);
+        },
+      );
+      await t.test(
+        "the DatabaseActor is got at the configured location hint",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          await open(database, { worker: "hinted-edge" });
+          assert.equal((await stats()).length, 1);
+        },
+      );
+      await t.test(
+        "each connection logs where its time went and which request of its isolate it was",
+        async () => {
+          await reset();
+          const { database, node } = await seed();
+          await open(database);
+          const [row] = await stats();
+          const first = await logged(
+            "conn_admission",
+            (await claimsOf(row!.token, node)).cid,
+          );
+          // The connection id of the log is the one the gateway received in the route.
+          assert.equal(first.database_id, database);
+          assert.equal(first.user, "app");
+          assert.equal(first.region_id, region);
+          assert.equal(first.outcome, "accepted");
+          assert.equal(first.route, "v6");
+          assert.ok(first.colo === null || typeof first.colo === "string");
+          for (const stage of [
+            "duration_ms",
+            "limiters_ms",
+            "admit_ms",
+            "token_ms",
+            "gateway_connect_ms",
+          ])
+            assert.ok(Number(first[stage]) >= 0, stage);
+          // Everything of the upgrade but the gateway's answer: the Edge's own share.
+          assert.equal(
+            first.edge_ms,
+            Number(first.duration_ms) - Number(first.gateway_connect_ms),
+          );
+          await open(database);
+          const [, next] = await stats();
+          const second = await logged(
+            "conn_admission",
+            (await claimsOf(next!.token, node)).cid,
+          );
+          assert.equal(
+            second.isolate_requests,
+            Number(first.isolate_requests) + 1,
+          );
+          // Only admission fields: no route, password or byte counts the Edge never sees.
+          for (const line of [first, second])
+            for (const name of [
+              "token",
+              "password",
+              "ingress_bytes",
+              "egress_bytes",
+            ])
+              assert.equal(name in line, false, name);
+          assert.equal(
+            JSON.stringify([first, second]).includes(row!.token),
+            false,
+          );
+        },
+      );
+      await t.test(
+        "an HTTP query is admitted as a connection is, signed a route and forwarded once",
+        async () => {
+          await reset();
+          const { database, node, instance } = await seed();
+          const answer = await query(
+            { query: "SELECT $1, $2, $3", params: ["x", 2, null] },
+            { database },
+          );
+          assert.equal(answer.status, 200);
+          assert.equal(answer.headers.get("content-type"), "application/json");
+          assert.equal(answer.headers.get("cache-control"), "no-store");
+          assert.deepEqual(answer.json, {
+            fields: [],
+            command: "SELECT",
+            rowCount: 0,
+            rows: [],
+            rowAsArray: true,
+          });
+          let rows = await stats();
+          assert.equal(rows.length, 1);
+          const sent = rows[0]!;
+          // The gateway of the node, at the path of HTTP queries; the caller's headers stay home.
+          assert.equal(sent.path, "/sql");
+          assert.equal(sent.method, "POST");
+          assert.equal(sent.headers["neon-connection-string"], undefined);
+          assert.deepEqual(JSON.parse(sent.body!), {
+            password: Buffer.from("secret").toString("base64url"),
+            queries: [{ query: "SELECT $1, $2, $3", params: ["x", "2", null] }],
+          });
+          const claims = await claimsOf(sent.token, node);
+          assert.equal(claims.v, 6);
+          assert.ok("inst" in claims && claims.inst === instance);
+          assert.equal(claims.db, database);
+          assert.equal(claims.user, "app");
+          // A transaction carries the characteristics of the driver's batch.
+          const batch = await query(
+            { queries: [{ query: "SELECT 1" }, { query: "SELECT 2" }] },
+            {
+              database,
+              headers: {
+                "Neon-Batch-Isolation-Level": "Serializable",
+                "Neon-Batch-Read-Only": "true",
+              },
+            },
+          );
+          assert.equal(batch.status, 200);
+          assert.equal((batch.json.results as unknown[]).length, 2);
+          rows = await stats();
+          assert.deepEqual(JSON.parse(rows[1]!.body!).transaction, {
+            isolation: "Serializable",
+            read_only: true,
+          });
+          // An empty transaction has nothing to run and asks nobody.
+          assert.deepEqual((await query({ queries: [] }, { database })).json, {
+            results: [],
+          });
+          assert.equal((await stats()).length, 2);
+          // A sleeping database is woken by the ticket of its wake, signed as v5.
+          await sleeping(database);
+          assert.equal(
+            (await query({ query: "SELECT 1" }, { database })).status,
+            200,
+          );
+          assert.equal((await claimsOf((await stats())[2]!.token, node)).v, 5);
+        },
+      );
+      await t.test(
+        "an HTTP query that cannot be admitted or understood is refused before the gateway",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          const suspended = await seed();
+          await DB.prepare(
+            "UPDATE databases SET desired_state='suspended',suspension_reason='manual' WHERE id=?",
+          )
+            .bind(suspended.database)
+            .run();
+          await publish(suspended.database);
+          const statement = { query: "SELECT 1" };
+          const refused = [
+            // An unknown database is a wrong password, as on a connection.
+            [
+              await query(statement, { database: id("d") }),
+              failure("28P01", "password authentication failed", "FATAL"),
+            ],
+            [
+              await query(statement, { database: suspended.database }),
+              failure("57P03", "database is not accepting connections"),
+            ],
+            [
+              await query(statement, { database, method: "GET" }),
+              failure("08P01", "HTTP SQL requires POST"),
+            ],
+            [
+              await query(statement, { database, connection: "not a url" }),
+              failure("08P01", "invalid HTTP SQL request"),
+            ],
+            [
+              await query(statement, {
+                database,
+                connection: `postgres://app@host.invalid/${database}`,
+              }),
+              failure("28P01", "password authentication failed", "FATAL"),
+            ],
+            [
+              await query(statement, {
+                database,
+                headers: { "Neon-Array-Mode": "false" },
+              }),
+              failure(
+                "0A000",
+                "only raw text results in array mode are supported",
+              ),
+            ],
+            [
+              await query(statement, {
+                database,
+                headers: { Authorization: "Bearer token" },
+              }),
+              failure("0A000", "authorization tokens are not supported"),
+            ],
+            [
+              await query("{", { database }),
+              failure("08P01", "invalid HTTP SQL request"),
+            ],
+            [
+              await query(
+                { queries: [{ query: "SELECT 1", extra: 1 }] },
+                { database },
+              ),
+              failure("08P01", "invalid HTTP SQL request"),
+            ],
+            [
+              await query("x".repeat(MAX_SQL_REQUEST_BYTES + 1), { database }),
+              failure("54000", "request is too large"),
+            ],
+          ] as const;
+          for (const [answer, expected] of refused) {
+            assert.equal(answer.status, 400);
+            assert.deepEqual(answer.json, expected);
+          }
+          assert.equal((await stats()).length, 0);
+        },
+      );
+      await t.test(
+        "an HTTP query passes on the gateway's error and never retries a lost answer",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          await mode(database, "sql-error");
+          const error = await query(
+            { query: "SELECT * FROM missing" },
+            { database },
+          );
+          assert.equal(error.status, 400);
+          assert.deepEqual(
+            error.json,
+            failure("42P01", "relation does not exist"),
+          );
+          assert.equal((await stats()).length, 1);
+          await reset();
+          await mode(database, "reject");
+          const lost = await query(
+            { query: "INSERT INTO t VALUES (1)" },
+            { database },
+          );
+          assert.equal(lost.status, 400);
+          assert.equal(lost.json.code, "08007");
+          assert.equal((await stats()).length, 1);
+          await reset();
+          await route(database, "gateway_binding='MISSING'");
+          const unconfigured = await query({ query: "SELECT 1" }, { database });
+          assert.deepEqual(
+            unconfigured.json,
+            failure("08006", "gateway connection failed"),
+          );
+          assert.equal((await stats()).length, 0);
+        },
+      );
+      await t.test(
+        "an HTTP query logs its stages without its password, statements or parameters",
+        async () => {
+          await reset();
+          const { database, node } = await seed();
+          await query(
+            {
+              query: "SELECT 'statement-canary'",
+              params: ["parameter-canary"],
+            },
+            {
+              database,
+              connection: `postgres://app:password-canary@host.invalid/${database}`,
+            },
+          );
+          const [row] = await stats();
+          const line = await logged(
+            "sql_admission",
+            (await claimsOf(row!.token, node)).cid,
+          );
+          assert.equal(line.database_id, database);
+          assert.equal(line.user, "app");
+          assert.equal(line.region_id, region);
+          assert.equal(line.outcome, "accepted");
+          assert.equal(line.route, "v6");
+          assert.equal(line.statements, 1);
+          assert.equal(line.gateway_status, 200);
+          for (const stage of [
+            "body_ms",
+            "gateway_ms",
+            "limiters_ms",
+            "admit_ms",
+            "token_ms",
+          ])
+            assert.ok(Number(line[stage]) >= 0, stage);
+          // All but the client's upload and the gateway is the Edge's own.
+          assert.equal(
+            line.edge_ms,
+            Number(line.duration_ms) -
+              Number(line.body_ms) -
+              Number(line.gateway_ms),
+          );
+          const text = JSON.stringify(line);
+          for (const secret of ["canary", "password"])
+            assert.equal(text.includes(secret), false, secret);
+          server.clearLogs();
+          const refused = await query("{", { database });
+          assert.equal(refused.json.code, "08P01");
+          const failed = await logged("sql_admission");
+          assert.equal(failed.outcome, "08P01");
+          assert.equal(failed.gateway_ms, undefined);
         },
       );
       await t.test(
@@ -721,9 +1151,18 @@ test(
           await reset();
           const { database } = await seed();
           await mode(database, "held");
+          server.clearLogs();
           const c = await open(database, { worker: "abort-edge" });
           assert.equal(await sqlstate(c), "08006");
           assert.equal((await stats()).length, 1);
+          // The wait on the upgrade the client interrupted is the gateway's, not the Edge's.
+          const line = await logged("conn_admission");
+          assert.equal(line.outcome, "08006");
+          assert.ok(Number(line.gateway_connect_ms) >= 50);
+          assert.equal(
+            line.edge_ms,
+            Number(line.duration_ms) - Number(line.gateway_connect_ms),
+          );
           await gateway.fetch("/release");
           assert.equal((await stats())[0]!.byte_count, 0);
           assert.equal((await stats()).length, 1);
