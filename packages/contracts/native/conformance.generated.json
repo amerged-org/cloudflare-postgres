@@ -38,6 +38,1322 @@
         "expected": null
       }
     ],
+    "sql": {
+      "connections": [
+        {
+          "header": null,
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "not a url",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "secret"
+            }
+          }
+        },
+        {
+          "header": "postgresql://app:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa?sslmode=require",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "secret"
+            }
+          }
+        },
+        {
+          "header": "postgres://app:p%40ss%2Fword%20x@host.invalid:5432/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "p@ss/word x"
+            }
+          }
+        },
+        {
+          "header": "postgres://app:p%C3%A4ss@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "päss"
+            }
+          }
+        },
+        {
+          "header": "postgres://app:p%E4ss@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:p%zzss@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:p%2@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:p%+1ss@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://ap%70:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "secret"
+            }
+          }
+        },
+        {
+          "header": "postgres://app@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "28P01",
+            "message": "password authentication failed",
+            "severity": "FATAL"
+          }
+        },
+        {
+          "header": "postgres://app:@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "28P01",
+            "message": "password authentication failed",
+            "severity": "FATAL"
+          }
+        },
+        {
+          "header": "postgres://app:secret@host.invalid/aaaaaaaaaaaaaaaaaaaax",
+          "expected": {
+            "ok": false,
+            "code": "3D000",
+            "message": "database does not exist",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:secret@host.invalid/",
+          "expected": {
+            "ok": false,
+            "code": "3D000",
+            "message": "database does not exist",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:secret@host.invalid",
+          "expected": {
+            "ok": false,
+            "code": "3D000",
+            "message": "database does not exist",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://pg_admin:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "28P01",
+            "message": "authentication failed",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres://app:secret@host.invalid/%61aaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "secret"
+            }
+          }
+        },
+        {
+          "header": "postgres:///aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "28P01",
+            "message": "authentication failed",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "postgres:aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "3D000",
+            "message": "database does not exist",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "mysql://app:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": "http://app:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "header": " postgres://app:secret@host.invalid/aaaaaaaaaaaaaaaaaaaa",
+          "expected": {
+            "ok": true,
+            "value": {
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "user": "app",
+              "password": "secret"
+            }
+          }
+        }
+      ],
+      "transactions": [
+        {
+          "headers": {},
+          "expected": {
+            "ok": false,
+            "code": "0A000",
+            "message": "only raw text results in array mode are supported",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true"
+          },
+          "expected": { "ok": true, "value": {} }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "TRUE",
+            "Neon-Array-Mode": "True"
+          },
+          "expected": { "ok": true, "value": {} }
+        },
+        {
+          "headers": { "Neon-Raw-Text-Output": "true" },
+          "expected": {
+            "ok": false,
+            "code": "0A000",
+            "message": "only raw text results in array mode are supported",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "false",
+            "Neon-Array-Mode": "true"
+          },
+          "expected": {
+            "ok": false,
+            "code": "0A000",
+            "message": "only raw text results in array mode are supported",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Authorization": "Bearer token"
+          },
+          "expected": {
+            "ok": false,
+            "code": "0A000",
+            "message": "authorization tokens are not supported",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Authorization": ""
+          },
+          "expected": {
+            "ok": false,
+            "code": "0A000",
+            "message": "authorization tokens are not supported",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Isolation-Level": "Serializable"
+          },
+          "expected": { "ok": true, "value": { "isolation": "Serializable" } }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Isolation-Level": "ReadCommitted"
+          },
+          "expected": { "ok": true, "value": { "isolation": "ReadCommitted" } }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Isolation-Level": "serializable"
+          },
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Read-Only": "true"
+          },
+          "expected": { "ok": true, "value": { "read_only": true } }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Read-Only": "false",
+            "Neon-Batch-Deferrable": "true"
+          },
+          "expected": {
+            "ok": true,
+            "value": { "read_only": false, "deferrable": true }
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Read-Only": "TRUE"
+          },
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Deferrable": "1"
+          },
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "headers": {
+            "Neon-Raw-Text-Output": "true",
+            "Neon-Array-Mode": "true",
+            "Neon-Batch-Isolation-Level": "RepeatableRead",
+            "Neon-Batch-Read-Only": "true",
+            "Neon-Batch-Deferrable": "false"
+          },
+          "expected": {
+            "ok": true,
+            "value": {
+              "isolation": "RepeatableRead",
+              "read_only": true,
+              "deferrable": false
+            }
+          }
+        }
+      ],
+      "bodies": [
+        {
+          "text": "",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "null",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "1",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "\"text\"",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "[]",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "[1]",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\"}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT 1", "params": [] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"params\":[]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT 1", "params": [] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"params\":null}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT 1", "params": [] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"params\":{}}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"params\":\"x\"}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"params\":[[1]]}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"params\":[{}]}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT 1\",\"extra\":1}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":1}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"query\":\"a\",\"query\":\"b\"}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "b", "params": [] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1, $2, $3, $4\",\"params\":[\"a\",null,true,false]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                {
+                  "query": "SELECT $1, $2, $3, $4",
+                  "params": ["a", null, "true", "false"]
+                }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT \\u00e9, \\ud83d\\ude00, \\n, \\u0001, \\\"\",\"params\":[\"\\u00e9\\u0000x\"]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                {
+                  "query": "SELECT é, 😀, \n, \u0001, \"",
+                  "params": ["é\u0000x"]
+                }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[-1]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["-1"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[-0]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["0"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[0.0]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["0"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1.0]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1.5]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1.5"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[0.1]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["0.1"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[3.14159265358979]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["3.14159265358979"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[100]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["100"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1e3]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1000"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1E3]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1000"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1e21]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1e+21"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1e20]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["100000000000000000000"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[123456789012345678901234567890]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["1.2345678901234568e+29"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[9007199254740993]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["9007199254740992"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[0.000001]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["0.000001"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[0.0000001]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1e-7"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1.5e-7]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1.5e-7"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1.7976931348623157e308]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["1.7976931348623157e+308"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[5e-324]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["5e-324"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[2.2250738585072014e-308]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["2.2250738585072014e-308"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[8.41e21]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["8.41e+21"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[0.30000000000000004]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["0.30000000000000004"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1.00000000000000011102230246251565404236316680908203125]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["1"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[123456789.123456789]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["123456789.12345679"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[1.2345678901234567e25]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["1.2345678901234566e+25"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[4.35e-100]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [{ "query": "SELECT $1", "params": ["4.35e-100"] }],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"query\":\"SELECT $1\",\"params\":[9.5367431640625e-7]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT $1", "params": ["9.5367431640625e-7"] }
+              ],
+              "batch": false
+            }
+          }
+        },
+        {
+          "text": "{\"queries\":[]}",
+          "expected": { "ok": true, "value": { "queries": [], "batch": true } }
+        },
+        {
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\"},{\"query\":\"SELECT $1\",\"params\":[\"x\"]}]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT $1", "params": ["x"] }
+              ],
+              "batch": true
+            }
+          }
+        },
+        {
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\"}],\"extra\":1}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"queries\":{}}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"queries\":null}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"queries\":[1]}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\",\"extra\":1}]}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"}]}",
+          "expected": {
+            "ok": true,
+            "value": {
+              "queries": [
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] },
+                { "query": "SELECT 1", "params": [] }
+              ],
+              "batch": true
+            }
+          }
+        },
+        {
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"},{\"query\":\"SELECT 1\"}]}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "text": "﻿{\"query\":\"SELECT 1\"}",
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        }
+      ],
+      "decoded": [
+        {
+          "bytes": [
+            123, 34, 113, 117, 101, 114, 121, 34, 58, 34, 195, 169, 34, 125
+          ],
+          "expected": { "ok": true, "value": "{\"query\":\"é\"}" }
+        },
+        {
+          "bytes": [239, 187, 191, 123, 125],
+          "expected": { "ok": true, "value": "{}" }
+        },
+        {
+          "bytes": [123, 255, 125],
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "bytes": [195, 40],
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        {
+          "bytes": [237, 160, 128],
+          "expected": {
+            "ok": false,
+            "code": "08P01",
+            "message": "invalid HTTP SQL request",
+            "severity": "ERROR"
+          }
+        },
+        { "bytes": [], "expected": { "ok": true, "value": "" } }
+      ],
+      "forwards": [
+        {
+          "password": "secret",
+          "text": "{\"query\":\"SELECT 1\"}",
+          "transaction": {},
+          "expected": {
+            "ok": true,
+            "value": "{\"password\":\"c2VjcmV0\",\"queries\":[{\"query\":\"SELECT 1\",\"params\":[]}]}"
+          }
+        },
+        {
+          "password": "päss/wörd+x",
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\"},{\"query\":\"SELECT $1\",\"params\":[null]}]}",
+          "transaction": {
+            "isolation": "Serializable",
+            "read_only": true,
+            "deferrable": false
+          },
+          "expected": {
+            "ok": true,
+            "value": "{\"password\":\"cMOkc3Mvd8O2cmQreA\",\"queries\":[{\"query\":\"SELECT 1\",\"params\":[]},{\"query\":\"SELECT $1\",\"params\":[null]}],\"transaction\":{\"isolation\":\"Serializable\",\"read_only\":true,\"deferrable\":false}}"
+          }
+        },
+        {
+          "password": "secret",
+          "text": "{\"queries\":[{\"query\":\"SELECT 1\"}]}",
+          "transaction": {},
+          "expected": {
+            "ok": true,
+            "value": "{\"password\":\"c2VjcmV0\",\"queries\":[{\"query\":\"SELECT 1\",\"params\":[]}],\"transaction\":{}}"
+          }
+        }
+      ]
+    },
     "signing": [
       {
         "region": "eu-test",

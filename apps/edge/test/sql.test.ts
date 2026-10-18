@@ -13,7 +13,7 @@ import {
 } from "@pgcf/contracts/route-token";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
-import { MAX_SQL_REQUEST_BYTES } from "../src/sql.ts";
+import { MAX_SQL_REQUEST_BYTES } from "@pgcf/contracts/edge-sql";
 import type { DatabaseWakeAdmission, Env } from "../src/env.ts";
 
 const testEnv = env as unknown as Env & { GATEWAY: Fetcher };
