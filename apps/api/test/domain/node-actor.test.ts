@@ -13,6 +13,11 @@ import {
   NODE_UID_HEADER,
 } from "../../src/node-actor.ts";
 import {
+  choosePlacement,
+  placementNodes,
+  type PlacementNeed,
+} from "../../src/domain/placement.ts";
+import {
   cleanupFixtures,
   fixture,
   nodeRequest,
@@ -32,6 +37,11 @@ afterEach(async () => {
 });
 
 const MINUTE = 60_000;
+const placementNeed: PlacementNeed = {
+  memory_mib: 256,
+  cpu_millicores: 500,
+  storage_gib: 5,
+};
 const actor = (node: string) =>
   env.NODE_ACTOR.get(env.NODE_ACTOR.idFromName(node));
 const closed = (socket: WebSocket) =>
@@ -333,6 +343,43 @@ describe("the samples of a node", () => {
     it("refreshes the vitals at the rollover", () => rollOver(false));
     it("refreshes the vitals at the rollover also when the alarm already wrote the minute", () =>
       rollOver(true));
+  });
+
+  it("leaves what placement reads: the newest sample and the averages of the minutes", async () => {
+    const f = await fixture(0);
+    const socket = await connect(f);
+    const start = Math.floor((Date.now() - 20 * MINUTE) / MINUTE) * MINUTE;
+    // Twelve minutes of one sample each at 25 % RAM and 20 % CPU, the last minute still open.
+    for (let i = 0; i < 12; i++) {
+      socket.send(sampleMessage(start + i * MINUTE + 5_000));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    // The alarm of the minute still open may have written its row as well.
+    await until(
+      async () =>
+        (await minutes(f.node)).filter(
+          (row) => row.minute! < start / MINUTE + 11,
+        ).length === 11,
+    );
+    const last = start + 11 * MINUTE + 5_000;
+    const now = last + 1_000;
+    const node = (await placementNodes(env.DB, f.region, now)).find(
+      (value) => value.id === f.node,
+    )!;
+    expect(node).toMatchObject({
+      sampled_at: new Date(last).toISOString(),
+      memory_total_bytes: 12 * 1024 ** 3,
+      cpu_cores: 6,
+      room: 1,
+      pool_data_total_bytes: 125 * 1024 ** 3,
+      pool_nominal_bytes: 300 * 1024 ** 3,
+      // 3 GiB of 12 in use, 1200 of 6000 millicores busy: a node with less than 30 minutes of
+      // history has one average over all of it.
+      ram_peak_ppm: 250_000,
+      cpu_peak_ppm: 200_000,
+    });
+    expect(choosePlacement([node], placementNeed, now)?.id).toBe(f.node);
+    socket.close(1000);
   });
 
   it("opens an enrolled node for placement at its first sample and keeps a lost node closed", async () => {
