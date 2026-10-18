@@ -255,13 +255,16 @@ package from creating a default cluster.
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
   `ProtectSystem=strict` with only the data directory writable; `ProtectHome`, `PrivateTmp`,
-  `PrivateDevices`, a private `/dev/shm` of 64 MiB (`TemporaryFileSystem`; a database's own size
-  goes in a drop-in that applies at its next start); `ProtectKernelTunables/Modules/Logs`,
-  `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`,
-  `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`,
-  `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`, `RemoveIPC`;
-  `SystemCallFilter=@system-service ~@privileged ~@resources` (a forbidden call kills the process),
-  `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+  `PrivateDevices`, a private `/dev/shm` of 64 MiB mounted `noexec,nosuid,nodev`
+  (`TemporaryFileSystem`; a database's own size goes in a drop-in that applies at its next start);
+  `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
+  `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
+  `RestrictSUIDSGID`, `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`,
+  `RemoveIPC`; `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
+  kernel exploits use as a second stage and PostgreSQL does not need (`@keyring`,
+  `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
+  `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
+  call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
 - **Not set:** `PrivatePIDs` and `PrivateIPC`, because PostgreSQL's `postmaster.pid` interlock needs
   them off (the lab showed a second unit on the same directory being refused); `unix_socket_group`,
   because PostgreSQL would call `chown`, which the filter kills.
@@ -295,6 +298,8 @@ while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
   --type thin-pool --name pgcf_thinpool --chunksize 64K --zero y --poolmetadatasize 1G --extents
   100%FREE pgcf`, then `lvchange --errorwhenfull y pgcf/pgcf_thinpool`. On a 33 GiB partition this
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
+- `/var/lib/pgcf/db` is mode 0711 (the agent creates it so, and tmpfiles resets it at every boot): a
+  database reaches its own directory but cannot list the other databases' IDs.
 - Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
   the data directory `data` inside. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
   `pgcf-gateway`, mode 0750) when it creates a database and again for every database when it
@@ -333,8 +338,10 @@ while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
   except replies to the node's own flows and IPv6 neighbour discovery (hop limit 255). sshd, the
   gateway and cloudflared's metrics listen on loopback only; PostgreSQL listens on no address.
 - **Kernel.** [90-pgcf.conf](mkosi.extra/usr/lib/sysctl.d/90-pgcf.conf) turns off unprivileged user
-  namespaces and BPF, restricts kernel pointers, `dmesg` and `ptrace`, disables forwarding and
-  redirects, and reboots 10 s after a panic or oops (the agent recovers unproven databases at boot).
+  namespaces and BPF, turns off io_uring (`kernel.io_uring_disabled = 2`: nothing on the node uses
+  it, and PostgreSQL runs `io_method=worker`) and the autoload of terminal line disciplines,
+  restricts kernel pointers, `dmesg` and `ptrace`, disables forwarding and redirects, and reboots
+  10 s after a panic or oops (the agent recovers unproven databases at boot).
 - **Journal.** [journald](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf.conf) keeps at most
   1 GiB, at least 2 GiB free and 14 days on the 8 GiB root.
 
@@ -401,5 +408,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
-| Second | no failed unit; loopback only; inbound policy drop; the binaries; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
+| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
+| Second | no failed unit; loopback only; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |

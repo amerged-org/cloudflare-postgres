@@ -155,6 +155,48 @@ database_unit_has_no_start_pre() {
 	[ -z "$(systemctl show --property=ExecStartPre --value pgcf-pg@pgcfboottest0000000.service)" ]
 }
 
+# Plan 8: the filter is an allow-list (@system-service) with the deny lines subtracted, and systemd
+# reports what is left. A database's user must not reach io_uring, userfaultfd, the kernel keyring,
+# the message queues or the SysV semaphores; PostgreSQL's shared memory calls must stay.
+database_unit_syscall_filter() {
+	local allowed name
+	allowed=$(systemctl show --property=SystemCallFilter --value pgcf-pg@pgcfboottest0000000.service | tr ' ' '\n')
+	for name in shmget shmat shmdt shmctl; do
+		grep -qx "$name" <<<"$allowed" || {
+			echo "denied $name"
+			return 1
+		}
+	done
+	for name in io_uring_setup io_uring_enter io_uring_register userfaultfd add_key keyctl request_key \
+		msgget msgsnd msgrcv msgctl semget semop semtimedop semctl \
+		mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr; do
+		if grep -qx "$name" <<<"$allowed"; then
+			echo "allowed $name"
+			return 1
+		fi
+	done
+}
+
+sysctl_is() {
+	local value
+	value=$(sysctl -n "$1") || return 1
+	[ "$value" = "$2" ] || {
+		echo "$1 = $value"
+		false
+	}
+}
+
+# The agent creates /var/lib/pgcf/db 0711 (store.rs) and tmpfiles resets it at every boot: a
+# database's user reaches its own directory but cannot list the other databases' IDs.
+database_directory_not_listable() {
+	local mode
+	mode=$(stat -c %a /var/lib/pgcf/db) || return 1
+	[ "$mode" = 711 ] || {
+		echo "mode $mode"
+		false
+	}
+}
+
 # systemd nests a slice whose name has a dash inside the slice before the dash. A backup job must
 # not run under the databases' slice and its memory ceiling.
 backup_slice_top_level() {
@@ -173,12 +215,16 @@ check no_failed_units no_failed_units
 check loopback_only loopback_only
 check inbound_dropped inbound_dropped
 check binaries binaries
+check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
+check tty_ldisc_autoload_off sysctl_is dev.tty.ldisc_autoload 0
+check database_directory_not_listable database_directory_not_listable
 if [ "$phase" = 1 ]; then
 	check root_grown root_grown
 	check lvm_partition lvm_partition
 	check database_unit_sandbox database_unit_sandbox
 	check database_unit_waits_for_recovery database_unit_waits_for_recovery
 	check database_unit_has_no_start_pre database_unit_has_no_start_pre
+	check database_unit_syscall_filter database_unit_syscall_filter
 	check backup_slice_top_level backup_slice_top_level
 fi
 check pool wait_for 120 pool

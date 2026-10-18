@@ -1148,8 +1148,8 @@ That covers a crash, a reboot or a Contabo shutdown that stopped PostgreSQL with
 **Per-database isolation** on a shared kernel. Each database has:
 - its own Linux user;
 - no network;
-- a read-only system and private `/tmp`, devices and `/dev/shm`;
-- seccomp and no capabilities;
+- a read-only system and private `/tmp`, devices and `/dev/shm` (no code, no setuid file, no device node in it);
+- seccomp without io_uring, userfaultfd, the kernel keyring and the message queues, and no capabilities;
 - its own memory, CPU, IO and task limits;
 - its own filesystem on its own thin volume, mounted 0700;
 - zeroed chunks;
@@ -1189,7 +1189,7 @@ A reinstall issues a new token, and a lost node's key is restricted to the fence
 - Scoped to a project: another project's resource answers 404.
 - Exercised live in Stage 5.8.
 
-**Kernel security.** Isolation rests on the shared kernel, so kernel fixes reach nodes on a fixed schedule (section 9.3).
+**Kernel security.** Isolation rests on the shared kernel, so kernel fixes reach nodes on a fixed schedule (section 9.3). The image also shrinks what a database's user can ask of that kernel: `kernel.io_uring_disabled = 2`, `dev.tty.ldisc_autoload = 0`, and `/var/lib/pgcf/db` at 0711, so no database can list the others' IDs.
 
 **Repository rules.** Never print or commit secrets, `.env*` files, node keys, Tunnel or enrollment tokens, or R2 keys. Never content-search private files.
 
@@ -1877,10 +1877,10 @@ Key external references:
 - **OOM:** `OOMPolicy=continue`, `OOMScoreAdjust=-900`, `PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj`, `PG_OOM_ADJUST_VALUE=0` (*measured (lab)*: postmaster -900, children 0).
 - **Sandbox:**
   - network: `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
-  - filesystem: `ProtectSystem=strict` with `ReadWritePaths` limited to its data and socket directories; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `TemporaryFileSystem=/dev/shm:size=<from memory size>,mode=1777` (without the mode PostgreSQL cannot create its segments; Stage 1);
+  - filesystem: `ProtectSystem=strict` with `ReadWritePaths` limited to its data and socket directories; `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `TemporaryFileSystem=/dev/shm:size=<from memory size>,mode=1777,noexec,nosuid,nodev` (without the mode PostgreSQL cannot create its segments; Stage 1);
   - kernel and processes: `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectProc=invisible`, `ProcSubset=pid`;
   - privileges: `RestrictNamespaces`, `RestrictSUIDSGID`, `NoNewPrivileges`, empty `CapabilityBoundingSet`;
-  - system calls and memory: `SystemCallFilter=@system-service ~@privileged ~@resources`, `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`;
+  - system calls and memory: `SystemCallFilter=@system-service`, then `~@privileged @resources`, then `~@keyring io_uring_setup io_uring_enter io_uring_register userfaultfd msgget msgsnd msgrcv msgctl semget semop semtimedop semctl mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr` (`@system-service` allows these, they are the usual second stage of a kernel exploit, and PostgreSQL uses none: `io_method=worker`, SysV shared memory, unnamed POSIX semaphores; `shmget`, `shmat`, `shmdt` and `shmctl` stay), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`;
   - IPC: `RemoveIPC=yes`, which removes the SysV segment a killed postmaster leaves behind (Stage 1 rerun, segments selected by uid, 11.1).
 - **Start cost** (Stage 1, EU1, 11.1): the mount and network namespaces add about 47 / 30 ms (p50 / p95) per start on the committed unit without its `ExecStartPre=` and 34 / 56 ms on the lab unit (both in the first session, in separate sets about 66 minutes apart); every `ExecStartPre=` adds about 26–35 ms (p50; two interleaved sets in two sessions), because systemd spawns one more process through its executor; a per-unit `CPUWeight` in `pgcf.slice` cost nothing in the rerun and at most 20 ms at p50 in the first session.
 - **Not set:**
