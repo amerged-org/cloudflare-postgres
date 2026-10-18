@@ -89,10 +89,10 @@ snapshot and on apt-archive.postgresql.org.
 
 | Component | License | Role |
 | --- | --- | --- |
-| [Debian 13 "trixie"](https://www.debian.org/) packages, Linux 6.12 | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
+| [Debian 13 "trixie"](https://www.debian.org/) packages at snapshot `20261016T133910Z`, Linux 6.12.113 (`6.12.113-1`) | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
 | [systemd 257](https://github.com/systemd/systemd) | LGPL-2.1-or-later | Units, sandboxing, cgroups, credentials, first-boot partitioning |
 | [GRUB 2](https://www.gnu.org/software/grub/) | GPL-3.0-or-later | BIOS and UEFI boot loader |
-| [PostgreSQL 18.6](https://www.postgresql.org/) (PGDG `18.6-1.pgdg13+2`) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
+| [PostgreSQL 18.6](https://www.postgresql.org/) (PGDG `18.6-1.pgdg13+2`, with its `libpq5` pinned to the same version) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
 | [pgvector 0.8.7](https://github.com/pgvector/pgvector) (PGDG `0.8.7-1.pgdg13+1`) | PostgreSQL License | Extension |
 | [barman-cli-cloud 3.20.1](https://github.com/EnterpriseDB/barman) (PGDG `3.20.1-1.pgdg13+1`) | GPL-3.0 | WAL archive, base backup and restore to R2; run as a separate program, not linked |
 | [lvm2](https://sourceware.org/lvm2/), [thin-provisioning-tools](https://github.com/jthornber/thin-provisioning-tools) | GPL-2.0, LGPL-2.1 / GPL-3.0 | Thin pool and volumes, run as separate programs |

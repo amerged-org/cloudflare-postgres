@@ -22,10 +22,10 @@ export type Env = Cloudflare.Env & {
   NODE_GATEWAY_ZONE_ID?: string;
   NODE_GATEWAY_DOMAIN?: string;
   /**
-   * "true" gives every node a shell hostname (`<node>-ssh.<domain>`, with its DNS record and Tunnel
-   * ingress rule); any other value, or none, gives none and removes the one a node has. Leave it
-   * off until Cloudflare Access guards the shell (ULTRA plan 8): without Access the hostname is
-   * reachable by anyone who can run cloudflared.
+   * "true" gives every node a shell hostname (`pgcf-shell-<id>.<domain>`, with its DNS record and
+   * Tunnel ingress rule); any other value, or none, gives none and removes the one a node has. Leave
+   * it off until Cloudflare Access guards the shell (`scripts/operations/setup-access.ts --shell`,
+   * ULTRA plan 8): without Access the hostname is reachable by anyone who can run cloudflared.
    */
   NODE_SHELL_HOSTNAME?: string;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
@@ -36,7 +36,12 @@ export type Env = Cloudflare.Env & {
   ARCHIVE_BINDINGS?: string;
   ARCHIVE_EU?: R2Bucket;
   ARCHIVE_US?: R2Bucket;
-  BOOTSTRAP_FIREWALL_BINDINGS: string;
+  /**
+   * The Contabo firewall every node sits behind: active, no inbound rule that accepts, created
+   * once by the operator (docs/operations/operator-installation.md). AddNode assigns an instance
+   * it does not list and sends no rescue until it does.
+   */
+  CONTABO_NODE_FIREWALL_ID: string;
   CONTABO_ORDER_DEFAULT_USER: string;
   CONTABO_ORDER_SSH_KEY_IDS: string;
 };

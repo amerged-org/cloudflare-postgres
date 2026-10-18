@@ -61,6 +61,7 @@ interface AdditionRow {
   receipt_json: string | null;
   audit_json: string | null;
   failure_code: NodeAddition["failure_code"];
+  install_blocker: NodeAddition["install_blocker"];
   created_at: string;
   updated_at: string;
 }
@@ -124,6 +125,7 @@ async function view(row: AdditionRow): Promise<NodeAddition> {
     receipt: json(row.receipt_json),
     audit: json(row.audit_json),
     failure_code: row.failure_code,
+    install_blocker: row.install_blocker,
     created_at: row.created_at,
     updated_at: row.updated_at,
   });
@@ -953,7 +955,27 @@ export async function markNodeBootstrapping(
       "conflict",
       "Only an audited server starts its installation",
     );
-  return changed(db, addition, "status='bootstrapping'", []);
+  return changed(
+    db,
+    addition,
+    "status='bootstrapping',install_blocker=NULL",
+    [],
+  );
+}
+/** What keeps an audited server from being sent its installer; the next pass asks again. */
+export async function markNodeInstallBlocked(
+  db: D1Database,
+  addition: NodeAddition,
+  blocker: NonNullable<NodeAddition["install_blocker"]>,
+): Promise<NodeAddition> {
+  if (addition.status !== "audited")
+    throw new NodeStateError(
+      "conflict",
+      "Only an audited server waits to start its installation",
+    );
+  return addition.install_blocker === blocker
+    ? addition
+    : changed(db, addition, "install_blocker=?", [blocker]);
 }
 export async function markNodeAdditionFailed(
   db: D1Database,
@@ -968,14 +990,22 @@ export async function markNodeAdditionFailed(
       "conflict",
       "Completed node state cannot be failed",
     );
-  return changed(db, addition, "status='failed',failure_code=?", [code]);
+  return changed(
+    db,
+    addition,
+    "status='failed',failure_code=?,install_blocker=NULL",
+    [code],
+  );
 }
-/** Tombstone only an audited adoption before any provider-host, installation or cluster progress. */
+/**
+ * Tombstone only an audited adoption before the rescue was requested or any cluster progress. The
+ * install cycle may have assigned the server to the node firewall already; that stays (the
+ * operator unassigns it by hand, docs/operations/operator-installation.md).
+ */
 export async function cancelAuditedNodeAdoption(
   db: D1Database,
   addition: NodeAddition,
   expectedRevision: number,
-  owner: { tenant_id: string; customer_id: string },
 ): Promise<NodeAddition> {
   revision(addition, expectedRevision);
   if (
@@ -999,7 +1029,7 @@ export async function cancelAuditedNodeAdoption(
   return changed(
     db,
     addition,
-    "status='cancelled',slot_held=0",
+    "status='cancelled',slot_held=0,install_blocker=NULL",
     [],
     `AND status='audited' AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=? AND intent_json=?
       AND dispatch_request_id IS NULL AND requested_instance_id=? AND provider_instance_id=?
@@ -1007,12 +1037,7 @@ export async function cancelAuditedNodeAdoption(
       AND NOT EXISTS(SELECT 1 FROM node_installs i WHERE i.node_id=node_additions.node_id AND i.rescue_requested_at IS NOT NULL)
       AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id AND r.provider='contabo' AND r.provider_region=?)
       AND NOT EXISTS(SELECT 1 FROM node_provider_mutations m WHERE m.operation_id=node_additions.operation_id)
-      AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)
-      AND NOT EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_additions.operation_id AND
-        (f.node_id<>node_additions.node_id OR f.region_id<>node_additions.region_id OR f.intent_hash<>node_additions.intent_hash
-          OR f.provider_instance_id<>node_additions.provider_instance_id OR f.provider_region<>? OR f.product_id<>? OR f.image_id<>?
-          OR f.tenant_id<>? OR f.customer_id<>? OR f.firewall_id IS NOT NULL OR f.result_json IS NOT NULL
-          OR f.state NOT IN('claimed','blocked') OR (f.state='blocked' AND f.failure_code IS NOT 'readback_unavailable')))`,
+      AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)`,
     [
       addition.intent.node_id,
       addition.intent.request.region_id,
@@ -1024,11 +1049,6 @@ export async function cancelAuditedNodeAdoption(
       canonical(addition.audit),
       addition.approval === null ? null : canonical(addition.approval),
       addition.audit.provider_region,
-      addition.audit.provider_region,
-      addition.audit.product_id,
-      addition.audit.image_id,
-      owner.tenant_id,
-      owner.customer_id,
     ],
   );
 }
@@ -1057,7 +1077,7 @@ export async function cancelProviderCancelledNodeAddition(
   return changed(
     db,
     addition,
-    "status='cancelled',slot_held=0",
+    "status='cancelled',slot_held=0,install_blocker=NULL",
     [],
     `AND status=? AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=?
       AND dispatch_request_id=? AND provider_instance_id=? AND receipt_json=?

@@ -37,10 +37,10 @@
     // uses) and, for the node's Tunnel and its hostnames, NODE_GATEWAY_DOMAIN and
     // NODE_GATEWAY_ZONE_ID (see the secrets below). A node whose region has no release assigned
     // waits for one.
-    // NODE_SHELL_HOSTNAME: "true" also gives each node a shell hostname (<node>-ssh.<domain>) on its
-    // Tunnel; any other value, or none (the default), gives none and removes the one a node has.
-    // Keep it off until Cloudflare Access guards the shell: otherwise anyone who can run cloudflared
-    // reaches it.
+    // NODE_SHELL_HOSTNAME: "true" also gives each node a shell hostname (pgcf-shell-<id>.<domain>) on
+    // its Tunnel; any other value, or none (the default), gives none and removes the one a node has.
+    // Keep it off until Cloudflare Access guards the shell (scripts/operations/setup-access.ts
+    // --shell): otherwise anyone who can run cloudflared reaches it.
     // Alternatively set INFRASTRUCTURE_ALERT_WEBHOOK_URL to the receiver's HTTPS endpoint.
     // Import INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN as a private Worker secret.
     "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",
@@ -48,7 +48,10 @@
     // Set the same value on the Edge Worker. An existing object never moves.
     "DATABASE_ACTOR_LOCATION_HINT": "weur",
     "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
-    "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",
+    // The id of the Contabo firewall every node sits behind: active, created once with no inbound
+    // rule, as docs/operations/operator-installation.md describes. AddNode sends the installer's
+    // rescue only once the firewall lists the instance.
+    "CONTABO_NODE_FIREWALL_ID": "<CONTABO_NODE_FIREWALL_ID>",
     "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",

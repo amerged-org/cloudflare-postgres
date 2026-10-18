@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
+import { nodeAdditionHostname, nodeShellHostname } from "@pgcf/contracts/nodes";
 import { cloudflareApi } from "../providers/cloudflare.ts";
 
 /**
@@ -8,8 +8,11 @@ import { cloudflareApi } from "../providers/cloudflare.ts";
  * operator shell. The Tunnel, its ingress and the DNS records that point at it are made by whoever
  * first asks for them and found again by every later call, so a read of the node's credentials
  * that failed half way is repeated whole. While `shell` is off, the call also removes the shell's
- * ingress rule and DNS record a node got before. Fencing (`fence-actions.ts`) deletes the Tunnel
- * by the same name, because nothing else ties the Tunnel to the node.
+ * ingress rule and DNS record a node got before. The gateway (`pgcf-node-<id>`) and the shell
+ * (`pgcf-shell-<id>`) hostnames are two families that Cloudflare Access guards with a wildcard each
+ * (`scripts/operations/setup-access.ts`), so no hostname of one may match the other's wildcard.
+ * Fencing (`fence-actions.ts`) deletes the Tunnel by the same name, because nothing else ties the
+ * Tunnel to the node.
  */
 export const nodeTunnelName = nodeAdditionHostname;
 
@@ -67,7 +70,9 @@ export async function ensureNodeTunnel(
     throw new Error("invalid node tunnel configuration");
   const name = nodeTunnelName(nodeId),
     gateway = `${name}.${services.domain}`,
-    shell = `${name}-ssh.${services.domain}`,
+    shell = `${nodeShellHostname(nodeId)}.${services.domain}`,
+    // The shell's hostname before it had a family of its own: `pgcf-node-*` would cover it.
+    legacyShell = `${name}-ssh.${services.domain}`,
     call = cloudflareApi(services.token, services.fetcher),
     base = `/accounts/${services.accountId}/cfd_tunnel`;
   const listed = await call(
@@ -121,8 +126,12 @@ export async function ensureNodeTunnel(
       await call("PUT", `${dns}/${have.id}`, wanted);
     }
   }
-  if (!services.shell) {
-    const have = await recordOf(shell);
+  // The ingress above no longer names any of these; their records go too. The former name is
+  // deleted whatever `shell` says: a node that got one before the rename still has the record.
+  for (const hostname of services.shell
+    ? [legacyShell]
+    : [shell, legacyShell]) {
+    const have = await recordOf(hostname);
     if (have !== undefined) {
       if (typeof have.id !== "string") throw new Error("cloudflare_api_failed");
       await call("DELETE", `${dns}/${have.id}`);

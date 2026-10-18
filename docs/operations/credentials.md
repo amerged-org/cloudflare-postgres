@@ -1,7 +1,8 @@
 # Manual credential changes
 
 Operational Cloudflare, R2 and PGCF credentials have no configured expiry in the current
-operator installation. Keep their scopes limited to the account, buckets and services they use.
+operator installation, except the Edge's Access service token below. Keep their scopes limited to
+the account, buckets and services they use.
 Routing capabilities, control messages, provider access tokens and certificates retain their
 security deadlines.
 
@@ -26,6 +27,16 @@ with its other credentials) and update the gateways first; activate the new mast
 only after the gateways accept it. Existing routing tokens
 expire within their configured short window. Verify a fresh connection before retiring the old
 key. Do not change an agent key as a side effect of a redeploy.
+
+For the Edge's Access service token (`ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`), rotate the
+token's secret in Zero Trust with a grace period; the Client ID stays the same. Set the new
+`ACCESS_CLIENT_SECRET` on the Edge, check a fresh connection and an HTTP query, then let the grace
+period end (or end it early on the rotate call). Never revoke or delete the token itself: Access
+revokes by deleting the token, which removes the new secret too, and every public-gateway
+connection and HTTP query then fails. The token expires after the duration chosen when it was
+created (8760h in the operator installation), after which Access refuses the Edge in the same way.
+Refresh it in Zero Trust (or with the Refresh endpoint, one more year) before then, and turn on the
+Zero Trust "Expiring Access Service Token" notification, which warns a week ahead.
 
 For `CREDENTIAL_KEYS`, adding a new active key ID does not make old ciphertext disposable. Retain
 all key IDs referenced by database roles, deleted-source archives and older D1 exports. Back up

@@ -774,148 +774,14 @@ function firewall(
     updatedDate: new Date().toISOString(),
   };
 }
-it("creates an empty unattached firewall definition without purchase fields and reads its exact owned identity", async () => {
+it("firewall reads and assignment receipts preserve identity without claiming deployment ready", async () => {
   const f = setup(),
-    firewallId = value(),
-    input = {
-      name: value(),
-      description: value(),
-      status: "active" as const,
-      rules: { inbound: [] },
-    },
-    created = {
-      ...firewall(f, firewallId, []),
-      ...input,
-      instances: [],
-      instanceStatus: [],
-    };
-  f.set((url, init) => {
-    if (init.method === "POST") {
-      expect(url.pathname).toBe("/v1/firewalls");
-      expect(JSON.parse(String(init.body))).toEqual(input);
-      expect(new Headers(init.headers).get("x-request-id")).toBe(f.requestId);
-      return Response.json(
-        { data: [created], _links: { self: `/v1/firewalls/${firewallId}` } },
-        { status: 201 },
-      );
-    }
-    expect(url.searchParams.get("name")).toBe(input.name);
-    return Response.json({
-      data: [created],
-      _pagination: { page: 1, size: 100, totalElements: 1, totalPages: 1 },
-      _links: { self: url.pathname, first: url.pathname, last: url.pathname },
-    });
-  });
-  expect(
-    await f.client.createFirewall(input, { requestId: f.requestId }),
-  ).toMatchObject({ kind: "accepted", value: { firewallId, instances: [] } });
-  expect(
-    await f.client.listFirewalls({ name: input.name }, { requestId: value() }),
-  ).toMatchObject([{ firewallId }]);
-  await expect(
-    f.client.createFirewall({ ...input, addOns: {} } as typeof input, {
-      requestId: value(),
-    }),
-  ).rejects.toMatchObject({ code: "invalid_input" });
-  expect(f.posts()).toHaveLength(1);
-});
-it("accepts the actual empty filtered firewall page with an empty last link", async () => {
-  const f = setup(),
-    name = value();
-  f.set((url) =>
-    Response.json({
-      data: [],
-      _pagination: { size: 100, totalElements: 0, totalPages: 0, page: 1 },
-      _links: {
-        first: url.pathname + url.search,
-        previous: "",
-        next: "",
-        last: "",
-        self: url.pathname,
-      },
-    }),
-  );
-  expect(
-    await f.client.listFirewalls({ name }, { requestId: f.requestId }),
-  ).toEqual([]);
-  expect(f.posts()).toHaveLength(0);
-  f.set((url) =>
-    Response.json({
-      data: [],
-      _pagination: { size: 100, totalElements: 1, totalPages: 1, page: 1 },
-      _links: { first: url.pathname, last: "", self: url.pathname },
-    }),
-  );
-  await expect(
-    f.client.listFirewalls({ name }, { requestId: value() }),
-  ).rejects.toMatchObject({ code: "invalid_response" });
-});
-it("treats firewall entitlement rejection as definite and a lost creation response as unknown without replay", async () => {
-  const f = setup(),
-    input = {
-      name: value(),
-      status: "active" as const,
-      rules: { inbound: [] },
-    };
-  f.set(() => new Response(null, { status: 402 }));
-  expect(
-    await f.client.createFirewall(input, { requestId: f.requestId }),
-  ).toMatchObject({ kind: "rejected", dispatched: true, status: 402 });
-  f.set(() => {
-    throw new Error(f.credentials.password);
-  });
-  expect(
-    await f.client.createFirewall(input, { requestId: value() }),
-  ).toMatchObject({ kind: "unknown", dispatched: true, code: "network_error" });
-  expect(f.posts()).toHaveLength(2);
-});
-it("refuses mismatched firewall creation receipts and incomplete filtered inventory", async () => {
-  const f = setup(1),
-    firewallId = value(),
-    input = {
-      name: value(),
-      status: "active" as const,
-      rules: { inbound: [] },
-    };
-  f.set(() =>
-    Response.json(
-      {
-        data: [firewall(f, firewallId, [])],
-        _links: { self: `/v1/firewalls/${firewallId}` },
-      },
-      { status: 201 },
-    ),
-  );
-  expect(
-    await f.client.createFirewall(input, { requestId: f.requestId }),
-  ).toMatchObject({ kind: "unknown", code: "invalid_response" });
-  f.set((url) =>
-    Response.json({
-      data: [],
-      _pagination: { page: 1, size: 1, totalElements: 1, totalPages: 1 },
-      _links: { self: url.pathname, first: url.pathname, last: url.pathname },
-    }),
-  );
-  await expect(
-    f.client.listFirewalls({ name: input.name }, { requestId: value() }),
-  ).rejects.toMatchObject({ code: "pagination_incomplete" });
-});
-it("firewall reads, explicit rules and assignment receipts preserve identity without claiming deployment ready", async () => {
-  const f = setup(),
-    firewallId = value(),
-    rule = {
-      protocol: "tcp" as const,
-      destPorts: [String(22)],
-      srcCidr: { ipv4: [f.instance.ipConfig.v4.ip + "/32"] },
-      action: "accept" as const,
-      status: "active" as const,
-      displayName: value(),
-    };
+    firewallId = value();
   f.set((url) =>
     url.pathname.includes("/instances/")
       ? Response.json({ _links: { self: url.pathname } }, { status: 201 })
       : Response.json({
-          data: [firewall(f, firewallId, [rule])],
+          data: [firewall(f, firewallId, [])],
           _links: { self: `/v1/firewalls/${firewallId}` },
         }),
   );
@@ -923,16 +789,6 @@ it("firewall reads, explicit rules and assignment receipts preserve identity wit
     (await f.client.getFirewall(firewallId, { requestId: f.requestId }))
       .firewallId,
   ).toBe(firewallId);
-  expect(
-    await f.client.putFirewallRules(
-      firewallId,
-      { rules: { inbound: [rule] } },
-      { requestId: value() },
-    ),
-  ).toMatchObject({
-    kind: "accepted",
-    value: { firewallId, instanceStatus: [{ status: "processing" }] },
-  });
   expect(
     await f.client.assignFirewall(firewallId, f.instanceId, {
       requestId: value(),
@@ -942,56 +798,6 @@ it("firewall reads, explicit rules and assignment receipts preserve identity wit
     value: { firewallId, instanceId: f.instanceId },
   });
   expect(f.posts()).toHaveLength(1);
-});
-it("firewall wildcard sources, implicit protocols and wrong receipt identity cannot be treated as successful policy", async () => {
-  const f = setup(),
-    firewallId = value(),
-    rule = {
-      protocol: "tcp" as const,
-      destPorts: [String(22)],
-      srcCidr: { ipv4: [f.instance.ipConfig.v4.ip + "/32"] },
-      action: "accept" as const,
-      status: "active" as const,
-      displayName: value(),
-    };
-  await expect(
-    f.client.putFirewallRules(
-      firewallId,
-      {
-        rules: {
-          inbound: [
-            { ...rule, srcCidr: { ipv4: [f.instance.ipConfig.v4.ip + "/0"] } },
-          ],
-        },
-      },
-      { requestId: f.requestId },
-    ),
-  ).rejects.toMatchObject({ code: "invalid_input" });
-  await expect(
-    f.client.putFirewallRules(
-      firewallId,
-      { rules: { inbound: [{ ...rule, protocol: "" } as never] } },
-      { requestId: f.requestId },
-    ),
-  ).rejects.toMatchObject({ code: "invalid_input" });
-  expect(f.calls).toHaveLength(0);
-  f.set(() =>
-    Response.json({
-      data: [firewall(f, value(), [rule])],
-      _links: { self: `/v1/firewalls/${firewallId}` },
-    }),
-  );
-  expect(
-    await f.client.putFirewallRules(
-      firewallId,
-      { rules: { inbound: [rule] } },
-      { requestId: f.requestId },
-    ),
-  ).toMatchObject({
-    kind: "unknown",
-    code: "invalid_response",
-    dispatched: true,
-  });
 });
 it("redirects and cancellation after dispatch are unknown, with exactly one mutation attempt", async () => {
   const f = setup();
@@ -1101,30 +907,6 @@ it("serializing the client never exposes cached credentials or OAuth tokens", as
     Object.values(f.credentials).some((secret) => serialized.includes(secret)),
   ).toBe(false);
   expect(serialized.includes(f.token)).toBe(false);
-});
-it("firewall address families must match their explicit source fields", async () => {
-  const f = setup();
-  await expect(
-    f.client.putFirewallRules(
-      value(),
-      {
-        rules: {
-          inbound: [
-            {
-              protocol: "tcp",
-              destPorts: [String(22)],
-              srcCidr: { ipv4: [["2001", "db8", "", "1"].join(":") + "/128"] },
-              action: "accept",
-              status: "active",
-              displayName: value(),
-            },
-          ],
-        },
-      },
-      { requestId: f.requestId },
-    ),
-  ).rejects.toMatchObject({ code: "invalid_input" });
-  expect(f.calls).toHaveLength(0);
 });
 it("action audit records can report the documented unassigned instance sentinel without inventing an instance", async () => {
   const f = setup();

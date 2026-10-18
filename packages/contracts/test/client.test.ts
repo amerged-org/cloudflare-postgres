@@ -112,6 +112,7 @@ function nodeFixtures() {
     receipt: null,
     audit: null,
     failure_code: null,
+    install_blocker: null,
     created_at: now,
     updated_at: now,
   });

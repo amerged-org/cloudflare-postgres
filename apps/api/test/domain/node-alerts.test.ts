@@ -382,9 +382,11 @@ it("alarms a node that holds databases while it reports no pool, and nothing for
 });
 
 it("alarms a node that refused five wakes for awake capacity within ten minutes", async () => {
+  // The refusals are summed by minute: in the middle of one, the samples a second later stay in
+  // its minute, as the window's edge is a whole minute.
   const f = await fixture(0),
     hook = receiver(),
-    now = Date.now();
+    now = Math.floor(Date.now() / MINUTE) * MINUTE + 30_000;
   await seedSamples(f.node, [
     ...steady(now - 11 * MINUTE, 0, { refusals: 50 }),
     { at: now - 9 * MINUTE, refusals: 2 },

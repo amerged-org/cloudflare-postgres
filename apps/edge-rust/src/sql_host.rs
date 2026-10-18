@@ -115,6 +115,9 @@ async fn forward(
         .map_err(|_| SqlFailure::unknown_outcome())?;
     sent.set(wire("routeHeader"), &admitted.token)
         .map_err(|_| SqlFailure::unknown_outcome())?;
+    // Nothing was sent yet, so a token that cannot be presented is no unknown outcome.
+    gateway::present_access(&sent, &admitted.region, env, timings)
+        .map_err(|_| SqlFailure::gateway())?;
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_headers(&sent);

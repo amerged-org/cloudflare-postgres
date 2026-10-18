@@ -16,6 +16,7 @@ import {
   approveNodePurchase,
   claimNodeDispatch,
   configureNodeRegionPolicy,
+  markNodeInstallBlocked,
   nodeRegionOccupiedSlots,
   readNodeAddition,
   recordNodeAudit,
@@ -23,18 +24,9 @@ import {
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
-import { ensureNodeInstallationFirewall } from "../../src/domain/node-firewall-allocation.ts";
-
-const adoptedOperations: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  for (const operation of adoptedOperations.splice(0))
-    await env.DB.prepare(
-      "DELETE FROM node_firewall_allocations WHERE operation_id=?",
-    )
-      .bind(operation)
-      .run();
   await cleanupFixtures();
 });
 
@@ -56,7 +48,6 @@ async function adoptedFixture() {
     request_key: crypto.randomUUID(),
     request: { mode: "adopt", region_id: f.region, provider_instance_id: id },
   });
-  adoptedOperations.push(addition.intent.operation_id);
   addition = await recordNodeReceipt(
     env.DB,
     addition.intent.operation_id,
@@ -108,45 +99,12 @@ async function adoptedFixture() {
     status: "running",
     addOns: [],
   };
-  const requestId = crypto.randomUUID(),
-    name = `pgcf-install-${addition.intent.node_id}-${requestId}`,
-    now = new Date().toISOString();
-  await env.DB.prepare(
-    `INSERT INTO node_firewall_allocations(operation_id,node_id,region_id,provider_instance_id,provider_region,product_id,image_id,intent_hash,inventory_revision,tenant_id,customer_id,request_id,name,description,state,failure_code,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'blocked','readback_unavailable',?,?)`,
-  )
-    .bind(
-      addition.intent.operation_id,
-      addition.intent.node_id,
-      f.region,
-      id,
-      actual.region,
-      actual.productId,
-      actual.imageId!,
-      addition.intent_hash,
-      addition.revision,
-      actual.tenantId,
-      actual.customerId,
-      requestId,
-      name,
-      `pgcf-node-installation/v1:${addition.intent_hash}:${requestId}`,
-      now,
-      now,
-    )
-    .run();
   return { ...f, addition, actual };
 }
 
-it("cancels an empty audited adoption while preserving its ambiguous firewall claim and allows a distinct new adoption", async () => {
+it("cancels an empty audited adoption and allows a distinct new adoption", async () => {
   const f = await adoptedFixture(),
     operation = f.addition.intent.operation_id;
-  const readClaim = (id = operation) =>
-    env.DB.prepare(
-      "SELECT * FROM node_firewall_allocations WHERE operation_id=?",
-    )
-      .bind(id)
-      .first<Record<string, unknown>>();
-  const claim = await readClaim();
   vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(f.actual);
   const result = await cancelRoute(f);
   expect(result.response.status).toBe(200);
@@ -157,7 +115,6 @@ it("cancels an empty audited adoption while preserving its ambiguous firewall cl
     audit: f.addition.audit,
     dispatch_request_id: null,
   });
-  expect(await readClaim()).toEqual(claim);
   expect(result.getWorkflow).toHaveBeenCalledExactlyOnceWith(operation);
   expect(result.terminate).toHaveBeenCalledTimes(1);
   const next = await reserveNodeAddition(env.DB, {
@@ -168,7 +125,6 @@ it("cancels an empty audited adoption while preserving its ambiguous firewall cl
       provider_instance_id: f.actual.id,
     },
   });
-  adoptedOperations.push(next.intent.operation_id);
   expect(next.intent.node_id).not.toBe(f.addition.intent.node_id);
   expect(next.intent.operation_id).not.toBe(operation);
   const audited = await recordNodeReceipt(
@@ -181,31 +137,24 @@ it("cancels an empty audited adoption while preserving its ambiguous firewall cl
     ...f.addition.audit!,
     observed_at: new Date().toISOString(),
   });
-  const listFirewalls = vi.fn(async () => {
-      throw new Error("fixture list unavailable before dispatch");
-    }),
-    createFirewall = vi.fn();
-  await ensureNodeInstallationFirewall(
-    {
-      ...env,
-      BOOTSTRAP_FIREWALL_BINDINGS: "{}",
-    },
-    next.intent.operation_id,
-    {
-      provider: {
-        getInstance: vi.fn(async (id) => ({ ...f.actual, id })),
-        listFirewalls,
-        createFirewall,
-        getFirewall: vi.fn(),
-      },
-    },
-  );
-  const fresh = await readClaim(next.intent.operation_id);
-  expect(fresh?.request_id).not.toBe(claim?.request_id);
-  expect(fresh?.name).not.toBe(claim?.name);
-  expect(createFirewall).not.toHaveBeenCalled();
   expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
-  expect(await readClaim()).toEqual(claim);
+});
+
+it("shows no install blocker on an audited adoption that was cancelled while the node firewall was unconfirmed", async () => {
+  const f = await adoptedFixture(),
+    blocked = await markNodeInstallBlocked(
+      env.DB,
+      f.addition,
+      "node_firewall_unconfirmed",
+    );
+  expect(blocked.install_blocker).toBe("node_firewall_unconfirmed");
+  vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(f.actual);
+  const result = await cancelRoute({ ...f, addition: blocked });
+  expect(result.response.status).toBe(200);
+  expect(await result.response.json()).toMatchObject({
+    status: "cancelled",
+    install_blocker: null,
+  });
 });
 
 it("refuses audited adoption cancellation when its server becomes an observed Node during the provider read", async () => {
@@ -214,26 +163,6 @@ it("refuses audited adoption cancellation when its server becomes an observed No
     async () => {
       await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
         .bind(f.actual.id, f.node)
-        .run();
-      return f.actual;
-    },
-  );
-  const result = await cancelRoute(f);
-  expect(result.response.status).toBe(409);
-  expect(result.getWorkflow).not.toHaveBeenCalled();
-  expect(
-    await readNodeAddition(env.DB, f.addition.intent.operation_id),
-  ).toEqual(f.addition);
-});
-
-it("refuses audited adoption cancellation when firewall dispatch begins during the provider read", async () => {
-  const f = await adoptedFixture();
-  vi.spyOn(ContaboClient.prototype, "getInstance").mockImplementation(
-    async () => {
-      await env.DB.prepare(
-        "UPDATE node_firewall_allocations SET state='dispatching',failure_code=NULL WHERE operation_id=?",
-      )
-        .bind(f.addition.intent.operation_id)
         .run();
       return f.actual;
     },
@@ -463,6 +392,22 @@ it("records an already cancelled paid provider without deleting it, frees only i
     f.addition.intent.operation_id,
   );
   expect(result.terminate).toHaveBeenCalledTimes(1);
+});
+
+it("shows no install blocker on a paid addition whose provider cancellation was recorded while the node firewall was unconfirmed", async () => {
+  const f = await paidFixture(),
+    blocked = await markNodeInstallBlocked(
+      env.DB,
+      f.addition,
+      "node_firewall_unconfirmed",
+    );
+  vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(f.actual);
+  const result = await cancelRoute({ ...f, addition: blocked });
+  expect(result.response.status).toBe(200);
+  expect(await result.response.json()).toMatchObject({
+    status: "cancelled",
+    install_blocker: null,
+  });
 });
 
 it("retains a live provider reservation when its cancellation date is absent or invalid", async () => {

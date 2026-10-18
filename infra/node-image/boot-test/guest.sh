@@ -56,6 +56,108 @@ loopback_only() {
 	}
 }
 
+# Plan 8: with sshd installed, systemd 257's ssh generator binds it to /run/ssh-unix-local/socket
+# (mode 0666, so a database's user could reach it) and to vsock. The image masks the generator and
+# the kernel command line turns it off, so no ssh socket exists. The journal socket proves that the
+# listings worked.
+no_ssh_socket() {
+	local sockets units pattern='ssh-unix-local|sshd-unix-local|sshd-vsock'
+	sockets=$(ss --listening --unix --numeric --no-header) || return 1
+	units=$(systemctl list-sockets --all --no-legend --plain) || return 1
+	grep -q 'systemd-journald\.socket' <<<"$units" || {
+		echo "no socket listing"
+		return 1
+	}
+	if grep -E "$pattern" <<<"$sockets" || grep -E "$pattern" <<<"$units"; then
+		false
+	fi
+}
+
+# Plan 8: the operator shell is certificate-only. sshd -t accepts the drop-in and sshd -T reports
+# its effective values; per-source penalties stay at their default.
+sshd_policy() {
+	sshd -t || return 1
+	local effective line
+	effective=$(sshd -T) || return 1
+	for line in \
+		'listenaddress 127.0.0.1:22' 'listenaddress [::1]:22' \
+		'passwordauthentication no' 'kbdinteractiveauthentication no' \
+		'authenticationmethods publickey' 'pubkeyauthentication yes' 'authorizedkeysfile none' \
+		'trustedusercakeys /etc/ssh/pgcf_user_ca.pub' 'authorizedprincipalsfile /etc/ssh/principals/%u' \
+		'revokedkeys /etc/ssh/pgcf_revoked.krl' 'permitrootlogin without-password' 'allowusers root' \
+		'maxauthtries 2' 'logingracetime 20' 'maxsessions 2' \
+		'x11forwarding no' 'allowtcpforwarding no' 'allowagentforwarding no' 'permittunnel no' \
+		'disableforwarding yes' 'gssapiauthentication no' \
+		'clientaliveinterval 30' 'clientalivecountmax 4' 'loglevel VERBOSE'; do
+		grep -qxF "$line" <<<"$effective" || {
+			echo "sshd -T lacks: $line"
+			return 1
+		}
+	done
+	grep -q '^persourcepenalties .*authfail:' <<<"$effective" || {
+		echo "per-source penalties are off"
+		return 1
+	}
+}
+
+# One publickey attempt as root with the key in $1 (and the certificate next to it) at address $2.
+ssh_attempt() {
+	ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 \
+		-i "$1" "root@$2" true 2>&1
+}
+
+# sshd's authentication must refuse (MaxAuthTries 2 ends a key with its certificate in "Too many
+# authentication failures"), not a connection that never reached it.
+ssh_refused() {
+	local output
+	if output=$(ssh_attempt "$@"); then
+		echo "login accepted at $2"
+		return 1
+	fi
+	grep -qE 'Permission denied \(publickey\)|Too many authentication failures' <<<"$output" || {
+		echo "$2: $output"
+		return 1
+	}
+}
+
+# The image ships no CA key, so no login is possible: a certificate from a throwaway CA is refused
+# on both loopback addresses. With that CA installed it is accepted (this proves the shipped
+# principals file, key revocation list and their modes), and refused again once the CA is gone.
+sshd_certificate_only() {
+	local ca=/etc/ssh/pgcf_user_ca.pub dir output result=0
+	[ ! -e "$ca" ] || {
+		echo "the image carries a CA key"
+		return 1
+	}
+	dir=$(mktemp -d) || return 1
+	if ssh-keygen -q -t ed25519 -N '' -f "$dir/user" &&
+		ssh-keygen -q -t ed25519 -N '' -f "$dir/ca" &&
+		ssh-keygen -q -s "$dir/ca" -I pgcf-boot-test -n pgcf-break-glass -V -1m:+10m "$dir/user.pub"; then
+		ssh_refused "$dir/user" 127.0.0.1 && ssh_refused "$dir/user" ::1 || result=1
+		if [ "$result" = 0 ]; then
+			cp "$dir/ca.pub" "$ca"
+			output=$(ssh_attempt "$dir/user" 127.0.0.1) || {
+				echo "refused with the CA installed: $output"
+				result=1
+			}
+			rm -f "$ca"
+			ssh_refused "$dir/user" 127.0.0.1 || result=1
+		fi
+	else
+		result=1
+	fi
+	rm -rf "$dir"
+	[ "$result" = 0 ]
+}
+
+# journald syncs every five minutes by default, and a freeze loses what it had not written (after
+# the unexplained stall of 2026-10-18 in plan 11.1 the journal could not be read over the link).
+# The image syncs every 15 s.
+journal_sync_interval() {
+	systemd-analyze cat-config systemd/journald.conf | grep -qx 'SyncIntervalSec=15s'
+}
+
 inbound_dropped() {
 	nft list chain inet pgcf input | grep -q 'policy drop;'
 }
@@ -155,6 +257,49 @@ database_unit_has_no_start_pre() {
 	[ -z "$(systemctl show --property=ExecStartPre --value pgcf-pg@pgcfboottest0000000.service)" ]
 }
 
+# Plan 8: the filter is an allow-list (@system-service) with the deny lines subtracted, and systemd
+# reports what is left. A database's user must not reach io_uring, userfaultfd, the kernel keyring,
+# the message queues or the SysV semaphores; PostgreSQL's shared memory calls must stay.
+database_unit_syscall_filter() {
+	local allowed name
+	allowed=$(systemctl show --property=SystemCallFilter --value pgcf-pg@pgcfboottest0000000.service | tr ' ' '\n')
+	for name in shmget shmat shmdt shmctl; do
+		grep -qx "$name" <<<"$allowed" || {
+			echo "denied $name"
+			return 1
+		}
+	done
+	for name in io_uring_setup io_uring_enter io_uring_register userfaultfd add_key keyctl request_key \
+		msgget msgsnd msgrcv msgctl semget semop semtimedop semctl \
+		mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr; do
+		if grep -qx "$name" <<<"$allowed"; then
+			echo "allowed $name"
+			return 1
+		fi
+	done
+}
+
+sysctl_is() {
+	local value
+	value=$(sysctl -n "$1") || return 1
+	[ "$value" = "$2" ] || {
+		echo "$1 = $value"
+		false
+	}
+}
+
+# The agent creates /var/lib/pgcf/db 0711 (store.rs) and tmpfiles resets it at every boot: a
+# database's user reaches its own directory but nobody can list this one (the IDs stay visible in
+# /etc/passwd, /run/pgcf and the mount table).
+database_directory_not_listable() {
+	local mode
+	mode=$(stat -c %a /var/lib/pgcf/db) || return 1
+	[ "$mode" = 711 ] || {
+		echo "mode $mode"
+		false
+	}
+}
+
 # systemd nests a slice whose name has a dash inside the slice before the dash. A backup job must
 # not run under the databases' slice and its memory ceiling.
 backup_slice_top_level() {
@@ -171,14 +316,22 @@ backup_slice_top_level() {
 
 check no_failed_units no_failed_units
 check loopback_only loopback_only
+check no_ssh_socket no_ssh_socket
+check journal_sync_interval journal_sync_interval
 check inbound_dropped inbound_dropped
 check binaries binaries
+check io_uring_disabled sysctl_is kernel.io_uring_disabled 2
+check tty_ldisc_autoload_off sysctl_is dev.tty.ldisc_autoload 0
+check database_directory_not_listable database_directory_not_listable
 if [ "$phase" = 1 ]; then
 	check root_grown root_grown
 	check lvm_partition lvm_partition
 	check database_unit_sandbox database_unit_sandbox
 	check database_unit_waits_for_recovery database_unit_waits_for_recovery
 	check database_unit_has_no_start_pre database_unit_has_no_start_pre
+	check database_unit_syscall_filter database_unit_syscall_filter
+	check sshd_policy sshd_policy
+	check sshd_certificate_only sshd_certificate_only
 	check backup_slice_top_level backup_slice_top_level
 fi
 check pool wait_for 120 pool

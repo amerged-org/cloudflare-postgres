@@ -51,6 +51,9 @@ const sha256Pattern = /^[0-9a-f]{64}$/;
 const packageNamePattern = /^[a-z0-9][a-z0-9+.-]+$/;
 const versionPattern = /^[A-Za-z0-9.+~:-]+$/;
 const architecturePattern = /^(?:amd64|all)$/;
+// Debian writes a pre-release as "<next>~rc1": it sorts below the release it precedes. apt takes the
+// highest version, so the unpinned PGDG archive once handed the image libpq5 19~rc1.
+const prereleasePattern = /~(?:alpha|beta|rc)\d*/i;
 
 export function debianRepositories(lock: PackageLock): Repository[] {
   const snapshot = lock.debian.snapshot;
@@ -63,6 +66,15 @@ export function debianRepositories(lock: PackageLock): Repository[] {
     { base: main, suite: "trixie-updates" },
     { base: main, suite: "trixie" },
     { base: lock.pgdg.url.replace(/\/+$/, ""), suite: lock.pgdg.suite },
+  ];
+}
+
+// The suites an image update draws from, as they are today rather than at the snapshot.
+export function liveRepositories(): Repository[] {
+  return [
+    { base: "https://deb.debian.org/debian-security", suite: "trixie-security" },
+    { base: "https://deb.debian.org/debian", suite: "trixie-updates" },
+    { base: "https://apt.postgresql.org/pub/repos/apt", suite: "trixie-pgdg" },
   ];
 }
 
@@ -112,6 +124,89 @@ export function parsePackagesIndex(text: string): IndexRecord[] {
     });
   }
   return records;
+}
+
+// dpkg's comparison of one upstream or revision string (Debian Policy 5.6.12): runs of non-digits
+// compare character by character ("~" before everything, even the end; letters before other
+// characters), runs of digits compare as numbers.
+function compareVersionPart(a: string, b: string): number {
+  const isDigit = (character: string | undefined) => character !== undefined && character >= "0" && character <= "9";
+  const order = (character: string | undefined) => {
+    if (character === undefined || isDigit(character)) return 0;
+    if (character === "~") return -1;
+    const code = character.charCodeAt(0);
+    return /[A-Za-z]/.test(character) ? code : code + 256;
+  };
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    while ((i < a.length && !isDigit(a[i])) || (j < b.length && !isDigit(b[j]))) {
+      const difference = order(a[i]) - order(b[j]);
+      if (difference !== 0) return Math.sign(difference);
+      i++;
+      j++;
+    }
+    const startA = i;
+    const startB = j;
+    while (isDigit(a[i])) i++;
+    while (isDigit(b[j])) j++;
+    const digitsA = a.slice(startA, i).replace(/^0+/, "");
+    const digitsB = b.slice(startB, j).replace(/^0+/, "");
+    if (digitsA.length !== digitsB.length) return digitsA.length < digitsB.length ? -1 : 1;
+    if (digitsA !== digitsB) return digitsA < digitsB ? -1 : 1;
+  }
+  return 0;
+}
+
+function splitVersion(version: string): { epoch: number; upstream: string; revision: string } {
+  const colon = version.indexOf(":");
+  const rest = colon === -1 ? version : version.slice(colon + 1);
+  const hyphen = rest.lastIndexOf("-");
+  return {
+    epoch: colon === -1 ? 0 : Number(version.slice(0, colon)),
+    upstream: hyphen === -1 ? rest : rest.slice(0, hyphen),
+    revision: hyphen === -1 ? "" : rest.slice(hyphen + 1),
+  };
+}
+
+// -1, 0 or 1 as `a` sorts before, with or after `b` in dpkg's version order.
+export function compareDebianVersions(a: string, b: string): number {
+  const left = splitVersion(a);
+  const right = splitVersion(b);
+  return (
+    Math.sign(left.epoch - right.epoch) ||
+    compareVersionPart(left.upstream, right.upstream) ||
+    compareVersionPart(left.revision, right.revision)
+  );
+}
+
+// The epoch and the leading number of the upstream version: "0:18" for 18.6-1.pgdg13+2 and 19~rc1-1.
+function majorSeries(version: string): string {
+  const { epoch, upstream } = splitVersion(version);
+  return `${epoch}:${/^[0-9]*/.exec(upstream)![0]}`;
+}
+
+// The package names that mkosi.conf pins to an exact version, such as "        libpq5=18.6-1.pgdg13+2".
+export function pinnedPackages(conf: string): Set<string> {
+  const names = new Set<string>();
+  for (const match of conf.matchAll(/^[ \t]+([a-z0-9][a-z0-9+.-]+)=\S+[ \t]*$/gm)) names.add(match[1]!);
+  return names;
+}
+
+// The records of an index that carry a locked package's name at a newer version. A pinned package
+// is a deliberate choice of major version (libpq5 follows its server, and PGDG's main component
+// moves libpq5 to the newest major on release), so only its own major series counts for it.
+export function behindLock(
+  lock: PackageLock,
+  records: IndexRecord[],
+  pinned: ReadonlySet<string> = new Set(),
+): IndexRecord[] {
+  const locked = new Map([...lock.extra, ...lock.packages].map((entry) => [entry.name, entry.version]));
+  return records.filter((record) => {
+    const version = locked.get(record.name);
+    if (version === undefined || compareDebianVersions(record.version, version) <= 0) return false;
+    return !pinned.has(record.name) || majorSeries(record.version) === majorSeries(version);
+  });
 }
 
 export function key(item: InstalledPackage): string {
@@ -192,6 +287,9 @@ export function snapshotEpoch(snapshot: string): number {
 function checkPackage(entry: LockedPackage, where: string): void {
   if (!packageNamePattern.test(entry.name)) throw new Error(`${where}: invalid name ${entry.name}`);
   if (!versionPattern.test(entry.version)) throw new Error(`${where}: invalid version of ${entry.name}`);
+  if (prereleasePattern.test(entry.version)) {
+    throw new Error(`${where}: ${entry.name} ${entry.version} is a pre-release; pin the release in mkosi.conf`);
+  }
   if (!architecturePattern.test(entry.architecture)) {
     throw new Error(`${where}: invalid architecture of ${entry.name}`);
   }

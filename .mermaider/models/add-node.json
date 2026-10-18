@@ -83,7 +83,7 @@
       },
       {
         "id": "05-audited",
-        "label": "Audited or bootstrapping: send the installer once, then watch the install until the node enrolls",
+        "label": "Audited or bootstrapping: confirm the node firewall, send the installer once, then watch the install until the node enrolls",
         "evidence": [
           {
             "line": 213,

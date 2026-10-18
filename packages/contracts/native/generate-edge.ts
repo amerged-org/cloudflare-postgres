@@ -25,6 +25,9 @@ import {
   transaction as sqlTransaction,
 } from "../src/edge-sql.ts";
 import {
+  ACCESS_CLIENT_ID_HEADER,
+  ACCESS_CLIENT_SECRET_HEADER,
+  ACCESS_SECRETS_INCOMPLETE,
   DECOY_AUTH_MAX_BYTES,
   DECOY_DEADLINE_MS,
   DECOY_MAX_BYTES,
@@ -32,6 +35,7 @@ import {
   DECOY_SALT_DOMAIN,
   DECOY_SCRAM_ITERATIONS,
   REFUSAL_BYTES,
+  accessTokenState,
   decoySalt,
   refusalCode,
 } from "../src/edge-policy.ts";
@@ -53,6 +57,9 @@ export function edgeContract() {
     wire: {
       routeKeyDomain: ROUTE_TOKEN_NODE_KEY_DOMAIN,
       routeHeader: ROUTE_TOKEN_HEADER,
+      accessClientIdHeader: ACCESS_CLIENT_ID_HEADER,
+      accessClientSecretHeader: ACCESS_CLIENT_SECRET_HEADER,
+      accessSecretsIncomplete: ACCESS_SECRETS_INCOMPLETE,
       decoySaltDomain: DECOY_SALT_DOMAIN,
     },
     gatewayRegion: z.toJSONSchema(DatabaseRegionRoute),
@@ -132,6 +139,7 @@ export async function edgeVectors() {
   return {
     ips: ips.map((ip) => ({ ip, expected: connectionRateKey(ip) })),
     refusals: refusalVectors(),
+    access: accessVectors(),
     sql: sqlVectors(),
     signing,
     salts: await Promise.all(
@@ -196,6 +204,24 @@ function refusalVectors() {
     '{"error":"route_refused","detail":"',
     '\ufeff{"error":"route_refused"}',
   ].map((text) => ({ text, expected: refusalCode(text) ?? null }));
+}
+
+/** The Access secrets of a Worker, and what the Rust Edge must make of them as TypeScript does. */
+function accessVectors() {
+  return [
+    [null, null],
+    ["", ""],
+    ["id-vector", "secret-vector"],
+    ["id-vector", null],
+    [null, "secret-vector"],
+    ["id-vector", ""],
+    ["", "secret-vector"],
+    [1, "secret-vector"],
+  ].map(([id, secret]) => ({
+    id,
+    secret,
+    expected: accessTokenState(id ?? undefined, secret ?? undefined),
+  }));
 }
 
 /** What a TypeScript function of HTTP SQL answers: its value, or the failure it refuses with. */

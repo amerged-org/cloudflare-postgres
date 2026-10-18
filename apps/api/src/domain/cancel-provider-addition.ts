@@ -19,7 +19,7 @@ const refuse = (message: string): never => {
   throw new NodeStateError("conflict", message);
 };
 
-/** Close an untouched audited adoption or record an existing provider cancellation; never mutates the provider. */
+/** Close an untouched audited adoption or record an existing provider cancellation; the cancellation never mutates the provider. */
 export async function cancelAlreadyCancelledProviderAddition(
   env: Env,
   operationId: string,
@@ -73,10 +73,7 @@ export async function cancelAlreadyCancelledProviderAddition(
       return refuse(
         "Fresh allocated provider inventory must match the audited adoption",
       );
-    return cancelAuditedNodeAdoption(env.DB, addition, expectedRevision, {
-      tenant_id: actual.tenantId,
-      customer_id: actual.customerId,
-    });
+    return cancelAuditedNodeAdoption(env.DB, addition, expectedRevision);
   }
   if (
     !Number.isSafeInteger(expectedRevision) ||

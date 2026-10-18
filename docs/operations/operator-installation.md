@@ -38,12 +38,46 @@ Adding a node installs it from the region's release (plan 9.2) and gives it its 
   `NODE_GATEWAY_ZONE_ID`; the Cloudflare account is the one of the region's R2 endpoint. Without
   the token, the domain or the zone a node gets no credentials and stays closed to placement.
 - `NODE_SHELL_HOSTNAME` is off unless it is the string `true`. The node's shell hostname
-  `<node>-ssh.<domain>`, its DNS record and its Tunnel ingress rule exist only while it is `true`,
-  and a node that has them loses them on its next credentials read when it is not. Leave it off
-  until Cloudflare Access guards the shell (plan 8): without Access the hostname is reachable by
-  anyone who can run cloudflared.
+  `pgcf-shell-<id>.<domain>`, its DNS record and its Tunnel ingress rule exist only while it is
+  `true`, and a node that has them loses them on its next credentials read when it is not. The
+  same read deletes a DNS record under the shell's former name, `pgcf-node-<id>-ssh.<domain>`,
+  whatever the variable says. Leave it off until Cloudflare Access guards the shell (plan 8,
+  [the section below](#cloudflare-access-for-node-gateways-and-shells)): without Access the
+  hostname is reachable by anyone who can run cloudflared.
 - `CONTABO_ORDER_SSH_KEY_IDS` also names the keys the provider's rescue action wants beside the
   installer; the installer itself uses none.
+- `CONTABO_NODE_FIREWALL_ID` names the Contabo firewall every node sits behind (plan 8). AddNode
+  requests the rescue only once that firewall is `active`, has no inbound rule that accepts and
+  lists the instance with the status `ok`, because the rescue system's `sshd` is reachable on the
+  public port 22 until the installer turns password login off. Without the firewall no node gets
+  its installer; create it once, as below.
+
+### The node firewall
+
+Create the firewall once, in the Contabo customer control panel or with `POST /v1/firewalls` and
+the body `{"name":"pgcf-nodes","status":"active","rules":{"inbound":[]}}`: active, with no inbound
+rule. A firewall that no rule opens admits no inbound connection, and the pull install and the
+node's Tunnel only connect outward, so nothing needs to be opened. Contabo lists the firewall as
+included with every VPS (contabo.com/blog/contabo-firewall); confirm that on the account first,
+because a new paid resource needs the owner's explicit, costed go. Put the firewall's id in the
+`CONTABO_NODE_FIREWALL_ID` Worker variable (an identifier, not a secret) and deploy.
+
+- Assign a node that exists already, such as EU1, to the firewall by hand before AddNode runs for
+  it. AddNode finds it listed and does not assign it again.
+- AddNode assigns any other instance itself, then reads the firewall back. Contabo applies an
+  assignment on its own time, so the first read may not list the instance yet, or list it with a
+  status other than `ok` (`processing`); the next cycle reads again and does not assign it twice.
+- AddNode never takes an instance off the firewall. An addition that is cancelled or fails after
+  the assignment leaves the instance behind it, and an adopted server that served inbound traffic
+  before loses it. Unassign such a server in the Contabo customer control panel.
+- While the firewall is not confirmed the addition stays `audited`, no rescue is requested and the
+  addition's `install_blocker` reads `node_firewall_unconfirmed`. The cause is one of: the variable
+  is unset or wrong, or the provider cannot be read; the firewall is not `active`; it has a rule
+  that accepts (a rule that drops is fine); the instance is not listed yet, or listed with a status
+  other than `ok`, and stays so (`error_processing`). Fix the cause; AddNode asks again on every
+  cycle and starts the install when the firewall is confirmed.
+- To verify an install, try a TCP connect to port 22 of the instance's public IPv4 address from
+  outside during the rescue and after the reboot. Both must time out.
 
 ## Edge Worker
 
@@ -56,6 +90,20 @@ namespace of its own for same-account Workers on a service binding (without it e
 is refused with `53300` "connection admission unavailable"), and `DATABASE_ACTOR_LOCATION_HINT`,
 which must equal the API Worker's value; the hint places only DatabaseActor objects created after
 it is set.
+
+Two optional Worker secrets, `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`, are the Cloudflare
+Access service token that the Edge presents (headers `CF-Access-Client-Id` and
+`CF-Access-Client-Secret`) to a gateway on a public hostname, once Access guards it; the Access
+application's policy for the gateway hostnames must use the Service Auth action for this token.
+Set them as secrets (`wrangler secret put` or the API), never as variables. Set both or neither:
+without them the Edge sends nothing and an installation without Access works as before, and one
+alone refuses every connection and HTTP query to a public gateway with `08006` before anything is
+sent, and logs `config_error: "access_secrets_incomplete"` (never a value). A gateway on a service
+binding does not go through Access and never receives the token. An Access refusal (401, 403, or
+a redirect to the login page, which the Edge does not follow) shows in the log as the
+`gateway_status` of the refused connection. The token expires after the duration chosen when it
+was created: refresh it before then and rotate it as described in
+[credentials](credentials.md).
 
 The Rust/Wasm replacement lives in `apps/edge-rust`. The common CI workflow builds it; it is not
 deployed. Build the selected source once using the Rust toolchain and `rustEdge` tools from
@@ -81,6 +129,121 @@ Both editions return the unopened upstream WebSocket directly to Cloudflare. Pos
 are not relayed through a TypeScript or Wasm application loop. Only bounded local refusal sockets
 parse their own startup/SCRAM exchange. Request aborts and the absolute admission deadline cancel
 the exact Actor waiter; a cancellation never retries the gateway connection or application SQL.
+
+## Cloudflare Access for node gateways and shells
+
+A node's gateway hostname, `pgcf-node-<id>.<NODE_GATEWAY_DOMAIN>`, is public: without Access only
+the route token protects it, and anyone on the internet can reach it past the Edge's limiters
+([plan 5.8](../architecture/cloudflare-convergence-and-serverless-plan.md#58-the-path-from-the-edge-to-the-node)).
+`scripts/operations/setup-access.ts` puts Cloudflare Access in front of two families of hostnames
+that do not overlap, because Cloudflare does not document which of two overlapping wildcard
+applications wins:
+
+| Application | Hostnames | Policy | Session |
+| --- | --- | --- | --- |
+| `pgcf node gateways` | `pgcf-node-*.<domain>` | `edge service token`: Service Auth for one service token, nothing else (no login, no email) | 24h |
+| `pgcf node shells` (only with `--shell`) | `pgcf-shell-*.<domain>` | `operators`: allow the named emails, through the one-time PIN identity provider if the organization has one | 1h |
+
+Both are self-hosted applications, hidden from the App Launcher, with HttpOnly cookies and no CORS
+headers. The gateways' application answers a request without credentials with 401, never with a
+login page. The shells use the native client (`cloudflared access ssh`); the SSH application
+type is the browser-rendered terminal and is not used. The script is idempotent: it reads what is
+there, changes only what differs (an application or policy edited by hand is put back, and any
+second policy on an application is deleted), and a second `apply` makes no write.
+
+**What it needs.** A Zero Trust organization on the account (the free plan is enough), and an
+account API token with these permissions, read from the environment and never printed or written
+(a value that is not a Cloudflare API token, such as one with a second line, is refused by name
+before any request):
+
+| Permission | When |
+| --- | --- |
+| Access: Apps and Policies Write | always |
+| Access: Service Tokens Write | always |
+| Access: Organizations, Identity Providers, and Groups Read | with `--shell` |
+| Workers Scripts Write | with `--edge-worker` |
+
+**Order.** The gateways refuse the Edge from the moment the application exists, so:
+
+1. Deploy the Edge release that presents the service token (the headers `CF-Access-Client-Id` and
+   `CF-Access-Client-Secret`, from its secrets `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET`).
+2. Read the plan, which writes nothing, then apply it:
+
+   ```sh
+   read -rs PGCF_CLOUDFLARE_API_TOKEN && export PGCF_CLOUDFLARE_API_TOKEN
+   node scripts/operations/setup-access.ts plan --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+     --service-token <TOKEN_NAME> --edge-worker <EDGE_WORKER>
+   node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+     --service-token <TOKEN_NAME> --edge-worker <EDGE_WORKER>
+   ```
+
+   `--service-token` names the token the Edge presents. If it does not exist, `apply` creates it
+   (duration 8760h) and sets its client id and secret as the Edge Worker's secrets in the same run;
+   Cloudflare shows the secret once, so the script refuses to create or rotate a token without
+   `--edge-worker`, deletes a token it just made when the secrets cannot be set, and never prints
+   or writes the client id or the secret. With a token that exists, `--edge-worker` also checks
+   that the Worker holds both secrets and refuses to go on without them, because the Edge would be
+   locked out.
+3. Verify from outside, with a node's own hostname unless the zone resolves every name (a wildcard
+   record), because the name must resolve to reach Cloudflare at all:
+
+   ```sh
+   node scripts/operations/setup-access.ts plan --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+     --service-token <TOKEN_NAME> --verify --verify-hostname pgcf-node-<id>.<NODE_GATEWAY_DOMAIN>
+   ```
+
+   It sends a GET without credentials and expects `verify ok ... answered 401` or `403`. A 200, a
+   redirect (a login page) or a 404 (the request got past Access to the node's Tunnel) is a failure
+   and exits non-zero. Changes take a moment to reach Cloudflare's edge: repeat once before
+   treating the first answer as final. Then open a connection through the Edge as usual to see that
+   the Edge still gets in.
+4. The shell, when an operator needs it. The application comes first, then the variable:
+
+   ```sh
+   node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+     --service-token <TOKEN_NAME> --shell --operator-email ops@example.org --operator-email dev@example.org
+   ```
+
+   The list of emails is the whole list: running it with fewer emails removes the others. Then set
+   `NODE_SHELL_HOSTNAME` to `"true"` on the API Worker and deploy it; a node gets its
+   `pgcf-shell-<id>.<domain>` hostname on its next credentials read. Connect with
+   `ssh -o ProxyCommand="cloudflared access ssh --hostname %h" <user>@pgcf-shell-<id>.<domain>`;
+   `cloudflared` opens the Access login, which needs one of the named emails.
+
+**Renew or rotate the service token.** The two are different steps. A token lasts the duration it
+was made with (8760h) and stops working then: Access refuses the Edge at every `pgcf-node-*`
+hostname and no database can be reached. Only a refresh moves that date; rotating replaces the
+secret and leaves the date as it was. The script prints the `expires` date of an existing token,
+warns when it is less than 30 days away and refuses to go on with an expired one. Cloudflare also
+sends the "Expiring Access Service Token" notification a week before; turn it on under
+Notifications in the dashboard.
+
+Renew (Cloudflare adds one year; the secret stays, so no `--edge-worker`):
+
+```sh
+node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+  --service-token <TOKEN_NAME> --refresh-service-token
+```
+
+Rotate (after a leak report or on a schedule of your own):
+
+```sh
+node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+  --service-token <TOKEN_NAME> --edge-worker <EDGE_WORKER> --rotate-service-token --grace 1h
+```
+
+The token keeps its id, so the applications do not change. The new secret goes into the Edge
+Worker's secrets and the old one stays valid for `--grace` (default 1h), so the Edge keeps
+connecting while the new Worker version rolls out. If the new secret cannot be set, the run says
+so and the old one stays valid for the grace period: run it again. A disabled token (for example
+after a leak report) is not enabled by the script; delete it in the dashboard to have a new one
+made, which also has a new expiry.
+
+**Roll back.** `apply --account <ACCOUNT_ID> --remove` deletes both applications and their
+policies (the same as deleting them in the dashboard under Access, Applications) and keeps the
+service token; the gateways have only their route token again. Turn `NODE_SHELL_HOSTNAME` off
+and deploy before the shell application goes, or the shell hostnames are open. `plan --remove`
+shows what would go.
 
 ## Operator-configured capacity and optional notifications
 

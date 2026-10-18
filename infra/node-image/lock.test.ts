@@ -4,12 +4,17 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   aptListName,
+  behindLock,
+  compareDebianVersions,
   compareInstalled,
   debianRepositories,
+  liveRepositories,
   lockPackages,
   parsePackagesIndex,
+  pinnedPackages,
   snapshotEpoch,
   validateLock,
+  type IndexRecord,
   type LockedPackage,
   type PackageLock,
 } from "./lock.ts";
@@ -78,6 +83,14 @@ test("list names follow apt's URI-to-file-name rule", () => {
     "apt-archive.postgresql.org_pub_repos_apt_dists_trixie-pgdg-archive_main_binary-amd64_Packages",
   );
   assert.equal(aptListName({ base: "https://example.org/a_b~c", suite: "s" }), "example.org_a%5fb%7ec_dists_s_main_binary-amd64_Packages");
+});
+
+test("the advisories read the lists apt writes for the live suites", () => {
+  assert.deepEqual(liveRepositories().map(aptListName), [
+    "deb.debian.org_debian-security_dists_trixie-security_main_binary-amd64_Packages",
+    "deb.debian.org_debian_dists_trixie-updates_main_binary-amd64_Packages",
+    "apt.postgresql.org_pub_repos_apt_dists_trixie-pgdg_main_binary-amd64_Packages",
+  ]);
 });
 
 test("every installed package maps to one signed record; anything unlisted fails", () => {
@@ -157,4 +170,186 @@ test("a lock with floating inputs is refused", () => {
     () => validateLock({ ...lock, packages: [{ ...lock.packages[0]!, url: "http://example.org/a.deb" }] }),
     /HTTPS/,
   );
+});
+
+test("the lock pins no pre-release version", () => {
+  const prerelease = /~(alpha|beta|rc)\d*/i;
+  for (const entry of [...lock.packages, ...lock.extra]) {
+    assert.doesNotMatch(entry.version, prerelease, `${entry.name} ${entry.version} is a pre-release`);
+  }
+  const candidate = { ...lock.packages.find((entry) => entry.name === "libpq5")!, version: "19~rc1-1.pgdg13+1" };
+  const withCandidate = (field: "packages" | "extra") => ({
+    ...lock,
+    [field]: [...lock[field].filter((entry) => entry.name !== "libpq5"), candidate],
+  });
+  assert.throws(() => validateLock(withCandidate("packages")), /libpq5.*pre-release/);
+  assert.throws(() => validateLock(withCandidate("extra")), /libpq5.*pre-release/);
+  for (const version of ["2~ALPHA", "2~beta3", "19~RC1-1"]) {
+    assert.throws(() => validateLock({ ...lock, extra: [{ ...candidate, version }] }), /pre-release/);
+  }
+});
+
+// Stanzas cut from the trixie-security Packages file of snapshot 20261016T133910Z.
+const securityIndex = `Package: libexpat1
+Source: expat
+Version: 2.9.0-1~deb13u1
+Installed-Size: 427
+Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
+Architecture: amd64
+Description: XML parsing C library - runtime library
+Homepage: https://libexpat.github.io/
+Description-md5: 969a775adb36dbfb73b9d7ef67f13bd6
+Multi-Arch: same
+Pre-Depends: libc6 (>= 2.36)
+Section: libs
+Priority: optional
+Filename: pool/updates/main/e/expat/libexpat1_2.9.0-1~deb13u1_amd64.deb
+Size: 125744
+SHA256: feff874772cae904ae4d24e917b35664952bec4b4ae9100a4edda5a7fa746832
+
+Package: libexpat1-dev
+Source: expat
+Version: 2.9.0-1~deb13u1
+Installed-Size: 964
+Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
+Architecture: amd64
+Provides: libexpat-dev
+Depends: libexpat1 (= 2.9.0-1~deb13u1), libc6-dev | libc-dev
+Conflicts: libexpat-dev
+Description: XML parsing C library - development kit
+Homepage: https://libexpat.github.io/
+Description-md5: 0b45073661cf63b9161c598405a4e62d
+Multi-Arch: same
+Section: libdevel
+Priority: optional
+Filename: pool/updates/main/e/expat/libexpat1-dev_2.9.0-1~deb13u1_amd64.deb
+Size: 184304
+SHA256: f1fb8aa3165e8c8f20d9e37e1d421fe17eaeb647fcf8fe3305acf3afb315c677
+
+Package: linux-image-amd64
+Source: linux-signed-amd64 (6.12.113+1)
+Version: 6.12.113-1
+Installed-Size: 13
+Maintainer: Debian Kernel Team <debian-kernel@lists.debian.org>
+Architecture: amd64
+Provides: linux-image-generic, linux-latest-modules-6.12.113+deb13-amd64, virtualbox-guest-modules, wireguard-modules (= 1.0.0)
+Depends: linux-image-6.12.113+deb13-amd64 (= 6.12.113-1)
+Description: Linux for 64-bit PCs (meta-package)
+Homepage: https://www.kernel.org/
+Description-md5: 6a25122b463a5515998ee600e16b3daf
+Section: kernel
+Priority: optional
+Filename: pool/updates/main/l/linux-signed-amd64/linux-image-amd64_6.12.113-1_amd64.deb
+Size: 1480
+SHA256: e6b5a5e6dbe6f2d07bd694139b758666d14351d6ba3a9a97de31096c30aff0f0
+
+Package: openssl
+Version: 3.5.7-1~deb13u3
+Installed-Size: 2510
+Maintainer: Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>
+Architecture: amd64
+Depends: libc6 (>= 2.34), libssl3t64 (>= 3.5.0)
+Suggests: ca-certificates
+Description: Secure Sockets Layer toolkit - cryptographic utility
+Homepage: https://openssl-library.org
+Description-md5: 9b6de2bb6e1d9016aeb0f00bcf6617bd
+Multi-Arch: foreign
+Section: utils
+Priority: optional
+Filename: pool/updates/main/o/openssl/openssl_3.5.7-1~deb13u3_amd64.deb
+Size: 1508068
+SHA256: 43a9cbcf2a8a0e1f0a1c3f5a33ee1f56b269690e7a2129f2b2d0582e789589d7
+`;
+
+test("Debian versions order by epoch, upstream version and revision", () => {
+  const ascending = [
+    ["6.12.111-1", "6.12.113-1"],
+    ["6.12.9-1", "6.12.10-1"],
+    ["2.8.3-1~deb13u1", "2.9.0-1~deb13u1"],
+    ["19~rc1-1.pgdg13+1", "19-1"],
+    ["1.0~", "1.0"],
+    ["1.0a", "1.0+"],
+    ["2.0", "1:1.0"],
+    ["18.6-1.pgdg13+1", "18.6-1.pgdg13+2"],
+  ] as const;
+  for (const [lower, higher] of ascending) {
+    assert.equal(compareDebianVersions(lower, higher), -1, `${lower} < ${higher}`);
+    assert.equal(compareDebianVersions(higher, lower), 1, `${higher} > ${lower}`);
+  }
+  assert.equal(compareDebianVersions("18.6-1.pgdg13+2", "18.6-1.pgdg13+2"), 0);
+  assert.equal(compareDebianVersions("1.0", "0:1.0-0"), 0);
+});
+
+function held(name: string, version: string): LockedPackage {
+  return {
+    name,
+    version,
+    architecture: "amd64",
+    url: "https://example.org/a.deb",
+    sha256: "a".repeat(64),
+    size: 1,
+  };
+}
+
+test("the packages behind the lock are the same-name records with a newer version", () => {
+  const old: PackageLock = {
+    ...lock,
+    packages: [held("libexpat1", "2.8.3-1~deb13u1"), held("linux-image-amd64", "6.12.111-1"), held("openssl", "3.5.7-1~deb13u3")],
+    extra: [held("cloudflared", "2026.10.0")],
+  };
+  const records = parsePackagesIndex(securityIndex);
+  assert.deepEqual(
+    behindLock(old, records).map((record) => [record.name, record.version]),
+    [["libexpat1", "2.9.0-1~deb13u1"], ["linux-image-amd64", "6.12.113-1"]],
+  );
+  const current: PackageLock = {
+    ...old,
+    packages: [held("libexpat1", "2.9.0-1~deb13u1"), held("linux-image-amd64", "6.12.113-1"), held("openssl", "3.6.0-1")],
+  };
+  assert.deepEqual(behindLock(current, records), []);
+});
+
+// PGDG's main component carries libpq5 from the newest major only, so the 19 release moves libpq5 19
+// into main while the image keeps the libpq5 of its server, 18.
+test("a package pinned in mkosi.conf is compared within its own major series", () => {
+  const record = (name: string, version: string): IndexRecord => ({
+    name,
+    version,
+    architecture: "amd64",
+    filename: `pool/${name}.deb`,
+    sha256: "a".repeat(64),
+    size: 1,
+  });
+  const pinnedLock: PackageLock = {
+    ...lock,
+    packages: [held("libpq5", "18.6-1.pgdg13+2"), held("libexpat1", "2.8.3-1~deb13u1")],
+    extra: [],
+  };
+  const records = [
+    record("libpq5", "19.0-1.pgdg13+1"),
+    record("libpq5", "19~rc1-1.pgdg13+1"),
+    record("libpq5", "18.7-1.pgdg13+1"),
+    record("libpq5", "18.6-1.pgdg13+2"),
+    record("libpq5", "18.5-1.pgdg13+1"),
+    record("libexpat1", "3.0.0-1"),
+  ];
+  assert.deepEqual(
+    behindLock(pinnedLock, records, new Set(["libpq5"])).map((entry) => entry.version),
+    ["18.7-1.pgdg13+1", "3.0.0-1"],
+  );
+  assert.deepEqual(
+    behindLock(pinnedLock, records).map((entry) => entry.version),
+    ["19.0-1.pgdg13+1", "19~rc1-1.pgdg13+1", "18.7-1.pgdg13+1", "3.0.0-1"],
+  );
+});
+
+test("the packages pinned in mkosi.conf are read from its Packages list", () => {
+  const pinned = pinnedPackages(readFileSync(new URL("mkosi.conf", import.meta.url), "utf8"));
+  assert.deepEqual([...pinned].sort(), [
+    "barman-cli-cloud",
+    "cloudflared",
+    "libpq5",
+    "postgresql-18",
+    "postgresql-18-pgvector",
+  ]);
 });

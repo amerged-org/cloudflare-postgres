@@ -292,6 +292,26 @@ pub fn refusal_code(text: &str) -> Option<String> {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
     .then(|| code.into())
 }
+/// What an Edge does with its two Cloudflare Access secrets: present both as a service token, none
+/// where neither is set (an installation without Access), or refuse the connection because only one
+/// is. An empty value is not set. `accessTokenState` in packages/contracts/src/edge-policy.ts holds
+/// this to the same vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access<'a> {
+    Send { id: &'a str, secret: &'a str },
+    Absent,
+    Incomplete,
+}
+pub fn access<'a>(id: Option<&'a str>, secret: Option<&'a str>) -> Access<'a> {
+    match (
+        id.filter(|id| !id.is_empty()),
+        secret.filter(|s| !s.is_empty()),
+    ) {
+        (Some(id), Some(secret)) => Access::Send { id, secret },
+        (None, None) => Access::Absent,
+        _ => Access::Incomplete,
+    }
+}
 /// What the Edge itself spent on a request: all of `duration` but the `waits` that were another's,
 /// the client's upload and the gateway's answer. Network transit and the node are not in it.
 pub fn edge_share(duration: u64, waits: &[Option<u64>]) -> u64 {
@@ -330,6 +350,9 @@ pub struct Timings {
     /// The error code of that refusal (`{"error": …}`), when it sent one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_error: Option<String>,
+    /// A configuration that kept the Edge from reaching the gateway: its name, never a value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<&'static str>,
     /// When the gateway stage began, for the handler to read; never logged.
     #[serde(skip)]
     pub gateway_started: Option<u64>,

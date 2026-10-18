@@ -52,7 +52,8 @@ ReadWritePaths=/var/lib/pgcf/db/%i /run/pgcf/%i
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-TemporaryFileSystem=/dev/shm:size=64M,mode=1777
+# PostgreSQL maps its segments here read-write only; nothing in it may run, carry setuid or be a device.
+TemporaryFileSystem=/dev/shm:size=64M,mode=1777,noexec,nosuid,nodev
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -71,4 +72,9 @@ RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# @system-service allows what kernel exploits use as their second stage: io_uring, userfaultfd, the
+# kernel keyring, the message queues and the SysV semaphores. PostgreSQL needs none of them
+# (io_method=worker, SysV shared memory, unnamed POSIX semaphores); shmget, shmat, shmdt and shmctl
+# stay allowed. The line follows the allow line above, because systemd merges the lines in order.
+SystemCallFilter=~@keyring io_uring_setup io_uring_enter io_uring_register userfaultfd msgget msgsnd msgrcv msgctl semget semop semtimedop semctl mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr
 MemoryDenyWriteExecute=yes
