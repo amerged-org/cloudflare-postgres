@@ -575,13 +575,18 @@ impl<M: Machine> Service<M> {
 
     // ---- the node reports
 
-    /// Posts what the core queued: the observations and results, and the events.
+    /// Posts what the core queued: the observations and results, and the events. The events of
+    /// the agent's log wake it as well, so that a node whose databases do not change reports them.
     async fn report(&self) {
+        let events = crate::events::global();
         let mut wait = self.intervals.batch;
         loop {
-            self.core.changed.notified().await;
+            tokio::select! {
+                () = self.core.changed.notified() => {}
+                () = events.due() => {}
+            }
             tokio::time::sleep(self.intervals.batch).await;
-            while let Some(report) = self.core.take_report() {
+            while let Some(report) = self.core.take_report(events) {
                 match self.link.post_observation(&report).await {
                     Ok(()) => wait = self.intervals.batch,
                     Err(error) => {
@@ -589,16 +594,16 @@ impl<M: Machine> Service<M> {
                             "event": "observation_not_posted",
                             "class": crate::diagnostics::error_code(&error),
                         }));
-                        self.core.unsent(&report);
+                        self.core.unsent(events, &report);
                         tokio::time::sleep(wait).await;
                         wait = (wait * 2).min(Duration::from_secs(30));
                         break;
                     }
                 }
             }
-            let events = self.core.take_events();
-            if !events.is_empty() {
-                let _ = self.link.queue_events(&events);
+            let queued = self.core.take_events();
+            if !queued.is_empty() {
+                let _ = self.link.queue_events(&queued);
             }
         }
     }

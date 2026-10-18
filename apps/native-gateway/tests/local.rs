@@ -11,7 +11,10 @@ use pgcf_native_gateway::{
     transport::{self, Config, Gateway},
 };
 use pgcf_native_protocol::{
-    agent::{self, ControlAction, Database, FromGateway, Mode, SessionStatus, ToGateway, Writer},
+    agent::{
+        self, ConnStages, ControlAction, Database, FromGateway, Mode, SessionStatus, ToGateway,
+        Writer,
+    },
     route::Keyring,
     wake::{self, MAX_HELD_PER_DATABASE, Outcome, WakeClaims, WakeResult},
     wire,
@@ -136,6 +139,8 @@ struct Node {
     port: u16,
     connections: mpsc::UnboundedReceiver<()>,
     messages: mpsc::UnboundedReceiver<FromGateway>,
+    /// The stage marks that passed while the test waited for other messages.
+    stages: Vec<ConnStages>,
     commands: mpsc::UnboundedSender<Command>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
@@ -217,6 +222,7 @@ impl Node {
             port,
             connections,
             messages,
+            stages: Vec::new(),
             commands,
             stop,
             tasks: vec![agent, channel, server],
@@ -263,6 +269,9 @@ impl Node {
                 let message = self.messages.recv().await.unwrap();
                 if pick(&message) {
                     return message;
+                }
+                if let FromGateway::ConnStages(stages) = message {
+                    self.stages.push(stages);
                 }
             }
         })
@@ -1036,5 +1045,38 @@ async fn every_connection_is_labelled_warm_or_cold() {
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The two connections that waited for a wake sent their marks to the agent, and no other
+    // connection or request did: not the warm ones, not the HTTP requests, not the tickets
+    // refused before their hold.
+    while let Ok(Some(message)) = timeout(Duration::from_millis(500), node.messages.recv()).await {
+        if let FromGateway::ConnStages(stages) = message {
+            node.stages.push(stages);
+        }
+    }
+    let mut forwarded = std::mem::take(&mut node.stages);
+    forwarded.sort_by(|a, b| a.held_outcome.cmp(&b.held_outcome));
+    let [refused, released] = forwarded.as_slice() else {
+        panic!("{forwarded:?}");
+    };
+    assert_eq!(refused.database, DATABASE);
+    assert_eq!(
+        (refused.outcome.as_str(), refused.held_outcome.as_deref()),
+        ("wake_refused", Some("refused"))
+    );
+    assert_eq!(refused.wake_reason.as_deref(), Some("no_headroom"));
+    assert_eq!(refused.dial_ms, None);
+    assert_eq!(released.held_outcome.as_deref(), Some("released"));
+    assert_eq!(released.wake_reason, None);
+    for mark in [
+        released.upgrade_ms,
+        released.startup_ms,
+        released.dial_ms,
+        released.first_backend_ms,
+        released.wake_wait_ms,
+        released.session_ms,
+    ] {
+        assert!(mark.is_some(), "{released:?}");
+    }
     node.finish().await;
 }

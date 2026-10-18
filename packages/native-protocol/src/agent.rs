@@ -4,16 +4,17 @@
 //!
 //! The agent sends the whole writer table first and then every change of it, the results of the
 //! wakes the gateway queued, and its quiesce, close, status and activity requests. The gateway
-//! sends the wakes of held connections (route v5) and its answers. A connection that ends, or a
-//! message that is not valid, ends the channel; the gateway then admits nothing new until the
-//! agent's next table, and the established sessions keep their writer.
+//! sends the wakes of held connections (route v5), its answers and the stage marks of the
+//! connections that were held. A connection that ends, or a message that is not valid, ends the
+//! channel; the gateway then admits nothing new until the agent's next table, and the established
+//! sessions keep their writer.
 //!
 //! A database's writer is its PostgreSQL unit: the Unix socket it listens on, the database's own
 //! uid and the unit's main PID, which the gateway compares with the kernel's peer credentials of
 //! every connection it dials, and the unit's invocation ID, which the route names.
 use crate::{
     valid_pattern,
-    wake::{WakeRequest, WakeResult},
+    wake::{REASONS, WakeRequest, WakeResult},
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -197,6 +198,13 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     Option::deserialize(deserializer)
 }
 
+/// A field that may be absent and is never `null`.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
 /// The counters and session counts of one database as the gateway reports them
 /// (`GatewayLocalActivityReport` of the contract): cumulative since `countersSince` within one
 /// counter run, which `processEpoch` and `epoch` name. A counter the gateway cannot know is null,
@@ -300,6 +308,95 @@ impl ActivityReport {
     }
 }
 
+/// The stage marks of one connection that waited for its database's wake (`conn_stages` of the
+/// gateway's log), in milliseconds. A mark the connection did not reach is absent. It holds
+/// numbers and fixed tokens only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnStages {
+    pub database: String,
+    /// How the connection ended: a fixed class of the gateway's log.
+    pub outcome: String,
+    /// How the wait for the wake ended: `released`, `refused`, `client_closed` and the like.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub held_outcome: Option<String>,
+    /// The reason of the agent's refusal, when it refused the wake.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub wake_reason: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub upgrade_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub startup_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub dial_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub first_backend_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub wake_wait_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub session_ms: Option<u64>,
+}
+/// `^[a-z0-9_]{1,48}$`.
+fn stage_token(text: &str) -> bool {
+    (1..=48).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+impl ConnStages {
+    pub fn valid(&self) -> bool {
+        valid_pattern("database", &self.database)
+            && stage_token(&self.outcome)
+            && self.held_outcome.as_deref().is_none_or(stage_token)
+            && self
+                .wake_reason
+                .as_deref()
+                .is_none_or(|reason| REASONS.contains(&reason))
+            && [
+                self.upgrade_ms,
+                self.startup_ms,
+                self.dial_ms,
+                self.first_backend_ms,
+                self.wake_wait_ms,
+                self.session_ms,
+            ]
+            .into_iter()
+            .all(|mark| mark.is_none_or(|ms| ms <= MAX_SAFE))
+    }
+}
+
 /// From the gateway to the agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -320,6 +417,8 @@ pub enum FromGateway {
         database: String,
         report: Box<ActivityReport>,
     },
+    /// The stage marks of a connection that was held for a wake, sent when it ends. No answer.
+    ConnStages(ConnStages),
 }
 
 /// One message as a line.
@@ -356,6 +455,7 @@ pub fn decode_from_gateway(line: &[u8]) -> Result<FromGateway, &'static str> {
             database,
             report,
         } => *id <= MAX_SAFE && valid_pattern("database", database) && report.valid(),
+        FromGateway::ConnStages(stages) => stages.valid(),
     };
     if !valid {
         return Err("invalid gateway message");

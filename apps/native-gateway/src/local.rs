@@ -6,12 +6,13 @@
 //! PostgreSQL does (running, quiescing, sleeping or retired). A connection is dialled on the
 //! database's socket and kept only when the kernel's peer credentials are the unit's uid and main
 //! PID. The wakes of held connections go to the agent on the same channel, and the agent's
-//! release is the table entry that shows the woken unit at the ticket's generation.
+//! release is the table entry that shows the woken unit at the ticket's generation. The stage
+//! marks of the connections that were held follow them there.
 use crate::{sessions::Action, transport::Gateway};
 use pgcf_native_protocol::{
     agent::{
-        self, ActivityReport, ControlAction, Database, FromGateway, MAX_LINE_BYTES, Mode,
-        SessionStatus, ToGateway, Writer,
+        self, ActivityReport, ConnStages, ControlAction, Database, FromGateway, MAX_LINE_BYTES,
+        Mode, SessionStatus, ToGateway, Writer,
     },
     wake::POLL_HOLD_MS,
 };
@@ -25,7 +26,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedReadHalf},
-    sync::{Notify, RwLock, mpsc, watch},
+    sync::{Mutex, Notify, RwLock, mpsc, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -37,6 +38,40 @@ const RECONNECT: Duration = Duration::from_millis(200);
 const WRITE_BOUND: Duration = Duration::from_secs(10);
 /// How long a quiesce or close waits for the sessions to reach the state it asks for.
 const SETTLE_BOUND: Duration = Duration::from_secs(1);
+
+/// How many stage marks wait for the channel to the agent at most.
+const STAGE_QUEUE: usize = 64;
+
+/// The stage marks of the connections that were held for a wake, on their way to the agent. A
+/// connection that ends sends its marks with `try_send` and never waits: a mark that finds the
+/// queue full is lost, and so is one that finds the agent's channel full, so the marks never
+/// delay a wake or an answer.
+pub struct StageQueue {
+    sender: mpsc::Sender<ConnStages>,
+    receiver: Mutex<mpsc::Receiver<ConnStages>>,
+}
+impl Default for StageQueue {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel(STAGE_QUEUE);
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+        }
+    }
+}
+impl StageQueue {
+    /// What a connection sends its marks with when it ends.
+    pub fn sender(&self) -> mpsc::Sender<ConnStages> {
+        self.sender.clone()
+    }
+    /// Forwards the queued marks to the agent's channel for as long as it is served.
+    pub async fn forward(&self, outgoing: &mpsc::Sender<Vec<u8>>) {
+        let mut marks = self.receiver.lock().await;
+        while let Some(stages) = marks.recv().await {
+            let _ = outgoing.try_send(agent::encode(&FromGateway::ConnStages(stages)));
+        }
+    }
+}
 
 /// The agent's table, as the gateway last received it.
 #[derive(Default)]
@@ -253,6 +288,10 @@ async fn serve(
             }
         });
     }
+    {
+        let (gateway, outgoing) = (gateway.clone(), outgoing.clone());
+        tasks.spawn(async move { gateway.stage_marks.forward(&outgoing).await });
+    }
     let mut line = Vec::new();
     loop {
         tokio::select! {
@@ -463,6 +502,44 @@ mod tests {
             writer: matches!(mode, Mode::Running | Mode::Quiesce).then(|| writer(pid)),
         }
     }
+    #[tokio::test]
+    async fn a_flood_of_stage_marks_is_dropped_never_queued_without_bound_or_waited_for() {
+        let queue = StageQueue::default();
+        let sender = queue.sender();
+        let marks = || ConnStages {
+            database: "a".repeat(20),
+            outcome: "client_closed".into(),
+            held_outcome: Some("released".into()),
+            wake_wait_ms: Some(640),
+            ..ConnStages::default()
+        };
+        // A connection that ends sends with `try_send`: beyond the bound its marks are gone.
+        let accepted = (0..STAGE_QUEUE * 4)
+            .filter(|_| sender.try_send(marks()).is_ok())
+            .count();
+        assert_eq!(accepted, STAGE_QUEUE);
+        // The agent's channel is full and nobody reads it: the forwarder drops what does not fit,
+        // empties its queue and waits for more, instead of waiting for the channel.
+        let (outgoing, mut channel) = mpsc::channel(4);
+        assert!(
+            timeout(Duration::from_millis(200), queue.forward(&outgoing))
+                .await
+                .is_err()
+        );
+        assert_eq!(sender.capacity(), STAGE_QUEUE);
+        let mut lines = Vec::new();
+        while let Ok(line) = channel.try_recv() {
+            lines.push(line);
+        }
+        assert_eq!(lines.len(), 4);
+        // What reaches the agent is the protocol's line.
+        let line = &lines[0][..lines[0].len() - 1];
+        assert_eq!(
+            agent::decode_from_gateway(line),
+            Ok(FromGateway::ConnStages(marks()))
+        );
+    }
+
     #[test]
     fn the_table_admits_running_units_and_moves_the_epochs_of_what_changed() {
         let (a, b) = ("a".repeat(20), "b".repeat(20));

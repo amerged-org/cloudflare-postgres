@@ -87,6 +87,14 @@ either. A held wake adds `held_outcome`, `wake_wait_ms` (upgrade to release), an
 `wake_reason` and `agent_ms` once its result arrived. Roles, addresses, tokens and payload bytes
 are never logged.
 
+A connection held for a wake (`wake_path` `cold`) also sends its marks to the agent on the channel
+when it ends, as the message `conn_stages` (`FromGateway::ConnStages`): the database ID, the
+`outcome`, `held_outcome` and `wake_reason` tokens and the milliseconds it reached, without
+`agent_ms` (the agent has its own steps in its `wake` event). The agent logs them as the event
+`conn_stages`, which reaches Cloudflare in an observation report. The marks wait in a queue of 64
+and are dropped when it, or the channel, is full; no connection ever waits for them. HTTP SQL
+requests send none.
+
 ## HTTP SQL
 
 `POST /sql` (`src/sql.rs`) serves the Neon driver's HTTP query mode for the Edge. It checks the

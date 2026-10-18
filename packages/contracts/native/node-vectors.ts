@@ -1715,6 +1715,18 @@ export function gatewayChannelVectors() {
     database: id,
     report: value,
   });
+  const stages = {
+    type: "conn_stages",
+    database: id,
+    outcome: "client_closed",
+    held_outcome: "released",
+    upgrade_ms: 3,
+    startup_ms: 12,
+    dial_ms: 1,
+    first_backend_ms: 7,
+    wake_wait_ms: 640,
+    session_ms: 1800,
+  };
   const gateway: [string, unknown, boolean][] = [
     ["wake", { type: "wake", wake: request }, true],
     [
@@ -1822,6 +1834,46 @@ export function gatewayChannelVectors() {
       false,
     ],
     ["unknown-type", { type: "release", database: id }, false],
+    ["conn-stages", stages, true],
+    [
+      "conn-stages-refused",
+      {
+        type: "conn_stages",
+        database: id,
+        outcome: "wake_refused",
+        held_outcome: "refused",
+        wake_reason: "no_headroom",
+        upgrade_ms: 2,
+        session_ms: 9,
+      },
+      true,
+    ],
+    [
+      "conn-stages-early-end",
+      { type: "conn_stages", database: id, outcome: "upgrade_failed" },
+      true,
+    ],
+    ["conn-stages-unknown-reason", { ...stages, wake_reason: "busy" }, false],
+    [
+      "conn-stages-outcome-text",
+      { ...stages, outcome: "client closed" },
+      false,
+    ],
+    ["conn-stages-negative", { ...stages, startup_ms: -1 }, false],
+    ["conn-stages-fraction", { ...stages, startup_ms: 1.5 }, false],
+    [
+      "conn-stages-above-2-53",
+      { ...stages, wake_wait_ms: 9_007_199_254_740_992 },
+      false,
+    ],
+    ["conn-stages-null-mark", { ...stages, dial_ms: null }, false],
+    ["conn-stages-wake-path", { ...stages, wake_path: "cold" }, false],
+    ["conn-stages-agent-steps", { ...stages, agent_ms: { start: 80 } }, false],
+    [
+      "conn-stages-no-outcome",
+      { type: "conn_stages", database: id, session_ms: 9 },
+      false,
+    ],
   ];
   const check = (
     schema: typeof local.AgentMessage | typeof local.GatewayMessage,
