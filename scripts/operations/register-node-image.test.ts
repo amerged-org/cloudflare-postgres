@@ -10,6 +10,7 @@ import {
   fleetReleaseSpec,
 } from "../../packages/contracts/src/releases.ts";
 import {
+  apiCredentials,
   digestFile,
   existingObject,
   parseBuildSummary,
@@ -275,6 +276,42 @@ test("the R2 credentials are read from named variables and a missing one is name
         PGCF_R2_ENDPOINT: "http://account.r2.example",
       }),
     /PGCF_R2_ENDPOINT/,
+  );
+});
+
+test("a credential that reaches a request header is checked first: a malformed one is refused by name and never quoted", () => {
+  const apiUrl = "https://api.example.org";
+  const apiKey = `pgcf_sk_${"a".repeat(12)}_${"B".repeat(43)}`;
+  assert.deepEqual(
+    apiCredentials({ PGCF_API_URL: apiUrl, PGCF_API_KEY: apiKey }),
+    { apiUrl, apiKey },
+  );
+  assert.throws(
+    () => apiCredentials({ PGCF_API_URL: apiUrl }),
+    /set PGCF_API_KEY/,
+  );
+  const refused = (error: Error) => {
+    assert.doesNotMatch(error.message, /SECOND-LINE|pgcf_sk_|id-value/);
+    return true;
+  };
+  assert.throws(
+    () =>
+      apiCredentials({
+        PGCF_API_URL: apiUrl,
+        PGCF_API_KEY: `${apiKey}\nSECOND-LINE`,
+      }),
+    (error: Error) => /PGCF_API_KEY/.test(error.message) && refused(error),
+  );
+  assert.throws(
+    () =>
+      r2Credentials({
+        PGCF_R2_ENDPOINT: "https://account.eu.r2.cloudflarestorage.com",
+        PGCF_R2_BUCKET: "bucket",
+        PGCF_R2_ACCESS_KEY_ID: "id-value\nSECOND-LINE",
+        PGCF_R2_SECRET_ACCESS_KEY: "secret-value",
+      }),
+    (error: Error) =>
+      /PGCF_R2_ACCESS_KEY_ID/.test(error.message) && refused(error),
   );
 });
 

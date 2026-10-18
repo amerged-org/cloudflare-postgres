@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import test from "node:test";
+import { promisify } from "node:util";
 import { newNodeId } from "../../packages/contracts/src/ids.ts";
 import {
   nodeAdditionHostname,
@@ -12,6 +14,7 @@ import {
   GATEWAY_POLICY,
   SHELL_APPLICATION,
   SHELL_POLICY,
+  cloudflareApiToken,
   durationSeconds,
   gatewayPattern,
   parseOptions,
@@ -141,15 +144,27 @@ function cloudflare(
       // The secret is in this answer only.
       return answer({ ...listed, client_secret: secret() }, 201);
     }
-    if ((match = /^\/access\/service_tokens\/([^/]+)(\/rotate)?$/.exec(rest))) {
+    if (
+      (match = /^\/access\/service_tokens\/([^/]+)(\/rotate|\/refresh)?$/.exec(
+        rest,
+      ))
+    ) {
       const at = state.tokens.findIndex((token) => token.id === match![1]);
       if (at < 0) return refuse(404, 1001, "no such token");
       if (method === "DELETE") {
         state.tokens.splice(at, 1);
         return answer({ id: match[1] });
       }
+      if (match[2] === "/refresh") {
+        // The expiry only: the secret stays, and the answer carries none.
+        state.tokens[at]!.expires_at = "2027-10-18T12:00:00Z";
+        return answer({ ...state.tokens[at] });
+      }
+      // The expiry is not in the answer of a rotation, and a rotation does not change it.
       rotations.push(body);
-      return answer({ ...state.tokens[at], client_secret: secret() });
+      const rotated: Json = { ...state.tokens[at], client_secret: secret() };
+      delete rotated.expires_at;
+      return answer(rotated);
     }
     if (rest === "/access/identity_providers" && method === "GET")
       return answer(state.providers);
@@ -510,6 +525,113 @@ test("a rotation sets the new secret on the Edge Worker, keeps the old one valid
     [],
   );
   assertNoSecrets(api, rotated.lines.join("\n"));
+});
+
+test("a rotation does not renew the token; a refresh does, needs no Edge Worker and touches nothing else", async () => {
+  const api = cloudflare();
+  await go(api, argv("--edge-worker", WORKER));
+  const [token] = api.state.tokens;
+  token!.expires_at = "2026-11-01T00:00:00Z";
+  await go(api, argv("--edge-worker", WORKER, "--rotate-service-token"));
+  assert.equal(token!.expires_at, "2026-11-01T00:00:00Z");
+
+  const before = api.calls.length;
+  const plan = await go(api, [
+    "plan",
+    ...argv("--refresh-service-token").slice(1),
+  ]);
+  assert.equal(plan.changes, 1);
+  assert.deepEqual(
+    api.calls.slice(before).filter((call) => call.method !== "GET"),
+    [],
+  );
+  const refreshed = await go(api, argv("--refresh-service-token"));
+  assert.equal(refreshed.changes, 1);
+  assert.deepEqual(
+    api.calls.slice(before).filter((call) => call.method !== "GET"),
+    [
+      {
+        method: "POST",
+        path: `/accounts/${ACCOUNT}/access/service_tokens/${String(token!.id)}/refresh`,
+        body: undefined,
+      },
+    ],
+  );
+  assert.equal(token!.expires_at, "2027-10-18T12:00:00Z");
+  assertNoSecrets(api, refreshed.lines.join("\n"));
+});
+
+test("an expired token is refused unless it is being refreshed, and one that expires within 30 days is warned about", async () => {
+  const api = cloudflare();
+  await go(api, argv("--edge-worker", WORKER));
+  const [token] = api.state.tokens;
+  const writesAfter = (from: number) =>
+    api.calls.slice(from).filter((call) => call.method !== "GET");
+
+  token!.expires_at = "2026-10-17T12:00:00Z";
+  const before = api.calls.length;
+  for (const extra of [[], ["--rotate-service-token"]])
+    await assert.rejects(
+      go(api, argv("--edge-worker", WORKER, ...extra)),
+      /expired.*--refresh-service-token/,
+    );
+  assert.deepEqual(writesAfter(before), []);
+  const renewed = await go(api, argv("--refresh-service-token"));
+  assert.equal(renewed.changes, 1);
+
+  token!.expires_at = "2026-11-10T12:00:00Z";
+  const soon = await go(api, argv());
+  assert.equal(soon.changes, 0);
+  assert.ok(
+    soon.lines.some((line) =>
+      /^warning: .*expires in 23 days.*--refresh-service-token/.test(line),
+    ),
+  );
+  // A token with a year ahead of it, and one that never expires, are not warned about.
+  for (const expires of ["2027-10-18T12:00:00Z", undefined]) {
+    if (expires === undefined) delete token!.expires_at;
+    else token!.expires_at = expires;
+    const fine = await go(api, argv());
+    assert.ok(!fine.lines.some((line) => line.startsWith("warning")));
+  }
+});
+
+test("a malformed API token is refused by name before any request and is in no output", async () => {
+  assert.equal(
+    cloudflareApiToken({ PGCF_CLOUDFLARE_API_TOKEN: API_TOKEN }),
+    API_TOKEN,
+  );
+  assert.throws(() => cloudflareApiToken({}), /set PGCF_CLOUDFLARE_API_TOKEN/);
+  const lines = ["faketokenAAAA", "FAKE-SECOND-LINE"];
+  const failure = await promisify(execFile)(
+    process.execPath,
+    [
+      new URL("./setup-access.ts", import.meta.url).pathname,
+      "plan",
+      "--account",
+      ACCOUNT,
+      "--domain",
+      DOMAIN,
+      "--service-token",
+      TOKEN_NAME,
+    ],
+    {
+      env: {
+        PATH: process.env.PATH,
+        PGCF_CLOUDFLARE_API_TOKEN: lines.join("\r\n"),
+      },
+    },
+  ).then(
+    () => assert.fail("it must fail"),
+    (error: { code: number; stdout: string; stderr: string }) => error,
+  );
+  assert.equal(failure.code, 1);
+  assert.equal(
+    failure.stderr.trim(),
+    "PGCF_CLOUDFLARE_API_TOKEN is not a Cloudflare API token",
+  );
+  for (const line of lines)
+    assert.ok(!(failure.stdout + failure.stderr).includes(line));
 });
 
 test("a token whose secret could not be delivered is deleted again, and the failure shows no credential", async () => {

@@ -106,7 +106,9 @@ there, changes only what differs (an application or policy edited by hand is put
 second policy on an application is deleted), and a second `apply` makes no write.
 
 **What it needs.** A Zero Trust organization on the account (the free plan is enough), and an
-account API token with these permissions, read from the environment and never printed or written:
+account API token with these permissions, read from the environment and never printed or written
+(a value that is not a Cloudflare API token, such as one with a second line, is refused by name
+before any request):
 
 | Permission | When |
 | --- | --- |
@@ -162,8 +164,22 @@ account API token with these permissions, read from the environment and never pr
    `ssh -o ProxyCommand="cloudflared access ssh --hostname %h" <user>@pgcf-shell-<id>.<domain>`;
    `cloudflared` opens the Access login, which needs one of the named emails.
 
-**Rotate the service token** (a year after creation at the latest: the script prints the
-`expires` date of an existing token):
+**Renew or rotate the service token.** The two are different steps. A token lasts the duration it
+was made with (8760h) and stops working then: Access refuses the Edge at every `pgcf-node-*`
+hostname and no database can be reached. Only a refresh moves that date; rotating replaces the
+secret and leaves the date as it was. The script prints the `expires` date of an existing token,
+warns when it is less than 30 days away and refuses to go on with an expired one. Cloudflare also
+sends the "Expiring Access Service Token" notification a week before; turn it on under
+Notifications in the dashboard.
+
+Renew (Cloudflare adds one year; the secret stays, so no `--edge-worker`):
+
+```sh
+node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
+  --service-token <TOKEN_NAME> --refresh-service-token
+```
+
+Rotate (after a leak report or on a schedule of your own):
 
 ```sh
 node scripts/operations/setup-access.ts apply --account <ACCOUNT_ID> --domain <NODE_GATEWAY_DOMAIN> \
@@ -175,7 +191,7 @@ Worker's secrets and the old one stays valid for `--grace` (default 1h), so the 
 connecting while the new Worker version rolls out. If the new secret cannot be set, the run says
 so and the old one stays valid for the grace period: run it again. A disabled token (for example
 after a leak report) is not enabled by the script; delete it in the dashboard to have a new one
-made.
+made, which also has a new expiry.
 
 **Roll back.** `apply --account <ACCOUNT_ID> --remove` deletes both applications and their
 policies (the same as deleting them in the dashboard under Access, Applications) and keeps the

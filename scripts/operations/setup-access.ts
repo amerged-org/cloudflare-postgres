@@ -4,7 +4,7 @@
 // there and changes only what differs, so a second run changes nothing.
 //
 //   node scripts/operations/setup-access.ts [plan|apply] --account ID --domain DOMAIN --service-token NAME
-//        [--edge-worker NAME] [--rotate-service-token] [--grace 1h]
+//        [--edge-worker NAME] [--rotate-service-token] [--grace 1h] [--refresh-service-token]
 //        [--shell --operator-email EMAIL ...] [--verify [--verify-hostname HOST]]
 //   node scripts/operations/setup-access.ts [plan|apply] --account ID --remove
 //
@@ -19,7 +19,13 @@
 //                   ACCESS_CLIENT_SECRET: a secret nobody receives is worse than none. With a token
 //                   that exists, the flag also checks that the Worker holds both secrets.
 //   --rotate-service-token  rotates the secret of the existing token and sets it on the Worker. The
-//                   token keeps its id; the old secret stays valid for --grace (default 1h).
+//                   token keeps its id and its expiry; the old secret stays valid for --grace
+//                   (default 1h).
+//   --refresh-service-token  renews the expiry of the existing token (Cloudflare adds one year); the
+//                   secret stays, so no Edge Worker is needed. A token that has expired is refused
+//                   without this flag, because Access would refuse the Edge everywhere, and one that
+//                   expires within 30 days is reported. Cloudflare also sends the "Expiring Access
+//                   Service Token" notification a week before.
 //   --shell         also guards the shells, `pgcf-shell-*.DOMAIN`, for exactly the --operator-email
 //                   addresses (repeatable; the list replaces the previous one) with a session of 1h,
 //                   through the one-time PIN identity provider when the organization has one. The
@@ -55,6 +61,7 @@ export const EDGE_SECRETS = {
   secret: "ACCESS_CLIENT_SECRET",
 } as const;
 const TOKEN_DURATION = "8760h";
+const EXPIRY_WARNING_DAYS = 30;
 const GATEWAY_SESSION = "24h";
 const SHELL_SESSION = "1h";
 const API = "https://api.cloudflare.com/client/v4";
@@ -92,6 +99,7 @@ export type Options =
       serviceToken: string;
       edgeWorker: string | undefined;
       rotate: boolean;
+      refresh: boolean;
       graceSeconds: number;
       /** The operators of the shells; undefined leaves the shells alone. */
       operators: string[] | undefined;
@@ -120,7 +128,7 @@ const sameDuration = (a: unknown, b: string) => {
 
 const USAGE =
   "usage: setup-access.ts [plan|apply] --account ID --domain DOMAIN --service-token NAME [--edge-worker NAME] " +
-  "[--rotate-service-token] [--grace 1h] [--shell --operator-email EMAIL ...] [--verify [--verify-hostname HOST]]\n" +
+  "[--rotate-service-token] [--grace 1h] [--refresh-service-token] [--shell --operator-email EMAIL ...] [--verify [--verify-hostname HOST]]\n" +
   "       setup-access.ts [plan|apply] --account ID --remove";
 
 export function parseOptions(argv: string[]): Options {
@@ -133,6 +141,7 @@ export function parseOptions(argv: string[]): Options {
       "service-token": { type: "string" },
       "edge-worker": { type: "string" },
       "rotate-service-token": { type: "boolean", default: false },
+      "refresh-service-token": { type: "boolean", default: false },
       grace: { type: "string" },
       shell: { type: "boolean", default: false },
       "operator-email": { type: "string", multiple: true },
@@ -195,6 +204,7 @@ export function parseOptions(argv: string[]): Options {
     serviceToken: values["service-token"],
     edgeWorker: values["edge-worker"],
     rotate: values["rotate-service-token"],
+    refresh: values["refresh-service-token"],
     graceSeconds,
     operators: values.shell ? [...new Set(emails)].sort() : undefined,
     verify: values.verify,
@@ -203,6 +213,21 @@ export function parseOptions(argv: string[]): Options {
 }
 
 // ---------- The Cloudflare API ----------
+
+/**
+ * The account API token of the environment. Cloudflare's tokens are letters, digits, `_` and `-`;
+ * anything else (a second line from a file, a carriage return) is refused here by name, because the
+ * runtime would quote it whole in the error for an invalid header value.
+ */
+export function cloudflareApiToken(
+  environment: Record<string, string | undefined>,
+): string {
+  const token = environment.PGCF_CLOUDFLARE_API_TOKEN;
+  if (!token) throw new Error("set PGCF_CLOUDFLARE_API_TOKEN");
+  if (!/^[A-Za-z0-9_-]+$/.test(token))
+    throw new Error("PGCF_CLOUDFLARE_API_TOKEN is not a Cloudflare API token");
+  return token;
+}
 
 /** A call of the API: the `result` of a successful answer. A refusal names the status and the API's own codes, never a body that was sent. */
 export function cloudflareCall(token: string, fetchImpl: Fetch): Call {
@@ -630,11 +655,39 @@ async function ensureServiceToken(
     throw new Error(
       `the service token "${name}" is disabled; enable it in the dashboard, or delete it to have a new one made`,
     );
-  if (options.rotate) {
-    const target = requireEdge("rotate");
-    say(`service token "${name}": exists`);
+  // Everything that can refuse the run is checked before the first write. Rotating replaces the
+  // secret and leaves the expiry alone, so an expired token needs a refresh in any case.
+  const expires = text(token.expires_at);
+  const daysLeft =
+    expires === undefined
+      ? Number.NaN
+      : (Date.parse(expires) - now.getTime()) / 86_400_000;
+  if (daysLeft <= 0 && !options.refresh)
+    throw new Error(
+      `the service token "${name}" expired on ${expires}, so Access refuses the Edge at every gateway; renew it with --refresh-service-token`,
+    );
+  say(
+    `service token "${name}": exists${expires ? `, expires ${expires}` : ""}`,
+  );
+  if (daysLeft < EXPIRY_WARNING_DAYS && !options.refresh)
+    say(
+      `warning: the service token "${name}" expires in ${Math.floor(daysLeft)} days; renew it with --refresh-service-token, because rotating does not`,
+    );
+  const rotation = options.rotate ? requireEdge("rotate") : undefined;
+  if (rotation === undefined)
+    for (const secret of Object.values(EDGE_SECRETS))
+      if (held !== undefined && !held.has(secret))
+        throw new Error(
+          `the Edge Worker "${edge?.name}" has no secret ${secret}, so Access would lock the Edge out; set both with --rotate-service-token`,
+        );
+
+  if (options.refresh)
+    await act("refresh its expiry (Cloudflare adds one year)", () =>
+      call("POST", `${accountPath}/access/service_tokens/${id}/refresh`),
+    );
+  if (rotation !== undefined)
     await act(
-      `rotate its secret (the old one stays valid for ${options.graceSeconds} s) and set it as ${EDGE_SECRETS.secret} of Worker "${target.name}"`,
+      `rotate its secret (the old one stays valid for ${options.graceSeconds} s) and set it as ${EDGE_SECRETS.secret} of Worker "${rotation.name}"`,
       async () => {
         const rotated = await call(
           "POST",
@@ -646,7 +699,7 @@ async function ensureServiceToken(
           },
         );
         try {
-          await deliver(target, rotated);
+          await deliver(rotation, rotated);
         } catch (error) {
           const reason = error instanceof Error ? error.message : "failed";
           throw new Error(
@@ -655,17 +708,6 @@ async function ensureServiceToken(
         }
       },
     );
-    return id;
-  }
-  const expires = text(token.expires_at);
-  say(
-    `service token "${name}": exists${expires ? `, expires ${expires}` : ""}`,
-  );
-  for (const secret of Object.values(EDGE_SECRETS))
-    if (held !== undefined && !held.has(secret))
-      throw new Error(
-        `the Edge Worker "${edge?.name}" has no secret ${secret}, so Access would lock the Edge out; set both with --rotate-service-token`,
-      );
   return id;
 }
 
@@ -731,10 +773,8 @@ async function main(
   environment: Record<string, string | undefined>,
 ) {
   const options = parseOptions(argv);
-  const token = environment.PGCF_CLOUDFLARE_API_TOKEN;
-  if (!token) throw new Error("set PGCF_CLOUDFLARE_API_TOKEN");
   const result = await run(options, {
-    token,
+    token: cloudflareApiToken(environment),
     fetch,
     log: (line) => console.log(line),
     now: () => new Date(),
