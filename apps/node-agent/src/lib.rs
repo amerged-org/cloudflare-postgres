@@ -9,6 +9,7 @@ pub mod credentials;
 pub mod diagnostics;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dm;
+pub mod gateway;
 pub mod health;
 pub mod holder;
 pub mod link;

@@ -42,41 +42,35 @@ pub const TICKET_LEASE_MS: u64 = 10_000;
 pub const MAX_HELD_PER_DATABASE: usize = 32;
 pub const MAX_HELD_TOTAL: usize = 512;
 pub const SLOT_NAMESPACE_PREFIX: &str = "pgcf-slot-";
-/// Every reason a wake result may name.
-pub const REASONS: [&str; 32] = [
-    "no_desired_row",
-    "not_sleeping",
-    "wake_in_progress",
-    "desired_stale",
+/// Every reason a wake result may name (`WAKE_REASONS` of `packages/contracts/src/node-local.ts`).
+pub const REASONS: [&str; 22] = [
     "no_room",
-    "thick_storage",
-    "volume_identity_missing",
-    "no_power_record",
-    "no_sleep_record",
-    "image_changed",
-    "configuration_changed",
-    "no_free_slot",
     "no_headroom",
-    "gateways_not_ready",
-    "agent_unavailable",
-    "holder_busy",
-    "volume_open",
-    "volume_suspended",
+    "deleted",
+    "suspended",
+    "moving",
+    "maintenance",
+    "fenced",
+    "superseded",
+    "unproven",
+    "storage_full",
+    "desired_stale",
+    "wake_in_progress",
+    "identity_mismatch",
+    "control_version",
     "volume_missing",
     "uuid_mismatch",
-    "unclean",
-    "control_version",
-    "identity_mismatch",
-    "container_missing",
+    "volume_suspended",
+    "volume_open",
+    "holder_busy",
     "mount_failed",
-    "audit_failed",
-    "bind_failed",
     "start_timeout",
-    "sql_identity_mismatch",
     "release_failed",
-    "deleted",
-    "not_in_region",
 ];
+/// The one refusal that waiting can undo, and so the only one with a retry hint.
+pub const RETRY_REASON: &str = "no_headroom";
+/// The longest retry hint, in seconds.
+pub const RETRY_AFTER_MAX_SECONDS: u32 = 300;
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 
 /// Route token v5 claims. `v: 5` is the wake flag: a v5 token exists only for a wake ticket.
@@ -405,11 +399,16 @@ impl WakePoll {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
+    /// The pool of the Kubernetes runtime; the node agent never answers it.
     Hit,
+    /// The pool of the Kubernetes runtime; the node agent never answers it.
     Miss,
+    /// The agent started the database's unit; its table entry releases the held connections.
+    Started,
+    /// The agent did not start it: the held connections answer 57P03.
     Refused,
 }
-/// The body of `POST /_pgcf/gateway/wake-result`.
+/// The agent's answer to a wake, with the times of its steps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WakeResult {
@@ -419,6 +418,9 @@ pub struct WakeResult {
     pub outcome: Outcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The HINT of the 57P03, exactly with `no_headroom` (`RETRY_REASON`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub steps_ms: BTreeMap<String, u64>,
 }
@@ -428,11 +430,16 @@ impl WakeResult {
             && valid_pattern("operation", &self.operation)
             && positive(self.generation)
             && match (&self.outcome, &self.reason) {
-                (Outcome::Hit, None) => true,
-                (Outcome::Miss | Outcome::Refused, Some(reason)) => {
-                    REASONS.contains(&reason.as_str())
-                }
+                (Outcome::Started, None) => true,
+                (Outcome::Refused, Some(reason)) => REASONS.contains(&reason.as_str()),
                 _ => false,
+            }
+            && match (&self.reason, self.retry_after_seconds) {
+                (Some(reason), Some(seconds)) => {
+                    reason == RETRY_REASON && (1..=RETRY_AFTER_MAX_SECONDS).contains(&seconds)
+                }
+                (reason, None) => reason.as_deref() != Some(RETRY_REASON),
+                (None, Some(_)) => false,
             }
             && self.steps_ms.len() <= 16
             && self.steps_ms.iter().all(|(key, value)| {

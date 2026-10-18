@@ -317,6 +317,7 @@ mod tests {
             generation,
             outcome,
             reason: (outcome != Outcome::Hit).then(|| "no_free_slot".into()),
+            retry_after_seconds: None,
             steps_ms: Default::default(),
         }
     }
