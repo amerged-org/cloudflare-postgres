@@ -34,8 +34,8 @@ pub use error::Error;
 pub use ids::VolumeId;
 pub use pool::{NoRoom, Policy, PoolMode, PoolSample};
 #[cfg(target_os = "linux")]
-pub use store::{Inventory, Removal, Storage};
-pub use usage::{Alert, FsUsage, MountInfo, ReserveAction, VolumeInfo};
+pub use store::Storage;
+pub use usage::{Alert, FsUsage, Inventory, MountInfo, Removal, ReserveAction, VolumeInfo};
 
 use crate::units::DB_ROOT;
 use std::{path::PathBuf, time::Duration};

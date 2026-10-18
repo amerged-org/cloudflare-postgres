@@ -529,6 +529,13 @@ impl Admitter {
     }
 
     /// The database's class gained or lost its idle time.
+    /// A resize changed the memory of an awake database: it counts at its new size from now on.
+    pub fn resized(&mut self, database: &str, memory_mib: u64) {
+        if let Some(awake) = self.awake.get_mut(database) {
+            awake.memory_mib = memory_mib;
+        }
+    }
+
     pub fn set_always_warm(&mut self, database: &str, always_warm: bool) {
         if let Some(awake) = self.awake.get_mut(database) {
             awake.always_warm = always_warm;
@@ -613,6 +620,7 @@ enum Event {
     Stopped(String),
     Activity(String, Instant),
     AlwaysWarm(String, bool),
+    Resized(String, u64),
     SleepRefused(String),
     Policy(Policy),
     Snapshot(oneshot::Sender<Snapshot>),
@@ -637,6 +645,10 @@ pub struct Permit {
     events: mpsc::UnboundedSender<Event>,
 }
 impl Permit {
+    /// The database the permit is for.
+    pub fn database(&self) -> &str {
+        &self.database
+    }
     fn end(self, ready: bool) {
         let _ = self.events.send(Event::Finish {
             database: self.database,
@@ -711,6 +723,13 @@ impl Admission {
         let _ = self
             .events
             .send(Event::AlwaysWarm(database.to_string(), always_warm));
+    }
+
+    /// An awake database was resized.
+    pub fn resized(&self, database: &str, memory_mib: u64) {
+        let _ = self
+            .events
+            .send(Event::Resized(database.to_string(), memory_mib));
     }
 
     /// An early sleep was refused; see `Admitter::early_sleep_refused`.
@@ -834,6 +853,9 @@ async fn run(
             Wake::Event(Event::Activity(database, at)) => admitter.activity(&database, at),
             Wake::Event(Event::AlwaysWarm(database, always_warm)) => {
                 admitter.set_always_warm(&database, always_warm);
+            }
+            Wake::Event(Event::Resized(database, memory_mib)) => {
+                admitter.resized(&database, memory_mib);
             }
             Wake::Event(Event::SleepRefused(database)) => {
                 admitter.early_sleep_refused(&database, now);

@@ -11,7 +11,7 @@ use super::{
     lvm::{self, GroupStep, LogicalVolume, PoolStep},
     mountinfo::{self, Mount},
     pool::{self, parse_pool, parse_thin_mapped},
-    usage::{MountInfo, VolumeInfo},
+    usage::{Inventory, MountInfo, Removal, VolumeInfo},
 };
 use std::{
     fs,
@@ -25,55 +25,6 @@ use std::{
 
 /// A volume is a whole number of extents; the volume group is made with lvm2's 4 MiB.
 const EXTENT_BYTES: u64 = 4 << 20;
-
-/// Why a volume may go (plan invariant 7: only explicit orders remove anything). Each carries the
-/// storage generation the persisted desired state or order names, which the volume's own
-/// generation must not pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Removal {
-    /// The desired state of its database is `deleted` at this storage generation.
-    DatabaseDeleted { storage_generation: u64 },
-    /// A `superseded` order for this storage generation or an older one; `remove_volume` is the
-    /// order's flag.
-    Superseded {
-        storage_generation: u64,
-        remove_volume: bool,
-    },
-}
-
-impl Removal {
-    /// Whether the order lets the volume of `id` go.
-    fn releases(self, id: &VolumeId) -> bool {
-        match self {
-            Removal::DatabaseDeleted { storage_generation } => {
-                id.generation() <= storage_generation
-            }
-            Removal::Superseded {
-                storage_generation,
-                remove_volume,
-            } => remove_volume && id.generation() <= storage_generation,
-        }
-    }
-}
-
-/// Every volume of the node and the sum of the pool's nominal sizes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Inventory {
-    pub volumes: Vec<VolumeInfo>,
-    /// The sum of every thin volume's nominal size, for the logical cap.
-    pub nominal_bytes: u64,
-}
-
-impl Inventory {
-    /// The volumes a full pool may have left damaged: those mounted while the pool took no
-    /// writes, and those on which ext4 recorded an error.
-    pub fn damaged(&self) -> Vec<&VolumeInfo> {
-        self.volumes
-            .iter()
-            .filter(|volume| volume.needs_repair())
-            .collect()
-    }
-}
 
 pub struct Storage<R = SystemRunner> {
     runner: R,
@@ -101,6 +52,10 @@ impl<R: CommandRunner> Storage<R> {
     }
     pub fn config(&self) -> &Config {
         &self.config
+    }
+    /// The device-mapper node of a volume, where its database's write limits are set.
+    pub fn device(&self, id: &VolumeId) -> String {
+        commands::device(&self.config, id)
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -327,6 +282,15 @@ impl<R: CommandRunner> Storage<R> {
                 .map(|lv| lv.size_bytes)
                 .sum(),
         })
+    }
+
+    /// Whether the database's volume of this generation exists on the node.
+    pub fn exists(&self, id: &VolumeId) -> Result<bool, Error> {
+        match self.volume(&self.read_lvs()?, id) {
+            Ok(_) => Ok(true),
+            Err(Error::Missing) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether the volume must be repaired (`recover_volume`) before its database starts again:

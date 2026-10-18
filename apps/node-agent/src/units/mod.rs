@@ -219,6 +219,13 @@ pub struct Started {
     pub socket: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+enum JobKind {
+    Start,
+    Stop,
+    Restart,
+}
+
 /// The agent's handle on the node's PostgreSQL units. Calls on different databases may run
 /// concurrently; the agent's lifecycle serializes the calls on one database.
 #[derive(Clone)]
@@ -249,8 +256,8 @@ impl Units {
         }
     }
 
-    /// Runs a start or stop job and waits for its result.
-    async fn job(&self, unit: &str, stop: bool) -> Result<(), Error> {
+    /// Runs a start, stop or restart job and waits for its result.
+    async fn job(&self, unit: &str, kind: JobKind) -> Result<(), Error> {
         // Listening starts before the job exists: a job can end before the reply to its start
         // reaches this client. The bus filters the signals to this unit's.
         let mut removed = self
@@ -260,10 +267,10 @@ impl Units {
             .await?;
         // A start never replaces a job that is queued, and a stop does: an order to stop wins over
         // a start that is under way, whose own waiter then sees `canceled`.
-        let job = if stop {
-            self.manager.stop_unit(unit, "replace").await?
-        } else {
-            self.manager.start_unit(unit, "fail").await?
+        let job = match kind {
+            JobKind::Stop => self.manager.stop_unit(unit, "replace").await?,
+            JobKind::Start => self.manager.start_unit(unit, "fail").await?,
+            JobKind::Restart => self.manager.restart_unit(unit, "replace").await?,
         };
         while let Some(message) = removed.next().await {
             let (_, path, _, result): (u32, OwnedObjectPath, String, String) =
@@ -353,7 +360,7 @@ impl Units {
     /// Starts the unit and returns when PostgreSQL accepts connections. Dropping the future does
     /// not stop the start.
     pub async fn start(&self, database: &str) -> Result<Started, Error> {
-        self.job(&Self::unit_of(database)?, false).await?;
+        self.job(&Self::unit_of(database)?, JobKind::Start).await?;
         self.started(database).await
     }
 
@@ -382,7 +389,7 @@ impl Units {
     /// Stops the unit (a fast shutdown, systemd's `KillSignal=SIGINT`), waits until it is stopped
     /// and lifts its CPU quota. A unit that is not running is stopped already.
     pub async fn stop(&self, database: &str) -> Result<(), Error> {
-        self.job(&Self::unit_of(database)?, true).await?;
+        self.job(&Self::unit_of(database)?, JobKind::Stop).await?;
         self.set_cpu_quota(database, None).await
     }
 
@@ -410,6 +417,17 @@ impl Units {
     pub async fn set_slice_memory(&self, awake_budget_mib: u64) -> Result<(), Error> {
         self.set_properties(SLICE, false, &[slice_memory(awake_budget_mib)])
             .await
+    }
+
+    /// Starts one of the image's own services (the gateway, the Tunnel), or restarts it, and
+    /// waits for the job.
+    pub async fn start_service(&self, name: &str, restart: bool) -> Result<(), Error> {
+        let kind = if restart {
+            JobKind::Restart
+        } else {
+            JobKind::Start
+        };
+        self.job(name, kind).await
     }
 
     /// Sets the CPU quota of a database's unit until the next boot, or lifts it with `None`.

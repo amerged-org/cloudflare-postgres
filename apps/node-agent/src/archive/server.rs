@@ -346,7 +346,7 @@ impl Entry {
     }
 }
 
-pub(super) fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
@@ -381,7 +381,7 @@ async fn read_line(stream: &mut UnixStream) -> Option<Vec<u8>> {
 
 /// A line of the agent's log about a failed job. The command's stderr is cut short and holds no
 /// part of the credential.
-pub(super) fn log_failed_job(
+pub(crate) fn log_failed_job(
     event: &str,
     database_id: &str,
     name: &str,

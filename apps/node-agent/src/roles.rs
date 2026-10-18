@@ -20,6 +20,9 @@ use std::{
     time::Duration,
 };
 
+/// The role that owns the tenant's database (`OWNER_ROLE_NAME` of the contract).
+pub const OWNER_ROLE: &str = "app";
+
 /// How long the sessions of a role that is being removed may take to end.
 const SESSIONS_END: Duration = Duration::from_secs(3);
 
@@ -238,6 +241,47 @@ async fn remove(session: &Session, name: &str) -> Result<bool, Error> {
     }
     session.batch(&format!("DROP ROLE {quoted}")).await?;
     Ok(true)
+}
+
+/// The role of barman's base backups (plan 7.6) and what barman 3.20 needs of it: `pg_checkpoint`,
+/// `pg_monitor` and `EXECUTE` on the backup functions (`archive::job::BACKUP_ROLE`). It logs in by
+/// peer, as the database's own Linux user (`pg_ident.conf`), and has no password.
+const BACKUP_ROLE_SQL: &str = "\
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pgcf_backup') THEN
+    CREATE ROLE pgcf_backup LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END $$;
+GRANT pg_checkpoint, pg_monitor TO pgcf_backup;
+GRANT CONNECT ON DATABASE postgres TO pgcf_backup;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_backup_start(text, boolean), pg_catalog.pg_backup_stop(boolean),
+  pg_catalog.pg_switch_wal(), pg_catalog.pg_create_restore_point(text) TO pgcf_backup";
+
+/// Makes the backup role what barman needs.
+pub async fn ensure_backup_role(session: &Session) -> Result<(), Error> {
+    debug_assert_eq!(BACKUP_ROLE, "pgcf_backup");
+    session.batch(BACKUP_ROLE_SQL).await
+}
+
+/// Makes the database `<id>` owned by `owner`, which the tenant's roles use; the cluster's own
+/// `postgres` and `template1` stay for the agent.
+pub async fn ensure_database(session: &Session, database: &str, owner: &str) -> Result<(), Error> {
+    let exists = session
+        .query(
+            "SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1",
+            &[&database],
+        )
+        .await?;
+    if exists.is_empty() {
+        session
+            .batch_long(&format!(
+                "CREATE DATABASE {} OWNER {}",
+                quote_identifier(database),
+                quote_identifier(owner)
+            ))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Makes PostgreSQL hold the page's roles. A present role is written when its applied revision is
@@ -632,5 +676,74 @@ mod tests {
             .await
             .unwrap();
         assert!(rows[0].get::<_, bool>(0));
+    }
+
+    #[tokio::test]
+    async fn the_backup_role_can_run_a_backup_and_nothing_else_and_the_database_is_the_owners() {
+        let Some((cluster, agent)) = started().await else {
+            return;
+        };
+        ensure_backup_role(&agent).await.unwrap();
+        // Again changes nothing and fails nothing.
+        ensure_backup_role(&agent).await.unwrap();
+        apply(&agent, &wanted(page()), &BTreeMap::new(), false)
+            .await
+            .unwrap();
+        ensure_database(&agent, "d0123456789abcdefghi", "app")
+            .await
+            .unwrap();
+        ensure_database(&agent, "d0123456789abcdefghi", "app")
+            .await
+            .unwrap();
+        let rows = agent
+            .query(
+                "SELECT pg_catalog.pg_get_userbyid(datdba)::text FROM pg_database WHERE datname = 'd0123456789abcdefghi'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, String>(0), "app");
+
+        // By peer, as the database's own user, it runs what barman 3.20 runs.
+        let backup = postgres::connect(&cluster.socket_directory(), "pgcf_backup", "postgres")
+            .await
+            .unwrap();
+        backup
+            .query("SELECT pg_backup_start('pgcf', true)", &[])
+            .await
+            .unwrap();
+        backup
+            .query("SELECT pg_create_restore_point('pgcf')", &[])
+            .await
+            .unwrap();
+        backup.query("SELECT pg_switch_wal()", &[]).await.unwrap();
+        backup
+            .query("SELECT * FROM pg_backup_stop(true)", &[])
+            .await
+            .unwrap();
+        backup.batch_long("CHECKPOINT").await.unwrap();
+        backup
+            .query("SELECT count(*) FROM pg_stat_activity", &[])
+            .await
+            .unwrap();
+        // It cannot make a role or read what a tenant keeps.
+        assert!(backup.batch("CREATE ROLE intruder").await.is_err());
+        assert!(
+            backup
+                .batch("ALTER SYSTEM SET work_mem = '1GB'")
+                .await
+                .is_err()
+        );
+        let rows = backup
+            .query("SELECT rolsuper, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname = current_user", &[])
+            .await
+            .unwrap();
+        assert!((0..4).all(|i| !rows[0].get::<_, bool>(i)));
+        // The tenant's roles do not log in by peer, whoever the Linux user is.
+        assert!(
+            postgres::connect(&cluster.socket_directory(), "app", "postgres")
+                .await
+                .is_err()
+        );
     }
 }

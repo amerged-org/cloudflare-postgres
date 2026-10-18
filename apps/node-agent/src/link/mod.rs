@@ -16,7 +16,7 @@ mod outbox;
 mod request;
 mod socket;
 #[cfg(test)]
-mod test_server;
+pub(crate) mod test_server;
 
 pub use desired::{Desired, Order};
 pub use events::LinkEvent;

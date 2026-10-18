@@ -125,6 +125,8 @@ pub struct Inner {
     pub upgrades: usize,
     pub hellos: Vec<Value>,
     pub samples: Vec<Value>,
+    /// The archive path a credential identifier is for, where it is not the example's.
+    pub credential_paths: std::collections::HashMap<String, String>,
 }
 pub struct Cloud {
     pub origin: String,
@@ -185,6 +187,7 @@ impl Cloud {
             upgrades: 0,
             hellos: vec![],
             samples: vec![],
+            credential_paths: Default::default(),
         }));
         let (commands, _) = broadcast::channel(16);
         let task = tokio::spawn({
@@ -469,6 +472,9 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
     } else if let Some(id) = path.strip_prefix(paths["archiveCredentials"].as_str().unwrap()) {
         let mut credential = vector("ArchiveCredential", "read-write");
         credential["id"] = id.into();
+        if let Some(path) = inner.credential_paths.get(id) {
+            credential["path"] = path.as_str().into();
+        }
         answer(200, credential)
     } else if is("observations") {
         post("NodeObservationReport")

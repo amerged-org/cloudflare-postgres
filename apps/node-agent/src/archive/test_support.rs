@@ -196,6 +196,10 @@ printf ']}}\n'
             self.root.join("jobs"),
         )
     }
+    /// The directory of the executables: `systemd-run` and the barman-cloud commands.
+    pub fn bin_directory(&self) -> PathBuf {
+        self.root.join("bin")
+    }
     pub fn jobs_directory(&self) -> PathBuf {
         self.root.join("jobs")
     }

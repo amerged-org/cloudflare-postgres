@@ -155,6 +155,55 @@ impl VolumeInfo {
     }
 }
 
+/// Why a volume may go (plan invariant 7: only explicit orders remove anything). Each carries the
+/// storage generation the persisted desired state or order names, which the volume's own
+/// generation must not pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// The desired state of its database is `deleted` at this storage generation.
+    DatabaseDeleted { storage_generation: u64 },
+    /// A `superseded` order for this storage generation or an older one; `remove_volume` is the
+    /// order's flag.
+    Superseded {
+        storage_generation: u64,
+        remove_volume: bool,
+    },
+}
+
+impl Removal {
+    /// Whether the order lets the volume of `id` go.
+    fn releases(self, id: &VolumeId) -> bool {
+        match self {
+            Removal::DatabaseDeleted { storage_generation } => {
+                id.generation() <= storage_generation
+            }
+            Removal::Superseded {
+                storage_generation,
+                remove_volume,
+            } => remove_volume && id.generation() <= storage_generation,
+        }
+    }
+}
+
+/// Every volume of the node and the sum of the pool's nominal sizes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inventory {
+    pub volumes: Vec<VolumeInfo>,
+    /// The sum of every thin volume's nominal size, for the logical cap.
+    pub nominal_bytes: u64,
+}
+
+impl Inventory {
+    /// The volumes a full pool may have left damaged: those mounted while the pool took no
+    /// writes, and those on which ext4 recorded an error.
+    pub fn damaged(&self) -> Vec<&VolumeInfo> {
+        self.volumes
+            .iter()
+            .filter(|volume| volume.needs_repair())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,5 +31,5 @@ pub mod recovery;
 pub mod restore;
 pub mod server;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 pub mod upload_log;

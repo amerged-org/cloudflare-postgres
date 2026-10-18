@@ -29,6 +29,7 @@ pub trait Manager {
     fn subscribe(&self) -> zbus::Result<()>;
     fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
+    fn restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     /// Sets properties on a unit that is loaded or not, without a reload. `runtime` keeps them
     /// until the next boot; otherwise systemd also writes a drop-in under `system.control`.
     fn set_unit_properties(

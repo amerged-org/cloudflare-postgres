@@ -50,6 +50,15 @@ impl ProvenSleepRecord {
     }
 }
 
+/// The size the node last set a database to: its unit's limits and its volume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resources {
+    pub memory_mib: u64,
+    pub cpu_millicores: u32,
+    pub storage_gib: u64,
+}
+
 /// The newest DONE base backup of the storage generation (`NodeDatabaseObservation.backup`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +94,13 @@ pub struct DatabaseState {
     pub roles: BTreeMap<String, u64>,
     pub record: Option<ProvenSleepRecord>,
     pub backup: Option<Backup>,
+    /// The SHA-256 of the configuration files the agent last wrote, so that it writes them again
+    /// only when the database's size or settings changed.
+    #[serde(default)]
+    pub config: Option<String>,
+    /// What the unit's limits and the volume were last set to.
+    #[serde(default)]
+    pub resources: Option<Resources>,
 }
 impl DatabaseState {
     pub fn new(storage_generation: u64) -> Self {
@@ -95,6 +111,8 @@ impl DatabaseState {
             roles: BTreeMap::new(),
             record: None,
             backup: None,
+            config: None,
+            resources: None,
         }
     }
     fn valid(&self) -> bool {
@@ -102,6 +120,12 @@ impl DatabaseState {
             && (1..=9_007_199_254_740_991).contains(&self.storage_generation)
             && self.record.as_ref().is_none_or(ProvenSleepRecord::valid)
             && self.backup.as_ref().is_none_or(Backup::valid)
+            && self.config.as_ref().is_none_or(|sha| {
+                sha.len() == 64
+                    && sha
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
     }
 }
 
@@ -220,6 +244,7 @@ mod tests {
         state.built = true;
         state.roles.insert("app".into(), 4);
         state.record = Some(record());
+        state.config = Some("a".repeat(64));
         state.backup = Some(Backup {
             backup_id: "20261018T101112".into(),
             timeline: 1,
