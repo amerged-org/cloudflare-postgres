@@ -180,12 +180,32 @@ export function compareDebianVersions(a: string, b: string): number {
   );
 }
 
-// The records of an index that carry a locked package's name at a newer version.
-export function behindLock(lock: PackageLock, records: IndexRecord[]): IndexRecord[] {
+// The epoch and the leading number of the upstream version: "0:18" for 18.6-1.pgdg13+2 and 19~rc1-1.
+function majorSeries(version: string): string {
+  const { epoch, upstream } = splitVersion(version);
+  return `${epoch}:${/^[0-9]*/.exec(upstream)![0]}`;
+}
+
+// The package names that mkosi.conf pins to an exact version, such as "        libpq5=18.6-1.pgdg13+2".
+export function pinnedPackages(conf: string): Set<string> {
+  const names = new Set<string>();
+  for (const match of conf.matchAll(/^[ \t]+([a-z0-9][a-z0-9+.-]+)=\S+[ \t]*$/gm)) names.add(match[1]!);
+  return names;
+}
+
+// The records of an index that carry a locked package's name at a newer version. A pinned package
+// is a deliberate choice of major version (libpq5 follows its server, and PGDG's main component
+// moves libpq5 to the newest major on release), so only its own major series counts for it.
+export function behindLock(
+  lock: PackageLock,
+  records: IndexRecord[],
+  pinned: ReadonlySet<string> = new Set(),
+): IndexRecord[] {
   const locked = new Map([...lock.extra, ...lock.packages].map((entry) => [entry.name, entry.version]));
   return records.filter((record) => {
     const version = locked.get(record.name);
-    return version !== undefined && compareDebianVersions(record.version, version) > 0;
+    if (version === undefined || compareDebianVersions(record.version, version) <= 0) return false;
+    return !pinned.has(record.name) || majorSeries(record.version) === majorSeries(version);
   });
 }
 

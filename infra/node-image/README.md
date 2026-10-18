@@ -16,7 +16,7 @@ Everything that goes into the image is pinned in [packages.lock.json](packages.l
 | Builder base | `debian:trixie-20260918-slim` by multi-platform digest |
 | Builder tools | Debian packages from the same snapshot as the image |
 | mkosi | tag `v27.1`, fetched by commit and checked |
-| Debian | snapshot.debian.org at `20261016T000000Z` (trixie, trixie-updates, trixie-security) |
+| Debian | snapshot.debian.org at `20261016T133910Z` (trixie, trixie-updates, trixie-security) |
 | PGDG | `apt-archive.postgresql.org` `trixie-pgdg-archive`, key [keys/pgdg.asc](keys/pgdg.asc) by sha256 and fingerprint |
 | cloudflared | the `2026.10.0` release `.deb` by URL, size and sha256 |
 | Packages | every installed `.deb` with name, version, architecture, URL, size and sha256 |
@@ -50,11 +50,15 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
   `deb.debian.org` and `trixie-pgdg` of `apt.postgresql.org`, verified with the container's
   `debian-archive-keyring` and with `keys/pgdg.asc` for the locked fingerprint. It prints
   `name locked available suite` for every package in the lock (`packages` and `extra`) that one of
-  these suites lists at a newer Debian version, and exits 1 if there is any. Nothing is installed or
-  written to the lock; the remedy is `resolve` with a newer snapshot (the first
+  these suites lists at a newer Debian version, and exits 1 if there is any. A package pinned in
+  `mkosi.conf` counts only within its major series: PGDG's `main` component carries `libpq5` of the
+  newest major only, so once PostgreSQL 19 is released `libpq5` 19 there is not an update of the
+  `libpq5` 18 that goes with the server. Nothing is installed or written to the lock. The remedy for
+  a Debian package is `resolve` with a newer snapshot (the first
   [snapshot.debian.org](https://snapshot.debian.org/archive/debian-security/) timestamp whose
-  `trixie-security` index lists the new versions), then a new image release. The check holds no
-  secret.
+  `trixie-security` index lists the new versions); for a package pinned in `mkosi.conf` (the PGDG
+  set) it is to raise that pin, because a snapshot never moves it, and then `resolve`. Either way a
+  new image release follows. The check holds no secret.
 - **build** downloads every locked `.deb` (size and sha256 checked, three attempts each), serves
   them as the only repository (mkosi `LocalMirror=`) and builds offline. The build fails if the
   installed set differs from the lock in any package or version. It writes `pgcf-node.raw`,

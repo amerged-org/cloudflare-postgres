@@ -11,8 +11,10 @@ import {
   liveRepositories,
   lockPackages,
   parsePackagesIndex,
+  pinnedPackages,
   snapshotEpoch,
   validateLock,
+  type IndexRecord,
   type LockedPackage,
   type PackageLock,
 } from "./lock.ts";
@@ -278,15 +280,18 @@ test("Debian versions order by epoch, upstream version and revision", () => {
   assert.equal(compareDebianVersions("1.0", "0:1.0-0"), 0);
 });
 
-test("the packages behind the lock are the same-name records with a newer version", () => {
-  const held = (name: string, version: string): LockedPackage => ({
+function held(name: string, version: string): LockedPackage {
+  return {
     name,
     version,
     architecture: "amd64",
     url: "https://example.org/a.deb",
     sha256: "a".repeat(64),
     size: 1,
-  });
+  };
+}
+
+test("the packages behind the lock are the same-name records with a newer version", () => {
   const old: PackageLock = {
     ...lock,
     packages: [held("libexpat1", "2.8.3-1~deb13u1"), held("linux-image-amd64", "6.12.111-1"), held("openssl", "3.5.7-1~deb13u3")],
@@ -302,4 +307,49 @@ test("the packages behind the lock are the same-name records with a newer versio
     packages: [held("libexpat1", "2.9.0-1~deb13u1"), held("linux-image-amd64", "6.12.113-1"), held("openssl", "3.6.0-1")],
   };
   assert.deepEqual(behindLock(current, records), []);
+});
+
+// PGDG's main component carries libpq5 from the newest major only, so the 19 release moves libpq5 19
+// into main while the image keeps the libpq5 of its server, 18.
+test("a package pinned in mkosi.conf is compared within its own major series", () => {
+  const record = (name: string, version: string): IndexRecord => ({
+    name,
+    version,
+    architecture: "amd64",
+    filename: `pool/${name}.deb`,
+    sha256: "a".repeat(64),
+    size: 1,
+  });
+  const pinnedLock: PackageLock = {
+    ...lock,
+    packages: [held("libpq5", "18.6-1.pgdg13+2"), held("libexpat1", "2.8.3-1~deb13u1")],
+    extra: [],
+  };
+  const records = [
+    record("libpq5", "19.0-1.pgdg13+1"),
+    record("libpq5", "19~rc1-1.pgdg13+1"),
+    record("libpq5", "18.7-1.pgdg13+1"),
+    record("libpq5", "18.6-1.pgdg13+2"),
+    record("libpq5", "18.5-1.pgdg13+1"),
+    record("libexpat1", "3.0.0-1"),
+  ];
+  assert.deepEqual(
+    behindLock(pinnedLock, records, new Set(["libpq5"])).map((entry) => entry.version),
+    ["18.7-1.pgdg13+1", "3.0.0-1"],
+  );
+  assert.deepEqual(
+    behindLock(pinnedLock, records).map((entry) => entry.version),
+    ["19.0-1.pgdg13+1", "19~rc1-1.pgdg13+1", "18.7-1.pgdg13+1", "3.0.0-1"],
+  );
+});
+
+test("the packages pinned in mkosi.conf are read from its Packages list", () => {
+  const pinned = pinnedPackages(readFileSync(new URL("mkosi.conf", import.meta.url), "utf8"));
+  assert.deepEqual([...pinned].sort(), [
+    "barman-cli-cloud",
+    "cloudflared",
+    "libpq5",
+    "postgresql-18",
+    "postgresql-18-pgvector",
+  ]);
 });

@@ -24,6 +24,7 @@ import {
   liveRepositories,
   lockPackages,
   parsePackagesIndex,
+  pinnedPackages,
   snapshotEpoch,
   validateLock,
   type LockedPackage,
@@ -193,7 +194,8 @@ async function resolveLock(work: string): Promise<void> {
 }
 
 // The locked packages that today's trixie-security, trixie-updates and PGDG indexes list at a newer
-// version, one "name locked available suite" line each. The run fails if there is any.
+// version, one "name locked available suite" line each; a package pinned in mkosi.conf counts only
+// within its major series. The run fails if there is any.
 async function checkAdvisories(work: string): Promise<void> {
   const lock = await readLock();
   const out = join(work, "advisories");
@@ -202,18 +204,22 @@ async function checkAdvisories(work: string): Promise<void> {
   runBuilder(buildBuilder(lock), lock, "advisories", { out }, "advisories");
 
   const locked = new Map([...lock.extra, ...lock.packages].map((entry) => [entry.name, entry.version]));
+  const pinned = pinnedPackages(await readFile(join(here, "mkosi.conf"), "utf8"));
   const behind: string[] = [];
   for (const repository of liveRepositories()) {
     const name = aptListName(repository);
     if (!existsSync(join(out, "lists", name))) throw new Error(`missing signed index ${name}`);
     const records = parsePackagesIndex(await readFile(join(out, "lists", name), "utf8"));
-    for (const record of behindLock(lock, records)) {
+    for (const record of behindLock(lock, records, pinned)) {
       behind.push(`${record.name} ${locked.get(record.name)} ${record.version} ${repository.suite}`);
     }
   }
   if (behind.length > 0) {
     console.log(behind.join("\n"));
-    console.error(`${behind.length} locked packages have a newer version; resolve a newer snapshot`);
+    console.error(
+      `${behind.length} locked packages have a newer version: for a Debian package resolve a newer snapshot, ` +
+        "for a package pinned in mkosi.conf raise its pin and then resolve",
+    );
     process.exitCode = 1;
   } else {
     console.log("the lock is current");
