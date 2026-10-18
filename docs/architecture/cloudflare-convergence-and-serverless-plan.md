@@ -1137,6 +1137,7 @@ That covers a crash, a reboot or a Contabo shutdown that stopped PostgreSQL with
 
 **Operator shell:**
 - `sshd` listens on loopback only.
+- It takes a user certificate for root and nothing else (no password, no `authorized_keys`): the CA public key is `/etc/ssh/pgcf_user_ca.pub`, which the public image does not ship, so no login is possible until the install writes it. The principal is `pgcf-break-glass`; two tries, no forwarding, an empty revocation list.
 - No other socket reaches it: systemd 257's ssh generator, which would bind sshd to a Unix socket any local user can connect to and to vsock, is masked and off on the kernel command line.
 - The operator reaches it through the node's Tunnel, with Cloudflare Access and short-lived SSH certificates.
 - The shell hostname (`<node>-ssh.<domain>`) is off until Access exists: without Access, anyone who can run cloudflared could reach it. The API makes the hostname, its DNS record and the Tunnel's ingress rule only while the Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (default off), and its next credentials call for a node removes a record and rule the node already has.

@@ -73,6 +73,84 @@ no_ssh_socket() {
 	fi
 }
 
+# Plan 8: the operator shell is certificate-only. sshd -t accepts the drop-in and sshd -T reports
+# its effective values; per-source penalties stay at their default.
+sshd_policy() {
+	sshd -t || return 1
+	local effective line
+	effective=$(sshd -T) || return 1
+	for line in \
+		'listenaddress 127.0.0.1:22' 'listenaddress [::1]:22' \
+		'passwordauthentication no' 'kbdinteractiveauthentication no' \
+		'authenticationmethods publickey' 'pubkeyauthentication yes' 'authorizedkeysfile none' \
+		'trustedusercakeys /etc/ssh/pgcf_user_ca.pub' 'authorizedprincipalsfile /etc/ssh/principals/%u' \
+		'revokedkeys /etc/ssh/pgcf_revoked.krl' 'permitrootlogin without-password' 'allowusers root' \
+		'maxauthtries 2' 'logingracetime 20' 'maxsessions 2' \
+		'x11forwarding no' 'allowtcpforwarding no' 'allowagentforwarding no' 'permittunnel no' \
+		'disableforwarding yes' 'gssapiauthentication no' \
+		'clientaliveinterval 30' 'clientalivecountmax 4' 'loglevel VERBOSE'; do
+		grep -qxF "$line" <<<"$effective" || {
+			echo "sshd -T lacks: $line"
+			return 1
+		}
+	done
+	grep -q '^persourcepenalties .*authfail:' <<<"$effective" || {
+		echo "per-source penalties are off"
+		return 1
+	}
+}
+
+# One publickey attempt as root with the key in $1 (and the certificate next to it) at address $2.
+ssh_attempt() {
+	ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 \
+		-i "$1" "root@$2" true 2>&1
+}
+
+# sshd's authentication must refuse (MaxAuthTries 2 ends a key with its certificate in "Too many
+# authentication failures"), not a connection that never reached it.
+ssh_refused() {
+	local output
+	if output=$(ssh_attempt "$@"); then
+		echo "login accepted at $2"
+		return 1
+	fi
+	grep -qE 'Permission denied \(publickey\)|Too many authentication failures' <<<"$output" || {
+		echo "$2: $output"
+		return 1
+	}
+}
+
+# The image ships no CA key, so no login is possible: a certificate from a throwaway CA is refused
+# on both loopback addresses. With that CA installed it is accepted (this proves the shipped
+# principals file, key revocation list and their modes), and refused again once the CA is gone.
+sshd_certificate_only() {
+	local ca=/etc/ssh/pgcf_user_ca.pub dir output result=0
+	[ ! -e "$ca" ] || {
+		echo "the image carries a CA key"
+		return 1
+	}
+	dir=$(mktemp -d) || return 1
+	if ssh-keygen -q -t ed25519 -N '' -f "$dir/user" &&
+		ssh-keygen -q -t ed25519 -N '' -f "$dir/ca" &&
+		ssh-keygen -q -s "$dir/ca" -I pgcf-boot-test -n pgcf-break-glass -V -1m:+10m "$dir/user.pub"; then
+		ssh_refused "$dir/user" 127.0.0.1 && ssh_refused "$dir/user" ::1 || result=1
+		if [ "$result" = 0 ]; then
+			cp "$dir/ca.pub" "$ca"
+			output=$(ssh_attempt "$dir/user" 127.0.0.1) || {
+				echo "refused with the CA installed: $output"
+				result=1
+			}
+			rm -f "$ca"
+			ssh_refused "$dir/user" 127.0.0.1 || result=1
+		fi
+	else
+		result=1
+	fi
+	rm -rf "$dir"
+	[ "$result" = 0 ]
+}
+
 inbound_dropped() {
 	nft list chain inet pgcf input | grep -q 'policy drop;'
 }
@@ -243,6 +321,8 @@ if [ "$phase" = 1 ]; then
 	check database_unit_waits_for_recovery database_unit_waits_for_recovery
 	check database_unit_has_no_start_pre database_unit_has_no_start_pre
 	check database_unit_syscall_filter database_unit_syscall_filter
+	check sshd_policy sshd_policy
+	check sshd_certificate_only sshd_certificate_only
 	check backup_slice_top_level backup_slice_top_level
 fi
 check pool wait_for 120 pool

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import test from "node:test";
 
 const image = new URL("mkosi.extra/", import.meta.url);
@@ -107,4 +107,33 @@ test("systemd's ssh generator is masked and off on the kernel command line: no s
     .filter((line) => line.startsWith("linux "));
   assert.equal(kernels.length, 2, "the current and the previous kernel");
   for (const line of kernels) assert.ok(line.split(/\s+/).includes("systemd.ssh_auto=no"), line);
+});
+
+test("sshd takes user certificates only and the image ships no CA key: nothing logs in until the install writes one", () => {
+  const directives = records(readFileSync(new URL("etc/ssh/sshd_config.d/10-pgcf.conf", image), "utf8")).map(
+    (fields) => [(fields[0] ?? "").toLowerCase(), fields.slice(1).join(" ")] as const,
+  );
+  const values = (keyword: string) => directives.filter(([name]) => name === keyword).map(([, value]) => value);
+  assert.deepEqual(values("listenaddress"), ["127.0.0.1", "::1"]);
+  const fixed = {
+    passwordauthentication: "no",
+    kbdinteractiveauthentication: "no",
+    authenticationmethods: "publickey",
+    authorizedkeysfile: "none",
+    allowusers: "root",
+  };
+  for (const [keyword, value] of Object.entries(fixed)) assert.deepEqual(values(keyword), [value], keyword);
+  const ca = values("trustedusercakeys")[0];
+  assert.ok(ca !== undefined && ca.startsWith("/"), "a CA file is named");
+  assert.equal(existsSync(new URL(ca.slice(1), image)), false, "the public image carries no CA key");
+  assert.equal(readFileSync(new URL("etc/ssh/principals/root", image), "utf8"), "pgcf-break-glass\n");
+  assert.deepEqual(values("authorizedprincipalsfile"), ["/etc/ssh/principals/%u"]);
+  // A missing RevokedKeys file makes sshd refuse every public key, so the image ships an empty KRL:
+  // the header of PROTOCOL.krl (magic, format 1, version, date, flags, reserved, comment), no section.
+  const revoked = values("revokedkeys")[0];
+  assert.ok(revoked !== undefined && revoked.startsWith("/"), "a revocation list is named");
+  const krl = readFileSync(new URL(revoked.slice(1), image));
+  assert.equal(krl.length, 44);
+  assert.equal(krl.subarray(0, 8).toString("latin1"), "SSHKRL\n\0");
+  assert.equal(krl.readUInt32BE(8), 1);
 });
