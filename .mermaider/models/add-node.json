@@ -47,7 +47,7 @@
             "path": "apps/api/src/domain/node-capacity.ts",
             "symbol": "placePendingDatabases",
             "line": 36,
-            "sha256": "5ce4831c16987acece8dbf7d851a438f76a2a77a2cfa16281dc0143f28174866"
+            "sha256": "8e21d958cbcf02ea0c8848e0766e8b673092372ee72bba1529643c9db36d623b"
           }
         ]
       },
@@ -71,7 +71,7 @@
             "path": "apps/api/src/domain/node-state.ts",
             "symbol": "claimNodeDispatch",
             "line": 756,
-            "sha256": "ba49ec54e82d4abe06a770b989e3b57c28542ba8fd07e14a20aafdd4ab3f49c1"
+            "sha256": "e11f651e427bdcc706202b84ac2c92acfa4d808c2cbdbcb689bc6b26db2828d9"
           },
           {
             "path": "apps/api/src/workflows/add-node.ts",

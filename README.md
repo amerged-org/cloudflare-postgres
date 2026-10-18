@@ -212,7 +212,8 @@ failing or stale daily infrastructure backup, a running database whose WAL archi
 (`database_archive_failing`), an awake database with no completed base backup within 36 hours of
 awake time (`database_base_backup_stale`; hibernated databases are excluded), and a thin pool
 without room or without a sample (`thin_storage_blocked`), a node that keeps refusing wakes for awake
-capacity (`regional_node_capacity_refusals`) and a database volume at 80 % or 90 % of its space or
+capacity (`regional_node_capacity_refusals`), a thin pool that placement has closed
+(`regional_node_pool_closed`: data at 80 %, metadata at 50 % or the logical cap) and a database volume at 80 % or 90 % of its space or
 inodes (`database_volume_warning`, `database_volume_critical`). Each
 minute-cron step runs in its own failure boundary, and the `CronWatchdog` Durable Object (binding
 `CRON_WATCHDOG`) judges the cron's heartbeat from its own alarm, independently of the cron trigger,

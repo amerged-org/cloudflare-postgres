@@ -82,6 +82,14 @@ export function usageSnapshot(resources: Resources) {
   };
 }
 
+/**
+ * `usageSnapshot` in SQL, for the database `d` and its row `r` of the view `database_resources`:
+ * the events that follow `created` keep the very figures it does.
+ */
+export const USAGE_SNAPSHOT_SQL = `json_object('memory_mib',r.memory_mib,'cpu_millicores',r.cpu_millicores,
+  'reserved_memory_mib',r.memory_mib,'reserved_cpu_millicores',r.cpu_millicores,
+  'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN r.storage_gib*1073741824 ELSE NULL END)`;
+
 /** The effective values of a database, as the SQL columns `effective_*` that rows.ts selects. */
 export function effectiveOf(
   row: Pick<

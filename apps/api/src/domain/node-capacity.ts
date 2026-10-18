@@ -72,6 +72,7 @@ export async function placePendingDatabases(
       guard = placementGuard("n", {
         nodeId: node.id,
         pendingMemoryMib: node.pending_memory_mib,
+        pendingStorageGib: node.pending_storage_gib,
         now: decidedAt,
       });
     const results = await db.batch([

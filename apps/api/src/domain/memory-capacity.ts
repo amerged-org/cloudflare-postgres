@@ -251,6 +251,6 @@ export function regionalRamExpansionSql(
           : `AND EXISTS(SELECT 1 FROM (SELECT ${key} request_key) ram_key
         WHERE (ram_key.request_key='capacity-ram-'||CAST(CAST(substr(ram_key.request_key,14) AS INTEGER) AS TEXT)
           AND CAST(substr(ram_key.request_key,14) AS INTEGER) BETWEEN 1 AND regional_ram.minute)
-          OR ram_key.request_key LIKE 'capacity-order-%' OR ram_key.request_key LIKE 'capacity-headroom-%')`
+          OR ram_key.request_key LIKE 'capacity-order-%')`
       })`;
 }

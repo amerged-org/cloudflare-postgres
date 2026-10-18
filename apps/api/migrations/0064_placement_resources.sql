@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS node_volumes (
 ALTER TABLE infrastructure_alerts RENAME TO infrastructure_alerts_previous;
 CREATE TABLE infrastructure_alerts (
   region_id TEXT NOT NULL REFERENCES regions(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK(kind IN('regional_ram_warning','regional_node_cap_reached','regional_node_stale','infrastructure_backup_failed','infrastructure_backup_stale','regional_node_ram_warning','regional_node_cpu_warning','regional_node_storage_warning','database_archive_failing','database_base_backup_stale','thin_storage_blocked','regional_node_capacity_refusals','database_volume_warning','database_volume_critical','control_cron_stalled','control_cron_step_failing')),
+  kind TEXT NOT NULL CHECK(kind IN('regional_ram_warning','regional_node_cap_reached','regional_node_stale','infrastructure_backup_failed','infrastructure_backup_stale','regional_node_ram_warning','regional_node_cpu_warning','regional_node_storage_warning','database_archive_failing','database_base_backup_stale','thin_storage_blocked','regional_node_capacity_refusals','regional_node_pool_closed','database_volume_warning','database_volume_critical','control_cron_stalled','control_cron_step_failing')),
   active INTEGER NOT NULL CHECK(active IN(0,1)),
   event_id TEXT NOT NULL UNIQUE,
   payload TEXT NOT NULL CHECK(json_valid(payload) AND length(payload)<=4096),

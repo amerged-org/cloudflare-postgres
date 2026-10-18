@@ -264,6 +264,7 @@ export async function restoreDatabase(
           resources: own,
           nodeId: node?.id ?? null,
           pendingMemoryMib: node?.pending_memory_mib,
+          pendingStorageGib: node?.pending_storage_gib,
           decidedAt,
           id: targetId,
           archivePath: archive,

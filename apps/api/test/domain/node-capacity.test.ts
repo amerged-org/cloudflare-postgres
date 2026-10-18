@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { DatabaseWithOperation } from "@pgcf/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { addNode, cleanupFixtures, fixture, request } from "./fixtures.ts";
 import { reports, seedSamples, steady } from "./node-samples.ts";
 
-afterEach(cleanupFixtures);
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await cleanupFixtures();
+});
 
 const providerId = () =>
   String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
@@ -73,6 +76,20 @@ describe("the next capacity step of a region", () => {
       .run();
     expect(await decide(f)).toBe("order");
     expect(await additions(f)).toBe(0);
+  });
+
+  it("reserves an order when no node fits, without any regional RAM window, and waits for the owner's approval", async () => {
+    const f = await region(4096, { order: true });
+    await seedSamples(f.node, steady(Date.now(), 40, { ramPpm: 900_000 }));
+    const start = vi
+      .spyOn(env.ADD_NODE, "create")
+      .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+    expect(await decide(f, false)).toBe("waiting_for_approval");
+    expect(await additions(f)).toBe(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    // The same hour's key binds the same addition: a second run reserves nothing more.
+    expect(await decide(f, false)).toBe("waiting_for_approval");
+    expect(await additions(f)).toBe(1);
   });
 
   it("buys when the CPU load of every node is at 80 %", async () => {

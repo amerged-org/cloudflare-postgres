@@ -55,11 +55,13 @@ export async function readDatabaseAdmissionSnapshot(
     ae.database_id epoch_database_id,CASE WHEN p.updated_at>d.updated_at THEN p.updated_at ELSE d.updated_at END presence_updated_at,
     ae.admission_revision,ae.route_revision,ae.mutation_id,ae.completed_mutation_id,
     CASE WHEN ${admissionSnapshotSql("r")} THEN 1 ELSE 0 END cache_capable,
-    s.memory_mib,CASE WHEN policy.placement_mode='actual_ram' AND d.desired_state='running' THEN policy.postgres_memory_request_mib ELSE NULL END memory_request_mib,
-    s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
+    dr.memory_mib,CASE WHEN policy.placement_mode='actual_ram' AND d.desired_state='running' THEN MIN(policy.postgres_memory_request_mib,dr.memory_mib) ELSE NULL END memory_request_mib,
+    dr.cpu_millicores,CASE WHEN s.cpu_request_millicores IS NULL THEN NULL ELSE MIN(s.cpu_request_millicores,dr.cpu_millicores) END cpu_request_millicores,
+    dr.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('name',rr.name,'owner',rr.owner,'revision',rr.password_revision,'valid_until',rr.valid_until)) FROM roles rr WHERE rr.database_id=d.id AND rr.deleted_at IS NULL) roles_json,
     m.password_revision maintenance_revision
     FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions r ON r.id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
+    JOIN database_resources dr ON dr.database_id=d.id
     LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
     LEFT JOIN node_region_policies policy ON policy.region_id=d.region_id LEFT JOIN maintenance_credentials m ON m.database_id=d.id WHERE d.id=?`,
     )

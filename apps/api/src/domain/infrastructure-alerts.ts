@@ -14,7 +14,9 @@ import {
   heartbeatHealth,
 } from "./operational-health.ts";
 import {
+  AVERAGE_MINIMUM_SPAN_SECONDS,
   AVERAGE_WINDOW_SECONDS,
+  closedPools,
   NODE_OBSERVATION_MAX_AGE_MS,
 } from "./placement.ts";
 import { cronErrorCode, readCronHealth } from "./cron-health.ts";
@@ -65,7 +67,7 @@ const averagedLoad = (ratio: string) =>
       WHERE n.region_id=? AND n.lost_at IS NULL AND julianday(latest.observed_at)>=julianday(?)
         AND EXISTS(SELECT 1 FROM node_samples s WHERE s.node_id=n.id
           AND s.observed_at>=${stamp("latest.observed_at", `-${AVERAGE_WINDOW_SECONDS} seconds`)}
-          AND s.observed_at<=${stamp("latest.observed_at", "-600 seconds")})`;
+          AND s.observed_at<=${stamp("latest.observed_at", `-${AVERAGE_MINIMUM_SPAN_SECONDS} seconds`)})`;
 /**
  * Each node's latest fresh utilization in parts per million; a node without one is unknown and absent.
  * Ingest rejects future-dated samples, so only age bounds freshness and a delayed run still sees newer data.
@@ -808,6 +810,7 @@ const HEALTH_KINDS = [
   "database_base_backup_stale",
   "thin_storage_blocked",
   "regional_node_capacity_refusals",
+  "regional_node_pool_closed",
   "database_volume_warning",
   "database_volume_critical",
 ] as const satisfies readonly InfraAlertKind[];
@@ -877,12 +880,14 @@ async function regionHealthAlerts(
   // The database and node reads fail on their own: the node and backup kinds above still
   // evaluate, and the unread kinds are unknown (retained) for this minute.
   let subjects: RegionSubjects | undefined,
+    closed: string[] | undefined,
     readFailure: { error: unknown } | undefined;
   try {
     subjects = new Map([
       ...(await readRegionSubjects(env.DB, regionId, now)),
       ...(await readNodeSubjects(env.DB, regionId, now)),
     ]);
+    closed = await closedPools(env.DB, regionId);
   } catch (error) {
     readFailure = { error };
   }
@@ -932,6 +937,18 @@ async function regionHealthAlerts(
       subjectOf("regional_node_capacity_refusals", (failing) => ({
         node_ids: failing.map((subject) => subject.id),
       })),
+    ],
+    [
+      "regional_node_pool_closed",
+      closed === undefined
+        ? { state: "retain" }
+        : closed.length
+          ? {
+              state: "active",
+              detail: { node_ids: closed.slice(0, 64) },
+              subjects: closed.slice(0, 64),
+            }
+          : { state: "resolved" },
     ],
     [
       "database_volume_warning",

@@ -91,6 +91,20 @@ it("a bounded legacy reconciliation clears a previously capable snapshot rather 
     );
   }
 });
+it("expects the runtime to hold the database's own memory, not its size class's", async () => {
+  const f = await admissionSnapshotFixture();
+  const admissible = async () =>
+    (await readDatabaseAdmissionSnapshot(env, f.id))?.snapshot.admissible;
+  expect(await admissible()).toBe(true);
+  // The proof attests the memory of the size class; a database that has its own needs another.
+  await env.DB.prepare(
+    "UPDATE databases SET own_memory_mib=(SELECT memory_mib+256 FROM size_classes WHERE id=databases.size_class_id) WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  expect(await admissible()).toBe(false);
+});
+
 async function replaceProof(id: string, proof: unknown) {
   await env.DB.prepare(
     "UPDATE databases SET runtime_attestation_json=? WHERE id=?",

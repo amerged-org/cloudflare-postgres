@@ -292,6 +292,59 @@ it("alarms a thin pool without room and clears it once the node has room", async
   });
 });
 
+it("alarms a pool that placement has closed, by its data, its metadata or the logical cap, and clears it once the pool opens", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    now = Date.now();
+  // A pool of 100 GiB: closed from 80 GiB of data, 0.5 GiB of metadata, or 400 GiB sold.
+  const closures: Partial<typeof OPEN_POOL>[] = [
+    { dataUsed: 80 * GIB },
+    { metadataUsed: GIB / 2 },
+    { nominal: 400 * GIB },
+  ];
+  let at = now;
+  await seedSamples(f.node, [{ at, pool: pool({}) }]);
+  await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  for (const [index, closure] of closures.entries()) {
+    at += MINUTE;
+    await seedSamples(f.node, [{ at, pool: pool(closure) }]);
+    await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+    const raised = hook.events.filter(
+      (event) => event.kind === "regional_node_pool_closed",
+    );
+    expect(raised, JSON.stringify(closure)).toHaveLength(index + 1);
+    expect(raised.at(-1)).toMatchObject({ node_ids: [f.node] });
+    expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+      active: true,
+    });
+    at += MINUTE;
+    await seedSamples(f.node, [{ at, pool: pool({}) }]);
+    await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
+    expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+      active: false,
+    });
+  }
+});
+
+it("counts the storage a node has not finished against the logical cap of the alarm", async () => {
+  const f = await fixture(0),
+    hook = receiver(),
+    now = Date.now();
+  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 395 * GIB }) }]);
+  await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
+  // A database of 5 GiB whose create the node has not finished: 400 GiB are sold, the cap.
+  const created = DatabaseWithOperation.parse(
+    await (await f.create("unfinished")).json(),
+  );
+  expect(created.database.node_id).toBe(f.node);
+  await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
+  expect(await status(f, "regional_node_pool_closed")).toMatchObject({
+    active: true,
+  });
+});
+
 it("alarms a node that holds databases while it reports no pool, and nothing for an empty node", async () => {
   const f = await fixture(0),
     hook = receiver(),

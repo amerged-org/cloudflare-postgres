@@ -901,6 +901,7 @@ it("adds per-database resources, node samples and the capacity alert kinds while
   );
   for (const kind of [
     "regional_node_capacity_refusals",
+    "regional_node_pool_closed",
     "database_volume_warning",
     "database_volume_critical",
   ])

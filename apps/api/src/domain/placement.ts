@@ -19,6 +19,8 @@ const LOGICAL_CAP_FACTOR = 4;
 /** The averaging window of a load figure, and how far back its highest value counts. */
 export const AVERAGE_WINDOW_SECONDS = 1800;
 export const PEAK_WINDOW_MS = 7 * 86_400_000;
+/** An average of fewer seconds of samples than this is not a 30-minute average (plan 4.8). */
+export const AVERAGE_MINIMUM_SPAN_SECONDS = 600;
 
 /** The memory a node keeps for the system and its page cache (plan 4.5); a start needs the rest. */
 export const MEMORY_FLOOR_MIB = 600;
@@ -53,6 +55,8 @@ export interface PlacementNode {
   cpu_peak_ppm: number | null;
   /** Memory of the databases placed in the last 30 minutes: no average includes them yet. */
   pending_memory_mib: number;
+  /** Storage of the databases whose volume the node may not have counted in `pool_nominal_bytes` yet. */
+  pending_storage_gib: number;
 }
 
 /** What a new database asks of its node. */
@@ -95,8 +99,9 @@ type PoolState =
   "unavailable" | "no_room" | "data" | "metadata" | "cap" | "open";
 /**
  * Whether the node's thin pool is open for placement (plan 4.3): readable, with room, below 80 %
- * of its data and 50 % of its metadata, and with the sold storage below the logical cap. The pool
- * of an offline node is judged by its last sample.
+ * of its data and 50 % of its metadata, and with the sold storage below the logical cap. The sold
+ * storage is what the node reported plus the databases it has not counted yet, and `needGib` more
+ * must fit under the cap as well. The pool of an offline node is judged by its last sample.
  */
 function poolState(
   pool: Pick<
@@ -107,8 +112,9 @@ function poolState(
     | "pool_metadata_total_bytes"
     | "pool_metadata_used_bytes"
     | "pool_nominal_bytes"
+    | "pending_storage_gib"
   >,
-  extraNominalBytes = 0n,
+  needGib = 0,
 ): PoolState {
   if (
     pool.pool_data_total_bytes === null ||
@@ -132,8 +138,9 @@ function poolState(
   )
     return "metadata";
   const cap = dataTotal * BigInt(LOGICAL_CAP_FACTOR),
-    nominal = BigInt(pool.pool_nominal_bytes);
-  return nominal >= cap || nominal + extraNominalBytes > cap ? "cap" : "open";
+    sold =
+      BigInt(pool.pool_nominal_bytes) + BigInt(pool.pending_storage_gib) * GIB;
+  return sold >= cap || sold + BigInt(needGib) * GIB > cap ? "cap" : "open";
 }
 
 /** `mib` of `total` bytes in parts per million, rounded up. */
@@ -176,7 +183,7 @@ export function choosePlacement(
   for (const node of nodes) {
     if (!nodeOnline(node, now) || !nodeOpen(node)) continue;
     if (
-      poolState(node, BigInt(need.storage_gib) * GIB) !== "open" ||
+      poolState(node, need.storage_gib) !== "open" ||
       node.cpu_cores === null ||
       need.cpu_millicores > node.cpu_cores * 1000 ||
       node.cpu_peak_ppm === null ||
@@ -219,7 +226,7 @@ export function growthFits(
         return false;
     }
     if (growth.storage_gib > 0) {
-      const state = poolState(node, BigInt(growth.storage_gib) * GIB);
+      const state = poolState(node, growth.storage_gib);
       if (state === "unavailable" || state === "no_room" || state === "cap")
         return false;
     }
@@ -229,6 +236,19 @@ export function growthFits(
   );
 }
 
+/**
+ * The storage in GiB of the databases on a node whose create, restore or resize has not finished,
+ * or finished after `sampleAt`, the node's newest sample: the node's `pool_nominal_bytes` cannot
+ * count their volumes yet. A database counts at its whole storage, which the node may have counted
+ * already; the sum only shrinks when a sample taken after the operation ends it.
+ */
+function pendingStorageSql(node: string, sampleAt: string): string {
+  return `COALESCE((SELECT SUM(r.storage_gib) FROM databases d JOIN database_resources r ON r.database_id=d.id
+    WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id
+      AND o.kind IN('database.create','database.restore','database.resize')
+      AND (o.status IN('pending','running') OR o.completed_at>${sampleAt}))),0)`;
+}
+
 /** The nodes of a region with what they reported and the placements no average includes yet. */
 export async function placementNodes(
   db: D1Database,
@@ -236,6 +256,8 @@ export async function placementNodes(
   now = Date.now(),
 ): Promise<PlacementNode[]> {
   const iso = (ms: number) => new Date(ms).toISOString();
+  // A 30-minute average needs at least ten minutes of samples in its window; a node with less
+  // than 30 minutes of history altogether has one average over all of it (plan 4.8).
   const result = await db
     .prepare(
       `WITH latest AS (
@@ -249,17 +271,27 @@ export async function placementNodes(
         FROM node_samples s JOIN latest l ON l.node_id=s.node_id AND l.observed_at>=?
         WHERE s.observed_at>=? AND s.observed_at<=?
       ), averaged AS (
-        SELECT node_id,t,SUM(ram_ppm) OVER w/COUNT(*) OVER w ram_avg,SUM(cpu_ppm) OVER w/COUNT(*) OVER w cpu_avg
+        SELECT node_id,t,SUM(ram_ppm) OVER w/COUNT(*) OVER w ram_avg,SUM(cpu_ppm) OVER w/COUNT(*) OVER w cpu_avg,
+          t-MIN(t) OVER w span
         FROM recent WINDOW w AS (PARTITION BY node_id ORDER BY t RANGE BETWEEN ${AVERAGE_WINDOW_SECONDS} PRECEDING AND CURRENT ROW)
+      ), history AS (
+        SELECT node_id,MAX(t)-MIN(t) span,SUM(ram_ppm)/COUNT(*) ram_avg,SUM(cpu_ppm)/COUNT(*) cpu_avg
+        FROM recent GROUP BY node_id
       ), peaks AS (
-        SELECT node_id,MAX(ram_avg) ram_peak_ppm,MAX(cpu_avg) cpu_peak_ppm FROM averaged WHERE t>=? GROUP BY node_id
+        SELECT h.node_id,
+          CASE WHEN h.span<${AVERAGE_WINDOW_SECONDS} THEN h.ram_avg
+            ELSE (SELECT MAX(a.ram_avg) FROM averaged a WHERE a.node_id=h.node_id AND a.t>=? AND a.span>=${AVERAGE_MINIMUM_SPAN_SECONDS}) END ram_peak_ppm,
+          CASE WHEN h.span<${AVERAGE_WINDOW_SECONDS} THEN h.cpu_avg
+            ELSE (SELECT MAX(a.cpu_avg) FROM averaged a WHERE a.node_id=h.node_id AND a.t>=? AND a.span>=${AVERAGE_MINIMUM_SPAN_SECONDS}) END cpu_peak_ppm
+        FROM history h
       )
       SELECT n.id,n.region_id,n.ready,n.schedulable,n.lost_at,n.database_placement_enabled,n.database_placement_closed_at,
         l.observed_at sampled_at,l.memory_total_bytes,l.cpu_cores,l.room,
         l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,l.pool_nominal_bytes,
         p.ram_peak_ppm,p.cpu_peak_ppm,
         COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
-          WHERE d.node_id=n.id AND d.deleted_at IS NULL AND d.placed_at>?),0) pending_memory_mib
+          WHERE d.node_id=n.id AND d.deleted_at IS NULL AND d.placed_at>?),0) pending_memory_mib,
+        ${pendingStorageSql("n", "l.observed_at")} pending_storage_gib
       FROM nodes n LEFT JOIN latest l ON l.node_id=n.id LEFT JOIN peaks p ON p.node_id=n.id
       WHERE n.region_id=? ORDER BY n.id`,
     )
@@ -270,11 +302,36 @@ export async function placementNodes(
       iso(now - PEAK_WINDOW_MS - AVERAGE_WINDOW_SECONDS * 1000),
       iso(now + CLOCK_SKEW_MS),
       Math.floor((now - PEAK_WINDOW_MS) / 1000),
+      Math.floor((now - PEAK_WINDOW_MS) / 1000),
       iso(now - AVERAGE_WINDOW_SECONDS * 1000),
       regionId,
     )
     .all<PlacementNode>();
   return result.results;
+}
+
+/**
+ * The nodes of a region, not lost, whose thin pool the newest sample closes for placement: its
+ * data or metadata is too full, or the storage sold has reached the logical cap (plan 4.3). A pool
+ * without room or without a reading is another alarm's.
+ */
+export async function closedPools(
+  db: D1Database,
+  regionId: string,
+): Promise<string[]> {
+  const result = await db
+    .prepare(
+      `SELECT n.id,l.room,l.pool_data_total_bytes,l.pool_data_used_bytes,l.pool_metadata_total_bytes,l.pool_metadata_used_bytes,
+        l.pool_nominal_bytes,${pendingStorageSql("n", "l.observed_at")} pending_storage_gib
+      FROM nodes n JOIN node_samples l ON l.node_id=n.id
+        AND l.observed_at=(SELECT MAX(observed_at) FROM node_samples WHERE node_id=n.id)
+      WHERE n.region_id=? AND n.lost_at IS NULL ORDER BY n.id`,
+    )
+    .bind(regionId)
+    .all<Parameters<typeof poolState>[0] & { id: string }>();
+  return result.results
+    .filter((node) => ["data", "metadata", "cap"].includes(poolState(node)))
+    .map((node) => node.id);
 }
 
 const aliasOf = (alias: string) => {
@@ -284,31 +341,40 @@ const aliasOf = (alias: string) => {
 };
 /**
  * The write side of a decision from `placementNodes`: the node still reports, and has the same
- * memory pending on it. Another placement that landed meanwhile changes the pending memory, so
- * only one of two concurrent changes takes the room the node has for one. `now` is the instant
- * `placementNodes` was read at; the node's report is judged by the clock of the write.
+ * memory and storage pending on it. Another placement or resize that landed meanwhile changes the
+ * pending figures, so only one of two concurrent changes takes the room the node has for one.
+ * `now` is the instant `placementNodes` was read at; the node's report is judged by the clock of
+ * the write.
  */
 export function nodeLoadGuard(
   nodeAlias: string,
-  claim: { pendingMemoryMib: number; now: number },
+  claim: { pendingMemoryMib: number; pendingStorageGib: number; now: number },
 ): { sql: string; bindings: (string | number)[] } {
   const node = aliasOf(nodeAlias),
     stamp = (offset: string) =>
-      `strftime('%Y-%m-%dT%H:%M:%fZ','now','${offset}')`;
+      `strftime('%Y-%m-%dT%H:%M:%fZ','now','${offset}')`,
+    newest = `(SELECT MAX(observed_at) FROM node_samples WHERE node_id=${node}.id AND observed_at<=${stamp(`+${CLOCK_SKEW_MS / 1000} seconds`)})`;
   return {
-    sql: `((SELECT MAX(observed_at) FROM node_samples WHERE node_id=${node}.id AND observed_at<=${stamp(`+${CLOCK_SKEW_MS / 1000} seconds`)})>=${stamp(`-${NODE_OBSERVATION_MAX_AGE_MS / 1000} seconds`)}
+    sql: `(${newest}>=${stamp(`-${NODE_OBSERVATION_MAX_AGE_MS / 1000} seconds`)}
       AND COALESCE((SELECT SUM(r.memory_mib) FROM databases d JOIN database_resources r ON r.database_id=d.id
-        WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND d.placed_at>?),0)=?)`,
+        WHERE d.node_id=${node}.id AND d.deleted_at IS NULL AND d.placed_at>?),0)=?
+      AND ${pendingStorageSql(node, newest)}=?)`,
     bindings: [
       new Date(claim.now - AVERAGE_WINDOW_SECONDS * 1000).toISOString(),
       claim.pendingMemoryMib,
+      claim.pendingStorageGib,
     ],
   };
 }
 /** `nodeLoadGuard` for a node that must also be ready, open for new databases and the one named. */
 export function placementGuard(
   nodeAlias: string,
-  claim: { nodeId: string; pendingMemoryMib: number; now: number },
+  claim: {
+    nodeId: string;
+    pendingMemoryMib: number;
+    pendingStorageGib: number;
+    now: number;
+  },
 ): { sql: string; bindings: (string | number)[] } {
   const node = aliasOf(nodeAlias),
     load = nodeLoadGuard(node, claim);

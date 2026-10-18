@@ -93,8 +93,9 @@ export interface DatabaseInsertSnapshot {
   resources?: ResourceOverrides;
   /** The node the database is placed on; null waits for verified regional capacity. */
   nodeId: string | null;
-  /** The memory pending on that node when `placementNodes` read it, and the instant of that read. */
+  /** The memory and storage pending on that node when `placementNodes` read it, and the instant of that read. */
   pendingMemoryMib?: number;
+  pendingStorageGib?: number;
   decidedAt?: number;
   id: string;
   archivePath: string;
@@ -159,6 +160,7 @@ export function databaseInsertStatement(
   const guard = placementGuard("n", {
     nodeId: snapshot.nodeId,
     pendingMemoryMib: snapshot.pendingMemoryMib ?? 0,
+    pendingStorageGib: snapshot.pendingStorageGib ?? 0,
     now: snapshot.decidedAt ?? Date.parse(snapshot.now),
   });
   return db
@@ -273,6 +275,7 @@ export async function createDatabase(
               resources: own,
               nodeId: node?.id ?? null,
               pendingMemoryMib: node?.pending_memory_mib,
+              pendingStorageGib: node?.pending_storage_gib,
               decidedAt,
               id,
               archivePath: archive,
@@ -392,12 +395,13 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
 }
 
 /**
- * What the resize of an awake database asks of its node, decided from `placementNodes` at
- * `decidedAt`: the memory pending there then, and whether the memory grows (a growing database
+ * What the resize of a database asks of its node, decided from `placementNodes` at `decidedAt`:
+ * the memory and storage pending there then, and whether the memory grows (a growing database
  * counts at its full memory until its average catches up).
  */
 export interface ResizeCapacity {
   pendingMemoryMib: number;
+  pendingStorageGib: number;
   decidedAt: number;
   grows: boolean;
 }
@@ -448,6 +452,14 @@ export function databaseResizeStatement(
       size.archive_timeout_seconds,
       size.backup_retention_days,
     ];
+  const guard =
+    capacity === undefined
+      ? null
+      : nodeLoadGuard("n", {
+          pendingMemoryMib: capacity.pendingMemoryMib,
+          pendingStorageGib: capacity.pendingStorageGib,
+          now: capacity.decidedAt,
+        });
   if (row.desired_state === "suspended")
     return db
       .prepare(
@@ -460,6 +472,7 @@ export function databaseResizeStatement(
          AND ${stoppedSleeperSql("databases", false)}
          AND EXISTS(SELECT 1 FROM size_classes s WHERE s.id=? AND ${sameClassImagePatch ? "1=1" : "s.enabled=1"}
            AND ${classRead})
+         ${guard === null ? "" : `AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND ${guard.sql})`}
          AND (${authority?.sql ?? "1=1"}) AND (${admission?.sql ?? "1=1"})`,
       )
       .bind(
@@ -478,16 +491,10 @@ export function databaseResizeStatement(
         row.suspension_reason ?? null,
         size.id,
         ...classValues,
+        ...(guard?.bindings ?? []),
         ...(authority?.bindings ?? []),
         ...(admission?.bindings ?? []),
       );
-  const guard =
-    capacity === undefined
-      ? null
-      : nodeLoadGuard("n", {
-          pendingMemoryMib: capacity.pendingMemoryMib,
-          now: capacity.decidedAt,
-        });
   return db
     .prepare(
       `UPDATE databases SET ${imageUpdate}${ownSet},placed_at=CASE WHEN ?=1 THEN ? ELSE placed_at END,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
@@ -665,16 +672,20 @@ export async function scheduleDatabaseResize(
       reason: "not_ready",
     });
   let capacity: ResizeCapacity | undefined;
-  if (!sleeping) {
+  // A sleeping database takes its memory and CPU at its next wake, where its node admits them;
+  // its storage is sold from now on, so it counts against the logical cap like an awake one's.
+  const growth = {
+    memory_mib: sleeping
+      ? 0
+      : Math.max(0, after.memory_mib - before.memory_mib),
+    storage_gib: Math.max(0, after.storage_gib - before.storage_gib),
+    cpu_millicores: sleeping ? 0 : after.cpu_millicores,
+  };
+  if (!sleeping || growth.storage_gib > 0) {
     const decidedAt = Date.parse(now),
       node = (await placementNodes(db, row.region_id, decidedAt)).find(
         (value) => value.id === row.node_id,
-      ),
-      growth = {
-        memory_mib: Math.max(0, after.memory_mib - before.memory_mib),
-        storage_gib: Math.max(0, after.storage_gib - before.storage_gib),
-        cpu_millicores: after.cpu_millicores,
-      };
+      );
     if (!node || !growthFits(node, growth, decidedAt))
       throw new ApiError(
         "capacity_exhausted",
@@ -685,6 +696,7 @@ export async function scheduleDatabaseResize(
     if (growth.memory_mib > 0 || growth.storage_gib > 0)
       capacity = {
         pendingMemoryMib: node.pending_memory_mib,
+        pendingStorageGib: node.pending_storage_gib,
         decidedAt,
         grows: growth.memory_mib > 0,
       };
@@ -763,7 +775,7 @@ export async function scheduleDatabaseResize(
         changed.size_class_id !== row.size_class_id ||
         changed.updated_at !== row.updated_at ||
         !sameOverrides(ownResources(changed), current) ||
-        sleeping
+        (sleeping && capacity === undefined)
       )
         throw new ApiError("conflict", "Database changed; retry the request", {
           reason: "generation_changed",

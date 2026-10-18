@@ -17,6 +17,7 @@ export const InfraAlertKind = z
     "database_base_backup_stale",
     "thin_storage_blocked",
     "regional_node_capacity_refusals",
+    "regional_node_pool_closed",
     "database_volume_warning",
     "database_volume_critical",
     "control_cron_stalled",
@@ -25,8 +26,8 @@ export const InfraAlertKind = z
   .describe(
     "regional_ram_warning: regional ten-minute RAM utilization at or above ram_warning_threshold_ppm. regional_node_cap_reached: allocated nodes reached max_nodes with cap_warning_enabled. regional_node_stale: a node's observation is older than 180 s or the node is marked lost; never-observed nodes are ignored. infrastructure_backup_failed / infrastructure_backup_stale: the daily D1 backup stored in the region is failing / has not completed for more than 36 h. regional_node_ram_warning, regional_node_cpu_warning, regional_node_storage_warning: a node reached the matching node_*_warning_threshold_ppm; RAM and CPU are the 30-minute average of the node's own samples, storage the fuller of its thin pool's data and metadata. Thresholds come from the region's capacity policy. " +
       "database_archive_failing: a running, awake database of the region reports health.archiving failing (database_ids, at most 64). database_base_backup_stale: an awake database has no completed base backup within 36 h of awake time; a hibernated database is excluded and a wake restarts the clock (database_ids). thin_storage_blocked: a node's newest sample says its thin pool has no room (thin_pool_no_room: no database starts, is created or restored there), or a node that holds databases has no sample of its pool within 180 s (thin_pool_unobserved); thin_storage lists each node with its thin_pool_* error_code. " +
-      "regional_node_capacity_refusals: a node refused 5 or more wakes for awake capacity (57P03 \"node at awake capacity\") in the last 10 minutes (node_ids). database_volume_warning, database_volume_critical: the space or the inodes of a database's volume are at least 80 % (below 90 %), or at least 90 %, used in the volume's newest report of at most 180 s (database_ids, at most 64). " +
-      "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
+      "regional_node_capacity_refusals: a node refused 5 or more wakes for awake capacity (57P03 \"node at awake capacity\") in the last 10 minutes (node_ids). regional_node_pool_closed: a node's newest sample closes its thin pool for placement, with its data at 80 % or more, its metadata at 50 % or more, or the storage sold at 4 times its data (node_ids); nothing is created or restored there, and running databases keep running. database_volume_warning, database_volume_critical: the space or the inodes of a database's volume are at least 80 % (below 90 %), or at least 90 %, used in the volume's newest report of at most 180 s (database_ids, at most 64). " +
+      "control_cron_stalled: no run of the minute cron completed for 5 minutes, found by the CronWatchdog Durable Object alarm independently of the cron trigger. control_cron_step_failing: a cron step failed in each of its last 5 completed runs (cron.failing_steps). The database, Thin storage, pool and cron kinds have fixed rules and no threshold; the cron kinds are raised in every region.",
   );
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
 
@@ -56,6 +57,8 @@ export const INFRA_ALERT_ACTIONS: Record<InfraAlertKind, string> = {
     "A listed node's thin pool is out of room or unobserved. thin_pool_no_room: nothing starts, is created or is restored there until deleting databases on the node frees space; the pool does not grow. thin_pool_unobserved: fix the node's samples.",
   regional_node_capacity_refusals:
     "A listed node keeps refusing wakes because its awake capacity is full. Move its most active databases to another node, or add a node; see the capacity decision in GET /v1/regions/{id}/capacity-decision.",
+  regional_node_pool_closed:
+    "A listed node's thin pool is closed for placement: no database is created or restored there, and running databases keep running. Free space by deleting databases on the node, or add a node; the pool does not grow.",
   database_volume_warning:
     "The volume of each listed database is at least 80 % full, in space or inodes. Raise its storage with PUT /v1/databases/{id}/resources, or have the integrator free space.",
   database_volume_critical:

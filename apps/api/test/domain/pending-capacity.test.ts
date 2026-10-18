@@ -92,6 +92,39 @@ describe("pending capacity on real D1", () => {
     ).toBe(0);
   });
 
+  it("rejects a captured pending placement when storage became pending on the node before the atomic write", async () => {
+    const f = await fixture(0);
+    const first = DatabaseWithOperation.parse(
+      await (await f.create("captured-storage")).json(),
+    );
+    const second = DatabaseWithOperation.parse(
+      await (await f.create("racing-storage")).json(),
+    );
+    await reports(f.node);
+    let raced = false;
+    const db = {
+      prepare: env.DB.prepare.bind(env.DB),
+      batch: async (statements: D1PreparedStatement[]) => {
+        if (!raced) {
+          raced = true;
+          // The racing database lands on the node with its create still open, and no memory
+          // pending: only its 5 GiB of storage differ from what the decision read.
+          await env.DB.prepare("UPDATE databases SET node_id=? WHERE id=?")
+            .bind(f.node, second.database.id)
+            .run();
+        }
+        return env.DB.batch(statements);
+      },
+    } as D1Database;
+    expect(await placePendingDatabases(db, f.region)).toEqual([]);
+    expect(raced).toBe(true);
+    expect(
+      await env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
+        .bind(first.database.id)
+        .first("node_id"),
+    ).toBeNull();
+  });
+
   it("retains one pending create and its credentials without emitting unplaced desired state", async () => {
     const f = await fixture(0);
     const first = await f.create("waiting", f.integrator, "pending-once");

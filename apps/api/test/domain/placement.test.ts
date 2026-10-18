@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { DatabaseWithOperation, newOperationId } from "@pgcf/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   PLACEMENT_LIMIT_PPM,
@@ -51,6 +52,7 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     ram_peak_ppm: 0,
     cpu_peak_ppm: 0,
     pending_memory_mib: 0,
+    pending_storage_gib: 0,
     ...overrides,
   };
 }
@@ -204,6 +206,19 @@ describe("which node takes a new database", () => {
     expect(pick([pool(400 * GIB)])).toBeNull();
   });
 
+  it("counts the storage of databases the node has not finished against the same cap", () => {
+    const pool = (pending: number) =>
+      node({
+        pool_data_total_bytes: 100 * GIB,
+        pool_nominal_bytes: 390 * GIB,
+        pending_storage_gib: pending,
+      });
+    // The cap is 400 GiB; 390 GiB are reported, the database brings 5 GiB.
+    expect(pick([pool(5)])).not.toBeNull();
+    expect(pick([pool(6)])).toBeNull();
+    expect(pick([pool(10)])).toBeNull();
+  });
+
   it("needs a node with the cores the database is allowed to use", () => {
     const eight = node({ cpu_cores: 8 });
     expect(pick([eight], { ...SMALL, cpu_millicores: 8000 })).not.toBeNull();
@@ -263,6 +278,46 @@ describe("the load of a node, read from its samples", () => {
     expect(n.ram_peak_ppm).toBe(200_000);
     expect(n.cpu_peak_ppm).toBe(300_000);
     expect(n.sampled_at).toBe(new Date(NOW - 30_000).toISOString());
+  });
+
+  it("does not let one sample at the start of the history stand for a 30-minute average", async () => {
+    const { f, a } = await regionWith();
+    // A boot spike at 95 %, then three hours at 10 %.
+    const samples = steady(NOW, 180, { ramPpm: 100_000, cpuPpm: 100_000 });
+    samples[0] = { ...samples[0]!, ramPpm: 950_000, cpuPpm: 950_000 };
+    await seedSamples(a, samples);
+    const n = await load(f.region, a);
+    // The first window with ten minutes of history holds the spike and ten samples at 10 %.
+    const first = Math.floor((950_000 + 10 * 100_000) / 11);
+    expect(n.ram_peak_ppm).toBe(first);
+    expect(n.cpu_peak_ppm).toBe(first);
+  });
+
+  it("does not let one sample after a gap of 30 minutes or more stand for a 30-minute average", async () => {
+    const { f, a } = await regionWith();
+    // Two hours at 10 %, 40 minutes of silence, and 85 % when the link returns.
+    const before = steady(NOW - 40 * 60_000, 120, {
+      ramPpm: 100_000,
+      cpuPpm: 100_000,
+    });
+    await seedSamples(a, [
+      ...before,
+      { at: NOW, ramPpm: 850_000, cpuPpm: 850_000 },
+    ]);
+    const n = await load(f.region, a);
+    expect(n.ram_peak_ppm).toBe(100_000);
+    expect(n.cpu_peak_ppm).toBe(100_000);
+  });
+
+  it("averages all of the history of a node that has less than 30 minutes of it", async () => {
+    const { f, a } = await regionWith();
+    const samples = steady(NOW, 20, { ramPpm: 100_000 });
+    samples[0] = { ...samples[0]!, ramPpm: 900_000 };
+    await seedSamples(a, samples);
+    // 21 samples, one at 90 % and 20 at 10 %, not the 90 % of the first sample alone.
+    expect((await load(f.region, a)).ram_peak_ppm).toBe(
+      Math.floor((900_000 + 20 * 100_000) / 21),
+    );
   });
 
   it("averages the ratio of each sample, so a node whose memory changed stays right", async () => {
@@ -374,7 +429,138 @@ describe("the load of a node, read from its samples", () => {
   });
 });
 
+describe("the storage a node has not finished", () => {
+  /** A database of the region's fixture on `nodeId` with `storage` GiB and one operation. */
+  async function withOperation(
+    f: Awaited<ReturnType<typeof fixture>>,
+    nodeId: string,
+    storage: number,
+    operation: {
+      kind: string;
+      status: string;
+      completedAt?: number;
+      deleted?: boolean;
+    },
+  ) {
+    const database = "d" + crypto.randomUUID().replaceAll("-", "").slice(0, 19),
+      at = new Date(NOW).toISOString(),
+      completed =
+        operation.completedAt === undefined
+          ? null
+          : new Date(operation.completedAt).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,archive_path,created_at,updated_at,deleted_at,own_storage_gib)
+        VALUES(?,?,?,?,?,?,?,'ready',1,'s3://b/x',?,?,?,?)`,
+      ).bind(
+        database,
+        f.project,
+        f.region,
+        nodeId,
+        database,
+        f.size,
+        operation.deleted ? "deleted" : "running",
+        at,
+        at,
+        operation.deleted ? at : null,
+        storage,
+      ),
+      env.DB.prepare(
+        `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
+        VALUES(?,?,?,?,?,1,?,?,?)`,
+      ).bind(
+        newOperationId(),
+        operation.kind,
+        operation.status,
+        f.project,
+        database,
+        at,
+        at,
+        completed,
+      ),
+    ]);
+  }
+  const pending = async (region: string, nodeId: string) =>
+    (await placementNodes(env.DB, region, NOW)).find((n) => n.id === nodeId)!
+      .pending_storage_gib;
+
+  it("is the storage of the databases whose create, restore or resize is still open, or finished after the node's newest sample", async () => {
+    const f = await fixture(0),
+      a = await addNode(f.region, 0),
+      b = await addNode(f.region, 0);
+    // The newest sample of both nodes is 30 s old.
+    await seedSamples(a, [{ at: NOW - 30_000 }]);
+    await seedSamples(b, [{ at: NOW - 30_000 }]);
+    const open = (kind: string, status: string) => ({ kind, status });
+    await withOperation(f, a, 7, open("database.create", "pending"));
+    await withOperation(f, a, 11, open("database.resize", "running"));
+    await withOperation(f, a, 13, open("database.restore", "pending"));
+    // Finished 10 s ago: the sample of 30 s ago cannot hold its volume yet.
+    await withOperation(f, a, 3, {
+      kind: "database.create",
+      status: "succeeded",
+      completedAt: NOW - 10_000,
+    });
+    // Finished a minute before the sample: the node's pool figure holds it, or never will.
+    await withOperation(f, a, 100, {
+      kind: "database.create",
+      status: "succeeded",
+      completedAt: NOW - 90_000,
+    });
+    await withOperation(f, a, 100, {
+      kind: "database.restore",
+      status: "failed",
+      completedAt: NOW - 90_000,
+    });
+    // Other operations and deleted databases change nothing, nor does another node.
+    await withOperation(f, a, 100, {
+      kind: "database.wake",
+      status: "pending",
+    });
+    await withOperation(f, a, 100, {
+      kind: "database.create",
+      status: "pending",
+      deleted: true,
+    });
+    await withOperation(f, b, 100, {
+      kind: "database.create",
+      status: "pending",
+    });
+    expect(await pending(f.region, a)).toBe(7 + 11 + 13 + 3);
+    expect(await pending(f.region, b)).toBe(100);
+  });
+
+  it("is zero for a node with nothing in flight and for a node that never reported", async () => {
+    const f = await fixture(0),
+      quiet = await addNode(f.region, 0);
+    expect(await pending(f.region, quiet)).toBe(0);
+    expect(await pending(f.region, f.node)).toBe(0);
+  });
+});
+
 describe("placement over real samples", () => {
+  it("stops a burst of creates at the logical cap before the node has reported any of them", async () => {
+    const f = await fixture(0);
+    // 30 GiB of pool data give a cap of 120 GiB; 115 GiB are sold when the node last reported.
+    await seedSamples(
+      f.node,
+      steady(Date.now(), 40, {
+        pool: {
+          ...OPEN_POOL,
+          dataTotal: 30 * GIB,
+          dataUsed: 0,
+          nominal: 115 * GIB,
+        },
+      }),
+    );
+    const create = async (name: string) =>
+      DatabaseWithOperation.parse(await (await f.create(name)).json());
+    // The class has 5 GiB: the first create reaches the cap exactly, the second would pass it.
+    expect((await create("one")).database.node_id).toBe(f.node);
+    expect((await create("two")).database.node_id).toBeNull();
+    expect((await create("three")).database.node_id).toBeNull();
+  });
+
   it("puts a database on the fullest node that has room and on a quiet one when the fullest is full", async () => {
     const f = await fixture(0);
     const quiet = await addNode(f.region, 0),

@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import {
   Database,
   DatabaseWithOperation,
+  DesiredResponse,
   newOperationId,
   type DatabaseResources,
 } from "@pgcf/contracts";
@@ -16,7 +17,7 @@ import {
   refusal,
   request,
 } from "./fixtures.ts";
-import { seedSamples, steady } from "./node-samples.ts";
+import { GIB, OPEN_POOL, seedSamples, steady } from "./node-samples.ts";
 
 afterEach(cleanupFixtures);
 
@@ -101,6 +102,37 @@ describe("resources of a database", () => {
     expect((await read(f, id)).resources.memory_mib).toBe(1024);
   });
 
+  it("is what the region's desired state carries, with a CPU request held to the new limit", async () => {
+    const f = await fixture(16384);
+    const id = await ready(f);
+    await env.DB.prepare(
+      "UPDATE size_classes SET cpu_request_millicores=400 WHERE id=?",
+    )
+      .bind(f.size)
+      .run();
+    const size = async () =>
+      DesiredResponse.parse(
+        await (await request("/agent/v1/desired", f.agent)).json(),
+      ).databases.find((database) => database.id === id)?.size;
+    expect(await size()).toMatchObject({
+      memory_mib: 512,
+      cpu_millicores: 500,
+      cpu_request_millicores: 400,
+      storage_gib: 5,
+    });
+    await put(
+      f,
+      id,
+      own({ memory_mib: 2048, cpu_millicores: 200, storage_gib: 8 }),
+    );
+    expect(await size()).toMatchObject({
+      memory_mib: 2048,
+      cpu_millicores: 200,
+      cpu_request_millicores: 200,
+      storage_gib: 8,
+    });
+  });
+
   it("meters the effective values: the created and the resized events carry them", async () => {
     const f = await fixture(16384);
     const created = DatabaseWithOperation.parse(
@@ -124,23 +156,29 @@ describe("resources of a database", () => {
           .bind(id, kind)
           .all<{ resource_snapshot: string }>()
       ).results.map((row) => JSON.parse(row.resource_snapshot));
-    expect(await snapshots("created")).toMatchObject([
+    // Every event reserves exactly the limits, whichever event it is.
+    expect(await snapshots("created")).toEqual([
       {
         memory_mib: 1536,
         cpu_millicores: 500,
+        reserved_memory_mib: 1536,
+        reserved_cpu_millicores: 500,
         storage_allocated_bytes: 20 * 2 ** 30,
       },
     ]);
+    expect(await snapshots("ready")).toEqual(await snapshots("created"));
     await put(
       f,
       id,
       own({ memory_mib: 1024, cpu_millicores: 750, storage_gib: 24 }),
     );
     await applied(f, id, 2);
-    expect(await snapshots("resized")).toMatchObject([
+    expect(await snapshots("resized")).toEqual([
       {
         memory_mib: 1024,
         cpu_millicores: 750,
+        reserved_memory_mib: 1024,
+        reserved_cpu_millicores: 750,
         storage_allocated_bytes: 24 * 2 ** 30,
       },
     ]);
@@ -295,6 +333,38 @@ describe("resources of a database", () => {
     expect((await put(f, id, own({ cpu_millicores: 750 }))).status).toBe(202);
   });
 
+  /** The fixture's node reports a 30 GiB pool (cap 120 GiB) with `soldGib` GiB sold. */
+  const sold = (f: Fixture, soldGib: number) =>
+    seedSamples(
+      f.node,
+      steady(Date.now(), 40, {
+        pool: {
+          ...OPEN_POOL,
+          dataTotal: 30 * GIB,
+          dataUsed: 0,
+          nominal: soldGib * GIB,
+        },
+      }),
+    );
+
+  it("holds the storage growth of an awake database to the node's logical cap, counting the growth still open", async () => {
+    const f = await fixture(16384);
+    const id = await ready(f);
+    await sold(f, 112);
+    // 112 GiB and 5 GiB more are under the cap of 120 GiB.
+    expect((await put(f, id, own({ storage_gib: 10 }))).status).toBe(202);
+    await applied(f, id, 2);
+    // The node has not reported the volume yet: 112 GiB, the 10 GiB in flight and 5 GiB more pass it.
+    expect(
+      await refusal(await put(f, id, own({ storage_gib: 15 }))),
+    ).toMatchObject({
+      status: 503,
+      code: "capacity_exhausted",
+      reason: "node_capacity",
+    });
+    expect((await stored(id))?.own_storage_gib).toBe(10);
+  });
+
   it("applies at the next wake for a database that sleeps, whatever its node reports", async () => {
     const f = await fixture(16384);
     const id = await ready(f);
@@ -313,6 +383,50 @@ describe("resources of a database", () => {
     const response = await put(f, id, own({ memory_mib: 2048 }));
     expect(response.status).toBe(202);
     expect((await stored(id))?.own_memory_mib).toBe(2048);
+  });
+});
+
+describe("storage growth of a database that sleeps", () => {
+  it("is held to the node's logical cap like the growth of an awake one, while memory waits for the wake", async () => {
+    const f = await fixture(16384);
+    const id = await ready(f);
+    const at = new Date().toISOString(),
+      stop = newOperationId();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at) VALUES(?,'database.hibernate','succeeded',?,?,1,?,?,?)",
+      ).bind(stop, f.project, id, at, at, at),
+      env.DB.prepare(
+        "UPDATE databases SET desired_state='suspended',suspension_reason='idle',power_operation=?,observed_state='provisioning',observed_power='hibernated',observed_generation=generation WHERE id=?",
+      ).bind(stop, id),
+    ]);
+    await seedSamples(
+      f.node,
+      steady(Date.now(), 40, {
+        pool: {
+          ...OPEN_POOL,
+          dataTotal: 30 * GIB,
+          dataUsed: 0,
+          nominal: 100 * GIB,
+        },
+      }),
+    );
+    // The cap is 120 GiB: 100 GiB sold, so 60,000 GiB are refused and 8 GiB are not.
+    expect(
+      await refusal(await put(f, id, own({ storage_gib: 60000 }))),
+    ).toMatchObject({
+      status: 503,
+      code: "capacity_exhausted",
+      reason: "node_capacity",
+    });
+    expect((await stored(id))?.own_storage_gib).toBeNull();
+    expect(
+      (await put(f, id, own({ memory_mib: 2048, storage_gib: 8 }))).status,
+    ).toBe(202);
+    expect(await stored(id)).toMatchObject({
+      own_memory_mib: 2048,
+      own_storage_gib: 8,
+    });
   });
 });
 

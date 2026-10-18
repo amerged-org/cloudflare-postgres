@@ -2,7 +2,6 @@
 import {
   newNodeId,
   ObservationReport,
-  SIDECAR,
   postgresImageIdMatches,
   type DatabaseObservation,
 } from "@pgcf/contracts";
@@ -18,8 +17,8 @@ import { recordNodeStorageObservation } from "./node-storage.ts";
 import {
   recordStartupObservationStatement,
   rememberStartAttestationStatement,
-  databaseCpuChargeSql,
 } from "./startup-admission.ts";
+import { USAGE_SNAPSHOT_SQL } from "./resources.ts";
 
 import { DatabaseRuntimeAttestation } from "@pgcf/contracts/reclaim";
 import { thinStorageDeletionConfirmedSql } from "./storage-capacity.ts";
@@ -516,16 +515,12 @@ export async function observations(
         statements.push(
           c.env.DB.prepare(
             `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-      SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,
-        json_object('memory_mib',COALESCE(d.own_memory_mib,s.memory_mib),'cpu_millicores',COALESCE(d.own_cpu_millicores,s.cpu_millicores),
-          'reserved_memory_mib',COALESCE(d.own_memory_mib,s.memory_mib)+?,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)},
-          'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN COALESCE(d.own_storage_gib,s.storage_gib)*1073741824 ELSE NULL END)
-      FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.region_id=?
+      SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
+      FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE changes()=1 AND d.id=? AND d.region_id=?
       AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=? AND kind=? AND generation=?)`,
           ).bind(
             event,
             body.observed_at,
-            SIDECAR.requestMemoryMib,
             row.id,
             region.id,
             row.id,
@@ -618,17 +613,11 @@ export async function observations(
           statements.push(
             c.env.DB.prepare(
               `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',COALESCE(d.own_memory_mib,s.memory_mib),'cpu_millicores',COALESCE(d.own_cpu_millicores,s.cpu_millicores),'reserved_memory_mib',COALESCE(d.own_memory_mib,s.memory_mib)+?,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN COALESCE(d.own_storage_gib,s.storage_gib)*1073741824 ELSE NULL END)
-        FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.generation=d.generation AND o.kind IN('database.resume','database.wake')
+        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
+        FROM databases d JOIN database_resources r ON r.database_id=d.id JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.generation=d.generation AND o.kind IN('database.resume','database.wake')
         WHERE d.id=? AND d.generation=? AND d.observed_generation=d.generation AND d.observed_state='ready' AND d.observed_power='awake' AND d.updated_at=?
         AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='woke' AND generation=d.generation)`,
-            ).bind(
-              body.observed_at,
-              SIDECAR.requestMemoryMib,
-              row.id,
-              row.generation,
-              now,
-            ),
+            ).bind(body.observed_at, row.id, row.generation, now),
           );
         statements.push(
           c.env.DB.prepare(
@@ -698,16 +687,14 @@ export async function observations(
         statements.push(
           c.env.DB.prepare(
             `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-          SELECT d.id,'resized',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',COALESCE(d.own_memory_mib,s.memory_mib),'cpu_millicores',COALESCE(d.own_cpu_millicores,s.cpu_millicores),
-            'reserved_memory_mib',COALESCE(d.own_memory_mib,s.memory_mib)+?,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN COALESCE(d.own_storage_gib,s.storage_gib)*1073741824 ELSE NULL END)
-          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.region_id=? AND d.generation=?
+          SELECT d.id,'resized',d.node_id,d.size_class_id,d.generation,?,${USAGE_SNAPSHOT_SQL}
+          FROM databases d JOIN database_resources r ON r.database_id=d.id WHERE d.id=? AND d.region_id=? AND d.generation=?
             AND d.observed_generation=? AND d.observed_state='ready' AND d.updated_at=?
             AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id AND o.kind='database.resize' AND o.generation<=d.generation AND o.status IN('pending','running')
               AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=o.database_id AND newer.kind='database.resize' AND newer.generation>o.generation))
             AND NOT EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='resized' AND e.generation=d.generation)`,
           ).bind(
             body.observed_at,
-            SIDECAR.requestMemoryMib,
             row.id,
             region.id,
             observation.generation,

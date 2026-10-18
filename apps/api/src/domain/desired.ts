@@ -143,7 +143,7 @@ async function desiredPage(
         }
       : undefined;
   const result = await env.DB.prepare(
-    `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
+    `SELECT d.*,COALESCE(ae.admission_revision,1) admission_revision,COALESCE(ae.route_revision,1) route_revision,n.k8s_node_name,dr.memory_mib,dr.cpu_millicores,s.cpu_request_millicores,dr.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'deleted_at',r.deleted_at,'valid_until',r.valid_until,'connection_limit',r.connection_limit,'member_of',json(r.member_of_json),'bypass_rls',r.bypass_rls)) FROM roles r WHERE r.database_id=d.id) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
@@ -151,6 +151,7 @@ async function desiredPage(
     x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status,
     src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
+    JOIN database_resources dr ON dr.database_id=d.id
     LEFT JOIN database_admission_epochs ae ON ae.database_id=d.id
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
@@ -283,15 +284,26 @@ async function desiredPage(
               },
             }
           : {}),
+        // The database's effective values; a request never exceeds the limit it is a share of.
         size: {
           memory_mib: row.memory_mib,
           ...(scheduling && row.desired_state === "running"
-            ? { memory_request_mib: scheduling.postgres_memory_request_mib }
+            ? {
+                memory_request_mib: Math.min(
+                  scheduling.postgres_memory_request_mib ?? row.memory_mib,
+                  row.memory_mib,
+                ),
+              }
             : {}),
           cpu_millicores: row.cpu_millicores,
           ...(row.cpu_request_millicores == null
             ? {}
-            : { cpu_request_millicores: row.cpu_request_millicores }),
+            : {
+                cpu_request_millicores: Math.min(
+                  row.cpu_request_millicores,
+                  row.cpu_millicores,
+                ),
+              }),
           storage_gib: row.storage_gib,
           max_connections: row.max_connections,
           archive_timeout_seconds: row.archive_timeout_seconds,
