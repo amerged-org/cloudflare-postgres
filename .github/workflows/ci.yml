@@ -320,7 +320,7 @@ jobs:
           node scripts/operations/register-node-image.ts --image-dir "$release" --binaries "$release" \
             --lock "$release/packages.lock.json" --dry-run
       - name: Keep the release files for the operator
-        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.fork
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: pgcf-node-release-${{ github.sha }}-${{ github.run_attempt }}
