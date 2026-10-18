@@ -390,6 +390,33 @@ describe("a database the node put to sleep", () => {
     await setNodePolicy(f);
   });
 
+  it("is recorded as a hibernation when the node proved the sleep of a database it found unproven after a crash", async () => {
+    // Live, a VM reset under load left a ready database unproven; the node recovered it, proved its
+    // sleep and reported asleep at the generation it had been ready at. D1 kept it as running and
+    // hibernated at once, and the Actor handed every connect the old wake ticket, which no node
+    // order backed, so the database never woke.
+    const f = await fixture();
+    const db = await created(f);
+    await report(f, db.id, 1);
+    await report(f, db.id, 1, "unproven");
+    expect((await row(db.id))!.observed_state).toBe("provisioning");
+    expect(await verdicts(await report(f, db.id, 1, "asleep"))).toEqual([
+      "accept",
+    ]);
+    expect(await row(db.id)).toMatchObject({
+      desired_state: "suspended",
+      suspension_reason: "idle",
+      generation: 2,
+      observed_generation: 2,
+      observed_state: "provisioning",
+      observed_power: "hibernated",
+    });
+    expect((await events(db.id)).at(-1)).toEqual({
+      kind: "hibernated",
+      generation: 2,
+    });
+  });
+
   it("does not hibernate a database the node reports asleep before D1 knew it ready", async () => {
     const f = await fixture();
     const db = await created(f);
