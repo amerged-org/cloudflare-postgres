@@ -95,10 +95,21 @@ impl<M: Machine> Core<M> {
     /// Applies a pull of the desired page: the orders that outlive their result first, then the
     /// entries, then the orders that act.
     pub async fn apply(self: &Arc<Self>, page: &Page) {
+        // An order runs once in this process: the page lists it until the API has its result, and
+        // the pulls in between do not run it again.
+        let take_up = |operation: &str| {
+            self.taken
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(operation.to_string())
+        };
         for order in &page.orders {
+            // A fence and a superseded generation are on the disk before the agent acts. Once there
+            // they are acted on again by every process that reads them from the page, since the
+            // agent may have gone down before it stopped anything.
             match order.clone() {
                 Order::Fence { operation } => {
-                    if self.persist_fence(&operation) {
+                    if self.persist_fence(&operation) && take_up(&operation) {
                         let core = self.clone();
                         tokio::spawn(async move { core.enforce_fence(&operation).await });
                     }
@@ -113,7 +124,7 @@ impl<M: Machine> Core<M> {
                     &database,
                     storage_generation,
                     remove_volume,
-                ) =>
+                ) && take_up(&operation) =>
                 {
                     let core = self.clone();
                     tokio::spawn(async move {
@@ -163,14 +174,6 @@ impl<M: Machine> Core<M> {
                 }
             }
         }
-        // An order runs once: the page lists it until the API has its result, and the pulls in
-        // between do not run it again.
-        let take_up = |operation: &str| {
-            self.taken
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(operation.to_string())
-        };
         for order in &page.orders {
             if matches!(order, Order::Fence { .. } | Order::Superseded { .. })
                 || !take_up(order.operation())
@@ -296,7 +299,9 @@ impl<M: Machine> Core<M> {
                 view.phase = Phase::Error;
                 view.error = Some(error);
             }),
-            Step::Retire => self.retire(db, &entry).await,
+            Step::Retire => {
+                self.retire(db).await;
+            }
         }
         self.set(db, |view| view.adopted = true);
         if matches!(db.phase(), Phase::Ready | Phase::Asleep) {
@@ -462,28 +467,37 @@ impl<M: Machine> Core<M> {
         });
     }
 
-    /// A fenced node or a retired generation: never started or archived again. A unit that runs
-    /// is stopped, since the order says so.
-    async fn retire(self: &Arc<Self>, db: &Arc<Db>, _entry: &Entry) {
-        let _ = self.machine.stop(&db.id).await;
-        self.admission.stopped(&db.id);
-        if let Some(account) = self.machine.account(&db.id) {
+    /// Stops the unit of a database by its name, out of admission's awake set and off the archive
+    /// socket's table; the node needs no record of the database for it. `false` when the unit may
+    /// still run.
+    async fn stop_unit(&self, database: &str) -> bool {
+        let stopped = self.machine.stop(database).await.is_ok();
+        self.admission.stopped(database);
+        if let Some(account) = self.machine.account(database) {
             self.table.remove(account.uid);
         }
+        stopped
+    }
+
+    /// A fenced node or a retired generation: never started or archived again. A unit that runs
+    /// is stopped, since the order says so.
+    async fn retire(self: &Arc<Self>, db: &Arc<Db>) -> bool {
+        let stopped = self.stop_unit(&db.id).await;
         self.set(db, |view| {
             view.phase = Phase::Retired;
             view.writer = None;
             view.awake_since_ms = None;
         });
+        stopped
     }
 
     // ---- the orders
 
     /// `fence` (plan 9.4): the order is on disk before the agent acts on it. `false` when it is
-    /// not, or was before.
+    /// not on disk.
     fn persist_fence(&self, operation: &str) -> bool {
         match self.fences.fence(operation) {
-            Ok(news) => news,
+            Ok(_) => true,
             Err(error) => {
                 crate::timing::emit_event(json!({
                     "event": "fence_unwritten", "class": crate::diagnostics::error_code(&error.into()),
@@ -493,20 +507,43 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    /// Nothing is started or archived again; what runs is stopped, since the order says so.
+    /// Nothing is started or archived again; what runs is stopped, since the order says so. That
+    /// includes the units the page never named: an agent that restarted while it was cut off finds
+    /// its units running and a first page that holds the fence and no database.
     async fn enforce_fence(self: &Arc<Self>, operation: &str) {
+        let mut stopped = true;
         for db in self.all() {
             let _flow = db.lock.lock().await;
-            let entry = db.view().entry.clone();
-            if let Some(entry) = entry {
-                self.retire(&db, &entry).await;
+            let named = db.view().entry.is_some();
+            if named {
+                stopped &= self.retire(&db).await;
             }
         }
-        self.report_order(operation, Ok(()));
+        match self.machine.units().await {
+            Ok(units) => {
+                for unit in units {
+                    let named = self
+                        .find(&unit.database)
+                        .is_some_and(|db| db.view().entry.is_some());
+                    if !named {
+                        stopped &= self.stop_unit(&unit.database).await;
+                    }
+                }
+            }
+            Err(_) => stopped = false,
+        }
+        self.report_order(
+            operation,
+            if stopped {
+                Ok(())
+            } else {
+                Err("unit_not_stopped")
+            },
+        );
     }
 
     /// `superseded`: this storage generation and every older one is never started or archived
-    /// again. The order is on disk first. `false` when it is not, or was before.
+    /// again. The order is on disk first. `false` when it is not on disk.
     fn persist_superseded(
         &self,
         operation: &str,
@@ -518,7 +555,7 @@ impl<M: Machine> Core<M> {
             .fences
             .supersede(database, storage_generation, remove_volume, operation)
         {
-            Ok(news) => news,
+            Ok(_) => true,
             Err(error) => {
                 crate::timing::emit_event(json!({
                     "event": "superseded_unwritten", "class": crate::diagnostics::error_code(&error.into()),
@@ -537,14 +574,37 @@ impl<M: Machine> Core<M> {
         remove_volume: bool,
     ) {
         let mut outcome = Ok(());
-        if let Some(db) = self.find(database) {
-            let _flow = db.lock.lock().await;
-            let entry = db.view().entry.clone();
-            if let Some(entry) =
-                entry.filter(|entry| entry.storage_generation <= storage_generation)
-            {
-                self.retire(&db, &entry).await;
+        let db = self.find(database);
+        let _flow = match &db {
+            Some(db) => Some(db.lock.lock().await),
+            None => None,
+        };
+        let entry = db.as_ref().and_then(|db| db.view().entry.clone());
+        // A node that restarted has no record of a unit that runs on: it serves the generation that
+        // is mounted.
+        let retired = match entry {
+            Some(entry) => Some(entry.storage_generation <= storage_generation),
+            None => self.machine.inventory().await.ok().map(|inventory| {
+                inventory.volumes.iter().any(|volume| {
+                    volume.id.database() == database
+                        && volume.mounted()
+                        && volume.id.generation() <= storage_generation
+                })
+            }),
+        };
+        match (retired, &db) {
+            (Some(true), Some(db)) => {
+                if !self.retire(db).await {
+                    outcome = Err("unit_not_stopped");
+                }
             }
+            (Some(true), None) => {
+                if !self.stop_unit(database).await {
+                    outcome = Err("unit_not_stopped");
+                }
+            }
+            (None, _) => outcome = Err("unit_not_stopped"),
+            (Some(false), _) => {}
         }
         if remove_volume && let Ok(inventory) = self.machine.inventory().await {
             for volume in inventory.volumes.into_iter().filter(|volume| {
@@ -654,7 +714,7 @@ mod tests {
     use crate::{
         agent::testing::{Rig, eventually},
         link::Order,
-        node_link::schema_valid,
+        node_link::contract_valid,
         postgres, testpg,
     };
     use pgcf_native_protocol::agent::Mode;
@@ -941,7 +1001,7 @@ mod tests {
         assert_eq!(rig.gateway.get(&id).unwrap().mode, Mode::Retired);
         let observation = rig.observation(&id);
         assert_eq!(observation["state"], "deleted");
-        assert!(schema_valid(
+        assert!(contract_valid(
             "NodeObservationReport",
             &json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
         ));
@@ -1074,7 +1134,7 @@ mod tests {
             state.roles,
             [("app".to_string(), 1), ("reader".to_string(), 4)].into()
         );
-        assert!(schema_valid(
+        assert!(contract_valid(
             "NodeObservationReport",
             &json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
         ));
@@ -1291,6 +1351,82 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!rig.machine.running(&id));
         assert_eq!(rig.core.db(&id).view().phase, Phase::Retired);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_that_is_fenced_stops_every_unit_it_finds_before_it_says_so() {
+        let Some(rig) = Rig::new("fence-restart").await else {
+            return;
+        };
+        let (db, other) = (rig.entry_json(), rig.entry_json());
+        let ids = [id_of(&db), id_of(&other)];
+        rig.core
+            .apply(&Rig::page(vec![db.clone(), other], vec![]))
+            .await;
+        for id in &ids {
+            let handle = rig.core.db(id);
+            eventually(90, "ready", || handle.phase() == Phase::Ready).await;
+        }
+        // The fence reached the disk and the agent went down before it acted: it comes back with
+        // units that run and a first page that holds the fence and no database.
+        rig.core.fences.fence("op_ffffffffffffffffffff").unwrap();
+        let rig = rig.restart().await;
+        assert!(ids.iter().all(|id| rig.machine.running(id)));
+        let fence = Order::Fence {
+            operation: "op_ffffffffffffffffffff".into(),
+        };
+        rig.core.apply(&Rig::page(vec![], vec![fence])).await;
+        eventually(30, "the fence", || {
+            rig.core.pending_order("op_ffffffffffffffffffff").is_some()
+        })
+        .await;
+        assert!(
+            ids.iter().all(|id| !rig.machine.running(id)),
+            "what runs is stopped by the order, whether or not the page names it"
+        );
+        assert_eq!(
+            rig.core.pending_order("op_ffffffffffffffffffff").unwrap()["status"],
+            "done"
+        );
+        assert!(
+            rig.core
+                .admission
+                .snapshot()
+                .await
+                .unwrap()
+                .awake
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_stops_the_unit_of_a_superseded_generation_it_has_no_record_of() {
+        let Some(rig) = Rig::new("superseded-restart").await else {
+            return;
+        };
+        let db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        let rig = rig.restart().await;
+        assert!(rig.machine.running(&id));
+        let order = Order::Superseded {
+            operation: "op_ssssssssssssssssssss".into(),
+            database: id.clone(),
+            storage_generation: 1,
+            remove_volume: false,
+        };
+        rig.core.apply(&Rig::page(vec![], vec![order])).await;
+        eventually(30, "the superseded order", || {
+            rig.core.pending_order("op_ssssssssssssssssssss").is_some()
+        })
+        .await;
+        assert!(!rig.machine.running(&id));
+        assert_eq!(
+            rig.core.pending_order("op_ssssssssssssssssssss").unwrap()["status"],
+            "done"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

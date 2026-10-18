@@ -1070,7 +1070,7 @@ mod tests {
     use super::*;
     use crate::{
         agent::testing::{Rig, eventually},
-        node_link::schema_valid,
+        node_link::contract_valid,
         postgres,
     };
     use pgcf_native_protocol::agent::{Mode, ToGateway};
@@ -1129,7 +1129,7 @@ mod tests {
         })
         .await;
         let observation = rig.observation(&entry.id);
-        assert!(schema_valid(
+        assert!(contract_valid(
             "NodeObservationReport",
             &report(observation.clone())
         ));
@@ -1183,7 +1183,10 @@ mod tests {
         assert_eq!(rows[0].get::<_, i64>(0), 2000);
         // What the node decided is told: the admission, and the wake with its phases.
         let events = rig.core.take_events();
-        assert!(schema_valid("NodeEventReport", &json!({"events": events})));
+        assert!(contract_valid(
+            "NodeEventReport",
+            &json!({"events": events})
+        ));
         assert!(events.iter().any(|e| e["type"] == "admission"
             && e["start"] == "wake"
             && e["decision"] == "admitted"));
@@ -1396,7 +1399,10 @@ mod tests {
             && e["decision"] == "refused"
             && e["reason"] == "no_headroom"
             && e["retry_after_seconds"] == 5));
-        assert!(schema_valid("NodeEventReport", &json!({"events": events})));
+        assert!(contract_valid(
+            "NodeEventReport",
+            &json!({"events": events})
+        ));
         // Room again: the same database wakes.
         rig.machine.set_available_bytes(8 << 30);
         assert_eq!(
@@ -1513,7 +1519,10 @@ mod tests {
             ),
             (Some("ready"), Some("power_busy"))
         );
-        assert!(schema_valid("NodeObservationReport", &report(observation)));
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &report(observation)
+        ));
         // Still wakeable: a wake of a database that runs is answered with its writer.
         assert_eq!(
             rig.core.wake(&Rig::ticket(&entry)).await.outcome,
@@ -1701,6 +1710,9 @@ mod tests {
         assert!(events.iter().any(|e| e["type"] == "early_sleep"
             && e["database"] == a.id.as_str()
             && e["for_database"] == b.id.as_str()));
-        assert!(schema_valid("NodeEventReport", &json!({"events": events})));
+        assert!(contract_valid(
+            "NodeEventReport",
+            &json!({"events": events})
+        ));
     }
 }

@@ -588,7 +588,7 @@ mod tests {
             LinkConfig, Timing as LinkTiming, Transport,
             test_server::{Cloud, tempdir},
         },
-        node_link::schema_valid,
+        node_link::contract_valid,
     };
     use pgcf_native_protocol::{
         agent::{Mode, ToGateway},
@@ -681,7 +681,8 @@ mod tests {
         .await;
         let sample = cloud.with(|inner| inner.samples.last().cloned()).unwrap();
         assert!(
-            schema_valid("NodeSample", &sample["sample"]) || schema_valid("NodeSample", &sample)
+            contract_valid("NodeSample", &sample["sample"])
+                || contract_valid("NodeSample", &sample)
         );
         assert_eq!(
             machine.credentials_applied(),

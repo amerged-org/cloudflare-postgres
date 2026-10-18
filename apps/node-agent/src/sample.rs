@@ -194,7 +194,7 @@ mod tests {
         };
         let sample = node_sample(&inputs);
         assert!(
-            crate::node_link::schema_valid("NodeSample", &sample),
+            crate::node_link::contract_valid("NodeSample", &sample),
             "{sample}"
         );
         assert_eq!(sample["pool"]["nominal_bytes"], 300u64 << 30);
@@ -207,7 +207,7 @@ mod tests {
             ..inputs
         });
         assert!(
-            crate::node_link::schema_valid("NodeSample", &unknown),
+            crate::node_link::contract_valid("NodeSample", &unknown),
             "{unknown}"
         );
         assert_eq!(unknown["pool"], Value::Null);

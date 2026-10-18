@@ -194,7 +194,7 @@ test("values that could break out of a KEY=value line or a file are refused", ()
   assert.throws(() => installerParameters({ ...longest, enrollmentToken: "short" }), /invalid enrollmentToken/);
 });
 
-test("the installer takes exactly the node id, region and enrollment token the agent's seed takes", () => {
+test("the installer takes exactly the node id, region, API origin and enrollment token the agent's seed takes", () => {
   const directory = mkdtempSync(join(tmpdir(), "pgcf-installer-"));
   try {
     const seeds = [
@@ -202,6 +202,9 @@ test("the installer takes exactly the node id, region and enrollment token the a
       // The identifiers of the contract.
       { nodeId: `nod_${"a1b2c3d4e5".repeat(2)}` },
       { enrollmentToken: `pgcf_et_${"A-_z0".repeat(8)}abc` },
+      // The API's origin, with or without its slash and port.
+      { apiUrl: "https://api.example.org/" },
+      { apiUrl: "https://api.example.org:8443" },
       // What the contract refuses: another prefix or length, capitals, separators, a short token.
       { nodeId: "n".repeat(64) },
       { nodeId: "nod_short" },
@@ -213,6 +216,12 @@ test("the installer takes exactly the node id, region and enrollment token the a
       { enrollmentToken: "e".repeat(64) },
       { enrollmentToken: `pgcf_et_${"e".repeat(42)}` },
       { enrollmentToken: `pgcf_et_${"e".repeat(44)}` },
+      // The agent dials the origin and refuses a path or a query, which would leave the node installed
+      // and never enrolled.
+      { apiUrl: "https://api.example.org/pgcf" },
+      { apiUrl: "https://api.example.org/?x=1" },
+      { apiUrl: "https://api.example.org?x=1" },
+      { apiUrl: "http://api.example.org" },
     ];
     for (const [index, seed] of seeds.entries()) {
       const parameters = { ...longest, ...seed };
@@ -236,6 +245,7 @@ test("the installer takes exactly the node id, region and enrollment token the a
         Object.entries({
           PGCF_NODE_ID: parameters.nodeId,
           PGCF_REGION: parameters.region,
+          PGCF_API_URL: parameters.apiUrl,
           PGCF_ENROLLMENT_TOKEN: parameters.enrollmentToken,
         }).reduce(
           (text, [name, value]) => text.replace(new RegExp(`^${name}=.*$`, "m"), `${name}=${value}`),

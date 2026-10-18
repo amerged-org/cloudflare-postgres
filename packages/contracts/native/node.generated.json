@@ -10,7 +10,7 @@
         "api_url": {
           "type": "string",
           "maxLength": 2048,
-          "pattern": "^https:\\/\\/"
+          "pattern": "^https:\\/\\/[A-Za-z0-9.-]+(:[0-9]{1,5})?\\/?$"
         },
         "enrollment_token": {
           "type": "string",

@@ -11,6 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::LazyLock,
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub static CONTRACT: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str(include_str!(
@@ -72,6 +73,181 @@ pub fn archive_path(path: &str) -> Option<ArchivePath<'_>> {
 /// A desired page the agent may act on: its schema, and the rules no JSON Schema states.
 pub fn desired_page_valid(page: &Value) -> bool {
     schema_valid("NodeDesiredPage", page) && page_rules(page)
+}
+
+/// The contract's verdict on a message: its schema and the rules no JSON Schema states (the
+/// refinements of the Zod contract). Cloudflare refuses a whole request for one broken rule, so the
+/// agent holds what it sends, and the double it is tested against, to the same verdict.
+pub fn contract_valid(name: &str, value: &Value) -> bool {
+    schema_valid(name, value)
+        && match name {
+            "NodeDesiredPage" => page_rules(value),
+            "NodeEnrollmentRequest" => public_key_canonical(&value["public_key"]),
+            "NodeObservationReport" => observation_rules(value),
+            "AgentLinkMessage" => value["type"] != "sample" || sample_rules(&value["sample"]),
+            "NodeSample" => sample_rules(value),
+            "NodeVolumeReport" => volume_rules(value),
+            "NodeUsageReport" => {
+                rows(value).iter().all(usage_row_rules) && unique(rows(value), usage_identity)
+            }
+            "NodeEventReport" => {
+                let events = array(&value["events"]);
+                events.iter().all(event_rules) && unique(events, |event| event["id"].as_str())
+            }
+            _ => true,
+        }
+}
+
+fn array(value: &Value) -> &[Value] {
+    value.as_array().map_or(&[], Vec::as_slice)
+}
+/// Whether `key` names no two of `values`: a report names each of its items once.
+fn unique<'a, K: std::hash::Hash + Eq>(values: &'a [Value], key: impl Fn(&'a Value) -> K) -> bool {
+    let mut seen = HashSet::new();
+    values.iter().all(|value| seen.insert(key(value)))
+}
+
+/// A raw Ed25519 public key in its one canonical text.
+fn public_key_canonical(key: &Value) -> bool {
+    key.as_str()
+        .and_then(|key| URL_SAFE_NO_PAD.decode(key).ok())
+        .is_some_and(|bytes| bytes.len() == 32)
+}
+
+/// `NodeObservationReport`: each database and each order once; a failed order, and only a failed
+/// order, names its reason; and the rules of every database's observation.
+fn observation_rules(report: &Value) -> bool {
+    let (databases, orders) = (array(&report["databases"]), array(&report["orders"]));
+    unique(databases, |db| db["id"].as_str())
+        && unique(orders, |order| order["operation"].as_str())
+        && databases.iter().all(database_observation_rules)
+        && orders
+            .iter()
+            .all(|order| (order["status"] == "failed") == order.get("reason").is_some())
+}
+
+/// `NodeDatabaseObservation`: a ready database names its unit's instance and has a DONE base
+/// backup; a database is asleep exactly with its proven-sleep record and in error exactly with its
+/// error; a refused sleep and the fate of roles belong to a ready database, which names each role
+/// once; and the record's system identifier fits 64 bits.
+fn database_observation_rules(db: &Value) -> bool {
+    let ready = db["state"] == "ready";
+    let has = |field: &str| db.get(field).is_some();
+    let roles = &db["roles"];
+    ready == has("instance")
+        && (!ready || !db["backup"].is_null())
+        && (db["state"] == "asleep") == !db["proven_sleep"].is_null()
+        && (db["state"] == "error") == has("error")
+        && (!has("refusal") || ready)
+        && (!has("roles")
+            || (ready && {
+                let names: Vec<_> = array(&roles["removed"])
+                    .iter()
+                    .chain(array(&roles["blocked"]))
+                    .collect();
+                names.iter().collect::<HashSet<_>>().len() == names.len()
+            }))
+        && db["proven_sleep"]["system_identifier"]
+            .as_str()
+            .is_none_or(|identifier| identifier.parse::<u64>().is_ok())
+}
+
+/// `NodeSample`: what the node measured cannot exceed what it has.
+fn sample_rules(sample: &Value) -> bool {
+    let number = |value: &Value| value.as_u64();
+    let rules = || -> Option<bool> {
+        let (memory, cpu, pool, volumes, archive) = (
+            &sample["memory"],
+            &sample["cpu"],
+            &sample["pool"],
+            &sample["volumes"],
+            &sample["archive"],
+        );
+        let awake = array(&sample["awake"]);
+        Some(
+            number(&memory["available_bytes"])? <= number(&memory["total_bytes"])?
+                && number(&cpu["busy_millicores"])? <= number(&cpu["cores"])? * 1000
+                && (pool.is_null()
+                    || (number(&pool["data_used_bytes"])? <= number(&pool["data_total_bytes"])?
+                        && number(&pool["metadata_used_bytes"])?
+                            <= number(&pool["metadata_total_bytes"])?
+                        && pool["observed_at"].as_str()? <= sample["observed_at"].as_str()?))
+                && number(&volumes["mounted"])? <= number(&volumes["total"])?
+                && (archive["oldest_ready_seconds"].is_null()
+                    || archive["ready_files"].as_u64().unwrap_or(0) > 0)
+                && unique(awake, Value::as_str)
+                && usize::try_from(number(&sample["starting"])?).ok()? <= awake.len(),
+        )
+    };
+    rules().unwrap_or(false)
+}
+
+/// `NodeVolumeReport`: a mounted volume reports its filesystem, and no volume is named twice.
+fn volume_rules(report: &Value) -> bool {
+    let volumes = array(&report["volumes"]);
+    volumes
+        .iter()
+        .all(|volume| (volume["mounted"] == true) == !volume["filesystem"].is_null())
+        && unique(volumes, |volume| {
+            (
+                volume["database"].as_str(),
+                volume["storage_generation"].as_u64(),
+            )
+        })
+}
+
+/// `USAGE_HOUR_MS` of the usage contract.
+const HOUR_MS: i128 = 3_600_000;
+
+fn millis(timestamp: &Value) -> Option<i128> {
+    let at = OffsetDateTime::parse(timestamp.as_str()?, &Rfc3339).ok()?;
+    Some(at.unix_timestamp_nanos() / 1_000_000)
+}
+fn rows(report: &Value) -> &[Value] {
+    array(&report["rows"])
+}
+/// A usage row is identified by its database and interval.
+pub fn usage_identity(row: &Value) -> (&str, &str, &str) {
+    (
+        row["database"].as_str().unwrap_or_default(),
+        row["interval_start"].as_str().unwrap_or_default(),
+        row["interval_end"].as_str().unwrap_or_default(),
+    )
+}
+/// A usage row (`NodeUsageRow`): its interval is positive and stays within one UTC hour, and a
+/// database is not awake longer than the interval.
+fn usage_row_rules(row: &Value) -> bool {
+    let (Some(start), Some(end)) = (millis(&row["interval_start"]), millis(&row["interval_end"]))
+    else {
+        return false;
+    };
+    end > start
+        && start.div_euclid(HOUR_MS) == (end - 1).div_euclid(HOUR_MS)
+        && row["awake_ms"]
+            .as_i64()
+            .is_none_or(|awake| i128::from(awake) <= end - start)
+}
+/// An event (`NodeEvent`): exactly a refusal names its reason, and exactly the refusal of awake
+/// capacity (`no_headroom`) carries the retry hint.
+fn event_rules(event: &Value) -> bool {
+    match event["type"].as_str() {
+        Some("admission") => {
+            (event["decision"] == "refused") == event.get("reason").is_some()
+                && (event["reason"] == "no_headroom") == event.get("retry_after_seconds").is_some()
+        }
+        Some("wake") => (event["outcome"] == "refused") == event.get("reason").is_some(),
+        _ => true,
+    }
+}
+
+/// A usage row alone, as a report of one row: what Cloudflare would accept of it. One invalid row
+/// would make Cloudflare refuse the whole batch it sits in.
+pub fn usage_row_valid(row: &Value) -> bool {
+    contract_valid("NodeUsageReport", &serde_json::json!({"rows": [row]}))
+}
+/// An event alone, as a report of one event.
+pub fn event_valid(event: &Value) -> bool {
+    contract_valid("NodeEventReport", &serde_json::json!({"events": [event]}))
 }
 
 fn page_rules(page: &Value) -> bool {
@@ -311,6 +487,7 @@ mod tests {
                 valid || refinement,
                 "{schema}/{name}"
             );
+            assert_eq!(contract_valid(schema, value), valid, "{schema}/{name}");
             if schema == "NodeDesiredPage" {
                 assert_eq!(desired_page_valid(value), valid, "{schema}/{name}");
             }

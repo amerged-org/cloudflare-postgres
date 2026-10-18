@@ -37,6 +37,7 @@ const token = /^[A-Za-z0-9._~-]{16,512}$/;
 const nodeId = /^nod_[a-z0-9]{20}$/;
 const region = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 const enrollmentToken = /^pgcf_et_[A-Za-z0-9_-]{43}$/;
+const apiOrigin = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?\/?$/;
 
 function count(value: number, name: string): string {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
@@ -76,7 +77,7 @@ export function installerParameters(p: InstallerParameters): string {
     ["PGCF_PROGRESS_TOKEN", match(p.progressToken, token, "progressToken")],
     ["PGCF_NODE_ID", match(p.nodeId, nodeId, "nodeId")],
     ["PGCF_REGION", match(p.region, region, "region")],
-    ["PGCF_API_URL", match(p.apiUrl, https, "apiUrl")],
+    ["PGCF_API_URL", match(p.apiUrl, apiOrigin, "apiUrl")],
     ["PGCF_ENROLLMENT_TOKEN", match(p.enrollmentToken, enrollmentToken, "enrollmentToken")],
   ];
   return values.map(([name, value]) => `${name}=${value}\n`).join("");

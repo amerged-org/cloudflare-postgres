@@ -46,7 +46,8 @@ pub(crate) fn uuid() -> String {
 
 impl<M: Machine> Core<M> {
     /// The observation of a database as its view and its disk say it, or `None` while it has none
-    /// to give: the page has not named it, or a wake is under way.
+    /// to give: the page has not named it, a wake is under way, or the unit of a ready database is
+    /// not known.
     fn observe(&self, db: &Db, view: &View) -> Option<Value> {
         let entry = view.entry.as_ref()?;
         let (state, error) = match view.phase {
@@ -91,10 +92,13 @@ impl<M: Machine> Core<M> {
         if let Some(error) = error {
             observation["error"] = error.into();
         }
-        if state == "ready"
-            && let Some(refusal) = view.refusal
-        {
-            observation["refusal"] = refusal.into();
+        if state == "ready" {
+            // The route names the unit (`UnitWriter.instance`), so Cloudflare learns it here. A ready
+            // database whose unit the node does not know has nothing to report.
+            observation["instance"] = view.writer.as_ref()?.instance.clone().into();
+            if let Some(refusal) = view.refusal {
+                observation["refusal"] = refusal.into();
+            }
         }
         if state == "ready" && !(view.roles_removed.is_empty() && view.roles_blocked.is_empty()) {
             observation["roles"] =
@@ -264,6 +268,30 @@ impl<M: Machine> Core<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{agent::testing::Rig, node_link::contract_valid};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ready_database_names_the_unit_it_runs_and_the_report_is_what_cloudflare_accepts() {
+        let Some(rig) = Rig::new("observe-ready").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let instance = db.view().writer.as_ref().unwrap().instance.clone();
+        let observation = rig.observation(&entry.id);
+        assert_eq!(observation["state"], "ready");
+        assert_eq!(observation["instance"], instance);
+        let report = json!({
+            "observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []
+        });
+        assert!(contract_valid("NodeObservationReport", &report));
+        // The same report without the instance is the one Cloudflare refuses.
+        let mut without = report;
+        without["databases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("instance");
+        assert!(!contract_valid("NodeObservationReport", &without));
+    }
 
     #[test]
     fn an_event_identifier_is_a_version_4_uuid_and_never_repeats() {

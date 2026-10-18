@@ -53,6 +53,12 @@ const Bytes = Count;
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
 /** The pattern carries the scheme into the JSON Schema, which drops the URL check. */
 const Https = HttpsUrl.regex(/^https:\/\//);
+/**
+ * The API's origin: https, a host and a port, nothing else. The agent dials it for every request
+ * and refuses a path or a query, so the installer and the seed take exactly this shape.
+ */
+const API_ORIGIN_PATTERN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?\/?$/;
+const ApiOrigin = HttpsUrl.regex(API_ORIGIN_PATTERN);
 
 export const NODE_PROTOCOL_VERSION = 1;
 /** Every path a node calls; each but `enroll` carries a signed node request. */
@@ -132,7 +138,7 @@ export const NODE_ENROLLMENT_SEED_PATH = "/var/lib/pgcf/enrollment/seed.json";
 export const NodeEnrollmentSeed = z.strictObject({
   node_id: NodeId,
   region: RegionId,
-  api_url: Https,
+  api_url: ApiOrigin,
   enrollment_token: EnrollmentToken,
 });
 export type NodeEnrollmentSeed = z.infer<typeof NodeEnrollmentSeed>;

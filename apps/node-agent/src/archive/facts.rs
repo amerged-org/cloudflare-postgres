@@ -406,6 +406,7 @@ mod tests {
                     "operation": format!("op_{}", "a".repeat(20)),
                     "storage_generation": 1,
                     "state": "ready",
+                    "instance": "0f6c2d8e-5b7a-4c1e-9a3b-2d4e6f8a0b1c",
                     "proven_sleep": null,
                     "backup": backup_observation(newest_done(&backups)),
                     "archive": archive,
@@ -413,7 +414,7 @@ mod tests {
                 "orders": [],
             })
         };
-        assert!(crate::node_link::schema_valid(
+        assert!(crate::node_link::contract_valid(
             "NodeObservationReport",
             &report(facts.observation())
         ));
@@ -424,13 +425,13 @@ mod tests {
             ready: None,
             failing_since_ms: None,
         });
-        assert!(crate::node_link::schema_valid(
+        assert!(crate::node_link::contract_valid(
             "NodeObservationReport",
             &report(unknown.observation())
         ));
         let mut wrong = facts.observation();
         wrong["ready_files"] = json!("1");
-        assert!(!crate::node_link::schema_valid(
+        assert!(!crate::node_link::contract_valid(
             "NodeObservationReport",
             &report(wrong)
         ));

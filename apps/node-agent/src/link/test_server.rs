@@ -2,7 +2,7 @@
 //! A Cloudflare double that speaks the node contract over TLS. It verifies every signed request
 //! as the Worker does (`verifyNodeRequest`), enrolls one node, serves the node's desired pages in
 //! the contract's paging, records what the node posts, and runs the node's WebSocket link.
-use crate::node_link::{constant, schema_valid};
+use crate::node_link::{constant, contract_valid};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -47,16 +47,6 @@ pub fn vector(schema: &str, name: &str) -> Value {
         .find(|v| v["schema"] == schema && v["name"] == name && v["valid"] == true)
         .unwrap_or_else(|| panic!("no vector {schema}/{name}"))["value"]
         .clone()
-}
-/// Every example of the contract schema `schema`, valid or not, as the vectors state it.
-pub fn vectors(schema: &str) -> Vec<Value> {
-    VECTORS["schemas"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|v| v["schema"] == schema)
-        .cloned()
-        .collect()
 }
 /// A desired database of the contract's example page, under another identifier.
 pub fn database(id: &str) -> Value {
@@ -159,6 +149,7 @@ impl Cloud {
         leaf.subject_alt_names = vec![
             rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()),
             rcgen::SanType::IpAddress("::1".parse().unwrap()),
+            rcgen::SanType::DnsName("localhost".try_into().unwrap()),
         ];
         let leaf = leaf.signed_by(&key, &authority).unwrap();
         let tls = rustls::ServerConfig::builder()
@@ -223,11 +214,16 @@ impl Cloud {
     }
     /// The installer's seed under `base`, naming this double as the API.
     pub fn seed(&self, base: &Path) {
+        self.seed_for(base, &self.origin);
+    }
+    /// The seed for the API at `api_url`, which the contract allows to be an origin with a host name
+    /// only: an address of the double's is reached as `localhost`.
+    pub fn seed_for(&self, base: &Path, api_url: &str) {
         let directory = base.join("enrollment");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("seed.json"),
-            json!({"node_id":NODE_ID,"region":"eu-dev","api_url":self.origin,"enrollment_token":TOKEN})
+            json!({"node_id":NODE_ID,"region":"eu-dev","api_url":api_url,"enrollment_token":TOKEN})
                 .to_string(),
         )
         .unwrap();
@@ -363,7 +359,7 @@ fn verify(
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or("malformed")?;
-    if !schema_valid("NodeRequestClaims", &claims) {
+    if !contract_valid("NodeRequestClaims", &claims) {
         return Err("claims");
     }
     let hash: String = Sha256::digest(body)
@@ -460,7 +456,7 @@ fn route(inner: &mut Inner, method: &str, target: &str, body: &Value) -> Answer 
         return answer(403, json!({"error":"node_fenced"}));
     }
     let post = |schema: &str| {
-        if method != "POST" || !schema_valid(schema, body) {
+        if method != "POST" || !contract_valid(schema, body) {
             return answer(400, error("invalid_request"));
         }
         answer(200, json!({}))
@@ -595,7 +591,7 @@ async fn serve(
 /// POST /node/v1/enroll: the first key is bound to the node; the same token and key repeat the
 /// answer, anything else is refused.
 fn enroll(inner: &mut Inner, body: &Value) -> Answer {
-    if !schema_valid("NodeEnrollmentRequest", body) || body["enrollment_token"] != TOKEN {
+    if !contract_valid("NodeEnrollmentRequest", body) || body["enrollment_token"] != TOKEN {
         return answer(403, error("enrollment_refused"));
     }
     let key = URL_SAFE_NO_PAD
@@ -618,7 +614,7 @@ async fn session<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         return;
     };
     let hello: Value = serde_json::from_str(hello.as_str()).unwrap_or(Value::Null);
-    if !schema_valid("AgentLinkMessage", &hello) || hello["type"] != "hello" {
+    if !contract_valid("AgentLinkMessage", &hello) || hello["type"] != "hello" {
         return;
     }
     let silent = {
@@ -643,7 +639,7 @@ async fn session<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             message = socket.next() => match message {
                 Some(Ok(Message::Text(text))) => {
                     let message: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
-                    if !schema_valid("AgentLinkMessage", &message) || message["type"] != "sample" {
+                    if !contract_valid("AgentLinkMessage", &message) || message["type"] != "sample" {
                         return;
                     }
                     inner.lock().unwrap().samples.push(message["sample"].clone());

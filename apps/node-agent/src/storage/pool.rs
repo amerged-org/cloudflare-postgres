@@ -491,6 +491,6 @@ mod tests {
             "queued": 0,
             "credentials_revision": 1,
         });
-        assert!(crate::node_link::schema_valid("NodeSample", &node_sample));
+        assert!(crate::node_link::contract_valid("NodeSample", &node_sample));
     }
 }

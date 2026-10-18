@@ -27,7 +27,7 @@ pub use request::{Fenced, Transport};
 use crate::{
     Error,
     api::Refusal,
-    node_link::{constant, schema_valid},
+    node_link::{constant, contract_valid, schema_valid},
 };
 use events::Events;
 use request::Api;
@@ -257,7 +257,7 @@ impl Link {
     /// at once, and again after a reconnect until a newer one replaces it. Sample every 15 s.
     pub async fn post_samples(&self, sample: &Value) -> Result<(), Error> {
         let message = json!({"type": "sample", "sample": sample});
-        if !schema_valid("AgentLinkMessage", &message) {
+        if !contract_valid("AgentLinkMessage", &message) {
             return Err("native sample invalid".into());
         }
         self.inner.samples.send_replace(Some(message.to_string()));
@@ -281,7 +281,7 @@ impl Link {
     }
 
     async fn post(&self, name: &str, schema: &str, report: &Value) -> Result<(), Error> {
-        if !schema_valid(schema, report) {
+        if !contract_valid(schema, report) {
             return Err(format!("native {name} report invalid").into());
         }
         self.inner.api.post(path(name)?, report).await

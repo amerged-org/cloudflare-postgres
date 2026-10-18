@@ -96,30 +96,30 @@ impl Fences {
     pub fn fenced(&self) -> bool {
         self.stored().fence.is_some()
     }
-    /// Fences the node: on disk before it returns. `true` when this order is news.
-    pub fn fence(&self, operation: &str) -> io::Result<bool> {
+    /// Fences the node: on disk before it returns. A node that is fenced stays fenced under its
+    /// first order.
+    pub fn fence(&self, operation: &str) -> io::Result<()> {
         let mut stored = self.stored();
         if stored.fence.is_some() {
-            return Ok(false);
+            return Ok(());
         }
         let mut next = stored.clone();
         next.fence = Some(operation.to_string());
-        self.keep(&mut stored, next)?;
-        Ok(true)
+        self.keep(&mut stored, next)
     }
     /// Retires `storage_generation` of `database` and every older one: on disk before it returns.
-    /// `true` when this order is news.
+    /// An order that is on disk already is kept as it is.
     pub fn supersede(
         &self,
         database: &str,
         storage_generation: u64,
         remove_volume: bool,
         operation: &str,
-    ) -> io::Result<bool> {
+    ) -> io::Result<()> {
         let mut stored = self.stored();
         let orders = stored.superseded.get(database);
         if orders.is_some_and(|orders| orders.iter().any(|order| order.operation == operation)) {
-            return Ok(false);
+            return Ok(());
         }
         let mut next = stored.clone();
         next.superseded
@@ -130,8 +130,7 @@ impl Fences {
                 storage_generation,
                 remove_volume,
             });
-        self.keep(&mut stored, next)?;
-        Ok(true)
+        self.keep(&mut stored, next)
     }
     /// Whether the storage generation is retired: it is never started or archived again.
     pub fn blocks(&self, database: &str, storage_generation: u64) -> bool {
@@ -176,11 +175,14 @@ mod tests {
         let path = path("fence");
         let fences = Fences::load(&path).unwrap();
         assert!(!fences.fenced());
-        assert!(fences.fence("op_aaaaaaaaaaaaaaaaaaaa").unwrap());
+        fences.fence("op_aaaaaaaaaaaaaaaaaaaa").unwrap();
         assert!(fences.fenced());
-        // The same order again is not news.
-        assert!(!fences.fence("op_aaaaaaaaaaaaaaaaaaaa").unwrap());
-        assert!(Fences::load(&path).unwrap().fenced());
+        // The first order stays the node's fence.
+        fences.fence("op_bbbbbbbbbbbbbbbbbbbb").unwrap();
+        assert_eq!(
+            Fences::load(&path).unwrap().stored().fence.as_deref(),
+            Some("op_aaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]
@@ -189,11 +191,9 @@ mod tests {
         let fences = Fences::load(&path).unwrap();
         let db = "abcdefghij0123456789";
         assert!(!fences.blocks(db, 1));
-        assert!(
-            fences
-                .supersede(db, 2, false, "op_bbbbbbbbbbbbbbbbbbbb")
-                .unwrap()
-        );
+        fences
+            .supersede(db, 2, false, "op_bbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
         assert!(fences.blocks(db, 1) && fences.blocks(db, 2));
         assert!(
             !fences.blocks(db, 3),
@@ -205,20 +205,17 @@ mod tests {
         );
         // The volume goes only with `remove_volume`, and only the volumes the order covers.
         assert!(!fences.removable(db, 2));
-        assert!(
-            fences
-                .supersede(db, 3, true, "op_cccccccccccccccccccc")
-                .unwrap()
-        );
+        fences
+            .supersede(db, 3, true, "op_cccccccccccccccccccc")
+            .unwrap();
         assert!(fences.removable(db, 3) && fences.removable(db, 1));
         assert!(!fences.removable(db, 4));
-        // An order that was reported and left the page is still in force after a restart; a repeat
-        // is not news.
-        assert!(
-            !fences
-                .supersede(db, 3, true, "op_cccccccccccccccccccc")
-                .unwrap()
-        );
+        // An order that was reported and left the page is still in force after a restart, and a
+        // repeat of it is kept once.
+        fences
+            .supersede(db, 3, true, "op_cccccccccccccccccccc")
+            .unwrap();
+        assert_eq!(fences.stored().superseded[db].len(), 2);
         let reopened = Fences::load(&path).unwrap();
         assert!(reopened.blocks(db, 3) && reopened.removable(db, 3));
         // A lower generation never lowers what is superseded.

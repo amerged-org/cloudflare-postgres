@@ -10,7 +10,7 @@ use super::{file, request::Api};
 use crate::{
     Error,
     api::Refusal,
-    node_link::{constant, schema_valid},
+    node_link::{constant, event_valid, usage_identity, usage_row_valid},
 };
 use serde_json::{Value, json};
 use std::{
@@ -20,7 +20,6 @@ use std::{
     sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex as Gate, Notify};
 
 /// Usage rows held while Cloudflare does not answer: about 5 MB, hours of a full node's rows.
@@ -70,57 +69,12 @@ fn batches(field: &str, values: Vec<Value>) -> Result<Vec<Vec<Value>>, Error> {
     }
     Ok(result)
 }
-/// `USAGE_HOUR_MS` of the usage contract.
-const HOUR_MS: i128 = 3_600_000;
-
-fn millis(timestamp: &Value) -> Option<i128> {
-    let at = OffsetDateTime::parse(timestamp.as_str()?, &Rfc3339).ok()?;
-    Some(at.unix_timestamp_nanos() / 1_000_000)
-}
-/// A usage row (`NodeUsageRow`), with the rules a JSON Schema cannot state: its interval is
-/// positive and stays within one UTC hour, and a database is not awake longer than the interval.
-/// One invalid row would make Cloudflare refuse the whole batch it sits in.
-fn usage_row_valid(row: &Value) -> bool {
-    let (Some(start), Some(end)) = (millis(&row["interval_start"]), millis(&row["interval_end"]))
-    else {
-        return false;
-    };
-    schema_valid("NodeUsageReport", &json!({"rows": [row]}))
-        && end > start
-        && start.div_euclid(HOUR_MS) == (end - 1).div_euclid(HOUR_MS)
-        && row["awake_ms"]
-            .as_i64()
-            .is_none_or(|awake| i128::from(awake) <= end - start)
-}
-/// An event (`NodeEvent`) with the rules a JSON Schema cannot state: exactly a refusal names its
-/// reason, and exactly the refusal of awake capacity (`no_headroom`) carries the retry hint.
-fn event_valid(event: &Value) -> bool {
-    schema_valid("NodeEventReport", &json!({"events": [event]}))
-        && match event["type"].as_str() {
-            Some("admission") => {
-                (event["decision"] == "refused") == event.get("reason").is_some()
-                    && (event["reason"] == "no_headroom")
-                        == event.get("retry_after_seconds").is_some()
-            }
-            Some("wake") => (event["outcome"] == "refused") == event.get("reason").is_some(),
-            _ => true,
-        }
-}
-
 /// The usage rows not yet acknowledged, oldest first, and the file that keeps them.
 struct UsageQueue {
     path: PathBuf,
     rows: Vec<Value>,
     /// Rows left the queue since the file was written: it still holds rows that were answered.
     unsaved: bool,
-}
-fn identity(row: &Value) -> (&str, &str, &str) {
-    let text = |key: &str| row[key].as_str().unwrap_or_default();
-    (
-        text("database"),
-        text("interval_start"),
-        text("interval_end"),
-    )
 }
 impl UsageQueue {
     /// The queue a previous run left. A file that is no valid queue is no loss worth stopping
@@ -161,10 +115,10 @@ impl UsageQueue {
         if !rows.iter().all(usage_row_valid) {
             return Err("native usage rows invalid".into());
         }
-        let mut seen: HashSet<_> = self.rows.iter().map(identity).collect();
+        let mut seen: HashSet<_> = self.rows.iter().map(usage_identity).collect();
         let fresh: Vec<&Value> = rows
             .iter()
-            .filter(|row| seen.insert(identity(row)))
+            .filter(|row| seen.insert(usage_identity(row)))
             .collect();
         if self.rows.len() + fresh.len() > USAGE_MAX_ROWS {
             return Err("usage outbox full".into());
@@ -393,7 +347,7 @@ mod tests {
     use super::*;
     use crate::link::{
         request::{Fenced, tests::enrolled},
-        test_server::{Cloud, Failure, TempDir, database_id, tempdir, vector, vectors},
+        test_server::{Cloud, Failure, TempDir, database_id, tempdir, vector},
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -413,35 +367,6 @@ mod tests {
             .as_array()
             .unwrap()
             .clone()
-    }
-
-    #[test]
-    fn the_rules_decide_as_the_contract_does_for_every_usage_and_event_vector() {
-        for vector in vectors("NodeUsageReport") {
-            let (value, rows) = (
-                &vector["value"],
-                vector["value"]["rows"].as_array().unwrap(),
-            );
-            let identities: HashSet<_> = rows.iter().map(identity).collect();
-            let accepted = schema_valid("NodeUsageReport", value)
-                && rows.iter().all(usage_row_valid)
-                && identities.len() == rows.len();
-            assert_eq!(accepted, vector["valid"], "{}", vector["name"]);
-        }
-        for vector in vectors("NodeEventReport") {
-            let (value, events) = (
-                &vector["value"],
-                vector["value"]["events"].as_array().unwrap(),
-            );
-            let ids: HashSet<_> = events
-                .iter()
-                .map(|e| e["id"].as_str().unwrap_or_default())
-                .collect();
-            let accepted = schema_valid("NodeEventReport", value)
-                && events.iter().all(event_valid)
-                && ids.len() == events.len();
-            assert_eq!(accepted, vector["valid"], "{}", vector["name"]);
-        }
     }
 
     #[test]

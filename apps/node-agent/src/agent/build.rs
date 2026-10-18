@@ -746,7 +746,7 @@ impl<M: Machine> Host for Rebuild<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::testing::Rig, node_link::schema_valid, pg_control};
+    use crate::{agent::testing::Rig, node_link::contract_valid, pg_control};
     use pgcf_native_protocol::agent::Mode;
     use serde_json::{Value, json};
     use std::num::NonZeroU32;
@@ -865,7 +865,7 @@ mod tests {
 
         // What Cloudflare is told is what the contract states, and says ready with the backup.
         let observation = rig.observation(&entry.id);
-        assert!(schema_valid(
+        assert!(contract_valid(
             "NodeObservationReport",
             &report(observation.clone())
         ));
@@ -881,7 +881,10 @@ mod tests {
         assert!(events.iter().any(|e| e["type"] == "admission"
             && e["start"] == "create"
             && e["decision"] == "admitted"));
-        assert!(schema_valid("NodeEventReport", &json!({"events": events})));
+        assert!(contract_valid(
+            "NodeEventReport",
+            &json!({"events": events})
+        ));
         let _ = pg_control::CONTROL_FILE;
     }
 

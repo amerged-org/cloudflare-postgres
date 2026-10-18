@@ -58,6 +58,8 @@ count='^[1-9][0-9]{0,15}$'
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 token='^[A-Za-z0-9._~-]+$'
 https='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/?&=+-]*)?$'
+# The seed's API URL is an origin (NodeEnrollmentSeed): the agent refuses a path or a query.
+origin='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$'
 need PGCF_IMAGE_URL "$https"
 need PGCF_IMAGE_ZST_SHA256 "$hex64"
 need PGCF_IMAGE_ZST_BYTES "$count"
@@ -80,7 +82,7 @@ token_length PGCF_PROGRESS_TOKEN
 # The seed's identifiers are the contract's (NodeEnrollmentSeed): the agent refuses any other shape.
 need PGCF_NODE_ID '^nod_[a-z0-9]{20}$'
 need PGCF_REGION '^[a-z][a-z0-9-]{1,30}[a-z0-9]$'
-need PGCF_API_URL "$https"
+need PGCF_API_URL "$origin"
 need PGCF_ENROLLMENT_TOKEN '^pgcf_et_[A-Za-z0-9_-]{43}$'
 token_length PGCF_ENROLLMENT_TOKEN
 if [ -n "${PGCF_IPV6}" ] && { [ -z "${PGCF_IPV6_PREFIX}" ] || [ -z "${PGCF_IPV6_GATEWAY}" ]; }; then

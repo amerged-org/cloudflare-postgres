@@ -315,7 +315,10 @@ fn a_volume_is_created_formatted_and_mounted_for_its_owner_alone() {
         "observed_at": "2026-10-18T10:00:00.000Z",
         "volumes": inventory.volumes.iter().map(VolumeInfo::to_contract).collect::<Vec<_>>(),
     });
-    assert!(crate::node_link::schema_valid("NodeVolumeReport", &report));
+    assert!(crate::node_link::contract_valid(
+        "NodeVolumeReport",
+        &report
+    ));
 }
 
 #[test]

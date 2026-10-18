@@ -363,11 +363,11 @@ mod tests {
         });
         // The same volume twice breaks the report's own rule; the entries are what is checked.
         let one = |v: &VolumeInfo| json!({"observed_at": "2026-10-18T10:00:00.000Z", "volumes": [v.to_contract()]});
-        assert!(crate::node_link::schema_valid(
+        assert!(crate::node_link::contract_valid(
             "NodeVolumeReport",
             &one(&mounted)
         ));
-        assert!(crate::node_link::schema_valid(
+        assert!(crate::node_link::contract_valid(
             "NodeVolumeReport",
             &one(&asleep_unmounted)
         ));

@@ -10,7 +10,7 @@ use super::{
 use crate::{
     Error,
     api::Refusal,
-    node_link::{RequestClaims, constant, public_key, schema_valid, sign_request},
+    node_link::{RequestClaims, constant, contract_valid, public_key, schema_valid, sign_request},
 };
 use reqwest::Url;
 use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
@@ -212,7 +212,7 @@ pub async fn establish(
         "public_key": public_key(&key),
         "image_version": image_version,
     });
-    if !schema_valid("NodeEnrollmentRequest", &request) {
+    if !contract_valid("NodeEnrollmentRequest", &request) {
         return Err("enrollment request invalid".into());
     }
     let url = origin.join(
@@ -277,7 +277,7 @@ mod tests {
     use super::*;
     use crate::{
         api::Refusal,
-        link::test_server::{Cloud, Failure, NODE_ID, NODE_UID, tempdir},
+        link::test_server::{Cloud, Failure, NODE_ID, NODE_UID, tempdir, vector},
     };
     use ring::signature::KeyPair;
     use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
@@ -422,7 +422,9 @@ mod tests {
         // an IPv6 route would otherwise reach Cloudflare from an address it refuses for good.
         let cloud = Cloud::start_on("[::1]:0").await;
         let base = tempdir();
-        cloud.seed(&base);
+        // The seed names the double by host name, as the contract has it; the node reaches it only
+        // over IPv6 (`localhost` is both) and so never.
+        cloud.seed_for(&base, &cloud.origin.replace("[::1]", "localhost"));
         let (paths, transport) = (Paths::new(&base), Transport::new(cloud.roots()).unwrap());
         let window = Timing {
             enrollment_window: Duration::from_millis(100),
@@ -435,6 +437,14 @@ mod tests {
         assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_connect());
         assert!(cloud.requests().is_empty());
         assert!(!paths.identity().exists());
+    }
+
+    #[test]
+    fn every_seed_the_contract_accepts_names_an_origin_the_agent_dials() {
+        for name in ["installer-seed", "origin-with-port-and-slash"] {
+            let seed = vector("NodeEnrollmentSeed", name);
+            assert!(origin(seed["api_url"].as_str().unwrap()).is_ok(), "{name}");
+        }
     }
 
     #[tokio::test]

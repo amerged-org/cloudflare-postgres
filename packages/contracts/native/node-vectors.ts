@@ -338,6 +338,16 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       true,
     ],
     [
+      "origin-with-port-and-slash",
+      {
+        node_id: node.id,
+        region,
+        api_url: "https://api.example:8443/",
+        enrollment_token: `pgcf_et_${"e".repeat(43)}`,
+      },
+      true,
+    ],
+    [
       "unknown-field",
       {
         node_id: node.id,
@@ -345,6 +355,26 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
         api_url: "https://api.example",
         enrollment_token: `pgcf_et_${"e".repeat(43)}`,
         hostname: "eu1",
+      },
+      false,
+    ],
+    [
+      "url-with-path",
+      {
+        node_id: node.id,
+        region,
+        api_url: "https://api.example/pgcf",
+        enrollment_token: `pgcf_et_${"e".repeat(43)}`,
+      },
+      false,
+    ],
+    [
+      "url-with-query",
+      {
+        node_id: node.id,
+        region,
+        api_url: "https://api.example/?x=1",
+        enrollment_token: `pgcf_et_${"e".repeat(43)}`,
       },
       false,
     ],
@@ -919,6 +949,24 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
       false,
       true,
     ],
+    [
+      "roles-while-asleep",
+      observations({ ...observation, roles: { removed: [], blocked: [] } }),
+      false,
+      true,
+    ],
+    [
+      "role-removed-and-blocked",
+      observations({
+        ...observation,
+        state: "ready",
+        instance,
+        proven_sleep: null,
+        roles: { removed: ["report"], blocked: ["report"] },
+      }),
+      false,
+      true,
+    ],
     ["duplicate-database", observations(observation, observation), false, true],
     [
       "failed-order-without-reason",
@@ -957,6 +1005,24 @@ const cases: Record<keyof typeof nodeSchemas, Case[]> = {
     [
       "pool-above-total",
       { ...sample, pool: { ...sample.pool, data_used_bytes: 126 * 1024 ** 3 } },
+      false,
+      true,
+    ],
+    [
+      "metadata-above-total",
+      {
+        ...sample,
+        pool: { ...sample.pool, metadata_used_bytes: 2 * 1024 ** 3 },
+      },
+      false,
+      true,
+    ],
+    [
+      "pool-read-after-the-sample",
+      {
+        ...sample,
+        pool: { ...sample.pool, observed_at: "2026-10-17T12:00:00.001Z" },
+      },
       false,
       true,
     ],

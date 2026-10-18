@@ -450,7 +450,7 @@ mod tests {
         }
         for row in &rows {
             assert!(
-                crate::node_link::schema_valid("NodeUsageReport", &json!({"rows": [row]})),
+                crate::node_link::contract_valid("NodeUsageReport", &json!({"rows": [row]})),
                 "{row}"
             );
         }
