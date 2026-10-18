@@ -110,6 +110,26 @@ export const ADMISSION_REFUSAL_DETAILS = {
 export const refusalRetryHint = (reason: WakeReason): boolean =>
   reason === "no_headroom";
 
+/**
+ * What the gateway sends with the 57P03 of a refused wake besides its message: the DETAIL of an
+ * admission refusal and, with a retry hint, the HINT `retry after <n> s`. Every other reason
+ * answers the 57P03 alone.
+ */
+export function refusalFields(
+  reason: WakeReason,
+  retryAfterSeconds?: number,
+): { detail?: string; hint?: string } {
+  const detail = (
+    ADMISSION_REFUSAL_DETAILS as Partial<Record<WakeReason, string>>
+  )[reason];
+  return {
+    ...(detail === undefined ? {} : { detail }),
+    ...(refusalRetryHint(reason) && retryAfterSeconds !== undefined
+      ? { hint: `retry after ${retryAfterSeconds} s` }
+      : {}),
+  };
+}
+
 const utf8 = new TextEncoder();
 export const UnixSocketPath = z
   .string()

@@ -18,6 +18,7 @@ import {
   nodeRequestVectors,
   nodeSchemas,
   nodeSchemaVectors,
+  refusalVectors,
 } from "./node-vectors.ts";
 
 const files = {
@@ -84,6 +85,7 @@ const files = {
       ARCHIVE_CLIENT_BOUND_MS: local.ARCHIVE_CLIENT_BOUND_MS,
     },
     gateway_channel: gatewayChannelVectors(),
+    refusals: refusalVectors(),
     archive: archiveVectors(),
   },
 };

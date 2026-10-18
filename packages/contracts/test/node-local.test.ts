@@ -9,6 +9,7 @@ import {
   GatewayLocalActivityReport,
   WAKE_OUTCOMES,
   WAKE_REASONS,
+  refusalFields,
   refusalRetryHint,
   formatArchiveReply,
   formatArchiveRequest,
@@ -174,6 +175,18 @@ describe("the agent's gateway channel", () => {
     ])
       expect(WAKE_REASONS).not.toContain(reason);
     expect(new Set(WAKE_REASONS).size).toBe(WAKE_REASONS.length);
+  });
+
+  it("sends the DETAIL of an admission refusal and the HINT of its retry hint with the 57P03", () => {
+    expect(refusalFields("no_headroom", 5)).toEqual({
+      detail: "node at awake capacity",
+      hint: "retry after 5 s",
+    });
+    expect(refusalFields("no_room")).toEqual({ detail: "storage" });
+    // The other reasons answer the 57P03 alone.
+    for (const reason of WAKE_REASONS)
+      if (!ADMISSION_REFUSALS.some((refusal) => refusal === reason))
+        expect(refusalFields(reason)).toEqual({});
   });
 
   it("gives the retry hint of the 57P03 to exactly the refusal of awake capacity", () => {

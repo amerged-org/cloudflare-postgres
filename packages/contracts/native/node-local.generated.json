@@ -357,6 +357,35 @@
       }
     ]
   },
+  "refusals": [
+    { "reason": "no_room", "detail": "storage" },
+    {
+      "reason": "no_headroom",
+      "retry_after_seconds": 5,
+      "detail": "node at awake capacity",
+      "hint": "retry after 5 s"
+    },
+    { "reason": "deleted" },
+    { "reason": "suspended" },
+    { "reason": "moving" },
+    { "reason": "maintenance" },
+    { "reason": "fenced" },
+    { "reason": "superseded" },
+    { "reason": "unproven" },
+    { "reason": "storage_full" },
+    { "reason": "desired_stale" },
+    { "reason": "wake_in_progress" },
+    { "reason": "identity_mismatch" },
+    { "reason": "control_version" },
+    { "reason": "volume_missing" },
+    { "reason": "uuid_mismatch" },
+    { "reason": "volume_suspended" },
+    { "reason": "volume_open" },
+    { "reason": "holder_busy" },
+    { "reason": "mount_failed" },
+    { "reason": "start_timeout" },
+    { "reason": "release_failed" }
+  ],
   "archive": {
     "requests": [
       {

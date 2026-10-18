@@ -1726,6 +1726,20 @@ export function gatewayChannelVectors() {
   };
 }
 
+/** The DETAIL and HINT of the 57P03 that answers a refused wake, for every reason of a result. */
+export function refusalVectors() {
+  return local.WAKE_REASONS.map((reason) => {
+    const retryAfterSeconds = local.refusalRetryHint(reason) ? 5 : undefined;
+    return {
+      reason,
+      ...(retryAfterSeconds === undefined
+        ? {}
+        : { retry_after_seconds: retryAfterSeconds }),
+      ...local.refusalFields(reason, retryAfterSeconds),
+    };
+  });
+}
+
 /** Lines of the archive socket, without their newline. */
 export function archiveVectors() {
   const requests = [
