@@ -208,7 +208,7 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; host mount namespace (see below); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
-| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until the install writes one); host keys are created at first boot |
+| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until a CA key is written; nothing writes one yet); host keys are created at first boot |
 
 A preset allowlist ([10-pgcf.preset](mkosi.extra/usr/lib/systemd/system-preset/10-pgcf.preset))
 enables exactly these plus networkd, timesyncd, getty and LVM monitoring. Everything else a package
@@ -299,7 +299,9 @@ while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
   100%FREE pgcf`, then `lvchange --errorwhenfull y pgcf/pgcf_thinpool`. On a 33 GiB partition this
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
 - `/var/lib/pgcf/db` is mode 0711 (the agent creates it so, and tmpfiles resets it at every boot): a
-  database reaches its own directory but cannot list the other databases' IDs.
+  database reaches its own directory, but nobody can list this one. The IDs are not hidden: the
+  accounts `pgcf-<id>` are in `/etc/passwd`, `/run/pgcf` is 0755 and the mount table lists every
+  mount.
 - Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
   the data directory `data` inside. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
   `pgcf-gateway`, mode 0750) when it creates a database and again for every database when it
@@ -340,11 +342,12 @@ while its Worker variable `NODE_SHELL_HOSTNAME` is `"true"` (plan 8).
 - **Operator shell.** [10-pgcf.conf](mkosi.extra/etc/ssh/sshd_config.d/10-pgcf.conf) makes sshd take
   one thing: a user certificate for root, signed by the CA in `/etc/ssh/pgcf_user_ca.pub` and
   carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). The image ships no CA key,
-  so no login is possible until the install writes the CA's public key there. There are no
-  passwords, no `authorized_keys`, two tries, a 20 s grace time, two sessions and no forwarding of
-  any kind; the log level is `VERBOSE`, and per-source penalties stay at their default. sshd refuses
-  every public key when `RevokedKeys` names a missing file, so the image ships an empty key
-  revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only; `ssh-keygen -k -u -f` adds to it).
+  so no login is possible until a CA's public key is written there; the installer does not write
+  one yet (plan 11.2). There are no passwords, no `authorized_keys`, two tries, a 20 s grace time,
+  two sessions and no forwarding of any kind; the log level is `VERBOSE`, and per-source penalties
+  stay at their default. sshd refuses every public key when `RevokedKeys` names a missing file, so
+  the image ships an empty key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only;
+  `ssh-keygen -k -u -f` adds to it).
   A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end after
   the key and its certificate.
 - **No ssh socket.** With sshd installed, systemd 257's `systemd-ssh-generator` binds it to the Unix
@@ -424,4 +427,4 @@ The guest reports one line per check on the second serial port:
 | Boot | Checks |
 | --- | --- |
 | First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
-| Second | no failed unit; loopback only; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
+| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |

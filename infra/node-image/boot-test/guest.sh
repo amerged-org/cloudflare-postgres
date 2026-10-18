@@ -151,8 +151,9 @@ sshd_certificate_only() {
 	[ "$result" = 0 ]
 }
 
-# journald syncs every five minutes by default, and a freeze loses what it had not written (the
-# unexplained stall of 2026-10-18 in plan 11.1 left no journal). The image syncs every 15 s.
+# journald syncs every five minutes by default, and a freeze loses what it had not written (after
+# the unexplained stall of 2026-10-18 in plan 11.1 the journal could not be read over the link).
+# The image syncs every 15 s.
 journal_sync_interval() {
 	systemd-analyze cat-config systemd/journald.conf | grep -qx 'SyncIntervalSec=15s'
 }
@@ -288,7 +289,8 @@ sysctl_is() {
 }
 
 # The agent creates /var/lib/pgcf/db 0711 (store.rs) and tmpfiles resets it at every boot: a
-# database's user reaches its own directory but cannot list the other databases' IDs.
+# database's user reaches its own directory but nobody can list this one (the IDs stay visible in
+# /etc/passwd, /run/pgcf and the mount table).
 database_directory_not_listable() {
 	local mode
 	mode=$(stat -c %a /var/lib/pgcf/db) || return 1
