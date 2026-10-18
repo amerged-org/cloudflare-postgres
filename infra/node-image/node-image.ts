@@ -53,9 +53,11 @@ async function sha256File(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
-async function readLock(): Promise<PackageLock> {
+// resolve replaces the package list, so an old one that validateLock now refuses (a pre-release,
+// say) must not stop the run that fixes it.
+async function readLock(options: { resolving?: boolean } = {}): Promise<PackageLock> {
   const lock = JSON.parse(await readFile(lockPath, "utf8")) as PackageLock;
-  validateLock(lock);
+  validateLock(options.resolving ? { ...lock, packages: [] } : lock);
   const keySha = await sha256File(join(here, lock.pgdg.key.path));
   if (keySha !== lock.pgdg.key.sha256) throw new Error("the PGDG key does not match its locked sha256");
   return lock;
@@ -148,7 +150,7 @@ function runBuilder(
 }
 
 async function resolveLock(work: string): Promise<void> {
-  const lock = await readLock();
+  const lock = await readLock({ resolving: true });
   const extraDebs = join(work, "extra-debs");
   const out = join(work, "resolve");
   await downloadAll(lock.extra, extraDebs);

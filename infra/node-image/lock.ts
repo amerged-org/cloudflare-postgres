@@ -51,6 +51,9 @@ const sha256Pattern = /^[0-9a-f]{64}$/;
 const packageNamePattern = /^[a-z0-9][a-z0-9+.-]+$/;
 const versionPattern = /^[A-Za-z0-9.+~:-]+$/;
 const architecturePattern = /^(?:amd64|all)$/;
+// Debian writes a pre-release as "<next>~rc1": it sorts below the release it precedes. apt takes the
+// highest version, so the unpinned PGDG archive once handed the image libpq5 19~rc1.
+const prereleasePattern = /~(?:alpha|beta|rc)\d*/i;
 
 export function debianRepositories(lock: PackageLock): Repository[] {
   const snapshot = lock.debian.snapshot;
@@ -192,6 +195,9 @@ export function snapshotEpoch(snapshot: string): number {
 function checkPackage(entry: LockedPackage, where: string): void {
   if (!packageNamePattern.test(entry.name)) throw new Error(`${where}: invalid name ${entry.name}`);
   if (!versionPattern.test(entry.version)) throw new Error(`${where}: invalid version of ${entry.name}`);
+  if (prereleasePattern.test(entry.version)) {
+    throw new Error(`${where}: ${entry.name} ${entry.version} is a pre-release; pin the release in mkosi.conf`);
+  }
   if (!architecturePattern.test(entry.architecture)) {
     throw new Error(`${where}: invalid architecture of ${entry.name}`);
   }

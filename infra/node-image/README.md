@@ -39,8 +39,11 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
 
 - **resolve** builds once from the snapshot and the PGDG archive with network access, maps every
   installed package to the signed index entry apt verified, and rewrites the `packages` list of the
-  lock. PostgreSQL, pgvector and barman-cli-cloud are pinned to exact versions in `mkosi.conf`, so a
-  new snapshot never moves them silently.
+  lock. PostgreSQL, pgvector, barman-cli-cloud and `libpq5` are pinned to exact versions in
+  `mkosi.conf`, so a new snapshot never moves them silently. `libpq5` needs its own pin: apt takes the
+  highest version, and the PGDG archive also holds the release candidates of the next major version
+  (it once handed the image `19~rc1`). `validateLock` refuses every locked version that contains
+  `~alpha`, `~beta` or `~rc`.
 - **build** downloads every locked `.deb` (size and sha256 checked, three attempts each), serves
   them as the only repository (mkosi `LocalMirror=`) and builds offline. The build fails if the
   installed set differs from the lock in any package or version. It writes `pgcf-node.raw`,

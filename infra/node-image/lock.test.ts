@@ -158,3 +158,20 @@ test("a lock with floating inputs is refused", () => {
     /HTTPS/,
   );
 });
+
+test("the lock pins no pre-release version", () => {
+  const prerelease = /~(alpha|beta|rc)\d*/i;
+  for (const entry of [...lock.packages, ...lock.extra]) {
+    assert.doesNotMatch(entry.version, prerelease, `${entry.name} ${entry.version} is a pre-release`);
+  }
+  const candidate = { ...lock.packages.find((entry) => entry.name === "libpq5")!, version: "19~rc1-1.pgdg13+1" };
+  const withCandidate = (field: "packages" | "extra") => ({
+    ...lock,
+    [field]: [...lock[field].filter((entry) => entry.name !== "libpq5"), candidate],
+  });
+  assert.throws(() => validateLock(withCandidate("packages")), /libpq5.*pre-release/);
+  assert.throws(() => validateLock(withCandidate("extra")), /libpq5.*pre-release/);
+  for (const version of ["2~ALPHA", "2~beta3", "19~RC1-1"]) {
+    assert.throws(() => validateLock({ ...lock, extra: [{ ...candidate, version }] }), /pre-release/);
+  }
+});
