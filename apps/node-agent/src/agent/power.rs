@@ -63,6 +63,23 @@ fn millis(duration: Duration) -> u64 {
         .min(600_000)
 }
 
+/// The log line of a wake (plan 9.9): its outcome and reason, the milliseconds of every step and
+/// of the whole wake. The observation report carries it to Cloudflare, where a cold wake's time
+/// is broken down by node.
+fn wake_line(result: &WakeResult, total_ms: u64) -> serde_json::Value {
+    let mut line = json!({
+        "event": "wake", "database_id": result.database, "outcome": result.outcome,
+        "total_ms": total_ms,
+    });
+    if let Some(reason) = &result.reason {
+        line["reason"] = reason.clone().into();
+    }
+    for (step, ms) in &result.steps_ms {
+        line[format!("step_{step}")] = (*ms).into();
+    }
+    line
+}
+
 impl<M: Machine> Core<M> {
     /// Changes the database's state file, and the view's copy of it: on disk before it returns.
     pub(crate) fn save_state(
@@ -289,7 +306,7 @@ impl<M: Machine> Core<M> {
             event["reason"] = reason.into();
         }
         self.event(event);
-        let _ = begun;
+        crate::timing::emit_event(wake_line(&result, millis(begun.elapsed())));
         result
     }
 
@@ -1083,6 +1100,46 @@ mod tests {
     }
     fn report(observation: Value) -> Value {
         json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
+    }
+
+    #[test]
+    fn a_wake_is_logged_once_with_its_outcome_every_step_and_its_total() {
+        let mut result = WakeResult {
+            database: "abcdefghijklmnopqrst".into(),
+            operation: format!("op_{}", "w".repeat(20)),
+            generation: 5,
+            outcome: WakeOutcome::Started,
+            reason: None,
+            retry_after_seconds: None,
+            steps_ms: [("admission", 3), ("queue_wait", 120), ("pg_control", 4)]
+                .into_iter()
+                .chain([("mount", 31), ("start", 61), ("release", 0)])
+                .map(|(step, ms)| (step.to_string(), ms))
+                .collect(),
+        };
+        let line = wake_line(&result, 230);
+        assert_eq!(
+            line,
+            json!({
+                "event": "wake", "database_id": "abcdefghijklmnopqrst", "outcome": "started",
+                "total_ms": 230, "step_admission": 3, "step_queue_wait": 120,
+                "step_pg_control": 4, "step_mount": 31, "step_start": 61, "step_release": 0,
+            })
+        );
+        // What a node sends of it is what Cloudflare accepts.
+        let at = "2026-10-18T10:11:12.345Z";
+        let event = crate::events::sanitize(&line, at).unwrap();
+        assert_eq!(event["fields"]["step_queue_wait"], 120);
+        assert!(contract_valid(
+            "NodeObservationReport",
+            &json!({"observed_at": at, "databases": [], "orders": [], "events": [event]})
+        ));
+        // A refusal names its reason.
+        result.outcome = WakeOutcome::Refused;
+        result.reason = Some("no_headroom".into());
+        let refused = wake_line(&result, 9);
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(refused["reason"], "no_headroom");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

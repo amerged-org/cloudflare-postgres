@@ -27,7 +27,8 @@ use super::{
     upload_log::UploadLog,
 };
 use crate::credentials::Credentials;
-use std::future::Future;
+use serde_json::json;
+use std::{future::Future, time::Instant};
 
 /// What a step of the host did not do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl Restorer<'_> {
         let settings =
             recovery::settings(self.fetch_command, order.target_time).ok_or("build_failed")?;
 
+        let mut lap = Instant::now();
         // 1. The source's backup, DONE and with the size of its WAL segments.
         let listing = self
             .barman(
@@ -120,12 +122,14 @@ impl Restorer<'_> {
             .find(|backup| backup.backup_id == order.backup_id && backup.status == "DONE")
             .ok_or("archive_unusable")?;
         let segment_bytes = backup.segment_bytes.ok_or("archive_unusable")?;
+        phase(order, "listed", &mut lap);
 
         // 2. Its files, into the new database's data directory.
         let restore = Job::restore(order.source, order.backup_id, &database.data_directory());
         self.barman(order, order.source, restore, "restore")
             .await
             .map_err(|_| "archive_unusable")?;
+        phase(order, "base_fetched", &mut lap);
 
         // 3. The recovery settings, and the database known to the archive socket as recovering.
         recovery::prepare(&database.data_directory(), &settings, order.uid, order.gid)
@@ -147,7 +151,9 @@ impl Restorer<'_> {
 
         // 4. Recovery to the end of the archive or the target, and the check of who promoted.
         host.start().await.map_err(|_| "start_failed")?;
+        phase(order, "recovery_started", &mut lap);
         let restored = host.promoted().await.map_err(|_| "no_recovery_point")?;
+        phase(order, "promoted", &mut lap);
         let end = order
             .end
             .map(|end| (end.system_identifier.as_str(), end.timeline));
@@ -171,14 +177,16 @@ impl Restorer<'_> {
             .await
             .map_err(|_| "build_failed")?;
         // Only a DONE backup of the new timeline counts.
-        facts::parse_backup_list(&listing.stdout)
+        let newest = facts::parse_backup_list(&listing.stdout)
             .ok()
             .and_then(|backups| {
                 facts::newest_done(&backups)
                     .filter(|backup| backup.timeline == restored.timeline)
                     .cloned()
             })
-            .ok_or("build_failed")
+            .ok_or("build_failed")?;
+        phase(order, "first_backup", &mut lap);
+        Ok(newest)
     }
 
     /// Runs a barman job of the new database against `store`, to its end; `Failed` for any reason
@@ -211,6 +219,18 @@ impl Restorer<'_> {
         }
         Ok(outcome)
     }
+}
+
+/// Logs how long the phase that ends now took (plan 9.9: where the time of a restore goes), and
+/// starts the clock of the next. `recovery_started` ends when PostgreSQL accepts connections
+/// while it recovers, and `promoted` when the recovery reached the end of the archive or the
+/// target and the roles and the checkpoint of the promoted database are done.
+fn phase(order: &Order<'_>, name: &str, since: &mut Instant) {
+    crate::timing::emit_event(json!({
+        "event": "restore_phase", "database_id": order.database.id, "phase": name,
+        "ms": u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }));
+    *since = Instant::now();
 }
 
 #[cfg(test)]
