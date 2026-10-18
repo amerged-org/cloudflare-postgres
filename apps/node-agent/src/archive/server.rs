@@ -99,6 +99,16 @@ impl Table {
     fn get(&self, uid: u32) -> Option<Arc<Entry>> {
         self.entries.read().expect("table lock").get(&uid).cloned()
     }
+    /// Whether `uid` archives into `store` with `upload_log`, out of recovery: registered as that
+    /// already, which a registration again would only start anew.
+    pub fn archives(&self, uid: u32, store: &Store, upload_log: &UploadLog) -> bool {
+        self.get(uid).is_some_and(|entry| {
+            let registration = &entry.registration;
+            registration.recovery.is_none()
+                && registration.store == *store
+                && registration.upload_log.path() == upload_log.path()
+        })
+    }
     /// Since when the archive calls of `database` fail, if they do.
     pub fn failing_since_ms(&self, database: &str) -> Option<i64> {
         self.entries

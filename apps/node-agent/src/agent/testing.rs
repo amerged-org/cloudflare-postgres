@@ -129,6 +129,7 @@ pub(crate) fn timing() -> Timing {
         watch: Duration::from_millis(100),
         recovery_retry: Duration::from_millis(100),
         recovery_retry_maximum: Duration::from_millis(400),
+        settle: Duration::from_secs(10),
     }
 }
 
@@ -397,8 +398,18 @@ impl Drop for FakeGateway {
     }
 }
 impl FakeGateway {
+    /// Connects as soon as the agent serves `socket`, as the gateway retries while it does not.
     pub(crate) async fn connect(socket: &Path) -> Self {
-        let stream = UnixStream::connect(socket).await.unwrap();
+        let started = std::time::Instant::now();
+        let stream = loop {
+            match UnixStream::connect(socket).await {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    assert!(started.elapsed() < Duration::from_secs(60), "{error}");
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
         let (read, write) = stream.into_split();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sessions = Arc::new(Mutex::new(Sessions {

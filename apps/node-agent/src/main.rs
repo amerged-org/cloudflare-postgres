@@ -96,7 +96,7 @@ mod linux {
         emit_event(json!({"event": "agent_started"}));
         stop.await;
         // The databases run on: they are units of their own.
-        drop(service);
+        service.stop();
         Ok(())
     }
 

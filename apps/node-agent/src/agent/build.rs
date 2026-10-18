@@ -51,6 +51,31 @@ macro_rules! build_failed {
 
 /// The tasks one database's unit may have (`TasksMax=` of the unit template).
 const TASKS_MAX: u64 = 64;
+/// How old the newest base backup of a database that runs may grow (plan 7.6).
+const BACKUP_MAX_AGE_MS: i64 = 24 * 3_600_000;
+/// How long a base backup that failed waits before it is tried again.
+pub(crate) const BACKUP_RETRY_MS: i64 = 600_000;
+
+/// Whether a base backup is due (plan 7.6): there is none of the timeline the database runs on
+/// (`None`: not asked), or the newest is older than a day. It is asked only of a database that
+/// runs, which has written WAL since: its sleep proof writes a checkpoint at least.
+pub(crate) fn backup_due(
+    backup: Option<&state::Backup>,
+    timeline: Option<u32>,
+    now_ms: i64,
+) -> bool {
+    let Some(backup) = backup else {
+        return true;
+    };
+    let completed = time::OffsetDateTime::parse(
+        &backup.completed_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()
+    .and_then(|at| i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).ok());
+    timeline.is_some_and(|timeline| timeline != backup.timeline)
+        || completed.is_none_or(|completed| now_ms - completed >= BACKUP_MAX_AGE_MS)
+}
 
 /// What the entry sets a database's unit and volume to.
 fn resources(entry: &Entry) -> state::Resources {
@@ -266,6 +291,47 @@ impl<M: Machine> Core<M> {
                 })
             })
             .ok_or_else(|| build_failed!())
+    }
+
+    /// The base backup that is due of a database that runs (plan 7.6): before an idle sleep, and
+    /// daily for an always-warm database. A database is never woken for one. `Ok(false)` when
+    /// none is due, or one failed a short while ago.
+    pub(crate) async fn backup_if_due(&self, db: &Db, entry: &Entry) -> Result<bool, &'static str> {
+        let now = super::now_ms();
+        let (held, failed) = {
+            let view = db.view();
+            let held = view.state.as_ref().and_then(|state| state.backup.clone());
+            (held, view.backup_failed_ms)
+        };
+        if failed.is_some_and(|failed| now - failed < BACKUP_RETRY_MS) {
+            return Ok(false);
+        }
+        let socket = self.layout().socket_directory(&db.id);
+        let session = postgres::agent(&socket)
+            .await
+            .map_err(|_| "backup_failed")?;
+        let identity = sleep::system(&session).await.ok_or("backup_failed")?;
+        drop(session);
+        let timeline = u32::try_from(identity.timeline).map_err(|_| "backup_failed")?;
+        if !backup_due(held.as_ref(), Some(timeline), now) {
+            return Ok(false);
+        }
+        let taken = async {
+            let account = self.machine.account(&db.id).ok_or("backup_failed")?;
+            let store = self
+                .store(&entry.archive_path, Access::ReadWrite)
+                .ok_or("archive_unusable")?;
+            let backup = self
+                .take_backup(&self.job_database(&db.id, &account.name), &store, timeline)
+                .await?;
+            self.save_state(db, |state| state.backup = Some(backup))
+                .map_err(|_| "backup_failed")
+        }
+        .await;
+        self.set(db, |view| {
+            view.backup_failed_ms = taken.is_err().then_some(now);
+        });
+        taken.map(|()| true)
     }
 
     /// Builds the storage generation `entry.origin` names. Ready follows only the first base
@@ -662,8 +728,18 @@ impl<M: Machine> Host for Rebuild<M> {
                 )
                 .await;
         }
-        let _ = std::fs::remove_dir_all(core.layout().socket_directory(&self.entry.id));
-        let _ = core.machine.remove_account(&self.entry.id).await;
+        // A move on the node of its source leaves the source's volume, whose files the user owns:
+        // the user, and its uid, go only with the database's last volume.
+        let others = core.machine.inventory().await.map(|inventory| {
+            inventory
+                .volumes
+                .iter()
+                .any(|volume| volume.id.database() == self.entry.id)
+        });
+        if matches!(others, Ok(false)) {
+            let _ = std::fs::remove_dir_all(core.layout().socket_directory(&self.entry.id));
+            let _ = core.machine.remove_account(&self.entry.id).await;
+        }
     }
 }
 
@@ -677,6 +753,33 @@ mod tests {
 
     fn report(observation: Value) -> Value {
         json!({"observed_at": "2026-10-18T10:11:12.345Z", "databases": [observation], "orders": []})
+    }
+
+    #[test]
+    fn a_base_backup_is_due_without_one_of_the_timeline_or_after_a_day() {
+        // 2026-10-18T10:00:00Z.
+        let now = 1_792_317_600_000;
+        let backup = |completed_at: &str| state::Backup {
+            backup_id: "20261018T080000".into(),
+            timeline: 2,
+            completed_at: completed_at.into(),
+        };
+        let today = backup("2026-10-18T08:00:00.000Z");
+        assert!(backup_due(None, Some(2), now));
+        assert!(!backup_due(Some(&today), Some(2), now));
+        assert!(!backup_due(Some(&today), None, now));
+        assert!(backup_due(Some(&today), Some(3), now));
+        assert!(!backup_due(
+            Some(&backup("2026-10-17T10:00:00.001Z")),
+            Some(2),
+            now
+        ));
+        assert!(backup_due(
+            Some(&backup("2026-10-17T10:00:00.000Z")),
+            Some(2),
+            now
+        ));
+        assert!(backup_due(Some(&backup("yesterday")), Some(2), now));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

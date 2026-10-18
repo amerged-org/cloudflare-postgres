@@ -57,6 +57,9 @@ pub struct Timing {
     /// The wait before the first retry of a recovery, and the longest wait.
     pub recovery_retry: Duration,
     pub recovery_retry_maximum: Duration,
+    /// How long a starting agent waits for its decisions on the databases of the first page before
+    /// it serves the gateway, whose sessions end on a database the table does not show running.
+    pub settle: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -67,6 +70,7 @@ impl Default for Timing {
             watch: Duration::from_secs(1),
             recovery_retry: Duration::from_secs(1),
             recovery_retry_maximum: Duration::from_secs(30),
+            settle: Duration::from_secs(10),
         }
     }
 }
@@ -137,6 +141,8 @@ pub(crate) struct View {
     pub recovering: bool,
     /// Since when the unit runs, for the usage meter.
     pub awake_since_ms: Option<i64>,
+    /// When the last base backup that was due failed (`backup_if_due`).
+    pub backup_failed_ms: Option<i64>,
     /// The node has decided on this database in this run.
     pub adopted: bool,
     /// The reconciliation of the entry: one runs, and runs again when the entry changed meanwhile.
@@ -165,6 +171,7 @@ impl View {
             roles_blocked: Vec::new(),
             recovering: false,
             awake_since_ms: None,
+            backup_failed_ms: None,
             adopted: false,
             reconcile: Reconcile::Idle,
         }
@@ -204,8 +211,8 @@ pub struct Core<M: Machine> {
     pub(crate) policy: Arc<RwLock<Policy>>,
     /// A maintenance order is open: new wakes are held with 57P03 (plan 9.3).
     pub(crate) maintenance: AtomicBool,
-    /// The orders that ended and are still on the page.
-    reported: Mutex<std::collections::HashSet<String>>,
+    /// The orders the node took up: each runs once, however often the page lists it.
+    taken: Mutex<std::collections::HashSet<String>>,
     /// The R2 endpoint each archive path was delivered with.
     endpoints: Mutex<HashMap<String, String>>,
     dbs: Mutex<HashMap<String, Arc<Db>>>,
@@ -260,7 +267,7 @@ impl<M: Machine> Core<M> {
             timing: parts.timing,
             policy,
             maintenance: AtomicBool::new(false),
-            reported: Mutex::new(std::collections::HashSet::new()),
+            taken: Mutex::new(std::collections::HashSet::new()),
             endpoints: Mutex::new(HashMap::new()),
             dbs: Mutex::new(HashMap::new()),
             reports: Mutex::new(report::Reports::default()),
@@ -306,6 +313,15 @@ impl<M: Machine> Core<M> {
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .cloned()
+    }
+    /// Waits until the node has decided on every database it knows, for at most `bound`.
+    pub async fn settled(&self, bound: Duration) {
+        let deadline = tokio::time::Instant::now() + bound;
+        while !self.all().iter().all(|db| db.view().adopted)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     pub(crate) fn all(&self) -> Vec<Arc<Db>> {
         let mut dbs: Vec<_> = self

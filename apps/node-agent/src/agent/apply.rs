@@ -163,16 +163,18 @@ impl<M: Machine> Core<M> {
                 }
             }
         }
-        // A result that is reported ends the order on the page; one the node already reported is
-        // not run again while the page still lists it.
-        let reported = |operation: &str| {
-            self.reported
+        // An order runs once: the page lists it until the API has its result, and the pulls in
+        // between do not run it again.
+        let take_up = |operation: &str| {
+            self.taken
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains(operation)
+                .insert(operation.to_string())
         };
         for order in &page.orders {
-            if reported(order.operation()) {
+            if matches!(order, Order::Fence { .. } | Order::Superseded { .. })
+                || !take_up(order.operation())
+            {
                 continue;
             }
             let core = self.clone();
@@ -251,16 +253,20 @@ impl<M: Machine> Core<M> {
                 }
             }
         }
-        let volume = Self::volume_id(&entry);
-        let has_volume = match &volume {
-            Some(volume) => self.machine.has_volume(volume).await.unwrap_or(false),
+        // What cannot be read is not known: nothing is decided on a guess, and the next pull
+        // decides. A volume taken for missing would fail the database; a unit taken for stopped
+        // would put a database that runs through recovery.
+        let has_volume = match Self::volume_id(&entry) {
+            Some(volume) => match self.machine.has_volume(&volume).await {
+                Ok(found) => found,
+                Err(_) => return,
+            },
             None => false,
         };
-        let unit_awake = self
-            .machine
-            .unit(&db.id)
-            .await
-            .is_ok_and(|unit| unit.active.awake());
+        let Ok(unit) = self.machine.unit(&db.id).await else {
+            return;
+        };
+        let unit_awake = unit.active.awake();
         let step = {
             let view = db.view();
             plan(&Facts {
@@ -284,7 +290,7 @@ impl<M: Machine> Core<M> {
             Step::Suspend => {
                 self.sleep_locked(db, Why::Order).await;
             }
-            Step::AdoptRunning => self.adopt_running(db).await,
+            Step::AdoptRunning => self.adopt_running(db, &entry).await,
             Step::AdoptAsleep => self.adopt_asleep(db).await,
             Step::Fail(error) => self.set(db, |view| {
                 view.phase = Phase::Error;
@@ -293,13 +299,18 @@ impl<M: Machine> Core<M> {
             Step::Retire => self.retire(db, &entry).await,
         }
         self.set(db, |view| view.adopted = true);
+        if matches!(db.phase(), Phase::Ready | Phase::Asleep) {
+            self.resize(db, &entry).await;
+        }
         if db.phase() == Phase::Ready {
             self.sync(db, &entry).await;
         }
     }
 
-    /// The unit runs, as the agent found it at its start: it is released to the gateway as ready.
-    async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>) {
+    /// The unit runs, as the agent found it at its start: it is released to the gateway as ready,
+    /// and its archiver reaches the archive socket again.
+    async fn adopt_running(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+        self.ensure_archive(db, entry);
         match self.machine.wait_started(&db.id).await {
             Ok(started) => match writer_of(&started) {
                 Some(writer) => self.set(db, |view| {
@@ -337,9 +348,9 @@ impl<M: Machine> Core<M> {
     }
 
     /// The database sizes of the entry are the unit's limits and the volume's: set again when
-    /// they changed, and the admission knows it. A change of the settings is written at the next
-    /// start; one of the roles when the database runs.
-    pub(crate) async fn sync(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+    /// they changed, running or asleep, and the admission knows it. A change of the settings is
+    /// written at the next start.
+    pub(crate) async fn resize(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
         let current = Resources {
             memory_mib: entry.memory_mib,
             cpu_millicores: entry.cpu_millicores,
@@ -371,6 +382,12 @@ impl<M: Machine> Core<M> {
             self.admission.resized(&db.id, entry.memory_mib);
             self.set(db, |_| {});
         }
+    }
+
+    /// What the entry asks of a database that runs: the roles, and an archiver that reaches R2
+    /// once the credential has arrived after the start.
+    pub(crate) async fn sync(self: &Arc<Self>, db: &Arc<Db>, entry: &Entry) {
+        self.ensure_archive(db, entry);
         self.admission
             .set_always_warm(&db.id, entry.sleep_after_seconds.is_none());
         if let Err(reason) = self.refresh_roles(db, entry).await {
@@ -485,7 +502,7 @@ impl<M: Machine> Core<M> {
                 self.retire(&db, &entry).await;
             }
         }
-        self.finished(operation, Ok(()));
+        self.report_order(operation, Ok(()));
     }
 
     /// `superseded`: this storage generation and every older one is never started or archived
@@ -546,17 +563,7 @@ impl<M: Machine> Core<M> {
                 }
             }
         }
-        self.finished(operation, outcome);
-    }
-
-    /// An order ended: its result is reported, and the node does not run it again while the page
-    /// still lists it.
-    fn finished(&self, operation: &str, result: Result<(), &str>) {
-        self.report_order(operation, result);
-        self.reported
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(operation.to_string());
+        self.report_order(operation, outcome);
     }
 
     /// `wake` (resume): the database starts through admission as a connection's wake would.
@@ -583,9 +590,9 @@ impl<M: Machine> Core<M> {
         };
         let result = self.wake(&request).await;
         match (result.outcome, result.reason.as_deref()) {
-            (Outcome::Started, _) => self.finished(operation, Ok(())),
-            (_, Some(reason)) => self.finished(operation, Err(reason)),
-            _ => self.finished(operation, Err("release_failed")),
+            (Outcome::Started, _) => self.report_order(operation, Ok(())),
+            (_, Some(reason)) => self.report_order(operation, Err(reason)),
+            _ => self.report_order(operation, Err("release_failed")),
         }
     }
 
@@ -622,7 +629,7 @@ impl<M: Machine> Core<M> {
         if ended.is_err() {
             self.set(&db, |view| view.moving = None);
         }
-        self.finished(operation, ended);
+        self.report_order(operation, ended);
     }
 
     /// `maintenance` (plan 9.3): new wakes are held, and every database that runs sleeps with the
@@ -637,7 +644,7 @@ impl<M: Machine> Core<M> {
                 failed = Some(refusal.observation());
             }
         }
-        self.finished(operation, failed.map_or(Ok(()), Err));
+        self.report_order(operation, failed.map_or(Ok(()), Err));
     }
 }
 
@@ -972,6 +979,36 @@ mod tests {
             .await
             .unwrap()
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_resized_while_it_sleeps_wakes_within_its_new_limits() {
+        let Some(rig) = Rig::new("resize-asleep").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+
+        // The page resizes the sleeping database: its unit and its volume take the new size
+        // before anything starts it, so that it never runs its new settings in its old limits.
+        next(&mut db, 6);
+        db["resources"] = json!({"memory_mib": 512, "cpu_millicores": 500, "storage_gib": 2});
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(30, "the limits of the new size", || {
+            rig.machine
+                .limits(&id)
+                .is_some_and(|limits| limits.memory_mib == 512 && limits.cpu_millicores == 500)
+        })
+        .await;
+        assert_eq!(rig.machine.volumes()[0].1, 2 << 30);
+        assert_eq!(handle.phase(), Phase::Asleep);
+        let result = rig.core.wake(&Rig::ticket(&rig.entry_for(&db))).await;
+        assert_eq!(result.outcome, Outcome::Started, "{:?}", result.reason);
+        assert_eq!(rig.machine.limits(&id).unwrap().memory_mib, 512);
+    }
+
     /// The next generation of a page entry: the same database, moved on by the API.
     fn next(db: &mut Value, generation: u64) {
         db.as_object_mut().unwrap().remove("origin");
@@ -1339,6 +1376,112 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_that_cannot_read_lvm_or_systemd_decides_nothing_until_it_can() {
+        let Some(rig) = Rig::new("unreadable").await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        db.as_object_mut().unwrap().remove("origin");
+        let page = Rig::page(vec![db.clone()], vec![]);
+        let pid = rig.machine.unit(&id).await.unwrap().main_pid;
+
+        let mut rig = rig;
+        for unreadable in ["volumes", "units"] {
+            // The agent restarts and cannot read what it would decide from: what it does not
+            // know is neither a missing volume nor a stopped unit.
+            rig = rig.restart().await;
+            rig.deliver(&path, "read_write");
+            match unreadable {
+                "volumes" => rig.machine.set_volumes_unreadable(true),
+                _ => rig.machine.set_units_unreadable(true),
+            }
+            rig.core.apply(&page).await;
+            let handle = rig.core.db(&id);
+            eventually(10, "the decision to be tried", || {
+                handle.view().reconcile == super::super::Reconcile::Idle
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                !matches!(handle.phase(), Phase::Error | Phase::Unproven),
+                "{unreadable}: {:?} {:?}",
+                handle.phase(),
+                handle.view().error
+            );
+            assert!(rig.machine.running(&id));
+            // The next pull reads them, and finds the database running as it was.
+            rig.machine.set_volumes_unreadable(false);
+            rig.machine.set_units_unreadable(false);
+            rig.core.apply(&page).await;
+            eventually(30, "the running database to be found", || {
+                handle.phase() == Phase::Ready
+            })
+            .await;
+            assert_eq!(rig.machine.unit(&id).await.unwrap().main_pid, pid);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_archives_what_it_found_running_and_what_it_wakes() {
+        // One database, archived through the agent's own socket as on a node.
+        let timing = crate::agent::Timing {
+            archive_wait: std::time::Duration::from_secs(5),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("restart-archive", timing).await else {
+            return;
+        };
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        db.as_object_mut().unwrap().remove("origin");
+
+        // The agent restarts while the database runs: what it writes reaches the archive, and it
+        // sleeps with its proof.
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the running unit to be found", || {
+            handle.phase() == Phase::Ready
+        })
+        .await;
+        let data = tenant(&rig, &id).await;
+        data.batch("CREATE TABLE t AS SELECT generate_series(1, 100) AS a")
+            .await
+            .unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+
+        // The agent restarts while it sleeps: the wake's writes reach the archive too.
+        let rig = rig.restart().await;
+        rig.deliver(&path, "read_write");
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        let handle = rig.core.db(&id);
+        eventually(30, "the sleeping database to be found", || {
+            let view = handle.view();
+            view.phase == Phase::Asleep && view.adopted
+        })
+        .await;
+        let woken = rig.core.wake(&Rig::ticket(&rig.entry_for(&db))).await;
+        assert_eq!(woken.outcome, Outcome::Started, "{:?}", woken.reason);
+        let data = tenant(&rig, &id).await;
+        data.batch("INSERT INTO t SELECT generate_series(101, 200)")
+            .await
+            .unwrap();
+        drop(data);
+        assert_eq!(rig.core.sleep(&handle, Why::Idle).await, Slept::Proven);
+    }
+
     /// A database that exists, with a table of 4000 rows, asleep with its proof.
     async fn source(rig: &Rig) -> (Value, String, crate::state::DatabaseState) {
         let mut db = rig.entry_json();
@@ -1405,6 +1548,97 @@ mod tests {
                 .any(|e| e["type"] == "admission" && e["start"] == "restore")
         );
         assert_eq!(rig.observation(&id)["state"], "ready");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_order_that_runs_is_not_run_again_by_the_pulls_that_still_list_it() {
+        use pgcf_native_protocol::agent::{ControlAction, ToGateway};
+        let timing = crate::agent::Timing {
+            archive_wait: std::time::Duration::from_secs(2),
+            ..crate::agent::testing::timing()
+        };
+        let Some(rig) = Rig::with_timing("order-once", timing).await else {
+            return;
+        };
+        let gateway = rig.connect_gateway().await;
+        let mut db = rig.entry_json();
+        let id = id_of(&db);
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "ready", || handle.phase() == Phase::Ready).await;
+        db.as_object_mut().unwrap().remove("origin");
+
+        // R2 fails: the source's sleep waits for its archive, and two pulls list the move
+        // meanwhile.
+        rig.fixture.set("fail", "");
+        let operation = "op_vvvvvvvvvvvvvvvvvvvv";
+        let page = Rig::page(
+            vec![db.clone()],
+            vec![Order::Move {
+                operation: operation.into(),
+                database: id.clone(),
+                storage_generation: 1,
+            }],
+        );
+        rig.core.apply(&page).await;
+        rig.core.apply(&page).await;
+        eventually(30, "the move to end", || {
+            rig.core.pending_order(operation).is_some()
+        })
+        .await;
+        assert_eq!(
+            rig.core.pending_order(operation).unwrap()["reason"],
+            "power_archive"
+        );
+        // The move ran once: one sleep began, and its result stands.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let begun = gateway
+            .received()
+            .iter()
+            .filter(|message| {
+                matches!(message, ToGateway::Control { action: ControlAction::Begin, database, .. } if database == &id)
+            })
+            .count();
+        assert_eq!(begun, 1);
+        assert_eq!(
+            rig.core.pending_order(operation).unwrap()["reason"],
+            "power_archive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_move_that_fails_on_the_sources_node_keeps_the_sources_user_and_volume() {
+        let Some(rig) = Rig::new("move-fail").await else {
+            return;
+        };
+        let (mut db, id, source_state) = source(&rig).await;
+        let old_path = db["archive"]["path"].as_str().unwrap().to_string();
+        rig.deliver(&old_path, "read_only");
+        let new_path = format!("s3://pgcf-eu/eu-dev/{id}/g2-op_hhhhhhhhhhhhhhhhhhhh");
+        rig.deliver(&new_path, "read_write");
+
+        // The move names a backup the source's archive does not hold: the target is abandoned.
+        db["storage_generation"] = json!(2);
+        db["generation"] = json!(7);
+        db["operation"] = json!("op_hhhhhhhhhhhhhhhhhhhh");
+        db["archive"]["path"] = json!(new_path);
+        db["origin"] = json!({"kind": "move", "source": {
+            "database_id": id, "path": old_path, "backup_id": "20200101T000000",
+            "credential": {"id": "crd_rrrrrrrrrrrrrrrrrrrr", "expires_at": "2099-01-01T00:00:00.000Z"},
+            "end": source_state.record.clone().unwrap()}});
+        let handle = rig.core.db(&id);
+        rig.core.apply(&Rig::page(vec![db.clone()], vec![])).await;
+        eventually(60, "the move to fail", || handle.phase() == Phase::Error).await;
+        assert_eq!(handle.view().error, Some("archive_unusable"));
+        // The source's volume stays, and so does the user whose uid owns its files: a uid given
+        // back would pass them to the next database that is given it.
+        assert!(
+            rig.machine
+                .volumes()
+                .iter()
+                .any(|(volume, _)| volume.generation() == 1)
+        );
+        assert!(rig.machine.has_account(&id), "{:?}", rig.machine.calls());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

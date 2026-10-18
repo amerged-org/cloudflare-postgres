@@ -112,7 +112,7 @@ impl<M: Machine> Service<M> {
     /// Starts the agent on a node: reads the first desired page, builds the core from the node's
     /// units and the page's policy, serves the archive socket and the gateway's channel, does
     /// what a boot does, and starts the loops. Returns once the node is up; the loops run until
-    /// the service is dropped.
+    /// `stop`.
     pub async fn start(
         machine: Arc<M>,
         link: Link,
@@ -179,17 +179,9 @@ impl<M: Machine> Service<M> {
         let listener = bind_archive(&layout.archive_socket())?;
         let channel = bind_gateway(&layout.gateway_socket(), 0o600, config.gateway)?;
         let (wake_sender, wakes) = mpsc::unbounded_channel();
-        {
-            let mut tasks = service.tasks.lock().unwrap_or_else(PoisonError::into_inner);
-            tasks.spawn(async move {
-                archive.serve(listener).await;
-            });
-            let feed = gateway.clone();
-            let owner = config.gateway.map(|(uid, _)| uid);
-            tasks.spawn(async move {
-                feed.serve(channel, wake_sender, owner).await;
-            });
-        }
+        service.spawn(async move {
+            archive.serve(listener).await;
+        });
         // Starts that were in flight when the agent began end with their units' answers.
         for permit in resumed {
             let (machine, database) = (machine.clone(), permit.database().to_string());
@@ -203,6 +195,14 @@ impl<M: Machine> Service<M> {
 
         service.boot(&page).await;
         service.pull_page(page).await;
+        // The gateway is served once the node has found what runs: its first table is then what
+        // runs, and the sessions it kept across the agent's restart go on.
+        core.settled(config.timing.settle).await;
+        let feed = gateway.clone();
+        let owner = config.gateway.map(|(uid, _)| uid);
+        service.spawn(async move {
+            feed.serve(channel, wake_sender, owner).await;
+        });
 
         let s = service.clone();
         service.spawn(async move { s.follow(&mut events).await });
@@ -223,12 +223,23 @@ impl<M: Machine> Service<M> {
         let s = service.clone();
         service.spawn(async move { s.watches().await });
         let s = service.clone();
+        service.spawn(async move { s.idle().await });
+        let s = service.clone();
         service.spawn(async move { s.early_sleeps(early).await });
         Ok(service)
     }
 
     pub fn core(&self) -> &Arc<Core<M>> {
         &self.core
+    }
+
+    /// Ends the loops and closes the agent's sockets. The databases run on: they are units of
+    /// their own.
+    pub fn stop(&self) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .abort_all();
     }
 
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -554,16 +565,22 @@ impl<M: Machine> Service<M> {
         }
     }
 
-    /// The units that ended on their own, and the databases nobody uses.
+    /// The units that ended on their own. A loop of its own: an idle check that waits for the
+    /// gateway, or a sleep that waits for the archive, never holds it up.
     async fn watches(&self) {
-        let (watch, idle) = (self.core.timing.watch, self.core.timing.idle_poll);
-        let mut watching = tokio::time::interval(watch);
-        let mut idling = tokio::time::interval(idle);
+        let mut tick = tokio::time::interval(self.core.timing.watch);
         loop {
-            tokio::select! {
-                _ = watching.tick() => self.core.watch_pass().await,
-                _ = idling.tick() => self.core.idle_pass().await,
-            }
+            tick.tick().await;
+            self.core.watch_pass().await;
+        }
+    }
+
+    /// The databases nobody uses.
+    async fn idle(&self) {
+        let mut tick = tokio::time::interval(self.core.timing.idle_poll);
+        loop {
+            tick.tick().await;
+            self.core.idle_pass().await;
         }
     }
 
@@ -759,5 +776,169 @@ mod tests {
         )
         .await;
         drop(service);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_agent_tells_the_gateway_what_runs_before_anything_else() {
+        let Some((machine, _fixture, _root)) =
+            site("restart-gateway", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let link = || async {
+            Link::start(
+                LinkConfig {
+                    paths: crate::link::Paths::new(&base),
+                    image_version: "25".into(),
+                    agent_version: "0.1.0".into(),
+                    release_id: None,
+                    timing: LinkTiming {
+                        interval: Duration::from_millis(300),
+                        ..LinkTiming::default()
+                    },
+                },
+                Transport::new(cloud.roots()).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let config = || ServiceConfig {
+            intervals: quick(),
+            timing: timing(),
+            gateway: None,
+        };
+        let db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let (first, events) = link().await;
+        let service = Service::start(machine.clone(), first, events, config())
+            .await
+            .unwrap();
+        eventually(90, "the database to be ready", || {
+            observed(&cloud, &id, "ready")
+        })
+        .await;
+        let writer = service.core().find(&id).unwrap().view().writer.clone();
+        assert!(writer.is_some());
+
+        // The agent stops and starts again; its database runs on, and so do the gateway's
+        // sessions: the gateway, which connects again as soon as it can, is never told that the
+        // database sleeps or is gone, which would end them.
+        service.stop();
+        drop(service);
+        assert!(machine.running(&id));
+        let (second, events) = link().await;
+        let starting = tokio::spawn(Service::start(machine.clone(), second, events, config()));
+        let gateway = FakeGateway::connect(&machine.layout().gateway_socket()).await;
+        let service = starting.await.unwrap().unwrap();
+        eventually(30, "the gateway to have the table", || {
+            !gateway.received().is_empty()
+        })
+        .await;
+        let received = gateway.received();
+        let ToGateway::Table { databases } = &received[0] else {
+            panic!("the first message is the table: {received:?}");
+        };
+        let entry = databases.iter().find(|entry| entry.database == id);
+        assert_eq!(
+            entry.map(|entry| (entry.mode, entry.writer.clone())),
+            Some((Mode::Running, writer)),
+            "{received:?}"
+        );
+        assert!(
+            !received.iter().any(|message| matches!(
+                message,
+                ToGateway::Database { database } if database.database == id && database.mode != Mode::Running
+            ) || matches!(message, ToGateway::Removed { database } if database == &id)),
+            "{received:?}"
+        );
+        service.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gateway_that_does_not_answer_keeps_no_crash_from_being_found() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let Some((machine, _fixture, _root)) =
+            site("watch-silent", &|root| root.join("r/agent/archive.sock"))
+        else {
+            return;
+        };
+        let cloud = Cloud::start().await;
+        let base = tempdir();
+        cloud.seed(&base);
+        let (link, events) = Link::start(
+            LinkConfig {
+                paths: crate::link::Paths::new(&base),
+                image_version: "25".into(),
+                agent_version: "0.1.0".into(),
+                release_id: None,
+                timing: LinkTiming {
+                    interval: Duration::from_millis(300),
+                    ..LinkTiming::default()
+                },
+            },
+            Transport::new(cloud.roots()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let db = new_entry_json();
+        let id = db["id"].as_str().unwrap().to_string();
+        let credential = db["archive"]["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = db["archive"]["path"].as_str().unwrap().to_string();
+        cloud.with(|inner| {
+            inner.databases = vec![db.clone()];
+            inner.credential_paths.insert(credential, path);
+        });
+        let service = Service::start(
+            machine.clone(),
+            link,
+            events,
+            ServiceConfig {
+                intervals: quick(),
+                timing: timing(),
+                gateway: None,
+            },
+        )
+        .await
+        .unwrap();
+        let handle = service.core().find(&id).unwrap();
+        eventually(90, "ready", || handle.phase() == crate::agent::Phase::Ready).await;
+
+        // A gateway that reads the agent's requests and answers none: each idle check of the
+        // database waits for it in vain.
+        let stream = tokio::net::UnixStream::connect(machine.layout().gateway_socket())
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            if matches!(
+                pgcf_native_protocol::agent::decode_to_gateway(line.as_bytes()),
+                Ok(ToGateway::Activity { .. })
+            ) {
+                break;
+            }
+        }
+        // The postmaster dies while an idle check waits: the watch of the units finds it at once.
+        machine.crash(&id);
+        eventually(2, "the crash to be found", || {
+            handle.phase() != crate::agent::Phase::Ready
+        })
+        .await;
+        service.stop();
     }
 }

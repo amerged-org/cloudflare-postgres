@@ -55,6 +55,9 @@ struct State {
     start_fails: bool,
     /// How long the next start takes before the postmaster begins.
     start_delay: Option<Duration>,
+    /// LVM, or systemd, cannot be read: what they hold is not known.
+    volumes_unreadable: bool,
+    units_unreadable: bool,
     /// The `archive_command` of a database, where it is not the layout's.
     archive_commands: HashMap<String, String>,
     /// Every database archives straight into its upload log.
@@ -180,6 +183,12 @@ impl Local {
     pub fn fail_next_start(&self) {
         self.state().start_fails = true;
     }
+    pub fn set_volumes_unreadable(&self, unreadable: bool) {
+        self.state().volumes_unreadable = unreadable;
+    }
+    pub fn set_units_unreadable(&self, unreadable: bool) {
+        self.state().units_unreadable = unreadable;
+    }
     pub fn has_account(&self, database: &str) -> bool {
         self.state().accounts.iter().any(|a| a == database)
     }
@@ -273,7 +282,11 @@ impl Machine for Local {
         Ok(())
     }
     async fn has_volume(&self, id: &VolumeId) -> Result<bool, storage::Error> {
-        Ok(self.state().volumes.contains_key(id))
+        let state = self.state();
+        if state.volumes_unreadable {
+            return Err(storage::Error::Unexpected("lvs"));
+        }
+        Ok(state.volumes.contains_key(id))
     }
     async fn mount_volumes(
         &self,
@@ -463,6 +476,9 @@ impl Machine for Local {
 
     async fn unit(&self, database: &str) -> Result<UnitState, units::Error> {
         let mut state = self.state();
+        if state.units_unreadable {
+            return Err(units::Error::NotReady("bus"));
+        }
         let memory_max = state.limits.get(database).and_then(|limits| {
             limits
                 .properties()
