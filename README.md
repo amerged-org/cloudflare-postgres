@@ -109,9 +109,10 @@ The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the singl
 Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with its default
 `pipelineConnect: "password"` and a `wsProxy` URL containing both URL-encoded hints. Requests to
 the bare `/v2` endpoint or with missing or invalid hints are unsupported. Actor admission checks the database and role against D1.
-The Edge signs a route token that lives 30 seconds and names the database, role, region, database
-generation and verified primary Pod (v3; v4 adds the admission route revision), and returns the
-unopened upstream WebSocket for native forwarding. Admission failures return a small failure-only
+The Edge signs a route token that lives 30 seconds and names the database, role, region, the
+database generation and admission route revision, the node and the invocation ID of the unit that
+serves it (v6; a sleeping database gets the v5 wake ticket), sealed with a key derived for that
+node, and returns the unopened upstream WebSocket for native forwarding. Admission failures return a small failure-only
 `101` WebSocket carrying a PostgreSQL SQLSTATE error before any gateway upgrade or PostgreSQL dial.
 Dev uses a VPC HTTP service with native forwarding; VPC TCP raw streams were unsuitable, and a
 signed Tunnel route is the fallback.

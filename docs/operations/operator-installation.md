@@ -141,7 +141,6 @@ These management routes are API-only; no PGCF administration UI is part of the p
 | `PUT /v1/resource-profiles/{id}/rollout` | Select `profile_revision` for all databases currently assigned to that profile; `expected_revision` is the previous rollout target, or0 before its first selection |
 | `GET /v1/resource-profiles/{id}/rollout` | Read assigned, applied, deferred and pending counts |
 | `GET/PUT /v1/regions/{id}/configuration` | Read/change the gateway URL and binding through configuration-hash CAS; the route must end in `/pg` |
-| `GET /v1/nodes/{id}/storage` | Read a fresh identity-bound physical LVM observation, or `sample:null` when unavailable |
 
 Profile creation, rollout selection and regional configuration require administrator scope.
 Database assignment retains project authorization. Use `Idempotency-Key` for mutations and retain

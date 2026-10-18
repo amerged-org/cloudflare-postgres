@@ -226,7 +226,11 @@ enrollment seed, reports each checkpoint (`started`, `hardware_ok`, `image_verif
 progress token from a header file, and reboots. The work directory (the one that holds `install.sh`
 and the parameters) is set to 0700 before the parameters are read, and the header file and the
 parameters file are removed when the install succeeds, when it fails and when a parameter is
-refused; `--validate-only`, which the renderer test uses, changes nothing.
+refused; `--validate-only`, which the renderer test uses, changes nothing. The node ID, region
+and enrollment token are checked against the shapes of the agent's seed (`NodeEnrollmentSeed` of
+`packages/contracts/src/node-link.ts`: `nod_` and 20 lowercase letters or digits, the contract's
+region ID, `pgcf_et_` and 43 characters), because a seed the agent refuses would leave the node
+installed and never enrolled; the installer's test holds both to the contract.
 
 The installer is built on what Stage 1 recorded about Contabo's rescue system (plan 11.1):
 

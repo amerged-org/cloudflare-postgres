@@ -7,9 +7,9 @@ records those.
 
 ## Configuration
 
-`PGCF_REGION_ID`, the derived `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_PORT`, `PGCF_GATEWAY_MEMORY_BYTES`,
-`PGCF_GATEWAY_DATABASE_MEMORY_BYTES` and `PGCF_AGENT_SOCKET` (default
-`/run/pgcf/agent/gateway.sock`). The gateway listens on `127.0.0.1:PGCF_GATEWAY_PORT` only, for
+`PGCF_REGION_ID`, `PGCF_NODE_ID`, the node's derived `PGCF_ROUTE_KEY`, `PGCF_GATEWAY_PORT`,
+`PGCF_GATEWAY_MEMORY_BYTES`, `PGCF_GATEWAY_DATABASE_MEMORY_BYTES` and `PGCF_AGENT_SOCKET`
+(default `/run/pgcf/agent/gateway.sock`). The gateway listens on `127.0.0.1:PGCF_GATEWAY_PORT` only, for
 cloudflared. It holds no provider credentials and no PostgreSQL credentials of its own.
 
 ## The agent's table
@@ -23,9 +23,9 @@ archive socket.
   and operation, its route revision, its mode (`running`, `quiesce`, `sleeping`, `retired`) and,
   while PostgreSQL runs, its unit: the Unix socket, the database's uid, the unit's main PID and the
   unit's invocation ID.
-- A route is admitted only on a running unit, and only as an admission route (v4) whose
-  generation, route revision and `pod` (the unit's invocation ID, until the route version that
-  names node and instance replaces v4) are the table's. The dial is the database's socket; the
+- A route is admitted only on a running unit, and only as a v6 route made for this node (its
+  key is derived for the node, and the route names it) whose generation, route revision and
+  instance (the unit's invocation ID) are the table's. The dial is the database's socket; the
   connection is kept only when the kernel's peer credentials are the unit's uid and main PID.
   Nothing is written to any other process, and a failed check logs the outcome `peer_mismatch`.
 - The agent's `control` requests are `begin` (quiesce), `close` (close idle sessions with 1000
@@ -38,7 +38,7 @@ archive socket.
 
 ## Connections
 
-- Cloudflare signs single-use, short-lived regional route tokens. The original StartupMessage
+- Cloudflare signs single-use, short-lived route tokens for the node. The original StartupMessage
   and authentication bytes pass through unchanged; database and role must match the token before
   any byte reaches PostgreSQL. The dial begins with the admission, so it overlaps the client's own
   round trips.
@@ -65,9 +65,16 @@ connections per database and 512 in total, refused with HTTP 429 or 503 before t
 The gateway sends the agent the wake before it answers the upgrade (`wake`, again after 3 s
 without a result). The release is the table entry that shows the unit running at the ticket's
 generation and operation, at the ticket's route revision or a later one. The connection is then
-routed as the v4 route of that unit; a ticket the table has already released is routed at once.
+routed as the route of that unit; a ticket the table has already released is routed at once.
 The agent's `wake_result` is `started` or `refused`; a refusal, 25 s without release, or a table
 that moves past the ticket answer FATAL 57P03; a draining gateway and a failed dial answer 08006.
+A refusal for want of room carries the DETAIL "storage", one for awake capacity the DETAIL "node
+at awake capacity" and the HINT "retry after <n> s" (the agent's retry hint), on a WebSocket and
+in the JSON error of HTTP SQL alike; the other reasons answer the 57P03 alone
+(`refusalFields` of `packages/contracts/src/node-local.ts`).
+The reason `wake_in_progress` is no result: the agent already serves that wake, so the held
+connections keep waiting for the answer of the first delivery and the ticket is delivered again
+after 3 s (`WAKE_AGAIN_REASON`).
 
 ## Logs
 

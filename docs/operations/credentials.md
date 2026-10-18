@@ -20,9 +20,10 @@ Maintain the exact Worker binding names from the private deployment configuratio
 from a protected file through Wrangler secret import; keep command output private. Deploy to the
 verified account and compare secret **names**, never print values.
 
-For `ROUTE_MASTER_KEYS`, retain the old key ID while adding the replacement. Derive each region's
-gateway keyring with the shared `deriveRegionKeyring` contract and update the gateway first;
-activate the new master signing key only after the gateway accepts it. Existing routing tokens
+For `ROUTE_MASTER_KEYS`, retain the old key ID while adding the replacement. Derive each node's
+gateway keyring with the shared `deriveNodeKeyring` contract (the node reads it from Cloudflare
+with its other credentials) and update the gateways first; activate the new master signing key
+only after the gateways accept it. Existing routing tokens
 expire within their configured short window. Verify a fresh connection before retiring the old
 key. Do not change an agent key as a side effect of a redeploy.
 
