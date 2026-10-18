@@ -218,7 +218,7 @@ so apt kernel updates need nothing from mkosi. The static [grub.cfg](mkosi.extra
 boots `/vmlinuz` and `/initrd.img`, which Debian's kernel packages point at the newest kernel, and
 offers the previous kernel through the `.old` links. A one-shot boot of the previous kernel:
 `grub-editenv /efi/grub/grubenv set next_entry=previous`, then reboot. The kernel console is on
-`tty0` (Contabo VNC) and `ttyS0`.
+`tty0` (Contabo VNC) and `ttyS0`. Both entries carry `systemd.ssh_auto=no`.
 
 ## Units
 
@@ -230,7 +230,7 @@ offers the previous kernel through the `.old` links. A one-shot boot of the prev
 | `pgcf-agent.service` | root | `pgcf-agent run`, `Type=notify`; host mount namespace (see below); creates `/run/pgcf/agent` |
 | `pgcf-gateway.service` | `pgcf-gateway` | `pgcf-native-gateway` in local mode on loopback; starts once `/var/lib/pgcf/credentials/gateway.env` exists |
 | `pgcf-cloudflared.service` | `pgcf-cloudflared` | The Tunnel; starts once `/var/lib/pgcf/credentials/tunnel-token.cred` exists |
-| `ssh.service` | root | Loopback only, no passwords; host keys are created at first boot |
+| `ssh.service` | root | Loopback only, user certificates only (no CA ships, so no login until a CA key is written; nothing writes one yet); host keys are created at first boot |
 
 A preset allowlist ([10-pgcf.preset](mkosi.extra/usr/lib/systemd/system-preset/10-pgcf.preset))
 enables exactly these plus networkd, timesyncd, getty and LVM monitoring. Everything else a package
@@ -277,13 +277,16 @@ package from creating a default cluster.
   `PG_OOM_ADJUST_VALUE=0`: the postmaster is protected, backends are not.
 - **Sandbox:** `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`;
   `ProtectSystem=strict` with only the data directory writable; `ProtectHome`, `PrivateTmp`,
-  `PrivateDevices`, a private `/dev/shm` of 64 MiB (`TemporaryFileSystem`; a database's own size
-  goes in a drop-in that applies at its next start); `ProtectKernelTunables/Modules/Logs`,
-  `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`,
-  `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`,
-  `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`, `RemoveIPC`;
-  `SystemCallFilter=@system-service ~@privileged ~@resources` (a forbidden call kills the process),
-  `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
+  `PrivateDevices`, a private `/dev/shm` of 64 MiB mounted `noexec,nosuid,nodev`
+  (`TemporaryFileSystem`; a database's own size goes in a drop-in that applies at its next start);
+  `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
+  `ProtectProc=invisible`, `ProcSubset=pid`; `RestrictNamespaces`, `RestrictRealtime`,
+  `RestrictSUIDSGID`, `LockPersonality`, `NoNewPrivileges`, an empty `CapabilityBoundingSet`,
+  `RemoveIPC`; `SystemCallFilter=@system-service` minus `@privileged @resources` and minus what
+  kernel exploits use as a second stage and PostgreSQL does not need (`@keyring`,
+  `io_uring_setup/enter/register`, `userfaultfd`, the SysV message queues and semaphores `msg*` and
+  `sem*`, the POSIX message queues `mq_*`; `shmget`, `shmat`, `shmdt` and `shmctl` stay; a forbidden
+  call kills the process), `MemoryDenyWriteExecute=yes` (needs `jit=off`), `UMask=0077`.
 - **Not set:** `PrivatePIDs` and `PrivateIPC`, because PostgreSQL's `postmaster.pid` interlock needs
   them off (the lab showed a second unit on the same directory being refused); `unix_socket_group`,
   because PostgreSQL would call `chown`, which the filter kills.
@@ -318,6 +321,10 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
   --type thin-pool --name pgcf_thinpool --chunksize 64K --zero y --poolmetadatasize 1G --extents
   100%FREE pgcf`, then `lvchange --errorwhenfull y pgcf/pgcf_thinpool`. On a 33 GiB partition this
   leaves 31.05 GiB of pool data next to 1 GiB of metadata and its 1 GiB spare.
+- `/var/lib/pgcf/db` is mode 0711 (the agent creates it so, and tmpfiles resets it at every boot): a
+  database reaches its own directory, but nobody can list this one. The IDs are not hidden: the
+  accounts `pgcf-<id>` are in `/etc/passwd`, `/run/pgcf` is 0755 and the mount table lists every
+  mount.
 - Each database's volume is mounted at `/var/lib/pgcf/db/<id>` (mode 0700, owner `pgcf-<id>`) with
   the data directory `data` inside. The agent creates `/run/pgcf/<id>` (owner `pgcf-<id>`, group
   `pgcf-gateway`, mode 0750) when it creates a database and again for every database when it
@@ -355,11 +362,29 @@ exists: the API makes it only while its Worker variable `NODE_SHELL_HOSTNAME` is
 - **No inbound surface.** [nftables.conf](mkosi.extra/etc/nftables.conf) drops all inbound traffic
   except replies to the node's own flows and IPv6 neighbour discovery (hop limit 255). sshd, the
   gateway and cloudflared's metrics listen on loopback only; PostgreSQL listens on no address.
+- **Operator shell.** [10-pgcf.conf](mkosi.extra/etc/ssh/sshd_config.d/10-pgcf.conf) makes sshd take
+  one thing: a user certificate for root, signed by the CA in `/etc/ssh/pgcf_user_ca.pub` and
+  carrying the principal `pgcf-break-glass` (`/etc/ssh/principals/root`). The image ships no CA key,
+  so no login is possible until a CA's public key is written there; the installer does not write
+  one yet (plan 11.2). There are no passwords, no `authorized_keys`, two tries, a 20 s grace time,
+  two sessions and no forwarding of any kind; the log level is `VERBOSE`, and per-source penalties
+  stay at their default. sshd refuses every public key when `RevokedKeys` names a missing file, so
+  the image ships an empty key revocation list (`/etc/ssh/pgcf_revoked.krl`, the header only;
+  `ssh-keygen -k -u -f` adds to it).
+  A client offers only the certificate's key (`IdentitiesOnly=yes`), because two tries end after
+  the key and its certificate.
+- **No ssh socket.** With sshd installed, systemd 257's `systemd-ssh-generator` binds it to the Unix
+  socket `/run/ssh-unix-local/socket` (mode 0666, which a database's user reaches, because its unit
+  allows `AF_UNIX`) and to vsock. The image masks the generator (a link to `/dev/null` in
+  `/etc/systemd/system-generators`) and both kernel lines of grub.cfg carry `systemd.ssh_auto=no`.
 - **Kernel.** [90-pgcf.conf](mkosi.extra/usr/lib/sysctl.d/90-pgcf.conf) turns off unprivileged user
-  namespaces and BPF, restricts kernel pointers, `dmesg` and `ptrace`, disables forwarding and
-  redirects, and reboots 10 s after a panic or oops (the agent recovers unproven databases at boot).
+  namespaces and BPF, turns off io_uring (`kernel.io_uring_disabled = 2`: nothing on the node uses
+  it, and PostgreSQL runs `io_method=worker`) and the autoload of terminal line disciplines,
+  restricts kernel pointers, `dmesg` and `ptrace`, disables forwarding and redirects, and reboots
+  10 s after a panic or oops (the agent recovers unproven databases at boot).
 - **Journal.** [journald](mkosi.extra/usr/lib/systemd/journald.conf.d/pgcf.conf) keeps at most
-  1 GiB, at least 2 GiB free and 14 days on the 8 GiB root.
+  1 GiB, at least 2 GiB free and 14 days on the 8 GiB root, and syncs to disk every 15 s instead of
+  every five minutes, so that the minutes before a freeze are in the journal after the reboot.
 
 ## Installing a node
 
@@ -424,5 +449,5 @@ The guest reports one line per check on the second serial port:
 
 | Boot | Checks |
 | --- | --- |
-| First | no failed unit; nothing listens outside loopback; inbound policy drop; the four binaries; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
-| Second | no failed unit; loopback only; inbound policy drop; the binaries; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
+| First | no failed unit; nothing listens outside loopback; the journal syncs every 15 s (`systemd-analyze cat-config`); no ssh socket (`ss` lists no `ssh-unix-local`, `systemctl list-sockets` no `sshd-unix-local` or `sshd-vsock`); inbound policy drop; `sshd -t` passes and `sshd -T` reports the operator shell's values; a certificate from a throwaway CA is refused on 127.0.0.1 and ::1, accepted once that CA is installed and refused again when it is removed; the four binaries; `kernel.io_uring_disabled` is 2 and `dev.tty.ldisc_autoload` is 0; `/var/lib/pgcf/db` is mode 711; root grown to 8 GiB; the LVM partition over the rest; the database unit rates SAFE, has no start timeout and no `ExecStartPre=`, and its loaded system-call filter allows `shmget` but none of the denied calls; a transient job in `pgcfbackup.slice` runs in `/pgcfbackup.slice/`, outside `pgcf.slice`; VG `pgcf` and the thin pool with 64 KiB chunks, zeroing and error-when-full; `pgcf-agent check` creates the scratch database on one thin volume, and its `/run/pgcf/<id>` is owned by `pgcf-<id>:pgcf-gateway` with mode 0750 |
+| Second | no failed unit; loopback only; the journal syncs every 15 s; no ssh socket; inbound policy drop; the binaries; both sysctl values and mode 711 again after the reboot; the pool; the agent has recreated the scratch database's `/run/pgcf/<id>` after the reboot; `pgcf-agent check` wakes the same scratch database |
